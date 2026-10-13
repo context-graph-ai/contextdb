@@ -1289,6 +1289,17 @@ pub(in super::super) trait ManifestOverlay {
     fn first_present_from(&self, start: &[u8], exclusive: bool) -> Option<&[u8]>;
 }
 
+/// An absent overlay holds no deltas.
+impl<T: ManifestOverlay + ?Sized> ManifestOverlay for Option<&T> {
+    fn latest_present(&self, coordinate: &[u8]) -> Option<bool> {
+        self.and_then(|overlay| overlay.latest_present(coordinate))
+    }
+
+    fn first_present_from(&self, start: &[u8], exclusive: bool) -> Option<&[u8]> {
+        self.and_then(|overlay| overlay.first_present_from(start, exclusive))
+    }
+}
+
 fn overlay_coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
     &mutation.logical_key[ORDERED_HISTORY_MAGIC.len() + 1..]
 }

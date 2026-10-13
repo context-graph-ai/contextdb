@@ -84,9 +84,7 @@ impl RedbPersistence {
             &prefix,
             false,
             &mut admission,
-            pending
-                .as_ref()
-                .map_or(&[] as &[_], |p| p.mutations.as_slice()),
+            &pending.as_deref().map(|p| &p.mutations),
         )
         .map_err(|e| self.relational_manifest_error(e))?;
         let old_coordinate = old
@@ -105,9 +103,7 @@ impl RedbPersistence {
                 coordinate,
                 true,
                 &mut admission,
-                pending
-                .as_ref()
-                .map_or(&[] as &[_], |p| p.mutations.as_slice()),
+                &pending.as_deref().map(|p| &p.mutations),
             )
             .map_err(|e| self.relational_manifest_error(e))?;
             if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
@@ -1048,7 +1044,13 @@ impl RedbPersistence {
         row_id: RowId,
         relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
     ) -> Result<()> {
-        self.verify_relational_group_pending_in_write(write, table, row_id, relation, &[])
+        self.verify_relational_group_pending_in_write(
+            write,
+            table,
+            row_id,
+            relation,
+            &[] as &[content_identity::ContentIdentityMutation],
+        )
     }
 
     pub(super) fn verify_relational_group_pending_in_write(
@@ -1057,7 +1059,7 @@ impl RedbPersistence {
         table: &str,
         row_id: RowId,
         relation: &impl ReadableTable<&'static [u8], &'static [u8]>,
-        pending: &[content_identity::ContentIdentityMutation],
+        pending: &(impl manifest::ManifestOverlay + ?Sized),
     ) -> Result<()> {
         let mut admission = self.proof_admission();
         admission.admit(
@@ -1482,22 +1484,76 @@ impl RetainedReadSource {
     }
 }
 
+/// Publication-ordered manifest deltas plus an ordered index of the latest
+/// delta at each coordinate, so a row's overlay seek costs a lookup instead
+/// of a rescan of every delta the rows before it staged.
+pub(super) struct PendingManifestMutations {
+    list: Vec<content_identity::ContentIdentityMutation>,
+    /// Coordinates whose latest delta adds them.
+    present: std::collections::BTreeSet<Vec<u8>>,
+    /// Coordinates whose latest delta removes them.
+    removed: std::collections::BTreeSet<Vec<u8>>,
+}
+impl std::ops::Deref for PendingManifestMutations {
+    type Target = [content_identity::ContentIdentityMutation];
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+impl manifest::ManifestOverlay for PendingManifestMutations {
+    fn latest_present(&self, coordinate: &[u8]) -> Option<bool> {
+        #[cfg(any(test, feature = "test-seams"))]
+        manifest::commit_row_work::count_overlay_entries(1);
+        if self.present.contains(coordinate) {
+            Some(true)
+        } else if self.removed.contains(coordinate) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn first_present_from(&self, start: &[u8], exclusive: bool) -> Option<&[u8]> {
+        use std::ops::Bound;
+        #[cfg(any(test, feature = "test-seams"))]
+        manifest::commit_row_work::count_overlay_entries(1);
+        let lower = if exclusive {
+            Bound::Excluded(start)
+        } else {
+            Bound::Included(start)
+        };
+        self.present
+            .range::<[u8], _>((lower, Bound::Unbounded))
+            .next()
+            .map(Vec::as_slice)
+    }
+}
+
+/// Native bytes one index entry may hold beyond its coordinate: the owning
+/// vector header and its share of the ordered set's node.
+const PENDING_INDEX_ENTRY_BYTES: usize = 3 * std::mem::size_of::<Vec<u8>>();
+
 /// Finite writer-funded publication deltas. Field order frees every mutation
 /// and the native container before its original proof invoices are returned.
 pub(super) struct PendingManifestPublication {
-    pub(super) mutations: Vec<content_identity::ContentIdentityMutation>,
+    pub(super) mutations: PendingManifestMutations,
     admission: content_identity::OwnedProofAdmission,
 }
 impl PendingManifestPublication {
     pub(super) fn new(admission: content_identity::OwnedProofAdmission) -> Self {
         Self {
-            mutations: Vec::new(),
+            mutations: PendingManifestMutations {
+                list: Vec::new(),
+                present: std::collections::BTreeSet::new(),
+                removed: std::collections::BTreeSet::new(),
+            },
             admission,
         }
     }
     fn push(&mut self, coordinate: &[u8], present: bool) -> Result<()> {
-        if self.mutations.len() == self.mutations.capacity() {
-            let old = self.mutations.capacity();
+        let list = &mut self.mutations.list;
+        if list.len() == list.capacity() {
+            let old = list.capacity();
             let capacity = old
                 .checked_mul(2)
                 .map(|n| n.max(4))
@@ -1507,8 +1563,8 @@ impl PendingManifestPublication {
                 .ok_or_else(|| Error::Other("manifest publication layout overflow".into()))?;
             self.admission.admit(bytes)?;
             let mut next = Vec::with_capacity(capacity);
-            next.extend(std::mem::take(&mut self.mutations));
-            self.mutations = next;
+            next.extend(std::mem::take(list));
+            *list = next;
             self.admission
                 .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
         }
@@ -1520,7 +1576,26 @@ impl PendingManifestPublication {
                 + mutation.logical_value.as_ref().map_or(0, Vec::capacity),
             bytes
         );
-        self.mutations.push(mutation);
+        let (into, from) = if present {
+            (&mut self.mutations.present, &mut self.mutations.removed)
+        } else {
+            (&mut self.mutations.removed, &mut self.mutations.present)
+        };
+        if !into.contains(coordinate) {
+            let key = match from.take(coordinate) {
+                Some(key) => key,
+                None => {
+                    let entry = coordinate
+                        .len()
+                        .checked_add(PENDING_INDEX_ENTRY_BYTES)
+                        .ok_or_else(|| Error::Other("manifest index entry overflow".into()))?;
+                    self.admission.admit(entry)?;
+                    coordinate.to_vec()
+                }
+            };
+            into.insert(key);
+        }
+        self.mutations.list.push(mutation);
         Ok(())
     }
 }
