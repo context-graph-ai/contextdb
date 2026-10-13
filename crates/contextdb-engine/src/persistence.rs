@@ -54047,7 +54047,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                                 .copied()
                                 .unwrap_or_default();
                             identity_mutations
-                                .push_at("vector_insert", content_identity::original_producers::vector_mutation(&frame,entry, quantization)?);
+                                .push_at("vector_insert", content_identity::original_producers::vector_mutation(&frame,entry, quantization)?)?;
                             identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
                                 entry,
                                 quantization,
@@ -54096,7 +54096,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                                 moved.vector = Self::decode_vector_entry_original(&frame,source.value())?.vector;
                             }
                             identity_mutations
-                                .push_at("vector_move", content_identity::original_producers::vector_mutation(&frame,&moved, quantization)?);
+                                .push_at("vector_move", content_identity::original_producers::vector_mutation(&frame,&moved, quantization)?)?;
                             identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
                                 &moved,
                                 quantization,
@@ -55673,7 +55673,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             )
                         })?;
                         change_log_identity
-                            .push_at("received_change_log", Self::stored_change_log_mutation(&key_buf, &bytes)?);
+                            .push_at("received_change_log", Self::stored_change_log_mutation(&key_buf, &bytes)?)?;
                     }
                 }
             }
@@ -56028,7 +56028,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         content_identity::original_producers::encoded_history_mutation(
                             &frame, &key, *change,
                         )?,
-                    );
+                    )?;
                 }
             }
             // The committed history records the very commit-index entry this
@@ -56406,7 +56406,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         content_identity::original_producers::encoded_history_mutation(
                             &frame, &key, *change,
                         )?,
-                    );
+                    )?;
                 }
             }
             for (table, row_id, _) in &stage.operational_write_set.relational_deletes {
