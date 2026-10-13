@@ -28,6 +28,15 @@ static PROBES: AtomicUsize = AtomicUsize::new(0);
 /// admission point) instead of from `BASE`.
 static FROM_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static FIRST: AtomicIsize = AtomicIsize::new(0);
+/// The writer whose accountant also funds commit validation's verifier and
+/// the pages its reads load; its growth is admitted, not unadmitted.
+static WRITER: std::sync::OnceLock<Arc<Database>> = std::sync::OnceLock::new();
+static FIRST_WRITER: AtomicIsize = AtomicIsize::new(0);
+fn writer_used() -> isize {
+    WRITER
+        .get()
+        .map_or(0, |writer| writer.accountant().usage().used as isize)
+}
 
 fn probe(held: usize) {
     let live = live_allocations_for_test() as isize;
@@ -35,11 +44,17 @@ fn probe(held: usize) {
         // Commit validation starts: measure from here, with nothing admitted.
         if FROM_FIRST.load(Ordering::SeqCst) {
             FIRST.store(live, Ordering::SeqCst);
+            FIRST_WRITER.store(writer_used(), Ordering::SeqCst);
             PROBES.store(1, Ordering::SeqCst);
         }
         return;
     }
-    let unadmitted = live - held as isize;
+    let writer_grown = if FROM_FIRST.load(Ordering::SeqCst) {
+        writer_used() - FIRST_WRITER.load(Ordering::SeqCst)
+    } else {
+        0
+    };
+    let unadmitted = live - held as isize - writer_grown;
     if FROM_FIRST.load(Ordering::SeqCst) && PROBES.load(Ordering::SeqCst) == 0 {
         FIRST.store(unadmitted, Ordering::SeqCst);
     }
@@ -228,10 +243,15 @@ fn stage_wide_unit(edge: &Database, unit: usize) -> contextdb_core::TxId {
 
 /// Commit validation admits its companion planning before allocating it:
 /// commits of wide units under a sweep of validation limits, measured from
-/// the start of commit validation.
+/// the start of commit validation. What the writer accountant admits meanwhile
+/// (the admitted verifier, the pages validation's reads load) is admitted too.
 async fn companion_planning() {
     let dir = tempfile::tempdir().unwrap();
     let (edge, _hub) = edge_with_units(dir.path(), 1).await;
+    WRITER
+        .set(edge.clone())
+        .ok()
+        .expect("one planning arm per process");
     let mut unit = 1usize;
     // Find the limit that admits a whole validation (also warming pages).
     let mut enough = 64 * 1024;
