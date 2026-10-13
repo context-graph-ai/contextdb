@@ -32,10 +32,16 @@ static FIRST: AtomicIsize = AtomicIsize::new(0);
 /// the pages its reads load; its growth is admitted, not unadmitted.
 static WRITER: std::sync::OnceLock<Arc<Database>> = std::sync::OnceLock::new();
 static FIRST_WRITER: AtomicIsize = AtomicIsize::new(0);
+/// What the writer admits outside this memory: its accountant's charges, and
+/// the page cache's occupancy and index, which live inside the cache's own
+/// fixed share (see the delivery-journal oracle's attribution).
 fn writer_used() -> isize {
-    WRITER
-        .get()
-        .map_or(0, |writer| writer.accountant().usage().used as isize)
+    WRITER.get().map_or(0, |writer| {
+        let cache = writer.__writer_cache_stats_for_test().unwrap();
+        (writer.accountant().usage().used
+            + cache.3
+            + writer.__writer_cache_index_bytes_for_test().unwrap()) as isize
+    })
 }
 
 fn probe(held: usize) {
