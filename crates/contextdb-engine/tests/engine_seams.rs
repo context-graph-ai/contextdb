@@ -105,6 +105,8 @@ mod writer_file_ownership_survives_recycle;
 mod buffer_pool_share_evicts_and_recharges_under_the_writer_budget;
 #[path = "engine_seams/custody_durable_selection_matches_the_resident_journal.rs"]
 mod custody_durable_selection_matches_the_resident_journal;
+#[path = "engine_seams/identity_preparation_refusal_leaves_the_store_unchanged.rs"]
+mod identity_preparation_refusal_leaves_the_store_unchanged;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/custody_history_commits_do_not_hydrate_the_delivery_journal.rs"]
 mod custody_history_commits_do_not_hydrate_the_delivery_journal;

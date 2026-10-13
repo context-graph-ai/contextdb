@@ -53342,6 +53342,19 @@ impl<'o> OriginalPersistenceFrame<'o> {
     }
 }
 
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    /// The one identity-mutation preparation site whose next growth this
+    /// thread refuses, if any.
+    static REFUSED_IDENTITY_GROWTH_SITE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+/// Arm (or disarm with `None`) a refusal at one named identity-mutation site
+/// for the calling thread.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn refuse_identity_growth_at_for_test(site: Option<&'static str>) {
+    REFUSED_IDENTITY_GROWTH_SITE.with(|armed| armed.set(site));
+}
 struct OriginalMutationVector<'f, 'o> {
     values: Vec<content_identity::ContentIdentityMutation>,
     frame: &'f OriginalPersistenceFrame<'o>,
@@ -53378,6 +53391,29 @@ impl<'f, 'o> OriginalMutationVector<'f, 'o> {
         }
         self.values.push(value);
         Ok(())
+    }
+    /// `push` at a named preparation site. A test may arm one site so the
+    /// growth admission refuses there exactly as an exhausted MEMORY_LIMIT does.
+    fn push_at(
+        &mut self,
+        _site: &'static str,
+        value: content_identity::ContentIdentityMutation,
+    ) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if self.values.len() == self.values.capacity()
+            && REFUSED_IDENTITY_GROWTH_SITE.with(|armed| armed.get() == Some(_site))
+        {
+            return Err(Error::MemoryBudgetExceeded {
+                subsystem: "persistence".into(),
+                operation: "prepare_commit".into(),
+                requested_bytes: std::mem::size_of::<content_identity::ContentIdentityMutation>()
+                    * self.values.capacity().saturating_mul(2).max(4),
+                available_bytes: 0,
+                budget_limit_bytes: 0,
+                hint: "Raise MEMORY_LIMIT to admit commit preparation.".into(),
+            });
+        }
+        self.push(value)
     }
     fn extend(
         &mut self,
@@ -54011,7 +54047,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                                 .copied()
                                 .unwrap_or_default();
                             identity_mutations
-                                .push(content_identity::original_producers::vector_mutation(&frame,entry, quantization)?);
+                                .push_at("vector_insert", content_identity::original_producers::vector_mutation(&frame,entry, quantization)?);
                             identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
                                 entry,
                                 quantization,
@@ -54060,7 +54096,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                                 moved.vector = Self::decode_vector_entry_original(&frame,source.value())?.vector;
                             }
                             identity_mutations
-                                .push(content_identity::original_producers::vector_mutation(&frame,&moved, quantization)?);
+                                .push_at("vector_move", content_identity::original_producers::vector_mutation(&frame,&moved, quantization)?);
                             identity_mutations.push(content_identity::original_producers::vector_version_mutation(&frame,
                                 &moved,
                                 quantization,
@@ -55637,7 +55673,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             )
                         })?;
                         change_log_identity
-                            .push(Self::stored_change_log_mutation(&key_buf, &bytes)?);
+                            .push_at("received_change_log", Self::stored_change_log_mutation(&key_buf, &bytes)?);
                     }
                 }
             }
@@ -55987,7 +56023,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
             for (ddl_lsn, changes) in grouped_ddl {
                 for (index, change) in changes.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(ddl_lsn, index, changes.len());
-                    identity_mutations.push(
+                    identity_mutations.push_at(
+                        "received_ddl_history",
                         content_identity::original_producers::encoded_history_mutation(
                             &frame, &key, *change,
                         )?,
@@ -56152,6 +56189,45 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
+    /// Measurement only: run the owned no-op received-schema flush for one
+    /// DDL entry at `lsn` on this store, exactly as its producer would.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn flush_received_schema_noop_ddl_for_test(
+        &self,
+        accountant: crate::memory_accounting::AccountantHandle,
+        lsn: Lsn,
+        change: DdlChange,
+    ) -> Result<()> {
+        let original = crate::memory_accounting::OwnedMemoryReservation::new(accountant);
+        let ws = WriteSet {
+            commit_lsn: Some(lsn),
+            ..WriteSet::default()
+        };
+        let stage = ReceivedSchemaPersistenceProjection {
+            schema_noop: true,
+            affected_tables: HashSet::new(),
+            replace_graph: false,
+            affected_graph_edge_types: HashSet::new(),
+            replace_vectors: false,
+            vector_image_memory: crate::read_image_memory::ImageMemory::new(None),
+            retired_vector_construction: parking_lot::Mutex::new(Vec::new()),
+            table_meta: HashMap::new(),
+            row_changed_tables: HashSet::new(),
+            rows: HashMap::new(),
+            sync_sources: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            vector_memberships: Vec::new(),
+            ddl_log: vec![(lsn, change)],
+            config_values: Vec::new(),
+            config_max_u64_keys: Vec::new(),
+            operational_write_set: WriteSet::default(),
+            operational_table_meta: HashMap::new(),
+            operational_deleted_rows: HashMap::new(),
+            structurally_dropped_tables: HashSet::new(),
+        };
+        self.flush_owned_received_schema_noop(&original, &ws, &[], &stage, None, 0)
+    }
     pub(crate) fn flush_owned_received_schema_noop(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -56325,7 +56401,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
             for (ddl_lsn, changes) in grouped_ddl {
                 for (index, change) in changes.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(ddl_lsn, index, changes.len());
-                    identity_mutations.push(
+                    identity_mutations.push_at(
+                        "received_noop_ddl_history",
                         content_identity::original_producers::encoded_history_mutation(
                             &frame, &key, *change,
                         )?,

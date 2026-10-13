@@ -102129,3 +102129,27 @@ impl Database {
             .transpose()
     }
 }
+
+#[cfg(feature = "test-seams")]
+impl Database {
+    /// Measurement only: run the owned no-op received-schema flush for one
+    /// probe DDL entry at the next LSN, optionally with the growth admission of
+    /// its DDL-history identity mutations refusing as an exhausted MEMORY_LIMIT
+    /// does.
+    #[doc(hidden)]
+    pub fn __flush_received_noop_ddl_for_test(&self, refuse_identity_growth: bool) -> Result<()> {
+        let persistence = self.persistence.as_ref().expect("file-backed fixture");
+        crate::persistence::refuse_identity_growth_at_for_test(
+            refuse_identity_growth.then_some("received_noop_ddl_history"),
+        );
+        let result = persistence.flush_received_schema_noop_ddl_for_test(
+            self.accountant.clone(),
+            Lsn(self.current_lsn().0 + 1),
+            crate::sync_types::DdlChange::DropTable {
+                name: "identity_refusal_probe".into(),
+            },
+        );
+        crate::persistence::refuse_identity_growth_at_for_test(None);
+        result
+    }
+}
