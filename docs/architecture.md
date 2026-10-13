@@ -112,7 +112,7 @@ audio, or policy embeddings with different dimensions and quantization choices.
 - A commit updates the durable base/change/tail lifecycle for the affected layout. Inserts enter a
   fresh searchable tail; deletes and replacements add tombstones. Searches merge the valid base,
   sealed committed changes, and tail under one MVCC snapshot.
-  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_tail_admission_refuses_the_complete_transaction_before_durability -->
+  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_current_identity_admission_refuses_the_complete_transaction_before_durability -->
 - `AUTO_INDEX_AT` and HNSW (`M`, `EF_CONSTRUCTION`, `EF_SEARCH`) are declarable per-column
   workload policy; silence keeps the compatibility profile. `AUTO` applies its effective threshold
   to the aggregate allowed set, while `EXACT` and `INDEXED` remain explicit whole-query contracts.
@@ -500,7 +500,7 @@ The carried tail holds no store source or lock and is released at import end, er
 Journal suffix admission and replay seek past the entire covered LSN cohort. They authenticate
 selected records without decoding already-covered history; a finite upper frontier includes every
 ordinal of its LSN, and a maximal covered frontier has an empty suffix.
-<!-- enforced by: persistence::bounded_journal_suffix_tests::fixed_journal_suffix_selection_does_not_examine_n_or_four_n_covered_records, persistence::bounded_journal_suffix_tests::suffix_seek_includes_all_ordinals_and_excludes_later_cohorts, persistence::bounded_journal_suffix_tests::suffix_seek_still_authenticates_each_selected_record, persistence::bounded_journal_suffix_tests::both_tail_loaders_and_delete_carrier_selection_seek_past_covered_history -->
+<!-- enforced by: crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::fixed_journal_suffix_selection_does_not_examine_n_or_four_n_covered_records, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::suffix_seek_includes_all_ordinals_and_excludes_later_cohorts, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::suffix_seek_still_authenticates_each_selected_record, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::both_tail_loaders_and_delete_carrier_selection_seek_past_covered_history -->
 
 Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
 Generation admission counts raw versions separately from selected live graph points at one committed
