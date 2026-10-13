@@ -28,7 +28,7 @@ const SETTLING_SLACK: usize = 1024 * 1024;
 /// boundedness proof: the RED resident journal differs by megabytes between
 /// arms, while the checkpoint attribution below names every owner that moves.
 const ALLOCATION_SPREAD: usize = 256 * 1024;
-/// Child process selector: the edge's own commits, or the hub's received units.
+/// Child process selector: the commits the edge makes, or the units the hub receives.
 const MODE: &str = "CONTEXTDB_CUSTODY_HISTORY_MODE";
 /// Measured commits per kind: K registrations, then K root updates.
 const K: usize = 8;

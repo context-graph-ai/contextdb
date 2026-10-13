@@ -4,7 +4,7 @@ use super::*;
 
 impl RedbPersistence {
     /// Measurement only: drop the custody group index completion marker in
-    /// its own committed transaction, as an unfunded maintenance write does.
+    /// a separate committed transaction, as an unfunded maintenance write does.
     #[cfg(feature = "test-seams")]
     pub(crate) fn invalidate_custody_groups_for_test(&self) -> Result<()> {
         self.with_db(|db| {
@@ -14,7 +14,7 @@ impl RedbPersistence {
         })
     }
     /// Measurement only: the repair rebuild of the custody read mirror and its
-    /// group index, in its own committed transaction.
+    /// group index, in a separate committed transaction.
     #[cfg(feature = "test-seams")]
     pub(crate) fn rebuild_custody_index_for_test(&self) -> Result<()> {
         self.with_db(|db| {
