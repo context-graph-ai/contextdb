@@ -93,6 +93,9 @@ mod writer_file_ownership_survives_recycle;
 
 #[path = "engine_seams/buffer_pool_share_evicts_and_recharges_under_the_writer_budget.rs"]
 mod buffer_pool_share_evicts_and_recharges_under_the_writer_budget;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_history_commits_do_not_hydrate_the_delivery_journal.rs"]
+mod custody_history_commits_do_not_hydrate_the_delivery_journal;
 #[path = "engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs"]
 mod history_sync_and_commit_cursors_reload_without_full_directories;
 #[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
