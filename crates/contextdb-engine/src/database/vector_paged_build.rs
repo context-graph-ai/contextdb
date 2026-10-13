@@ -1300,6 +1300,14 @@ impl MaintenanceContext {
             "Raise MEMORY_LIMIT before cleaning this maintained route.",
         )?;
         let truncated = match self.publish_direct_metadata(|| {
+            // Each covered record the cleanup decodes is admitted in its
+            // writer workspace and dropped before the next is read; its
+            // decode is charged to this writer for that one record, not
+            // kept by a private reader at the shipped default.
+            let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            )?;
+            let _decode = decode.enter();
             persistence.truncate_vector_partition_journal_through_catalog_with_checkpoint(
                 &published_catalog,
                 &mut workspace,
