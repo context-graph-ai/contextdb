@@ -11,6 +11,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn try_unit(db: &Database, unit: usize) -> contextdb_core::Result<()> {
+    let tx = stage_unit(db, unit)?;
+    db.commit(tx)
+}
+/// Rows and registration staged in one transaction, not yet committed.
+fn stage_unit(db: &Database, unit: usize) -> contextdb_core::Result<contextdb_core::TxId> {
     let tx = db.begin()?;
     db.insert_row(
         tx,
@@ -28,7 +33,7 @@ fn try_unit(db: &Database, unit: usize) -> contextdb_core::Result<()> {
             members: Vec::new(),
         },
     )?;
-    db.commit(tx)
+    Ok(tx)
 }
 fn roots(db: &Database) -> u64 {
     db.__custody_durable_key_count_for_test("delivery_root.v1.")
@@ -50,8 +55,9 @@ async fn custody_commit_validation_admits_before_it_allocates() {
     // A one-byte budget (zero means unlimited) refuses at the first
     // admission: nothing was decoded.
     Database::__limit_custody_validation_for_test(Some(1));
+    let staged = stage_unit(&edge, 1).unwrap();
     let decoded_before = edge.__custody_writer_work_for_test().1;
-    let refused = try_unit(&edge, 1);
+    let refused = edge.commit(staged);
     assert!(
         matches!(refused, Err(Error::MemoryBudgetExceeded { .. })),
         "{refused:?}"
