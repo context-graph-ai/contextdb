@@ -1929,8 +1929,8 @@ mod exact_sequence_tests {
     fn a_per_call_reader_holds_one_decode_at_a_time_and_returns_it_on_drop() {
         let values: Vec<f32> = (0..1536).map(|lane| lane as f32).collect();
         let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1 << 20);
-        let owner =
-            ImageMemory::charging_reader_per_call(accountant(1 << 20), declared.child().unwrap());
+        let reader = declared.child().unwrap();
+        let owner = ImageMemory::charging_reader_per_call(accountant(1 << 20), reader.clone());
         let before = declared.retained_bytes_for_test();
         {
             let _scope = owner.enter();
@@ -1953,6 +1953,8 @@ mod exact_sequence_tests {
             before,
             "the last call's charge returns when the request owner drops"
         );
+        drop(reader);
+        assert_eq!(declared.retained_bytes_for_test(), 0);
     }
 
     fn length_prefix_u32(length: u32) -> Vec<u8> {
