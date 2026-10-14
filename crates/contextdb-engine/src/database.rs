@@ -11657,6 +11657,8 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub captured_root_charge: usize,
     pub commit_source_reference_charge: usize,
     pub storage_maintenance_control_charge: usize,
+    /// Writer charge for the resident windows of durable sink queues.
+    pub sink_window_charge: usize,
     /// Process open-residue capacity; observed here, outside named writer liabilities.
     pub snapshot_pin_capacity_charge: usize,
 }
@@ -12690,7 +12692,9 @@ struct AuthoritativePurgeSinkEntryKey {
     sink: String,
     queue_id: u64,
     row_id: RowId,
-    durable_bytes: Option<Vec<u8>>,
+    /// BLAKE3 digest of the durable value the selection saw; the atomic
+    /// removal checks the stored value still has it.
+    durable_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -12880,6 +12884,9 @@ struct AuthoritativePurgePreparedSet {
     disk_source_provenance: Vec<(String, RowId, Lsn, u8)>,
     lineage_config_owners: Vec<AuthoritativePurgeLineageConfigOwners>,
     durable_sink_entries: Vec<AuthoritativePurgeSinkEntryKey>,
+    /// Writer charge for the selected sink entries and their durable
+    /// projection, held until the purge is done with them.
+    _sink_projection_charge: Option<Arc<crate::read_image_memory::ImageMemory>>,
     graph_arrival_config_keys: Vec<String>,
     publication_replacements: AuthoritativePurgePublicationReplacements,
     survivor_report: OwnedQueryResult,
@@ -13215,6 +13222,13 @@ pub struct SinkMetrics {
     /// rejected, not merely not-yet-processed. Tests read it to make
     /// "denied events are never delivered" a state assertion instead of a sleep.
     pub examined: u64,
+    /// Times a window of this sink's durable queue could not be held within
+    /// the writer memory limit (at open or when the dispatcher read the next
+    /// window). Those events stay queued in the store.
+    pub window_refusals: u64,
+    /// The latest window read was refused and no window has been held since:
+    /// delivery is stalled until the writer budget admits the next window.
+    pub window_refused: bool,
 }
 
 /// One declared `CREATE EVENT TYPE`, for `.events status`-style operator
@@ -59621,15 +59635,21 @@ impl Database {
         // already freezes queue mutation and remains in `event_bus` through
         // the matching durable purge commit/direct swap.
         let durable_sink_names = self.authoritative_purge_durable_sink_names()?;
-        let event_bus = self
+        let mut event_bus = self
             .event_bus
             .prepare_authoritative_purge_queue_replacement(
                 queue_mutation_token,
                 durable_sink_names,
                 &selected_by_table,
-            );
+            )?;
         let sink_names = event_bus.authoritative_purge_sink_names().clone();
         let mut durable_sink_entries = Vec::new();
+        let sink_projection_charge = match &self.persistence {
+            Some(_) => Some(crate::read_image_memory::ImageMemory::operation_writer(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            )?),
+            None => None,
+        };
         let mut survivor_report = OwnedQueryResult::empty();
         if report_shape == PurgeReportShape::PerTable {
             survivor_report.columns =
@@ -59648,6 +59668,7 @@ impl Database {
                 table,
                 ids,
                 &sink_names,
+                sink_projection_charge.as_ref(),
             )?);
             let before = &selected_table_rows[table];
             let after = if self.relational_store.uses_disk_backed_committed_bodies() {
@@ -59940,7 +59961,12 @@ impl Database {
             change_log_lsn_refcounts: replacement_change_log_lsn_refcounts,
             graph,
             vector,
-            event_bus,
+            event_bus: {
+                for entry in &durable_sink_entries {
+                    event_bus.record_durable_sink_removal(&entry.sink);
+                }
+                event_bus
+            },
             accepted_author_memory_mirror,
             graph_arrival_memory_mirror,
             memory_swap,
@@ -59955,6 +59981,7 @@ impl Database {
             disk_source_provenance,
             lineage_config_owners,
             durable_sink_entries,
+            _sink_projection_charge: sink_projection_charge,
             graph_arrival_config_keys,
             publication_replacements,
             survivor_report,
@@ -60581,9 +60608,8 @@ impl Database {
                         .iter()
                         .map(|entry| {
                             entry
-                                .durable_bytes
-                                .clone()
-                                .map(|bytes| (entry.sink.clone(), entry.queue_id, bytes))
+                                .durable_digest
+                                .map(|digest| (entry.sink.clone(), entry.queue_id, digest))
                                 .ok_or_else(|| {
                                     Error::SyncError(
                                 "authoritative purge durable sink selection lost its raw witness"
@@ -60929,25 +60955,48 @@ impl Database {
         table: &str,
         selected_row_ids: &HashSet<RowId>,
         sink_names: &BTreeSet<String>,
+        projection: Option<&Arc<crate::read_image_memory::ImageMemory>>,
     ) -> Result<Vec<AuthoritativePurgeSinkEntryKey>> {
-        let Some(persistence) = &self.persistence else {
+        let (Some(persistence), Some(projection)) = (&self.persistence, projection) else {
             return Ok(Vec::new());
         };
         let mut entries = Vec::new();
         for sink in sink_names {
-            for (queue_id, durable_bytes) in persistence.dump_sink_queue_raw(sink)? {
-                let entry = RedbPersistence::decode_config_value::<event_bus::SinkQueueEntry>(
-                    &durable_bytes,
+            // Stream the queue: each entry is decoded under its own writer
+            // owner and destroyed, with its credit returned, before the next;
+            // only the selected ones are kept, each as its id and a digest of
+            // its durable value, admitted before it is kept. The admission
+            // covers this list and the durable projection built from it.
+            persistence.visit_sink_queue(sink, |queue_id, durable_bytes| {
+                let entry_owner = crate::read_image_memory::ImageMemory::operation_writer(
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
                 )?;
-                if entry.event.table == table && selected_row_ids.contains(&entry.row_id) {
+                let selected = {
+                    let _decode_scope = entry_owner.enter();
+                    let entry = RedbPersistence::decode_config_value::<event_bus::SinkQueueEntry>(
+                        durable_bytes,
+                    )?;
+                    (entry.event.table == table && selected_row_ids.contains(&entry.row_id))
+                        .then_some(entry.row_id)
+                };
+                drop(entry_owner);
+                if let Some(row_id) = selected {
+                    let keep = std::mem::size_of::<AuthoritativePurgeSinkEntryKey>()
+                        .saturating_add(std::mem::size_of::<(String, u64, [u8; 32])>())
+                        .saturating_add(sink.len())
+                        .saturating_mul(2);
+                    projection.reserve(keep)?;
                     entries.push(AuthoritativePurgeSinkEntryKey {
                         sink: sink.clone(),
                         queue_id,
-                        row_id: entry.row_id,
-                        durable_bytes: Some(durable_bytes),
+                        row_id,
+                        durable_digest: Some(*blake3::hash(durable_bytes).as_bytes()),
                     });
                 }
-            }
+                Ok(())
+            })?;
         }
         Ok(entries)
     }
@@ -68463,6 +68512,7 @@ impl Database {
                     persistence.writer_snapshot_charge_for_test()
                 })
                 .saturating_sub(receipt.published_root_charge);
+            receipt.sink_window_charge = self.event_bus.sink_window_charge();
             receipt.storage_maintenance_control_charge =
                 self.persistence.as_ref().map_or(0, |persistence| {
                     persistence.storage_compaction_control_charge()
@@ -68495,7 +68545,8 @@ impl Database {
                 + receipt.commit_index_charge
                 + receipt.persistence_cache
                 + receipt.current_membership_charge
-                + receipt.captured_membership_charge;
+                + receipt.captured_membership_charge
+                + receipt.sink_window_charge;
             receipt.reconciliation_gap =
                 receipt.vector.accountant_total as i64 - receipt.named_owner_total as i64;
             observe(receipt)
@@ -101685,7 +101736,7 @@ impl Database {
                         sink: frame.copy_text(sink)?,
                         queue_id: id,
                         row_id: entry.value.row_id,
-                        durable_bytes: Some(frame.copy_bytes(bytes)?),
+                        durable_digest: Some(*blake3::hash(bytes).as_bytes()),
                     });
                 }
                 Ok(())

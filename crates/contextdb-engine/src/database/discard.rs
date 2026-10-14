@@ -363,7 +363,7 @@ impl Database {
                     Ok((
                         e.sink,
                         e.queue_id,
-                        e.durable_bytes
+                        e.durable_digest
                             .ok_or_else(crate::custody::canonical::invalid)?,
                     ))
                 })
@@ -918,7 +918,7 @@ impl Database {
                             Ok((
                                 e.sink,
                                 e.queue_id,
-                                e.durable_bytes
+                                e.durable_digest
                                     .ok_or_else(crate::custody::canonical::invalid)?,
                             ))
                         })

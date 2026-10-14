@@ -9,6 +9,13 @@ pub(crate) const UNCERTAIN_COUNT_CONFIG_PREFIX: &str = "__event_bus_uncertain_co
 pub(crate) const UNCONFIRMED_COUNT_CONFIG_PREFIX: &str = "__event_bus_unconfirmed_count.";
 pub(crate) const MAX_SINK_QUEUE_DEPTH: usize = 100_000;
 const SINK_DISPATCH_BATCH: usize = 1024;
+/// A durable sink queue keeps at most this many entries resident, and at most
+/// `SINK_WINDOW_BYTES` of them by encoded width (one wider entry is resident
+/// alone). The rest stays in the store and is read in windows as dispatch
+/// reaches it, so opening a store and running its dispatcher hold the same
+/// memory however long the queue is.
+const SINK_WINDOW_ENTRIES: usize = SINK_DISPATCH_BATCH;
+const SINK_WINDOW_BYTES: usize = 1024 * 1024;
 // A durable marker written before calling an external sink. A pending marked
 // entry has an unconfirmed effect even if the process died before the handler
 // returned or its outcome could be recorded.
@@ -20,7 +27,17 @@ type SinkCallback = Arc<dyn Fn(&SinkEvent) -> std::result::Result<(), SinkError>
 pub(crate) struct EventBusState {
     pub(super) definitions: Mutex<EventBusDefinitions>,
     callbacks: RwLock<HashMap<String, SinkRegistration>>,
-    queues: Mutex<HashMap<String, VecDeque<SinkQueueEntry>>>,
+    queues: Mutex<HashMap<String, SinkQueue>>,
+    /// The writer accountant every bounded window's owner charges. Installed
+    /// when a durable store's queues are loaded; an in-memory database leaves
+    /// it unset and keeps every queue resident, as before.
+    window_accountant: Mutex<Option<crate::memory_accounting::AccountantHandle>>,
+    /// Identifies each prepared refill so an install can tell it is still
+    /// the one its queue is waiting for.
+    next_refill_token: AtomicU64,
+    /// Set when a durable store's queues are loaded: every queue this writer
+    /// creates from then on is a bounded window.
+    durable_windows: AtomicBool,
     /// Entries a committed read image counted but left in the store. Always
     /// empty on a writable handle, which loads its queues.
     unloaded_queue_depths: Mutex<HashMap<String, u64>>,
@@ -98,6 +115,215 @@ pub(crate) struct SinkQueueEntry {
     pub(crate) row_id: RowId,
     pub(crate) attempts: u32,
     gate: EventGateSnapshot,
+}
+
+/// One sink's queue as this writer holds it. An unbounded queue (in-memory
+/// database, or a committed image) keeps every entry resident. A bounded
+/// queue keeps a window of its durable table: `entries` holds ids in
+/// ascending order, all at or below `resident_through`, decoded under the
+/// window's own writer-funded owner, which holds each entry's actual decoded
+/// heap (`credits`, aligned with `entries`) until the entry leaves the
+/// window. Committed appends to a bounded queue stay in the store until a
+/// window read reaches them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SinkQueue {
+    entries: VecDeque<SinkQueueEntry>,
+    /// Decoded bytes each resident entry holds on `owner`.
+    credits: VecDeque<usize>,
+    owner: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    /// Durable entries; equals `entries.len()` while everything is resident.
+    depth: u64,
+    bounded: bool,
+    /// The highest id the current sweep has read.
+    resident_through: u64,
+    /// The fixed upper id of the current sweep, captured when it started.
+    sweep_upper: u64,
+    /// Bumped by every published removal; a prepared refill installs only if
+    /// no removal was published since it was planned.
+    removal_generation: u64,
+    /// The refill this queue is waiting for, if one is prepared.
+    pending_refill: Option<u64>,
+}
+
+/// One bounded window read: entries in ascending id order with the decoded
+/// bytes each holds on `owner`.
+pub(crate) struct SinkWindow {
+    pub(crate) entries: VecDeque<SinkQueueEntry>,
+    pub(crate) credits: VecDeque<usize>,
+    /// `None` for an empty window, which holds nothing.
+    pub(crate) owner: Option<Arc<crate::read_image_memory::ImageMemory>>,
+}
+
+impl SinkQueue {
+    fn unbounded(entries: VecDeque<SinkQueueEntry>) -> Self {
+        Self {
+            entries,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn depth(&self) -> u64 {
+        if self.bounded {
+            self.depth
+        } else {
+            self.entries.len() as u64
+        }
+    }
+
+    pub(crate) fn resident(&self) -> &VecDeque<SinkQueueEntry> {
+        &self.entries
+    }
+
+    /// Decoded bytes the resident window holds.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.credits.iter().sum()
+    }
+
+    fn all_resident(&self) -> bool {
+        !self.bounded || self.depth == self.entries.len() as u64
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
+
+    /// Publish one committed append. A bounded queue counts it and leaves it
+    /// in the store, where the next window read reaches it in id order: an
+    /// entry is resident only as a window read decoded and funded it.
+    fn publish_append(&mut self, entry: SinkQueueEntry) {
+        if self.bounded {
+            self.depth = self.depth.saturating_add(1);
+        } else {
+            self.entries.push_back(entry);
+        }
+    }
+
+    /// Plan the next window read of a bounded queue with nothing visible
+    /// resident: continue the current sweep up to its fixed upper id, or,
+    /// once the sweep is exhausted, start a new sweep from the lowest id.
+    fn plan_refill(&mut self, token: u64) -> SinkRefillPlan {
+        self.pending_refill = Some(token);
+        let wrap = self.resident_through >= self.sweep_upper;
+        SinkRefillPlan {
+            token,
+            generation: self.removal_generation,
+            after: (!wrap).then_some(self.resident_through),
+            upper: (!wrap).then_some(self.sweep_upper),
+        }
+    }
+
+    /// Install a window read for `plan`; the read's owner already holds its
+    /// entries' decoded heap, and the predecessor's owner is released when it
+    /// is replaced, so both were funded while both existed. Refused (`false`,
+    /// nothing changed) when another plan replaced this one or any removal
+    /// was published since it was planned, whatever range it read, a wrap
+    /// included.
+    fn install_refill(
+        &mut self,
+        plan: &SinkRefillPlan,
+        window: SinkWindow,
+        newest_id: u64,
+        exhausted: bool,
+    ) -> bool {
+        if self.pending_refill != Some(plan.token) {
+            return false;
+        }
+        self.pending_refill = None;
+        if self.removal_generation != plan.generation {
+            return false;
+        }
+        let sweep_upper = plan.upper.unwrap_or(newest_id);
+        self.sweep_upper = sweep_upper;
+        self.resident_through = if exhausted {
+            sweep_upper
+        } else {
+            window.entries.back().map_or(sweep_upper, |entry| entry.id)
+        };
+        self.entries = window.entries;
+        self.credits = window.credits;
+        self.owner = window.owner;
+        true
+    }
+
+    /// Remove these ids from the resident window without returning their
+    /// credit: the caller returns it (`publish_removals`) or defers it to a
+    /// publication. Returns the removed entries' credit.
+    fn filter_removed(&mut self, ids: &HashSet<u64>) -> usize {
+        self.removal_generation = self.removal_generation.wrapping_add(1);
+        let mut write = 0;
+        let mut released = 0usize;
+        for read in 0..self.entries.len() {
+            if ids.contains(&self.entries[read].id) {
+                if self.bounded {
+                    released = released.saturating_add(self.credits[read]);
+                }
+            } else {
+                self.entries.swap(write, read);
+                if self.bounded {
+                    self.credits.swap(write, read);
+                }
+                write += 1;
+            }
+        }
+        self.entries.truncate(write);
+        if self.bounded {
+            self.credits.truncate(write);
+        }
+        released
+    }
+
+    /// Publish committed removals of these ids, returning each removed
+    /// resident entry's decoded credit to the window owner.
+    fn publish_removals(&mut self, ids: &HashSet<u64>, durable_removed: u64) {
+        // Compacted in place (the window's buffers are already funded); the
+        // removed entries are destroyed before their credit is returned.
+        let released = self.filter_removed(ids);
+        if self.bounded {
+            if let Some(owner) = &self.owner {
+                owner.release(released);
+            }
+            self.depth = self.depth.saturating_sub(durable_removed);
+        }
+    }
+}
+
+/// Give `entry` its rewritten attempt count for `persist` and keep it only if
+/// `persist` succeeds; the entry is borrowed, never copied.
+fn with_rewritten_attempts<T>(
+    entry: &mut SinkQueueEntry,
+    attempts: u32,
+    persist: impl FnOnce(&SinkQueueEntry) -> Result<T>,
+) -> Result<T> {
+    let previous = std::mem::replace(&mut entry.attempts, attempts);
+    let result = persist(entry);
+    if result.is_err() {
+        entry.attempts = previous;
+    }
+    result
+}
+
+/// A charge reserved on a window owner for copies that live beside the
+/// window (a dispatcher checkout, a purge replacement), returned when they
+/// are gone.
+pub(crate) struct SinkWindowCopyCharge {
+    owner: Arc<crate::read_image_memory::ImageMemory>,
+    bytes: usize,
+}
+
+impl SinkWindowCopyCharge {
+    fn reserve(owner: &Arc<crate::read_image_memory::ImageMemory>, bytes: usize) -> Result<Self> {
+        owner.reserve(bytes)?;
+        Ok(Self {
+            owner: owner.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for SinkWindowCopyCharge {
+    fn drop(&mut self) {
+        self.owner.release(self.bytes);
+    }
 }
 
 impl Serialize for SinkQueueEntry {
@@ -430,23 +656,72 @@ impl EventBusState {
         queue_mutation_token: AuthoritativePurgeQueueMutationToken,
         durable_sink_names: BTreeSet<String>,
         selections: &BTreeMap<String, HashSet<RowId>>,
-    ) -> PreparedAuthoritativePurgeEventBusPublication {
+    ) -> Result<PreparedAuthoritativePurgeEventBusPublication> {
         let mut sink_names = durable_sink_names;
         sink_names.extend(self.queues.lock().keys().cloned());
-        let mut queues = self.queues.lock().clone();
-        for sink in &sink_names {
-            let entries = queues.entry(sink.clone()).or_default();
-            entries.retain(|entry| {
-                !selections
-                    .get(&entry.event.table)
-                    .is_some_and(|ids| ids.contains(&entry.row_id))
-            });
+        // A bounded queue's replacement filters only its resident window;
+        // the durable removal count of each sink is recorded once the purge
+        // has selected its durable entries, and applied to depth at the swap.
+        // The replacement copies every resident window: fund the copies on
+        // each window's owner before making them, until the swap destroys the
+        // originals.
+        // The copy includes each window's buffers, funded at their capacity.
+        let current = self.queues.lock();
+        let mut overlap = Vec::new();
+        for queue in current.values() {
+            if let Some(owner) = &queue.owner {
+                let buffers = queue
+                    .entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SinkQueueEntry>())
+                    .saturating_add(
+                        queue
+                            .credits
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<usize>()),
+                    );
+                overlap.push(SinkWindowCopyCharge::reserve(
+                    owner,
+                    queue.resident_bytes().saturating_add(buffers),
+                )?);
+            }
         }
-        PreparedAuthoritativePurgeEventBusPublication {
+        let mut queues = current.clone();
+        drop(current);
+        // Filtering the copy returns nothing to the shared window owner yet:
+        // the originals still hold those bytes. The removed entries' credit
+        // is returned only by a successful publication, so a preparation that
+        // is dropped leaves every owner exactly as it was.
+        let mut deferred_releases = Vec::new();
+        for sink in &sink_names {
+            let queue = queues
+                .entry(sink.clone())
+                .or_insert_with(|| self.fresh_queue());
+            let removed = queue
+                .entries
+                .iter()
+                .filter(|entry| {
+                    selections
+                        .get(&entry.event.table)
+                        .is_some_and(|ids| ids.contains(&entry.row_id))
+                })
+                .map(|entry| entry.id)
+                .collect::<HashSet<_>>();
+            if !removed.is_empty() {
+                let released = queue.filter_removed(&removed);
+                if let Some(owner) = &queue.owner {
+                    deferred_releases.push((owner.clone(), released));
+                }
+            }
+        }
+        Ok(PreparedAuthoritativePurgeEventBusPublication {
             queues,
             sink_names,
+            durable_removed: BTreeMap::new(),
+            deferred_releases,
+            _overlap: overlap,
             _queue_mutation_token: queue_mutation_token,
-        }
+        })
     }
 
     /// The later commit kernel may call only this direct swap after its
@@ -458,7 +733,27 @@ impl EventBusState {
         // `publication` owns the paused-checkout token acquired during preparation.
         // This direct swap therefore cannot discard an enqueue or an in-flight
         // worker acknowledgement that arrived after the snapshot.
-        *self.queues.lock() = publication.queues;
+        let mut replacement = publication.queues;
+        for (sink, removed) in &publication.durable_removed {
+            if let Some(queue) = replacement.get_mut(sink)
+                && queue.bounded
+            {
+                queue.depth = queue.depth.saturating_sub(*removed);
+                // A prepared refill may have read a purged entry.
+                queue.removal_generation = queue.removal_generation.wrapping_add(1);
+            }
+        }
+        let mut queues = self.queues.lock();
+        let originals = std::mem::replace(&mut *queues, replacement);
+        drop(queues);
+        // The originals are destroyed before the purged entries' credit and
+        // the copies' overlap charge are returned.
+        drop(originals);
+        for (owner, released) in publication.deferred_releases {
+            owner.release(released);
+        }
+        drop(publication.durable_removed);
+        drop(publication._overlap);
         self.waiters.notify_all();
     }
 
@@ -471,7 +766,7 @@ impl EventBusState {
             .lock()
             .get(sink)
             .into_iter()
-            .flatten()
+            .flat_map(|queue| queue.entries.iter())
             .map(|entry| (entry.row_id, entry.event.row_values.clone()))
             .collect()
     }
@@ -481,14 +776,26 @@ impl EventBusState {
 /// VecDeque private prevents a later kernel from rebuilding entries after
 /// durability and accidentally losing retry or gate state.
 pub(crate) struct PreparedAuthoritativePurgeEventBusPublication {
-    queues: HashMap<String, VecDeque<SinkQueueEntry>>,
+    queues: HashMap<String, SinkQueue>,
     sink_names: BTreeSet<String>,
+    /// Durable entries the purge removes from each sink, resident or not.
+    durable_removed: BTreeMap<String, u64>,
+    /// Credit of the purged resident entries, returned to their window owner
+    /// only when this replacement is published.
+    deferred_releases: Vec<(Arc<crate::read_image_memory::ImageMemory>, usize)>,
+    /// Funding for the copied windows while the originals still live.
+    _overlap: Vec<SinkWindowCopyCharge>,
     _queue_mutation_token: AuthoritativePurgeQueueMutationToken,
 }
 
 impl PreparedAuthoritativePurgeEventBusPublication {
     pub(crate) fn authoritative_purge_sink_names(&self) -> &BTreeSet<String> {
         &self.sink_names
+    }
+
+    /// Count one durable entry the purge's commit removes from `sink`.
+    pub(crate) fn record_durable_sink_removal(&mut self, sink: &str) {
+        *self.durable_removed.entry(sink.to_owned()).or_default() += 1;
     }
 }
 
@@ -543,6 +850,11 @@ struct SinkMetricsState {
     /// (delivered, permanently failed, or denied-and-rotated alike). Always-on,
     /// carried on this existing per-sink metrics mutex; see `SinkMetrics::examined`.
     examined: u64,
+    window_refusals: u64,
+    window_refused: bool,
+    /// Window reads the dispatcher made, and idle pauses it took before one.
+    window_reads: u64,
+    window_idle_pauses: u64,
 }
 
 #[derive(Debug)]
@@ -708,6 +1020,9 @@ impl EventBusState {
             definitions: Mutex::new(EventBusDefinitions::default()),
             callbacks: RwLock::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
+            window_accountant: Mutex::new(None),
+            next_refill_token: AtomicU64::new(1),
+            durable_windows: AtomicBool::new(false),
             unloaded_queue_depths: Mutex::new(HashMap::new()),
             queue_mutation_state: Arc::new(Mutex::new(QueueMutationState::default())),
             queue_mutation_waiters: Arc::new(Condvar::new()),
@@ -722,6 +1037,40 @@ impl EventBusState {
             next_queue_id: AtomicU64::new(1),
             #[cfg(any(test, feature = "test-seams"))]
             queue_capacity_for_test: std::sync::atomic::AtomicUsize::new(MAX_SINK_QUEUE_DEPTH),
+        }
+    }
+
+    /// Bytes the resident sink windows hold on the writer accountant.
+    pub(crate) fn sink_window_charge(&self) -> usize {
+        self.queues
+            .lock()
+            .values()
+            .filter_map(|queue| queue.owner.as_ref())
+            .map(|owner| owner.held())
+            .sum()
+    }
+
+    /// A bounded window the writer budget could not hold: counted on the
+    /// sink, which stays stalled until a later window read succeeds.
+    fn record_window_refusal(&self, sink: &str, error: &Error) {
+        tracing::warn!(sink, %error, "a sink window does not fit the writer memory limit");
+        let mut metrics = self.metrics.lock();
+        let state = metrics.entry(sink.to_owned()).or_default();
+        state.window_refusals = state.window_refusals.saturating_add(1);
+        state.window_refused = true;
+    }
+
+    fn clear_window_refusal(&self, sink: &str) {
+        if let Some(state) = self.metrics.lock().get_mut(sink) {
+            state.window_refused = false;
+        }
+    }
+
+    /// An empty queue of the kind this writer keeps.
+    fn fresh_queue(&self) -> SinkQueue {
+        SinkQueue {
+            bounded: self.durable_windows.load(Ordering::SeqCst),
+            ..SinkQueue::default()
         }
     }
 
@@ -745,7 +1094,9 @@ impl EventBusState {
             *count += 1;
             if queues
                 .get(sink)
-                .map_or(0, VecDeque::len)
+                .map_or(0, |queue| {
+                    usize::try_from(queue.depth()).unwrap_or(usize::MAX)
+                })
                 .saturating_add(*count)
                 > capacity
             {
@@ -928,15 +1279,19 @@ impl Database {
         let mut queues = self.event_bus.queues.lock();
         queues.retain(|sink, _| sink_names.contains(sink));
         for sink in &sink_names {
-            queues.entry(sink.clone()).or_default();
+            queues
+                .entry(sink.clone())
+                .or_insert_with(|| self.event_bus.fresh_queue());
         }
         for (sink, entry) in received_events {
-            let queue = queues.entry(sink).or_default();
+            let queue = queues
+                .entry(sink)
+                .or_insert_with(|| self.event_bus.fresh_queue());
             assert!(
-                queue.len() < MAX_SINK_QUEUE_DEPTH,
+                queue.depth() < MAX_SINK_QUEUE_DEPTH as u64,
                 "committed sink queue capacity"
             );
-            queue.push_back(entry);
+            queue.publish_append(entry);
         }
         drop(queues);
         self.event_bus.waiters.notify_all();
@@ -982,6 +1337,14 @@ impl Database {
         queues.clear();
         let mut unloaded = self.event_bus.unloaded_queue_depths.lock();
         unloaded.clear();
+        let durable_windows = matches!(source, StartupState::Durable(_));
+        self.event_bus
+            .durable_windows
+            .store(durable_windows, Ordering::SeqCst);
+        let window_accountant = durable_windows.then(|| {
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant)
+        });
+        *self.event_bus.window_accountant.lock() = window_accountant.clone();
         let mut max_id = source
             .config_value::<u64>(NEXT_ACTION_ID_CONFIG_KEY)?
             .unwrap_or(1)
@@ -1001,7 +1364,51 @@ impl Database {
             if let Some(extent) = source.unloaded_sink_queue(&sink) {
                 max_id = max_id.max(extent.newest_id);
                 unloaded.insert(sink.clone(), extent.depth);
-                queues.insert(sink, VecDeque::new());
+                queues.insert(sink, SinkQueue::default());
+                continue;
+            }
+            if let StartupState::Durable(persistence) = &source {
+                // Read one bounded window of the durable queue; the rest is
+                // read as dispatch reaches it. A window the writer budget
+                // cannot hold is left in the store and the refusal is recorded
+                // on the sink; opening does not fail for it.
+                let read = persistence.load_sink_queue_window::<SinkQueueEntry>(
+                    &sink,
+                    None,
+                    None,
+                    SINK_WINDOW_ENTRIES,
+                    SINK_WINDOW_BYTES,
+                    crate::memory_accounting::AccountantHandle::clone(
+                        window_accountant
+                            .as_ref()
+                            .expect("a durable store has a window accountant"),
+                    ),
+                )?;
+                max_id = max_id.max(read.newest_id);
+                let mut queue = SinkQueue {
+                    depth: read.depth,
+                    bounded: true,
+                    sweep_upper: read.newest_id,
+                    ..SinkQueue::default()
+                };
+                if let Some(error) = &read.refusal {
+                    self.event_bus.record_window_refusal(&sink, error);
+                }
+                if let Some(owner) = read.owner {
+                    let mut entries = VecDeque::from(read.entries);
+                    for entry in &mut entries {
+                        entry.event.action_id = entry.id;
+                    }
+                    queue.resident_through = if read.exhausted {
+                        read.newest_id
+                    } else {
+                        entries.back().map_or(0, |entry| entry.id)
+                    };
+                    queue.entries = entries;
+                    queue.credits = VecDeque::from(read.credits);
+                    queue.owner = Some(owner);
+                }
+                queues.insert(sink, queue);
                 continue;
             }
             let mut queue = source.sink_queue::<SinkQueueEntry>(&sink)?;
@@ -1009,7 +1416,7 @@ impl Database {
                 entry.event.action_id = entry.id;
             }
             max_id = max_id.max(queue.iter().map(|entry| entry.id).max().unwrap_or(0));
-            queues.insert(sink, queue.into());
+            queues.insert(sink, SinkQueue::unbounded(queue.into()));
         }
         drop(unloaded);
         self.event_bus
@@ -1556,7 +1963,7 @@ impl Database {
             .queues
             .lock()
             .get(sink)
-            .map(|queue| queue.len() as u64)
+            .map(SinkQueue::depth)
             .unwrap_or(0)
             .saturating_add(
                 self.event_bus
@@ -1580,6 +1987,8 @@ impl Database {
             uncertain: metrics.uncertain.saturating_add(metrics.unconfirmed),
             permanent_failures: metrics.permanent_failures,
             examined: metrics.examined,
+            window_refusals: metrics.window_refusals,
+            window_refused: metrics.window_refused,
         }
     }
 
@@ -1593,12 +2002,54 @@ impl Database {
     #[doc(hidden)]
     pub fn pending_sink_action_ids_for_test(&self, sink: &str) -> Vec<u64> {
         let _operation = self.assert_open_operation();
+        let queues = self.event_bus.queues.lock();
+        let Some(queue) = queues.get(sink) else {
+            return Vec::new();
+        };
+        if !queue.all_resident()
+            && let Some(persistence) = self.persistence.as_ref()
+        {
+            // Part of a bounded queue is only in the store: list it from there.
+            drop(queues);
+            let mut ids = Vec::new();
+            persistence
+                .visit_sink_queue(sink, |id, _| {
+                    ids.push(id);
+                    Ok(())
+                })
+                .expect("pending sink ids are readable");
+            return ids;
+        }
+        queue.entries.iter().map(|entry| entry.id).collect()
+    }
+
+    /// Window reads the dispatcher made for one sink and the idle pauses it
+    /// took before them, for pacing tests.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn sink_window_pacing_for_test(&self, sink: &str) -> (u64, u64) {
+        let _operation = self.assert_open_operation();
+        self.event_bus
+            .metrics
+            .lock()
+            .get(sink)
+            .map_or((0, 0), |state| {
+                (state.window_reads, state.window_idle_pauses)
+            })
+    }
+
+    /// Resident and durable depth of one sink's queue, for window tests.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn sink_queue_residency_for_test(&self, sink: &str) -> (usize, usize, u64) {
+        let _operation = self.assert_open_operation();
         self.event_bus
             .queues
             .lock()
             .get(sink)
-            .map(|queue| queue.iter().map(|entry| entry.id).collect())
-            .unwrap_or_default()
+            .map_or((0, 0, 0), |queue| {
+                (queue.entries.len(), queue.resident_bytes(), queue.depth())
+            })
     }
 
     /// Bound a test queue without constructing the production maximum of 100,000 actions.
@@ -1666,6 +2117,7 @@ impl Database {
             .get(sink)
             .map(|queue| {
                 queue
+                    .entries
                     .iter()
                     .map(|entry| (entry.id, entry.event.clone()))
                     .collect()
@@ -2145,12 +2597,14 @@ impl Database {
         }
         let mut queues = self.event_bus.queues.lock();
         for (sink, entry) in events {
-            let queue = queues.entry(sink).or_default();
+            let queue = queues
+                .entry(sink)
+                .or_insert_with(|| self.event_bus.fresh_queue());
             assert!(
-                queue.len() < MAX_SINK_QUEUE_DEPTH,
+                queue.depth() < MAX_SINK_QUEUE_DEPTH as u64,
                 "committed sink queue capacity"
             );
-            queue.push_back(entry);
+            queue.publish_append(entry);
         }
         drop(queues);
         self.event_bus.waiters.notify_all();
@@ -2371,7 +2825,9 @@ impl Database {
         *self.event_bus.definitions.lock() = definitions;
         let mut queues = self.event_bus.queues.lock();
         for sink in sink_names {
-            queues.entry(sink).or_default();
+            queues
+                .entry(sink)
+                .or_insert_with(|| self.event_bus.fresh_queue());
         }
     }
 
@@ -2523,6 +2979,17 @@ impl Database {
     }
 }
 
+/// One planned read of a bounded queue's next window.
+struct SinkRefillPlan {
+    token: u64,
+    generation: u64,
+    /// Read ids after this one; `None` starts a new sweep at the lowest id.
+    after: Option<u64>,
+    /// The sweep's fixed upper id; `None` for a new sweep, which takes the
+    /// newest id at the time of the read.
+    upper: Option<u64>,
+}
+
 struct EventBusWorker {
     sink: String,
     event_bus: Arc<EventBusState>,
@@ -2532,6 +2999,10 @@ struct EventBusWorker {
 
 impl EventBusWorker {
     fn dispatch_loop(self, shutdown: Arc<AtomicBool>) {
+        // Whether the last drive installed a window. A window that then shows
+        // this registration nothing waits the idle pause before the next read,
+        // so a queue it cannot see is not re-read back to back.
+        let mut just_refilled = false;
         'dispatch: while !shutdown.load(Ordering::SeqCst) {
             let Some(registration) = self.event_bus.callbacks.read().get(&self.sink).cloned()
             else {
@@ -2542,6 +3013,8 @@ impl EventBusWorker {
             // a purge cannot pause between cloning an entry and recording it
             // as in-flight. The callback itself runs without the guard.
             let mut queue_mutation = self.event_bus.queue_checkout_guard();
+            let mut refill = None;
+            let mut checkout_charge = None;
             let entries = {
                 let mut queues = self.event_bus.queues.lock();
                 let Some(queue) = queues.get_mut(&self.sink) else {
@@ -2550,30 +3023,113 @@ impl EventBusWorker {
                     self.wait(&shutdown, Duration::from_millis(250));
                     continue;
                 };
-                let Some(front) = queue.front().cloned() else {
-                    drop(queues);
-                    drop(queue_mutation);
-                    self.wait(&shutdown, Duration::from_millis(250));
-                    continue;
-                };
-                if !event_visible_for_access(&registration.access, &front) {
-                    if let Some(entry) = queue.pop_front() {
-                        queue.push_back(entry);
+                if queue.bounded {
+                    // A bounded window: take the visible entries in id order,
+                    // passing over (and counting) the ones this registration
+                    // cannot see; they stay queued and the next sweep reaches
+                    // them again.
+                    let mut skipped = 0u64;
+                    let mut chosen = Vec::new();
+                    let mut chosen_bytes = 0usize;
+                    for (position, entry) in queue.entries.iter().enumerate() {
+                        if chosen.len() == SINK_DISPATCH_BATCH {
+                            break;
+                        }
+                        if event_visible_for_access(&registration.access, entry) {
+                            chosen.push(position);
+                            chosen_bytes = chosen_bytes.saturating_add(queue.credits[position]);
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    // The checkout copies are funded on the window owner
+                    // before they are made, and returned after the batch.
+                    let mut picked = Vec::new();
+                    if !chosen.is_empty()
+                        && let Some(owner) = &queue.owner
+                    {
+                        match SinkWindowCopyCharge::reserve(
+                            owner,
+                            chosen_bytes.saturating_add(
+                                chosen
+                                    .len()
+                                    .saturating_mul(std::mem::size_of::<SinkQueueEntry>()),
+                            ),
+                        ) {
+                            Ok(charge) => {
+                                self.event_bus.clear_window_refusal(&self.sink);
+                                checkout_charge = Some(charge);
+                                picked = chosen
+                                    .iter()
+                                    .map(|position| queue.entries[*position].clone())
+                                    .collect();
+                            }
+                            Err(error) => {
+                                drop(queues);
+                                drop(queue_mutation);
+                                self.event_bus.record_window_refusal(&self.sink, &error);
+                                self.wait(&shutdown, Duration::from_millis(250));
+                                continue;
+                            }
+                        }
+                    }
+                    if picked.is_empty()
+                        && !queue.all_resident()
+                        && queue.pending_refill.is_none()
+                        && !queue_mutation
+                            .checked_out
+                            .iter()
+                            .any(|(sink, _)| sink == &self.sink)
+                    {
+                        refill = Some(self.plan_refill(queue));
                     }
                     drop(queues);
-                    self.record_examined(1);
-                    self.event_bus.waiters.notify_all();
-                    drop(queue_mutation);
-                    self.wait(&shutdown, Duration::from_millis(10));
-                    continue;
+                    self.record_examined(skipped);
+                    picked
+                } else {
+                    let Some(front) = queue.entries.front().cloned() else {
+                        drop(queues);
+                        drop(queue_mutation);
+                        self.wait(&shutdown, Duration::from_millis(250));
+                        continue;
+                    };
+                    if !event_visible_for_access(&registration.access, &front) {
+                        if let Some(entry) = queue.entries.pop_front() {
+                            queue.entries.push_back(entry);
+                        }
+                        drop(queues);
+                        self.record_examined(1);
+                        self.event_bus.waiters.notify_all();
+                        drop(queue_mutation);
+                        self.wait(&shutdown, Duration::from_millis(10));
+                        continue;
+                    }
+                    queue
+                        .entries
+                        .iter()
+                        .take(SINK_DISPATCH_BATCH)
+                        .take_while(|entry| event_visible_for_access(&registration.access, entry))
+                        .cloned()
+                        .collect::<Vec<_>>()
                 }
-                queue
-                    .iter()
-                    .take(SINK_DISPATCH_BATCH)
-                    .take_while(|entry| event_visible_for_access(&registration.access, entry))
-                    .cloned()
-                    .collect::<Vec<_>>()
             };
+            if let Some(plan) = refill {
+                drop(queue_mutation);
+                if just_refilled {
+                    // The window the last read installed showed this
+                    // registration nothing: pause before reading the next.
+                    self.note_window_pacing(0, 1);
+                    self.wait(&shutdown, Duration::from_millis(250));
+                }
+                self.note_window_pacing(1, 0);
+                just_refilled = self.refill_window(plan);
+                if !just_refilled {
+                    self.wait(&shutdown, Duration::from_millis(250));
+                }
+                continue;
+            }
+            just_refilled = false;
+            let _checkout_charge = checkout_charge;
             for entry in &entries {
                 queue_mutation
                     .checked_out
@@ -2590,7 +3146,7 @@ impl EventBusWorker {
             let mut delivered_count = 0u64;
             let mut permanent_failure_count = 0u64;
             let mut examined_count = 0u64;
-            for (entry_position, entry) in entries.iter().cloned().enumerate() {
+            for (entry_position, entry) in entries.iter().enumerate() {
                 if shutdown.load(Ordering::SeqCst) {
                     for pending in entries.iter().skip(entry_position) {
                         self.event_bus
@@ -2632,13 +3188,20 @@ impl EventBusWorker {
                 examined_count = examined_count.saturating_add(1);
                 self.add_in_flight(1);
                 let callback = registration.callback.clone();
-                let mut event = entry.event.clone();
-                if event.action_id == 0 {
-                    event.action_id = entry.id;
-                }
+                // A window entry already carries its action id; only an
+                // unbounded queue's entry may need a copy that names it.
+                let named;
+                let event = if entry.event.action_id == 0 {
+                    let mut copy = entry.event.clone();
+                    copy.action_id = entry.id;
+                    named = copy;
+                    &named
+                } else {
+                    &entry.event
+                };
                 let result = {
                     let _callback = EventBusCallbackGuard::enter(&self.event_bus);
-                    catch_unwind(AssertUnwindSafe(|| callback(&event)))
+                    catch_unwind(AssertUnwindSafe(|| callback(event)))
                 };
                 self.add_in_flight(-1);
                 let result = match result {
@@ -2727,6 +3290,89 @@ impl EventBusWorker {
             );
         }
         self.finish_deferred_resource_cleanup();
+    }
+
+    fn plan_refill(&self, queue: &mut SinkQueue) -> SinkRefillPlan {
+        queue.plan_refill(
+            self.event_bus
+                .next_refill_token
+                .fetch_add(1, Ordering::SeqCst),
+        )
+    }
+
+    /// Read the planned window outside every lock, then install it under the
+    /// dispatcher lease if no removal was published and no other refill took
+    /// its place meanwhile. Returns whether a window was installed.
+    fn refill_window(&self, plan: SinkRefillPlan) -> bool {
+        let clear = |event_bus: &EventBusState| {
+            if let Some(queue) = event_bus.queues.lock().get_mut(&self.sink)
+                && queue.pending_refill == Some(plan.token)
+            {
+                queue.pending_refill = None;
+            }
+        };
+        let accountant = self
+            .event_bus
+            .window_accountant
+            .lock()
+            .as_ref()
+            .map(crate::memory_accounting::AccountantHandle::clone);
+        let (Some(persistence), Some(accountant)) = (self.persistence.as_ref(), accountant) else {
+            clear(&self.event_bus);
+            return false;
+        };
+        let read = match persistence.load_sink_queue_window::<SinkQueueEntry>(
+            &self.sink,
+            plan.after,
+            plan.upper,
+            SINK_WINDOW_ENTRIES,
+            SINK_WINDOW_BYTES,
+            accountant,
+        ) {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(sink = %self.sink, %error, "cannot read the next window of a sink queue");
+                clear(&self.event_bus);
+                return false;
+            }
+        };
+        if let Some(error) = &read.refusal {
+            self.event_bus.record_window_refusal(&self.sink, error);
+            clear(&self.event_bus);
+            return false;
+        }
+        let Ok(_lease) = self.event_bus.begin_dispatcher_queue_mutation() else {
+            clear(&self.event_bus);
+            return false;
+        };
+        let mut queues = self.event_bus.queues.lock();
+        let Some(queue) = queues.get_mut(&self.sink) else {
+            return false;
+        };
+        let owner = read.owner;
+        let mut entries = VecDeque::from(read.entries);
+        for entry in &mut entries {
+            entry.event.action_id = entry.id;
+        }
+        let window = SinkWindow {
+            entries,
+            credits: VecDeque::from(read.credits),
+            owner,
+        };
+        let installed = queue.install_refill(&plan, window, read.newest_id, read.exhausted);
+        drop(queues);
+        if installed {
+            self.event_bus.clear_window_refusal(&self.sink);
+            self.event_bus.waiters.notify_all();
+        }
+        installed
+    }
+
+    fn note_window_pacing(&self, reads: u64, pauses: u64) {
+        let mut metrics = self.event_bus.metrics.lock();
+        let state = metrics.entry(self.sink.clone()).or_default();
+        state.window_reads = state.window_reads.saturating_add(reads);
+        state.window_idle_pauses = state.window_idle_pauses.saturating_add(pauses);
     }
 
     fn finish_deferred_resource_cleanup(&self) {
@@ -2820,14 +3466,13 @@ impl EventBusWorker {
             let mut queues = self.event_bus.queues.lock();
             let entry = queues
                 .get_mut(&self.sink)
-                .and_then(|queue| queue.iter_mut().find(|entry| entry.id == entry_id))
+                .and_then(|queue| queue.entries.iter_mut().find(|entry| entry.id == entry_id))
                 .ok_or_else(|| {
                     Error::Other(format!("pending sink action disappeared: {entry_id}"))
                 })?;
-            let mut updated = entry.clone();
-            let attempts = updated.attempts & ATTEMPT_COUNT_MASK;
-            updated.attempts = if start {
-                if updated.attempts & UNCONFIRMED_ATTEMPT != 0 {
+            let attempts = entry.attempts & ATTEMPT_COUNT_MASK;
+            let rewritten = if start {
+                if entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
                     return Err(Error::Other(format!(
                         "sink action has an unresolved attempt: {entry_id}"
                     )));
@@ -2847,18 +3492,21 @@ impl EventBusWorker {
             if self.persistence.is_some() {
                 publication.reserve()?;
             }
-            persist_sink_queue_update(
-                &self.persistence,
-                &self.sink,
-                None,
-                Some(&updated),
-                uncertain,
-                unconfirmed_delta,
-            )?;
+            // The durable rewrite encodes the resident entry itself with its
+            // new attempt count: no copy of the payload is made.
+            with_rewritten_attempts(entry, rewritten, |updated| {
+                persist_sink_queue_update(
+                    &self.persistence,
+                    &self.sink,
+                    None,
+                    Some(updated),
+                    uncertain,
+                    unconfirmed_delta,
+                )
+            })?;
             if self.persistence.is_some() {
                 publication.complete();
             }
-            entry.attempts = updated.attempts;
             if start {
                 self.event_bus
                     .metrics
@@ -2883,18 +3531,26 @@ impl EventBusWorker {
             let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
             let mut queues = self.event_bus.queues.lock();
             if let Some(queue) = queues.get_mut(&self.sink) {
+                // Acknowledge by id: a checkout skips entries the registration
+                // cannot see, so what it delivered need not be a front prefix.
+                let resident = queue
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<HashSet<_>>();
                 let removable = entry_ids
                     .iter()
                     .copied()
-                    .zip(queue.iter())
-                    .take_while(|(id, entry)| *id == entry.id)
-                    .map(|(id, _)| id)
+                    .filter(|id| resident.contains(id))
                     .collect::<Vec<_>>();
                 if !removable.is_empty() {
+                    let removed = removable.iter().copied().collect::<HashSet<_>>();
                     let unconfirmed = queue
+                        .entries
                         .iter()
-                        .take(removable.len())
-                        .filter(|entry| entry.attempts & UNCONFIRMED_ATTEMPT != 0)
+                        .filter(|entry| {
+                            removed.contains(&entry.id) && entry.attempts & UNCONFIRMED_ATTEMPT != 0
+                        })
                         .count() as u64;
                     if self.persistence.is_some() {
                         publication.reserve()?;
@@ -2908,9 +3564,7 @@ impl EventBusWorker {
                     if self.persistence.is_some() {
                         publication.complete();
                     }
-                    for _ in 0..removable.len() {
-                        queue.pop_front();
-                    }
+                    queue.publish_removals(&removed, removable.len() as u64);
                     let mut metrics = self.event_bus.metrics.lock();
                     let state = metrics.entry(self.sink.clone()).or_default();
                     state.unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
@@ -3896,6 +4550,8 @@ impl OwnedEventBusHandle {
             uncertain: state.map_or(0, |s| s.uncertain.saturating_add(s.unconfirmed)),
             permanent_failures: state.map_or(0, |s| s.permanent_failures),
             examined: state.map_or(0, |s| s.examined),
+            window_refusals: state.map_or(0, |s| s.window_refusals),
+            window_refused: state.is_some_and(|s| s.window_refused),
         }
     }
     pub(super) fn with_owned_queue_entries<R>(
@@ -9073,3 +9729,7 @@ impl Database {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "sink_window_tests.rs"]
+mod sink_window_tests;

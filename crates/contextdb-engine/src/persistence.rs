@@ -1911,6 +1911,32 @@ pub(crate) struct SinkQueueExtent {
     pub(crate) newest_id: u64,
 }
 
+/// One bounded read of a durable sink queue (`load_sink_queue_window`):
+/// entries with their ids and the decoded bytes each holds on `owner`.
+pub(crate) struct SinkQueueWindowRead<T> {
+    pub(crate) depth: u64,
+    pub(crate) newest_id: u64,
+    pub(crate) entries: Vec<T>,
+    pub(crate) credits: Vec<usize>,
+    pub(crate) owner: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    pub(crate) exhausted: bool,
+    pub(crate) refusal: Option<Error>,
+}
+
+impl<T> SinkQueueWindowRead<T> {
+    fn empty(depth: u64, newest_id: u64) -> Self {
+        Self {
+            depth,
+            newest_id,
+            entries: Vec::new(),
+            credits: Vec::new(),
+            owner: None,
+            exhausted: true,
+            refusal: None,
+        }
+    }
+}
+
 /// What a page-on-demand open keeps of history instead of the history
 /// itself: the authenticated maxima the open needs. Graph versions remain
 /// in the pinned root and are validated by the querying operation.
@@ -21510,7 +21536,9 @@ pub(crate) struct AuthoritativePurgePersistenceProjection {
     pub(crate) vector_partition_identities: Vec<VectorPartitionVersionIdentity>,
     pub(crate) vector_generation_candidates: Vec<VectorPartitionGenerationCandidate>,
     pub(crate) graph_entries: Vec<AdjEntry>,
-    pub(crate) sink_entries: Vec<(String, u64, Vec<u8>)>,
+    /// Selected sink entries: sink, id and the BLAKE3 digest of the durable
+    /// value the selection saw.
+    pub(crate) sink_entries: Vec<(String, u64, [u8; 32])>,
     pub(crate) change_log_entries: Vec<ChangeLogEntry>,
     pub(crate) config_keys_removed: Vec<String>,
     pub(crate) lifecycle_records: Vec<(String, Vec<u8>)>,
@@ -27713,6 +27741,144 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 entries.push(Self::decode(value.value())?);
             }
             Ok(entries)
+        })
+    }
+
+    /// One bounded read of a durable sink queue in a single read transaction:
+    /// its depth and newest id from the table root and last key, then the
+    /// entries with ids in `(after, upper]` in ascending id order (`after =
+    /// None` starts at the lowest id, `upper = None` ends at the newest).
+    /// Each entry is decoded under a fresh writer-funded owner that keeps its
+    /// actual decoded heap charged; the read stops once `max_entries` entries
+    /// or `max_bytes` decoded bytes are held (the first entry is always kept,
+    /// so one entry wider than `max_bytes` is read alone). A memory refusal
+    /// before any entry is held is returned as `refusal`, with depth and
+    /// newest id still read; a refusal after that just ends the window.
+    pub(crate) fn load_sink_queue_window<T: serde::de::DeserializeOwned>(
+        &self,
+        sink: &str,
+        after: Option<u64>,
+        upper: Option<u64>,
+        max_entries: usize,
+        max_bytes: usize,
+        accountant: crate::memory_accounting::AccountantHandle,
+    ) -> Result<SinkQueueWindowRead<T>> {
+        let owner = match crate::read_image_memory::ImageMemory::operation_writer(accountant) {
+            Ok(owner) => owner,
+            Err(error) if crate::read_image_memory::is_memory_refusal(&error) => {
+                let mut read = self.load_sink_queue_extent(sink)?;
+                read.refusal = Some(error);
+                return Ok(read);
+            }
+            Err(error) => return Err(error),
+        };
+        let _decode_scope = owner.enter();
+        let mut read = self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table_name = Self::sink_queue_table_name(sink);
+            let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(table_name.as_str());
+            let table = match read_txn.open_table(table_def) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Ok(SinkQueueWindowRead::empty(0, 0));
+                }
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let depth = table.len().map_err(Self::storage_error)?;
+            let newest_id = table
+                .last()
+                .map_err(Self::storage_error)?
+                .map(|(key, _)| key.value())
+                .unwrap_or(0);
+            let mut read = SinkQueueWindowRead::empty(depth, newest_id);
+            let start = match after {
+                Some(after) => match after.checked_add(1) {
+                    Some(start) => start,
+                    None => return Ok(read),
+                },
+                None => 0,
+            };
+            let end = upper.unwrap_or(u64::MAX);
+            if start > end {
+                return Ok(read);
+            }
+            // The window's own buffers are funded before they are allocated.
+            let capacity = max_entries.min(usize::try_from(depth).unwrap_or(usize::MAX));
+            let buffers = capacity.saturating_mul(
+                std::mem::size_of::<T>().saturating_add(std::mem::size_of::<usize>()),
+            );
+            if let Err(error) = owner.reserve(buffers) {
+                if !crate::read_image_memory::is_memory_refusal(&error) {
+                    return Err(error);
+                }
+                read.refusal = Some(error);
+                read.exhausted = false;
+                return Ok(read);
+            }
+            read.entries = Vec::with_capacity(capacity);
+            read.credits = Vec::with_capacity(capacity);
+            let mut held = 0usize;
+            for entry in table.range(start..=end).map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                if read.entries.len() >= max_entries {
+                    read.exhausted = false;
+                    break;
+                }
+                let before = owner.held();
+                let decoded = match Self::decode::<T>(value.value()) {
+                    Ok(decoded) => decoded,
+                    Err(error) if crate::read_image_memory::is_memory_refusal(&error) => {
+                        if read.entries.is_empty() {
+                            read.refusal = Some(error);
+                        }
+                        read.exhausted = false;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let credit = owner.held().saturating_sub(before);
+                if !read.entries.is_empty() && held.saturating_add(credit) > max_bytes {
+                    drop(decoded);
+                    owner.release(credit);
+                    read.exhausted = false;
+                    break;
+                }
+                held = held.saturating_add(credit);
+                let _ = key;
+                read.entries.push(decoded);
+                read.credits.push(credit);
+            }
+            Ok(read)
+        })?;
+        // An empty read keeps no owner; dropping it returns its buffer credit.
+        if !read.entries.is_empty() {
+            read.owner = Some(owner);
+        }
+        Ok(read)
+    }
+
+    /// Depth and newest id of one durable sink queue, without its entries.
+    fn load_sink_queue_extent<T>(&self, sink: &str) -> Result<SinkQueueWindowRead<T>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table_name = Self::sink_queue_table_name(sink);
+            let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(table_name.as_str());
+            let table = match read_txn.open_table(table_def) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Ok(SinkQueueWindowRead::empty(0, 0));
+                }
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let depth = table.len().map_err(Self::storage_error)?;
+            let newest_id = table
+                .last()
+                .map_err(Self::storage_error)?
+                .map(|(key, _)| key.value())
+                .unwrap_or(0);
+            let mut read = SinkQueueWindowRead::empty(depth, newest_id);
+            read.exhausted = depth == 0;
+            Ok(read)
         })
     }
 
@@ -36088,17 +36254,17 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
         }
 
-        for (sink, queue_id, expected_bytes) in &projection.sink_entries {
+        for (sink, queue_id, expected_digest) in &projection.sink_entries {
             let name = Self::sink_queue_table_name(sink);
             let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(name.as_str());
             let mut queue = write_txn
                 .open_table(definition)
                 .map_err(Self::storage_error)?;
-            let bytes = queue
+            let digest = queue
                 .get(*queue_id)
                 .map_err(Self::storage_error)?
-                .map(|value| value.value().to_vec());
-            if bytes.as_deref() != Some(expected_bytes.as_slice()) {
+                .map(|value| *blake3::hash(value.value()).as_bytes());
+            if digest.as_ref() != Some(expected_digest) {
                 return Err(Error::SyncError(
                         "authoritative purge selected sink occurrence disappeared before durable commit"
                             .to_string(),
@@ -37761,6 +37927,30 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 }
             }
             Ok(names)
+        })
+    }
+
+    /// Visit every entry of one durable sink queue in id order, in one read
+    /// transaction, without copying the queue.
+    pub(crate) fn visit_sink_queue(
+        &self,
+        sink: &str,
+        mut visit: impl FnMut(u64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table_name = Self::sink_queue_table_name(sink);
+            let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(table_name.as_str());
+            let table = match read_txn.open_table(table_def) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                visit(key.value(), value.value())?;
+            }
+            Ok(())
         })
     }
 
