@@ -1346,8 +1346,12 @@ fn latest_in_slice<'a>(
 }
 
 /// Overlay admitted unpublished deltas on the unchanged authenticated root.
-/// Rooted seeks still authenticate every stored candidate, including removed
-/// predecessors; the overlay cannot make a damaged stored member disappear.
+/// Rooted seeks still authenticate every stored candidate up to the answer,
+/// including removed predecessors; the overlay cannot make a damaged stored
+/// member disappear. Removed stored members are skipped only while they
+/// precede the first present pending coordinate: past it the pending
+/// coordinate is the answer, and skipping on would walk every member a
+/// transaction updating many rows has already removed, once per row.
 pub(in super::super) fn writer_manifest_next_pending<O: ManifestOverlay + ?Sized>(
     write: &redb::WriteTransaction,
     start: &[u8],
@@ -1355,20 +1359,22 @@ pub(in super::super) fn writer_manifest_next_pending<O: ManifestOverlay + ?Sized
     admission: &mut ProofAdmission,
     pending: &O,
 ) -> Result<Option<Vec<u8>>> {
+    let pending_first = pending.first_present_from(start, exclusive);
     let mut stored = writer_manifest_next(write, start, exclusive, admission)?;
-    while stored
-        .as_deref()
-        .is_some_and(|key| pending.latest_present(key) == Some(false))
-    {
+    while stored.as_deref().is_some_and(|key| {
+        pending_first.is_none_or(|first| key < first)
+            && pending.latest_present(key) == Some(false)
+    }) {
         let key = stored.take().expect("selected predecessor");
         stored = writer_manifest_next(write, &key, true, admission)?;
         let bytes = key.capacity();
         drop(key);
         admission.release(bytes);
     }
-    let selected = pending
-        .first_present_from(start, exclusive)
-        .filter(|key| stored.as_deref().is_none_or(|stored| *key < stored));
+    // A stored member equal to the pending coordinate is present (its latest
+    // delta adds it) and is preferred, as an authenticated candidate.
+    let selected =
+        pending_first.filter(|key| stored.as_deref().is_none_or(|stored| *key < stored));
     if let Some(key) = selected {
         admission.admit(key.len())?;
         let selected = key.to_vec();
