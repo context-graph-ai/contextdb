@@ -38485,16 +38485,87 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     fn decode_vector_entry(bytes: &[u8]) -> Result<VectorEntry> {
+        // The stored layout of `PersistedVectorEntry`, field for field and
+        // variant for variant. A stored f32 body is decoded into exactly its
+        // encoded length, admitted before it is allocated as the kept output,
+        // and becomes the entry's vector without a copy; a caller that already
+        // admitted its kept vectors has that credit adopted. A quantized body
+        // is exact-length scratch, and its expansion is the kept output.
+        #[derive(Deserialize)]
+        struct StoredVectorEntry {
+            index: VectorIndexRef,
+            row_id: contextdb_core::RowId,
+            vector: StoredVector,
+            created_tx: contextdb_core::TxId,
+            deleted_tx: Option<contextdb_core::TxId>,
+            lsn: Lsn,
+        }
+        #[derive(Deserialize)]
+        enum StoredVector {
+            F32(#[serde(deserialize_with = "kept_f32")] Vec<f32>),
+            SQ8 {
+                min: f32,
+                max: f32,
+                len: u32,
+                #[serde(deserialize_with = "scratch_bytes")]
+                payload: Vec<u8>,
+            },
+            SQ4 {
+                min: f32,
+                max: f32,
+                len: u32,
+                #[serde(deserialize_with = "scratch_bytes")]
+                payload: Vec<u8>,
+            },
+        }
+        fn kept_f32<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Vec<f32>, D::Error> {
+            crate::read_image_memory::deserialize_exact_vec(deserializer, true)
+        }
+        fn scratch_bytes<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Vec<u8>, D::Error> {
+            crate::read_image_memory::deserialize_exact_vec(deserializer, false)
+        }
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-        let persisted: PersistedVectorEntry = Self::decode(bytes)?;
-        crate::read_image_memory::reserve(persisted.vector.decoded_bytes())?;
+        let stored: StoredVectorEntry = Self::decode(bytes)?;
+        let expand = |quantized: PersistedVector| -> Result<Vec<f32>> {
+            crate::read_image_memory::reserve_output(quantized.decoded_bytes())?;
+            Ok(quantized.to_f32())
+        };
+        let vector = match stored.vector {
+            StoredVector::F32(values) => values,
+            StoredVector::SQ8 {
+                min,
+                max,
+                len,
+                payload,
+            } => expand(PersistedVector::SQ8 {
+                min,
+                max,
+                len,
+                payload,
+            })?,
+            StoredVector::SQ4 {
+                min,
+                max,
+                len,
+                payload,
+            } => expand(PersistedVector::SQ4 {
+                min,
+                max,
+                len,
+                payload,
+            })?,
+        };
         Ok(VectorEntry {
-            index: persisted.index,
-            row_id: persisted.row_id,
-            vector: persisted.vector.to_f32(),
-            created_tx: persisted.created_tx,
-            deleted_tx: persisted.deleted_tx,
-            lsn: persisted.lsn,
+            index: stored.index,
+            row_id: stored.row_id,
+            vector,
+            created_tx: stored.created_tx,
+            deleted_tx: stored.deleted_tx,
+            lsn: stored.lsn,
         })
     }
 
