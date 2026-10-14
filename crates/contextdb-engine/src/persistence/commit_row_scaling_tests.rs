@@ -20,10 +20,12 @@
 //!   tables, each of which makes redb finalize the checksums of every page the
 //!   transaction has dirtied in the tables closed since the previous one.
 //!
-//! Doubling the rows from N to 2N may at most grow the overlay comparisons by
-//! the N log N factor, 2N log2(2N) / (N log2 N), plus a fixed allowance: a
-//! seek is one root-to-leaf descent of a balanced index, never a rescan of
-//! the deltas already pending (which grows them 4x or 8x per doubling). Protected-table root events must not grow with the rows at
+//! The overlay comparisons of an N-row commit may not exceed
+//! `OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL` x N x log2 N at any size: indexing
+//! a delta and each seek are one root-to-leaf descent of a balanced index, a
+//! fixed number of them per row, never a rescan of the deltas already pending
+//! (which costs on the order of N^2 or N^3 and exceeds the bound from about a
+//! thousand rows on). Protected-table root events must not grow with the rows at
 //! all: each one costs work proportional to the pages already dirtied, so one
 //! per row (or one per change of table between consecutive rows) is
 //! quadratic. Wall time is printed as a fact and never asserted.
@@ -36,7 +38,9 @@ use std::collections::HashMap;
 const INSERT_ROW_COUNTS: [usize; 4] = [1_024, 2_048, 4_096, 8_192];
 const DELETE_ROW_COUNTS: [usize; 4] = [512, 1_024, 2_048, 4_096];
 const TABLES: [&str; 2] = ["imported", "mirrored"];
-const FIXED_ALLOWANCE: u64 = 1_024;
+/// Measured at the indexed revision: about 3 for an import, 12 for a bulk
+/// delete and 21 for an update (each row retires one version and adds one).
+const OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL: u64 = 32;
 const PROTECTED_ROOT_EVENT_ALLOWANCE: u64 = 64;
 
 #[derive(Debug, Clone, Copy)]
@@ -213,16 +217,14 @@ fn assert_linear(measured: Measured) {
             work.overlay_comparisons >= rows as u64,
             "every committed row consults the pending manifest overlay: {work:?}"
         );
+        let allowed =
+            OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL * rows as u64 * u64::from(rows.ilog2());
+        assert!(
+            work.overlay_comparisons <= allowed,
+            "overlay comparisons exceed {OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL} N log2 N: \
+             {work:?}, allowed {allowed}"
+        );
         if let Some(previous) = previous {
-            let n_log_n = |rows: usize| rows as u128 * u128::from(rows.ilog2());
-            let allowed = u128::from(previous.overlay_comparisons) * n_log_n(rows)
-                / n_log_n(previous.rows)
-                + u128::from(FIXED_ALLOWANCE);
-            assert!(
-                u128::from(work.overlay_comparisons) <= allowed,
-                "overlay comparisons grew faster than N log N: {previous:?} -> {work:?}, \
-                 allowed {allowed}"
-            );
             assert!(
                 work.protected_root_events
                     <= previous
