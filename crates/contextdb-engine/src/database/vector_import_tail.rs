@@ -40,6 +40,53 @@ impl Database {
     }
 }
 
+impl Database {
+    /// Per route of `table.column`: the serving coverage's LSN and the
+    /// inserts its maintained counters still hold pending at that coverage's
+    /// transaction -- what a reader's captured suffix is admitted from.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn vector_serving_pending_inserts_for_test(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<Vec<(Lsn, usize)>> {
+        let _operation = self.assert_open_operation();
+        let context = self.maintenance_context();
+        let Some(persistence) = &context.persistence else {
+            return Ok(Vec::new());
+        };
+        let _decode = context.writer_maintenance_decode()?;
+        let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            context.finalization.accountant.vector_budget()?,
+        );
+        let mut pending = Vec::new();
+        for partition in vector_partition_routes(&context.vector, &mut copy_owner)? {
+            if partition.index.table != table || partition.index.column != column {
+                continue;
+            }
+            let Some(catalog) = persistence.load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?
+            else {
+                continue;
+            };
+            let serving = catalog.change.unwrap_or(catalog.base);
+            let inserts = persistence.with_db(|db| {
+                let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+                RedbPersistence::vector_suffix_saved_inserts_in_read(
+                    &read,
+                    &partition,
+                    serving.covered_tx,
+                )
+            })?;
+            pending.push((serving.covered_lsn, inserts));
+        }
+        Ok(pending)
+    }
+}
+
 impl MaintenanceContext {
     /// Import-tail work is writer maintenance, so every stored value it
     /// decodes -- partition metadata, catalogs, counts, the uncovered suffix
@@ -53,22 +100,25 @@ impl MaintenanceContext {
         )
     }
 
-    /// Load one cohort's stored vectors. Their decoded bodies are already
-    /// admitted in this cohort's writer workspace, so the decode owner is a
-    /// per-call writer owner: each stored value's decode -- its stored body,
-    /// codec growth and owned copy -- is charged to the declared writer limit
-    /// while that one value decodes and returned when the next begins, never
-    /// a second time for the retained copy and never accumulated across
-    /// values that are already freed.
+    /// Load one cohort's stored vectors. The vectors it keeps are already
+    /// admitted in this cohort's writer workspace (`kept_vector_bytes` of
+    /// it is their decoded f32 bodies), so the decode owner adopts that
+    /// credit for each kept vector instead of charging it again. Everything
+    /// else a stored value's decode needs -- its record, names, decode
+    /// control and any quantized scratch -- is charged to the declared writer
+    /// limit by a per-call owner, live for that one value and returned when
+    /// the next value's decode begins, never accumulated across values.
     fn load_import_cohort(
         &self,
         site: &'static str,
         cohort_vectors: usize,
         workspace_bytes: usize,
+        kept_vector_bytes: usize,
         load: impl FnOnce() -> Result<(Vec<VectorEntry>, Lsn)>,
     ) -> Result<(Vec<VectorEntry>, Lsn)> {
         let owner = crate::read_image_memory::ImageMemory::operation_writer_per_call(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            kept_vector_bytes,
         )?;
         #[cfg(feature = "test-seams")]
         let observed = std::sync::Arc::downgrade(&owner);
@@ -84,6 +134,8 @@ impl MaintenanceContext {
             )?;
             load()
         };
+        #[cfg(feature = "test-seams")]
+        let adopted_output = owner.adopted_output();
         drop(owner);
         #[cfg(feature = "test-seams")]
         {
@@ -91,6 +143,7 @@ impl MaintenanceContext {
                 Ok((entries, _)) => {
                     crate::vector_observations::ImportTailLoadBoundaryForTest::Loaded {
                         vectors: entries.len(),
+                        adopted_output,
                     }
                 }
                 Err(error) => crate::vector_observations::ImportTailLoadBoundaryForTest::Refused {
@@ -146,6 +199,7 @@ impl MaintenanceContext {
     /// The upserts one cohort takes: the whole uncovered suffix when its
     /// decoded bodies fit this writer's cohort share, otherwise whole
     /// committed LSNs, oldest first, while they fit -- always at least one.
+    /// The third value is that LSN when the cohort is one commit alone.
     fn import_cohort_through(
         &self,
         persistence: &RedbPersistence,
@@ -153,7 +207,7 @@ impl MaintenanceContext {
         covered: Lsn,
         suffix_vectors: usize,
         entry_bytes: usize,
-    ) -> Result<(usize, Option<Lsn>)> {
+    ) -> Result<(usize, Option<Lsn>, Option<Lsn>)> {
         let share = self
             .finalization
             .accountant
@@ -166,13 +220,14 @@ impl MaintenanceContext {
                 .is_some_and(|bytes| bytes <= share)
         };
         if fits(suffix_vectors) {
-            return Ok((suffix_vectors, None));
+            return Ok((suffix_vectors, None, None));
         }
         let Some(mut through) =
             persistence.native_candidate_first_uncovered_lsn(partition, covered)?
         else {
-            return Ok((suffix_vectors, None));
+            return Ok((suffix_vectors, None, None));
         };
+        let first = through;
         let mut vectors = persistence.vector_partition_tail_entry_count_through(
             &partition.index,
             &partition.partition_key,
@@ -194,7 +249,7 @@ impl MaintenanceContext {
             vectors += more;
             through = next;
         }
-        Ok((vectors, Some(through)))
+        Ok((vectors, Some(through), (through == first).then_some(first)))
     }
 
     fn persist_import_vector_tails(
@@ -377,26 +432,69 @@ impl MaintenanceContext {
             .saturating_mul(4)
             .saturating_add(std::mem::size_of::<VectorEntry>())
             .saturating_add(256);
-        let (count, cohort_through) =
+        let (count, cohort_through, single_commit) =
             self.import_cohort_through(persistence, partition, covered, suffix, entry_bytes)?;
         let body_bytes = count
             .checked_mul(entry_bytes)
             .ok_or_else(|| Error::Other("import vector suffix size overflow".into()))?;
         let workspace_bytes = body_bytes.saturating_add(128 * 1024);
-        let mut workspace = self.vector.reserve_workspace(
+        let mut workspace = match self.vector.reserve_workspace(
             Arc::clone(&self.finalization.vector_accountant),
             workspace_bytes,
             "persist_import_vector_tail",
             "Release idle writer state before persisting this import's vector suffix.",
-        )?;
+        ) {
+            Ok(workspace) => workspace,
+            // Coverage is per committed LSN, so one commit's vectors cannot
+            // be split. Name that commit and what it needs.
+            Err(Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                ..
+            }) if single_commit.is_some() => {
+                let lsn = single_commit.map_or(0, |lsn| lsn.0);
+                return Err(Error::MemoryBudgetExceeded {
+                    subsystem,
+                    operation,
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    hint: format!(
+                        "The import's transaction committed at LSN {lsn} alone holds {count} new vectors ({body_bytes} decoded bytes) and is covered as one unit; raise MEMORY_LIMIT so {requested_bytes} bytes are free for it."
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let ((mut entries, through_lsn), through_tx, _pin) =
             self.tx_mgr.with_commit_lock(|| {
-                let through_tx = self.tx_mgr.current_tx_max();
+                // Coverage names the commit the cohort ends at: the whole
+                // suffix ends at the store's frontier, a committed prefix at
+                // its last commit, never at commits it did not absorb.
+                let through_tx = match cohort_through {
+                    None => self.tx_mgr.current_tx_max(),
+                    Some(lsn) => match self
+                        .tx_mgr
+                        .try_commit_index_floor(std::ops::Bound::Included(lsn))?
+                    {
+                        Some((found, tx)) if found == lsn => tx,
+                        _ => {
+                            return Err(Error::Other(
+                                "an import cohort's last commit is missing from the commit index"
+                                    .into(),
+                            ));
+                        }
+                    },
+                };
                 let pin = self.snapshot_registry.register(SnapshotId(through_tx.0));
                 let entries = self.load_import_cohort(
                     "persist_import_vector_tail",
                     count,
                     workspace_bytes,
+                    count.saturating_mul(layout.dimension.saturating_mul(4)),
                     || {
                         persistence.load_vector_partition_tail_entries_through(
                             &partition.index,
@@ -565,6 +663,7 @@ impl MaintenanceContext {
                 "catch_up_native_import_candidate",
                 count,
                 workspace_bytes,
+                count.saturating_mul(layout.dimension.saturating_mul(4)),
                 || {
                     persistence.load_vector_partition_tail_entries_through(
                         &partition.index,

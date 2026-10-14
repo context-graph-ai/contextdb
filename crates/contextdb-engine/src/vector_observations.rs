@@ -284,7 +284,11 @@ pub enum ImportTailLoadBoundaryForTest {
     /// The cohort workspace is admitted and its decode owner entered.
     Enter,
     /// The load returned this many vectors; its decode owner is gone.
-    Loaded { vectors: usize },
+    /// `adopted_output` is the prepaid kept-vector credit its decodes adopted.
+    Loaded {
+        vectors: usize,
+        adopted_output: usize,
+    },
     /// The load refused with this display text; its decode owner is gone.
     Refused { error: String },
 }

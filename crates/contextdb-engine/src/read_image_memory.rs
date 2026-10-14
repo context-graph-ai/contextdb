@@ -24,9 +24,20 @@ pub(crate) struct ImageMemory {
     /// its own writer owner: the slot holds the latest call's owner until the
     /// next call begins or this owner drops.
     per_call: Option<parking_lot::Mutex<Option<Arc<ImageMemory>>>>,
+    /// Decoded outputs a caller already admitted elsewhere -- an import's
+    /// workspace for the vectors it keeps. An output admission under this
+    /// owner, or a per-call owner it creates, adopts that credit instead of
+    /// charging the same bytes a second time.
+    prepaid_output: Option<Arc<PrepaidOutput>>,
     // Last custody field pins the original writer epoch through image refund.
     _writer_custody: Option<crate::memory_accounting::StoreAccountantHandle>,
 }
+#[derive(Debug)]
+struct PrepaidOutput {
+    remaining: AtomicUsize,
+    adopted: AtomicUsize,
+}
+
 impl ImageMemory {
     pub(crate) fn new(limit: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
@@ -43,6 +54,7 @@ impl ImageMemory {
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
             per_call: None,
+            prepaid_output: None,
             _writer_custody: None,
         })
     }
@@ -79,6 +91,7 @@ impl ImageMemory {
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
             per_call: None,
+            prepaid_output: None,
             _writer_custody: writer_custody,
         })
     }
@@ -98,6 +111,7 @@ impl ImageMemory {
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
             per_call: None,
+            prepaid_output: None,
             _writer_custody: None,
         })
     }
@@ -122,6 +136,7 @@ impl ImageMemory {
             control_bytes: 0,
             failure: parking_lot::Mutex::new(None),
             per_call: None,
+            prepaid_output: None,
             _writer_custody: None,
         })
     }
@@ -155,6 +170,7 @@ impl ImageMemory {
             control_bytes: control,
             failure: parking_lot::Mutex::new(None),
             per_call: None,
+            prepaid_output: None,
             _writer_custody: None,
         }))
     }
@@ -180,6 +196,7 @@ impl ImageMemory {
             control_bytes: control | crate::memory_accounting::OPEN_RESIDUE_TAG,
             failure: parking_lot::Mutex::new(None),
             per_call: None,
+            prepaid_output: None,
             _writer_custody: writer_custody,
         }))
     }
@@ -193,12 +210,39 @@ impl ImageMemory {
     /// time instead of accumulating across values that are already freed.
     pub(crate) fn operation_writer_per_call(
         accountant: crate::memory_accounting::AccountantHandle,
+        prepaid_output_bytes: usize,
     ) -> Result<Arc<Self>> {
         let mut owner = Self::operation_writer(accountant)?;
-        Arc::get_mut(&mut owner)
-            .expect("new writer owner is exclusive")
-            .per_call = Some(parking_lot::Mutex::new(None));
+        let owner_mut = Arc::get_mut(&mut owner).expect("new writer owner is exclusive");
+        owner_mut.per_call = Some(parking_lot::Mutex::new(None));
+        owner_mut.prepaid_output = Some(Arc::new(PrepaidOutput {
+            remaining: AtomicUsize::new(prepaid_output_bytes),
+            adopted: AtomicUsize::new(0),
+        }));
         Ok(owner)
+    }
+
+    /// Prepaid output bytes this owner's per-call decodes adopted.
+    pub(crate) fn adopted_output(&self) -> usize {
+        self.prepaid_output
+            .as_ref()
+            .map_or(0, |prepaid| prepaid.adopted.load(Ordering::SeqCst))
+    }
+
+    /// Adopt `bytes` of a caller's prepaid output credit, if it has that much.
+    fn adopt_prepaid_output(&self, bytes: usize) -> bool {
+        self.prepaid_output.as_ref().is_some_and(|prepaid| {
+            let adopted = prepaid
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(bytes)
+                })
+                .is_ok();
+            if adopted {
+                prepaid.adopted.fetch_add(bytes, Ordering::SeqCst);
+            }
+            adopted
+        })
     }
 
     /// `subsystem/operation` this owner's admissions and refusals carry.
@@ -238,12 +282,17 @@ impl ImageMemory {
                 // The previous call returned before this one began; its
                 // stored body and codec growth are already dropped.
                 drop(slot.take());
-                let call = Self::operation_writer(owner.accountant.clone())?;
+                let mut call = Self::operation_writer(owner.accountant.clone())?;
+                Arc::get_mut(&mut call)
+                    .expect("new writer owner is exclusive")
+                    .prepaid_output = owner.prepaid_output.clone();
                 *slot = Some(call.clone());
                 return Ok(call.enter());
             }
             return Ok(owner.enter());
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::vector_read_memory::note_unowned_decode_for_test();
         Self::enter_writer_operation(Self::default_decode_accountant())
     }
 
@@ -492,6 +541,7 @@ impl ImageMemory {
             control_bytes: control,
             failure: parking_lot::Mutex::new(None),
             per_call: None,
+            prepaid_output: None,
             _writer_custody: self._writer_custody.clone(),
         }))
     }
@@ -751,6 +801,131 @@ pub(crate) fn current_reader_budget()
 pub(crate) fn reserve(bytes: usize) -> Result<()> {
     active_owner()?.reserve(bytes)
 }
+
+/// Admit a decoded value the caller keeps. A caller that already admitted
+/// its kept outputs (`operation_writer_per_call`) has that credit adopted;
+/// otherwise the active owner is charged, as for any other admission.
+pub(crate) fn reserve_output(bytes: usize) -> Result<()> {
+    let owner = active_owner()?;
+    if owner.adopt_prepaid_output(bytes) {
+        return Ok(());
+    }
+    owner.reserve(bytes)
+}
+
+fn admit_output<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
+    let owner = active_owner().map_err(E::custom)?;
+    if owner.failure.lock().is_some() {
+        return Err(E::custom("read image admission refused"));
+    }
+    if owner.adopt_prepaid_output(bytes) {
+        return Ok(());
+    }
+    admit(bytes)
+}
+
+thread_local! {
+    /// The sequence `deserialize_exact_vec` is about to read, until the
+    /// admitted wrapper (or the visitor itself) admits its exact length.
+    static EXACT_SEQUENCE: std::cell::Cell<Option<ExactSequence>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct ExactSequence {
+    element_bytes: usize,
+    output: bool,
+    admitted: bool,
+}
+
+/// Admit the exact length of the sequence `deserialize_exact_vec` opened,
+/// before anything is allocated for it. Returns whether this is that sequence.
+fn admit_exact_sequence<E: de::Error>(length: Option<usize>) -> std::result::Result<bool, E> {
+    let Some(pending) = EXACT_SEQUENCE.with(std::cell::Cell::get) else {
+        return Ok(false);
+    };
+    if pending.admitted {
+        return Ok(false);
+    }
+    let length = length.ok_or_else(|| E::custom("exact sequence has no encoded length"))?;
+    let bytes = length
+        .checked_mul(pending.element_bytes)
+        .ok_or_else(|| E::custom("exact sequence length overflows"))?;
+    if pending.output {
+        admit_output(bytes)?;
+    } else {
+        admit(bytes)?;
+    }
+    EXACT_SEQUENCE.with(|slot| {
+        slot.set(Some(ExactSequence {
+            admitted: true,
+            ..pending
+        }))
+    });
+    Ok(true)
+}
+
+/// Deserialize a vector of fixed-size scalars into exactly its encoded
+/// length. Its bytes are admitted before the vector is allocated -- as a
+/// kept output when `output`, so a caller's prepaid credit is adopted --
+/// and nothing is charged per element. The generic sequence path, which
+/// cannot know its element size before allocation, keeps its growth
+/// allowance unchanged.
+pub(crate) fn deserialize_exact_vec<'de, D, E>(
+    deserializer: D,
+    output: bool,
+) -> std::result::Result<Vec<E>, D::Error>
+where
+    D: de::Deserializer<'de>,
+    E: de::Deserialize<'de> + Copy,
+{
+    struct Restore(Option<ExactSequence>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXACT_SEQUENCE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(EXACT_SEQUENCE.with(|slot| {
+        slot.replace(Some(ExactSequence {
+            element_bytes: std::mem::size_of::<E>(),
+            output,
+            admitted: false,
+        }))
+    }));
+    struct ExactVec<E>(PhantomData<E>);
+    impl<'de, E: de::Deserialize<'de> + Copy> Visitor<'de> for ExactVec<E> {
+        type Value = Vec<E>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a length-prefixed sequence")
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            // Read outside the admitted wrapper, the visitor admits itself.
+            admit_exact_sequence::<A::Error>(sequence.size_hint())?;
+            let length = sequence
+                .size_hint()
+                .ok_or_else(|| de::Error::custom("exact sequence has no encoded length"))?;
+            let mut values = Vec::with_capacity(length);
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == length {
+                    return Err(de::Error::custom(
+                        "exact sequence is longer than its length",
+                    ));
+                }
+                values.push(value);
+            }
+            if values.len() != length {
+                return Err(de::Error::custom(
+                    "exact sequence is shorter than its length",
+                ));
+            }
+            Ok(values)
+        }
+    }
+    deserializer.deserialize_seq(ExactVec(PhantomData))
+}
 fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
     let owner = active_owner().map_err(E::custom)?;
     if owner.failure.lock().is_some() {
@@ -983,9 +1158,10 @@ impl<'de, VV: Visitor<'de>> Visitor<'de> for V<VV> {
         self.inner.visit_borrowed_bytes(value)
     }
     fn visit_seq<A: de::SeqAccess<'de>>(self, a: A) -> std::result::Result<Self::Value, A::Error> {
+        let exact = self.heap && admit_exact_sequence::<A::Error>(a.size_hint())?;
         self.inner.visit_seq(Seq {
             inner: a,
-            heap: self.heap,
+            heap: self.heap && !exact,
             first: true,
         })
     }
@@ -1642,5 +1818,118 @@ impl<T> NativeSelectionHold<T> {
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> bool {
         self.invoice.is_funded_by(owner)
+    }
+}
+
+#[cfg(test)]
+mod exact_sequence_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Exact(#[serde(deserialize_with = "exact")] Vec<f32>);
+    fn exact<'de, D: de::Deserializer<'de>>(d: D) -> std::result::Result<Vec<f32>, D::Error> {
+        deserialize_exact_vec(d, false)
+    }
+    #[derive(Deserialize)]
+    struct Kept(#[serde(deserialize_with = "kept")] Vec<f32>);
+    fn kept<'de, D: de::Deserializer<'de>>(d: D) -> std::result::Result<Vec<f32>, D::Error> {
+        deserialize_exact_vec(d, true)
+    }
+    #[derive(Deserialize)]
+    struct Generic(Vec<f32>);
+
+    fn encoded(values: &[f32]) -> Vec<u8> {
+        bincode::serde::encode_to_vec(values, bincode::config::standard()).unwrap()
+    }
+
+    fn accountant(limit: usize) -> crate::memory_accounting::AccountantHandle {
+        Arc::new(MemoryAccountant::with_budget(limit)).into()
+    }
+
+    #[test]
+    fn an_exact_sequence_decodes_into_its_length_and_charges_exactly_it() {
+        let values: Vec<f32> = (0..1536).map(|lane| lane as f32 * 0.5).collect();
+        let owner = ImageMemory::operation_writer(accountant(1 << 20)).unwrap();
+        let _scope = owner.enter();
+        let (decoded, _) = decode::<Exact>(&encoded(&values)).unwrap();
+        assert_eq!(decoded.0, values, "the stored format is unchanged");
+        assert_eq!(decoded.0.capacity(), 1536, "no growth past its length");
+        assert_eq!(owner.held(), 1536 * 4, "charged exactly its decoded bytes");
+    }
+
+    #[test]
+    fn the_generic_sequence_keeps_its_growth_allowance() {
+        let values: Vec<f32> = (0..1536).map(|lane| lane as f32).collect();
+        let owner = ImageMemory::operation_writer(accountant(1 << 20)).unwrap();
+        let _scope = owner.enter();
+        let (decoded, _) = decode::<Generic>(&encoded(&values)).unwrap();
+        assert_eq!(decoded.0, values);
+        assert_eq!(owner.held(), 48 + 16 * 1535, "unchanged allowance");
+    }
+
+    #[test]
+    fn a_kept_sequence_adopts_a_prepaid_credit_instead_of_charging_it() {
+        let values: Vec<f32> = (0..1536).map(|lane| lane as f32).collect();
+        let writer = accountant(1 << 20);
+        let owner = ImageMemory::operation_writer_per_call(writer.clone(), 1536 * 4).unwrap();
+        let _scope = owner.enter();
+        let before = writer.usage().used;
+        let (decoded, _) = decode::<Kept>(&encoded(&values)).unwrap();
+        assert_eq!(decoded.0.capacity(), 1536);
+        assert_eq!(owner.adopted_output(), 1536 * 4);
+        // The call's own owner holds no payload: the kept vector was prepaid.
+        assert_eq!(owner.held_with_call(), 0);
+        assert_eq!(writer.usage().used, before);
+        // A second kept vector finds no prepaid credit left and is charged.
+        let (_second, _) = decode::<Kept>(&encoded(&values)).unwrap();
+        assert_eq!(owner.adopted_output(), 1536 * 4);
+        assert_eq!(writer.usage().used, before + 1536 * 4);
+    }
+
+    fn length_prefix_u32(length: u32) -> Vec<u8> {
+        let mut bytes = vec![252];
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_malformed_length_is_refused_before_anything_is_allocated() {
+        let owner = ImageMemory::operation_writer(accountant(1 << 20)).unwrap();
+        let _scope = owner.enter();
+        // One billion f32 values claimed, none present: the 4 GB admission
+        // is refused as the typed budget refusal, and nothing stays charged.
+        let refused = decode::<Exact>(&length_prefix_u32(1_000_000_000))
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(refused, Error::MemoryBudgetExceeded { requested_bytes, .. } if requested_bytes == 4_000_000_000),
+            "{refused:?}"
+        );
+        assert_eq!(owner.held(), 0);
+    }
+
+    #[test]
+    fn an_overflowing_length_is_refused_without_a_panic() {
+        let owner = ImageMemory::operation_writer(accountant(1 << 20)).unwrap();
+        let _scope = owner.enter();
+        let mut bytes = vec![253];
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let refused = decode::<Exact>(&bytes).err().expect("refused");
+        assert!(
+            matches!(&refused, Error::Other(reason) if reason.contains("exact sequence length overflows")),
+            "{refused:?}"
+        );
+        assert_eq!(owner.held(), 0);
+    }
+
+    #[test]
+    fn a_truncated_sequence_is_refused_and_returns_its_charge() {
+        let owner = ImageMemory::operation_writer(accountant(1 << 20)).unwrap();
+        let _scope = owner.enter();
+        let mut bytes = encoded(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        bytes.truncate(bytes.len() - 8);
+        assert!(decode::<Exact>(&bytes).is_err());
+        assert_eq!(owner.held(), 0, "a failed decode returns its admission");
     }
 }
