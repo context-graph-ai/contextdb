@@ -3352,17 +3352,19 @@
  const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
      SystemTableDefinition::new("next_savepoint_id");
  pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
-@@ -562,7 +623,8 @@
+@@ -562,7 +623,10 @@
  }
  
  struct TableNamespace<'db> {
 -    open_tables: HashMap<String, &'static panic::Location<'static>>,
 +    open_tables: crate::table_registry::OpenTables,
++    // Read only through the hidden `contextdb-internal` funding surface.
++    #[cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 +    registry_funding: Arc<crate::table_registry::RegistryFunding>,
      allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
      table_tree: TableTreeMut<'db>,
-@@ -585,8 +647,10 @@
+@@ -585,8 +649,10 @@
              freed_pages.clone(),
              allocated.clone(),
          );
@@ -3374,7 +3376,7 @@
              table_tree,
              freed_pages,
              allocated_pages: allocated,
-@@ -621,7 +685,7 @@
+@@ -621,7 +687,7 @@
              .table_tree
              .get_or_create_table::<K, V>(name, table_type)?;
          self.open_tables
@@ -3383,7 +3385,7 @@
  
          Ok(root)
      }
-@@ -752,6 +816,116 @@
+@@ -752,6 +818,116 @@
          self.table_tree
              .stage_update_table_root(name, table.get_root(), length);
      }
@@ -3500,7 +3502,7 @@
  }
  
  // Transaction-local savepoint lifecycle state.
-@@ -814,6 +988,19 @@
+@@ -814,6 +990,19 @@
          // shared tracker, so dropping them is sufficient.
          self.invalidated.clear();
      }
@@ -3520,7 +3522,7 @@
  }
  
  /// A read/write transaction
-@@ -832,9 +1019,77 @@
+@@ -832,9 +1021,77 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
@@ -3598,7 +3600,7 @@
  }
  
  impl WriteTransaction {
-@@ -850,8 +1105,16 @@
+@@ -850,8 +1107,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -3615,7 +3617,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +1127,111 @@
+@@ -864,9 +1129,111 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -3727,7 +3729,7 @@
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1257,29 @@
+@@ -892,6 +1259,29 @@
              return Ok(true);
          }
  
@@ -3757,7 +3759,7 @@
          Ok(false)
      }
  
-@@ -1349,7 +1737,206 @@
+@@ -1349,7 +1739,206 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -3964,7 +3966,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +1960,13 @@
+@@ -1373,6 +1962,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -3978,7 +3980,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +1978,21 @@
+@@ -1384,10 +1980,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -4001,7 +4003,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +2017,29 @@
+@@ -1412,7 +2019,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -4032,7 +4034,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +2085,39 @@
+@@ -1458,9 +2087,39 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -4072,7 +4074,7 @@
      }
  
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +2126,45 @@
+@@ -1469,11 +2128,45 @@
              self.two_phase_commit = true;
          }
  
@@ -4120,7 +4122,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +2175,102 @@
+@@ -1484,6 +2177,102 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -4223,7 +4225,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,18 +2414,39 @@
+@@ -1627,18 +2416,39 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -4267,7 +4269,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2488,17 @@
+@@ -1680,7 +2490,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -4286,7 +4288,7 @@
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2506,11 @@
+@@ -1688,6 +2508,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -4298,7 +4300,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2521,146 @@
+@@ -1698,6 +2523,146 @@
              self.mem.free(page, &mut PageTrackerPolicy::Ignore);
          }
  
@@ -4445,7 +4447,7 @@
          Ok(())
      }
  
-@@ -1766,6 +2729,9 @@
+@@ -1766,6 +2731,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -4455,7 +4457,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2789,384 @@
+@@ -1823,46 +2791,384 @@
          Ok(progress)
      }
  
@@ -4870,7 +4872,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +3341,18 @@
+@@ -2037,6 +3343,18 @@
          })
      }
  
@@ -4889,7 +4891,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +3423,148 @@
+@@ -2107,18 +3425,148 @@
      tree: TableTree,
  }
  
@@ -5039,7 +5041,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3581,69 @@
+@@ -2135,12 +3583,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -5110,7 +5112,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +3664,7 @@
+@@ -2161,7 +3666,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -5119,7 +5121,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +3692,7 @@
+@@ -2189,7 +3694,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -5128,7 +5130,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +3720,7 @@
+@@ -2217,7 +3722,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -5137,7 +5139,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +3766,15 @@
+@@ -2263,7 +3768,15 @@
  
  #[cfg(test)]
  mod test {
@@ -5154,7 +5156,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3795,919 @@
+@@ -2284,4 +3797,919 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }

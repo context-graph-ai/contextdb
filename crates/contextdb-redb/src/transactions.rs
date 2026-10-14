@@ -624,6 +624,8 @@ impl<'db> SystemNamespace<'db> {
 
 struct TableNamespace<'db> {
     open_tables: crate::table_registry::OpenTables,
+    // Read only through the hidden `contextdb-internal` funding surface.
+    #[cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
     registry_funding: Arc<crate::table_registry::RegistryFunding>,
     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
