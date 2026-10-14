@@ -50,7 +50,12 @@ fn probe(label: &'static str, phase: u8, _invoice: usize, _held: usize) {
 
 /// Run one terminal selection observed at every refund: its answer, the
 /// largest unadmitted excess at a refund, and how many refunds were seen.
+/// A fresh undelivered unit is committed first, so the read's root is new and
+/// no closure check certified at an earlier root is skipped: every read walks
+/// the same whole closure.
 fn observed(edge: &Database) -> (Result<Vec<String>, Error>, usize, isize, usize) {
+    static NEXT: AtomicUsize = AtomicUsize::new(1_000);
+    commit_long_unit(edge, NEXT.fetch_add(1, Ordering::SeqCst));
     EXCESS.store(isize::MIN, Ordering::SeqCst);
     RELEASES.store(0, Ordering::SeqCst);
     BASE.store(live_allocations_for_test(), Ordering::SeqCst);
