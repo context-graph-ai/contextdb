@@ -1778,7 +1778,7 @@ pub(crate) struct NativeDeliveryBytes {
     bytes: Vec<u8>,
     #[allow(
         dead_code,
-        reason = "native delivery code is staged ahead of its first non-test caller"
+        reason = "held only so the credit is returned when the image drops"
     )]
     invoice: contextdb_core::read_memory::ReadCredit,
 }

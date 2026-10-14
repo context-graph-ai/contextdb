@@ -20022,7 +20022,7 @@ struct NativeRequestState {
     work_units: u64,
     #[allow(
         dead_code,
-        reason = "native delivery code is staged ahead of its first non-test caller"
+        reason = "staged counter that no non-test path reads yet"
     )]
     rows_so_far: u64,
     bytes_so_far: u64,

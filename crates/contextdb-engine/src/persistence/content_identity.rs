@@ -9009,8 +9009,6 @@ pub(crate) mod original_writer {
         }
     }
 
-    // The exact payload capacity mutation_tree_key requests for this encoding.
-
     impl RedbPersistence {
         pub(crate) fn apply_owned_content_identity_with_manifests_in_write(
             write_txn: &redb::WriteTransaction,

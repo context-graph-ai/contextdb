@@ -476,7 +476,7 @@ struct OwnedTerminalApplyScope {
     previous: Option<OwnedTerminalApplyBinding>,
     #[allow(
         dead_code,
-        reason = "native delivery code is staged ahead of its first non-test caller"
+        reason = "held only so the reservation is released when the scope drops"
     )]
     control: crate::memory_accounting::OwnedMemoryReservation,
 }

@@ -481,25 +481,6 @@ fn options(limit: usize) -> DatabaseOpenOptions {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
-fn partition_status(db: &Database) -> HashMap<String, Value> {
-    let result = db
-        .execute(
-            "SHOW VECTOR_PARTITIONS FOR points.embedding",
-            &HashMap::new(),
-        )
-        .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    result
-        .columns
-        .into_iter()
-        .zip(result.rows.into_iter().next().unwrap())
-        .collect()
-}
-
 /// A built 16-row graph of 3-dimension vectors, 2,048 more rows absorbed as
 /// a native tail, a replacement queued, and one later commit.
 fn queued_replacement_with_a_later_commit(path: &std::path::Path) -> Database {
