@@ -505,6 +505,14 @@ pages, plus the trailing region. The old page count in `resize_to` is (regions â
 plus the last region's length. No open, save, trim or resize visits a region to compute them. A
 test-seams counter of geometry region visits proves this.
 
+**Lowest-first placement.** `TransactionalMemory::allocate` takes the lowest free pages
+(`allocate_helper(.., lowest = true, ..)`), as relocation already did. First-fit-by-order could
+put a small block at the very end of a grown file, because growth from an odd length leaves
+buddy fragments at both ends of the new space. One page there pins the tail: no trim, and the
+free space before it reads as reclaimable, so a compacted store restarted automatic compaction on
+every reopen. The quick-repair close's allocator-state save is an ordinary allocation, so it now
+lands low too and the close's trim returns the end of the file.
+
 **Accessors.** Production gets one hidden accessor, `Database::allocator_free_totals`. It
 returns `(free, region pages, trailing free pages)`. The trailing run comes from the last
 region's `trailing_free_pages()`, the same bounded walk over buddy blocks that `try_shrink` does
