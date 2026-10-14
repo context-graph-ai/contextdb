@@ -2483,6 +2483,11 @@ impl WriteTransaction {
                 .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
         }
 
+        // The saved allocator state is placed at the lowest free pages, so a
+        // close after compaction leaves the end of the file free to trim.
+        let _lowest_placement = self
+            .quick_repair
+            .then(TransactionalMemory::lowest_placement_scope);
         if self.quick_repair {
             system_tree.create_table_and_flush_table_root(
                 ALLOCATOR_STATE_TABLE_NAME,
@@ -2599,6 +2604,11 @@ impl WriteTransaction {
                 .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
         }
 
+        // The saved allocator state is placed at the lowest free pages, so a
+        // close after compaction leaves the end of the file free to trim.
+        let _lowest_placement = self
+            .quick_repair
+            .then(TransactionalMemory::lowest_placement_scope);
         if self.quick_repair {
             system_tree.create_table_and_flush_table_root(
                 ALLOCATOR_STATE_TABLE_NAME,

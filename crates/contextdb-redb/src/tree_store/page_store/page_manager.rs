@@ -208,6 +208,23 @@ fn free_totals_save_override() -> Option<crate::db::FreeTotalsSaveForTest> {
     FREE_TOTALS_SAVE_OVERRIDE.with(|slot| slot.borrow().clone())
 }
 
+thread_local! {
+    /// While set, ordinary allocations on this thread take the lowest free
+    /// pages instead of the first free block of their order.
+    static LOWEST_PLACEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the thread's previous placement when dropped.
+pub(crate) struct LowestPlacementScope {
+    previous: bool,
+}
+
+impl Drop for LowestPlacementScope {
+    fn drop(&mut self) {
+        LOWEST_PLACEMENT.with(|lowest| lowest.set(self.previous));
+    }
+}
+
 struct InMemoryState {
     header: DatabaseHeader,
     // TODO: we should make this an Option because it is only valid after the Database initializes it
@@ -1879,11 +1896,22 @@ impl TransactionalMemory {
         allocation_size: usize,
         allocated: &mut PageTrackerPolicy,
     ) -> Result<PageMut<'txn>> {
-        let result = self.allocate_helper(allocation_size, false, true);
+        let lowest = LOWEST_PLACEMENT.with(std::cell::Cell::get);
+        let result = self.allocate_helper(allocation_size, lowest, true);
         if let Ok(ref page) = result {
             allocated.insert(page.get_page_number());
         }
         result
+    }
+
+    /// Place this thread's ordinary allocations at the lowest free pages
+    /// until the returned scope drops. The quick-repair save uses it, so the
+    /// saved allocator state never lands in the trailing free run, where it
+    /// would stop the same commit's trim and pin the end of the file.
+    pub(crate) fn lowest_placement_scope() -> LowestPlacementScope {
+        LowestPlacementScope {
+            previous: LOWEST_PLACEMENT.with(|lowest| lowest.replace(true)),
+        }
     }
 
     pub(crate) fn allocate_lowest<'txn>(&self, allocation_size: usize) -> Result<PageMut<'txn>> {
