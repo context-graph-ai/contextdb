@@ -3114,37 +3114,34 @@ mod durable {
                 fetch(&mut committed, &mut scratch, key)?;
             }
         }
-        let current = |key: &str| -> Option<&Record> {
-            match delta.get(key) {
-                Some(next) => next.as_ref(),
-                None => committed.get(key).and_then(|(record, _)| record.as_ref()),
-            }
-        };
-        let mut plans = AdmittedVec::<(&String, AdmittedKeys<String, ()>)>::with_exact(
-            memory.clone(),
-            "custody_delta_plans",
-            affected.len(),
-        )?;
+        // One affected record at a time: its companion keys, the committed
+        // companions it still needs, its validation, then its companion keys
+        // dropped before the next record. No record's companion set is held
+        // beside another's.
         for key in affected.keys() {
-            if let Some(record) = current(key) {
-                plans.push_within((key, companion_keys(r, key, record, Some(&delta), &memory)?))?;
-            }
-        }
-        for (_, companions) in plans.as_slice() {
-            for key in companions.keys() {
-                if !delta.contains(key.as_str()) {
-                    fetch(&mut committed, &mut scratch, key)?;
+            let companions = {
+                let record = match delta.get(key.as_str()) {
+                    Some(next) => next.as_ref(),
+                    None => committed
+                        .get(key.as_str())
+                        .and_then(|(record, _)| record.as_ref()),
+                };
+                let Some(record) = record else {
+                    continue;
+                };
+                companion_keys(r, key, record, Some(&delta), &memory)?
+            };
+            for companion in companions.keys() {
+                if !delta.contains(companion.as_str()) {
+                    fetch(&mut committed, &mut scratch, companion)?;
                 }
             }
-        }
-        // `committed` grew; borrow it afresh for the verification pass.
-        let current = |key: &str| -> Option<&Record> {
-            match delta.get(key) {
-                Some(next) => next.as_ref(),
-                None => committed.get(key).and_then(|(record, _)| record.as_ref()),
-            }
-        };
-        for (key, companions) in plans.as_slice() {
+            let current = |key: &str| -> Option<&Record> {
+                match delta.get(key) {
+                    Some(next) => next.as_ref(),
+                    None => committed.get(key).and_then(|(record, _)| record.as_ref()),
+                }
+            };
             let record = current(key).ok_or_else(invalid)?;
             // The companion view; the admitted verifier funds its own work.
             let mut view = AdmittedVec::<&Record>::with_exact(
@@ -3158,8 +3155,9 @@ mod durable {
                 }
             }
             validate_record_owned(db, record, view.as_slice())?;
+            drop(view);
+            drop(companions);
         }
-        drop(plans);
         drop(group);
         drop(affected);
         drop(committed);
