@@ -3,8 +3,8 @@
 //! partition. Those decoded bodies are admitted once, in the import's writer
 //! workspace, before they are read. The decode itself must then be charged to
 //! the declared writer limit for exactly as long as one stored value is being
-//! decoded -- never a second time for the copy the workspace already paid
-//! for, never accumulated across stored bodies that are already freed -- and
+//! decoded -- never a second time for the kept vector the workspace already
+//! paid for, never accumulated across stored values that are already freed -- and
 //! an import whose new vectors exceed the writer budget must still complete,
 //! in committed cohorts, without the budget being raised.
 use contextdb_core::{Value, Wallclock, read_contract::ReadLimits};
@@ -15,7 +15,9 @@ use contextdb_engine::vector_observations::{
     ImportTailLoadBoundaryForTest, ImportTailLoadForTest, VectorJournalReplayWork,
     observe_import_tail_loads_for_test, observe_journal_replay,
 };
-use contextdb_engine::vector_read_memory::reader_parents_created_for_test;
+use contextdb_engine::vector_read_memory::{
+    reader_parents_created_for_test, unowned_decodes_for_test,
+};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::{
     collections::HashMap,
@@ -32,12 +34,15 @@ const TARGET_ID: i64 = 1_000_000;
 const SITE: &str = "persist_import_vector_tail";
 const CANDIDATE_SITE: &str = "catch_up_native_import_candidate";
 const DECODE_OWNER: (&str, &str) = ("writer_source", "decode_stored_value");
-/// The writer's live decode charge while one stored 1536-dimension vector
-/// decodes, above what the load found charged at its start. It is the same
-/// for every value and every suffix size: the stored body's codec growth
-/// allowance (48 + 16 * 1535 = 24,608), the index name it carries ("points"
-/// and "embedding", 15) and its owned copy (1536 * 4 = 6,144).
-const DECODE_PEAK_PER_VALUE: usize = 30_767;
+/// The writer's live decode charge while one stored value decodes, above
+/// what the load found charged at its start: the same for every value and
+/// every suffix size. The kept 1536-dimension vector is decoded into exactly
+/// its length and adopts the workspace's prepaid credit, so it is NOT part of
+/// this charge; what remains is the value's record, names and decode control
+/// (measured at 256 and 512 vectors: identical).
+const DECODE_PEAK_PER_VALUE: usize = 1_726;
+/// One kept vector's decoded body, prepaid in the import workspace.
+const KEPT_VECTOR_BYTES: usize = DIMENSION * 4;
 
 fn vector_for(id: i64) -> Vec<f32> {
     (0..DIMENSION)
@@ -58,15 +63,11 @@ fn append(db: &Database, id: i64, vector: Vec<f32>) {
 
 /// A built 16-row graph, then `suffix_rows` single-row commits and the target.
 fn fixture(path: &std::path::Path, limit: usize, suffix_rows: usize) -> Database {
-    let db = Database::open_with_options(
-        path,
-        DatabaseOpenOptions {
-            maintenance_policy: MaintenancePolicy::CallerDriven,
-            memory_limit: Some(limit),
-            ..DatabaseOpenOptions::default()
-        },
-    )
-    .unwrap();
+    // Readers are declared large enough to search a pending suffix; the
+    // writer limit is what these tests hold fixed.
+    let mut options = options(limit);
+    options.owner_reads.limits.limits.memory = 1 << 30;
+    let db = Database::open_with_options(path, options).unwrap();
     db.execute(
         &format!(
             "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)"
@@ -205,11 +206,17 @@ fn absorb_roomy(suffix_rows: usize) -> Load {
     );
     let (loads, observation) = record_loads(|_| None, ROOMY_LIMIT);
     let parents = reader_parents_created_for_test();
+    let unowned = unowned_decodes_for_test();
     assert!(db.persist_import_vector_tails().unwrap());
     assert_eq!(
         reader_parents_created_for_test(),
         parents,
         "no private reader"
+    );
+    assert_eq!(
+        unowned_decodes_for_test(),
+        unowned,
+        "no import-tail decode falls back to the private default accountant"
     );
     drop(observation);
     assert_searchable(&db, suffix_rows);
@@ -221,8 +228,10 @@ fn absorb_roomy(suffix_rows: usize) -> Load {
     assert_eq!(
         load.exit.boundary,
         ImportTailLoadBoundaryForTest::Loaded {
-            vectors: suffix_rows + 1
-        }
+            vectors: suffix_rows + 1,
+            adopted_output: (suffix_rows + 1) * KEPT_VECTOR_BYTES,
+        },
+        "every kept vector adopts its prepaid workspace credit, once"
     );
     assert_owned_by_the_writer(&load);
     load
@@ -244,8 +253,14 @@ fn an_import_tail_decode_is_charged_once_per_stored_value_and_returned_at_both_l
             load.decode_admissions()
         );
         assert!(
-            load.peak_above_enter() >= DIMENSION * 4,
-            "each stored body is charged to the writer while it decodes"
+            load.peak_above_enter() > 0,
+            "each stored value's decode is charged to the writer while it decodes"
+        );
+        assert!(
+            load.peak_above_enter() < KEPT_VECTOR_BYTES,
+            "the kept vector is prepaid by the workspace; charging it again in the \
+             decode owner is the double charge this rejects: {}",
+            load.peak_above_enter()
         );
         assert_eq!(
             load.peak_above_enter(),
@@ -285,7 +300,8 @@ fn a_tight_writer_limit_refuses_a_missing_and_admits_no_duplicate_decode_charge(
     assert_eq!(
         loads[0].exit.boundary,
         ImportTailLoadBoundaryForTest::Loaded {
-            vectors: suffix_rows + 1
+            vectors: suffix_rows + 1,
+            adopted_output: (suffix_rows + 1) * KEPT_VECTOR_BYTES,
         }
     );
     assert_searchable(&db, suffix_rows);
@@ -369,6 +385,13 @@ fn an_import_larger_than_the_writer_limit_is_absorbed_in_committed_cohorts_witho
             "a cohort's decoded vectors take at most a sixteenth of the limit: {:?}",
             load.enter
         );
+        assert_eq!(
+            load.exit.boundary,
+            ImportTailLoadBoundaryForTest::Loaded {
+                vectors: load.enter.cohort_vectors,
+                adopted_output: load.enter.cohort_vectors * KEPT_VECTOR_BYTES,
+            }
+        );
         assert_owned_by_the_writer(load);
     }
     assert_searchable(&db, suffix_rows);
@@ -442,7 +465,501 @@ fn a_completed_replacement_catches_up_its_import_cohort_under_the_writer() {
     assert_eq!(candidate[0].enter.cohort_vectors, 1);
     assert_eq!(
         candidate[0].exit.boundary,
-        ImportTailLoadBoundaryForTest::Loaded { vectors: 1 }
+        ImportTailLoadBoundaryForTest::Loaded {
+            vectors: 1,
+            adopted_output: 3 * 4,
+        }
     );
     assert_owned_by_the_writer(candidate[0]);
+}
+
+fn options(limit: usize) -> DatabaseOpenOptions {
+    DatabaseOpenOptions {
+        maintenance_policy: MaintenancePolicy::CallerDriven,
+        memory_limit: Some(limit),
+        ..DatabaseOpenOptions::default()
+    }
+}
+
+fn partition_status(db: &Database) -> HashMap<String, Value> {
+    let result = db
+        .execute(
+            "SHOW VECTOR_PARTITIONS FOR points.embedding",
+            &HashMap::new(),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    result
+        .columns
+        .into_iter()
+        .zip(result.rows.into_iter().next().unwrap())
+        .collect()
+}
+
+/// A built 16-row graph of 3-dimension vectors, 2,048 more rows absorbed as
+/// a native tail, a replacement queued, and one later commit.
+fn queued_replacement_with_a_later_commit(path: &std::path::Path) -> Database {
+    let db = Database::open_with_options(path, options(64 * 1024 * 1024)).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512))", &HashMap::new()).unwrap();
+    let small = |id: i64, vector: Vec<f32>| {
+        db.execute(
+            "INSERT INTO points VALUES ($id, 1, $vector)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("vector".into(), Value::Vector(vector)),
+            ]),
+        )
+        .unwrap();
+    };
+    for id in 0..16 {
+        small(id, vec![0.0, 1.0, id as f32 + 1.0]);
+    }
+    while db
+        .run_maintenance_cycle()
+        .unwrap()
+        .vector
+        .remaining_partitions
+        != 0
+    {}
+    for id in 16..2064 {
+        small(id, vec![0.0, 1.0, id as f32 + 1.0]);
+    }
+    small(10_000, vec![1.0, 0.0, 0.0]);
+    assert!(db.persist_import_vector_tails().unwrap());
+    let pending = db.run_maintenance_cycle().unwrap().vector;
+    assert!(
+        pending.first_failure.is_none(),
+        "{:?}",
+        pending.first_failure
+    );
+    small(10_001, vec![0.0, 0.0, 1.0]);
+    db
+}
+
+#[test]
+fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let root = tempfile::tempdir().unwrap();
+    let db = queued_replacement_with_a_later_commit(&root.path().join("candidate-refusal.db"));
+    // The first catch-up load gets no headroom at all: its first decode
+    // admission must refuse, and the refusal must leave nothing charged.
+    let tightened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let once = tightened.clone();
+    let (loads, observation) = record_loads(
+        move |enter| {
+            (enter.site == CANDIDATE_SITE && !once.swap(true, Ordering::SeqCst))
+                .then_some(enter.writer_used)
+        },
+        64 * 1024 * 1024,
+    );
+    let mut refused_reports = 0;
+    for _ in 0..128 {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        if report.first_failure.is_some() {
+            refused_reports += 1;
+        }
+        if loads.lock().iter().any(|load| {
+            load.enter.site == CANDIDATE_SITE
+                && matches!(
+                    load.exit.boundary,
+                    ImportTailLoadBoundaryForTest::Loaded { .. }
+                )
+        }) {
+            break;
+        }
+    }
+    drop(observation);
+    let loads = std::mem::take(&mut *loads.lock());
+    let candidate: Vec<&Load> = loads
+        .iter()
+        .filter(|load| load.enter.site == CANDIDATE_SITE)
+        .collect();
+    eprintln!("candidate refusal then catch-up: {candidate:?}");
+    assert_eq!(candidate.len(), 2, "{loads:?}");
+    let refusal = match &candidate[0].exit.boundary {
+        ImportTailLoadBoundaryForTest::Refused { error } => error.clone(),
+        other => panic!("the tightened catch-up must refuse at its decode, saw {other:?}"),
+    };
+    assert!(
+        refusal.starts_with("memory budget exceeded: writer_source/decode_stored_value requested "),
+        "{refusal}"
+    );
+    assert_eq!(refused_reports, 1, "the refusal is reported once");
+    assert_eq!(candidate[0].exit.decode_held, 0, "{:?}", candidate[0].exit);
+    assert_eq!(
+        candidate[0].exit.writer_used, candidate[0].enter.writer_used,
+        "a refused catch-up returns every decode charge it made"
+    );
+    assert_eq!(
+        candidate[1].exit.boundary,
+        ImportTailLoadBoundaryForTest::Loaded {
+            vectors: 1,
+            adopted_output: 3 * 4,
+        }
+    );
+    assert_owned_by_the_writer(candidate[1]);
+    let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1";
+    assert_eq!(
+        db.execute(
+            query,
+            &HashMap::from([("q".into(), Value::Vector(vec![0.0, 0.0, 1.0]))])
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Int64(10_001)]]
+    );
+}
+
+const CRASH_LIMIT: usize = 16 * 1024 * 1024;
+const CRASH_SUFFIX_ROWS: usize = 3000;
+
+/// The writer stays at 16 MiB; the reader is declared large enough to search
+/// a pending suffix of 2,840 1536-dimension vectors while it is pending.
+fn crash_options() -> DatabaseOpenOptions {
+    let mut options = options(CRASH_LIMIT);
+    options.owner_reads.limits.limits.memory = 1 << 30;
+    options
+}
+
+fn nearest(db: &Database, query: Vec<f32>) -> Vec<Vec<Value>> {
+    db.execute(
+        "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+        &HashMap::from([("q".into(), Value::Vector(query))]),
+    )
+    .unwrap()
+    .rows
+}
+
+/// Inserts the one route's maintained counters hold pending at its serving
+/// coverage. (SHOW VECTOR_PARTITIONS reports a native tail's counters at its
+/// base, for consolidation; readers are admitted from these.)
+fn pending_inserts(db: &Database) -> usize {
+    let pending = db
+        .vector_serving_pending_inserts_for_test("points", "embedding")
+        .unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    pending[0].1
+}
+
+/// Resume the import tail and prove it decodes exactly the pending vectors,
+/// never one an earlier cohort already covered, then finishes the route.
+fn resume_reads_exactly_the_pending(db: &Database, pending: usize) {
+    let replayed = Arc::new(AtomicUsize::new(0));
+    let observed = replayed.clone();
+    let replay = observe_journal_replay(Arc::new(move |event| {
+        if matches!(event.work, VectorJournalReplayWork::Vector { .. }) {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let (loads, observation) = record_loads(|_| None, CRASH_LIMIT);
+    assert!(db.persist_import_vector_tails().unwrap());
+    drop(observation);
+    drop(replay);
+    let loads = std::mem::take(&mut *loads.lock());
+    assert_eq!(
+        replayed.load(Ordering::SeqCst),
+        pending,
+        "resume decodes only what is still pending, never an absorbed cohort"
+    );
+    assert_eq!(
+        loads
+            .iter()
+            .map(|load| load.enter.cohort_vectors)
+            .sum::<usize>(),
+        pending
+    );
+    for load in &loads {
+        assert_owned_by_the_writer(load);
+    }
+    assert_eq!(pending_inserts(db), 0);
+    assert_searchable(db, CRASH_SUFFIX_ROWS);
+}
+
+#[test]
+fn an_import_interrupted_after_one_cohort_publishes_only_that_cohort_and_resumes_without_re_reading_it()
+ {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cohort-interrupt.db");
+    let db = fixture(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS);
+    assert_eq!(pending_inserts(&db), CRASH_SUFFIX_ROWS + 1);
+    // The second cohort's load gets no headroom: the first cohort is
+    // published, the second refuses at its first decode.
+    let started = Arc::new(AtomicUsize::new(0));
+    let count = started.clone();
+    let (loads, observation) = record_loads(
+        move |enter| (count.fetch_add(1, Ordering::SeqCst) == 1).then_some(enter.writer_used),
+        CRASH_LIMIT,
+    );
+    let interrupted = db.persist_import_vector_tails();
+    drop(observation);
+    let loads = std::mem::take(&mut *loads.lock());
+    assert!(interrupted.is_err(), "{interrupted:?}");
+    assert_eq!(loads.len(), 2, "{loads:?}");
+    let first = loads[0].enter.cohort_vectors;
+    assert!(matches!(
+        loads[1].exit.boundary,
+        ImportTailLoadBoundaryForTest::Refused { .. }
+    ));
+    // Coverage ends at the first cohort: every later insert stays pending,
+    // exactly, and the counters say so durably.
+    assert_eq!(pending_inserts(&db), CRASH_SUFFIX_ROWS + 1 - first);
+    // The target is in a later cohort: answered from the pending suffix.
+    let mut target = vec![0.0; DIMENSION];
+    target[0] = 1.0;
+    assert_eq!(nearest(&db, target), vec![vec![Value::Int64(TARGET_ID)]]);
+    // A row of the covered first cohort is answered from the published graph.
+    assert_eq!(
+        nearest(&db, vector_for(BASE_ROWS)),
+        vec![vec![Value::Int64(BASE_ROWS)]]
+    );
+    db.close().unwrap();
+    let db = Database::open_with_options(&path, crash_options()).unwrap();
+    assert_eq!(
+        pending_inserts(&db),
+        CRASH_SUFFIX_ROWS + 1 - first,
+        "the partial coverage and its counters survive a restart"
+    );
+    resume_reads_exactly_the_pending(&db, CRASH_SUFFIX_ROWS + 1 - first);
+}
+
+#[test]
+fn a_crash_between_import_cohorts_keeps_later_cohorts_pending_and_resumes_without_reading_them_twice()
+ {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    if let Ok(path) = std::env::var("S7_IMPORT_COHORT_CRASH_PATH") {
+        let db = Database::open_with_options(path, crash_options()).unwrap();
+        // The first cohort is published; the process dies as the second
+        // cohort's load begins, before it reads anything.
+        let loads = Arc::new(AtomicUsize::new(0));
+        let _observation = observe_import_tail_loads_for_test(Arc::new(move |event| {
+            if event.boundary == ImportTailLoadBoundaryForTest::Enter
+                && loads.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                std::process::exit(77);
+            }
+            None
+        }));
+        db.persist_import_vector_tails().unwrap();
+        panic!("the second cohort's load must be reached");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cohort-crash.db");
+    let db = fixture(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS);
+    assert_eq!(pending_inserts(&db), CRASH_SUFFIX_ROWS + 1);
+    db.close().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("an_import_tail_charges_each_decoded_vector_once::a_crash_between_import_cohorts_keeps_later_cohorts_pending_and_resumes_without_reading_them_twice")
+        .args(["--exact", "--nocapture"])
+        .env("S7_IMPORT_COHORT_CRASH_PATH", &path)
+        .status()
+        .unwrap();
+    assert_eq!(
+        child.code(),
+        Some(77),
+        "the second cohort's start is reached"
+    );
+    let db = Database::open_with_options(&path, crash_options()).unwrap();
+    // A cohort publication is durable only once the store commits durably
+    // after it; the crash may lose the first cohort's publication but never
+    // leaves coverage and counters disagreeing. Whatever survived, exactly
+    // the rest is pending, and resume reads exactly that.
+    let pending = pending_inserts(&db);
+    eprintln!("after the crash: pending_inserts={pending}");
+    assert!(pending <= CRASH_SUFFIX_ROWS + 1 && pending > 0, "{pending}");
+    let mut target = vec![0.0; DIMENSION];
+    target[0] = 1.0;
+    assert_eq!(nearest(&db, target), vec![vec![Value::Int64(TARGET_ID)]]);
+    resume_reads_exactly_the_pending(&db, pending);
+}
+
+fn absorb_quantized(quantization: &str) {
+    const QUANTIZED_DIMENSION: usize = 64;
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open_with_options(
+        root.path().join(format!("{quantization}.db")),
+        options(ROOMY_LIMIT),
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({QUANTIZED_DIMENSION}) WITH (quantization = '{quantization}') PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)"
+        ),
+        &HashMap::new(),
+    )
+    .unwrap();
+    let vector = |id: i64| -> Vec<f32> {
+        (0..QUANTIZED_DIMENSION)
+            .map(|lane| (((id as f32) * 0.618 + lane as f32 * 0.37).sin() * 0.5) + 0.5)
+            .collect()
+    };
+    let insert = |id: i64, value: Vec<f32>| {
+        db.execute(
+            "INSERT INTO points VALUES ($id, 1, $vector)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("vector".into(), Value::Vector(value)),
+            ]),
+        )
+        .unwrap();
+    };
+    for id in 0..BASE_ROWS {
+        insert(id, vector(id));
+    }
+    while db
+        .run_maintenance_cycle()
+        .unwrap()
+        .vector
+        .remaining_partitions
+        != 0
+    {}
+    let suffix = 200usize;
+    for id in BASE_ROWS..BASE_ROWS + suffix as i64 {
+        insert(id, vector(id));
+    }
+    let mut target = vec![0.0; QUANTIZED_DIMENSION];
+    target[0] = 1.0;
+    insert(TARGET_ID, target.clone());
+    let (loads, observation) = record_loads(|_| None, ROOMY_LIMIT);
+    assert!(db.persist_import_vector_tails().unwrap());
+    drop(observation);
+    let loads = std::mem::take(&mut *loads.lock());
+    assert_eq!(loads.len(), 1, "{loads:?}");
+    // The quantized payload is decode scratch; its expansion is the kept
+    // vector, adopted from the prepaid workspace once per vector.
+    assert_eq!(
+        loads[0].exit.boundary,
+        ImportTailLoadBoundaryForTest::Loaded {
+            vectors: suffix + 1,
+            adopted_output: (suffix + 1) * QUANTIZED_DIMENSION * 4,
+        },
+        "{quantization}"
+    );
+    assert_owned_by_the_writer(&loads[0]);
+    assert_eq!(
+        db.execute(
+            "SELECT COUNT(*) FROM points WHERE bucket = 1",
+            &HashMap::new()
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Int64(BASE_ROWS + suffix as i64 + 1)]]
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            &HashMap::from([("q".into(), Value::Vector(target))]),
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Int64(TARGET_ID)]],
+        "{quantization}"
+    );
+}
+
+#[test]
+fn quantized_import_vectors_decode_exactly_with_their_expansion_prepaid() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    absorb_quantized("SQ8");
+    absorb_quantized("SQ4");
+}
+
+/// One INSERT of `rows` vectors is one committed LSN. Returns whether it
+/// committed under `limit`, and if so whether its import tail was absorbed.
+fn one_commit_of(rows: usize, limit: usize) -> (bool, Result<bool, String>) {
+    let root = tempfile::tempdir().unwrap();
+    let db = fixture(&root.path().join("one-commit.db"), limit, 0);
+    let mut sql = String::from("INSERT INTO points VALUES ");
+    let mut params = HashMap::new();
+    for row in 0..rows {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("($i{row}, 1, $v{row})"));
+        let id = 2_000_000 + row as i64;
+        params.insert(format!("i{row}"), Value::Int64(id));
+        params.insert(format!("v{row}"), Value::Vector(vector_for(id)));
+    }
+    if db.execute(&sql, &params).is_err() {
+        return (false, Ok(false));
+    }
+    (
+        true,
+        db.persist_import_vector_tails()
+            .map_err(|error| error.to_string()),
+    )
+}
+
+#[test]
+fn every_commit_the_writer_accepted_is_absorbed_under_the_same_limit() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    // One committed LSN is the import tail's smallest unit of coverage. A
+    // commit holds all its vectors under the writer's declared limit; its
+    // import tail must then fit under that same limit, whatever its size.
+    let mut largest_committed = 0;
+    for rows in [4096usize, 2048, 1024, 512, 256, 128, 64] {
+        let (committed, absorbed) = one_commit_of(rows, 16 * 1024 * 1024);
+        eprintln!(
+            "one commit of {rows} vectors under 16 MiB: committed={committed} absorbed={absorbed:?}"
+        );
+        if committed {
+            largest_committed = largest_committed.max(rows);
+            assert_eq!(absorbed, Ok(true), "{rows} vectors in one commit");
+        }
+    }
+    assert!(
+        largest_committed > 0,
+        "at least one single-commit size is exercised"
+    );
+}
+
+#[test]
+fn a_committed_lsn_larger_than_a_lowered_limit_is_refused_naming_its_lsn_and_bytes() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("lowered.db");
+    let db = fixture(&path, ROOMY_LIMIT, 0);
+    let rows = 4096usize;
+    let mut sql = String::from("INSERT INTO points VALUES ");
+    let mut params = HashMap::new();
+    for row in 0..rows {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("($i{row}, 1, $v{row})"));
+        let id = 2_000_000 + row as i64;
+        params.insert(format!("i{row}"), Value::Int64(id));
+        params.insert(format!("v{row}"), Value::Vector(vector_for(id)));
+    }
+    db.execute(&sql, &params).unwrap();
+    db.close().unwrap();
+    // The operator reopens with a limit below what that one commit's
+    // decoded vectors need (4,096 x 6,144 B = 24 MiB > 16 MiB).
+    let db = Database::open_with_options(&path, options(16 * 1024 * 1024)).unwrap();
+    let refused = db
+        .persist_import_vector_tails()
+        .expect_err("one commit's vectors are covered as one unit")
+        .to_string();
+    eprintln!("lowered-limit refusal: {refused}");
+    assert!(
+        refused.starts_with("memory budget exceeded: vector_index/persist_import_vector_tail "),
+        "{refused}"
+    );
+    assert!(refused.contains("committed at LSN "), "{refused}");
+    assert!(
+        refused.contains(&format!("{rows} new vectors")),
+        "the refusal names how many vectors the commit holds: {refused}"
+    );
+    db.close().unwrap();
+    let db = Database::open_with_options(&path, options(ROOMY_LIMIT)).unwrap();
+    assert!(db.persist_import_vector_tails().unwrap());
+    assert_eq!(
+        db.execute(
+            "SELECT COUNT(*) FROM points WHERE bucket = 1",
+            &HashMap::new()
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Int64(BASE_ROWS + rows as i64 + 1)]]
+    );
 }
