@@ -58,107 +58,282 @@ const HOLD_RELATIONS_HINT: &str =
     "Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to.";
 impl RowHeadAdmission for content_identity::ProofAdmission {
     fn admit_held_relations(&mut self, bytes: usize) -> Result<()> {
-        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)?;
-        #[cfg(test)]
-        staging_witness::charged(true, bytes);
-        Ok(())
+        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)
     }
     fn release_held_relations(&mut self, bytes: usize) {
         self.release(bytes);
-        #[cfg(test)]
-        staging_witness::charged(false, bytes);
     }
 }
 impl RowHeadAdmission for content_identity::original_writer::ProofAdmission {
     fn admit_held_relations(&mut self, bytes: usize) -> Result<()> {
-        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)?;
-        #[cfg(test)]
-        staging_witness::charged(true, bytes);
-        Ok(())
+        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)
     }
     fn release_held_relations(&mut self, bytes: usize) {
         self.release(bytes);
-        #[cfg(test)]
-        staging_witness::charged(false, bytes);
     }
 }
 
-/// One ordered record, on the test thread, of the holder's charges and of
-/// every allocation and free of one chosen size (a storage name's length),
-/// fed by the lib test binary's global allocator. Recording never allocates:
-/// the log is a fixed array, and a full log is reported, not truncated.
+/// What a holder charge funds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Charge {
+    TempName,
+    Names,
+    Registry,
+    Scratch,
+    Slots,
+    Nodes,
+}
+
+/// One ordered record, on the test thread, of the holder's charges and of the
+/// allocations they fund, fed by the lib test binary's global allocator.
+/// Each admission names the allocations it expects; the next allocations of
+/// those sizes are tagged with its category, and every free of a tagged (or
+/// watched-size) address is recorded. At every release and at every injected
+/// fault, each category's live tagged bytes must fit in what is still charged
+/// for it, so a charge released before its memory is freed is caught where it
+/// happens. The scratch replacement's release is the declared transfer to the
+/// baseline allowance: its array stays live. Recording never allocates.
 #[cfg(test)]
 pub(crate) mod staging_witness {
+    use super::Charge;
     use std::cell::{Cell, RefCell};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Event {
-        Admit(usize),
-        Release(usize),
-        Alloc(usize),
+        Admit(Charge, usize),
+        Release(Charge, usize),
+        /// A tagged allocation, or an untagged one of the watched size.
+        Alloc(Option<Charge>, usize),
         Free(usize),
         /// Whether a relation was already staged when the holder first used it.
         Staged(bool),
+        Fault,
     }
 
-    const CAPACITY: usize = 4096;
+    /// The first category whose live tagged bytes exceeded what was charged.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Overrun {
+        pub(crate) charge: Charge,
+        pub(crate) live: usize,
+        pub(crate) charged: usize,
+        pub(crate) at_event: usize,
+    }
+
+    const CAPACITY: usize = 16_384;
+    const LIVE: usize = 2_048;
+    const EXPECTED: usize = 64;
+    const CHARGES: [Charge; 6] = [
+        Charge::TempName,
+        Charge::Names,
+        Charge::Registry,
+        Charge::Scratch,
+        Charge::Slots,
+        Charge::Nodes,
+    ];
     thread_local! {
-        static SIZE: Cell<usize> = const { Cell::new(0) };
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static WATCHED: Cell<usize> = const { Cell::new(0) };
         static LEN: Cell<usize> = const { Cell::new(0) };
         static LOG: RefCell<[Option<Event>; CAPACITY]> = const { RefCell::new([None; CAPACITY]) };
+        static LIVE_TAGGED: RefCell<[Option<(usize, Charge, usize)>; LIVE]> =
+            const { RefCell::new([None; LIVE]) };
+        static EXPECTING: RefCell<[Option<(Charge, usize, usize)>; EXPECTED]> =
+            const { RefCell::new([None; EXPECTED]) };
+        static CHARGED: Cell<[usize; 6]> = const { Cell::new([0; 6]) };
+        static OVERRUN: Cell<Option<Overrun>> = const { Cell::new(None) };
+    }
+
+    fn index(charge: Charge) -> usize {
+        CHARGES.iter().position(|known| *known == charge).unwrap()
+    }
+
+    fn armed() -> bool {
+        ARMED.try_with(Cell::get).unwrap_or(false)
     }
 
     fn push(event: Event) {
-        let _ = SIZE.try_with(|size| {
-            if size.get() == 0 {
-                return;
+        LEN.with(|len| {
+            let at = len.get();
+            if at < CAPACITY {
+                LOG.with(|log| log.borrow_mut()[at] = Some(event));
             }
-            LEN.with(|len| {
-                let index = len.get();
-                if index < CAPACITY {
-                    LOG.with(|log| log.borrow_mut()[index] = Some(event));
-                }
-                len.set(index + 1);
-            });
+            len.set(at + 1);
         });
     }
 
-    /// Start recording, watching allocations of exactly `size` bytes.
-    pub(crate) fn arm(size: usize) {
-        LEN.with(|len| len.set(0));
-        SIZE.with(|watched| watched.set(size));
+    fn live_bytes(charge: Charge) -> usize {
+        LIVE_TAGGED.with(|live| {
+            live.borrow()
+                .iter()
+                .flatten()
+                .filter(|(_, tagged, _)| *tagged == charge)
+                .map(|(_, _, size)| *size)
+                .sum()
+        })
     }
 
-    /// Stop recording and return the log.
-    pub(crate) fn take() -> Vec<Event> {
-        SIZE.with(|watched| watched.set(0));
+    fn check(charges: &[Charge]) {
+        for &charge in charges {
+            let live = live_bytes(charge);
+            let charged = CHARGED.with(Cell::get)[index(charge)];
+            if live > charged && OVERRUN.with(Cell::get).is_none() {
+                let at_event = LEN.with(Cell::get);
+                OVERRUN.with(|overrun| {
+                    overrun.set(Some(Overrun {
+                        charge,
+                        live,
+                        charged,
+                        at_event,
+                    }))
+                });
+            }
+        }
+    }
+
+    /// Start recording, also logging untagged allocations of `watched` bytes.
+    pub(crate) fn arm(watched: usize) {
+        LEN.with(|len| len.set(0));
+        LIVE_TAGGED.with(|live| *live.borrow_mut() = [None; LIVE]);
+        EXPECTING.with(|expecting| *expecting.borrow_mut() = [None; EXPECTED]);
+        CHARGED.with(|charged| charged.set([0; 6]));
+        OVERRUN.with(|overrun| overrun.set(None));
+        WATCHED.with(|size| size.set(watched));
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    /// Stop recording; the log and the first overrun, if any.
+    pub(crate) fn take() -> (Vec<Event>, Option<Overrun>) {
+        ARMED.with(|armed| armed.set(false));
         let len = LEN.with(Cell::get);
         assert!(len <= CAPACITY, "the staging witness held every event");
-        LOG.with(|log| log.borrow()[..len].iter().map(|event| event.unwrap()).collect())
+        let events = LOG.with(|log| log.borrow()[..len].iter().map(|event| event.unwrap()).collect());
+        (events, OVERRUN.with(Cell::get))
+    }
+
+    /// Bytes still charged per category, in `Charge` order.
+    pub(crate) fn charged() -> [usize; 6] {
+        CHARGED.with(Cell::get)
+    }
+
+    /// Live tagged allocations: (category, bytes).
+    pub(crate) fn live() -> Vec<(Charge, usize)> {
+        LIVE_TAGGED.with(|live| {
+            live.borrow()
+                .iter()
+                .flatten()
+                .map(|(_, charge, size)| (*charge, *size))
+                .collect()
+        })
+    }
+
+    /// `charge` admitted `bytes`, funding `count` allocations of `size` each.
+    pub(crate) fn admitted(charge: Charge, bytes: usize, count: usize, size: usize) {
+        if !armed() {
+            return;
+        }
+        CHARGED.with(|charged| {
+            let mut all = charged.get();
+            all[index(charge)] += bytes;
+            charged.set(all);
+        });
+        if count > 0 {
+            EXPECTING.with(|expecting| {
+                let mut expecting = expecting.borrow_mut();
+                if let Some(slot) = expecting.iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some((charge, size, count));
+                }
+            });
+        }
+        push(Event::Admit(charge, bytes));
+    }
+
+    /// `charge` released `bytes`: whatever it still expected is not coming.
+    pub(crate) fn released(charge: Charge, bytes: usize) {
+        if !armed() {
+            return;
+        }
+        CHARGED.with(|charged| {
+            let mut all = charged.get();
+            all[index(charge)] = all[index(charge)].saturating_sub(bytes);
+            charged.set(all);
+        });
+        EXPECTING.with(|expecting| {
+            for slot in expecting.borrow_mut().iter_mut() {
+                if slot.is_some_and(|(expected, _, _)| expected == charge) {
+                    *slot = None;
+                }
+            }
+        });
+        push(Event::Release(charge, bytes));
+        if charge == Charge::Scratch {
+            // The prepared array now holds the pass-start tables and stays
+            // with the transaction: the declared baseline transfer.
+            LIVE_TAGGED.with(|live| {
+                for slot in live.borrow_mut().iter_mut() {
+                    if slot.is_some_and(|(_, tagged, _)| tagged == Charge::Scratch) {
+                        *slot = None;
+                    }
+                }
+            });
+        } else {
+            check(&[charge]);
+        }
+    }
+
+    /// An injected fault fired: every category must fit what is charged.
+    pub(crate) fn fault() {
+        if armed() {
+            push(Event::Fault);
+            check(&CHARGES);
+        }
     }
 
     pub(crate) fn allocated(address: usize, size: usize) {
-        if SIZE.try_with(Cell::get).is_ok_and(|watched| watched != 0 && watched == size) {
-            push(Event::Alloc(address));
+        if !armed() {
+            return;
+        }
+        let tag = EXPECTING.with(|expecting| {
+            let mut expecting = expecting.borrow_mut();
+            let slot = expecting
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|(_, expected, _)| expected == size))?;
+            let (charge, expected, count) = slot.unwrap();
+            *slot = (count > 1).then_some((charge, expected, count - 1));
+            Some(charge)
+        });
+        if let Some(charge) = tag {
+            LIVE_TAGGED.with(|live| {
+                if let Some(slot) = live.borrow_mut().iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some((address, charge, size));
+                }
+            });
+            push(Event::Alloc(Some(charge), address));
+        } else if WATCHED.with(Cell::get) == size {
+            push(Event::Alloc(None, address));
         }
     }
 
     pub(crate) fn freed(address: usize, size: usize) {
-        if SIZE.try_with(Cell::get).is_ok_and(|watched| watched != 0 && watched == size) {
+        if !armed() {
+            return;
+        }
+        let tagged = LIVE_TAGGED.with(|live| {
+            let mut live = live.borrow_mut();
+            let slot = live
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|(at, _, _)| at == address))?;
+            *slot = None;
+            Some(())
+        });
+        if tagged.is_some() || WATCHED.with(Cell::get) == size {
             push(Event::Free(address));
         }
     }
 
-    pub(crate) fn charged(admitted: bool, bytes: usize) {
-        push(if admitted {
-            Event::Admit(bytes)
-        } else {
-            Event::Release(bytes)
-        });
-    }
-
     pub(crate) fn staged(staged: bool) {
-        push(Event::Staged(staged));
+        if armed() {
+            push(Event::Staged(staged));
+        }
     }
 }
 
@@ -282,26 +457,67 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         self.ledger
     }
 
-    fn admit(&mut self, bytes: usize) -> Result<()> {
-        self.admission.admit_held_relations(bytes)
+    /// Admit `bytes` for `charge`, which funds `count` allocations of `size`
+    /// bytes each (the witness uses this to tag them).
+    fn admit(&mut self, charge: Charge, bytes: usize, count: usize, size: usize) -> Result<()> {
+        self.admission.admit_held_relations(bytes)?;
+        #[cfg(test)]
+        staging_witness::admitted(charge, bytes, count, size);
+        #[cfg(not(test))]
+        let _ = (charge, count, size);
+        Ok(())
     }
 
-    fn release(&mut self, field: fn(&mut HoldLedger) -> &mut usize) {
-        let bytes = std::mem::take(field(&mut self.ledger));
+    fn release_bytes(&mut self, charge: Charge, bytes: usize) {
         if bytes > 0 {
             self.admission.release_held_relations(bytes);
+            #[cfg(test)]
+            staging_witness::released(charge, bytes);
         }
+        #[cfg(not(test))]
+        let _ = charge;
+    }
+
+    fn release(&mut self, charge: Charge, field: fn(&mut HoldLedger) -> &mut usize) {
+        let bytes = std::mem::take(field(&mut self.ledger));
+        self.release_bytes(charge, bytes);
+    }
+
+    /// An injection point between a first use's admissions and allocations.
+    fn fault(&mut self, step: HoldStep) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(fault) = take_hold_fault(step) {
+            #[cfg(test)]
+            staging_witness::fault();
+            match fault {
+                HoldFault::Error => {
+                    return Err(Error::Other(format!(
+                        "injected held-relation fault at {step:?}"
+                    )));
+                }
+                HoldFault::Panic => panic!("injected held-relation fault at {step:?}"),
+                HoldFault::GlobalAllocation => {
+                    // The next registry array allocation fails as the global
+                    // allocator would; the real redb call surfaces it.
+                    #[cfg(test)]
+                    self.write.open_table_registry_fail_next_allocation_for_test();
+                }
+            }
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let _ = step;
+        Ok(())
     }
 
     fn first_use(&mut self, table: &'name str, vacancy: Vacancy) -> Result<usize> {
-        hold_fault(HoldStep::AdmitName)?;
+        self.fault(HoldStep::AdmitName)?;
         let name_len = RELATION_PREFIX
             .len()
             .checked_add(table.len())
             .ok_or_else(|| Error::Other("held relation name overflow".into()))?;
-        self.admit(name_len)?;
+        self.admit(Charge::TempName, name_len, 1, name_len)?;
         self.ledger.temp_name = name_len;
-        hold_fault(HoldStep::BuildName)?;
+        self.fault(HoldStep::BuildName)?;
         let mut name = String::with_capacity(name_len);
         name.push_str(RELATION_PREFIX);
         name.push_str(table);
@@ -310,7 +526,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         debug_assert_eq!(name.strip_prefix(RELATION_PREFIX), Some(table));
         let used = self.first_use_named(table, &name, vacancy);
         drop(name);
-        self.release(|ledger| &mut ledger.temp_name);
+        self.release(Charge::TempName, |ledger| &mut ledger.temp_name);
         used
     }
 
@@ -341,10 +557,10 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
                 .len()
                 .checked_mul(2)
                 .ok_or_else(|| Error::Other("held relation name overflow".into()))?;
-            hold_fault(HoldStep::AdmitNames)?;
-            self.admit(names)?;
+            self.fault(HoldStep::AdmitNames)?;
+            self.admit(Charge::Names, names, 2, name.len())?;
             self.ledger.names_pending = names;
-            hold_fault(HoldStep::Open)?;
+            self.fault(HoldStep::Open)?;
             match self.write.open_table(definition) {
                 Ok(relation) => {
                     self.ledger.names_pending = 0;
@@ -353,14 +569,14 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
                 }
                 Err(error) => {
                     // redb registers nothing before a failed open returns.
-                    self.release(|ledger| &mut ledger.names_pending);
+                    self.release(Charge::Names, |ledger| &mut ledger.names_pending);
                     return Err(RedbPersistence::storage_error(error));
                 }
             }
         } else {
             None
         };
-        hold_fault(HoldStep::Install)?;
+        self.fault(HoldStep::Install)?;
         self.slots.push((table, relation));
         let steps = self.index.insert_at(vacancy, position);
         #[cfg(any(test, feature = "test-seams"))]
@@ -373,7 +589,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
     /// Make registry room for `additional` more open tables, funding any
     /// growth it needs before redb allocates it.
     fn reserve_registry(&mut self, additional: usize) -> Result<()> {
-        hold_fault(HoldStep::ProbeRegistry)?;
+        self.fault(HoldStep::ProbeRegistry)?;
         let Some(growth) = self
             .write
             .open_table_registry_cost_to_reserve(additional)
@@ -388,14 +604,14 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         } else {
             None
         };
-        hold_fault(HoldStep::AdmitRegistry)?;
-        self.admit(growth.size())?;
+        self.fault(HoldStep::AdmitRegistry)?;
+        self.admit(Charge::Registry, growth.size(), 1, growth.size())?;
         self.ledger.registry_pending = growth.size();
         if let Some(scratch) = scratch {
-            hold_fault(HoldStep::AdmitScratch)?;
-            self.admit(scratch.size())?;
+            self.fault(HoldStep::AdmitScratch)?;
+            self.admit(Charge::Scratch, scratch.size(), 1, scratch.size())?;
             self.ledger.scratch_pending = scratch.size();
-            hold_fault(HoldStep::PrepareScratch)?;
+            self.fault(HoldStep::PrepareScratch)?;
             let replacement = self
                 .write
                 .open_table_registry_prepare(self.baseline_len, scratch.size())
@@ -404,9 +620,9 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
             self.replacement = Some(replacement);
             self.ledger.scratch_pending = 0;
             self.ledger.scratch = scratch.size();
-            hold_fault(HoldStep::AfterScratch)?;
+            self.fault(HoldStep::AfterScratch)?;
         }
-        hold_fault(HoldStep::Reserve)?;
+        self.fault(HoldStep::Reserve)?;
         let freed = self
             .write
             .open_table_registry_reserve(additional, growth.size())
@@ -417,9 +633,9 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         // funded it; the pass-start array was never charged here.
         if funded > 0 {
             debug_assert_eq!(freed, funded);
-            self.admission.release_held_relations(funded);
+            self.release_bytes(Charge::Registry, funded);
         }
-        hold_fault(HoldStep::AfterReserve)?;
+        self.fault(HoldStep::AfterReserve)?;
         Ok(())
     }
 
@@ -429,10 +645,10 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         }
         let entry = std::mem::size_of::<Slot<'name, 'txn>>();
         let (capacity, bytes) = doubled(self.slots.capacity(), entry)?;
-        hold_fault(HoldStep::AdmitSlots)?;
-        self.admit(bytes)?;
+        self.fault(HoldStep::AdmitSlots)?;
+        self.admit(Charge::Slots, bytes, 1, bytes)?;
         self.ledger.slots_pending = bytes;
-        hold_fault(HoldStep::GrowSlots)?;
+        self.fault(HoldStep::GrowSlots)?;
         let mut next = Vec::with_capacity(capacity);
         #[cfg(any(test, feature = "test-seams"))]
         content_identity::version_manifest::commit_row_work::count_held_relation_work(
@@ -442,9 +658,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         drop(std::mem::replace(&mut self.slots, next));
         self.ledger.slots_pending = 0;
         let freed = std::mem::replace(&mut self.ledger.slots, bytes);
-        if freed > 0 {
-            self.admission.release_held_relations(freed);
-        }
+        self.release_bytes(Charge::Slots, freed);
         Ok(())
     }
 
@@ -453,10 +667,10 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
             return Ok(());
         }
         let (capacity, bytes) = doubled(self.index.capacity(), PositionTree::NODE_BYTES)?;
-        hold_fault(HoldStep::AdmitNodes)?;
-        self.admit(bytes)?;
+        self.fault(HoldStep::AdmitNodes)?;
+        self.admit(Charge::Nodes, bytes, 1, bytes)?;
         self.ledger.nodes_pending = bytes;
-        hold_fault(HoldStep::GrowNodes)?;
+        self.fault(HoldStep::GrowNodes)?;
         let moved = self.index.grow(capacity);
         #[cfg(any(test, feature = "test-seams"))]
         content_identity::version_manifest::commit_row_work::count_held_relation_work(moved);
@@ -464,9 +678,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         let _ = moved;
         self.ledger.nodes_pending = 0;
         let freed = std::mem::replace(&mut self.ledger.nodes, bytes);
-        if freed > 0 {
-            self.admission.release_held_relations(freed);
-        }
+        self.release_bytes(Charge::Nodes, freed);
         Ok(())
     }
 }
@@ -477,8 +689,8 @@ impl<A: RowHeadAdmission> Drop for HeldRelations<'_, '_, '_, A> {
         // registry key. A name admission whose open never returned funds
         // nothing.
         self.slots.clear();
-        self.release(|ledger| &mut ledger.names);
-        self.release(|ledger| &mut ledger.names_pending);
+        self.release(Charge::Names, |ledger| &mut ledger.names);
+        self.release(Charge::Names, |ledger| &mut ledger.names_pending);
         // Put the tables open when the pass started back into the prepared
         // array, freeing the array this pass grew, without allocating.
         if self.ledger.registry > 0 {
@@ -488,10 +700,10 @@ impl<A: RowHeadAdmission> Drop for HeldRelations<'_, '_, '_, A> {
             {
                 Ok(freed) => {
                     debug_assert_eq!(freed, self.ledger.registry);
-                    self.release(|ledger| &mut ledger.registry);
+                    self.release(Charge::Registry, |ledger| &mut ledger.registry);
                     // The prepared array now holds those tables and stays with
                     // the transaction: the pre-existing baseline allowance.
-                    self.release(|ledger| &mut ledger.scratch);
+                    self.release(Charge::Scratch, |ledger| &mut ledger.scratch);
                 }
                 Err((_, replacement)) => {
                     // The grown array is still allocated, so its charge is
@@ -503,18 +715,18 @@ impl<A: RowHeadAdmission> Drop for HeldRelations<'_, '_, '_, A> {
         }
         if let Some(replacement) = self.replacement.take() {
             drop(replacement);
-            self.release(|ledger| &mut ledger.scratch);
+            self.release(Charge::Scratch, |ledger| &mut ledger.scratch);
         }
-        self.release(|ledger| &mut ledger.scratch_pending);
-        self.release(|ledger| &mut ledger.registry_pending);
+        self.release(Charge::Scratch, |ledger| &mut ledger.scratch_pending);
+        self.release(Charge::Registry, |ledger| &mut ledger.registry_pending);
         self.slots = Vec::new();
-        self.release(|ledger| &mut ledger.slots);
-        self.release(|ledger| &mut ledger.slots_pending);
+        self.release(Charge::Slots, |ledger| &mut ledger.slots);
+        self.release(Charge::Slots, |ledger| &mut ledger.slots_pending);
         self.index.clear();
-        self.release(|ledger| &mut ledger.nodes);
-        self.release(|ledger| &mut ledger.nodes_pending);
+        self.release(Charge::Nodes, |ledger| &mut ledger.nodes);
+        self.release(Charge::Nodes, |ledger| &mut ledger.nodes_pending);
         // The storage name was a local of the lookup that built it.
-        self.release(|ledger| &mut ledger.temp_name);
+        self.release(Charge::TempName, |ledger| &mut ledger.temp_name);
         #[cfg(any(test, feature = "test-seams"))]
         HELD_OVERDRAFT.with(|total| total.set(total.get() + self.monitor.overdraft_bytes()));
     }
@@ -569,6 +781,8 @@ pub(super) enum HoldStep {
 pub(super) enum HoldFault {
     Error,
     Panic,
+    /// The next registry array allocation fails as the global allocator would.
+    GlobalAllocation,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -578,6 +792,7 @@ thread_local! {
     static HOLD_FAULT: std::cell::Cell<Option<(HoldStep, HoldFault, usize)>> =
         const { std::cell::Cell::new(None) };
     static HELD_OVERDRAFT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HOLD_ARRIVALS: std::cell::Cell<[usize; 16]> = const { std::cell::Cell::new([0; 16]) };
 }
 
 /// Fail the `skip + 1`-th arrival at `step` on this thread.
@@ -599,28 +814,30 @@ pub(super) fn take_held_overdraft() -> usize {
     HELD_OVERDRAFT.with(|total| total.replace(0))
 }
 
-fn hold_fault(step: HoldStep) -> Result<()> {
-    #[cfg(any(test, feature = "test-seams"))]
-    if let Some((armed, fault, skip)) = HOLD_FAULT.with(std::cell::Cell::get)
-        && armed == step
-    {
-        if skip > 0 {
-            HOLD_FAULT.with(|slot| slot.set(Some((armed, fault, skip - 1))));
-        } else {
-            HOLD_FAULT.with(|slot| slot.set(None));
-            match fault {
-                HoldFault::Error => {
-                    return Err(Error::Other(format!(
-                        "injected held-relation fault at {step:?}"
-                    )));
-                }
-                HoldFault::Panic => panic!("injected held-relation fault at {step:?}"),
-            }
-        }
+/// The fault armed for this arrival at `step`, if any; counts every arrival.
+#[cfg(any(test, feature = "test-seams"))]
+fn take_hold_fault(step: HoldStep) -> Option<HoldFault> {
+    HOLD_ARRIVALS.with(|arrivals| {
+        let mut all = arrivals.get();
+        all[step as usize] += 1;
+        arrivals.set(all);
+    });
+    let (armed, fault, skip) = HOLD_FAULT.with(std::cell::Cell::get)?;
+    if armed != step {
+        return None;
     }
-    #[cfg(not(any(test, feature = "test-seams")))]
-    let _ = step;
-    Ok(())
+    if skip > 0 {
+        HOLD_FAULT.with(|slot| slot.set(Some((armed, fault, skip - 1))));
+        return None;
+    }
+    HOLD_FAULT.with(|slot| slot.set(None));
+    Some(fault)
+}
+
+/// How many times each step was reached on this thread since the last call.
+#[cfg(any(test, feature = "test-seams"))]
+pub(super) fn take_hold_arrivals() -> [usize; 16] {
+    HOLD_ARRIVALS.with(|arrivals| arrivals.replace([0; 16]))
 }
 
 /// Look up `order`'s tables through one pass's holder, handing each lookup's

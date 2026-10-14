@@ -384,6 +384,7 @@ fn the_holder_builds_the_storage_name_every_caller_uses() {
 #[test]
 fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_until_after_it_is_freed()
 {
+    use super::Charge;
     use super::staging_witness::{self, Event};
     let table = format!("s{}", "t".repeat(776));
     let name_len = RELATION_PREFIX.len() + table.len();
@@ -404,27 +405,33 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
     .expect("stage one row");
     staging_witness::arm(name_len);
     db.commit(tx).expect("commit the row");
-    let events = staging_witness::take();
+    let (events, overrun) = staging_witness::take();
+    assert_eq!(overrun, None, "no charge was released before what it funds was freed");
     let names = 2 * name_len;
     let mut windows = 0;
     let mut index = 0;
     while let Some(start) = events[index..]
         .iter()
-        .position(|event| *event == Event::Admit(names))
+        .position(|event| *event == Event::Admit(Charge::Names, names))
         .map(|offset| index + offset)
     {
         let end = start
             + events[start..]
                 .iter()
-                .position(|event| *event == Event::Release(names))
+                .position(|event| *event == Event::Release(Charge::Names, names))
                 .expect("the names charge is released");
         let temp = events[..start]
             .iter()
-            .rposition(|event| *event == Event::Admit(name_len))
+            .rposition(|event| *event == Event::Admit(Charge::TempName, name_len))
             .expect("the temporary name is admitted first");
         let before: Vec<_> = events[temp + 1..start]
             .iter()
-            .filter(|event| matches!(event, Event::Alloc(_)))
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::Alloc(None | Some(Charge::TempName | Charge::Names), _)
+                )
+            })
             .collect();
         assert_eq!(
             before.len(),
@@ -448,7 +455,7 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
         let mut peak = 0;
         for event in &events[start + 1..end] {
             match *event {
-                Event::Alloc(address) => {
+                Event::Alloc(None | Some(Charge::Names), address) => {
                     live.insert(address);
                     allocated += 1;
                     peak = peak.max(live.len());
@@ -480,4 +487,178 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
     }
     assert_eq!(windows, 2, "both reconciliation passes held the relation: {events:?}");
     db.close().expect("close");
+}
+
+/// A store with `count` tables and one staged transaction writing one row to
+/// each, in name order. Enough tables that each pass grows the registry,
+/// the slot vector and the node vector more than once.
+fn many_table_commit(
+    count: usize,
+) -> (
+    tempfile::TempDir,
+    crate::Database,
+    contextdb_core::TxId,
+    Vec<String>,
+) {
+    let root = tempfile::tempdir().expect("fixture directory");
+    let db = crate::Database::open(root.path().join("held.db")).expect("open the database");
+    db.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
+    let tables: Vec<String> = (0..count).map(|n| format!("held_{n:03}_{}", "x".repeat(60))).collect();
+    for table in &tables {
+        db.execute(
+            &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, payload TEXT NOT NULL)"),
+            &std::collections::HashMap::new(),
+        )
+        .expect("declare one table");
+    }
+    let tx = db.begin().expect("begin");
+    for (n, table) in tables.iter().enumerate() {
+        db.execute_in_tx(
+            tx,
+            &format!(
+                "INSERT INTO {table} VALUES ('{}', 'one row')",
+                uuid::Uuid::from_u128(0x6e1d << 112 | n as u128)
+            ),
+            &std::collections::HashMap::new(),
+        )
+        .expect("stage one row");
+    }
+    (root, db, tx, tables)
+}
+
+const COMMIT_TABLES: usize = 40;
+
+/// Through a real commit (both reconciliation passes, several registry,
+/// slot and node growths each), every holder charge is released only after
+/// the allocations it funds are freed, at every release, and nothing stays
+/// charged or tagged-live when the commit ends.
+#[test]
+fn a_commit_releases_each_holder_charge_only_after_what_it_funds_is_freed() {
+    use super::staging_witness;
+    let (_root, db, tx, _) = many_table_commit(COMMIT_TABLES);
+    take_hold_arrivals();
+    staging_witness::arm(0);
+    db.commit(tx).expect("commit every table");
+    let charged = staging_witness::charged();
+    let live = staging_witness::live();
+    let (events, overrun) = staging_witness::take();
+    let arrivals = take_hold_arrivals();
+    assert_eq!(overrun, None, "a charge outlived nothing it funded: {overrun:?}");
+    assert_eq!(charged, [0; 6], "every charge was released");
+    assert!(live.is_empty(), "every funded allocation was freed: {live:?}");
+    for step in [HoldStep::Reserve, HoldStep::GrowSlots, HoldStep::GrowNodes, HoldStep::PrepareScratch] {
+        assert!(
+            arrivals[step as usize] >= 2,
+            "{step:?} happened in both passes: {arrivals:?}"
+        );
+    }
+    eprintln!("held_commit_events={} arrivals={arrivals:?}", events.len());
+    assert_eq!(take_held_overdraft(), 0, "no registry growth went unfunded");
+    db.close().expect("close");
+}
+
+/// Through a real commit, each holder step fails as an injected error, an
+/// injected panic and (where it allocates a registry array) a failed global
+/// allocation, at its first arrival, at its first arrival in the second pass
+/// and at its last arrival (a later growth). Every injection must fire. At
+/// the moment it fires, every category must fit what is still charged; after
+/// the commit fails, nothing is left charged, nothing went unfunded, nothing
+/// was committed, and (after an error) the store keeps committing.
+#[test]
+fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_usable() {
+    use super::staging_witness;
+    const STEPS: [HoldStep; 16] = [
+        HoldStep::AdmitName,
+        HoldStep::BuildName,
+        HoldStep::ProbeRegistry,
+        HoldStep::AdmitRegistry,
+        HoldStep::AdmitScratch,
+        HoldStep::PrepareScratch,
+        HoldStep::AfterScratch,
+        HoldStep::Reserve,
+        HoldStep::AfterReserve,
+        HoldStep::AdmitSlots,
+        HoldStep::GrowSlots,
+        HoldStep::AdmitNodes,
+        HoldStep::GrowNodes,
+        HoldStep::AdmitNames,
+        HoldStep::Open,
+        HoldStep::Install,
+    ];
+    // How often each step is reached in a commit, and in its first pass.
+    let (_root, db, tx, _) = many_table_commit(COMMIT_TABLES);
+    take_hold_arrivals();
+    db.commit(tx).expect("the dry run commits");
+    let total = take_hold_arrivals();
+    db.close().expect("close");
+    for step in STEPS {
+        let arrivals = total[step as usize];
+        assert!(arrivals > 0, "{step:?} is reached by a commit");
+        let mut skips = vec![0, arrivals / 2, arrivals - 1];
+        skips.dedup();
+        let mut faults = vec![HoldFault::Error, HoldFault::Panic];
+        if matches!(step, HoldStep::PrepareScratch | HoldStep::Reserve) {
+            faults.push(HoldFault::GlobalAllocation);
+        }
+        for fault in faults {
+            for &skip in &skips {
+                let label = format!("{step:?} {fault:?} arrival {}", skip + 1);
+                let (_root, db, tx, tables) = many_table_commit(COMMIT_TABLES);
+                let accountant = db.__accountant_handle_for_test();
+                let before = accountant.usage().used;
+                staging_witness::arm(0);
+                inject_hold_fault(step, fault, skip);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.commit(tx)));
+                let fired = !clear_hold_fault();
+                let charged = staging_witness::charged();
+                let (_, overrun) = staging_witness::take();
+                assert!(fired, "{label}: the injection fired");
+                assert_eq!(overrun, None, "{label}: every category fit its charge");
+                assert_eq!(charged, [0; 6], "{label}: every holder charge was released");
+                assert_eq!(take_held_overdraft(), 0, "{label}: no unfunded registry growth");
+                assert!(
+                    accountant.usage().used <= before,
+                    "{label}: the failed commit holds nothing more than before it ran"
+                );
+                match (fault, outcome) {
+                    (HoldFault::Panic, Err(_)) => {
+                        // A panic inside commit may leave the database's own
+                        // locks poisoned; this test only proves the holder
+                        // gave back what it took.
+                        drop(accountant);
+                        std::mem::forget(db);
+                        continue;
+                    }
+                    // A commit that contains the panic must still refuse.
+                    (_, Ok(Err(_))) => {}
+                    (_, Ok(Ok(()))) => panic!("{label}: the commit did not fail"),
+                    (_, Err(_)) => panic!("{label}: the injected error surfaced as a panic"),
+                }
+                let committed: usize = tables
+                    .iter()
+                    .map(|table| {
+                        db.execute(
+                            &format!("SELECT id FROM {table}"),
+                            &std::collections::HashMap::new(),
+                        )
+                        .expect("read")
+                        .rows
+                        .len()
+                    })
+                    .sum();
+                assert_eq!(committed, 0, "{label}: the failed commit published nothing");
+                db.execute(
+                    &format!(
+                        "INSERT INTO {} VALUES ('{}', 'after failure')",
+                        tables[0],
+                        uuid::Uuid::from_u128(1)
+                    ),
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap_or_else(|error| panic!("{label}: the store keeps committing: {error}"));
+                drop(accountant);
+                db.close().expect("close");
+            }
+        }
+    }
 }
