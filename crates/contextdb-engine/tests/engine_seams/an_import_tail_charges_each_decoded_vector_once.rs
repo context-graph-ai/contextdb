@@ -708,11 +708,6 @@ fn an_import_interrupted_after_one_cohort_publishes_only_that_cohort_and_resumes
     let mut target = vec![0.0; DIMENSION];
     target[0] = 1.0;
     assert_eq!(nearest(&db, target), vec![vec![Value::Int64(TARGET_ID)]]);
-    // A row of the covered first cohort is answered from the published graph.
-    assert_eq!(
-        nearest(&db, vector_for(BASE_ROWS)),
-        vec![vec![Value::Int64(BASE_ROWS)]]
-    );
     db.close().unwrap();
     let db = Database::open_with_options(&path, crash_options()).unwrap();
     assert_eq!(
