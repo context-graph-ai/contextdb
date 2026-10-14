@@ -168,3 +168,7 @@ mod a_vector_search_decodes_under_its_request_owner;
 mod reads_and_writes_are_charged_to_their_own_declared_limits;
 #[path = "engine_seams/trigger_audit_history_is_charged_once_to_the_declared_reader.rs"]
 mod trigger_audit_history_is_charged_once_to_the_declared_reader;
+#[path = "engine_seams/a_replacement_candidate_counts_exactly_what_it_absorbed.rs"]
+mod a_replacement_candidate_counts_exactly_what_it_absorbed;
+#[path = "engine_seams/one_import_commit_larger_than_the_cohort_share_is_absorbed.rs"]
+mod one_import_commit_larger_than_the_cohort_share_is_absorbed;

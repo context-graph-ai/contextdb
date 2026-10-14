@@ -980,7 +980,7 @@ fn every_commit_the_writer_accepted_is_absorbed_under_the_same_limit() {
 }
 
 #[test]
-fn a_committed_lsn_larger_than_a_lowered_limit_is_refused_naming_its_lsn_and_bytes() {
+fn a_committed_lsn_larger_than_a_lowered_limit_is_absorbed_by_a_bounded_rebuild() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("lowered.db");
@@ -1000,25 +1000,13 @@ fn a_committed_lsn_larger_than_a_lowered_limit_is_refused_naming_its_lsn_and_byt
     db.execute(&sql, &params).unwrap();
     db.close().unwrap();
     // The operator reopens with a limit below what that one commit's
-    // decoded vectors need (4,096 x 6,144 B = 24 MiB > 16 MiB).
+    // decoded vectors need (4,096 x 6,144 B = 24 MiB > 16 MiB). Coverage is
+    // per committed LSN, so the commit is absorbed by a bounded rebuild under
+    // the unchanged limit instead of being refused.
     let db = Database::open_with_options(&path, options(16 * 1024 * 1024)).unwrap();
-    let refused = db
-        .persist_import_vector_tails()
-        .expect_err("one commit's vectors are covered as one unit")
-        .to_string();
-    eprintln!("lowered-limit refusal: {refused}");
-    assert!(
-        refused.starts_with("memory budget exceeded: vector_index/persist_import_vector_tail "),
-        "{refused}"
-    );
-    assert!(refused.contains("committed at LSN "), "{refused}");
-    assert!(
-        refused.contains(&format!("{rows} new vectors")),
-        "the refusal names how many vectors the commit holds: {refused}"
-    );
-    db.close().unwrap();
-    let db = Database::open_with_options(&path, options(ROOMY_LIMIT)).unwrap();
     assert!(db.persist_import_vector_tails().unwrap());
+    assert_eq!(db.memory_limit(), Some(16 * 1024 * 1024));
+    assert_eq!(pending_inserts(&db), 0);
     assert_eq!(
         db.execute(
             "SELECT COUNT(*) FROM points WHERE bucket = 1",
