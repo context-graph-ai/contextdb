@@ -945,12 +945,12 @@ mod undeclared_limit_tests {
 
     const DIMENSION: usize = 384;
     const BASE_ROWS: i64 = 16;
-    const COMMITS: i64 = 64;
+    const COMMITS: i64 = 8;
     const PER_COMMIT: i64 = 1024;
     /// The child's whole-process ceiling: the undeclared writer's fixed
-    /// 64 MiB page cache plus 64 MiB, below the suffix's decoded vectors
-    /// (65,536 x 1,536 B = 96 MiB) held as one cohort, far above a cohort
-    /// bounded by a sixteenth of it.
+    /// 64 MiB page cache plus 64 MiB. A sixteenth of it (8 MiB) is below the
+    /// suffix's decoded vectors (8,192 x 1,536 B = 12 MiB), so an unbounded
+    /// plan takes the suffix as one cohort and a bounded one splits it.
     const PROCESS_CEILING: usize = 128 * 1024 * 1024;
     const CHILD_PATH: &str = "S7_UNDECLARED_LIMIT_PATH";
 
@@ -1092,11 +1092,11 @@ mod undeclared_limit_tests {
         let nearest = db
             .execute(
                 "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-                &HashMap::from([("q".into(), Value::Vector(vector_for(1_000_000 + 40_000)))]),
+                &HashMap::from([("q".into(), Value::Vector(vector_for(1_000_000 + 5_000)))]),
             )
             .unwrap()
             .rows;
-        assert_eq!(nearest, vec![vec![Value::Int64(1_000_000 + 40_000)]]);
+        assert_eq!(nearest, vec![vec![Value::Int64(1_000_000 + 5_000)]]);
     }
 }
 
