@@ -16,6 +16,18 @@ use redb::ReadableDatabase;
 /// refusing it; without a limit the whole suffix is one cohort.
 const IMPORT_COHORT_BUDGET_SHARE: usize = 16;
 
+/// What the next cohort of a route's uncovered suffix, up to the import's
+/// fixed target, can be.
+enum CohortPlan {
+    /// No uncovered commit at or before the target.
+    Covered,
+    /// The first uncovered commit alone exceeds the cohort share: a
+    /// replacement build absorbs it in bounded batches.
+    Rebuild,
+    /// Whole committed LSNs, oldest first, through `through`, while they fit.
+    Retain { vectors: usize, through: Lsn },
+}
+
 /// What one pass over a partition's uncovered suffix did.
 enum ImportCohort {
     /// One committed cohort was absorbed and published; more may follow.
@@ -24,6 +36,8 @@ enum ImportCohort {
     Covered,
     /// The route cannot take a native tail now.
     Incomplete,
+    /// The next commit is absorbed by a replacement build instead.
+    RebuildRoute,
 }
 
 impl Database {
@@ -91,6 +105,67 @@ impl Database {
             pending.push((serving.covered_lsn, serving.covered_tx, commit_tx, inserts));
         }
         Ok(pending)
+    }
+}
+
+impl Database {
+    /// Per route of `table.column` with a durable replacement build: its
+    /// phase, inserted points and frontier LSN.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn vector_build_progress_for_test(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<Vec<(PagedVectorPhase, usize, Lsn)>> {
+        let _operation = self.assert_open_operation();
+        let context = self.maintenance_context();
+        let Some(persistence) = &context.persistence else {
+            return Ok(Vec::new());
+        };
+        let _decode = context.writer_maintenance_decode()?;
+        let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            context.finalization.accountant.vector_budget()?,
+        );
+        let mut builds = Vec::new();
+        for partition in vector_partition_routes(&context.vector, &mut copy_owner)? {
+            if partition.index.table != table || partition.index.column != column {
+                continue;
+            }
+            if let Some(record) = persistence.load_paged_build_record(&partition)? {
+                let progress = record.progress()?;
+                builds.push((progress.phase, progress.graph.points, progress.frontier_lsn));
+            }
+        }
+        Ok(builds)
+    }
+
+    /// Per route of `table.column`: the maintained pending counters as
+    /// `(covered_tx, inserts, tombstones)`, serving and replacement candidate.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn vector_pending_counters_for_test(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<Vec<((TxId, u64, u64), Option<(TxId, u64, u64)>)>> {
+        let _operation = self.assert_open_operation();
+        let context = self.maintenance_context();
+        let Some(persistence) = &context.persistence else {
+            return Ok(Vec::new());
+        };
+        let _decode = context.writer_maintenance_decode()?;
+        let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            context.finalization.accountant.vector_budget()?,
+        );
+        let mut counters = Vec::new();
+        for partition in vector_partition_routes(&context.vector, &mut copy_owner)? {
+            if partition.index.table == table && partition.index.column == column {
+                counters.push(persistence.vector_pending_counters_for_test(&partition)?);
+            }
+        }
+        Ok(counters)
     }
 }
 
@@ -208,60 +283,102 @@ impl MaintenanceContext {
         Ok(())
     }
 
-    /// The upserts one cohort takes: the whole uncovered suffix when its
-    /// decoded bodies fit this writer's cohort share, otherwise whole
-    /// committed LSNs, oldest first, while they fit -- always at least one.
-    /// The third value is that LSN when the cohort is one commit alone.
-    fn import_cohort_through(
+    /// Bytes of decoded vectors one import cohort may retain: a sixteenth
+    /// of the declared writer limit (unlimited without one).
+    fn import_cohort_share(&self) -> usize {
+        self.finalization
+            .accountant
+            .usage()
+            .limit
+            .map_or(usize::MAX, |limit| limit / IMPORT_COHORT_BUDGET_SHARE)
+    }
+
+    /// The transaction the commit index records at exactly `lsn`.
+    fn commit_tx_at(&self, lsn: Lsn) -> Result<TxId> {
+        match self
+            .tx_mgr
+            .try_commit_index_floor(std::ops::Bound::Included(lsn))?
+        {
+            Some((found, tx)) if found == lsn => Ok(tx),
+            _ => Err(Error::Other(
+                "an import cohort's last commit is missing from the commit index".into(),
+            )),
+        }
+    }
+
+    /// The next cohort of a route's uncovered suffix after `covered`, never
+    /// past the import's fixed `target`: whole committed LSNs, oldest first,
+    /// while their decoded vectors fit this writer's cohort share.
+    fn import_cohort_plan(
         &self,
         persistence: &RedbPersistence,
         partition: &VectorPartitionRef,
         covered: Lsn,
-        suffix_vectors: usize,
+        target: Lsn,
         entry_bytes: usize,
-    ) -> Result<(usize, Option<Lsn>, Option<Lsn>)> {
-        let share = self
-            .finalization
-            .accountant
-            .usage()
-            .limit
-            .map_or(usize::MAX, |limit| limit / IMPORT_COHORT_BUDGET_SHARE);
+    ) -> Result<CohortPlan> {
+        let share = self.import_cohort_share();
         let fits = |vectors: usize| {
             vectors
                 .checked_mul(entry_bytes)
                 .is_some_and(|bytes| bytes <= share)
         };
-        if fits(suffix_vectors) {
-            return Ok((suffix_vectors, None, None));
-        }
-        let Some(mut through) =
-            persistence.native_candidate_first_uncovered_lsn(partition, covered)?
-        else {
-            return Ok((suffix_vectors, None, None));
-        };
-        let first = through;
-        let mut vectors = persistence.vector_partition_tail_entry_count_through(
-            &partition.index,
-            &partition.partition_key,
-            covered,
-            Some(through),
-        )?;
-        while let Some(next) =
-            persistence.native_candidate_first_uncovered_lsn(partition, through)?
-        {
-            let more = persistence.vector_partition_tail_entry_count_through(
-                &partition.index,
-                &partition.partition_key,
-                through,
-                Some(next),
+        Ok(
+            match persistence
+                .vector_partition_journal_cohort_by_key(partition, covered, target, fits)?
+            {
+                None => CohortPlan::Covered,
+                Some((0, _)) => CohortPlan::Rebuild,
+                Some((vectors, through)) => CohortPlan::Retain { vectors, through },
+            },
+        )
+    }
+
+    /// Drive this route's replacement build toward the import's fixed
+    /// target until a publication moves its coverage. Returns false when the
+    /// route cannot advance now (quarantined, no build possible, no durable
+    /// progress, or superseded twice): the import reports it incomplete.
+    fn rebuild_route_to_target(
+        &self,
+        persistence: &Arc<RedbPersistence>,
+        partition: &VectorPartitionRef,
+        read_memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        target: (TxId, Lsn),
+    ) -> Result<bool> {
+        let mut superseded = false;
+        loop {
+            let before = persistence
+                .load_paged_build_record(partition)?
+                .map(|record| record.progress())
+                .transpose()?;
+            let outcome = self.advance_paged_vector_build_toward(
+                partition,
+                copy_owner,
+                Arc::clone(read_memory),
+                target,
             )?;
-            if !fits(vectors.saturating_add(more)) {
-                break;
+            #[cfg(feature = "test-seams")]
+            crate::vector_observations::emit_import_rebuild_step_for_test();
+            let Some(outcome) = outcome else {
+                return Ok(false);
+            };
+            if outcome.published {
+                return Ok(true);
             }
-            vectors += more;
-            through = next;
+            let after = persistence
+                .load_paged_build_record(partition)?
+                .map(|record| record.progress())
+                .transpose()?;
+            match (&before, &after) {
+                // Durable progress moved: source cursor, phase, encoding
+                // cursor or a catch-up frontier, each finite.
+                (_, Some(after)) if before.as_ref() != Some(after) => {}
+                // The build vanished without a publication: superseded.
+                (Some(_), None) if !superseded => superseded = true,
+                _ => return Ok(false),
+            }
         }
-        Ok((vectors, Some(through), (through == first).then_some(first)))
     }
 
     fn persist_import_vector_tails(
@@ -274,6 +391,14 @@ impl MaintenanceContext {
         let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
             self.finalization.accountant.vector_budget()?,
         );
+        // The import's fixed target: every commit at or before it is covered
+        // before this call reports complete; later commits are never chased.
+        // Its snapshot stays pinned so a build can source exactly it.
+        let (target, _target_pin) = self.tx_mgr.with_commit_lock(|| {
+            let target = (self.tx_mgr.current_tx_max(), self.tx_mgr.current_lsn());
+            let pin = self.snapshot_registry.register(SnapshotId(target.0.0));
+            Ok::<_, Error>((target, pin))
+        })?;
         let routes = vector_partition_routes(&self.vector, &mut copy_owner)?;
         let mut complete = true;
         for partition in routes {
@@ -287,8 +412,21 @@ impl MaintenanceContext {
                     &partition,
                     &read_memory,
                     &mut copy_owner,
+                    target,
                 )? {
                     ImportCohort::Absorbed => {}
+                    ImportCohort::RebuildRoute => {
+                        if !self.rebuild_route_to_target(
+                            persistence,
+                            &partition,
+                            &read_memory,
+                            &mut copy_owner,
+                            target,
+                        )? {
+                            complete = false;
+                            break;
+                        }
+                    }
                     ImportCohort::Covered => break,
                     ImportCohort::Incomplete => {
                         complete = false;
@@ -306,6 +444,7 @@ impl MaintenanceContext {
         partition: &VectorPartitionRef,
         read_memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        target: (TxId, Lsn),
     ) -> Result<ImportCohort> {
         let Some(info) = self.vector.try_partition_info(
             &partition.index,
@@ -325,6 +464,29 @@ impl MaintenanceContext {
         else {
             return Ok(ImportCohort::Incomplete);
         };
+        // Route before anything is prepared: a commit this writer cannot
+        // retain whole goes to a replacement build, and no serving generation
+        // that build would retire is copied first.
+        let layout =
+            contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
+        let entry_bytes = layout
+            .dimension
+            .saturating_mul(4)
+            .saturating_add(std::mem::size_of::<VectorEntry>())
+            .saturating_add(256);
+        match self.import_cohort_plan(
+            persistence,
+            partition,
+            catalog.change.unwrap_or(catalog.base).covered_lsn,
+            target.1,
+            entry_bytes,
+        )? {
+            CohortPlan::Rebuild => return Ok(ImportCohort::RebuildRoute),
+            // A covered route still adopts a saved change or prepares its
+            // native base, exactly as before; only the rebuild is decided
+            // first.
+            CohortPlan::Covered | CohortPlan::Retain { .. } => {}
+        }
         if catalog.change.is_none() {
             let mut base_workspace = self.vector.reserve_workspace(
                 Arc::clone(&self.finalization.vector_accountant),
@@ -386,22 +548,26 @@ impl MaintenanceContext {
             self.install_published_vector_catalog(&catalog, read_memory.clone())?;
         }
         let covered = catalog.change.unwrap_or(catalog.base).covered_lsn;
-        let suffix = persistence.vector_partition_tail_entry_count(
-            &partition.index,
-            &partition.partition_key,
-            covered,
-        )?;
-        let uncovered = persistence.vector_partition_has_uncovered_journal_records_with_admission(
-            &partition.index,
-            &partition.partition_key,
-            covered,
-            |bytes| copy_owner.reserve(bytes),
-        )?;
-        if !uncovered {
-            return Ok(ImportCohort::Covered);
-        }
-        let layout =
-            contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
+        let CohortPlan::Retain {
+            vectors: count,
+            through: cohort_through,
+        } = self.import_cohort_plan(persistence, partition, covered, target.1, entry_bytes)?
+        else {
+            // Nothing at or before the target is uncovered, or preparation
+            // moved the coverage onto a commit only a rebuild can take.
+            return Ok(
+                match self.import_cohort_plan(
+                    persistence,
+                    partition,
+                    covered,
+                    target.1,
+                    entry_bytes,
+                )? {
+                    CohortPlan::Rebuild => ImportCohort::RebuildRoute,
+                    _ => ImportCohort::Covered,
+                },
+            );
+        };
         let mut policy = layout.resolve_policy(info.live_rows, 1);
         let mut declaration = vector_paged_build::declaration_for(&layout, &policy)?;
         let saved = catalog
@@ -439,73 +605,26 @@ impl MaintenanceContext {
             policy.hnsw_ef_search = declaration.hnsw_ef_search as usize;
             policy.policy_revision = declaration.policy_revision;
         }
-        let entry_bytes = layout
-            .dimension
-            .saturating_mul(4)
-            .saturating_add(std::mem::size_of::<VectorEntry>())
-            .saturating_add(256);
-        let (count, cohort_through, single_commit) =
-            self.import_cohort_through(persistence, partition, covered, suffix, entry_bytes)?;
         let body_bytes = count
             .checked_mul(entry_bytes)
             .ok_or_else(|| Error::Other("import vector suffix size overflow".into()))?;
         let workspace_bytes = body_bytes.saturating_add(128 * 1024);
-        let mut workspace = match self.vector.reserve_workspace(
+        let mut workspace = self.vector.reserve_workspace(
             Arc::clone(&self.finalization.vector_accountant),
             workspace_bytes,
             "persist_import_vector_tail",
             "Release idle writer state before persisting this import's vector suffix.",
-        ) {
-            Ok(workspace) => workspace,
-            // Coverage is per committed LSN, so one commit's vectors cannot
-            // be split. Name that commit and what it needs.
-            Err(Error::MemoryBudgetExceeded {
-                subsystem,
-                operation,
-                requested_bytes,
-                available_bytes,
-                budget_limit_bytes,
-                ..
-            }) if single_commit.is_some() => {
-                let lsn = single_commit.map_or(0, |lsn| lsn.0);
-                return Err(Error::MemoryBudgetExceeded {
-                    subsystem,
-                    operation,
-                    requested_bytes,
-                    available_bytes,
-                    budget_limit_bytes,
-                    hint: format!(
-                        "The import's transaction committed at LSN {lsn} alone holds {count} new vectors ({body_bytes} decoded bytes) and is covered as one unit; raise MEMORY_LIMIT so {requested_bytes} bytes are free for it."
-                    ),
-                });
-            }
-            Err(error) => return Err(error),
-        };
+        )?;
         let ((mut entries, through_lsn), through_tx, _pin) =
             self.tx_mgr.with_commit_lock(|| {
-                // Coverage names the commit the cohort ends at: the whole
-                // suffix ends at the store's frontier, a committed prefix at
-                // its last commit, never at commits it did not absorb.
-                let through_tx = match cohort_through {
-                    None => self.tx_mgr.current_tx_max(),
-                    Some(lsn) => match self
-                        .tx_mgr
-                        .try_commit_index_floor(std::ops::Bound::Included(lsn))?
-                    {
-                        Some((found, tx)) if found == lsn => tx,
-                        _ => {
-                            return Err(Error::Other(
-                                "an import cohort's last commit is missing from the commit index"
-                                    .into(),
-                            ));
-                        }
-                    },
-                };
+                // Coverage names the commit the cohort ends at, never a
+                // commit it did not absorb.
+                let through_tx = self.commit_tx_at(cohort_through)?;
                 let pin = self.snapshot_registry.register(SnapshotId(through_tx.0));
                 let entries = self.load_import_cohort(
                     "persist_import_vector_tail",
                     count,
-                    cohort_through,
+                    Some(cohort_through),
                     workspace_bytes,
                     count.saturating_mul(layout.dimension.saturating_mul(4)),
                     || {
@@ -513,13 +632,13 @@ impl MaintenanceContext {
                             &partition.index,
                             &partition.partition_key,
                             covered,
-                            cohort_through,
+                            Some(cohort_through),
                         )
                     },
                 )?;
                 Ok::<_, Error>((entries, through_tx, pin))
             })?;
-        if entries.len() > count || cohort_through.is_some_and(|through| through != through_lsn) {
+        if entries.len() > count || through_lsn != cohort_through {
             return Err(Error::Other(
                 "import suffix grew beyond its admitted frontier".into(),
             ));
@@ -637,6 +756,7 @@ impl MaintenanceContext {
         record: &PagedBuildRecord,
         progress: &PagedVectorProgress,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        catch_up_bound: Option<Lsn>,
     ) -> Result<bool> {
         let _decode = self.writer_maintenance_decode()?;
         use crate::persistence::vector_paged::import_tail::NativeImportCandidate;
@@ -645,6 +765,11 @@ impl MaintenanceContext {
         else {
             return Ok(false);
         };
+        // A commit after the caller's fixed target is not this call's to
+        // absorb; the complete candidate publishes at its truthful frontier.
+        if catch_up_bound.is_some_and(|bound| through_lsn > bound) {
+            return Ok(false);
+        }
         let count = persistence.vector_partition_tail_entry_count_through(
             &partition.index,
             &partition.partition_key,
@@ -662,6 +787,12 @@ impl MaintenanceContext {
                     .saturating_add(256),
             )
             .ok_or_else(|| Error::Other("native candidate cohort admission overflow".into()))?;
+        // A cohort larger than this writer's cohort share is never retained
+        // whole: the candidate publishes at its truthful frontier and a fresh
+        // replacement absorbs that commit in bounded batches.
+        if bytes > self.import_cohort_share() {
+            return Ok(false);
+        }
         let workspace_bytes = bytes.saturating_add(128 * 1024);
         let _workspace = self.vector.reserve_workspace(
             Arc::clone(&self.finalization.vector_accountant),
@@ -670,7 +801,9 @@ impl MaintenanceContext {
             "Release idle writer state before advancing this finite cohort.",
         )?;
         let (mut entries, frontier_tx, _pin) = self.tx_mgr.with_commit_lock(|| {
-            let tx = self.tx_mgr.current_tx_max();
+            // The candidate's coverage names the absorbed commit, not the
+            // store's newest transaction.
+            let tx = self.commit_tx_at(through_lsn)?;
             let pin = self.snapshot_registry.register(SnapshotId(tx.0));
             let (entries, loaded_through) = self.load_import_cohort(
                 "catch_up_native_import_candidate",

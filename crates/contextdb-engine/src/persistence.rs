@@ -38641,13 +38641,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    fn decode_vector_entry(bytes: &[u8]) -> Result<VectorEntry> {
+    /// Decode one stored vector entry with every vector body at exactly its
+    /// encoded length. A stored f32 body is admitted before it is allocated
+    /// as a kept output -- a caller that prepaid its kept vectors has that
+    /// credit adopted -- and a quantized payload as exact-length scratch.
+    fn decode_persisted_vector_entry_exact(bytes: &[u8]) -> Result<PersistedVectorEntry> {
         // The stored layout of `PersistedVectorEntry`, field for field and
-        // variant for variant. A stored f32 body is decoded into exactly its
-        // encoded length, admitted before it is allocated as the kept output,
-        // and becomes the entry's vector without a copy; a caller that already
-        // admitted its kept vectors has that credit adopted. A quantized body
-        // is exact-length scratch, and its expansion is the kept output.
+        // variant for variant.
         #[derive(Deserialize)]
         struct StoredVectorEntry {
             index: VectorIndexRef,
@@ -38687,34 +38687,51 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let stored: StoredVectorEntry = Self::decode(bytes)?;
-        let expand = |quantized: PersistedVector| -> Result<Vec<f32>> {
-            crate::read_image_memory::reserve_output(quantized.decoded_bytes())?;
-            Ok(quantized.to_f32())
-        };
+        Ok(PersistedVectorEntry {
+            index: stored.index,
+            row_id: stored.row_id,
+            vector: match stored.vector {
+                StoredVector::F32(values) => PersistedVector::F32(values),
+                StoredVector::SQ8 {
+                    min,
+                    max,
+                    len,
+                    payload,
+                } => PersistedVector::SQ8 {
+                    min,
+                    max,
+                    len,
+                    payload,
+                },
+                StoredVector::SQ4 {
+                    min,
+                    max,
+                    len,
+                    payload,
+                } => PersistedVector::SQ4 {
+                    min,
+                    max,
+                    len,
+                    payload,
+                },
+            },
+            created_tx: stored.created_tx,
+            deleted_tx: stored.deleted_tx,
+            lsn: stored.lsn,
+        })
+    }
+
+    fn decode_vector_entry(bytes: &[u8]) -> Result<VectorEntry> {
+        // A stored f32 body becomes the entry's vector without a copy; a
+        // quantized body's expansion is the kept output.
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let stored = Self::decode_persisted_vector_entry_exact(bytes)?;
         let vector = match stored.vector {
-            StoredVector::F32(values) => values,
-            StoredVector::SQ8 {
-                min,
-                max,
-                len,
-                payload,
-            } => expand(PersistedVector::SQ8 {
-                min,
-                max,
-                len,
-                payload,
-            })?,
-            StoredVector::SQ4 {
-                min,
-                max,
-                len,
-                payload,
-            } => expand(PersistedVector::SQ4 {
-                min,
-                max,
-                len,
-                payload,
-            })?,
+            PersistedVector::F32(values) => values,
+            quantized => {
+                crate::read_image_memory::reserve_output(quantized.decoded_bytes())?;
+                quantized.to_f32()
+            }
         };
         Ok(VectorEntry {
             index: stored.index,
@@ -41952,6 +41969,28 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 )
             })
             .accountant())
+    }
+
+    /// A route's maintained pending counters as `(covered_tx, inserts,
+    /// tombstones)`: the serving frontier's and, while a replacement builds,
+    /// its candidate's.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn vector_pending_counters_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> Result<((TxId, u64, u64), Option<(TxId, u64, u64)>)> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let summary = vector_membership_pages::read_partition_summary(&read, partition)?;
+            let counts = |counts: &vector_membership_pages::PendingCounts| {
+                (counts.covered_tx, counts.pending_inserts, counts.tombstones)
+            };
+            Ok((
+                counts(&summary.pending),
+                summary.candidate_pending.as_ref().map(counts),
+            ))
+        })
     }
 
     /// Read routes install their reader owner before entering here, and a

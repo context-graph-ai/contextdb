@@ -342,3 +342,45 @@ pub(crate) fn emit_import_tail_load_for_test(
     let observer = IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.borrow().clone());
     observer.and_then(|observer| observer(event))
 }
+
+/// Called on the import's thread between replacement-build steps, after
+/// every commit and partition gate is released: a test may commit there.
+#[cfg(any(test, feature = "test-seams"))]
+type ImportRebuildStepObserver = Arc<dyn Fn() + Send + Sync>;
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static IMPORT_REBUILD_STEP_OBSERVER: RefCell<Option<ImportRebuildStepObserver>> = const { RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn observe_import_rebuild_steps_for_test(
+    observer: ImportRebuildStepObserver,
+) -> ImportRebuildStepObservationForTest {
+    let previous = IMPORT_REBUILD_STEP_OBSERVER.with(|slot| slot.replace(Some(observer)));
+    ImportRebuildStepObservationForTest {
+        previous,
+        _thread: PhantomData,
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub struct ImportRebuildStepObservationForTest {
+    previous: Option<ImportRebuildStepObserver>,
+    _thread: PhantomData<Rc<()>>,
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for ImportRebuildStepObservationForTest {
+    fn drop(&mut self) {
+        IMPORT_REBUILD_STEP_OBSERVER.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn emit_import_rebuild_step_for_test() {
+    let observer = IMPORT_REBUILD_STEP_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer();
+    }
+}

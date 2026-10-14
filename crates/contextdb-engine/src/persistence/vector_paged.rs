@@ -1911,8 +1911,13 @@ impl<'t> NativeBatch<'t> {
             &record.index,
             dimension,
         )?;
-        let persisted: PersistedVectorEntry = RedbPersistence::decode(stored.value())
-            .map_err(|_| corruption("a paged build source body cannot be decoded"))?;
+        // Exact-length bodies: the f32 values become the source values with
+        // no growth slack and no copy.
+        let persisted = RedbPersistence::decode_persisted_vector_entry_exact(stored.value())
+            .map_err(|error| match error {
+                Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) => error,
+                _ => corruption("a paged build source body cannot be decoded"),
+            })?;
         if persisted.index != record.index
             || persisted.row_id != record.row_id
             || persisted.created_tx != record.vector_created_tx
@@ -2962,6 +2967,70 @@ impl RedbPersistence {
 
     /// Every durable build record, for restart registration and floor restore.
     /// The inventory is one small control record per unpublished partition.
+    /// The first durable build record after `after` (all records when None),
+    /// in key order, from its own read: reopen streams build records one at a
+    /// time instead of materializing the whole inventory.
+    pub(crate) fn next_paged_build_record_after(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, VectorPartitionRef, PagedBuildRecord)>> {
+        self.saved_export_recovery_cutoff()?;
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let builds = match read.open_table(BUILDS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut range = match after {
+                Some(after) => builds
+                    .range::<&[u8]>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded)),
+                None => builds.range::<&[u8]>(..),
+            }
+            .map_err(Self::storage_error)?;
+            let Some(entry) = range.next() else {
+                return Ok(None);
+            };
+            let (key, value) = entry.map_err(Self::storage_error)?;
+            let record: PagedBuildRecord =
+                Self::decode_exact(open_value(key.value(), value.value())?)
+                    .map_err(|_| corruption("paged build record cannot be decoded"))?;
+            let partition = vector_membership_pages::partition_from_prefix(key.value())?;
+            Ok(Some((key.value().to_vec(), partition, record)))
+        })
+    }
+
+    /// The first durable construction floor after `after`, in key order,
+    /// from its own read.
+    pub(crate) fn next_construction_floor_after(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, VectorPartitionRef, TxId)>> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let floors = match read.open_table(FLOORS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut range = match after {
+                Some(after) => floors
+                    .range::<&[u8]>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded)),
+                None => floors.range::<&[u8]>(..),
+            }
+            .map_err(Self::storage_error)?;
+            let Some(entry) = range.next() else {
+                return Ok(None);
+            };
+            let (key, value) = entry.map_err(Self::storage_error)?;
+            Ok(Some((
+                key.value().to_vec(),
+                vector_membership_pages::partition_from_prefix(key.value())?,
+                TxId(value.value()),
+            )))
+        })
+    }
+
     pub(crate) fn load_paged_build_records(
         &self,
     ) -> Result<Vec<(VectorPartitionRef, PagedBuildRecord)>> {
@@ -3378,6 +3447,121 @@ impl RedbPersistence {
             }
         }
         Ok(())
+    }
+
+    /// The import cohort after `covered`, never past `target`: whole committed
+    /// LSNs, oldest first, while `fits` accepts their journal record count.
+    /// Grouping reads only the ordered journal keys (prefix, LSN, ordinal),
+    /// never a payload, so planning decodes nothing. A tombstone's key is
+    /// counted too: the count is an upper bound, like the tail admission's.
+    /// Returns `None` when no record lies in (covered, target], and
+    /// `Some((0, first))` when the first LSN alone does not fit.
+    pub(crate) fn vector_partition_journal_cohort_by_key(
+        &self,
+        partition: &VectorPartitionRef,
+        covered: Lsn,
+        target: Lsn,
+        fits: impl Fn(usize) -> bool,
+    ) -> Result<Option<(usize, Lsn)>> {
+        let Some((lower, upper)) = Self::vector_partition_journal_suffix_bounds(
+            &partition.index,
+            &partition.partition_key,
+            covered,
+            Some(target),
+        )?
+        else {
+            return Ok(None);
+        };
+        let lsn_at = lower.len() - 8;
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let journal = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut taken = 0usize;
+            let mut through: Option<Lsn> = None;
+            let mut group: Option<(Lsn, usize)> = None;
+            for entry in journal
+                .range(lower.as_slice()..upper.as_slice())
+                .map_err(Self::storage_error)?
+            {
+                let (key, _) = entry.map_err(Self::storage_error)?;
+                let lsn = key
+                    .value()
+                    .get(lsn_at..lsn_at + 8)
+                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                    .map(|bytes| Lsn(u64::from_be_bytes(bytes)))
+                    .ok_or_else(|| self.vector_partition_corruption("journal key has no LSN"))?;
+                group = match group {
+                    Some((current, records)) if current == lsn => Some((current, records + 1)),
+                    Some((current, records)) => {
+                        if !fits(taken.saturating_add(records)) {
+                            return Ok(Some((taken, through.unwrap_or(current))));
+                        }
+                        taken += records;
+                        through = Some(current);
+                        Some((lsn, 1))
+                    }
+                    None => Some((lsn, 1)),
+                };
+            }
+            Ok(match group {
+                None => None,
+                Some((current, records)) if fits(taken.saturating_add(records)) => {
+                    Some((taken + records, current))
+                }
+                Some((current, _)) => Some((taken, through.unwrap_or(current))),
+            })
+        })
+    }
+
+    /// Live membership count of one partition at a past frontier: the
+    /// memberships a build pinned at `(frontier_tx, frontier_lsn)` sources,
+    /// by the same visibility rule its source scan applies. One record is
+    /// decoded at a time under the caller's decode owner.
+    pub(crate) fn vector_partition_live_membership_count_at(
+        &self,
+        partition: &VectorPartitionRef,
+        frontier_tx: TxId,
+        frontier_lsn: Lsn,
+    ) -> Result<usize> {
+        let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let memberships = match read.open_byte_table_bounded(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+            {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut live = 0usize;
+            for entry in memberships
+                .prefix_bounded(prefix.as_slice())
+                .map_err(Self::storage_error)?
+            {
+                let (_, value) = entry.map_err(Self::storage_error)?;
+                let record: VectorPartitionMembershipRecord = self
+                    .decode_expected_vector_partition_metadata(
+                        VectorPartitionRecordKind::Membership,
+                        value.value(),
+                        &partition.index,
+                        &partition.partition_key,
+                    )?;
+                if record.row_lsn <= frontier_lsn
+                    && record.visible_from <= frontier_tx
+                    && record
+                        .deleted_tx
+                        .is_none_or(|deleted| deleted > frontier_tx)
+                {
+                    live = live
+                        .checked_add(1)
+                        .ok_or_else(|| corruption("live membership count overflow"))?;
+                }
+            }
+            Ok(live)
+        })
     }
 
     /// Live membership count of one partition, from its maintained summary.
