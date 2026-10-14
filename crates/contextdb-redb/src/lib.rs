@@ -112,7 +112,7 @@ mod table;
 mod table_registry;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub use table_registry::RegistryAllocationRecord;
+pub use table_registry::{RegistryAllocationRecord, set_registry_allocation_observer_for_test};
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
 pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveError};

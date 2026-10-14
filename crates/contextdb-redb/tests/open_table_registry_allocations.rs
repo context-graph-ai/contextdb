@@ -324,3 +324,141 @@ fn restaging_an_already_staged_table_allocates_no_key() {
     );
     assert_eq!(write.pending_table_updates_for_test().0, entries);
 }
+
+/// Every recorded free names the allocation generation it ends, each
+/// generation is freed at most once, and a reused address is a new
+/// generation: repeated growth and replacement are distinct lifetimes.
+#[test]
+fn every_freed_registry_array_names_the_allocation_it_ends() {
+    let db = database();
+    let write = db.begin_write().expect("begin");
+    write.open_table_registry_record_for_test();
+    for round in 0..6 {
+        let mut held = Vec::new();
+        for n in 0..300 {
+            reserve_exactly(&write, 1);
+            held.push(
+                write
+                    .open_table(definition(&format!("r{round}_{n}")))
+                    .expect("open"),
+            );
+        }
+        drop(held);
+        let replacement = write
+            .open_table_registry_cost_to_hold(0)
+            .expect("representable")
+            .map(|layout| {
+                write
+                    .open_table_registry_prepare(0, layout.size())
+                    .expect("prepare")
+            });
+        write
+            .open_table_registry_install(replacement)
+            .unwrap_or_else(|(error, _)| panic!("install: {error:?}"));
+    }
+    let (records, live, _) = write.open_table_registry_records_for_test();
+    let mut open = std::collections::HashMap::new();
+    let mut ended = std::collections::HashSet::new();
+    for record in &records {
+        if record.allocated {
+            assert!(
+                open.insert(record.generation, record.address).is_none(),
+                "generation {} is allocated once",
+                record.generation
+            );
+        } else {
+            assert_eq!(
+                open.remove(&record.generation),
+                Some(record.address),
+                "a free ends the live allocation of its own generation: {record:?}"
+            );
+            assert!(ended.insert(record.generation));
+        }
+    }
+    let reused = records
+        .iter()
+        .filter(|record| record.allocated)
+        .map(|record| record.address)
+        .collect::<Vec<_>>();
+    let distinct = reused.iter().collect::<std::collections::HashSet<_>>().len();
+    eprintln!(
+        "registry generations allocated={} distinct_addresses={distinct}",
+        reused.len()
+    );
+    assert_eq!(live, 0, "every array of an empty registry is freed");
+}
+
+/// The registry's own work: over seeded orders of names sharing a 200-byte
+/// prefix, an empty-started registry funded one table at a time resizes at
+/// most ⌈log2(T + 3)⌉ + 2 times and performs at most 2T + 2R + 4 operations
+/// (T inserts and removes, two per funded reserve, plus a fixed allowance).
+#[test]
+fn registry_work_stays_within_its_bounds_on_seeded_long_prefix_names() {
+    const TABLES: usize = 2_048;
+    let prefix = "p".repeat(200);
+    for seed in 0..8u64 {
+        let db = database();
+        let write = db.begin_write().expect("begin");
+        let mut names: Vec<String> = (0..TABLES).map(|n| format!("{prefix}{n:05}")).collect();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (seed + 1);
+        for index in (1..names.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            names.swap(index, (state % (index as u64 + 1)) as usize);
+        }
+        let (calls_before, resizes_before) = write.open_table_registry_work_for_test();
+        let mut reserves = 0usize;
+        let mut held = Vec::new();
+        for name in &names {
+            reserve_exactly(&write, 1);
+            reserves += 1;
+            held.push(write.open_table(definition(name)).expect("open"));
+        }
+        drop(held);
+        let (calls, resizes) = write.open_table_registry_work_for_test();
+        let (calls, resizes) = (calls - calls_before, resizes - resizes_before);
+        let resize_bound = (usize::BITS - (TABLES + 3).leading_zeros()) as usize + 2;
+        let call_bound = 2 * TABLES + 2 * reserves + 4;
+        eprintln!(
+            "registry_work seed={seed} calls={calls} bound={call_bound} resizes={resizes} \
+             bound={resize_bound}"
+        );
+        assert!(resizes <= resize_bound, "seed {seed}: {resizes} > {resize_bound}");
+        assert!(calls <= call_bound, "seed {seed}: {calls} > {call_bound}");
+    }
+}
+
+/// A global allocation failure while preparing a replacement reports the
+/// refused layout and leaves the registry and its allocation unchanged.
+#[test]
+fn a_failed_global_allocation_while_preparing_changes_nothing() {
+    let db = database();
+    let write = db.begin_write().expect("begin");
+    let mut held = Vec::new();
+    for n in 0..40 {
+        reserve_exactly(&write, 1);
+        held.push(write.open_table(definition(&format!("f{n}"))).expect("open"));
+    }
+    let before = write.open_table_registry_bytes();
+    let layout = write
+        .open_table_registry_cost_to_hold(40)
+        .expect("representable")
+        .expect("a non-empty array");
+    write.open_table_registry_fail_next_allocation_for_test();
+    assert_eq!(
+        write
+            .open_table_registry_prepare(40, layout.size())
+            .err(),
+        Some(RegistryReserveError::AllocError(layout)),
+        "the failed allocation reports its exact layout"
+    );
+    assert_eq!(write.open_table_registry_bytes(), before);
+    assert_eq!(write.open_table_registry_len(), 40);
+    let replacement = write
+        .open_table_registry_prepare(40, layout.size())
+        .expect("the next preparation succeeds");
+    assert_eq!(replacement.allocation_bytes(), layout.size());
+    drop(replacement);
+    drop(held);
+}

@@ -686,6 +686,7 @@ impl TableNamespace<'_> {
         let root = self
             .table_tree
             .get_or_create_table::<K, V>(name, table_type)?;
+        self.registry_funding.count_call();
         self.open_tables
             .insert(Box::from(name), panic::Location::caller());
 
@@ -814,6 +815,7 @@ impl TableNamespace<'_> {
         table: &BtreeMut<K, V>,
         length: u64,
     ) {
+        self.registry_funding.count_call();
         self.open_tables.remove(name).unwrap();
         self.table_tree
             .stage_update_table_root(name, table.get_root(), length);
@@ -826,6 +828,7 @@ impl TableNamespace<'_> {
         &mut self,
         additional: usize,
     ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
+        self.registry_funding.count_call();
         let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
         match self.open_tables.try_reserve(additional) {
             Ok(()) => Ok(None),
@@ -844,6 +847,7 @@ impl TableNamespace<'_> {
         additional: usize,
         credit: usize,
     ) -> Result<usize, crate::table_registry::RegistryReserveError> {
+        self.registry_funding.count_call();
         let before = self.open_tables.allocation_size();
         let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
         let allocations = call.allocations();
@@ -860,6 +864,7 @@ impl TableNamespace<'_> {
         &self,
         len: usize,
     ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
+        self.registry_funding.count_call();
         let mut scratch = crate::table_registry::new_open_tables(&self.registry_funding);
         let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
         match scratch.try_reserve(len) {
@@ -881,6 +886,7 @@ impl TableNamespace<'_> {
         crate::table_registry::RegistryReplacement,
         crate::table_registry::RegistryReserveError,
     > {
+        self.registry_funding.count_call();
         let mut map = crate::table_registry::new_open_tables(&self.registry_funding);
         let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
         map.try_reserve(len)
@@ -920,7 +926,9 @@ impl TableNamespace<'_> {
         };
         // `next` has room for every entry, so these inserts allocate nothing;
         // a monitored caller would see any allocation as an overdraft.
+        self.registry_funding.count_call();
         for (name, location) in self.open_tables.drain() {
+            self.registry_funding.count_call();
             next.insert(name, location);
         }
         let previous = std::mem::replace(&mut self.open_tables, next);
@@ -1893,6 +1901,25 @@ impl WriteTransaction {
         let tables = self.tables.lock().unwrap();
         let (live, peak) = tables.registry_funding.live_and_peak();
         (tables.registry_funding.take_records(), live, peak)
+    }
+
+    /// Make the next registry array allocation fail as the global allocator
+    /// would.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_fail_next_allocation_for_test(&self) {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_funding
+            .fail_next_allocation();
+    }
+
+    /// (registry operations, array allocations) in this transaction so far.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_work_for_test(&self) -> (usize, usize) {
+        self.tables.lock().unwrap().registry_funding.work()
     }
 
     /// The address and length of every registry key box.

@@ -40,8 +40,28 @@ pub(crate) struct RegistryFunding {
     peak: AtomicUsize,
     overdraft: AtomicUsize,
     allocations: AtomicUsize,
+    /// Registry operations (inserts, removes, reserves, probes, installs).
+    calls: AtomicUsize,
     #[cfg(feature = "test-seams")]
     records: std::sync::Mutex<Option<Vec<RegistryAllocationRecord>>>,
+    /// The generation of each live array, so a free names the allocation it
+    /// ends even when an address is reused.
+    #[cfg(feature = "test-seams")]
+    live_generations: std::sync::Mutex<Vec<(usize, usize)>>,
+    /// Fail the next array allocation as the global allocator would.
+    #[cfg(feature = "test-seams")]
+    fail_next: AtomicBool,
+}
+
+/// A process-wide observer of every registry array allocation and free, for
+/// tests that order them with their own events.
+#[cfg(feature = "test-seams")]
+static OBSERVER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install (or remove) the observer of registry array allocations and frees.
+#[cfg(feature = "test-seams")]
+pub fn set_registry_allocation_observer_for_test(observer: Option<fn(RegistryAllocationRecord)>) {
+    OBSERVER.store(observer.map_or(0, |observer| observer as usize), Ordering::SeqCst);
 }
 
 /// One allocation or free of a registry array, in the order they happened.
@@ -62,33 +82,56 @@ impl RegistryFunding {
             let live = self.live.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
             self.peak.fetch_max(live, Ordering::SeqCst);
             #[cfg(feature = "test-seams")]
-            self.record(generation, address, layout, true);
+            {
+                self.live_generations
+                    .lock()
+                    .unwrap()
+                    .push((address, generation));
+                self.record(generation, address, layout, true);
+            }
             #[cfg(not(feature = "test-seams"))]
             let _ = (generation, address);
         } else {
             self.live.fetch_sub(layout.size(), Ordering::SeqCst);
             #[cfg(feature = "test-seams")]
-            self.record(
-                self.allocations.load(Ordering::SeqCst),
-                address,
-                layout,
-                false,
-            );
+            {
+                let generation = {
+                    let mut live = self.live_generations.lock().unwrap();
+                    let index = live
+                        .iter()
+                        .position(|(at, _)| *at == address)
+                        .expect("a freed registry array was recorded when allocated");
+                    live.swap_remove(index).1
+                };
+                self.record(generation, address, layout, false);
+            }
             #[cfg(not(feature = "test-seams"))]
             let _ = address;
         }
     }
 
+    pub(crate) fn count_call(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+
     #[cfg(feature = "test-seams")]
     fn record(&self, generation: usize, address: usize, layout: Layout, allocated: bool) {
+        let record = RegistryAllocationRecord {
+            generation,
+            address,
+            size: layout.size(),
+            align: layout.align(),
+            allocated,
+        };
         if let Some(records) = self.records.lock().unwrap().as_mut() {
-            records.push(RegistryAllocationRecord {
-                generation,
-                address,
-                size: layout.size(),
-                align: layout.align(),
-                allocated,
-            });
+            records.push(record);
+        }
+        let observer = OBSERVER.load(Ordering::SeqCst);
+        if observer != 0 {
+            // SAFETY: only `set_registry_allocation_observer_for_test` stores
+            // a non-zero value, and it stores a `fn(RegistryAllocationRecord)`.
+            let observer: fn(RegistryAllocationRecord) = unsafe { std::mem::transmute(observer) };
+            observer(record);
         }
     }
 
@@ -110,6 +153,10 @@ pub(crate) struct RegistryAlloc(Arc<RegistryFunding>);
 unsafe impl Allocator for RegistryAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let funding = &*self.0;
+        #[cfg(feature = "test-seams")]
+        if funding.fail_next.swap(false, Ordering::SeqCst) {
+            return Err(AllocError);
+        }
         if funding.fallible.load(Ordering::SeqCst) {
             let credit = funding.credit.load(Ordering::SeqCst);
             if layout.size() > credit {
@@ -245,6 +292,20 @@ impl RegistryFunding {
 
     pub(crate) fn take_records(&self) -> Vec<RegistryAllocationRecord> {
         self.records.lock().unwrap().take().unwrap_or_default()
+    }
+
+    /// Make the next registry array allocation fail as the global
+    /// allocator would.
+    pub(crate) fn fail_next_allocation(&self) {
+        self.fail_next.store(true, Ordering::SeqCst);
+    }
+
+    /// (registry operations, array allocations) so far.
+    pub(crate) fn work(&self) -> (usize, usize) {
+        (
+            self.calls.load(Ordering::SeqCst),
+            self.allocations.load(Ordering::SeqCst),
+        )
     }
 
     pub(crate) fn live_and_peak(&self) -> (usize, usize) {
