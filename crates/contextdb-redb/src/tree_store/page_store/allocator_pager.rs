@@ -47,6 +47,8 @@ struct Window {
     identity: u64,
     bytes: [u8; WINDOW_BYTES],
     dirty: bool,
+    // Set on every use, cleared as the eviction clock passes.
+    referenced: bool,
 }
 
 impl Window {
@@ -55,6 +57,7 @@ impl Window {
             identity: 0,
             bytes: [0; WINDOW_BYTES],
             dirty: false,
+            referenced: false,
         })
     }
 }
@@ -471,6 +474,7 @@ impl AllocatorPager {
             .and_then(|key| key.checked_add(1))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocator key overflow"))?;
         if let Some(slot) = inner.index.get(identity) {
+            inner.windows[slot].referenced = true;
             return Ok(slot);
         }
 
@@ -479,13 +483,33 @@ impl AllocatorPager {
         let victim = if let Some(slot) = inner.vacant.pop() {
             slot
         } else {
-            // Source-only words can be reloaded without spilling. Keep dirty
-            // words in the same owner while any clean window can be reused.
+            // A clock over the windows. One lap prefers, in order, a clean
+            // window nobody used since the hand last passed (it reloads
+            // without a spill) and then a dirty one nobody used (spilled once
+            // rather than pinning its slot for good), clearing the use marks
+            // it passes. Only when every window was in use does a second lap
+            // take the first clean window, else the hand's own slot.
             let windows = inner.windows.len();
-            let victim = (0..windows)
-                .map(|offset| (inner.next_victim + offset) % windows)
-                .find(|index| !inner.windows[*index].dirty)
-                .unwrap_or(inner.next_victim);
+            let mut cold_dirty = None;
+            let mut victim = None;
+            for step in 0..windows {
+                let index = (inner.next_victim + step) % windows;
+                let window = &mut inner.windows[index];
+                if window.referenced {
+                    window.referenced = false;
+                } else if !window.dirty {
+                    victim = Some(index);
+                    break;
+                } else if cold_dirty.is_none() {
+                    cold_dirty = Some(index);
+                }
+            }
+            let victim = victim.or(cold_dirty).unwrap_or_else(|| {
+                (0..windows)
+                    .map(|step| (inner.next_victim + step) % windows)
+                    .find(|index| !inner.windows[*index].dirty)
+                    .unwrap_or(inner.next_victim)
+            });
             inner.next_victim = (victim + 1) % windows;
             victim
         };
@@ -542,6 +566,7 @@ impl AllocatorPager {
             }
         }
         prior.identity = identity;
+        prior.referenced = true;
         inner.index.insert(identity, victim);
         Ok(victim)
     }
