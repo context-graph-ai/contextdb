@@ -19119,8 +19119,8 @@ pub struct PruningReport {
     /// Whether this cycle advanced durable storage compaction. A bounded
     /// sweep may require subsequent maintenance cycles to finish.
     pub compacted: bool,
-    /// The allocator's free-page ratio (free pages over region pages) as it
-    /// stood BEFORE this cycle pruned anything — accumulated waste that
+    /// The allocator's reclaimable free-page ratio (interior free pages over
+    /// the pages a trim would leave) as it stood BEFORE this cycle pruned anything — accumulated waste that
     /// survived page reuse from earlier cycles, not the space this prune just
     /// released. It counts whole free pages, the only space a relocation can
     /// give back, not unused bytes inside live pages, and it is no promise
@@ -24228,9 +24228,10 @@ impl MaintenanceContext {
     /// threshold are satisfied. An active sweep advances one bounded durable
     /// batch per cycle; completion starts the next interval, and so does a
     /// check that found the file below the threshold. The threshold is
-    /// measured on the allocator's maintained free-page ratio -- the pages a
-    /// whole-page relocation can actually give back -- which costs the same
-    /// at any store size; untrusted totals take no decision. It runs outside
+    /// measured on the allocator's reclaimable free-page ratio -- interior
+    /// free pages, which only a whole-page relocation gives back, not in-page
+    /// slack and not the trailing growth headroom any trim returns -- which
+    /// costs the same at any store size; untrusted totals take no decision. It runs outside
     /// the commit lock, since
     /// this is called from `run_cycle` after both `run_pruning` and
     /// `run_currency` have already returned.
@@ -65036,11 +65037,11 @@ impl Database {
     pub fn __allocator_free_page_ratios_for_test(&self) -> Result<(Option<f64>, f64)> {
         let persistence = self.persistence.as_ref().expect("file fixture");
         let maintained = persistence.allocator_free_page_ratio()?;
-        let (free, pages) = persistence.with_db(|db| {
+        let (free, pages, trailing) = persistence.with_db(|db| {
             db.allocator_free_totals_recount_for_test()
                 .map_err(crate::persistence::RedbPersistence::storage_error)
         })?;
-        let recounted = if pages == 0 { 0.0 } else { free as f64 / pages as f64 };
+        let recounted = crate::persistence::reclaimable_free_ratio(free, pages, trailing);
         Ok((maintained, recounted))
     }
 

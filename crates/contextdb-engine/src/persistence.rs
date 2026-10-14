@@ -177,6 +177,17 @@ thread_local! {
     static STORAGE_STATISTICS_CAPTURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Interior free pages over the pages a trim would leave.
+pub(crate) fn reclaimable_free_ratio(free: u64, pages: u64, trailing: u64) -> f64 {
+    let interior_free = free.saturating_sub(trailing);
+    let kept_pages = pages.saturating_sub(trailing);
+    if kept_pages == 0 {
+        0.0
+    } else {
+        interior_free as f64 / kept_pages as f64
+    }
+}
+
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub(crate) fn storage_statistics_captures_for_test() -> u64 {
@@ -37261,21 +37272,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    /// The allocator's free pages over its region pages, from the totals the
-    /// allocator maintains as it allocates and frees: no page or bitmap word
-    /// is read, so the cost is the same at any store size. This is the input
-    /// of the maintenance compaction decisions, because whole free pages are
-    /// what relocation gives back; in-page slack is not. `None` while the
-    /// totals are untrusted, when no decision may be taken.
+    /// The free pages only relocation can give back, over the file a trim
+    /// would leave: `(free - trailing) / (region pages - trailing)`, from the
+    /// totals the allocator maintains as it allocates and frees plus the
+    /// bounded free run that ends the last region. No page is read and the
+    /// full bitmap is not counted, so the cost is the same at any store size.
+    ///
+    /// This is the input of the maintenance compaction decisions. Whole
+    /// interior free pages are what relocation reclaims; in-page slack is
+    /// not, and the trailing free run (growth headroom) is reclaimed by any
+    /// trim without a relocation sweep. `None` while the totals are untrusted,
+    /// when no decision may be taken.
     pub(crate) fn allocator_free_page_ratio(&self) -> Result<Option<f64>> {
         self.with_db(|db| {
-            Ok(db.allocator_free_totals().map(|(free, pages)| {
-                if pages == 0 {
-                    0.0
-                } else {
-                    free as f64 / pages as f64
-                }
-            }))
+            Ok(db
+                .allocator_free_totals()
+                .map(|(free, pages, trailing)| reclaimable_free_ratio(free, pages, trailing)))
         })
     }
 

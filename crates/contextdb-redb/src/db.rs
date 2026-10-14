@@ -908,19 +908,21 @@ impl Database {
         move || tracker.has_waiting_write_transactions()
     }
 
-    /// The allocator's maintained `(free pages, region pages)`, read under the
-    /// allocator state lock without visiting a bitmap word or a page. `None`
-    /// while the totals are untrusted (repair in progress, a poisoned
-    /// allocator pager, or a failed rebuild), when no decision may use them.
+    /// The allocator's maintained `(free pages, region pages)` and the free
+    /// pages that end the last region, which a trim gives back without
+    /// relocation. Reads the maintained totals and the bounded tail run under
+    /// the allocator state lock, never a page or the full bitmap. `None` while
+    /// the totals are untrusted (repair in progress, a poisoned allocator
+    /// pager, or a failed rebuild), when no decision may use them.
     #[doc(hidden)]
-    pub fn allocator_free_totals(&self) -> Option<(u64, u64)> {
+    pub fn allocator_free_totals(&self) -> Option<(u64, u64, u64)> {
         self.mem.allocator_free_totals()
     }
 
     /// Independent recount of every region's free bits, for agreement tests.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn allocator_free_totals_recount_for_test(&self) -> Result<(u64, u64)> {
+    pub fn allocator_free_totals_recount_for_test(&self) -> Result<(u64, u64, u64)> {
         self.mem.recount_free_totals_for_test()
     }
 

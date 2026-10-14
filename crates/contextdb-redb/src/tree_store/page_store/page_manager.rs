@@ -913,21 +913,41 @@ impl TransactionalMemory {
             .mark_free_totals_untrusted();
     }
 
-    /// Trusted `(free pages, region pages)`; `None` while untrusted.
-    pub(crate) fn allocator_free_totals(&self) -> Option<(u64, u64)> {
-        self.state.lock().unwrap().allocators.free_totals()
+    /// Trusted `(free pages, region pages, trailing free pages)`; `None` while
+    /// untrusted. The trailing free pages end the last region: a trim gives
+    /// them back without relocating anything. Counting them walks the free
+    /// buddy blocks that end at the tail, which coalescing bounds by the order
+    /// count; `try_shrink` does the same on every shrinking commit.
+    pub(crate) fn allocator_free_totals(&self) -> Option<(u64, u64, u64)> {
+        let mut state = self.state.lock().unwrap();
+        let (free, pages) = state.allocators.free_totals()?;
+        let trailing = Self::trailing_free_pages(&mut state)?;
+        Some((free, pages, trailing))
+    }
+
+    fn trailing_free_pages(state: &mut InMemoryState) -> Option<u64> {
+        let last = state.header.layout().num_regions().checked_sub(1)?;
+        let trailing = u64::from(state.get_region(last).trailing_free_pages());
+        // A pager fault while reading the tail leaves no trusted answer.
+        state.allocators.free_totals()?;
+        Some(trailing)
     }
 
     /// Independent order-weighted recount of every region's free bits, for
     /// agreement tests. Leaves the maintained totals untouched.
     #[cfg(feature = "test-seams")]
-    pub(crate) fn recount_free_totals_for_test(&self) -> Result<(u64, u64)> {
+    pub(crate) fn recount_free_totals_for_test(&self) -> Result<(u64, u64, u64)> {
         let mut state = self.state.lock().unwrap();
         let layout = state.header.layout();
         let mut free_pages = 0u64;
         for region in 0..layout.num_regions() {
             free_pages += u64::from(state.get_region(region).count_free_pages());
         }
+        let trailing = u64::from(
+            state
+                .get_region(layout.num_regions() - 1)
+                .trailing_free_pages(),
+        );
         if let Some(error) = state
             .allocators
             .pager()
@@ -935,7 +955,7 @@ impl TransactionalMemory {
         {
             return Err(error);
         }
-        Ok((free_pages, layout_pages(&layout)))
+        Ok((free_pages, layout_pages(&layout), trailing))
     }
 
     pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
