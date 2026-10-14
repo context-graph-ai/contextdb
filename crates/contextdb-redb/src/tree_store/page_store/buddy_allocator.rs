@@ -631,7 +631,11 @@ mod test {
                 let expected = oracle.alloc_lowest_by_trial(order);
                 let actual = allocator.alloc_lowest(order);
                 assert_eq!(actual, expected, "order {order}");
-                assert_eq!(allocator.to_vec(), oracle.to_vec(), "free index after order {order}");
+                assert_eq!(
+                    allocator.to_vec(),
+                    oracle.to_vec(),
+                    "free index after order {order}"
+                );
                 if let Some(page) = actual {
                     held.push((page, order));
                 }
