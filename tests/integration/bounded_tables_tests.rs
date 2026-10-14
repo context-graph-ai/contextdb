@@ -537,18 +537,29 @@ fn c7_compaction_rides_the_same_fragmentation_threshold_as_the_currency_path() {
     insert_rows(&db, "windows", 1..401, &payload);
     clock.advance(RETENTION_WINDOW_MILLIS * 2);
 
-    let report = db.run_pruning_cycle_checked().expect("prune cycle");
-    assert_eq!(
-        report.compacted,
-        report.fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD,
-        "compaction must trigger exactly on the shared threshold \
-         ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}), fragmentation was {}: {report:?}",
-        report.fragmentation_before
-    );
-    assert!(
-        report.compacted,
+    // The decision input is the allocator's reclaimable free-page ratio, read
+    // before each cycle prunes (owner ruling, S9). Freshly written rows leave
+    // almost no free pages (0.0281 measured before the first cycle), so the
+    // first cycles decide below the threshold; the pages each finite prune
+    // releases raise the ratio until a later cycle's decision crosses it.
+    let mut report = None;
+    for _ in 0..64 {
+        let cycle = db.run_pruning_cycle_checked().expect("prune cycle");
+        assert_eq!(
+            cycle.compacted,
+            cycle.fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD,
+            "compaction must trigger exactly on the shared threshold \
+             ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}), fragmentation was {}: {cycle:?}",
+            cycle.fragmentation_before
+        );
+        if cycle.compacted {
+            report = Some(cycle);
+            break;
+        }
+    }
+    let report = report.expect(
         "pruning 400 of 400 large rows must leave the file dead-space dominated \
-         and trip compaction: {report:?}"
+         and trip compaction",
     );
     let before = report.file_bytes_before.expect("file size before");
     assert_eq!(
