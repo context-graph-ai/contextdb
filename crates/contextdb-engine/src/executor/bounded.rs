@@ -1216,8 +1216,11 @@ impl RequestContext {
         // The vector store's membership and body decodes for this request are
         // its own reads: fund them from its reader budget when no operation
         // owner is active, never from the private default decode accountant.
+        // A scan drops each body after scoring it (the caller's own scratch
+        // holds the body meanwhile), so each decode call's charge is returned
+        // when the next one begins, never accumulated across the scan.
         let decode = crate::read_image_memory::active_owner().is_err().then(|| {
-            crate::read_image_memory::ImageMemory::charging_reader(
+            crate::read_image_memory::ImageMemory::charging_reader_per_call(
                 crate::read_image_memory::ImageMemory::default_decode_accountant(),
                 self.reader_budget.clone(),
             )

@@ -141,6 +141,56 @@ impl ImageMemory {
         })
     }
 
+    /// A request's reader owner for work that decodes stored values one call
+    /// at a time and keeps none of them past the call -- a vector search
+    /// scoring candidates whose bodies it drops after scoring. Each top-level
+    /// decode call under it gets a fresh owner charged to the same declared
+    /// reader, and the previous call's charge is returned when the next call
+    /// begins or this owner drops, so a streamed scan holds one value's
+    /// decode at a time instead of every value it has already freed.
+    pub(crate) fn charging_reader_per_call(
+        accountant: crate::memory_accounting::AccountantHandle,
+        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Arc<Self> {
+        let mut owner = Self::charging_reader(accountant, reader_budget);
+        Arc::get_mut(&mut owner)
+            .expect("new reader owner is exclusive")
+            .per_call = Some(parking_lot::Mutex::new(None));
+        owner
+    }
+
+    /// Enter this owner for one top-level decode call. A per-call owner
+    /// returns its previous call's charge and admits the call under a fresh
+    /// owner with the same funder and labels; any other owner is entered
+    /// as is.
+    pub(crate) fn enter_call(self: &Arc<Self>) -> Result<ImageMemoryScope> {
+        let Some(slot) = &self.per_call else {
+            return Ok(self.enter());
+        };
+        let mut slot = slot.lock();
+        // The previous call returned before this one began; its stored body
+        // and codec growth are already dropped.
+        drop(slot.take());
+        let call = match &self.reader_budget {
+            Some(reader) => Self::charging_reader_for(
+                self.accountant.clone(),
+                reader.clone(),
+                self.subsystem,
+                self.operation,
+                self.hint,
+            ),
+            None => {
+                let mut call = Self::operation_writer(self.accountant.clone())?;
+                Arc::get_mut(&mut call)
+                    .expect("new writer owner is exclusive")
+                    .prepaid_output = self.prepaid_output.clone();
+                call
+            }
+        };
+        *slot = Some(call.clone());
+        Ok(call.enter())
+    }
+
     pub(crate) fn reader_budget(
         &self,
     ) -> Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
@@ -277,19 +327,7 @@ impl ImageMemory {
     /// Reuse an operation's owner; otherwise admit a fresh call-local owner.
     pub(crate) fn enter_decode_call() -> Result<ImageMemoryScope> {
         if let Ok(owner) = active_owner() {
-            if let Some(slot) = &owner.per_call {
-                let mut slot = slot.lock();
-                // The previous call returned before this one began; its
-                // stored body and codec growth are already dropped.
-                drop(slot.take());
-                let mut call = Self::operation_writer(owner.accountant.clone())?;
-                Arc::get_mut(&mut call)
-                    .expect("new writer owner is exclusive")
-                    .prepaid_output = owner.prepaid_output.clone();
-                *slot = Some(call.clone());
-                return Ok(call.enter());
-            }
-            return Ok(owner.enter());
+            return owner.enter_call();
         }
         #[cfg(any(test, feature = "test-seams"))]
         crate::vector_read_memory::note_unowned_decode_for_test();
@@ -1885,6 +1923,36 @@ mod exact_sequence_tests {
         let (_second, _) = decode::<Kept>(&encoded(&values)).unwrap();
         assert_eq!(owner.adopted_output(), 1536 * 4);
         assert_eq!(writer.usage().used, before + 1536 * 4);
+    }
+
+    #[test]
+    fn a_per_call_reader_holds_one_decode_at_a_time_and_returns_it_on_drop() {
+        let values: Vec<f32> = (0..1536).map(|lane| lane as f32).collect();
+        let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1 << 20);
+        let owner =
+            ImageMemory::charging_reader_per_call(accountant(1 << 20), declared.child().unwrap());
+        let before = declared.retained_bytes_for_test();
+        {
+            let _scope = owner.enter();
+            // A streamed scan: each body is decoded, scored and dropped.
+            for _ in 0..64 {
+                let (decoded, _) = decode::<Exact>(&encoded(&values)).unwrap();
+                drop(decoded);
+            }
+            assert_eq!(owner.held(), 0, "the request owner itself holds nothing");
+            assert_eq!(
+                owner.held_with_call(),
+                1536 * 4,
+                "only the latest call's decode is still charged"
+            );
+            assert_eq!(declared.retained_bytes_for_test(), before + 1536 * 4);
+        }
+        drop(owner);
+        assert_eq!(
+            declared.retained_bytes_for_test(),
+            before,
+            "the last call's charge returns when the request owner drops"
+        );
     }
 
     fn length_prefix_u32(length: u32) -> Vec<u8> {
