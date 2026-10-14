@@ -13,6 +13,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(test)]
+thread_local! {
+    /// Regional descriptor views this thread built, for work-count tests.
+    pub(super) static REGION_VIEWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) type SavedBitmapWindow =
     dyn Fn(Option<u32>, u8, u8, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
 type PagedBaseLoader = dyn Fn(u64, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
@@ -140,11 +146,15 @@ impl RegionTracker {
         let order: usize = order.into();
         assert!(order < self.order_trackers.len());
         for i in order..self.order_trackers.len() {
-            // Already-full orders need no parent updates or dirty windows.
-            // Keep allocation's exact tracker update within the shared pager.
-            if !self.order_trackers[i].get(region) {
-                self.order_trackers[i].set(region);
+            // Full marks are upward-closed: `mark_full` sets every order from
+            // its own upward and `mark_free` clears every order up to its own,
+            // so an order already marked full has every higher order marked
+            // too. Stopping there keeps an allocation's tracker update to the
+            // orders it actually changes instead of one read per order.
+            if self.order_trackers[i].get(region) {
+                break;
             }
+            self.order_trackers[i].set(region);
         }
     }
 
@@ -170,14 +180,19 @@ pub(super) struct PagedRegions {
     layout: Arc<Mutex<DatabaseLayout>>,
     saved_region_limit: Arc<AtomicU32>,
     active: Option<(u32, BuddyAllocator)>,
+    // The saved table measured too large to retire at (saved regions, layout
+    // regions, layout bytes, window bytes). Unchanged inputs keep the verdict.
+    oversized_source: Option<(u32, u32, u64, usize)>,
 }
 
 impl Allocators {
-    /// A paged allocator's operation peak is `W * P + H + C`: W=32 windows,
-    /// P=4096 bytes each, H=4096 bytes of stack hashing scratch, and C<32KiB
-    /// for tags, pager control, both descriptor trees, one regional view and
-    /// source state. The source B-tree page belongs to the existing page owner.
-    /// This bound is independent of the file's region count.
+    /// A paged allocator's operation peak is `W * P + H + C`: W windows the
+    /// writer's cache share admits (at least 32), P=4096 bytes each plus their
+    /// index, H=4096 bytes of stack hashing scratch plus at most one
+    /// 4104-byte stack record buffer while a window reloads, and C<32KiB for tags,
+    /// pager control, both descriptor trees, one regional view and source
+    /// state. The source B-tree page belongs to the existing page owner. This
+    /// bound follows the declared budget and is independent of region count.
     pub(super) fn resident_bytes(&self) -> usize {
         if let Some(paged) = &self.paged {
             let descriptors = self.region_tracker.allocator_metadata_bytes_for_test()
@@ -187,7 +202,7 @@ impl Allocators {
                 + size_of::<Allocators>()
                 + 1024;
             debug_assert!(descriptors <= 16 * 1024);
-            return AllocatorPager::resident_bytes() + descriptors.max(16 * 1024);
+            return paged.pager.resident_bytes() + descriptors.max(16 * 1024);
         }
         let resident = self.regions.capacity() * size_of::<BuddyAllocator>()
             + self
@@ -221,7 +236,7 @@ impl Allocators {
         }
     }
 
-    /// Bitmap payload resides in 32 fixed 4096-byte windows. The tracker and
+    /// Bitmap payload resides in budget-sized 4096-byte windows. The tracker and
     /// the one active region retain only descriptor vectors; all other region
     /// descriptors are reconstructed from scalar geometry on demand.
     pub(super) fn new_paged(
@@ -244,13 +259,25 @@ impl Allocators {
                 layout: geometry,
                 saved_region_limit,
                 active: None,
+                oversized_source: None,
             }),
         })
+    }
+
+    /// Size the window set from the writer's page-cache share. Returns the
+    /// bytes it takes from that share, which the page cache gives up.
+    pub(super) fn set_window_budget(&mut self, cache_bytes: usize) -> io::Result<usize> {
+        let Some(paged) = &self.paged else {
+            return Ok(0);
+        };
+        paged.pager.set_cache_budget(cache_bytes)?;
+        Ok(AllocatorPager::cache_bytes_taken(cache_bytes))
     }
 
     pub(super) fn set_saved_source(&mut self, source: Arc<SavedBitmapWindow>) -> io::Result<()> {
         if let Some(paged) = &mut self.paged {
             paged.active = None;
+            paged.oversized_source = None;
             paged.saved_region_limit.store(
                 paged.layout.lock().unwrap().num_regions(),
                 Ordering::Release,
@@ -274,6 +301,7 @@ impl Allocators {
         if let Some(paged) = &mut self.paged {
             *paged.layout.lock().unwrap() = layout;
             paged.active = None;
+            paged.oversized_source = None;
             paged.saved_region_limit.store(0, Ordering::Release);
             Self::install_paged_source(
                 &paged.pager,
@@ -412,8 +440,12 @@ impl Allocators {
     }
 
     /// Retire a small saved allocator table during an ordinary commit. The
-    /// complete copy fits in one fixed window set; larger tables stay as the
-    /// lazy source until quick repair or explicit whole-file compaction materializes them.
+    /// complete copy fits in the floor's `WINDOWS` windows, whatever the
+    /// admitted set: retiring a larger table would read the whole saved bitmap
+    /// inside an ordinary commit. Larger tables stay as the lazy source until
+    /// quick repair or explicit whole-file compaction materializes them. A
+    /// table measured too large stays too large until the layout changes, so
+    /// that verdict is kept.
     pub(super) fn materialize_saved_source_if_small(&mut self) -> io::Result<bool> {
         let Some(paged) = &self.paged else {
             return Ok(true);
@@ -425,22 +457,36 @@ impl Allocators {
         let current_regions = u32::try_from(self.region_count())
             .map_err(|_| io::Error::other("allocator region count overflow"))?;
         let saved = saved.min(current_regions);
-        if saved as usize > WINDOWS {
+        let paged = self.paged.as_ref().unwrap();
+        let window_bytes = WINDOWS * WINDOW_BYTES;
+        let layout_bytes = paged.layout.lock().unwrap().len();
+        let inputs = (saved, current_regions, layout_bytes, window_bytes);
+        if paged.oversized_source == Some(inputs) {
             return Ok(false);
         }
+        if saved as usize > window_bytes / WINDOW_BYTES
+            || !self.saved_source_fits(saved, window_bytes)?
+        {
+            self.paged.as_mut().unwrap().oversized_source = Some(inputs);
+            return Ok(false);
+        }
+        self.materialize_saved_source()?;
+        Ok(true)
+    }
+
+    fn saved_source_fits(&mut self, saved: u32, window_bytes: usize) -> io::Result<bool> {
         let mut encoded_bytes = self.region_tracker.encoded_len();
-        if encoded_bytes > WINDOWS * WINDOW_BYTES {
+        if encoded_bytes > window_bytes {
             return Ok(false);
         }
         for region in 0..saved {
             encoded_bytes = encoded_bytes
                 .checked_add(self.get_region(region).encoded_len())
                 .ok_or_else(|| io::Error::other("allocator source size overflow"))?;
-            if encoded_bytes > WINDOWS * WINDOW_BYTES {
+            if encoded_bytes > window_bytes {
                 return Ok(false);
             }
         }
-        self.materialize_saved_source()?;
         Ok(true)
     }
 
@@ -476,6 +522,8 @@ impl Allocators {
                     false,
                 );
                 paged.active = Some((region, allocator));
+                #[cfg(test)]
+                REGION_VIEWS_BUILT.with(|built| built.set(built.get() + 1));
                 #[cfg(feature = "test-seams")]
                 crate::db::allocator_metadata_test_seams::note_loaded_regions(1);
             }

@@ -24,15 +24,21 @@ complete-page admission and decoding. Retained roots keep complete checksum veri
 <!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::absent_lookup_and_prefix_neighbor_reject_without_materializing_the_extent, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::retained_root_inspection_keeps_full_checksum_admission -->
 
 Allocator metadata is paged, not resident. Both the region tracker and the buddy-allocator
-bitmaps read through 32 fixed 4096-byte windows (`tree_store/page_store/allocator_pager.rs`); a
-dirty window spills to a disposable same-directory scratch file the backend supplies
-(`ScratchBackend`) and bitmap words load lazily from the saved or virtual base. Resident allocator
-bytes therefore do not grow with the file's region count, a scratch I/O fault refuses publication
+bitmaps read through a set of 4096-byte windows (`tree_store/page_store/allocator_pager.rs`) sized
+from the writer's page-cache share the engine passes in: one byte in 32 of that share, never fewer
+than 32 windows, carved out of the page cache so the engine's one cache charge covers it. Windows
+are found through a fixed open-addressed identity index sized once per admitted count, so
+evict/insert churn never allocates. A dirty window spills to a disposable same-directory scratch
+file the backend supplies (`ScratchBackend`) as one 4104-byte record (identity plus words), a miss
+reloads that record with one read through a 4104-byte stack buffer, and bitmap words load lazily
+from the saved or virtual base. Free-order lookups descend the bitmap summary rather than sweeping
+leaf words. Resident allocator bytes therefore follow the declared budget and do not grow with the
+file's region count, a scratch I/O fault refuses publication
 and is repaired from the durable root on reopen, and a backend with no scratch keeps the old
 in-memory allocator. Compaction advances past a protected allocator source without reading its
 payload. The engine reads the retained envelope through the fork's resident-byte and region-count
 observations; it decides every budget.
-<!-- enforced by: crates/contextdb-redb/tests/allocator_residency_contract.rs::allocator_open_decodes_a_fixed_number_of_regions, crates/contextdb-redb/tests/allocator_residency_contract.rs::allocator_windows_bound_dirty_regions_in_one_transaction, crates/contextdb-redb/tests/allocator_residency_contract.rs::allocator_scratch_failure_prevents_publication_and_repairs_on_reopen -->
+<!-- enforced by: crates/contextdb-redb/tests/allocator_residency_contract.rs::allocator_open_decodes_a_fixed_number_of_regions, crates/contextdb-redb/tests/allocator_residency_contract.rs::allocator_windows_bound_dirty_regions_in_one_transaction, crates/contextdb-redb/tests/allocator_residency_contract.rs::allocator_scratch_failure_prevents_publication_and_repairs_on_reopen, crates/contextdb-redb/src/tree_store/page_store/allocator_pager.rs::window_churn_allocates_nothing, crates/contextdb-redb/src/tree_store/page_store/page_manager.rs::allocation_word_reads_do_not_grow_with_store_size, crates/contextdb-redb/src/tree_store/page_store/page_manager.rs::allocation_window_loads_do_not_grow_with_store_size -->
 
 Must not own: any ContextDB policy — thresholds, batch sizes, intervals, memory limits, table
 layouts. The engine decides those (`persistence.rs` calls `compact_step` with its own 64-page

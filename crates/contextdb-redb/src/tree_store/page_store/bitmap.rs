@@ -39,8 +39,11 @@ impl BtreeBitmap {
         self.get_level(self.get_height() - 1).count_unset()
     }
 
+    // Answered by the maintained fullness summary: one word per level, the
+    // same descent `alloc` takes, rather than a sweep of the leaf words whose
+    // length is the region's page count. True exactly when `alloc` succeeds.
     pub(crate) fn has_unset(&self) -> bool {
-        self.get_level(self.get_height() - 1).any_unset()
+        self.find_first_unset().is_some()
     }
 
     pub(crate) fn get(&self, i: u32) -> bool {
@@ -469,10 +472,6 @@ impl U64GroupedBitmap {
         (0..self.word_count())
             .map(|i| self.word(i).count_zeros())
             .sum()
-    }
-
-    fn any_unset(&self) -> bool {
-        (0..self.word_count()).any(|i| self.word(i).count_zeros() > 0)
     }
 
     fn first_unset(&self, start_bit: u32, end_bit: u32) -> Option<u32> {

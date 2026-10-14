@@ -4,6 +4,7 @@ use crate::transaction_tracker::TransactionId;
 use crate::transactions::DurablePublication;
 use crate::transactions::{AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut};
 use crate::tree_store::btree_base::{BtreeHeader, Checksum};
+use crate::tree_store::page_store::allocator_pager::AllocatorPager;
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
 use crate::tree_store::page_store::cached_file::PagedCachedFile;
@@ -193,9 +194,15 @@ struct InMemoryState {
 }
 
 impl InMemoryState {
-    fn new(header: DatabaseHeader, scratch: Option<Box<dyn ScratchBackend>>) -> Result<Self> {
+    fn new(
+        header: DatabaseHeader,
+        scratch: Option<Box<dyn ScratchBackend>>,
+        cache_size: usize,
+    ) -> Result<Self> {
         let allocators = if let Some(scratch) = scratch {
-            Allocators::new_paged(header.layout(), scratch)?
+            let mut allocators = Allocators::new_paged(header.layout(), scratch)?;
+            allocators.set_window_budget(cache_size)?;
+            allocators
         } else {
             Allocators::new(header.layout())
         };
@@ -322,7 +329,14 @@ impl TransactionalMemory {
         } else {
             file.scratch_backend()?
         };
-        let storage = PagedCachedFile::new(file, page_size as u64, cache_size)?;
+        // A paged allocator's windows are an allotment of the cache share.
+        let allocator_window_bytes = if scratch.is_some() {
+            AllocatorPager::cache_bytes_taken(cache_size)
+        } else {
+            0
+        };
+        let storage =
+            PagedCachedFile::new(file, page_size as u64, cache_size - allocator_window_bytes)?;
 
         let initial_storage_len = storage.raw_file_len()?;
 
@@ -442,7 +456,7 @@ impl TransactionalMemory {
         }
         let region_size = layout.full_region_layout().len();
         let region_header_size = layout.full_region_layout().data_section().start;
-        let state = InMemoryState::new(header, scratch)?;
+        let state = InMemoryState::new(header, scratch, cache_size)?;
 
         assert!(page_size >= DB_HEADER_SIZE);
 
@@ -469,7 +483,18 @@ impl TransactionalMemory {
 
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize> {
-        self.storage.settle_startup_cache_budget(bytes)
+        // The allocator window set takes its allotment of the share first;
+        // the page cache settles on the rest, so the reserve stays one charge.
+        let allocator_window_bytes = self
+            .state
+            .lock()
+            .unwrap()
+            .allocators
+            .set_window_budget(bytes)?;
+        let reserve = self
+            .storage
+            .settle_startup_cache_budget(bytes - allocator_window_bytes)?;
+        Ok(reserve + allocator_window_bytes)
     }
 
     pub(crate) fn cache_index_bytes(&self) -> usize {
@@ -711,6 +736,8 @@ impl TransactionalMemory {
         tree: &mut AllocatorStateTreeMut,
         num_regions: u32,
     ) -> Result<bool> {
+        #[cfg(test)]
+        allocator_growth_tests::SAVE_CALLS.with(|calls| calls.set(calls.get() + 1));
         self.check_io_errors()?;
         // Has the number of regions changed since reserve_allocator_state() was called?
         if num_regions != self.state.lock().unwrap().header.layout().num_regions() {
@@ -1906,5 +1933,252 @@ impl TransactionalMemory {
         // Like existing get_page_window, this lends immutable PageMemory.
         // No PageImpl/debug HashMap node or generic get_page is constructed.
         self.storage.read_native_clean_miss(offset, len)
+    }
+}
+
+/// Allocation work against stores of different sizes. The fixtures build real
+/// paged allocator state over 4 KiB-page geometry (no data pages are written):
+/// every region is fully allocated, then order-0 holes are punched at a fixed
+/// stride so each allocation fills a hole in region 0 while every higher order
+/// stays full. Counts are pager work counters, never elapsed time.
+#[cfg(test)]
+mod allocator_growth_tests {
+    use super::{InMemoryState, TransactionalMemory};
+    use crate::transaction_tracker::TransactionId;
+    use crate::tree_store::page_store::base::MAX_PAGE_INDEX;
+    use crate::tree_store::page_store::header::DatabaseHeader;
+    use crate::tree_store::page_store::layout::{DatabaseLayout, RegionLayout};
+    use crate::tree_store::page_store::region::REGION_VIEWS_BUILT;
+    use std::sync::Arc;
+
+    thread_local! {
+        /// `try_save_allocator_state` calls on this thread.
+        pub(super) static SAVE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The whole-allocator serialization runs only on quick-repair commits,
+    /// which the database issues on close; ordinary commits never call it.
+    #[test]
+    fn allocator_state_is_serialized_on_close_not_per_commit() {
+        use crate::{Database, TableDefinition};
+        const TABLE: TableDefinition<u64, u64> = TableDefinition::new("save_calls");
+        let file = crate::create_tempfile();
+        let db = Database::create(file.path()).unwrap();
+        let before = SAVE_CALLS.with(std::cell::Cell::get);
+        for key in 0..16 {
+            let write = db.begin_write().unwrap();
+            write.open_table(TABLE).unwrap().insert(key, key).unwrap();
+            write.commit().unwrap();
+        }
+        let after_commits = SAVE_CALLS.with(std::cell::Cell::get);
+        assert_eq!(
+            after_commits - before,
+            0,
+            "ordinary commits serialized allocator state"
+        );
+        drop(db);
+        let after_close = SAVE_CALLS.with(std::cell::Cell::get);
+        assert!(
+            after_close > after_commits,
+            "close must persist allocator state through a quick-repair commit"
+        );
+    }
+
+    const PAGE_SIZE: u32 = 4096;
+    const HOLE_STRIDE: usize = 1024;
+    const WARM_ALLOCATIONS: usize = 16;
+    const MEASURED_ALLOCATIONS: u64 = 64;
+    /// 1 GiB of pages: one partial region.
+    const SMALL_STORE_PAGES: u32 = 1 << 18;
+    /// 8 GiB of pages: two full 4 GiB regions.
+    const LARGE_STORE_FULL_REGIONS: u32 = 2;
+
+    fn layout(full_regions: u32, trailing_pages: Option<u32>) -> DatabaseLayout {
+        DatabaseLayout::new(
+            full_regions,
+            RegionLayout::new(MAX_PAGE_INDEX + 1, 1, PAGE_SIZE),
+            trailing_pages.map(|pages| RegionLayout::new(pages, 1, PAGE_SIZE)),
+        )
+    }
+
+    fn paged_state(layout: DatabaseLayout) -> InMemoryState {
+        let scratch = crate::scratch_backend_in_directory(&std::env::temp_dir()).unwrap();
+        InMemoryState::new(
+            DatabaseHeader::new(layout, TransactionId::new(0)),
+            Some(scratch),
+            0,
+        )
+        .unwrap()
+    }
+
+    fn fragmented_state(layout: DatabaseLayout) -> InMemoryState {
+        let mut state = paged_state(layout);
+        for region in 0..layout.num_regions() {
+            let allocator = state.get_region_mut(region);
+            for order in (0..=allocator.get_max_order()).rev() {
+                while allocator.alloc(order).is_some() {}
+            }
+            for page in (0..allocator.len()).step_by(HOLE_STRIDE) {
+                allocator.free(page, 0);
+            }
+            state.get_region_tracker_mut().mark_free(0, region);
+        }
+        state
+    }
+
+    fn counters(state: &InMemoryState) -> (u64, u64, u64) {
+        state.allocators.pager().unwrap().counters_for_test()
+    }
+
+    /// (word reads, window loads) for `MEASURED_ALLOCATIONS` order-0
+    /// allocations after a fixed warm-up.
+    fn allocation_work(state: &mut InMemoryState) -> (u64, u64) {
+        let allocate = |state: &mut InMemoryState| {
+            let page = TransactionalMemory::allocate_helper_retry(state, 0, false)
+                .unwrap()
+                .expect("a hole is free");
+            assert_eq!(page.region, 0, "every measured allocation fills region 0");
+            assert_eq!(page.page_index as usize % HOLE_STRIDE, 0);
+        };
+        for _ in 0..WARM_ALLOCATIONS {
+            allocate(state);
+        }
+        let (words, loads, _) = counters(state);
+        for _ in 0..MEASURED_ALLOCATIONS {
+            allocate(state);
+        }
+        let (words_after, loads_after, _) = counters(state);
+        assert!(!state.allocators.pager().unwrap().is_poisoned());
+        (words_after - words, loads_after - loads)
+    }
+
+    /// Window loads per allocation do not grow with the store. Across a
+    /// 1 GiB store (one partial region), an 8 GiB store (two full regions) and
+    /// a 16 GiB store (four), the only difference is region geometry: a
+    /// partial region of 2^18 pages has empty buddy orders 19 and 20, whose
+    /// summary roots an allocation never reads (`first_unset` returns before
+    /// any word of an empty level), while a full 2^20-page region reads all 21
+    /// roots. At the 32-window floor each of those reads is a load, so the
+    /// full-region stores may pay exactly log2(full / partial pages) more
+    /// loads per allocation; doubling the full-region store adds nothing
+    /// beyond one load per 8 allocations.
+    #[test]
+    fn allocation_window_loads_do_not_grow_with_store_size() {
+        let full_region_geometry_loads =
+            u64::from((MAX_PAGE_INDEX + 1).ilog2() - SMALL_STORE_PAGES.ilog2());
+        let mut loads = Vec::new();
+        for (gib, layout) in [
+            (1, layout(0, Some(SMALL_STORE_PAGES))),
+            (8, layout(LARGE_STORE_FULL_REGIONS, None)),
+            (16, layout(2 * LARGE_STORE_FULL_REGIONS, None)),
+        ] {
+            let mut state = fragmented_state(layout);
+            let (_, window_loads) = allocation_work(&mut state);
+            loads.push((gib, window_loads));
+        }
+        let [(_, one), (_, eight), (_, sixteen)] = loads[..] else {
+            unreachable!()
+        };
+        let report =
+            format!("window loads for {MEASURED_ALLOCATIONS} allocations by store GiB: {loads:?}");
+        assert!(
+            eight <= one + full_region_geometry_loads * MEASURED_ALLOCATIONS,
+            "{report}"
+        );
+        assert!(sixteen <= eight + MEASURED_ALLOCATIONS / 8, "{report}");
+    }
+
+    /// Finding the highest free order after an allocation reads a bounded
+    /// number of bitmap words: the summary levels answer it, not a leaf sweep
+    /// whose length is the region's page count.
+    #[test]
+    fn allocation_word_reads_do_not_grow_with_store_size() {
+        let mut small = fragmented_state(layout(0, Some(SMALL_STORE_PAGES)));
+        let mut large = fragmented_state(layout(LARGE_STORE_FULL_REGIONS, None));
+        let (small_words, _) = allocation_work(&mut small);
+        let (large_words, _) = allocation_work(&mut large);
+        assert!(
+            large_words <= small_words + 8 * MEASURED_ALLOCATIONS,
+            "bitmap words read for {MEASURED_ALLOCATIONS} allocations: 1 GiB store \
+             {small_words}, 8 GiB store {large_words}"
+        );
+        assert!(
+            large_words <= 128 * MEASURED_ALLOCATIONS,
+            "an allocation read {} words on average",
+            large_words / MEASURED_ALLOCATIONS
+        );
+    }
+
+    /// A declared writer cache share sizes the window set: under the share a
+    /// 1.5 GiB writer budget gives (64 MiB) the 8 GiB store's allocation
+    /// working set stays resident, so steady-state allocations load nothing,
+    /// and the pager's residency stays inside its carve of that share. The
+    /// smallest shares keep exactly the former 32-window set.
+    #[test]
+    fn a_declared_cache_share_sizes_the_window_set() {
+        use crate::tree_store::page_store::allocator_pager::{
+            AllocatorPager, CACHE_SHARE_DIVISOR, WINDOWS,
+        };
+        const WRITER_CACHE: usize = 64 << 20;
+        assert_eq!(AllocatorPager::capacity_for_cache(0), WINDOWS);
+        assert_eq!(AllocatorPager::capacity_for_cache(4 << 20), WINDOWS);
+        assert_eq!(AllocatorPager::cache_bytes_taken(4 << 20), 0);
+        assert!(AllocatorPager::capacity_for_cache(WRITER_CACHE) > 8 * WINDOWS);
+
+        let mut large = fragmented_state(layout(LARGE_STORE_FULL_REGIONS, None));
+        let taken = large.allocators.set_window_budget(WRITER_CACHE).unwrap();
+        assert!(taken <= WRITER_CACHE / CACHE_SHARE_DIVISOR);
+        let base = paged_state(layout(LARGE_STORE_FULL_REGIONS, None))
+            .allocators
+            .resident_bytes();
+        assert!(
+            large.allocators.resident_bytes() <= base + taken,
+            "the window set outgrew its carve of the cache share"
+        );
+        // Measured allocations walk on through at most three order-0 leaf
+        // windows they had not reached; nothing already loaded is reloaded.
+        let (_, loads) = allocation_work(&mut large);
+        assert!(loads <= 3, "a resident working set loaded {loads} windows");
+
+        // Lowering the share spills the surplus and keeps every word.
+        assert_eq!(large.allocators.set_window_budget(0).unwrap(), 0);
+        assert_eq!(large.allocators.resident_bytes(), base);
+        allocation_work(&mut large);
+    }
+
+    /// A commit that cannot retire a large saved allocator table must not
+    /// rebuild a regional view to rediscover that on every commit.
+    #[test]
+    fn repeated_small_source_checks_rebuild_no_regional_view() {
+        let mut state = paged_state(layout(LARGE_STORE_FULL_REGIONS, None));
+        state
+            .allocators
+            .set_saved_source(Arc::new(|_, _, _, _, _| Ok(false)))
+            .unwrap();
+        assert!(
+            !state
+                .allocators
+                .materialize_saved_source_if_small()
+                .unwrap()
+        );
+        // Between commits the writer allocates in a later region, so region
+        // 0's view is no longer the active one when the next commit checks.
+        let mut rebuilt = 0;
+        for _ in 0..4 {
+            state.allocators.get_region(1);
+            let before = REGION_VIEWS_BUILT.with(std::cell::Cell::get);
+            assert!(
+                !state
+                    .allocators
+                    .materialize_saved_source_if_small()
+                    .unwrap()
+            );
+            rebuilt += REGION_VIEWS_BUILT.with(std::cell::Cell::get) - before;
+        }
+        assert_eq!(
+            rebuilt, 0,
+            "four commits rebuilt {rebuilt} regional views to re-measure the saved table"
+        );
+        assert!(state.allocators.has_saved_source());
     }
 }
