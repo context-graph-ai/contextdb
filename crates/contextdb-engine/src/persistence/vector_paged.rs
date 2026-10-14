@@ -1739,7 +1739,18 @@ impl PagedGenerationPersistence for NativePagedGeneration {
                         crate::writer_commit_test_seams::CommitBoundary::GenerationBeforeRedb,
                     );
                 }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    crate::writer_commit_test_seams::note_build_successor(&next);
+                    crate::writer_commit_test_seams::reached(
+                        crate::writer_commit_test_seams::CommitBoundary::BuildBatchBeforeRedb,
+                    );
+                }
                 write.commit().map_err(RedbPersistence::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::writer_commit_test_seams::reached(
+                    crate::writer_commit_test_seams::CommitBoundary::BuildBatchAfterRedb,
+                );
                 #[cfg(any(test, feature = "test-seams"))]
                 if let Some(publication) = &publication {
                     *publication.published_pending.lock() = pending;

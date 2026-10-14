@@ -1291,7 +1291,18 @@ impl PagedVectorPersistence for NativeImportCandidate {
                 bind_pages_root(&write)?;
                 RedbPersistence::write_writer_recovery_bounds_in_write(&write, None)?;
                 (owner.hooks.checkpoint)()?;
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    crate::writer_commit_test_seams::note_build_successor(&next);
+                    crate::writer_commit_test_seams::reached(
+                        crate::writer_commit_test_seams::CommitBoundary::CandidateCatchUpBeforeRedb,
+                    );
+                }
                 write.commit().map_err(RedbPersistence::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::writer_commit_test_seams::reached(
+                    crate::writer_commit_test_seams::CommitBoundary::CandidateCatchUpAfterRedb,
+                );
                 committed = Some((next, meta));
                 Ok(())
             })

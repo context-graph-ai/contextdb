@@ -13,6 +13,50 @@ pub enum CommitBoundary {
     BeforeMemoryPublication,
     GenerationBeforeRedb,
     GenerationAfterRedb,
+    /// Every paged build transaction (insertion, encoding, completion and
+    /// publication batches), around its redb commit.
+    BuildBatchBeforeRedb,
+    BuildBatchAfterRedb,
+    /// Every replacement-candidate catch-up transaction, around its commit.
+    CandidateCatchUpBeforeRedb,
+    CandidateCatchUpAfterRedb,
+}
+
+/// The durable successor the build or catch-up transaction on this thread
+/// is about to commit, readable from an observer at its boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildSuccessor {
+    pub phase: contextdb_vector::hnsw::paged_builder::PagedVectorPhase,
+    pub points: usize,
+    pub frontier_lsn: contextdb_core::Lsn,
+    pub frontier_tx: contextdb_core::TxId,
+    pub last_source_key: Option<Vec<u8>>,
+    pub encoded_points: usize,
+}
+
+thread_local! {
+    static SUCCESSOR: RefCell<Option<BuildSuccessor>> = const { RefCell::new(None) };
+}
+
+/// The successor of the build or catch-up transaction last observed on this
+/// thread, if any.
+pub fn last_build_successor() -> Option<BuildSuccessor> {
+    SUCCESSOR.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn note_build_successor(
+    next: &contextdb_vector::hnsw::paged_builder::PagedVectorProgress,
+) {
+    SUCCESSOR.with(|slot| {
+        *slot.borrow_mut() = Some(BuildSuccessor {
+            phase: next.phase,
+            points: next.graph.points,
+            frontier_lsn: next.frontier_lsn,
+            frontier_tx: next.frontier_tx,
+            last_source_key: next.last_source_key.clone(),
+            encoded_points: next.encoded_points,
+        })
+    });
 }
 
 type Observer = Arc<dyn Fn(CommitBoundary) + Send + Sync>;
