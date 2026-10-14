@@ -383,7 +383,7 @@ fn the_holder_builds_the_storage_name_every_caller_uses() {
 /// temporary, and no unadmitted second copy.
 #[test]
 fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_until_after_it_is_freed()
-{
+ {
     use super::Charge;
     use super::staging_witness::{self, Event};
     let table = format!("s{}", "t".repeat(776));
@@ -399,14 +399,20 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
     let tx = db.begin().expect("begin");
     db.execute_in_tx(
         tx,
-        &format!("INSERT INTO {table} VALUES ('{}', 'one row')", uuid::Uuid::from_u128(7)),
+        &format!(
+            "INSERT INTO {table} VALUES ('{}', 'one row')",
+            uuid::Uuid::from_u128(7)
+        ),
         &std::collections::HashMap::new(),
     )
     .expect("stage one row");
     staging_witness::arm(name_len);
     db.commit(tx).expect("commit the row");
     let (events, overrun) = staging_witness::take();
-    assert_eq!(overrun, None, "no charge was released before what it funds was freed");
+    assert_eq!(
+        overrun, None,
+        "no charge was released before what it funds was freed"
+    );
     let names = 2 * name_len;
     let mut windows = 0;
     let mut index = 0;
@@ -485,7 +491,10 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
         windows += 1;
         index = end + 1;
     }
-    assert_eq!(windows, 2, "both reconciliation passes held the relation: {events:?}");
+    assert_eq!(
+        windows, 2,
+        "both reconciliation passes held the relation: {events:?}"
+    );
     db.close().expect("close");
 }
 
@@ -503,7 +512,9 @@ fn many_table_commit(
     let root = tempfile::tempdir().expect("fixture directory");
     let db = crate::Database::open(root.path().join("held.db")).expect("open the database");
     db.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
-    let tables: Vec<String> = (0..count).map(|n| format!("held_{n:03}_{}", "x".repeat(60))).collect();
+    let tables: Vec<String> = (0..count)
+        .map(|n| format!("held_{n:03}_{}", "x".repeat(60)))
+        .collect();
     for table in &tables {
         db.execute(
             &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, payload TEXT NOT NULL)"),
@@ -543,9 +554,15 @@ fn a_commit_releases_each_holder_charge_only_after_what_it_funds_is_freed() {
     let live = staging_witness::live();
     let (events, overrun) = staging_witness::take();
     let arrivals = take_hold_arrivals();
-    assert_eq!(overrun, None, "a charge outlived nothing it funded: {overrun:?}");
+    assert_eq!(
+        overrun, None,
+        "a charge outlived nothing it funded: {overrun:?}"
+    );
     assert_eq!(charged, [0; 6], "every charge was released");
-    assert!(live.is_empty(), "every funded allocation was freed: {live:?}");
+    assert!(
+        live.is_empty(),
+        "every funded allocation was freed: {live:?}"
+    );
     for step in [HoldStep::Reserve, HoldStep::GrowSlots, HoldStep::GrowNodes] {
         assert!(
             arrivals[step as usize] >= 2,
@@ -602,7 +619,10 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
     for step in STEPS {
         let arrivals = total[step as usize];
         if BASELINE_ONLY.contains(&step) {
-            assert_eq!(arrivals, 0, "{step:?}: a commit's passes start with an empty registry");
+            assert_eq!(
+                arrivals, 0,
+                "{step:?}: a commit's passes start with an empty registry"
+            );
             continue;
         }
         assert!(arrivals > 0, "{step:?} is reached by a commit");
@@ -620,14 +640,19 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
                 let before = accountant.usage().used;
                 staging_witness::arm(0);
                 inject_hold_fault(step, fault, skip);
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.commit(tx)));
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.commit(tx)));
                 let fired = !clear_hold_fault();
                 let charged = staging_witness::charged();
                 let (_, overrun) = staging_witness::take();
                 assert!(fired, "{label}: the injection fired");
                 assert_eq!(overrun, None, "{label}: every category fit its charge");
                 assert_eq!(charged, [0; 6], "{label}: every holder charge was released");
-                assert_eq!(take_held_overdraft(), 0, "{label}: no unfunded registry growth");
+                assert_eq!(
+                    take_held_overdraft(),
+                    0,
+                    "{label}: no unfunded registry growth"
+                );
                 assert!(
                     accountant.usage().used <= before,
                     "{label}: the failed commit holds nothing more than before it ran"

@@ -206,7 +206,12 @@ pub(crate) mod staging_witness {
         ARMED.with(|armed| armed.set(false));
         let len = LEN.with(Cell::get);
         assert!(len <= CAPACITY, "the staging witness held every event");
-        let events = LOG.with(|log| log.borrow()[..len].iter().map(|event| event.unwrap()).collect());
+        let events = LOG.with(|log| {
+            log.borrow()[..len]
+                .iter()
+                .map(|event| event.unwrap())
+                .collect()
+        });
         (events, OVERRUN.with(Cell::get))
     }
 
@@ -500,7 +505,8 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
                     // The next registry array allocation fails as the global
                     // allocator would; the real redb call surfaces it.
                     #[cfg(test)]
-                    self.write.open_table_registry_fail_next_allocation_for_test();
+                    self.write
+                        .open_table_registry_fail_next_allocation_for_test();
                 }
             }
         }

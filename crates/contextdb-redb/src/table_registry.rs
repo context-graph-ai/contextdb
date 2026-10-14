@@ -61,7 +61,10 @@ static OBSERVER: AtomicUsize = AtomicUsize::new(0);
 /// Install (or remove) the observer of registry array allocations and frees.
 #[cfg(feature = "test-seams")]
 pub fn set_registry_allocation_observer_for_test(observer: Option<fn(RegistryAllocationRecord)>) {
-    OBSERVER.store(observer.map_or(0, |observer| observer as usize), Ordering::SeqCst);
+    OBSERVER.store(
+        observer.map_or(0, |observer| observer as usize),
+        Ordering::SeqCst,
+    );
 }
 
 /// One allocation or free of a registry array, in the order they happened.

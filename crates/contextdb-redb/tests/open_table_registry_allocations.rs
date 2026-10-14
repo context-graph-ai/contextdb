@@ -380,7 +380,10 @@ fn every_freed_registry_array_names_the_allocation_it_ends() {
         .filter(|record| record.allocated)
         .map(|record| record.address)
         .collect::<Vec<_>>();
-    let distinct = reused.iter().collect::<std::collections::HashSet<_>>().len();
+    let distinct = reused
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     eprintln!(
         "registry generations allocated={} distinct_addresses={distinct}",
         reused.len()
@@ -424,7 +427,10 @@ fn registry_work_stays_within_its_bounds_on_seeded_long_prefix_names() {
             "registry_work seed={seed} calls={calls} bound={call_bound} resizes={resizes} \
              bound={resize_bound}"
         );
-        assert!(resizes <= resize_bound, "seed {seed}: {resizes} > {resize_bound}");
+        assert!(
+            resizes <= resize_bound,
+            "seed {seed}: {resizes} > {resize_bound}"
+        );
         assert!(calls <= call_bound, "seed {seed}: {calls} > {call_bound}");
     }
 }
@@ -438,7 +444,11 @@ fn a_failed_global_allocation_while_preparing_changes_nothing() {
     let mut held = Vec::new();
     for n in 0..40 {
         reserve_exactly(&write, 1);
-        held.push(write.open_table(definition(&format!("f{n}"))).expect("open"));
+        held.push(
+            write
+                .open_table(definition(&format!("f{n}")))
+                .expect("open"),
+        );
     }
     let before = write.open_table_registry_bytes();
     let layout = write
@@ -447,9 +457,7 @@ fn a_failed_global_allocation_while_preparing_changes_nothing() {
         .expect("a non-empty array");
     write.open_table_registry_fail_next_allocation_for_test();
     assert_eq!(
-        write
-            .open_table_registry_prepare(40, layout.size())
-            .err(),
+        write.open_table_registry_prepare(40, layout.size()).err(),
         Some(RegistryReserveError::AllocError(layout)),
         "the failed allocation reports its exact layout"
     );
