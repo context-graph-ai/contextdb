@@ -152,7 +152,7 @@ fn copy_records<'a>(
 }
 
 /// Admitted bytes held by one custody operation, released on drop.
-pub(crate) use durable::Scratch as CustodyCharge;
+pub(crate) use durable::{DeltaRecords, Scratch as CustodyCharge};
 pub(crate) use verified::CompanionMemo;
 
 /// Test-seam measurement of custody-journal work (process-wide).
@@ -374,6 +374,72 @@ pub(crate) fn admission_probe_start() {
         probe(usize::MAX);
     }
 }
+/// Bracket phases reported to the measurement probe: immediately before an
+/// admission (`0`), immediately after the allocation it funds (`1`), and at a
+/// refusal (`2`).
+pub(crate) const PROBE_PRE: u8 = 0;
+pub(crate) const PROBE_POST: u8 = 1;
+pub(crate) const PROBE_REFUSED: u8 = 2;
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static BRACKET_PROBE: std::cell::Cell<Option<fn(&'static str, u8, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+    static REFUSE_AT: std::cell::Cell<Option<(&'static str, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+/// Measurement only: report every labelled custody admission bracket on this
+/// thread as `(label, phase, invoice bytes, operation bytes held)`.
+#[cfg(feature = "test-seams")]
+pub(crate) fn set_bracket_probe_for_test(probe: Option<fn(&'static str, u8, usize, usize)>) {
+    BRACKET_PROBE.with(|cell| cell.set(probe));
+}
+/// Measurement only: refuse the `occurrence`-th (1-based) admission labelled
+/// `label` on this thread, before it reserves anything.
+#[cfg(feature = "test-seams")]
+pub(crate) fn refuse_at_for_test(at: Option<(&'static str, usize)>) {
+    REFUSE_AT.with(|cell| cell.set(at));
+}
+/// One bracket edge: production-dead outside the measurement seam.
+#[inline]
+pub(crate) fn bracket(_label: &'static str, _phase: u8, _invoice: usize, _held: usize) {
+    #[cfg(feature = "test-seams")]
+    if let Some(probe) = BRACKET_PROBE.with(std::cell::Cell::get) {
+        probe(_label, _phase, _invoice, _held);
+    }
+}
+/// Whether the measurement seam refuses this occurrence of `label`.
+#[inline]
+pub(crate) fn refusal_injected(_label: &'static str) -> bool {
+    #[cfg(feature = "test-seams")]
+    {
+        return REFUSE_AT.with(|cell| match cell.get() {
+            Some((label, count)) if label == _label => {
+                if count <= 1 {
+                    cell.set(None);
+                    true
+                } else {
+                    cell.set(Some((label, count - 1)));
+                    false
+                }
+            }
+            _ => false,
+        });
+    }
+    #[allow(unreachable_code)]
+    false
+}
+/// The typed refusal of one labelled admission, built from static texts
+/// inside the operation's error reserve.
+pub(crate) fn injected_refusal(label: &'static str, bytes: usize) -> contextdb_core::Error {
+    contextdb_core::Error::MemoryBudgetExceeded {
+        subsystem: "custody".into(),
+        operation: label.into(),
+        requested_bytes: bytes,
+        available_bytes: 0,
+        budget_limit_bytes: 0,
+        hint: "Reduce the custody records this operation reads or raise the memory limit.".into(),
+    }
+}
 /// One admission point: production-dead outside the measurement seam.
 #[inline]
 pub(crate) fn admission_probe(_held: usize) {
@@ -400,7 +466,9 @@ pub(crate) fn decode_refusals_for_test(
     durable_limit: Option<usize>,
 ) -> (Option<contextdb_core::Error>, Option<contextdb_core::Error>) {
     let memory = crate::read_image_memory::ImageMemory::new(durable_limit);
-    let durable = durable::decode_stored(&memory, key, bytes).err();
+    let mut owner = durable::Scratch::new(memory.clone());
+    let durable = durable::decode_stored(&memory, &mut owner, key, bytes).err();
+    drop(owner);
     let resident = Store::from_entries(BTreeMap::from([(key.to_owned(), bytes.to_vec())])).err();
     (durable, resident)
 }
@@ -651,7 +719,7 @@ impl Store {
     }
     pub fn select(
         &mut self,
-        selectors: &[String],
+        selectors: &[&str],
         memory: Arc<crate::read_image_memory::ImageMemory>,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
@@ -921,7 +989,7 @@ impl Store {
         deletes: &[String],
         memory: Arc<crate::read_image_memory::ImageMemory>,
         db: &crate::Database,
-    ) -> Result<(BTreeMap<String, Option<Record>>, CustodyCharge)> {
+    ) -> Result<(DeltaRecords, CustodyCharge)> {
         if self.durable.is_some() {
             let durable_memory = memory.clone();
             if let Some((delta, visits, retained)) = self
@@ -931,7 +999,7 @@ impl Store {
                 return Ok((delta, retained));
             }
         }
-        let retained = CustodyCharge::new(memory);
+        let retained = CustodyCharge::new(memory.clone());
         let mut delta = BTreeMap::new();
         for key in deletes.iter().filter(|k| owned_key(k)) {
             delta.insert(key.clone(), None);
@@ -983,7 +1051,12 @@ impl Store {
                 super::records::validate_record(record, &self.companions(record, &delta)?)?;
             }
         }
-        Ok((delta, retained))
+        // The resident journal answers the same admitted delta type.
+        let mut admitted: DeltaRecords = durable::AdmittedKeys::new(memory, "custody_delta");
+        for (key, record) in delta {
+            admitted.insert_with(key.as_str(), key.len(), || key.clone(), record)?;
+        }
+        Ok((admitted, retained))
     }
 }
 
@@ -1098,51 +1171,84 @@ impl contextdb_core::read_memory::ReadMemoryBudget for VerificationFunds {
     }
 }
 
-/// Verify a stored record's signature unless these exact stored bytes were
-/// verified before. The native verifier renders each signature input into a
-/// buffer `memory` admits first; the funder itself is admitted too, so no
-/// verification allocation goes unfunded.
-fn verify_stored(
+/// The native checks of one stored record, after its charged decode: exact
+/// canonical form (a borrowed comparing re-serialization, no buffer), the key
+/// the record names, and its signature unless these exact stored bytes were
+/// verified before. The key and signature inputs are rendered into native
+/// buffers `memory` admits first through the admitted `VerificationFunds`.
+fn native_check(
     memory: &Arc<crate::read_image_memory::ImageMemory>,
     key: &str,
     bytes: &[u8],
 ) -> Result<()> {
     use super::native_selection::Failure;
-    let digest = verified::digest(&[key.as_bytes(), bytes]);
-    if verified::signature_known(&digest) {
-        return Ok(());
-    }
     let view = super::native_record_codec::decode_record(bytes).map_err(|_| invalid())?;
     // The funder's shared allocation, admitted before it exists.
     let funder_bytes = std::mem::size_of::<VerificationFunds>()
         + 2 * std::mem::size_of::<usize>()
         + crate::sync_types::held::ALLOCATION_BYTES;
+    bracket(
+        "custody_native_funder",
+        PROBE_PRE,
+        funder_bytes,
+        memory.held(),
+    );
+    if refusal_injected("custody_native_funder") {
+        return Err(injected_refusal("custody_native_funder", funder_bytes));
+    }
     memory.reserve(funder_bytes)?;
     let funds = Arc::new(VerificationFunds {
         memory: memory.clone(),
         refusal: parking_lot::Mutex::new(None),
     });
+    bracket("custody_native_funder", PROBE_POST, 0, memory.held());
     let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(funds.clone());
-    let verified = view.verify_native(&owner);
+    let checked = (|| -> std::result::Result<(), Failure> {
+        bracket("custody_native_key", PROBE_PRE, 0, memory.held());
+        if refusal_injected("custody_native_key") {
+            return Err(Failure::Unqualified(injected_refusal(
+                "custody_native_key",
+                0,
+            )));
+        }
+        let rendered = view.key_native(&owner)?;
+        let matches = rendered.text()? == key;
+        drop(rendered);
+        bracket("custody_native_key", PROBE_POST, 0, memory.held());
+        if !matches {
+            return Err(Failure::Invalid(super::native_decode::Invalid::Key));
+        }
+        let digest = verified::digest(&[key.as_bytes(), bytes]);
+        if verified::signature_known(&digest) {
+            return Ok(());
+        }
+        bracket("custody_native_signature", PROBE_PRE, 0, memory.held());
+        if refusal_injected("custody_native_signature") {
+            return Err(Failure::Unqualified(injected_refusal(
+                "custody_native_signature",
+                0,
+            )));
+        }
+        view.verify_native(&owner)?;
+        bracket("custody_native_signature", PROBE_POST, 0, memory.held());
+        verified::remember_signature(digest);
+        Ok(())
+    })();
     drop(owner);
     let refusal = funds.refusal.lock().take();
     drop(funds);
     memory.release(funder_bytes);
-    match verified {
-        Ok(()) => {}
-        Err(Failure::Invalid(_)) => return Err(invalid()),
-        Err(Failure::Unqualified(error)) => return Err(error),
-        Err(other) => {
-            return Err(refusal.unwrap_or_else(|| {
-                contextdb_core::Error::Other(match other {
-                    Failure::Refused(refusal) => refusal.to_string(),
-                    _ => "custody signature verification failed".into(),
-                })
-            }));
-        }
+    match checked {
+        Ok(()) => Ok(()),
+        Err(Failure::Invalid(_)) => Err(invalid()),
+        Err(Failure::Unqualified(error)) => Err(error),
+        Err(other) => Err(refusal.unwrap_or_else(|| {
+            contextdb_core::Error::Other(match other {
+                Failure::Refused(refusal) => refusal.to_string(),
+                _ => "custody signature verification failed".into(),
+            })
+        })),
     }
-    verified::remember_signature(digest);
-    Ok(())
 }
 
 /// Durable custody reads for a file-backed store with a complete group index.
@@ -1152,16 +1258,27 @@ fn verify_stored(
 /// returned, already-charged answer.
 mod durable {
     use super::*;
-    use super::{verified, verify_stored};
+    use super::{native_check, verified};
     use crate::custody::records::validate_record_owned;
     use crate::persistence::custody_source::CustodyReader;
     use crate::read_image_memory::ImageMemory;
     use crate::sync_types::held::ALLOCATION_BYTES;
 
-    /// Bytes admitted for scratch that this operation releases on drop.
+    /// Bytes admitted to one owner on an operation's memory, released on drop.
     pub(crate) struct Scratch {
         memory: Arc<ImageMemory>,
         bytes: usize,
+    }
+    /// A debit detached from one owner, owed to the next: the memory still
+    /// holds it. Dropping it un-adopted releases it (the abort path).
+    pub(crate) struct Debit {
+        memory: Arc<ImageMemory>,
+        bytes: usize,
+    }
+    impl Drop for Debit {
+        fn drop(&mut self) {
+            self.memory.release(self.bytes);
+        }
     }
     impl Scratch {
         pub(super) fn new(memory: Arc<ImageMemory>) -> Self {
@@ -1171,14 +1288,40 @@ mod durable {
         pub(crate) fn bytes(&self) -> usize {
             self.bytes
         }
-        pub(super) fn admit(&mut self, bytes: usize) -> Result<()> {
+        pub(super) fn memory(&self) -> &Arc<ImageMemory> {
+            &self.memory
+        }
+        /// Admit `bytes` under `label` before the allocation they fund. The
+        /// caller reports the allocation's completion with [`Self::post`].
+        pub(super) fn admit_at(&mut self, label: &'static str, bytes: usize) -> Result<()> {
+            bracket(label, PROBE_PRE, bytes, self.memory.held());
+            if refusal_injected(label) {
+                bracket(label, PROBE_REFUSED, bytes, self.memory.held());
+                return Err(injected_refusal(label, bytes));
+            }
             if let Err(refused) = self.memory.reserve(bytes) {
+                bracket(label, PROBE_REFUSED, bytes, self.memory.held());
                 admission_probe(self.memory.held());
                 return Err(refused);
             }
             self.bytes = self.bytes.checked_add(bytes).ok_or_else(invalid)?;
-            admission_probe(self.memory.held());
             Ok(())
+        }
+        /// The allocation funded by the last `admit_at(label, ..)` exists.
+        pub(super) fn post(&self, label: &'static str) {
+            bracket(label, PROBE_POST, 0, self.memory.held());
+            admission_probe(self.memory.held());
+        }
+        /// An admission whose funded allocation follows immediately.
+        pub(super) fn admit(&mut self, bytes: usize) -> Result<()> {
+            self.admit_at("custody_scratch", bytes)?;
+            self.post("custody_scratch");
+            Ok(())
+        }
+        pub(super) fn release(&mut self, bytes: usize) {
+            let bytes = bytes.min(self.bytes);
+            self.memory.release(bytes);
+            self.bytes -= bytes;
         }
         fn reset(&mut self) {
             self.memory.release(self.bytes);
@@ -1186,16 +1329,38 @@ mod durable {
         }
         /// Take over `bytes` this owner's memory already holds charged (a
         /// charged decode's result), to release with the rest on drop.
-        fn adopt(&mut self, bytes: usize) -> Result<()> {
+        pub(super) fn adopt(&mut self, bytes: usize) -> Result<()> {
             self.bytes = self.bytes.checked_add(bytes).ok_or_else(invalid)?;
             Ok(())
         }
-        fn admit_key(&mut self, key: &str) -> Result<()> {
-            self.admit(
-                key.len()
-                    .checked_add(std::mem::size_of::<String>() + ALLOCATION_BYTES)
-                    .ok_or_else(invalid)?,
-            )
+        /// Detach `bytes` of this owner's charge without a refund.
+        pub(super) fn detach(&mut self, bytes: usize) -> Result<Debit> {
+            self.bytes = self.bytes.checked_sub(bytes).ok_or_else(invalid)?;
+            Ok(Debit {
+                memory: self.memory.clone(),
+                bytes,
+            })
+        }
+        /// Adopt a detached debit on the same memory, without a reservation.
+        pub(super) fn adopt_debit(&mut self, debit: Debit) -> Result<()> {
+            if !Arc::ptr_eq(&self.memory, &debit.memory) {
+                return Err(invalid());
+            }
+            self.bytes = self.bytes.checked_add(debit.bytes).ok_or_else(invalid)?;
+            std::mem::forget(debit);
+            Ok(())
+        }
+        /// A copy of `key` admitted at exactly its length.
+        pub(super) fn own_key(&mut self, label: &'static str, key: &str) -> Result<String> {
+            self.admit_at(label, key.len())?;
+            let owned = key.to_owned();
+            if owned.capacity() > key.len() {
+                drop(owned);
+                self.release(key.len());
+                return Err(invalid());
+            }
+            self.post(label);
+            Ok(owned)
         }
     }
     impl Drop for Scratch {
@@ -1204,31 +1369,380 @@ mod durable {
         }
     }
 
-    /// Decode one stored record into an answer charged to `memory`, once:
-    /// canonical bytes, matching key, valid signature. The decode is charged
-    /// as it allocates; the transient canonical re-encode is admitted first.
+    /// Bytes of `n` slots of `T` plus one allocation header, checked.
+    fn slot_bytes<T>(n: usize) -> Result<usize> {
+        n.checked_mul(std::mem::size_of::<T>().max(1))
+            .and_then(|bytes| bytes.checked_add(ALLOCATION_BYTES))
+            .ok_or_else(invalid)
+    }
+
+    /// A vector whose capacity is admitted before it is allocated: exactly
+    /// (`with_exact`) or by doubling (`push`), the reallocation overlap
+    /// included. The actual capacity is checked against the admitted bound;
+    /// a larger capacity is dropped at once and refused. The capacity charge
+    /// is kept across `clear` and released only after the buffer is freed.
+    pub(crate) struct AdmittedVec<T> {
+        items: Vec<T>,
+        owner: Scratch,
+        label: &'static str,
+    }
+    impl<T> AdmittedVec<T> {
+        pub(super) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+            Self {
+                items: Vec::new(),
+                owner: Scratch::new(memory),
+                label,
+            }
+        }
+        pub(super) fn with_exact(
+            memory: Arc<ImageMemory>,
+            label: &'static str,
+            n: usize,
+        ) -> Result<Self> {
+            let mut this = Self::new(memory, label);
+            if n == 0 {
+                return Ok(this);
+            }
+            this.owner.admit_at(label, slot_bytes::<T>(n)?)?;
+            this.items = Vec::with_capacity(n);
+            if this.items.capacity() > n {
+                this.items = Vec::new();
+                return Err(invalid());
+            }
+            this.owner.post(label);
+            Ok(this)
+        }
+        /// Grow to twice the capacity (at least four), admitting the new
+        /// buffer while the old one still exists, then releasing the old one.
+        fn grow(&mut self) -> Result<()> {
+            let old = self.items.capacity();
+            let new = old.checked_mul(2).ok_or_else(invalid)?.max(4);
+            let added = slot_bytes::<T>(new)?;
+            self.owner.admit_at(self.label, added)?;
+            self.items.reserve_exact(new - self.items.len());
+            if self.items.capacity() > new {
+                // Unfunded surplus: drop the buffer and refuse.
+                self.items = Vec::new();
+                self.owner.reset();
+                return Err(invalid());
+            }
+            if old != 0 {
+                self.owner.release(slot_bytes::<T>(old)?);
+            }
+            self.owner.post(self.label);
+            Ok(())
+        }
+        pub(super) fn reserve_one(&mut self) -> Result<()> {
+            if self.items.len() == self.items.capacity() {
+                self.grow()?;
+            }
+            Ok(())
+        }
+        /// Push after capacity is admitted; never reallocates unfunded.
+        pub(super) fn push(&mut self, value: T) -> Result<()> {
+            self.reserve_one()?;
+            self.items.push(value);
+            Ok(())
+        }
+        /// Push into already admitted capacity only.
+        pub(super) fn push_within(&mut self, value: T) -> Result<()> {
+            if self.items.len() == self.items.capacity() {
+                return Err(invalid());
+            }
+            self.items.push(value);
+            Ok(())
+        }
+        pub(super) fn as_slice(&self) -> &[T] {
+            &self.items
+        }
+        pub(super) fn as_mut_slice(&mut self) -> &mut [T] {
+            &mut self.items
+        }
+        pub(super) fn len(&self) -> usize {
+            self.items.len()
+        }
+        pub(super) fn pop(&mut self) -> Option<T> {
+            self.items.pop()
+        }
+        pub(super) fn clear(&mut self) {
+            self.items.clear();
+        }
+        pub(super) fn insert(&mut self, index: usize, value: T) -> Result<()> {
+            self.reserve_one()?;
+            self.items.insert(index, value);
+            Ok(())
+        }
+        pub(super) fn retain_first_of_runs(&mut self, same: impl FnMut(&mut T, &mut T) -> bool) {
+            self.items.dedup_by(same);
+        }
+        pub(super) fn memory(&self) -> &Arc<ImageMemory> {
+            self.owner.memory()
+        }
+        pub(super) fn into_parts(self) -> (Vec<T>, Scratch) {
+            let this = std::mem::ManuallyDrop::new(self);
+            // SAFETY: `this` is never dropped; each field is moved out once.
+            unsafe { (std::ptr::read(&this.items), std::ptr::read(&this.owner)) }
+        }
+    }
+
+    /// Owned key strings in an admitted vector, each admitted at exactly its
+    /// length to `keys` and released only after the string is dropped.
+    pub(crate) struct KeyList {
+        items: AdmittedVec<String>,
+        keys: Scratch,
+    }
+    impl KeyList {
+        pub(super) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+            Self {
+                items: AdmittedVec::new(memory.clone(), label),
+                keys: Scratch::new(memory),
+            }
+        }
+        pub(super) fn with_exact(
+            memory: Arc<ImageMemory>,
+            label: &'static str,
+            n: usize,
+        ) -> Result<Self> {
+            Ok(Self {
+                items: AdmittedVec::with_exact(memory.clone(), label, n)?,
+                keys: Scratch::new(memory),
+            })
+        }
+        pub(super) fn push(&mut self, key: &str) -> Result<()> {
+            self.items.reserve_one()?;
+            let owned = self.keys.own_key(self.items.label, key)?;
+            self.items.push_within(owned)
+        }
+        /// Move a key owned by another list's key owner on the same memory.
+        pub(super) fn push_owned(&mut self, key: String, debit: Debit) -> Result<()> {
+            self.items.reserve_one()?;
+            self.keys.adopt_debit(debit)?;
+            self.items.push_within(key)
+        }
+        pub(super) fn pop(&mut self) -> Option<(String, Debit)> {
+            let key = self.items.pop()?;
+            let debit = self.keys.detach(key.len()).ok()?;
+            Some((key, debit))
+        }
+        pub(super) fn clear(&mut self) {
+            let bytes: usize = self.items.as_slice().iter().map(String::len).sum();
+            self.items.clear();
+            self.keys.release(bytes);
+        }
+        pub(super) fn sort_dedup(&mut self) {
+            self.items.as_mut_slice().sort_unstable();
+            let mut removed = 0usize;
+            self.items.retain_first_of_runs(|a, b| {
+                if a == b {
+                    removed += a.len();
+                    true
+                } else {
+                    false
+                }
+            });
+            self.keys.release(removed);
+        }
+        pub(super) fn as_slice(&self) -> &[String] {
+            self.items.as_slice()
+        }
+        pub(super) fn len(&self) -> usize {
+            self.items.len()
+        }
+        /// Move every key out with its debit into `into`.
+        pub(super) fn drain_into(&mut self, into: &mut KeyList) -> Result<()> {
+            while let Some((key, debit)) = self.pop() {
+                into.push_owned(key, debit)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A key a sorted admitted map can own: its heap bytes, if any.
+    pub(crate) trait KeyBytes: Ord {
+        fn heap(&self) -> usize;
+    }
+    impl KeyBytes for String {
+        fn heap(&self) -> usize {
+            self.len()
+        }
+    }
+    impl KeyBytes for [u8; 32] {
+        fn heap(&self) -> usize {
+            0
+        }
+    }
+
+    /// A sorted map without tree nodes: append-only admitted entries and an
+    /// admitted index sorted by key. Every admission precedes every move; if
+    /// the index growth is refused after the entries grew, the entries' new
+    /// capacity stays funded by their capacity charge.
+    pub(crate) struct AdmittedKeys<K: KeyBytes, V> {
+        entries: AdmittedVec<(K, V)>,
+        order: AdmittedVec<u32>,
+        keys: Scratch,
+    }
+    impl<K: KeyBytes, V> AdmittedKeys<K, V> {
+        pub(super) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+            Self {
+                entries: AdmittedVec::new(memory.clone(), label),
+                order: AdmittedVec::new(memory.clone(), label),
+                keys: Scratch::new(memory),
+            }
+        }
+        fn search<Q: Ord + ?Sized>(&self, key: &Q) -> std::result::Result<usize, usize>
+        where
+            K: std::borrow::Borrow<Q>,
+        {
+            let entries = self.entries.as_slice();
+            self.order
+                .as_slice()
+                .binary_search_by(|index| entries[*index as usize].0.borrow().cmp(key))
+        }
+        pub(super) fn contains<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+        where
+            K: std::borrow::Borrow<Q>,
+        {
+            self.search(key).is_ok()
+        }
+        pub(super) fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+        where
+            K: std::borrow::Borrow<Q>,
+        {
+            let at = self.search(key).ok()?;
+            Some(&self.entries.as_slice()[self.order.as_slice()[at] as usize].1)
+        }
+        /// Insert `key` (built by `make` after its `heap` bytes are admitted)
+        /// unless present. Answers whether it was inserted.
+        pub(super) fn insert_with<Q: Ord + ?Sized>(
+            &mut self,
+            probe: &Q,
+            heap: usize,
+            make: impl FnOnce() -> K,
+            value: V,
+        ) -> Result<bool>
+        where
+            K: std::borrow::Borrow<Q>,
+        {
+            let at = match self.search(probe) {
+                Ok(_) => return Ok(false),
+                Err(at) => at,
+            };
+            let label = self.entries.label;
+            if heap != 0 {
+                self.keys.admit_at(label, heap)?;
+            }
+            if let Err(refused) = self.entries.reserve_one() {
+                self.keys.release(heap);
+                return Err(refused);
+            }
+            if let Err(refused) = self.order.reserve_one() {
+                // The entries' grown capacity stays, funded by its charge.
+                self.keys.release(heap);
+                return Err(refused);
+            }
+            let index = u32::try_from(self.entries.len()).map_err(|_| invalid())?;
+            let key = make();
+            if key.heap() != heap {
+                drop(key);
+                self.keys.release(heap);
+                return Err(invalid());
+            }
+            if heap != 0 {
+                self.keys.post(label);
+            }
+            self.entries.push_within((key, value))?;
+            self.order.insert(at, index)?;
+            Ok(true)
+        }
+        pub(super) fn len(&self) -> usize {
+            self.entries.len()
+        }
+        pub(super) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+            let entries = self.entries.as_slice();
+            self.order.as_slice().iter().map(move |index| {
+                let (k, v) = &entries[*index as usize];
+                (k, v)
+            })
+        }
+        pub(super) fn keys(&self) -> impl Iterator<Item = &K> {
+            self.iter().map(|(k, _)| k)
+        }
+        /// Entries in key order, consumed; every charge is held by the
+        /// iterator until it drops.
+        pub(super) fn into_sorted(self) -> SortedEntries<K, V> {
+            let Self {
+                mut entries,
+                order,
+                keys,
+            } = self;
+            drop(order);
+            entries
+                .as_mut_slice()
+                .sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let (items, capacity) = entries.into_parts();
+            SortedEntries {
+                items: items.into_iter(),
+                _capacity: capacity,
+                _keys: keys,
+            }
+        }
+    }
+    impl<K: KeyBytes> AdmittedKeys<K, ()> {
+        pub(super) fn insert_key(&mut self, key: &str) -> Result<bool>
+        where
+            K: std::borrow::Borrow<str> + From<String>,
+        {
+            self.insert_with(key, key.len(), || K::from(key.to_owned()), ())
+        }
+    }
+    /// Consumed entries in key order, holding their charges until dropped.
+    pub(crate) struct SortedEntries<K, V> {
+        items: std::vec::IntoIter<(K, V)>,
+        _capacity: Scratch,
+        _keys: Scratch,
+    }
+    impl<K, V> Iterator for SortedEntries<K, V> {
+        type Item = (K, V);
+        fn next(&mut self) -> Option<(K, V)> {
+            self.items.next()
+        }
+    }
+
+    /// The validated records of one commit, keyed and sorted, with their
+    /// retained charge.
+    pub(crate) type DeltaRecords = AdmittedKeys<String, Option<Record>>;
+
+    /// The bound of one public error built during an operation: a static text
+    /// or at most 16 KiB of decoded detail, twice (the decoder's message and
+    /// its established rendering are alive together).
+    pub(crate) const ERROR_RESERVE: usize = 2 * (16 * 1024 + 64);
+    /// The longest decoded detail a returned error carries.
+    pub(crate) const ERROR_DETAIL_MAX: usize = 16 * 1024;
+
+    /// The operation's error reserve, admitted at entry by its outermost
+    /// owner and released at the public return, where a returned error's
+    /// ownership passes to the caller.
+    pub(crate) fn error_reserve(memory: &Arc<ImageMemory>) -> Result<Scratch> {
+        let mut reserve = Scratch::new(memory.clone());
+        reserve.admit_at("custody_error_reserve", ERROR_RESERVE)?;
+        reserve.post("custody_error_reserve");
+        Ok(reserve)
+    }
+
+    /// Decode one stored record into an answer charged to `owner`, once:
+    /// the charged decode first (malformed input keeps the established codec
+    /// diagnostic), then the native canonical, key and signature checks.
     pub(super) fn decode_stored(
         memory: &Arc<ImageMemory>,
+        owner: &mut Scratch,
         key: &str,
         bytes: &[u8],
     ) -> Result<Record> {
-        let credit = bytes
-            .len()
-            .checked_add(key.len())
-            .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
-            .ok_or_else(invalid)?;
-        memory.reserve(credit)?;
-        let decoded = (|| {
-            work::decoded(1);
-            let (record, _) = decode_charged(memory, bytes)?;
-            if encode(&record)? != bytes || record.key()? != key {
-                return Err(invalid());
-            }
-            verify_stored(memory, key, bytes)?;
-            Ok(record)
-        })();
-        memory.release(credit);
-        decoded
+        work::decoded(1);
+        let (record, charged) = decode_charged(memory, bytes)?;
+        owner.adopt(charged)?;
+        native_check(memory, key, bytes)?;
+        Ok(record)
     }
 
     /// Decode stored bytes with `memory`'s charged decoder: every string,
@@ -1241,22 +1755,41 @@ mod durable {
         bytes: &[u8],
     ) -> Result<(Record, usize)> {
         let before = memory.held();
+        bracket("custody_decode", PROBE_PRE, 0, before);
+        if refusal_injected("custody_decode") {
+            bracket("custody_decode", PROBE_REFUSED, 0, before);
+            return Err(injected_refusal("custody_decode", bytes.len()));
+        }
         let record = memory
             .decode_msgpack::<Record>(bytes)
             .map_err(established_codec_error)?;
+        bracket(
+            "custody_decode",
+            PROBE_POST,
+            memory.held() - before,
+            memory.held(),
+        );
         admission_probe(memory.held());
         Ok((record, memory.held().saturating_sub(before)))
     }
 
     /// The custody codec's established diagnostic for a malformed record,
     /// rendered from the charged decoder's own error without decoding again.
+    /// The detail is bounded at [`ERROR_DETAIL_MAX`] before it is copied.
     fn established_codec_error(error: contextdb_core::Error) -> contextdb_core::Error {
         match error {
             contextdb_core::Error::SyncError(message) => {
                 match message.strip_prefix("MessagePack decode error: ") {
-                    Some(detail) => contextdb_core::Error::SyncError(format!(
-                        "delivery metadata decode: {detail}"
-                    )),
+                    Some(detail) => {
+                        let mut end = detail.len().min(ERROR_DETAIL_MAX);
+                        while !detail.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        contextdb_core::Error::SyncError(format!(
+                            "delivery metadata decode: {}",
+                            &detail[..end]
+                        ))
+                    }
                     None => contextdb_core::Error::SyncError(message),
                 }
             }
@@ -1267,48 +1800,33 @@ mod durable {
     /// A transient check of one stored record (canonical, keyed, signed):
     /// charged as it decodes and released when the caller drops it.
     fn probe_stored(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<Probed> {
-        // The record's own slot and key, and its transient canonical re-encode.
-        let credit = key
-            .len()
-            .checked_add(bytes.len())
-            .and_then(|n| n.checked_add(std::mem::size_of::<Record>() + 3 * ALLOCATION_BYTES))
-            .ok_or_else(invalid)?;
-        memory.reserve(credit)?;
         let mut probed = Probed {
-            memory: memory.clone(),
-            credit,
+            owner: Scratch::new(memory.clone()),
             record: None,
         };
-        work::decoded(1);
-        let (record, charged) = decode_charged(memory, bytes)?;
-        probed.credit += charged;
+        probed
+            .owner
+            .admit_at("custody_probe_slot", std::mem::size_of::<Record>())?;
+        probed.owner.post("custody_probe_slot");
+        let record = decode_stored(memory, &mut probed.owner, key, bytes)?;
         probed.record = Some(record);
-        if encode(probed.record())? != bytes || probed.record().key()? != key {
-            return Err(invalid());
-        }
-        verify_stored(memory, key, bytes)?;
         Ok(probed)
     }
-    /// One transiently decoded record and its admission.
+    /// One transiently decoded record and its admission. The record drops
+    /// before its charge (field order).
     pub(super) struct Probed {
-        memory: Arc<ImageMemory>,
-        credit: usize,
         record: Option<Record>,
+        owner: Scratch,
     }
     impl Probed {
         fn record(&self) -> &Record {
             self.record.as_ref().expect("probed record")
         }
     }
-    impl Drop for Probed {
-        fn drop(&mut self) {
-            drop(self.record.take());
-            self.memory.release(self.credit);
-        }
-    }
 
     #[cfg(feature = "test-seams")]
     pub(super) fn probe_for_test(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<()> {
+        let _errors = error_reserve(memory)?;
         probe_stored(memory, key, bytes).map(drop)
     }
 
@@ -1321,45 +1839,149 @@ mod durable {
         })
     }
 
-    /// Admitted, sorted and deduplicated key list for `selectors`.
-    fn selected_keys(
-        r: &CustodyReader,
-        selectors: &[String],
-        scratch: &mut Scratch,
-    ) -> Result<Vec<String>> {
-        let memory = scratch.memory.clone();
-        let mut count = 0usize;
-        for selector in selectors {
-            visit_selector(r, selector, &memory, &mut |_| {
-                count = count.checked_add(1).ok_or_else(invalid)?;
-                Ok(())
-            })?;
-        }
-        scratch.admit(
-            count
-                .checked_mul(std::mem::size_of::<String>())
-                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                .ok_or_else(invalid)?,
-        )?;
-        let mut keys = Vec::with_capacity(count);
-        for selector in selectors {
-            visit_selector(r, selector, &memory, &mut |key| {
-                if keys.len() == count {
-                    return Err(invalid());
-                }
-                scratch.admit(
-                    key.len()
-                        .checked_add(ALLOCATION_BYTES)
-                        .ok_or_else(invalid)?,
-                )?;
-                keys.push(key.to_owned());
-                Ok(())
-            })?;
-        }
-        keys.sort_unstable();
-        keys.dedup();
-        Ok(keys)
+    /// The longest companion or caller selector: `delivery_peer_evidence.v1.`
+    /// and a 32-byte hex digest.
+    const SELECTOR_MAX: usize = 96;
+
+    /// One selector rendered on the stack: `@group` or a key prefix.
+    pub(crate) struct Selector {
+        bytes: [u8; SELECTOR_MAX],
+        len: usize,
     }
+    impl Selector {
+        pub(crate) fn text(text: &str) -> Result<Self> {
+            let mut this = Self {
+                bytes: [0; SELECTOR_MAX],
+                len: 0,
+            };
+            this.push(text.as_bytes())?;
+            Ok(this)
+        }
+        fn push(&mut self, part: &[u8]) -> Result<()> {
+            let end = self.len.checked_add(part.len()).ok_or_else(invalid)?;
+            if end > SELECTOR_MAX {
+                return Err(invalid());
+            }
+            self.bytes[self.len..end].copy_from_slice(part);
+            self.len = end;
+            Ok(())
+        }
+        fn push_hex(&mut self, digest: &[u8]) -> Result<()> {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for byte in digest {
+                self.push(&[HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]])?;
+            }
+            Ok(())
+        }
+        pub(crate) fn submission(id: uuid::Uuid) -> Result<Self> {
+            let mut this = Self::text("@submission:")?;
+            let mut buffer = uuid::Uuid::encode_buffer();
+            this.push(id.hyphenated().encode_lower(&mut buffer).as_bytes())?;
+            Ok(this)
+        }
+        pub(crate) fn object(digest: &[u8; 32]) -> Result<Self> {
+            let mut this = Self::text("@object:")?;
+            this.push_hex(digest)?;
+            Ok(this)
+        }
+        pub(crate) fn certificate_key(digest: &[u8; 32]) -> Result<Self> {
+            let mut this = Self::text("delivery_peer_evidence.v1.")?;
+            this.push_hex(digest)?;
+            Ok(this)
+        }
+        pub(crate) fn as_str(&self) -> &str {
+            // Only ASCII is ever pushed except whole `&str` parts.
+            std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+        }
+    }
+
+    /// The companion selectors the resident index answers, on the stack.
+    fn companion_selectors(record: &Record) -> Result<([Option<Selector>; 2], usize)> {
+        let (first, second) = match record {
+            Record::Control(_) => (Some(Selector::text("@authority")?), None),
+            Record::ObjectAdmission(a) => (
+                Some(Selector::object(&a.object_digest)?),
+                Some(Selector::certificate_key(&a.certificate)?),
+            ),
+            Record::Terminal { record: t, .. } => (
+                Some(Selector::submission(t.submission)?),
+                Some(Selector::object(
+                    &super::super::authority::object_digest_finite(
+                        1,
+                        |e| t.bytes_finite(e),
+                        &t.signature,
+                    )?,
+                )?),
+            ),
+            Record::Root { submission, .. } => (Some(Selector::submission(*submission)?), None),
+            Record::MaterializedOwner(o) => (Some(Selector::submission(o.submission)?), None),
+            _ => (None, None),
+        };
+        let count = usize::from(first.is_some()) + usize::from(second.is_some());
+        Ok(([first, second], count))
+    }
+
+    /// Whether `record` (stored at `key`) is a member of `selector`, decided
+    /// from its fields without building its group list. Mirrors `groups()`
+    /// for the selector families companions use; checked against it by
+    /// `joins_parity_for_test`.
+    pub(super) fn joins(key: &str, record: &Record, selector: &str) -> Result<bool> {
+        let Some(group) = selector.strip_prefix('@') else {
+            return Ok(key.starts_with(selector));
+        };
+        if group == "authority" {
+            return Ok(matches!(
+                record,
+                Record::Binding(_)
+                    | Record::Control(_)
+                    | Record::State(_)
+                    | Record::Birth(_)
+                    | Record::Certificate(_)
+                    | Record::Destination(_)
+            ));
+        }
+        if let Some(id) = group.strip_prefix("submission:") {
+            let submission = match record {
+                Record::Manifest(m) => Some(m.id),
+                Record::Terminal { record: t, .. } => Some(t.submission),
+                Record::MaterializedOwner(o) => Some(o.submission),
+                Record::Root { submission, .. }
+                | Record::MemberOwner { submission, .. }
+                | Record::Diagnostic { submission, .. }
+                | Record::DiagnosticOwner { submission, .. }
+                | Record::SourceHistory { submission, .. }
+                | Record::PolicyProfile { submission, .. }
+                | Record::Order { submission, .. } => Some(*submission),
+                _ => None,
+            };
+            let mut buffer = uuid::Uuid::encode_buffer();
+            return Ok(submission.is_some_and(|s| s.hyphenated().encode_lower(&mut buffer) == id));
+        }
+        if let Some(hex_digest) = group.strip_prefix("object:") {
+            let digest = match record {
+                Record::Binding(b) => Some(super::super::authority::object_digest_finite(
+                    0,
+                    |e| b.bytes_finite(e),
+                    &b.signature,
+                )?),
+                Record::Terminal { record: t, .. } => {
+                    Some(super::super::authority::object_digest_finite(
+                        1,
+                        |e| t.bytes_finite(e),
+                        &t.signature,
+                    )?)
+                }
+                Record::ObjectAdmission(a) => Some(a.object_digest),
+                _ => None,
+            };
+            return Ok(digest.is_some_and(|d| {
+                Selector::object(&d).is_ok_and(|s| &s.as_str()[8..] == hex_digest)
+            }));
+        }
+        Ok(false)
+    }
+
+    /// Visit the keys a selector names.
     fn visit_selector(
         r: &CustodyReader,
         selector: &str,
@@ -1372,29 +1994,74 @@ mod durable {
         }
     }
 
-    /// Decode `keys` into one answer charged to `memory`, in key order.
+    /// Admitted, sorted and deduplicated key list for `selectors`.
+    fn selected_keys(
+        r: &CustodyReader,
+        selectors: &[&str],
+        memory: &Arc<ImageMemory>,
+    ) -> Result<KeyList> {
+        let mut count = 0usize;
+        for selector in selectors {
+            visit_selector(r, selector, memory, &mut |_| {
+                count = count.checked_add(1).ok_or_else(invalid)?;
+                Ok(())
+            })?;
+        }
+        let mut keys = KeyList::with_exact(memory.clone(), "custody_selected_keys", count)?;
+        for selector in selectors {
+            visit_selector(r, selector, memory, &mut |key| {
+                if keys.len() == count {
+                    return Err(invalid());
+                }
+                keys.push(key)
+            })?;
+        }
+        keys.sort_dedup();
+        Ok(keys)
+    }
+
+    /// The answer under construction: its slots and decoded bodies are
+    /// charged to `owner`, which detaches into the answer on success and
+    /// releases everything (records first) on any failure.
+    struct AnswerBuild {
+        records: Vec<Record>,
+        owner: Scratch,
+    }
+
+    /// Decode `keys` into one answer charged to `memory`, in key order, and
+    /// validate its whole evidence closure.
     fn answer(
         r: &CustodyReader,
         keys: &[String],
         memory: Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
+        let mut build = AnswerBuild {
+            records: Vec::new(),
+            owner: Scratch::new(memory.clone()),
+        };
         if !keys.is_empty() {
-            memory.reserve(
-                keys.len()
-                    .checked_mul(std::mem::size_of::<Record>())
-                    .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                    .ok_or_else(invalid)?,
-            )?;
+            build
+                .owner
+                .admit_at("custody_answer_slots", slot_bytes::<Record>(keys.len())?)?;
+            build.records = Vec::with_capacity(keys.len());
+            if build.records.capacity() > keys.len() {
+                return Err(invalid());
+            }
+            build.owner.post("custody_answer_slots");
         }
-        let mut records = Vec::with_capacity(keys.len());
         for key in keys {
             // A derived member whose committed row is absent is damage.
-            records.push(r.get(key, |value| {
-                decode_stored(&memory, key, value.ok_or_else(invalid)?)
-            })?);
+            let record = r.get(key, |value| {
+                decode_stored(&memory, &mut build.owner, key, value.ok_or_else(invalid)?)
+            })?;
+            build.records.push(record);
         }
-        validate_answer(r, keys, &records, &memory, db)?;
+        validate_answer(r, keys, &build.records, &memory, db)?;
+        let AnswerBuild { records, mut owner } = build;
+        let bytes = owner.bytes();
+        // The answer owns these bytes now; the memory keeps holding them.
+        std::mem::forget(owner.detach(bytes)?);
         Ok(AdmittedRecords { records, memory })
     }
 
@@ -1406,14 +2073,14 @@ mod durable {
     /// relies on is validated at this same root, exactly as the resident
     /// journal checked each record when it loaded: a terminal's object
     /// admission is itself validated against its certificate, and so on. The
-    /// walk is an iterative worklist over keys with a visited set, so a cycle
-    /// of companions ends and no recursion grows the stack; every key it holds
-    /// and every record it loads is admitted to `memory`. A check that passed
-    /// at this root before is remembered in the store's fixed memo. A missing
-    /// or damaged record anywhere in the closure refuses with the custody
-    /// corruption error. The verifier itself is the admitted one. A memo entry
-    /// certifies a key's whole closure: entries are published only after the
-    /// walk completes, so a refusal part way through leaves none behind.
+    /// walk is an iterative worklist over keys with an admitted visited set
+    /// of digests, so a cycle of companions ends and no recursion grows the
+    /// stack. A check that passed at this root before is remembered in the
+    /// store's fixed memo; a memo entry certifies a key's whole closure, so
+    /// entries are published only after the walk completes and a refusal part
+    /// way through leaves none behind. A missing or damaged record anywhere in
+    /// the closure refuses with the custody corruption error. The verifier
+    /// itself is the admitted one.
     fn validate_answer(
         r: &CustodyReader,
         keys: &[String],
@@ -1421,176 +2088,191 @@ mod durable {
         memory: &Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<()> {
-        let empty = BTreeMap::new();
-        let mut scratch = Scratch::new(memory.clone());
-        // Positions of the answer by key, for companions the answer already holds.
-        scratch.admit(
-            keys.len()
-                .checked_mul(std::mem::size_of::<usize>())
-                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                .ok_or_else(invalid)?,
-        )?;
-        let mut by_key = (0..keys.len()).collect::<Vec<_>>();
-        by_key.sort_unstable_by(|a, b| keys[*a].cmp(&keys[*b]));
+        // Positions of the answer by key, for companions the answer holds.
+        let mut by_key =
+            AdmittedVec::<usize>::with_exact(memory.clone(), "custody_closure_by_key", keys.len())?;
+        for index in 0..keys.len() {
+            by_key.push_within(index)?;
+        }
+        by_key
+            .as_mut_slice()
+            .sort_unstable_by(|a, b| keys[*a].cmp(&keys[*b]));
+        let by_key = by_key;
         let in_answer = |key: &str| {
             by_key
+                .as_slice()
                 .binary_search_by(|i| keys[*i].as_str().cmp(key))
                 .ok()
-                .map(|i| &records[by_key[i]])
+                .map(|i| &records[by_key.as_slice()[i]])
         };
-        scratch.admit(
-            COMPANION_MEMO
-                .checked_mul(std::mem::size_of::<(String, Probed)>())
-                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                .ok_or_else(invalid)?,
+        // The memo of loaded companions: fixed slots, keys owned by
+        // `memo_keys` until eviction.
+        let mut memo_slots = Scratch::new(memory.clone());
+        memo_slots.admit_at(
+            "custody_closure_memo",
+            slot_bytes::<(String, Probed)>(COMPANION_MEMO)?,
         )?;
         let mut memo: std::collections::VecDeque<(String, Probed)> =
             std::collections::VecDeque::with_capacity(COMPANION_MEMO);
-        // Keys reached so far and the closure keys still to validate.
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut queue: Vec<String> = Vec::new();
-        // Certifications of this walk, published to the store's memo only once
-        // the whole reachable closure has validated and every admission it
-        // needed has succeeded. A failed or refused walk publishes none.
-        let mut staged: Vec<[u8; 32]> = Vec::new();
+        memo_slots.post("custody_closure_memo");
+        let mut memo_keys = Scratch::new(memory.clone());
+        // Keys reached so far, as digests, and the closure keys to validate.
+        let mut seen: AdmittedKeys<[u8; 32], ()> =
+            AdmittedKeys::new(memory.clone(), "custody_closure_seen");
+        let mut queue = KeyList::new(memory.clone(), "custody_closure_queue");
+        // Certifications of this walk, published only once it completes.
+        let mut staged: AdmittedVec<[u8; 32]> =
+            AdmittedVec::new(memory.clone(), "custody_closure_staged");
+        let digest_of = |key: &str| verified::digest(&[key.as_bytes()]);
         for key in keys {
-            if !seen.contains(key) {
-                scratch.admit_key(key)?;
-                seen.insert(key.clone());
-            }
+            let d = digest_of(key);
+            seen.insert_with(&d, 0, || d, ())?;
         }
         let mut next_answer = 0usize;
         loop {
             // The answer's own records first, then the closure they reach.
-            let (key, loaded_self) = if next_answer < keys.len() {
+            let (key, owned_key, loaded_self) = if next_answer < keys.len() {
                 next_answer += 1;
-                (keys[next_answer - 1].clone(), None)
-            } else if let Some(key) = queue.pop() {
-                let found = match in_answer(&key) {
-                    Some(_) => None,
-                    None => match memo.iter().position(|(k, _)| *k == key) {
-                        Some(_) => None,
-                        None => Some(load(r, memory, &key)?.ok_or_else(invalid)?),
-                    },
+                (keys[next_answer - 1].as_str(), None, None)
+            } else if let Some((owned, debit)) = queue.pop() {
+                let found = if in_answer(&owned).is_some() || memo.iter().any(|(k, _)| *k == owned)
+                {
+                    None
+                } else {
+                    Some(load(r, memory, &owned)?.ok_or_else(invalid)?)
                 };
-                (key, found)
+                ("", Some((owned, debit)), found)
             } else {
                 break;
             };
+            let key: &str = match &owned_key {
+                Some((owned, _)) => owned.as_str(),
+                None => key,
+            };
             // At one immutable root a key names one record and one companion
-            // set, so a check that passed there before need not repeat.
+            // set, so a closure certified there before need not repeat.
             let checked = verified::digest(&[r.root_fingerprint(), key.as_bytes()]);
             if r.companion_memo().is_some_and(|memo| memo.known(&checked)) {
                 continue;
             }
             let record = match &loaded_self {
                 Some(probed) => probed.record(),
-                None => in_answer(&key)
-                    .or_else(|| {
-                        memo.iter()
-                            .find(|(k, _)| *k == key)
-                            .map(|(_, p)| p.record())
-                    })
+                None => in_answer(key)
+                    .or_else(|| memo.iter().find(|(k, _)| k == key).map(|(_, p)| p.record()))
                     .ok_or_else(invalid)?,
             };
             let mut call = Scratch::new(memory.clone());
-            let companions = companion_keys(r, record, &empty, &|_| 0, &mut call)?;
-            call.admit(
-                companions
-                    .len()
-                    .checked_mul(
-                        std::mem::size_of::<(String, Probed)>() + std::mem::size_of::<&Record>(),
-                    )
-                    .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
-                    .ok_or_else(invalid)?,
+            let companions = companion_keys(r, key, record, None, memory)?;
+            let mut loaded = AdmittedVec::<(String, Probed)>::with_exact(
+                memory.clone(),
+                "custody_closure_loaded",
+                companions.len(),
             )?;
-            let mut loaded: Vec<(String, Probed)> = Vec::with_capacity(companions.len());
-            for companion in &companions {
+            for companion in companions.keys() {
                 if in_answer(companion).is_some() || memo.iter().any(|(k, _)| k == companion) {
                     continue;
                 }
                 // An absent companion is simply not in the view; a required
                 // one then fails validation below.
                 if let Some(probed) = load(r, memory, companion)? {
-                    call.admit_key(companion)?;
-                    loaded.push((companion.clone(), probed));
+                    let owned = call.own_key("custody_closure_loaded_key", companion)?;
+                    loaded.push_within((owned, probed))?;
                 }
             }
             {
-                let view = companions
-                    .iter()
-                    .filter_map(|key| {
-                        in_answer(key)
-                            .or_else(|| {
-                                memo.iter().find(|(k, _)| k == key).map(|(_, p)| p.record())
-                            })
-                            .or_else(|| {
-                                loaded
-                                    .iter()
-                                    .find(|(k, _)| k == key)
-                                    .map(|(_, p)| p.record())
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                validate_record_owned(db, record, &view)?;
+                let mut view = AdmittedVec::<&Record>::with_exact(
+                    memory.clone(),
+                    "custody_closure_view",
+                    companions.len(),
+                )?;
+                for companion in companions.keys() {
+                    if let Some(found) = in_answer(companion)
+                        .or_else(|| {
+                            memo.iter()
+                                .find(|(k, _)| k == companion)
+                                .map(|(_, p)| p.record())
+                        })
+                        .or_else(|| {
+                            loaded
+                                .as_slice()
+                                .iter()
+                                .find(|(k, _)| k == companion)
+                                .map(|(_, p)| p.record())
+                        })
+                    {
+                        view.push_within(found)?;
+                    }
+                }
+                validate_record_owned(db, record, view.as_slice())?;
             }
             if r.companion_memo().is_some() {
-                reserve_admitted(&mut staged, &mut scratch)?;
-                staged.push(checked);
+                staged.push(checked)?;
             }
-            // Every present companion joins the closure once.
-            for (companion, _) in &loaded {
-                if !seen.contains(companion) {
-                    scratch.admit_key(companion)?;
-                    seen.insert(companion.clone());
-                    reserve_admitted(&mut queue, &mut scratch)?;
-                    scratch.admit_key(companion)?;
-                    queue.push(companion.clone());
+            // Every present companion, loaded or memoized, joins the closure
+            // once.
+            for companion in companions.keys() {
+                if in_answer(companion).is_some() {
+                    continue;
                 }
-            }
-            for companion in &companions {
-                if !seen.contains(companion) && in_answer(companion).is_none() {
-                    // Present in the memo but not loaded by this record.
-                    if memo.iter().any(|(k, _)| k == companion) {
-                        scratch.admit_key(companion)?;
-                        seen.insert(companion.clone());
-                        reserve_admitted(&mut queue, &mut scratch)?;
-                        scratch.admit_key(companion)?;
-                        queue.push(companion.clone());
-                    }
+                let present = loaded.as_slice().iter().any(|(k, _)| k == companion)
+                    || memo.iter().any(|(k, _)| k == companion);
+                if !present {
+                    continue;
+                }
+                let d = digest_of(companion);
+                if seen.insert_with(&d, 0, || d, ())? {
+                    queue.push(companion)?;
                 }
             }
             drop(loaded_self);
-            for entry in loaded {
+            drop(owned_key);
+            // Move each loaded companion into the memo: its key's debit
+            // moves from `call` to `memo_keys`; an evicted entry drops
+            // before its key's bytes are released.
+            let (loaded, loaded_capacity) = loaded.into_parts();
+            for (owned, probed) in loaded {
                 if memo.len() == COMPANION_MEMO {
-                    memo.pop_front();
+                    if let Some((evicted, evicted_probe)) = memo.pop_front() {
+                        let bytes = evicted.len();
+                        drop(evicted_probe);
+                        drop(evicted);
+                        memo_keys.release(bytes);
+                    }
                 }
-                memo.push_back(entry);
+                let debit = call.detach(owned.len())?;
+                memo_keys.adopt_debit(debit)?;
+                memo.push_back((owned, probed));
             }
+            drop(loaded_capacity);
+            drop(companions);
+            drop(call);
         }
         // The whole closure validated: publish its certifications. Nothing
         // here can fail or allocate.
-        if let Some(memo) = r.companion_memo() {
-            for checked in staged.iter() {
-                memo.remember(*checked);
+        if let Some(certified) = r.companion_memo() {
+            for checked in staged.as_slice() {
+                certified.remember(*checked);
             }
         }
+        drop(memo);
+        drop(memo_keys);
+        drop(memo_slots);
         Ok(())
     }
 
     pub(super) fn select(
         r: &CustodyReader,
-        selectors: &[String],
+        selectors: &[&str],
         memory: Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
-        let mut scratch = Scratch::new(memory.clone());
-        let keys = selected_keys(r, selectors, &mut scratch)?;
-        let answer = answer(r, &keys, memory, db);
-        drop(keys);
-        drop(scratch);
-        answer
+        let _errors = error_reserve(&memory)?;
+        let keys = selected_keys(r, selectors, &memory)?;
+        answer(r, keys.as_slice(), memory, db)
     }
+
+    /// "submission:" + hyphenated UUID.
+    const SUBMISSION_GROUP_LEN: usize = 11 + 36;
 
     /// Every submission group with a record of `table`, plus authority.
     /// This administrative count is proportional to the table's units by
@@ -1601,43 +2283,35 @@ mod durable {
         memory: Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<(AdmittedRecords, u64)> {
-        // "submission:" + hyphenated UUID.
-        const SUBMISSION_GROUP_LEN: usize = 11 + 36;
-        let mut scratch = Scratch::new(memory.clone());
-        let mut keys = Vec::new();
+        let _errors = error_reserve(&memory)?;
+        let mut keys = KeyList::new(memory.clone(), "custody_table_keys");
+        let mut members = KeyList::new(memory.clone(), "custody_table_members");
         let mut visits = 0u64;
-        let mut group = String::new();
-        let mut members: Vec<String> = Vec::new();
+        let mut group = [0u8; SUBMISSION_GROUP_LEN];
+        let mut started = false;
         let mut relevant = false;
-        let finish = |members: &mut Vec<String>,
-                      relevant: bool,
-                      keys: &mut Vec<String>,
-                      scratch: &mut Scratch,
-                      probe: &mut Scratch|
-         -> Result<()> {
+        let finish = |members: &mut KeyList, relevant: bool, keys: &mut KeyList| -> Result<()> {
             if relevant {
-                for key in members.drain(..) {
-                    scratch.admit_key(&key)?;
-                    keys.push(key);
-                }
+                members.drain_into(keys)?;
             } else {
+                // Keeps the members' capacity charge; releases key bytes.
                 members.clear();
             }
-            probe.reset();
             Ok(())
         };
-        // One submission group's member keys at a time.
-        let mut probe = Scratch::new(memory.clone());
         r.visit_groups_with_prefix("submission:", SUBMISSION_GROUP_LEN, |next, key| {
-            if next != group {
-                finish(&mut members, relevant, &mut keys, &mut scratch, &mut probe)?;
-                group.clear();
-                group.push_str(next);
+            if !started || next.as_bytes() != group.as_slice() {
+                finish(&mut members, relevant, &mut keys)?;
+                group.copy_from_slice(
+                    next.as_bytes()
+                        .get(..SUBMISSION_GROUP_LEN)
+                        .ok_or_else(invalid)?,
+                );
+                started = true;
                 relevant = false;
             }
             visits += 1;
-            probe.admit_key(key)?;
-            members.push(key.to_owned());
+            members.push(key)?;
             if !relevant {
                 relevant = match load(r, &memory, key)?.ok_or_else(invalid)?.record() {
                     Record::Manifest(m) => m.seal.root.table == table,
@@ -1648,20 +2322,54 @@ mod durable {
             }
             Ok(())
         })?;
-        finish(&mut members, relevant, &mut keys, &mut scratch, &mut probe)?;
+        finish(&mut members, relevant, &mut keys)?;
         drop(members);
-        drop(probe);
-        r.visit_group("authority", &memory, |key| {
-            scratch.admit_key(key)?;
-            keys.push(key.to_owned());
+        r.visit_group("authority", &memory, |key| keys.push(key))?;
+        keys.sort_dedup();
+        let answer = answer(r, keys.as_slice(), memory, db)?;
+        Ok((answer, visits))
+    }
+
+    /// The group name `prefix` + hex of `row`'s canonical reference bytes,
+    /// rendered into `buffer` (admitted, grown by doubling) from the finite
+    /// encoding: no intermediate `RowRef::bytes()` or hex string.
+    pub(super) fn render_row_group<'b>(
+        buffer: &'b mut AdmittedVec<u8>,
+        prefix: &str,
+        row: &RowRef,
+    ) -> Result<&'b str> {
+        let len = finite_len(|e| {
+            row.encode_finite(e);
             Ok(())
         })?;
-        keys.sort_unstable();
-        keys.dedup();
-        let answer = answer(r, &keys, memory, db)?;
-        drop(keys);
-        drop(scratch);
-        Ok((answer, visits))
+        let total = len
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(prefix.len()))
+            .ok_or_else(invalid)?;
+        buffer.clear();
+        while buffer.items.capacity() < total {
+            buffer.grow()?;
+        }
+        buffer.items.resize(total, 0);
+        buffer.items[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        // Emit the raw bytes into the tail, then expand to hex in place from
+        // the back, so no second buffer exists.
+        let tail = total - len;
+        super::super::canonical::finite_emit_with_error(
+            &mut buffer.items[tail..],
+            |e| {
+                row.encode_finite(e);
+                Ok(())
+            },
+            invalid,
+        )?;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for i in (0..len).rev() {
+            let byte = buffer.items[tail + i];
+            buffer.items[prefix.len() + 2 * i] = HEX[usize::from(byte >> 4)];
+            buffer.items[prefix.len() + 2 * i + 1] = HEX[usize::from(byte & 15)];
+        }
+        std::str::from_utf8(&buffer.items[..total]).map_err(|_| invalid())
     }
 
     pub(super) fn select_rows(
@@ -1670,54 +2378,66 @@ mod durable {
         memory: Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<(AdmittedRecords, u64)> {
-        let mut scratch = Scratch::new(memory.clone());
-        let mut keys = BTreeSet::new();
+        let _errors = error_reserve(&memory)?;
+        let mut keys: AdmittedKeys<String, ()> =
+            AdmittedKeys::new(memory.clone(), "custody_rows_keys");
         let mut visits = 0u64;
-        let mut add =
-            |keys: &mut BTreeSet<String>, scratch: &mut Scratch, key: &str| -> Result<()> {
-                visits += 1;
-                if !keys.contains(key) {
-                    scratch.admit_key(key)?;
-                    keys.insert(key.to_owned());
-                }
-                Ok(())
-            };
+        let mut group = AdmittedVec::<u8>::new(memory.clone(), "custody_rows_group");
         for row in rows {
-            for group in [root_group(row), format!("row:{}", hex(&row.bytes()))] {
-                r.visit_group(&group, &memory, |key| add(&mut keys, &mut scratch, key))?;
+            for prefix in ["root:", "row:"] {
+                let name = render_row_group(&mut group, prefix, row)?;
+                r.visit_group(name, &memory, |key| {
+                    visits += 1;
+                    keys.insert_key(key).map(drop)
+                })?;
             }
         }
-        let mut submissions = BTreeSet::new();
-        for key in &keys {
+        let mut submissions =
+            AdmittedVec::<uuid::Uuid>::new(memory.clone(), "custody_rows_submissions");
+        let mut objects = AdmittedVec::<[u8; 32]>::new(memory.clone(), "custody_rows_objects");
+        for key in keys.keys() {
             match load(r, &memory, key)?.ok_or_else(invalid)?.record() {
-                Record::Manifest(m) => submissions.insert(m.id),
-                Record::Terminal { record, .. } => submissions.insert(record.submission),
-                Record::MaterializedOwner(owner) => submissions.insert(owner.submission),
-                _ => false,
-            };
+                Record::Manifest(m) => submissions.push(m.id)?,
+                Record::Terminal { record, .. } => submissions.push(record.submission)?,
+                Record::MaterializedOwner(owner) => submissions.push(owner.submission)?,
+                _ => {}
+            }
         }
-        for submission in submissions {
-            r.visit_group(&submission_group(submission), &memory, |key| {
-                add(&mut keys, &mut scratch, key)
+        submissions.as_mut_slice().sort_unstable();
+        submissions.retain_first_of_runs(|a, b| a == b);
+        for submission in submissions.as_slice() {
+            let selector = Selector::submission(*submission)?;
+            r.visit_group(&selector.as_str()[1..], &memory, |key| {
+                visits += 1;
+                keys.insert_key(key).map(drop)
             })?;
         }
-        let mut objects = BTreeSet::new();
-        for key in &keys {
+        for key in keys.keys() {
             if let Record::Terminal { record, .. } =
                 load(r, &memory, key)?.ok_or_else(invalid)?.record()
             {
-                objects.insert(object_digest(1, &record.bytes()?, &record.signature));
+                objects.push(super::super::authority::object_digest_finite(
+                    1,
+                    |e| record.bytes_finite(e),
+                    &record.signature,
+                )?)?;
             }
         }
-        for object in objects {
-            r.visit_group(&object_group(&object), &memory, |key| {
-                add(&mut keys, &mut scratch, key)
+        objects.as_mut_slice().sort_unstable();
+        objects.retain_first_of_runs(|a, b| a == b);
+        for object in objects.as_slice() {
+            let selector = Selector::object(object)?;
+            r.visit_group(&selector.as_str()[1..], &memory, |key| {
+                visits += 1;
+                keys.insert_key(key).map(drop)
             })?;
         }
-        let keys = keys.into_iter().collect::<Vec<_>>();
-        let answer = answer(r, &keys, memory, db)?;
+        let mut list = KeyList::with_exact(memory.clone(), "custody_rows_answer_keys", keys.len())?;
+        for key in keys.keys() {
+            list.push(key)?;
+        }
         drop(keys);
-        drop(scratch);
+        let answer = answer(r, list.as_slice(), memory, db)?;
         Ok((answer, visits))
     }
 
@@ -1729,23 +2449,6 @@ mod durable {
 
     const MANIFEST_PREFIX: &str = "delivery_manifest.v1.";
     const MANIFEST_KEY_LEN: usize = MANIFEST_PREFIX.len() + 32;
-
-    /// Grow `list` by doubling once it is full, admitting the added capacity
-    /// before the reallocation exists.
-    fn reserve_admitted<T>(list: &mut Vec<T>, scratch: &mut Scratch) -> Result<()> {
-        if list.len() < list.capacity() {
-            return Ok(());
-        }
-        let additional = list.capacity().max(4);
-        scratch.admit(
-            additional
-                .checked_mul(std::mem::size_of::<T>())
-                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                .ok_or_else(invalid)?,
-        )?;
-        list.reserve_exact(additional);
-        Ok(())
-    }
 
     /// Manifests of local roots still pending delivery, in submission order,
     /// read from the durable pending index page by page: the work is
@@ -1760,8 +2463,8 @@ mod durable {
         memory: Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
-        let mut scratch = Scratch::new(memory.clone());
-        let mut keys: Vec<String> = Vec::new();
+        let _errors = error_reserve(&memory)?;
+        let mut keys = KeyList::new(memory.clone(), "custody_pending_keys");
         let mut after = None;
         loop {
             let mut page = 0usize;
@@ -1778,9 +2481,7 @@ mod durable {
                     .encode_lower(&mut rendered[MANIFEST_PREFIX.len()..]);
                 let key = std::str::from_utf8(&rendered).map_err(|_| invalid())?;
                 if r.get(key, |value| Ok(value.is_some()))? {
-                    reserve_admitted(&mut keys, &mut scratch)?;
-                    scratch.admit_key(key)?;
-                    keys.push(key.to_owned());
+                    keys.push(key)?;
                 }
                 Ok(())
             })?;
@@ -1789,311 +2490,357 @@ mod durable {
             }
             after = next;
         }
-        let answer = answer(r, &keys, memory, db)?;
-        drop(keys);
-        drop(scratch);
-        Ok(answer)
+        answer(r, keys.as_slice(), memory, db)
     }
 
-    /// The fixed part of one delta or committed entry: its key copy and its map
-    /// slot. The decoded body is charged by the decoder as it allocates.
-    fn entry_bytes(key: &str) -> Result<usize> {
-        key.len()
-            .checked_add(std::mem::size_of::<(String, Option<Record>)>())
-            .and_then(|n| n.checked_add(std::mem::size_of::<(Option<Record>, usize)>()))
-            .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
-            .ok_or_else(invalid)
+    /// The fixed part of one delta or committed entry's map slot. The key
+    /// copy is admitted at its length by the map; the decoded body is
+    /// charged by the decoder as it allocates.
+    fn entry_slot_bytes() -> usize {
+        std::mem::size_of::<(String, Option<Record>)>()
+            + std::mem::size_of::<(Option<Record>, usize)>()
     }
+
     /// Decode, check and verify one stored body under `memory`, its decoded
-    /// allocations taken over by `owner`. The canonical re-encode and the
-    /// rendered key are admitted transiently first.
+    /// allocations taken over by `owner`.
     fn decode_checked(
         memory: &Arc<ImageMemory>,
         owner: &mut Scratch,
         key: &str,
         bytes: &[u8],
     ) -> Result<Record> {
-        let mut workspace = Scratch::new(memory.clone());
-        workspace.admit(
-            bytes
-                .len()
-                .checked_add(key.len())
-                .and_then(|n| n.checked_add(2 * ALLOCATION_BYTES))
-                .ok_or_else(invalid)?,
-        )?;
         work::validation_decoded(1);
         let (record, charged) = decode_charged(memory, bytes)?;
         owner.adopt(charged)?;
-        if encode(&record)? != bytes || record.key()? != key {
-            return Err(invalid());
-        }
-        drop(workspace);
-        verify_stored(memory, key, bytes)?;
+        native_check(memory, key, bytes)?;
         Ok(record)
     }
-    /// Upper bound of the group strings one record of `encoded` stored bytes
-    /// joins: each is a short prefix and a hex rendering of the record's own
-    /// content, so all together stay within four times its encoding.
-    fn group_bytes(record: &Record, encoded: usize) -> Result<usize> {
-        let count = match record {
-            Record::Manifest(m) => m.rows.len().checked_add(2).ok_or_else(invalid)?,
-            Record::Terminal { .. } => 3,
-            Record::Certificate(_) => 2,
-            _ => 3,
+
+    /// Visit, one at a time, the group names `record` joins (as `groups()`
+    /// lists them), rendering row groups into the admitted `buffer` and
+    /// every other group on the stack. No group list is built.
+    fn for_each_group(
+        record: &Record,
+        buffer: &mut AdmittedVec<u8>,
+        visit: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        let mut stack = |selector: Result<Selector>, visit: &mut dyn FnMut(&str) -> Result<()>| {
+            let selector = selector?;
+            visit(&selector.as_str()[1..])
         };
-        count
-            .checked_mul(std::mem::size_of::<String>() + 2 * ALLOCATION_BYTES + 96)
-            .and_then(|n| n.checked_add(encoded.checked_mul(4)?))
-            .ok_or_else(invalid)
+        let submission = match record {
+            Record::Manifest(m) => {
+                visit(render_row_group(buffer, "root:", &m.seal.root)?)?;
+                for row in &m.rows {
+                    visit(render_row_group(buffer, "row:", &row.reference)?)?;
+                }
+                Some(m.id)
+            }
+            Record::Terminal { record: t, .. } => {
+                visit(render_row_group(buffer, "root:", &t.root)?)?;
+                stack(
+                    Selector::object(&super::super::authority::object_digest_finite(
+                        1,
+                        |e| t.bytes_finite(e),
+                        &t.signature,
+                    )?),
+                    visit,
+                )?;
+                Some(t.submission)
+            }
+            Record::MaterializedOwner(o) => {
+                visit(render_row_group(buffer, "root:", &o.source.reference)?)?;
+                Some(o.submission)
+            }
+            Record::Root { submission, .. }
+            | Record::MemberOwner { submission, .. }
+            | Record::Diagnostic { submission, .. }
+            | Record::DiagnosticOwner { submission, .. }
+            | Record::SourceHistory { submission, .. }
+            | Record::PolicyProfile { submission, .. }
+            | Record::Order { submission, .. } => Some(*submission),
+            Record::Binding(b) => {
+                visit("authority")?;
+                stack(
+                    Selector::object(&super::super::authority::object_digest_finite(
+                        0,
+                        |e| b.bytes_finite(e),
+                        &b.signature,
+                    )?),
+                    visit,
+                )?;
+                None
+            }
+            Record::ObjectAdmission(a) => {
+                // A certificate's group is joined by the certificate itself
+                // below; an admission's certificate group is not followed
+                // here, exactly as the old filter did.
+                stack(Selector::object(&a.object_digest), visit)?;
+                None
+            }
+            Record::CheckpointFrontier(_)
+            | Record::CheckpointNode(_)
+            | Record::EdgeCheckpoint(_) => None,
+            Record::Policy(_) => {
+                visit("policies")?;
+                None
+            }
+            Record::Certificate(c) => {
+                visit("authority")?;
+                let mut selector = Selector::text("@certificate:")?;
+                selector.push_hex(&c.id_finite()?)?;
+                visit(&selector.as_str()[1..])?;
+                None
+            }
+            Record::Control(_) | Record::State(_) | Record::Birth(_) | Record::Destination(_) => {
+                visit("authority")?;
+                None
+            }
+        };
+        if let Some(id) = submission {
+            stack(Selector::submission(id), visit)?;
+        }
+        Ok(())
     }
 
     /// Touched-record validation over the committed journal plus `delta`.
     /// Affected keys are the delta and the durable members of every group a
     /// touched record joins or leaves; companions are point reads. Every key,
-    /// map entry, decoded body, group list, plan and verification workspace is
-    /// admitted before it is allocated. The returned delta's own bytes stay
-    /// admitted in the returned charge until the caller publishes or aborts.
+    /// map entry, decoded body, group name, plan and verification workspace
+    /// is admitted before it is allocated. The returned delta's own bytes
+    /// stay admitted in its own charges until the caller publishes or aborts.
     pub(super) fn validate_delta(
         r: &CustodyReader,
         writes: &[(String, Vec<u8>)],
         deletes: &[String],
         memory: Arc<ImageMemory>,
         db: &crate::Database,
-    ) -> Result<(BTreeMap<String, Option<Record>>, u64, Scratch)> {
+    ) -> Result<(DeltaRecords, u64, Scratch)> {
         admission_probe_start();
+        let errors = error_reserve(&memory)?;
         let mut retained = Scratch::new(memory.clone());
         let mut scratch = Scratch::new(memory.clone());
-        let mut delta = BTreeMap::new();
+        let mut delta: DeltaRecords = AdmittedKeys::new(memory.clone(), "custody_delta");
         for key in deletes.iter().filter(|k| owned_key(k)) {
-            retained.admit(entry_bytes(key)?)?;
-            delta.insert(key.clone(), None);
+            retained.admit_at("custody_delta_slot", entry_slot_bytes())?;
+            retained.post("custody_delta_slot");
+            delta.insert_with(key.as_str(), key.len(), || key.clone(), None)?;
         }
         for (key, bytes) in writes.iter().filter(|(k, _)| owned_key(k)) {
             // An unchanged committed record (for example the authority
             // certificate every unit restates) cannot change its dependents.
-            if !delta.contains_key(key) && r.get(key, |old| Ok(old == Some(bytes.as_slice())))? {
+            if !delta.contains(key.as_str())
+                && r.get(key, |old| Ok(old == Some(bytes.as_slice())))?
+            {
                 continue;
             }
-            retained.admit(entry_bytes(key)?)?;
+            retained.admit_at("custody_delta_slot", entry_slot_bytes())?;
+            retained.post("custody_delta_slot");
             let record = decode_checked(&memory, &mut retained, key, bytes)?;
-            delta.insert(key.clone(), Some(record));
+            delta.insert_with(key.as_str(), key.len(), || key.clone(), Some(record))?;
         }
         // Committed records this validation reads, each decoded once.
-        let mut committed: BTreeMap<String, (Option<Record>, usize)> = BTreeMap::new();
-        let fetch = |committed: &mut BTreeMap<String, (Option<Record>, usize)>,
+        let mut committed: AdmittedKeys<String, (Option<Record>, usize)> =
+            AdmittedKeys::new(memory.clone(), "custody_committed");
+        let fetch = |committed: &mut AdmittedKeys<String, (Option<Record>, usize)>,
                      scratch: &mut Scratch,
                      key: &str|
          -> Result<()> {
-            if committed.contains_key(key) {
+            if committed.contains(key) {
                 return Ok(());
             }
             let entry = r.get(key, |value| {
                 let encoded = value.map_or(0, <[u8]>::len);
-                scratch.admit(entry_bytes(key)?)?;
+                scratch.admit_at("custody_committed_slot", entry_slot_bytes())?;
+                scratch.post("custody_committed_slot");
                 let record = value
                     .map(|bytes| decode_checked(&memory, scratch, key, bytes))
                     .transpose()?;
                 Ok((record, encoded))
             })?;
-            committed.insert(key.to_owned(), entry);
+            committed.insert_with(key, key.len(), || key.to_owned(), entry)?;
             Ok(())
         };
-        let mut affected = BTreeSet::new();
-        for (key, next) in &delta {
-            if !affected.contains(key) {
-                scratch.admit_key(key)?;
-                affected.insert(key.clone());
-            }
+        let mut affected: AdmittedKeys<String, ()> =
+            AdmittedKeys::new(memory.clone(), "custody_affected");
+        let mut group = AdmittedVec::<u8>::new(memory.clone(), "custody_delta_group");
+        for (key, next) in delta.iter() {
+            affected.insert_key(key)?;
             fetch(&mut committed, &mut scratch, key)?;
-            let (old, old_encoded) = committed
-                .get(key)
-                .map(|(record, encoded)| (record.as_ref(), *encoded))
-                .unwrap_or((None, 0));
-            let next_encoded = writes
-                .iter()
-                .find(|(k, _)| k == key)
-                .map_or(0, |(_, bytes)| bytes.len());
-            for (record, encoded) in old
-                .map(|r| (r, old_encoded))
-                .into_iter()
-                .chain(next.as_ref().map(|r| (r, next_encoded)))
-            {
-                let mut lists = Scratch::new(memory.clone());
-                lists.admit(group_bytes(record, encoded)?)?;
-                let mut joined = groups(record)?
-                    .into_iter()
-                    .filter(|g| {
-                        !matches!(record, Record::ObjectAdmission(_))
-                            || !g.starts_with("certificate:")
+            let old = committed
+                .get(key.as_str())
+                .and_then(|(record, _)| record.as_ref());
+            for record in old.into_iter().chain(next.as_ref()) {
+                for_each_group(record, &mut group, &mut |name| {
+                    r.visit_group(name, &memory, |member| {
+                        affected.insert_key(member).map(drop)
                     })
-                    .collect::<Vec<_>>();
-                if let Record::Certificate(c) = record {
-                    joined.push(certificate_group(&c.id_finite()?));
-                }
-                for group in &joined {
-                    r.visit_group(group, &memory, |member| {
-                        if !affected.contains(member) {
-                            scratch.admit_key(member)?;
-                            affected.insert(member.to_owned());
-                        }
-                        Ok(())
-                    })?;
-                }
-                drop(joined);
-                drop(lists);
+                })?;
             }
         }
         let visits = affected.len() as u64;
-        for key in &affected {
-            if !delta.contains_key(key) {
+        for key in affected.keys() {
+            if !delta.contains(key.as_str()) {
                 fetch(&mut committed, &mut scratch, key)?;
             }
         }
-        scratch.admit(
-            affected
-                .len()
-                .checked_mul(std::mem::size_of::<(&String, BTreeSet<String>)>())
-                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                .ok_or_else(invalid)?,
-        )?;
-        let encoded = |key: &str| {
-            writes
-                .iter()
-                .find(|(k, _)| k == key)
-                .map_or(0, |(_, bytes)| bytes.len())
+        let current = |key: &str| -> Option<&Record> {
+            match delta.get(key) {
+                Some(next) => next.as_ref(),
+                None => committed.get(key).and_then(|(record, _)| record.as_ref()),
+            }
         };
-        let mut plans = Vec::with_capacity(affected.len());
-        for key in &affected {
-            if let Some(record) = current(&delta, &committed, key) {
-                plans.push((
-                    key,
-                    companion_keys(r, record, &delta, &encoded, &mut scratch)?,
-                ));
+        let mut plans = AdmittedVec::<(&String, AdmittedKeys<String, ()>)>::with_exact(
+            memory.clone(),
+            "custody_delta_plans",
+            affected.len(),
+        )?;
+        for key in affected.keys() {
+            if let Some(record) = current(key) {
+                plans.push_within((key, companion_keys(r, key, record, Some(&delta), &memory)?))?;
             }
         }
-        for (_, companions) in &plans {
-            for key in companions {
-                if !delta.contains_key(key) {
+        for (_, companions) in plans.as_slice() {
+            for key in companions.keys() {
+                if !delta.contains(key.as_str()) {
                     fetch(&mut committed, &mut scratch, key)?;
                 }
             }
         }
-        for (key, companions) in &plans {
-            let record = current(&delta, &committed, key).ok_or_else(invalid)?;
+        // `committed` grew; borrow it afresh for the verification pass.
+        let current = |key: &str| -> Option<&Record> {
+            match delta.get(key) {
+                Some(next) => next.as_ref(),
+                None => committed.get(key).and_then(|(record, _)| record.as_ref()),
+            }
+        };
+        for (key, companions) in plans.as_slice() {
+            let record = current(key).ok_or_else(invalid)?;
             // The companion view; the admitted verifier funds its own work.
-            let mut view_memory = Scratch::new(memory.clone());
-            view_memory.admit(
-                companions
-                    .len()
-                    .checked_mul(std::mem::size_of::<&Record>())
-                    .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                    .ok_or_else(invalid)?,
+            let mut view = AdmittedVec::<&Record>::with_exact(
+                memory.clone(),
+                "custody_delta_view",
+                companions.len(),
             )?;
-            let view = companions
-                .iter()
-                .filter_map(|key| current(&delta, &committed, key))
-                .collect::<Vec<_>>();
-            validate_record_owned(db, record, &view)?;
-            drop(view);
-            drop(view_memory);
+            for companion in companions.keys() {
+                if let Some(found) = current(companion) {
+                    view.push_within(found)?;
+                }
+            }
+            validate_record_owned(db, record, view.as_slice())?;
         }
         drop(plans);
-        drop(committed);
+        drop(group);
         drop(affected);
+        drop(committed);
         drop(scratch);
+        drop(errors);
         Ok((delta, visits, retained))
     }
 
-    /// The in-commit record at `key`, else the committed one.
-    fn current<'a>(
-        delta: &'a BTreeMap<String, Option<Record>>,
-        committed: &'a BTreeMap<String, (Option<Record>, usize)>,
-        key: &str,
-    ) -> Option<&'a Record> {
-        match delta.get(key) {
-            Some(next) => next.as_ref(),
-            None => committed.get(key).and_then(|(record, _)| record.as_ref()),
-        }
-    }
-
-    /// The longest companion selector: `delivery_peer_evidence.v1.` and a
-    /// 32-byte hex digest. Every selector is a short prefix and one digest or
-    /// identifier, so this bounds each one before it is formatted.
-    const SELECTOR_MAX: usize = 96;
-
-    /// The same companion selectors the resident index answers, read durably
-    /// and overlaid with the in-commit delta. Selector strings, candidate group
-    /// lists and the answered keys are admitted to `scratch` before they are
-    /// allocated; the terminal's object digest is computed without an encoding
-    /// buffer. `encoded` names each delta record's stored length.
+    /// The companion keys of `record` (stored at `key`): the durable members
+    /// of its stack-rendered selectors, overlaid with the in-commit delta's
+    /// members decided by the allocation-free `joins` predicate.
     fn companion_keys(
         r: &CustodyReader,
+        _key: &str,
         record: &Record,
-        delta: &BTreeMap<String, Option<Record>>,
-        encoded: &dyn Fn(&str) -> usize,
-        scratch: &mut Scratch,
-    ) -> Result<BTreeSet<String>> {
-        // Two selectors, each with its one intermediate digest rendering.
-        scratch.admit(
-            4usize
-                .checked_mul(std::mem::size_of::<String>() + SELECTOR_MAX + ALLOCATION_BYTES)
-                .and_then(|n| n.checked_add(ALLOCATION_BYTES))
-                .ok_or_else(invalid)?,
-        )?;
-        let selectors: Vec<String> = match record {
-            Record::Control(_) => vec!["@authority".into()],
-            Record::ObjectAdmission(a) => vec![
-                format!("@{}", object_group(&a.object_digest)),
-                format!("delivery_peer_evidence.v1.{}", hex(&a.certificate)),
-            ],
-            Record::Terminal { record: t, .. } => vec![
-                format!("@{}", submission_group(t.submission)),
-                format!(
-                    "@{}",
-                    object_group(&super::super::authority::object_digest_finite(
-                        1,
-                        |e| t.bytes_finite(e),
-                        &t.signature,
-                    )?)
-                ),
-            ],
-            Record::Root { submission, .. } => vec![format!("@{}", submission_group(*submission))],
-            Record::MaterializedOwner(o) => vec![format!("@{}", submission_group(o.submission))],
-            _ => Vec::new(),
-        };
-        if selectors.iter().any(|s| s.len() > SELECTOR_MAX) {
-            return Err(invalid());
-        }
-        let memory = scratch.memory.clone();
-        let mut keys = BTreeSet::new();
-        for selector in &selectors {
-            visit_selector(r, selector, &memory, &mut |key| {
-                if !keys.contains(key) {
-                    scratch.admit_key(key)?;
-                    keys.insert(key.to_owned());
-                }
-                Ok(())
+        delta: Option<&DeltaRecords>,
+        memory: &Arc<ImageMemory>,
+    ) -> Result<AdmittedKeys<String, ()>> {
+        let (selectors, count) = companion_selectors(record)?;
+        let mut keys: AdmittedKeys<String, ()> =
+            AdmittedKeys::new(memory.clone(), "custody_companion_keys");
+        for selector in selectors.iter().take(count).flatten() {
+            visit_selector(r, selector.as_str(), memory, &mut |member| {
+                keys.insert_key(member).map(drop)
             })?;
         }
-        for (key, candidate) in delta {
-            if let Some(candidate) = candidate {
-                // The candidate's group list, admitted for its own lifetime.
-                let mut lists = Scratch::new(memory.clone());
-                lists.admit(group_bytes(candidate, encoded(key))?)?;
-                let candidate_groups = groups(candidate)?;
-                let joins = selectors.iter().any(|s| match s.strip_prefix('@') {
-                    Some(group) => candidate_groups.iter().any(|g| g == group),
-                    None => key.starts_with(s.as_str()),
-                });
-                drop(candidate_groups);
-                drop(lists);
-                if joins && !keys.contains(key) {
-                    scratch.admit_key(key)?;
-                    keys.insert(key.clone());
+        if let Some(delta) = delta {
+            for (candidate_key, candidate) in delta.iter() {
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                let mut joins_any = false;
+                for selector in selectors.iter().take(count).flatten() {
+                    if joins(candidate_key, candidate, selector.as_str())? {
+                        joins_any = true;
+                        break;
+                    }
+                }
+                if joins_any {
+                    keys.insert_key(candidate_key)?;
                 }
             }
         }
         Ok(keys)
+    }
+
+    /// Measurement only: `joins` agrees with `groups()` for every record in
+    /// `records`, over every selector-family group any of them joins.
+    /// Answers how many (record, group) pairs were compared.
+    #[cfg(feature = "test-seams")]
+    pub(super) fn joins_parity_for_test(records: &[(String, Record)]) -> Result<usize> {
+        let mut families: Vec<String> = Vec::new();
+        for (_, record) in records {
+            for group in groups(record)? {
+                if group == "authority"
+                    || group.starts_with("submission:")
+                    || group.starts_with("object:")
+                {
+                    families.push(group);
+                }
+            }
+        }
+        families.sort();
+        families.dedup();
+        let mut compared = 0usize;
+        for (key, record) in records {
+            let own = groups(record)?;
+            for group in &families {
+                let expected = own.iter().any(|g| g == group);
+                let selector = format!("@{group}");
+                if joins(key, record, &selector)? != expected {
+                    return Err(contextdb_core::Error::Other(format!(
+                        "joins disagrees with groups() for {key} in {group}"
+                    )));
+                }
+                compared += 1;
+            }
+        }
+        Ok(compared)
+    }
+
+    /// Measurement only: `render_row_group` equals `root_group` for every
+    /// row reference the records name.
+    #[cfg(feature = "test-seams")]
+    pub(super) fn row_group_parity_for_test(
+        records: &[(String, Record)],
+        memory: Arc<ImageMemory>,
+    ) -> Result<usize> {
+        let mut buffer = AdmittedVec::<u8>::new(memory, "custody_row_group_parity");
+        let mut compared = 0usize;
+        for (_, record) in records {
+            let rows: Vec<&RowRef> = match record {
+                Record::Manifest(m) => std::iter::once(&m.seal.root)
+                    .chain(m.rows.iter().map(|row| &row.reference))
+                    .collect(),
+                Record::Terminal { record: t, .. } => vec![&t.root],
+                Record::MaterializedOwner(o) => vec![&o.source.reference],
+                _ => Vec::new(),
+            };
+            for row in rows {
+                let rendered = render_row_group(&mut buffer, "root:", row)?.to_owned();
+                if rendered != root_group(row) {
+                    return Err(contextdb_core::Error::Other(format!(
+                        "row group rendering differs: {rendered} vs {}",
+                        root_group(row)
+                    )));
+                }
+                compared += 1;
+            }
+        }
+        Ok(compared)
     }
 }
 
