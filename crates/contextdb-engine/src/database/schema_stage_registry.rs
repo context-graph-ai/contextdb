@@ -2589,11 +2589,13 @@ mod named_open_residue_tests {
         assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104);
         assert_eq!(owner.usage().used, local);
         let image = ImageMemory::operation_writer(owner.clone().into()).unwrap();
+        // The decode owner carries its per-call slot and prepaid output
+        // credit (32 bytes) beside its funder and labels.
         assert_eq!(
             std::mem::size_of::<ImageMemory>() + 2 * std::mem::size_of::<usize>(),
-            232
+            264
         );
-        assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104 + 232);
+        assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104 + 264);
         assert_eq!(owner.usage().used, local);
         assert!(
             matches!(
@@ -2604,17 +2606,17 @@ mod named_open_residue_tests {
         );
         let alias = registry.clone();
         drop(registry);
-        assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104 + 232);
+        assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104 + 264);
         drop(image);
         assert_eq!(process_aggregate_snapshot().0, aggregate + 3 * 104);
         drop(pending);
         drop(local_registry);
         assert_eq!(process_aggregate_snapshot().0, aggregate + 104);
-        set_process_ceiling_for_test(Some(aggregate + 104 + 231));
+        set_process_ceiling_for_test(Some(aggregate + 104 + 263));
         let _reset = CeilingReset;
         assert!(
             matches!(ImageMemory::operation_writer(owner.clone().into()),
-            Err(Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes: 232, .. })
+            Err(Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes: 264, .. })
             if subsystem == "process_native_ceiling" && operation == "writer_decode_open_residue")
         );
         assert_eq!(process_aggregate_snapshot().0, aggregate + 104);
@@ -2642,7 +2644,7 @@ mod named_open_residue_tests {
             std::mem::size_of::<super::super::AdmittedDynStore<crate::composite_store::CompositeStore>>(),
             std::mem::size_of::<super::super::AdmittedDynStore<crate::persistent_store::PersistentCompositeStore>>());
         println!(
-            "OPEN_RESIDUE assembly_budget_adapter=64 writer_decode=232 received_registry=104 pending_registry=104 local_registry=104 writer_limit=1 process_refusal=true single_refund=true"
+            "OPEN_RESIDUE assembly_budget_adapter=64 writer_decode=264 received_registry=104 pending_registry=104 local_registry=104 writer_limit=1 process_refusal=true single_refund=true"
         );
     }
 }
