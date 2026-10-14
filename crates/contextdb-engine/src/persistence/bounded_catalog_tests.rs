@@ -345,9 +345,19 @@ fn journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion()
     assert_eq!(before.1.len(), 192);
     let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
     let store = contextdb_vector::VectorStore::default();
-    // Check 3 is the second validation window, 7 the second key-copy window,
-    // and 11 the second deletion window. Each stop must abort the whole T2.
-    for (pass, stop_at) in [("validation", 3), ("collection", 7), ("deletion", 11)] {
+    // T2 removes the covered prefix in committed steps of
+    // VECTOR_JOURNAL_CLEANUP_STEP_RECORDS records. One step checks once on
+    // entry, once before each of its records and once before its commit, and
+    // the steps are separated by one more check, so a full step spans 67
+    // checks. A stop inside a step publishes none of that step's removals;
+    // the steps that committed before it stand.
+    const STEP: usize = VECTOR_JOURNAL_CLEANUP_STEP_RECORDS;
+    let mut remaining = before.1.len();
+    for (pass, stop_at, committed_steps) in [
+        ("first step", 3, 0),
+        ("second step", 70, 1),
+        ("second step again", 70, 1),
+    ] {
         let mut workspace = store
             .reserve_workspace(accountant.clone(), 0, "test_cleanup", "test")
             .unwrap();
@@ -372,12 +382,14 @@ fn journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion()
             checks, stop_at,
             "{pass} stops at its first cancelled checkpoint"
         );
+        remaining -= committed_steps * STEP;
+        let after = persistence
+            .debug_vector_partition_journal_for_test(&partition)
+            .unwrap();
         assert_eq!(
-            persistence
-                .debug_vector_partition_journal_for_test(&partition)
-                .unwrap(),
-            before,
-            "{pass} cannot publish a partial deletion"
+            (after.0, after.1.len()),
+            (before.0, remaining),
+            "{pass} publishes exactly the steps that committed before the stop"
         );
         assert!(
             accountant.usage().used > 0,
@@ -397,8 +409,10 @@ fn journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion()
     assert_eq!(
         restarted
             .debug_vector_partition_journal_for_test(&partition)
-            .unwrap(),
-        before
+            .unwrap()
+            .1
+            .len(),
+        remaining
     );
     let mut workspace = store
         .reserve_workspace(accountant.clone(), 0, "test_cleanup", "test")

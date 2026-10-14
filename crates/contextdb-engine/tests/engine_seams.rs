@@ -156,3 +156,7 @@ mod writer_tail_reuse_is_bounded_across_physical_opens;
 
 #[path = "engine_seams/import_tail_survives_restart_without_history_reconstruction.rs"]
 mod import_tail_survives_restart_without_history_reconstruction;
+#[path = "engine_seams/opening_a_store_charges_the_reader_the_same_however_long_its_history.rs"]
+mod opening_a_store_charges_the_reader_the_same_however_long_its_history;
+#[path = "engine_seams/opening_a_store_does_a_bounded_vector_journal_cleanup.rs"]
+mod opening_a_store_does_a_bounded_vector_journal_cleanup;

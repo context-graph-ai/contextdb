@@ -22979,17 +22979,27 @@ fn register_loaded_dormant_vector_generations(
 
         // Reopen is also a retry owner for T2. Only a validated catalog may
         // witness covered deletion; quarantined bytes never authorize it.
+        // Opening takes one bounded step of it; maintenance finishes the rest.
+        // A cleanup that cannot fit its memory is left to maintenance rather
+        // than failing the open: leftover covered records sit below the
+        // boundary every loader replays from.
         if let Some(persistence) = journal_truncation_owner {
-            let mut cleanup_workspace = vector.reserve_workspace(
-                accountant.vector_budget()?,
-                0,
-                "truncate_vector_partition_journal",
-                "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before cleaning this maintained route.",
-            )?;
-            match persistence
-                .truncate_vector_partition_journal_through_catalog(&catalog, &mut cleanup_workspace)
-            {
-                Ok(_) => {}
+            let step = accountant
+                .vector_budget()
+                .and_then(|budget| {
+                    vector.reserve_workspace(
+                        budget,
+                        0,
+                        "truncate_vector_partition_journal",
+                        "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before cleaning this maintained route.",
+                    )
+                })
+                .and_then(|mut cleanup_workspace| {
+                    persistence
+                        .truncate_vector_partition_journal_open_step(&catalog, &mut cleanup_workspace)
+                });
+            match step {
+                Ok(_) | Err(Error::MemoryBudgetExceeded { .. }) => {}
                 Err(Error::StoreCorrupted { .. }) => {
                     vector.quarantine_partition_route(
                         &partition,
@@ -78575,6 +78585,14 @@ impl Database {
         RedbPersistence::mutate_vector_generation_catalog_record_for_test(path, partition, fault)
     }
 
+    /// Journal records the vector journal cleanup (T2) read on this thread
+    /// since the last call.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __take_vector_journal_cleanup_records_read_for_test() -> u64 {
+        crate::persistence::take_vector_journal_cleanup_records_read_for_test()
+    }
+
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __corrupt_vector_partition_journal_record_for_test(
@@ -78582,6 +78600,15 @@ impl Database {
         partition: &VectorPartitionRef,
     ) -> Result<()> {
         RedbPersistence::corrupt_vector_partition_journal_record_for_test(path, partition)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __corrupt_last_vector_partition_journal_record_for_test(
+        path: &Path,
+        partition: &VectorPartitionRef,
+    ) -> Result<()> {
+        RedbPersistence::corrupt_last_vector_partition_journal_record_for_test(path, partition)
     }
 
     #[doc(hidden)]
@@ -81591,7 +81618,6 @@ impl Database {
             .collect::<Result<Vec<_>>>()?;
         Ok(values)
     }
-
 
     fn policy_hold_matches_scope(
         hold: &DurablePolicyHold,

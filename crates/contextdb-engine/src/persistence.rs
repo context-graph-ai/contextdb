@@ -11755,6 +11755,114 @@ fn vector_partition_expected_metadata_payload<'a>(
     Ok(payload)
 }
 
+/// Journal records one step of T2 reads: the whole of the reopen retry, and
+/// one committed transaction of every other caller's cleanup.
+pub(crate) const VECTOR_JOURNAL_CLEANUP_STEP_RECORDS: usize = 64;
+
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static VECTOR_JOURNAL_CLEANUP_RECORDS_READ: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn note_vector_journal_cleanup_record_read() {
+    VECTOR_JOURNAL_CLEANUP_RECORDS_READ.with(|read| read.set(read.get() + 1));
+}
+
+/// Journal records T2 has read on this thread since the last call.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn take_vector_journal_cleanup_records_read_for_test() -> u64 {
+    VECTOR_JOURNAL_CLEANUP_RECORDS_READ.with(|read| read.replace(0))
+}
+
+/// The widest encoded journal record a route can hold: the envelope, the
+/// route twice (record and membership), and every fixed scalar at its widest
+/// variable-length encoding. A wider value is refused before it is hashed.
+fn vector_partition_journal_record_width_bound(
+    index: &VectorIndexRef,
+    partition_key: &VectorPartitionKey,
+) -> usize {
+    struct CountWriter(usize);
+    impl std::io::Write for CountWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut route = CountWriter(0);
+    let route_bytes = bincode::serde::encode_into_std_write(
+        (index, partition_key),
+        &mut route,
+        bincode::config::standard(),
+    )
+    .map_or(usize::MAX, |_| route.0);
+    // u64 varints take at most 9 bytes, u32 variants 5, an Option tag 1.
+    // Record: lsn, ordinal, variant. Membership: row id, five tx/lsn scalars,
+    // optional deleted tx. Tombstone tail: deleted tx, lsn, cause.
+    const SCALARS: usize = (9 + 9 + 5) + (6 * 9 + 1 + 9) + (9 + 9 + 5);
+    const ENVELOPE: usize = VECTOR_PARTITION_RECORD_MAGIC.len() + 2 + 1 + 8 + 32;
+    route_bytes
+        .saturating_mul(2)
+        .saturating_add(SCALARS)
+        .saturating_add(ENVELOPE)
+}
+
+/// Validate one encoded journal record completely without decoding it into
+/// owned values: envelope and checksum, the exact route of the record and of
+/// its membership, every scalar of both journal variants with exact
+/// consumption, and the physical key's LSN and ordinal. Nothing here
+/// allocates or charges a memory owner. Returns the record's LSN.
+fn validate_vector_partition_journal_record(
+    prefix: &[u8],
+    key: &[u8],
+    encoded: &[u8],
+    index: &VectorIndexRef,
+    partition_key: &VectorPartitionKey,
+    width_bound: usize,
+) -> std::result::Result<u64, String> {
+    if encoded.len() > width_bound {
+        return Err("journal record is wider than its route allows".to_owned());
+    }
+    let payload = vector_partition_record_payload(VectorPartitionRecordKind::Journal, encoded)?;
+    let config = bincode::config::standard();
+    let mut at = vector_partition_expected_route_prefix(payload, index, partition_key)?;
+    let ((lsn, ordinal, variant), used): ((Lsn, u64, u32), usize) =
+        bincode::serde::decode_from_slice(&payload[at..], config)
+            .map_err(|_| "journal fixed prefix is truncated or invalid".to_owned())?;
+    at += used;
+    if variant > 1 {
+        return Err("journal change variant is invalid".to_owned());
+    }
+    at += vector_partition_expected_route_prefix(&payload[at..], index, partition_key)?;
+    let (_, used): ((RowId, TxId, Lsn, TxId, Lsn, TxId, Option<TxId>), usize) =
+        bincode::serde::decode_from_slice(&payload[at..], config)
+            .map_err(|_| "journal membership is truncated or invalid".to_owned())?;
+    at += used;
+    if variant == 1 {
+        let (_, used): ((TxId, Lsn, VectorPartitionTombstoneCause), usize) =
+            bincode::serde::decode_from_slice(&payload[at..], config)
+                .map_err(|_| "journal tombstone is truncated or invalid".to_owned())?;
+        at += used;
+    }
+    if at != payload.len() {
+        return Err("journal record has trailing bytes".to_owned());
+    }
+    let lsn_end = prefix.len().saturating_add(8);
+    let ordinal_end = lsn_end.saturating_add(8);
+    if key.len() != ordinal_end
+        || !key.starts_with(prefix)
+        || key.get(prefix.len()..lsn_end) != Some(lsn.0.to_be_bytes().as_slice())
+        || key.get(lsn_end..ordinal_end) != Some(ordinal.to_be_bytes().as_slice())
+    {
+        return Err("journal truncation encountered a mismatched route or physical key".to_owned());
+    }
+    Ok(lsn.0)
+}
+
 /// Stale catalog attribution needs only an exact route and an authenticated,
 /// completely decodable fixed suffix. Descriptors and publication IDs contain
 /// no strings or sequences, so unrelated catalogs never allocate route owners.
@@ -30248,6 +30356,24 @@ graph_commit_result }.map_err(Self::storage_error)?;
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
     ) -> Result<()> {
+        Self::corrupt_vector_partition_journal_record_at_for_test(path, partition, false)
+    }
+
+    /// Damage the route's LAST journal record, the newest uncovered one.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn corrupt_last_vector_partition_journal_record_for_test(
+        path: &Path,
+        partition: &contextdb_vector::VectorPartitionRef,
+    ) -> Result<()> {
+        Self::corrupt_vector_partition_journal_record_at_for_test(path, partition, true)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn corrupt_vector_partition_journal_record_at_for_test(
+        path: &Path,
+        partition: &contextdb_vector::VectorPartitionRef,
+        last: bool,
+    ) -> Result<()> {
         let database = redb_builder().open(path).map_err(Self::storage_error)?;
         let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
         let write = database.begin_write().map_err(Self::storage_error)?;
@@ -30258,17 +30384,20 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let mut table = write
                 .open_table(VECTOR_PARTITION_JOURNAL_TABLE)
                 .map_err(Self::storage_error)?;
-            let selected = table
+            let mut selected = None;
+            for entry in table
                 .prefix_bounded(prefix.as_slice())
                 .map_err(Self::storage_error)?
-                .next()
-                .transpose()
-                .map_err(Self::storage_error)?
-                .and_then(|(key, value)| {
-                    key.value()
-                        .starts_with(&prefix)
-                        .then(|| (key.value().to_vec(), value.value().to_vec()))
-                });
+            {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                if !key.value().starts_with(&prefix) {
+                    break;
+                }
+                selected = Some((key.value().to_vec(), value.value().to_vec()));
+                if !last {
+                    break;
+                }
+            }
             let (key, mut bytes) = selected.ok_or_else(|| {
                 Error::Other("vector partition journal fixture is absent".to_owned())
             })?;
@@ -32826,13 +32955,65 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     /// Maintenance supplies its stop check to the same transactional cleanup
-    /// kernel. Each scan and deletion pass checks at most 64 records apart;
-    /// cancellation before commit aborts the complete deletion transaction.
+    /// kernel. The covered prefix is removed in bounded steps of
+    /// `VECTOR_JOURNAL_CLEANUP_STEP_RECORDS` records, each its own committed
+    /// transaction, repeated until the prefix is gone. The stop check runs
+    /// before every record read; a cancelled step publishes none of its own
+    /// removals, and the steps already committed stand: covered records are
+    /// below the boundary every loader replays from.
     pub(crate) fn truncate_vector_partition_journal_through_catalog_with_checkpoint(
         &self,
         expected_catalog: &VectorPartitionGenerationCatalogRecord,
         workspace: &mut VectorWorkspaceReservation,
         mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        loop {
+            let mut removed = 0usize;
+            let complete = self.truncate_vector_partition_journal_in_steps(
+                expected_catalog,
+                workspace,
+                &mut checkpoint,
+                VECTOR_JOURNAL_CLEANUP_STEP_RECORDS,
+                &mut removed,
+            )?;
+            // A step that removed nothing made no progress to repeat: the
+            // prefix is gone, the catalog changed, or another branch owns it.
+            if complete || removed == 0 {
+                return Ok(complete);
+            }
+            checkpoint()?;
+        }
+    }
+
+    /// The reopen retry of T2: one bounded step. It reads at most
+    /// `VECTOR_JOURNAL_CLEANUP_STEP_RECORDS` journal records, removes the
+    /// covered ones among them in one committed transaction and leaves the
+    /// rest to maintenance, so opening a store does the same work however long
+    /// the route's covered backlog or unindexed suffix is. Returns whether the
+    /// covered prefix is now gone.
+    pub(crate) fn truncate_vector_partition_journal_open_step(
+        &self,
+        expected_catalog: &VectorPartitionGenerationCatalogRecord,
+        workspace: &mut VectorWorkspaceReservation,
+    ) -> Result<bool> {
+        self.truncate_vector_partition_journal_in_steps(
+            expected_catalog,
+            workspace,
+            || Ok(()),
+            VECTOR_JOURNAL_CLEANUP_STEP_RECORDS,
+            &mut 0,
+        )
+    }
+
+    /// One bounded step of T2: reads at most `record_limit` journal records
+    /// and counts the covered ones it removes in `removed`.
+    fn truncate_vector_partition_journal_in_steps(
+        &self,
+        expected_catalog: &VectorPartitionGenerationCatalogRecord,
+        workspace: &mut VectorWorkspaceReservation,
+        mut checkpoint: impl FnMut() -> Result<()>,
+        record_limit: usize,
+        removed: &mut usize,
     ) -> Result<bool> {
         const OPERATION: &str = "truncate_vector_partition_journal";
         const CHECKPOINT_RECORD_INTERVAL: usize = 64;
@@ -33004,111 +33185,68 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let mut journal = write_txn
                 .open_table(VECTOR_PARTITION_JOURNAL_TABLE)
                 .map_err(Self::storage_error)?;
-            let mut covered_key_count = 0usize;
-            let mut covered_key_bytes = 0usize;
-            for (position, entry) in journal
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-                .enumerate()
-            {
-                if position % CHECKPOINT_RECORD_INTERVAL == 0 {
-                    checkpoint()?;
-                }
-                let (key, value) = entry.map_err(Self::storage_error)?;
-                if !key.value().starts_with(&prefix) {
-                    break;
-                }
-                let decode_bound = Self::vector_partition_record_decode_bound(
-                    value.value().len(),
-                    std::mem::size_of::<VectorPartitionJournalRecord>(),
-                );
-                Self::resize_vector_cleanup_workspace(
-                    workspace,
-                    fixed_owned.saturating_add(decode_bound),
-                    OPERATION,
-                )?;
-                let record: VectorPartitionJournalRecord = self
-                    .decode_expected_vector_partition_metadata(
-                        VectorPartitionRecordKind::Journal,
+            // Journal keys are `prefix | lsn | ordinal`, so the covered records
+            // come first. Each pass re-seeks the route's first record, validates
+            // it without decoding it, stops at the first one past the covered
+            // boundary, and otherwise removes it. Only one copied physical key
+            // is live at a time, reserved before it is copied.
+            Self::resize_vector_cleanup_workspace(
+                workspace,
+                fixed_owned.saturating_add(physical_key_bound.saturating_mul(2)),
+                OPERATION,
+            )?;
+            let width_bound = vector_partition_journal_record_width_bound(
+                &expected_catalog.index,
+                &expected_catalog.partition_key,
+            );
+            let mut complete = false;
+            let mut read = 0usize;
+            while read < record_limit {
+                checkpoint()?;
+                let key = {
+                    let next = journal
+                        .prefix_bounded(prefix.as_slice())
+                        .map_err(Self::storage_error)?
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?;
+                    let Some((key, value)) = next else {
+                        complete = true;
+                        break;
+                    };
+                    if !key.value().starts_with(&prefix) {
+                        complete = true;
+                        break;
+                    }
+                    read += 1;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    note_vector_journal_cleanup_record_read();
+                    let lsn = validate_vector_partition_journal_record(
+                        &prefix,
+                        key.value(),
                         value.value(),
                         &expected_catalog.index,
                         &expected_catalog.partition_key,
-                    )?;
-                let record_owned = Self::vector_partition_journal_record_heap_bytes(&record);
-                debug_assert!(record_owned <= decode_bound);
-                Self::resize_vector_cleanup_workspace(
-                    workspace,
-                    fixed_owned.saturating_add(record_owned),
-                    OPERATION,
-                )?;
-                if record.index != expected_catalog.index
-                    || record.partition_key != expected_catalog.partition_key
-                    || !Self::vector_partition_journal_key_matches(&prefix, key.value(), &record)
-                {
-                    return Err(self.vector_partition_corruption(
-                        "journal truncation encountered a mismatched route or physical key",
-                    ));
+                        width_bound,
+                    )
+                    .map_err(|reason| self.vector_partition_corruption(reason))?;
+                    if lsn > covered_lsn.0 {
+                        complete = true;
+                        break;
+                    }
+                    key.value().to_vec()
+                };
+                // Covered records lead the route, so the first record read is
+                // the first one removed.
+                #[cfg(any(test, feature = "test-seams"))]
+                if read == 1 {
+                    crate::database::maybe_pause_vector_journal_cleanup_for_test();
                 }
-                if record.lsn.0 <= covered_lsn.0 {
-                    covered_key_count = covered_key_count.saturating_add(1);
-                    covered_key_bytes = covered_key_bytes.saturating_add(key.value().len());
-                }
-                drop(record);
-                Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
+                journal
+                    .remove(key.as_slice())
+                    .map_err(Self::storage_error)?;
+                *removed += 1;
             }
-
-            checkpoint()?;
-            let collection_bound =
-                Self::vector_cleanup_collection_bound(covered_key_count, covered_key_bytes);
-            Self::resize_vector_cleanup_workspace(
-                workspace,
-                fixed_owned.saturating_add(collection_bound),
-                OPERATION,
-            )?;
-            let mut covered_keys = Vec::<Box<[u8]>>::with_capacity(covered_key_count);
-            for (position, entry) in journal
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-                .enumerate()
-            {
-                if position % CHECKPOINT_RECORD_INTERVAL == 0 {
-                    checkpoint()?;
-                }
-                let (key, _) = entry.map_err(Self::storage_error)?;
-                let key = key.value();
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let lsn_end = prefix.len().saturating_add(8);
-                let lsn = key
-                    .get(prefix.len()..lsn_end)
-                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                    .map(u64::from_be_bytes)
-                    .expect("validated journal key keeps its fixed-width LSN");
-                if lsn <= covered_lsn.0 {
-                    covered_keys.push(Box::<[u8]>::from(key));
-                }
-            }
-            let collection_owned =
-                Self::boxed_vector_key_collection_bytes(covered_keys.capacity(), &covered_keys);
-            debug_assert!(collection_owned <= collection_bound);
-            Self::resize_vector_cleanup_workspace(
-                workspace,
-                fixed_owned.saturating_add(collection_owned),
-                OPERATION,
-            )?;
-            #[cfg(any(test, feature = "test-seams"))]
-            if !covered_keys.is_empty() {
-                crate::database::maybe_pause_vector_journal_cleanup_for_test();
-            }
-            checkpoint()?;
-            for (position, key) in covered_keys.iter().enumerate() {
-                if position % CHECKPOINT_RECORD_INTERVAL == 0 {
-                    checkpoint()?;
-                }
-                journal.remove(key.as_ref()).map_err(Self::storage_error)?;
-            }
-            drop(covered_keys);
             Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
             drop(journal);
             checkpoint()?;
@@ -33125,7 +33263,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 graph_commit_result
             }
             .map_err(Self::storage_error)?;
-            Ok(true)
+            Ok(complete)
         });
         if result.is_ok() {
             drop(prefix);
@@ -49486,6 +49624,10 @@ mod metadata_decode_guard_tests;
 #[cfg(test)]
 #[path = "persistence/retained_raw_body_guard_tests.rs"]
 mod retained_raw_body_guard_tests;
+
+#[cfg(test)]
+#[path = "persistence/journal_record_validation_tests.rs"]
+mod journal_record_validation_tests;
 
 #[cfg(test)]
 mod change_reload_decode_tests;
