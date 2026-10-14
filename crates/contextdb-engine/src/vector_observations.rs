@@ -345,8 +345,10 @@ pub(crate) fn emit_import_tail_load_for_test(
 
 /// Called on the import's thread between replacement-build steps, after
 /// every commit and partition gate is released: a test may commit there.
+/// It receives the bytes the import's own decode owner still holds at that
+/// boundary, after the step's decode owner has returned everything.
 #[cfg(any(test, feature = "test-seams"))]
-type ImportRebuildStepObserver = Arc<dyn Fn() + Send + Sync>;
+type ImportRebuildStepObserver = Arc<dyn Fn(usize) + Send + Sync>;
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static IMPORT_REBUILD_STEP_OBSERVER: RefCell<Option<ImportRebuildStepObserver>> = const { RefCell::new(None) };
@@ -378,9 +380,9 @@ impl Drop for ImportRebuildStepObservationForTest {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn emit_import_rebuild_step_for_test() {
+pub(crate) fn emit_import_rebuild_step_for_test(import_decode_held: usize) {
     let observer = IMPORT_REBUILD_STEP_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {
-        observer();
+        observer(import_decode_held);
     }
 }

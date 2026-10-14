@@ -2965,6 +2965,18 @@ impl RedbPersistence {
         Ok(())
     }
 
+    /// A build record's decode failure. A memory refusal, a read failure or
+    /// a cancellation is the caller's typed outcome and travels unchanged;
+    /// only a record that cannot be decoded is store corruption.
+    fn build_record_decode_error(error: Error) -> Error {
+        match error {
+            Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => {
+                error
+            }
+            _ => corruption("paged build record cannot be decoded"),
+        }
+    }
+
     /// Every durable build record, for restart registration and floor restore.
     /// The inventory is one small control record per unpublished partition.
     /// The first durable build record after `after` (all records when None),
@@ -2994,7 +3006,7 @@ impl RedbPersistence {
             let (key, value) = entry.map_err(Self::storage_error)?;
             let record: PagedBuildRecord =
                 Self::decode_exact(open_value(key.value(), value.value())?)
-                    .map_err(|_| corruption("paged build record cannot be decoded"))?;
+                    .map_err(Self::build_record_decode_error)?;
             let partition = vector_membership_pages::partition_from_prefix(key.value())?;
             Ok(Some((key.value().to_vec(), partition, record)))
         })
@@ -3072,7 +3084,7 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .map(|value| {
                     Self::decode_exact(open_value(&key, value.value())?)
-                        .map_err(|_| corruption("paged build record cannot be decoded"))
+                        .map_err(Self::build_record_decode_error)
                 })
                 .transpose()
         })

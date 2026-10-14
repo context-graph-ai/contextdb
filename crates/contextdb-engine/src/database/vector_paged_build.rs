@@ -689,18 +689,47 @@ impl MaintenanceContext {
                     }
                 }
                 PagedVectorPhase::Complete => {
-                    if record.storage_id & crate::persistence::vector_paged::MUTABLE_STORAGE != 0
-                        && self.catch_up_native_import_candidate(
+                    let (record, progress) = if record.storage_id
+                        & crate::persistence::vector_paged::MUTABLE_STORAGE
+                        != 0
+                    {
+                        match self.catch_up_native_import_candidate(
                             partition,
                             persistence,
                             &record,
                             &progress,
                             copy_owner,
                             target.map(|(_, lsn)| lsn),
-                        )?
-                    {
-                        return Ok(Some(VectorPartitionPublicationOutcome::default()));
-                    }
+                        ) {
+                            Ok(true) => {
+                                return Ok(Some(VectorPartitionPublicationOutcome::default()));
+                            }
+                            Ok(false) => (record, progress),
+                            // A refused catch-up has dropped its owners and
+                            // workspace. The candidate is complete at its
+                            // own durable frontier: publish it there and
+                            // leave later commits pending for a later
+                            // bounded build. Its durable record is read
+                            // again, never the progress from before the call.
+                            Err(error) if crate::read_image_memory::is_memory_refusal(&error) => {
+                                let Some(durable) =
+                                    persistence.load_paged_build_record(partition)?
+                                else {
+                                    return Err(error);
+                                };
+                                let durable_progress = durable.progress()?;
+                                if durable.storage_id != record.storage_id
+                                    || durable_progress.phase != PagedVectorPhase::Complete
+                                {
+                                    return Err(error);
+                                }
+                                (durable, durable_progress)
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        (record, progress)
+                    };
                     return self
                         .publish_paged_vector_build(
                             partition,

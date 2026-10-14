@@ -74,6 +74,11 @@ fn one_commit(db: &Database, first: i64, rows: usize) {
 
 /// A built 16-row route, then one commit of 4,096 vectors, closed.
 fn store_with_one_large_commit(path: &std::path::Path) {
+    store_with_one_commit_of(path, ONE_COMMIT);
+}
+
+/// A built 16-row route, then one commit of `rows` vectors, closed.
+fn store_with_one_commit_of(path: &std::path::Path, rows: usize) {
     let db = Database::open_with_options(path, options(ROOMY)).unwrap();
     db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
     for id in 0..BASE_ROWS {
@@ -86,7 +91,7 @@ fn store_with_one_large_commit(path: &std::path::Path) {
         .remaining_partitions
         != 0
     {}
-    one_commit(&db, 1_000_000, ONE_COMMIT);
+    one_commit(&db, 1_000_000, rows);
     db.close().unwrap();
 }
 
@@ -259,7 +264,7 @@ fn a_large_commit_after_the_import_target_stays_pending_for_the_next_call() {
     // vectors in one commit: larger than the cohort share, after the target.
     let committed = Arc::new(AtomicBool::new(false));
     let late = (Arc::clone(&db), Arc::clone(&committed));
-    let _steps = observe_import_rebuild_steps_for_test(Arc::new(move || {
+    let _steps = observe_import_rebuild_steps_for_test(Arc::new(move |_| {
         if !late.1.swap(true, Ordering::SeqCst) {
             let db = Arc::clone(&late.0);
             std::thread::spawn(move || one_commit(&db, 2_000_000, 256))
@@ -314,6 +319,48 @@ fn a_pinned_reader_keeps_its_answer_while_the_large_commit_is_rebuilt_and_publis
     assert_ne!(fresh, before, "a fresh reader sees the delete");
     assert_eq!(nearest(&db, 3_000_000), vec![vec![Value::Int64(3_000_000)]]);
     db.rollback(pinned).unwrap();
+}
+
+#[test]
+fn a_rebuild_holds_the_same_decode_charge_at_every_step_whatever_its_size() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let mut envelopes = Vec::new();
+    for rows in [1024, ONE_COMMIT] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("step-envelope.db");
+        store_with_one_commit_of(&path, rows);
+        let db = Database::open_with_options(&path, options(TIGHT)).unwrap();
+        // At each step boundary, the bytes the import's own decode owner
+        // still holds: a step's build records and inspection decodes are
+        // returned with the step, never accumulated across steps.
+        let held = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = held.clone();
+        let steps = observe_import_rebuild_steps_for_test(Arc::new(move |import_held| {
+            sink.lock().push(import_held);
+        }));
+        assert!(db.persist_import_vector_tails().unwrap());
+        drop(steps);
+        assert_eq!(db.memory_limit(), Some(TIGHT), "the limit is never raised");
+        assert_eq!(serving_pending(&db), 0);
+        let held = std::mem::take(&mut *held.lock());
+        eprintln!(
+            "rebuild of {rows}: {} step boundaries, import decode held {:?}..{:?}",
+            held.len(),
+            held.first(),
+            held.last()
+        );
+        assert!(held.len() > 1, "the rebuild takes more than one step");
+        assert!(
+            held.iter().all(|bytes| *bytes == held[0]),
+            "the import's decode owner holds the same at every step: {held:?}"
+        );
+        envelopes.push((rows, held.len(), held[0]));
+    }
+    assert!(envelopes[1].1 > envelopes[0].1, "{envelopes:?}");
+    assert_eq!(
+        envelopes[0].2, envelopes[1].2,
+        "the same envelope at both build sizes: {envelopes:?}"
+    );
 }
 
 /// Run the import in a child that dies at `cut`, then prove reopen and resume.

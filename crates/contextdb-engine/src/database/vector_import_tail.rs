@@ -357,36 +357,51 @@ impl MaintenanceContext {
     ) -> Result<bool> {
         let mut superseded = false;
         loop {
-            let before = persistence
-                .load_paged_build_record(partition)?
-                .map(|record| record.progress())
-                .transpose()?;
-            let outcome = self.advance_paged_vector_build_toward(
-                partition,
-                copy_owner,
-                Arc::clone(read_memory),
-                target,
-            )?;
+            {
+                // Every decode of this one step -- the build record before
+                // and after it and the step's own inspection -- is charged
+                // to a writer owner of the step alone, returned when the
+                // step's records are dropped below. The import's own decode
+                // owner never accumulates a charge per step.
+                let step = crate::read_image_memory::ImageMemory::operation_writer(
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
+                )?;
+                let _step = step.enter();
+                let before = persistence
+                    .load_paged_build_record(partition)?
+                    .map(|record| record.progress())
+                    .transpose()?;
+                let outcome = self.advance_paged_vector_build_toward(
+                    partition,
+                    copy_owner,
+                    Arc::clone(read_memory),
+                    target,
+                )?;
+                let Some(outcome) = outcome else {
+                    return Ok(false);
+                };
+                if outcome.published {
+                    return Ok(true);
+                }
+                let after = persistence
+                    .load_paged_build_record(partition)?
+                    .map(|record| record.progress())
+                    .transpose()?;
+                match (&before, &after) {
+                    // Durable progress moved: source cursor, phase, encoding
+                    // cursor or a catch-up frontier, each finite.
+                    (_, Some(after)) if before.as_ref() != Some(after) => {}
+                    // The build vanished without a publication: superseded.
+                    (Some(_), None) if !superseded => superseded = true,
+                    _ => return Ok(false),
+                }
+            }
             #[cfg(feature = "test-seams")]
-            crate::vector_observations::emit_import_rebuild_step_for_test();
-            let Some(outcome) = outcome else {
-                return Ok(false);
-            };
-            if outcome.published {
-                return Ok(true);
-            }
-            let after = persistence
-                .load_paged_build_record(partition)?
-                .map(|record| record.progress())
-                .transpose()?;
-            match (&before, &after) {
-                // Durable progress moved: source cursor, phase, encoding
-                // cursor or a catch-up frontier, each finite.
-                (_, Some(after)) if before.as_ref() != Some(after) => {}
-                // The build vanished without a publication: superseded.
-                (Some(_), None) if !superseded => superseded = true,
-                _ => return Ok(false),
-            }
+            crate::vector_observations::emit_import_rebuild_step_for_test(
+                crate::read_image_memory::active_owner().map_or(0, |owner| owner.held_with_call()),
+            );
         }
     }
 
@@ -1049,5 +1064,154 @@ mod undeclared_limit_tests {
             .unwrap()
             .rows;
         assert_eq!(nearest, vec![vec![Value::Int64(1_000_000 + 40_000)]]);
+    }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod build_record_refusal_tests {
+    use crate::memory_accounting::MemoryAccountant;
+    use crate::read_image_memory::ImageMemory;
+    use crate::{Database, DatabaseOpenOptions, MaintenancePolicy};
+    use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey, Wallclock};
+    use contextdb_vector::VectorPartitionRef;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const DIMENSION: usize = 384;
+
+    fn options(limit: usize) -> DatabaseOpenOptions {
+        let mut options = DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            memory_limit: Some(limit),
+            ..DatabaseOpenOptions::default()
+        };
+        options.owner_reads.limits.limits.memory = 1 << 30;
+        options
+    }
+
+    fn vector_for(id: i64) -> Vec<f32> {
+        let mut values: Vec<f32> = (0..DIMENSION)
+            .map(|lane| ((id as f32) * 0.618 + lane as f32 * 0.37).sin() * 0.25)
+            .collect();
+        values[(id as usize) % DIMENSION] += 4.0;
+        values
+    }
+
+    /// One decode under a writer owner that has no headroom at all.
+    fn refused<T: std::fmt::Debug>(decode: impl FnOnce() -> contextdb_core::Result<T>) -> Error {
+        let tiny: crate::memory_accounting::AccountantHandle =
+            Arc::new(MemoryAccountant::with_budget(1)).into();
+        let owner =
+            ImageMemory::charging_for(tiny.clone(), "writer_source", "decode_stored_value", "test");
+        let error = {
+            let _scope = owner.enter();
+            decode().expect_err("a decode with no headroom refuses")
+        };
+        assert_eq!(owner.held(), 0, "a refused decode returns its charge");
+        drop(owner);
+        assert_eq!(tiny.usage().used, 0, "nothing stays charged");
+        error
+    }
+
+    #[test]
+    fn a_refused_build_record_decode_is_the_typed_refusal_and_leaves_the_build_intact() {
+        let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("build-record-refusal.db");
+        {
+            let db = Database::open_with_options(&path, options(512 * 1024 * 1024)).unwrap();
+            db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
+            for id in 0..16 {
+                db.execute(
+                    "INSERT INTO points VALUES ($id, 1, $v)",
+                    &HashMap::from([
+                        ("id".into(), Value::Int64(id)),
+                        ("v".into(), Value::Vector(vector_for(id))),
+                    ]),
+                )
+                .unwrap();
+            }
+            while db
+                .run_maintenance_cycle()
+                .unwrap()
+                .vector
+                .remaining_partitions
+                != 0
+            {}
+            // One commit larger than the 16 MiB writer's cohort share.
+            let mut sql = String::from("INSERT INTO points VALUES ");
+            let mut params = HashMap::new();
+            for row in 0..2048i64 {
+                if row > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("($i{row}, 1, $v{row})"));
+                params.insert(format!("i{row}"), Value::Int64(1_000_000 + row));
+                params.insert(
+                    format!("v{row}"),
+                    Value::Vector(vector_for(1_000_000 + row)),
+                );
+            }
+            db.execute(&sql, &params).unwrap();
+            db.close().unwrap();
+        }
+        let db = Arc::new(Database::open_with_options(&path, options(16 * 1024 * 1024)).unwrap());
+        let partition = VectorPartitionRef::new(
+            VectorIndexRef::new("points", "embedding"),
+            VectorPartitionKey::from_values(&[Value::Int64(1)]).unwrap(),
+        );
+        // Between two rebuild steps a healthy durable build exists.
+        let checked = Arc::new(AtomicBool::new(false));
+        let observed = (Arc::clone(&db), partition.clone(), Arc::clone(&checked));
+        let _steps = crate::vector_observations::observe_import_rebuild_steps_for_test(Arc::new(
+            move |_| {
+                let (db, partition, checked) = &observed;
+                if checked.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let persistence = db.persistence.as_ref().unwrap();
+                let roomy = || {
+                    let owner = ImageMemory::operation_writer(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &db.finalization.accountant,
+                        ),
+                    )
+                    .unwrap();
+                    let _scope = owner.enter();
+                    persistence
+                        .load_paged_build_record(partition)
+                        .unwrap()
+                        .expect("a durable build exists between steps")
+                        .progress()
+                        .unwrap()
+                };
+                let before = roomy();
+                for error in [
+                    refused(|| persistence.load_paged_build_record(partition)),
+                    refused(|| persistence.next_paged_build_record_after(None)),
+                ] {
+                    assert!(
+                        matches!(error, Error::MemoryBudgetExceeded { .. }),
+                        "a valid record's refused decode is the typed refusal, never corruption: {error:?}"
+                    );
+                }
+                assert_eq!(roomy(), before, "the durable progress is unchanged");
+            },
+        ));
+        assert!(
+            db.persist_import_vector_tails().unwrap(),
+            "the retry with headroom completes"
+        );
+        assert!(checked.load(Ordering::SeqCst), "the refusal was exercised");
+        assert!(
+            db.persistence
+                .as_ref()
+                .unwrap()
+                .load_paged_build_record(&partition)
+                .unwrap()
+                .is_none(),
+            "the build published"
+        );
     }
 }

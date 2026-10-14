@@ -540,7 +540,8 @@ fn queued_replacement_with_a_later_commit(path: &std::path::Path) -> Database {
 fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
-    let db = queued_replacement_with_a_later_commit(&root.path().join("candidate-refusal.db"));
+    let path = root.path().join("candidate-refusal.db");
+    let db = queued_replacement_with_a_later_commit(&path);
     // The first catch-up load gets no headroom at all: its first decode
     // admission must refuse, and the refusal must leave nothing charged.
     let tightened = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -552,19 +553,17 @@ fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds()
         },
         64 * 1024 * 1024,
     );
-    let mut refused_reports = 0;
+    let mut failures = 0;
     for _ in 0..128 {
         let report = db.run_maintenance_cycle().unwrap().vector;
         if report.first_failure.is_some() {
-            refused_reports += 1;
+            failures += 1;
         }
-        if loads.lock().iter().any(|load| {
-            load.enter.site == CANDIDATE_SITE
-                && matches!(
-                    load.exit.boundary,
-                    ImportTailLoadBoundaryForTest::Loaded { .. }
-                )
-        }) {
+        if loads
+            .lock()
+            .iter()
+            .any(|load| load.enter.site == CANDIDATE_SITE)
+        {
             break;
         }
     }
@@ -574,8 +573,8 @@ fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds()
         .iter()
         .filter(|load| load.enter.site == CANDIDATE_SITE)
         .collect();
-    eprintln!("candidate refusal then catch-up: {candidate:?}");
-    assert_eq!(candidate.len(), 2, "{loads:?}");
+    eprintln!("candidate refusal then publication: {candidate:?}");
+    assert_eq!(candidate.len(), 1, "{loads:?}");
     let refusal = match &candidate[0].exit.boundary {
         ImportTailLoadBoundaryForTest::Refused { error } => error.clone(),
         other => panic!("the tightened catch-up must refuse at its decode, saw {other:?}"),
@@ -584,28 +583,54 @@ fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds()
         refusal.starts_with("memory budget exceeded: writer_source/decode_stored_value requested "),
         "{refusal}"
     );
-    assert_eq!(refused_reports, 1, "the refusal is reported once");
     assert_eq!(candidate[0].exit.decode_held, 0, "{:?}", candidate[0].exit);
     assert_eq!(
         candidate[0].exit.writer_used, candidate[0].enter.writer_used,
         "a refused catch-up returns every decode charge it made"
     );
+    // The refused catch-up publishes the complete candidate at its own
+    // frontier in the same cycle: nothing is reported failed, no build is
+    // left, and exactly the later commit stays pending.
     assert_eq!(
-        candidate[1].exit.boundary,
-        ImportTailLoadBoundaryForTest::Loaded {
-            vectors: 1,
-            adopted_output: 3 * 4,
-        }
+        failures, 0,
+        "the refused catch-up publishes instead of failing"
     );
-    assert_owned_by_the_writer(candidate[1]);
-    let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1";
+    assert!(
+        db.vector_build_progress_for_test("points", "embedding")
+            .unwrap()
+            .is_empty(),
+        "the candidate is published"
+    );
+    assert_eq!(pending_inserts(&db), 1, "only the later commit is pending");
+    db.close().unwrap();
+    drop(db);
+    let db = Database::open_with_options(&path, options(64 * 1024 * 1024)).unwrap();
+    assert!(
+        db.vector_build_progress_for_test("points", "embedding")
+            .unwrap()
+            .is_empty(),
+        "reopen sees the candidate published"
+    );
+    assert_eq!(pending_inserts(&db), 1);
+    let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
+    let nearest = |db: &Database, q: Vec<f32>| {
+        db.execute(query, &HashMap::from([("q".into(), Value::Vector(q))]))
+            .unwrap()
+            .rows
+    };
     assert_eq!(
-        db.execute(
-            query,
-            &HashMap::from([("q".into(), Value::Vector(vec![0.0, 0.0, 1.0]))])
-        )
-        .unwrap()
-        .rows,
+        nearest(&db, vec![1.0, 0.0, 0.0]),
+        vec![vec![Value::Int64(10_000)]]
+    );
+    assert_eq!(
+        nearest(&db, vec![0.0, 0.0, 1.0]),
+        vec![vec![Value::Int64(10_001)]]
+    );
+    // The later commit is covered by the next bounded pass.
+    assert!(db.persist_import_vector_tails().unwrap());
+    assert_eq!(pending_inserts(&db), 0);
+    assert_eq!(
+        nearest(&db, vec![0.0, 0.0, 1.0]),
         vec![vec![Value::Int64(10_001)]]
     );
 }
