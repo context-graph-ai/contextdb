@@ -7,7 +7,10 @@
 //! when that close trimmed the file. An explicit diagnostic still gets the
 //! exact statistics ratio on demand.
 use contextdb_core::Wallclock;
-use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
+use contextdb_engine::{
+    Database, DatabaseOpenOptions, MaintenancePolicy, REDB_COMPACT_FRAGMENTATION_THRESHOLD,
+};
+use redb::TableDefinition;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -311,4 +314,93 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
         large.warm_cycle_micros,
         small.warm_cycle_micros,
     );
+}
+
+const PAYLOAD: TableDefinition<u64, &[u8]> = TableDefinition::new("payload");
+/// Just over one 4 KiB page with its key and leaf header, so each row sits
+/// alone in an 8 KiB leaf that is about half unused: in-page slack that a
+/// whole-page relocation cannot give back.
+const SLACK_VALUE_BYTES: usize = 4_100;
+const SLACK_ROWS: u64 = 4_096;
+
+/// A store whose rows each leave half a page unused; the rows `keep` rejects
+/// are removed, so their pages are allocator-free. Every `keep` used here
+/// keeps the last row, so no clean close trims the freed pages away.
+fn raw_payload_store(path: &std::path::Path, keep: impl Fn(u64) -> bool) {
+    let initial = open(path);
+    initial.close().unwrap();
+    drop(initial);
+    let db = redb::Database::create(path).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut table = write.open_table(PAYLOAD).unwrap();
+        let bytes = vec![0x5c_u8; SLACK_VALUE_BYTES];
+        for key in 0..SLACK_ROWS {
+            table.insert(key, bytes.as_slice()).unwrap();
+        }
+    }
+    write.commit().unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut table = write.open_table(PAYLOAD).unwrap();
+        for key in (0..SLACK_ROWS).filter(|key| !keep(*key)) {
+            table.remove(key).unwrap();
+        }
+    }
+    write.commit().unwrap();
+    // Release the removed rows' pages to the allocator before the close.
+    db.begin_write().unwrap().commit().unwrap();
+    drop(db);
+}
+
+/// Opens the store and drives the first automatic compaction decision.
+/// Returns the exact statistics ratio, the allocator free-page ratio, and
+/// whether automatic compaction started.
+fn first_automatic_decision(path: &std::path::Path) -> (f64, f64, bool, Work) {
+    let db = open(path);
+    let exact = db.__storage_fragmentation_ratio_for_test().unwrap().unwrap();
+    let free = agreed_ratio(&db);
+    let before = work(&db);
+    let report = db.run_maintenance_cycle().unwrap();
+    let cycle = since(before, work(&db));
+    db.close().unwrap();
+    (exact, free, report.compaction.ran, cycle)
+}
+
+/// The accepted behavior change, proved in both directions: automatic
+/// compaction acts on whole free pages, which relocation gives back, and not
+/// on unused bytes inside live pages, which it cannot.
+#[test]
+fn automatic_compaction_starts_on_reclaimable_free_pages_and_not_on_in_page_slack() {
+    let directory = tempfile::tempdir().unwrap();
+
+    // Slack-dominated: a quarter of the rows removed, every row's page half
+    // empty. Dead space by the exact statistics, mostly not reclaimable.
+    let slack = directory.path().join("slack.redb");
+    raw_payload_store(&slack, |key| key % 4 != 1);
+    let (exact, free, ran, cycle) = first_automatic_decision(&slack);
+    println!("slack store: exact={exact} allocator_free={free} ran={ran}");
+    assert!(
+        exact >= REDB_COMPACT_FRAGMENTATION_THRESHOLD
+            && free < REDB_COMPACT_FRAGMENTATION_THRESHOLD,
+        "the fixture must be dead-space dominated only through in-page slack: \
+         exact={exact} free={free}"
+    );
+    assert!(
+        !ran,
+        "in-page slack that relocation cannot give back starts no automatic compaction"
+    );
+    assert_eq!(cycle, Work::default(), "the decision read no statistics");
+
+    // Free-page dominated: seven of eight rows removed.
+    let reclaimable = directory.path().join("reclaimable.redb");
+    raw_payload_store(&reclaimable, |key| key % 8 == 7);
+    let (exact, free, ran, cycle) = first_automatic_decision(&reclaimable);
+    println!("reclaimable store: exact={exact} allocator_free={free} ran={ran}");
+    assert!(
+        free >= REDB_COMPACT_FRAGMENTATION_THRESHOLD,
+        "the fixture must be dominated by whole free pages: exact={exact} free={free}"
+    );
+    assert!(ran, "reclaimable free pages start automatic compaction");
+    assert_eq!(cycle, Work::default(), "the decision read no statistics");
 }
