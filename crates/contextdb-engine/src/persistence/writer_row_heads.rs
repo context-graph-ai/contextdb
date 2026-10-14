@@ -463,6 +463,7 @@ pub(super) enum HoldStep {
 }
 
 /// How an injected fault surfaces.
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HoldFault {
     Error,
