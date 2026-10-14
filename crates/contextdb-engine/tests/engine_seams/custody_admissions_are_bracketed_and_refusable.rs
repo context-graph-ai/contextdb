@@ -176,15 +176,25 @@ fn bracketed(name: &str, prepare: &mut dyn FnMut(), mut operation: Operation<'_>
         "{name}: some funded bracket was checked"
     );
     let mut refused = 0usize;
+    let mut unreached = 0usize;
     for (label, count) in &record.counts {
         for occurrence in occurrences(*count) {
             Database::__custody_refuse_at_for_test(Some((label, occurrence)));
             let ((answer, held), refusal) = call(true);
             let left = Database::__custody_refuse_at_for_test(None);
-            assert_eq!(
-                left, None,
-                "{name}: occurrence {occurrence} of {label} was reached"
-            );
+            if left.is_some() {
+                // A signature verified once is remembered process-wide, so a
+                // later call may verify fewer: it must then have answered
+                // with fewer occurrences than the one targeted.
+                let reached = refusal.counts.get(label).copied().unwrap_or(0);
+                assert!(
+                    answer.is_ok() && reached < occurrence,
+                    "{name}: occurrence {occurrence} of {label} was not reached \
+                     ({reached} seen) yet the call did not answer: {answer:?}"
+                );
+                unreached += 1;
+                continue;
+            }
             let error = match answer {
                 Err(error) => error,
                 Ok(keys) => panic!("{name}: refusing {label}#{occurrence} answered {keys:?}"),
@@ -215,7 +225,8 @@ fn bracketed(name: &str, prepare: &mut dyn FnMut(), mut operation: Operation<'_>
         }
     }
     println!(
-        "S3_BRACKET {name} labels={} funded_checked={} refusals={refused}",
+        "S3_BRACKET {name} labels={} funded_checked={} refusals={refused} \
+         unreached={unreached}",
         record.counts.len(),
         record.checked
     );
