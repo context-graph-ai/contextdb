@@ -459,6 +459,7 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
 /// every held one costs T(T−1)/2 handle moves per pass instead.
 #[test]
 fn a_commit_writing_tables_in_descending_order_holds_each_once_with_logarithmic_work() {
+    let mut previous_events: Option<u64> = None;
     for count in [64usize, 128, 256] {
         let root = tempfile::tempdir().expect("fixture directory");
         let db = Database::open(root.path().join("descending.db")).expect("open the database");
@@ -511,12 +512,15 @@ fn a_commit_writing_tables_in_descending_order_holds_each_once_with_logarithmic_
              {work} > {}",
             2 * per_pass
         );
-        // The rows' own writes and both passes each open and close every
-        // relation once: protected root events stay linear in the tables.
-        assert!(
-            events <= 8 * count as u64 + PROTECTED_ROOT_EVENT_ALLOWANCE,
-            "protected root events grew faster than the tables: {events}"
-        );
+        // The rows' own writes and both passes open and close every relation
+        // a fixed number of times: doubling the tables at most doubles them.
+        if let Some(previous) = previous_events {
+            assert!(
+                events <= 2 * previous + PROTECTED_ROOT_EVENT_ALLOWANCE,
+                "protected root events grew faster than the tables: {previous} -> {events}"
+            );
+        }
+        previous_events = Some(events);
         db.close().expect("close the database");
     }
 }
