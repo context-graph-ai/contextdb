@@ -6742,6 +6742,13 @@ impl IndexState {
             Ok(loaded) => loaded,
             Err(error) => {
                 release_retained(reserved);
+                if interrupted.is_none() && matches!(error, Error::StoreCorrupted { .. }) {
+                    // The saved suffix failed its integrity check. Quarantine
+                    // the route as the dormant loader does, so indexed reads
+                    // report it, exact reads still answer and maintenance
+                    // repairs it.
+                    self.set_route_quarantine(VectorRouteQuarantineReason::CorruptChanges);
+                }
                 return Err(interrupted.unwrap_or_else(|| E::from(error)));
             }
         };
