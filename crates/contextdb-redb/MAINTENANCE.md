@@ -467,3 +467,48 @@ The engine owns prefix/resume policy and advances only after callback/checkpoint
 success; default APIs, formats and the previous exact lookup bodies are unchanged.
 Compiler, runtime, races and outside-family review remain unrun. The maintained
 patch reproduces every current src byte, including this companion.
+
+
+## Maintained allocator free-page totals (S9)
+
+`src/tree_store/page_store/region.rs` keeps one fixed `FreeTotals` aggregate in `Allocators`:
+free pages, region pages, and a trust flag, 24 bytes inside `size_of::<Allocators>()`. The
+resident envelope stays independent of the region count.
+
+**How the totals move.** `src/tree_store/page_store/page_manager.rs` applies a net delta only
+after an operation succeeds:
+- a successful allocation subtracts 2^order;
+- a free or a rollback free adds 2^order;
+- `Allocators::resize_to` moves both totals by the change in region pages: growth adds free pages,
+  and a trim removes trailing free pages only.
+
+Buddy split and coalesce never move them. Repair, a poisoned pager, a failed or out-of-range
+delta, or a missing or invalid saved value makes the totals untrusted. Untrusted totals are never
+published (`Database::allocator_free_totals` returns `None`) or saved.
+
+**Persistence.**
+- A new `AllocatorStateKey::FreeTotals` (tag 6, after `TransactionId`) holds 24 bytes:
+  `[u32 format=1][u32 regions][u64 region pages][u64 free pages]`.
+- It is reserved in `reserve_allocator_state` and written in `try_save_allocator_state` from the
+  same snapshot as the region bitmaps. Untrusted totals leave the reserved zeros (format 0), which
+  every load rejects. That save is not retried.
+- The saved value precedes the commit's `try_shrink`. A load therefore maps it onto the committed
+  geometry: the saved regions must equal the committed regions or exceed them by one, the
+  committed pages must not exceed the saved pages, and the trimmed pages must fit within the
+  saved free pages. The adopted totals are `free - trimmed` over the committed pages.
+- Anything else, and every full repair (`end_repair`), runs a checked recount of every region's
+  bitmap. The recount publishes trust only if it completed with a healthy pager; otherwise it
+  returns the storage error.
+
+**Accessors.** Production gets one hidden accessor, `Database::allocator_free_totals`. The
+test-seams accessors are an independent recount, a distrust seam, and a thread-local rebuild
+counter.
+
+**Tests.** The proofs are in `tests/allocator_residency_contract.rs`:
+- `allocator_free_totals_track_the_bitmaps_and_survive_trimming_reopen`
+- `allocator_free_totals_adopt_the_trimmed_geometry_on_reopen`
+- `allocator_untrusted_free_totals_are_not_saved_and_rebuild_once_on_reopen`
+- `allocator_free_totals_after_poison_are_withheld_and_rebuilt_by_repair`
+
+The patch sections for the four changed files were regenerated in place; the fork's other
+sections are unchanged. Compiler and runtime results are recorded in the S9 handover, not here.
