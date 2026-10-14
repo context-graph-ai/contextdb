@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-/// The long root table's name: 8,192 bytes.
+/// The long root table's name: 4,096 bytes.
 pub fn long_table() -> String {
-    format!("r{}", "x".repeat(8191))
+    format!("r{}", "x".repeat(4095))
 }
 const LONG_CLAUSES: &str = "SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST DELIVERY MANIFEST OVER parts";
 

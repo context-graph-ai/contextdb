@@ -1,6 +1,6 @@
 //! A durable custody read's closure walk keeps loaded companions in a memo
 //! whose keys can be kilobytes long (here: the roots of a table with an
-//! 8 KiB name, reached from their units' delivered terminals). On every exit, success or a refusal
+//! 4 KiB name, reached from their units' delivered terminals). On every exit, success or a refusal
 //! late in the walk with the memo populated, each entry is freed before its
 //! key bytes are refunded: at every refund, what this read has allocated
 //! never exceeds what its reader memory still holds admitted.
@@ -137,8 +137,9 @@ async fn memo_order() {
         let (entries, key_bytes) = Database::__last_closure_memo_for_test();
         assert!(
             // Beyond the slack and the operation's admitted-but-unused
-            // 32 KiB error reserve, which the reader's held bytes include.
-            key_bytes > 4 * SLACK as usize,
+            // error reserve (about 32 KiB), which the reader's held bytes
+            // include, by a clear margin.
+            key_bytes > SLACK as usize + 48 * 1024,
             "view #{occurrence}: the memo held {entries} entries with only {key_bytes} key bytes"
         );
         assert!(releases > 0);
