@@ -501,9 +501,9 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // a maintenance cycle that prunes nothing walks no storage statistics as the store grows;
     // automatic compaction starts on reclaimable free pages and not on in-page slack;
     // storage compaction is declarable and unmeasured fragmentation reads unknown (5 proofs).
-    ("contextdb-engine", 4510, RSN_TEST_COUNT),
+    ("contextdb-engine", 4516, RSN_TEST_COUNT),
     ("contextdb-server", 421, RSN_TEST_COUNT),
-    ("contextdb-cli", 270, RSN_TEST_COUNT),
+    ("contextdb-cli", 271, RSN_TEST_COUNT),
 ];
 
 /// Reason shared by every default-tier count entry.

@@ -14,7 +14,8 @@ pub mod types;
 
 pub use companion::{store_companion_path, store_holders_path};
 pub use error::{
-    CallbackKind, Error, Result, VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue,
+    CallbackKind, Error, Result, StorageCompactionDeclarationIssue, VectorPartitionDeclarationIssue,
+    VectorPolicyDeclarationIssue,
 };
 pub use memory::*;
 #[doc(hidden)]

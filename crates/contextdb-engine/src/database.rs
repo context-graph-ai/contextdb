@@ -9855,6 +9855,16 @@ fn publish_storage_compaction_batch(
     interrupted: &Arc<AtomicBool>,
     fragmentation: f64,
 ) -> Result<(redb::CompactionProgress, Option<u64>)> {
+    #[cfg(any(test, feature = "test-seams"))]
+    if let Some(remaining) = STORAGE_COMPACTION_BATCHES_BEFORE_REFUSAL.with(std::cell::Cell::get) {
+        if remaining == 0 {
+            STORAGE_COMPACTION_BATCHES_BEFORE_REFUSAL.with(|slot| slot.set(None));
+            return Err(Error::Other(
+                "storage compaction batch refused by the test seam".to_string(),
+            ));
+        }
+        STORAGE_COMPACTION_BATCHES_BEFORE_REFUSAL.with(|slot| slot.set(Some(remaining - 1)));
+    }
     let watch = PublicationInterruptionWatch::arm(interrupted);
     let progress = match persistence.compact_incremental(accountant.clone(), fragmentation) {
         Ok(progress) => progress,
@@ -24393,12 +24403,14 @@ impl MaintenanceContext {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(CompactionReport::default());
         };
-        let policy = *self.storage_compaction_policy.lock();
-        let min_interval = policy.min_interval();
+        let (policy, min_interval) = {
+            let state = self.storage_compaction_policy.lock();
+            (state.declared, state.min_interval())
+        };
         let due = self
             .last_auto_compact_at
             .lock()
-            .is_none_or(|at| at.elapsed() >= min_interval);
+            .is_none_or(|at| compaction_clock_now().saturating_duration_since(at) >= min_interval);
         let previous_sample = vector_source_page_admission::with_preparation_source_page_admission(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || persistence.storage_compaction_fragmentation_ratio(),
@@ -24419,10 +24431,10 @@ impl MaintenanceContext {
                 }
             }
         };
-        if previous_sample.is_none() && fragmentation_before < policy.declared.start_ratio() {
+        if previous_sample.is_none() && fragmentation_before < policy.start_ratio() {
             // A completed negative check starts the interval just as a
             // completed sweep does.
-            *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+            *self.last_auto_compact_at.lock() = Some(compaction_clock_now());
             return Ok(CompactionReport::default());
         }
         let bytes_before = self.file_bytes();
@@ -24436,7 +24448,7 @@ impl MaintenanceContext {
         )?;
         let duration_micros = start.elapsed().as_micros() as u64;
         if progress.complete {
-            *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+            *self.last_auto_compact_at.lock() = Some(compaction_clock_now());
         }
         let bytes_after = self.file_bytes();
         Ok(CompactionReport {
@@ -25081,7 +25093,7 @@ impl MaintenanceContext {
                 fragmentation_before,
             )?;
             if progress.complete {
-                *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+                *self.last_auto_compact_at.lock() = Some(compaction_clock_now());
             }
             report.compacted = true;
         }
@@ -27248,11 +27260,16 @@ impl StorageCompactionPolicy {
 }
 
 /// The declared policy shared by every handle onto one database, plus the
-/// test-only override of the automatic interval.
-#[derive(Debug, Clone, Copy, Default)]
+/// test-only override of the automatic interval and the test-only update
+/// seams.
+#[derive(Debug, Default)]
 pub(crate) struct StorageCompactionState {
     pub(crate) declared: StorageCompactionPolicy,
     pub(crate) min_interval_override: Option<Duration>,
+    #[cfg(any(test, feature = "test-seams"))]
+    update_pause: Arc<ApplyPhasePause>,
+    #[cfg(any(test, feature = "test-seams"))]
+    update_probe: Arc<MaintenancePollIntervalUpdateProbe>,
 }
 
 impl StorageCompactionState {
@@ -27269,6 +27286,36 @@ thread_local! {
     static AUTOMATIC_COMPACTION_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Sweeps the last explicit compaction on this thread ran. Production-dead.
     static EXPLICIT_COMPACTION_SWEEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// How far this thread's compaction clock runs ahead of the monotonic
+    /// clock. Production-dead.
+    static COMPACTION_CLOCK_ADVANCE: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// The next explicit compaction on this thread fails its exact
+    /// measurement. Production-dead.
+    static FAIL_EXACT_FRAGMENTATION_MEASUREMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Storage compaction batches this thread may still publish before one is
+    /// refused. Production-dead.
+    static STORAGE_COMPACTION_BATCHES_BEFORE_REFUSAL: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The monotonic clock the automatic compaction interval is measured on.
+fn compaction_clock_now() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    #[cfg(any(test, feature = "test-seams"))]
+    let now = now + COMPACTION_CLOCK_ADVANCE.with(std::cell::Cell::get);
+    now
+}
+
+/// Production-dead: whether the explicit compaction on this thread must
+/// report its exact measurement as failed.
+fn exact_fragmentation_measurement_fails_for_test() -> bool {
+    #[cfg(any(test, feature = "test-seams"))]
+    {
+        FAIL_EXACT_FRAGMENTATION_MEASUREMENT.with(|fail| fail.replace(false))
+    }
+    #[cfg(not(any(test, feature = "test-seams")))]
+    {
+        false
+    }
 }
 
 /// A worker whose clock runs ahead of the holder's stamps its rows in the
@@ -65514,6 +65561,63 @@ impl Database {
         EXPLICIT_COMPACTION_SWEEPS.with(std::cell::Cell::get)
     }
 
+    /// Production-dead: run the calling thread's compaction clock `by`
+    /// further ahead of the monotonic clock.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __advance_compaction_clock_for_test(by: Duration) {
+        COMPACTION_CLOCK_ADVANCE.with(|advance| advance.set(advance.get() + by));
+    }
+
+    /// Production-dead: the next explicit compaction on the calling thread
+    /// fails its exact fragmentation measurement.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __fail_next_exact_fragmentation_measurement_for_test() {
+        FAIL_EXACT_FRAGMENTATION_MEASUREMENT.with(|fail| fail.set(true));
+    }
+
+    /// Production-dead: the calling thread publishes `batches` more storage
+    /// compaction batches, then the next one is refused before it starts.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __refuse_storage_compaction_batch_after_for_test(batches: u32) {
+        STORAGE_COMPACTION_BATCHES_BEFORE_REFUSAL.with(|slot| slot.set(Some(batches)));
+    }
+
+    /// Production-dead: pause the next `SET STORAGE_COMPACTION` after it is
+    /// durable and before it is live.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __pause_after_storage_compaction_persist_for_test(&self) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
+        let inner = self.storage_compaction_policy.lock().update_pause.clone();
+        ApplyPhasePauseGuard::arm_for_test(inner)
+    }
+
+    /// Production-dead: `SET STORAGE_COMPACTION` calls that have entered.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __storage_compaction_update_entries_for_test(&self) -> u64 {
+        self.storage_compaction_policy.lock().update_probe.entries()
+    }
+
+    /// Production-dead: wait until `target` `SET STORAGE_COMPACTION` calls
+    /// have entered.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __wait_for_storage_compaction_update_entry_for_test(&self, target: u64) {
+        let probe = self.storage_compaction_policy.lock().update_probe.clone();
+        probe.wait_for(target);
+    }
+
+    /// Production-dead: whether the shared setting-update lock is held.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __storage_compaction_update_lock_is_held_for_test(&self) -> bool {
+        self.limit_update_lock.try_lock().is_none()
+    }
+
     /// Production-dead: the allocator's maintained `(free pages, region
     /// pages, trailing free pages)`; `None` while untrusted.
     #[cfg(any(test, feature = "test-seams"))]
@@ -65596,7 +65700,11 @@ impl Database {
         };
         // Explicit compaction measures exactly; a failed measurement is
         // reported unknown, and the sweep itself does not depend on it.
-        let fragmentation_before = persistence.fragmentation_ratio().ok();
+        let fragmentation_before = if exact_fragmentation_measurement_fails_for_test() {
+            None
+        } else {
+            persistence.fragmentation_ratio().ok()
+        };
         let bytes_before = self.disk_file_size();
         let policy = self.storage_compaction_policy.lock().declared;
         if !self.vector_store.has_durable_memberships() {
@@ -65652,7 +65760,7 @@ impl Database {
         }
         self.vector_store.evict_reloadable_raw_partitions();
         let duration_micros = start.elapsed().as_micros() as u64;
-        *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+        *self.last_auto_compact_at.lock() = Some(compaction_clock_now());
         let bytes_after = self.disk_file_size();
         Ok(CompactionReport {
             ran: true,
@@ -65887,6 +65995,13 @@ impl Database {
         &self,
         setting: &contextdb_parser::StorageCompactionSetting,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let (update_pause, update_probe) = {
+            let state = self.storage_compaction_policy.lock();
+            (state.update_pause.clone(), state.update_probe.clone())
+        };
+        #[cfg(any(test, feature = "test-seams"))]
+        update_probe.note_entered();
         let _operation = self.open_operation()?;
         let mut next = self.storage_compaction_policy();
         match setting {
@@ -65906,6 +66021,8 @@ impl Database {
                 })?;
             }
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        update_pause.maybe_pause();
         self.storage_compaction_policy.lock().declared = next;
         Ok(())
     }

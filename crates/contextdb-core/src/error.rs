@@ -125,6 +125,27 @@ pub enum VectorPolicyDeclarationIssue {
     ConsolidationPercentOutOfRange,
 }
 
+/// Why a `SET STORAGE_COMPACTION` declaration was refused. The SQL statement
+/// and the Rust setter refuse the same declarations with the same issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StorageCompactionDeclarationIssue {
+    #[error("START_RATIO must be greater than 0 and at most 1")]
+    StartRatioOutOfRange,
+    #[error("STOP_RATIO must be greater than 0 and at most 1")]
+    StopRatioOutOfRange,
+    #[error("MAX_SWEEPS must be at least 1")]
+    MaxSweepsNotPositive,
+    #[error("MAX_SWEEPS is outside the persisted numeric range")]
+    MaxSweepsOutOfRange,
+    #[error("MIN_INTERVAL must be positive")]
+    MinIntervalNotPositive,
+    #[error("MIN_INTERVAL is longer than 9223372036854775807 milliseconds")]
+    MinIntervalOutOfRange,
+    #[error("a clause may appear only once in one declaration")]
+    DuplicateClause,
+}
+
 /// The engine's own answers.
 ///
 /// This vocabulary is the engine's, and it is free to grow and be reordered:
@@ -203,6 +224,10 @@ pub enum Error {
     InvalidVectorPolicyDeclaration {
         index: VectorIndexRef,
         issue: VectorPolicyDeclarationIssue,
+    },
+    #[error("invalid storage compaction declaration: {issue}")]
+    InvalidStorageCompactionDeclaration {
+        issue: StorageCompactionDeclarationIssue,
     },
     /// A write's PARTITION_KEY value is not of the type its column declares.
     ///

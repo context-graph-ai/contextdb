@@ -675,6 +675,54 @@ fn maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli()
             outcome.describe()
         );
     }
+
+    // A cycle with no check due measured nothing: its receipt says unknown,
+    // never 0. Every run and compact receipt names the policy that governed it.
+    let receipts = run(
+        &[store.path_str(), "--write"],
+        ".maintenance run\n.maintenance run\n.maintenance compact\n",
+    );
+    assert_eq!(receipts.code, Some(0), "{}", receipts.describe());
+    assert!(
+        receipts
+            .stdout
+            .contains("auto_compact_fragmentation_before=unknown"),
+        "the second cycle's text receipt says unknown:\n{}",
+        receipts.describe()
+    );
+    let policy = "compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),\
+                  stop_ratio:0.05(default),max_sweeps:8(default)";
+    assert_eq!(
+        receipts.stdout.matches(policy).count(),
+        3,
+        "every run and compact text receipt names the governing policy:\n{}",
+        receipts.describe()
+    );
+    let json_receipts = run(
+        &[store.path_str(), "--write", "--json"],
+        ".maintenance run\n.maintenance run\n",
+    );
+    assert_eq!(json_receipts.code, Some(0), "{}", json_receipts.describe());
+    let cycles = documents_named(&json_receipts.stdout_docs(), "maintenance_cycle");
+    assert_eq!(cycles.len(), 2, "{}", json_receipts.describe());
+    assert!(
+        cycles[1]["compaction"]["fragmentation_before"].is_null(),
+        "the second cycle's JSON receipt says null: {}",
+        cycles[1]
+    );
+    for (name, value) in [
+        ("start_ratio", serde_json::json!(0.5)),
+        ("min_interval_ms", serde_json::json!(3_600_000)),
+        ("stop_ratio", serde_json::json!(0.05)),
+        ("max_sweeps", serde_json::json!(8)),
+    ] {
+        assert_eq!(
+            cycles[1]["compaction"]["policy"][name],
+            serde_json::json!({ "value": value, "source": "default" }),
+            "the JSON receipt names {name}: {}",
+            cycles[1]
+        );
+    }
 }
 
 #[test]

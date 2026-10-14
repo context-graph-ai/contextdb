@@ -338,6 +338,61 @@ fn maintenance_status_and_explain_keep_their_own_document_keys() {
 }
 
 #[test]
+fn a_declared_storage_compaction_shows_its_source_through_both_read_routes() {
+    let store = store_with(&format!(
+        "{}SET STORAGE_COMPACTION START_RATIO 0.4 MAX_SWEEPS 3;\n",
+        create_seeded_table("subject", 2)
+    ));
+    let declared = vec![
+        ("start_ratio".to_owned(), "0.4".to_owned(), "declared".to_owned()),
+        ("min_interval_ms".to_owned(), "3600000".to_owned(), "default".to_owned()),
+        ("stop_ratio".to_owned(), "0.05".to_owned(), "default".to_owned()),
+        ("max_sweeps".to_owned(), "3".to_owned(), "declared".to_owned()),
+    ];
+    let settings = |outcome: &Outcome| -> Vec<(String, String, String)> {
+        let docs = outcome.stdout_docs();
+        let maintenance = expect_document(&docs, "maintenance", "`.maintenance status`");
+        maintenance["storage_compaction"]
+            .as_array()
+            .expect("`.maintenance status` lists the storage compaction settings")
+            .iter()
+            .map(|setting| {
+                (
+                    setting["setting"].as_str().unwrap().to_owned(),
+                    setting["value"].as_str().unwrap().to_owned(),
+                    setting["source"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let route = |outcome: &Outcome| {
+        outcome
+            .route_notices()
+            .first()
+            .and_then(|notice| notice["detail"]["route"].as_str().map(str::to_owned))
+    };
+
+    let idle = run(&[store.path_str(), "--json"], ".maintenance status\n");
+    assert_eq!(idle.code, Some(0), "{}", idle.describe());
+    assert_ne!(route(&idle).as_deref(), Some("owner"), "{}", idle.describe());
+    assert_eq!(
+        settings(&idle),
+        declared,
+        "the committed file shows the declaration and its source"
+    );
+
+    let _owner = live_owner(&store.path, "");
+    let owned = run(&[store.path_str(), "--json"], ".maintenance status\n");
+    assert_eq!(owned.code, Some(0), "{}", owned.describe());
+    assert_eq!(route(&owned).as_deref(), Some("owner"), "{}", owned.describe());
+    assert_eq!(
+        settings(&owned),
+        declared,
+        "the live owner shows the same declaration and source"
+    );
+}
+
+#[test]
 fn a_complete_metadata_response_that_does_not_fit_refuses_with_the_setting_that_would() {
     let store = store_with(&create_seeded_table("subject", 2));
 
