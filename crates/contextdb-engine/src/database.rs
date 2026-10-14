@@ -9397,11 +9397,14 @@ pub(crate) struct ReceivedSchemaStage {
     /// idempotent against.
     received_schema_manifest: Option<(String, DurableReceivedSchemaManifest)>,
     in_memory_lineage_delta: InMemoryLineageDelta,
-    pub(crate) write_set: WriteSet,
+    /// Moved (never copied) into the committing transaction by the
+    /// pre-commit callback, through the registry's shared access; the lock is
+    /// inline and allocates nothing.
+    pub(crate) write_set: parking_lot::Mutex<WriteSet>,
     /// The funding of the ownership keys custody retirement moved into
     /// `write_set`; declared after it, so it is released only after the write
-    /// set is dropped.
-    retired_custody_keys: Vec<crate::custody::store::CustodyCharge>,
+    /// set is dropped. Moved out together with the write set.
+    retired_custody_keys: parking_lot::Mutex<Vec<crate::custody::store::CustodyCharge>>,
     pub(crate) durable_projection: ReceivedSchemaPersistenceProjection,
     pub(crate) structurally_dropped_tables: HashSet<String>,
     pub(crate) change_log_entries: Vec<ChangeLogEntry>,
@@ -41961,8 +41964,8 @@ impl Database {
                 apply_result,
                 received_schema_manifest,
                 in_memory_lineage_delta,
-                write_set,
-                retired_custody_keys: Vec::new(),
+                write_set: parking_lot::Mutex::new(write_set),
+                retired_custody_keys: parking_lot::Mutex::new(Vec::new()),
                 durable_projection: ReceivedSchemaPersistenceProjection {
                     schema_noop: true,
                     affected_tables: HashSet::new(),
@@ -42998,8 +43001,8 @@ impl Database {
             apply_result,
             received_schema_manifest,
             in_memory_lineage_delta,
-            write_set: finalized_write_set,
-            retired_custody_keys,
+            write_set: parking_lot::Mutex::new(finalized_write_set),
+            retired_custody_keys: parking_lot::Mutex::new(retired_custody_keys),
             durable_projection,
             structurally_dropped_tables,
             change_log_entries,
@@ -43167,10 +43170,12 @@ impl Database {
         )?;
         stage
             .write_set
+            .get_mut()
             .relational_inserts
             .extend(operational.relational_inserts.iter().cloned());
         stage
             .write_set
+            .get_mut()
             .relational_deletes
             .extend(operational.relational_deletes.iter().cloned());
         stage.change_log_entries.extend(operational_log);
@@ -43630,6 +43635,7 @@ impl Database {
                             let encoded = RedbPersistence::encode_config_value(&release)?;
                             stage
                                 .write_set
+                                .get_mut()
                                 .config_writes
                                 .push((key.clone(), encoded.clone()));
                             stage
@@ -43664,11 +43670,11 @@ impl Database {
                     let replacement = self
                         .received_schema_stages
                         .lock()
-                        .get_mut(&lsn)
+                        .get(&lsn)
                         .map(|stage| {
                             *moved_retired_custody_keys.borrow_mut() =
-                                std::mem::take(&mut stage.retired_custody_keys);
-                            std::mem::take(&mut stage.write_set)
+                                std::mem::take(&mut *stage.retired_custody_keys.lock());
+                            std::mem::take(&mut *stage.write_set.lock())
                         })
                         .ok_or_else(|| {
                             Error::Other(
