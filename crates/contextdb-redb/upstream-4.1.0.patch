@@ -209,7 +209,7 @@
 +}
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -20,12 +20,15 @@
+@@ -20,12 +20,31 @@
  use crate::sealed::Sealed;
  use crate::transactions::{
      ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, DATA_ALLOCATED_TABLE,
@@ -224,10 +224,26 @@
 +
 +#[cfg(feature = "test-seams")]
 +pub(crate) mod allocator_metadata_test_seams;
++
++/// How the next allocator-state save treats the free totals, for recovery
++/// tests. Production-dead.
++#[cfg(feature = "test-seams")]
++#[doc(hidden)]
++#[derive(Clone, Debug)]
++pub enum FreeTotalsSaveForTest {
++    /// Save without the free-totals key, as a store written before it existed.
++    Omit,
++    /// Save these bytes as the free-totals value instead of the real encoding.
++    Write(Vec<u8>),
++    /// Fail the save before the free totals are encoded.
++    FailBeforeEncode,
++    /// Fail the save after the free totals are encoded, before publication.
++    FailAfterEncode,
++}
  
  #[allow(clippy::len_without_is_empty)]
  /// Implements persistent storage for a database.
-@@ -49,6 +52,12 @@
+@@ -49,6 +68,12 @@
      /// Writes the specified array to the storage.
      fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
  
@@ -240,7 +256,7 @@
      /// Release any resources held by the backend
      ///
      /// Note: redb will not access the backend after calling this method and will call it exactly
-@@ -56,6 +65,64 @@
+@@ -56,6 +81,64 @@
      fn close(&self) -> std::result::Result<(), io::Error> {
          Ok(())
      }
@@ -305,7 +321,7 @@
  }
  
  pub trait TableHandle: Sealed {
-@@ -305,6 +372,14 @@
+@@ -305,6 +388,14 @@
          Self {
              transaction_tracker: None,
              transaction_id: None,
@@ -320,7 +336,7 @@
              write_transaction: false,
          }
      }
-@@ -419,9 +494,47 @@
+@@ -419,9 +510,47 @@
  }
  
  impl ReadOnlyDatabase {
@@ -368,7 +384,7 @@
      }
  
      fn new(
-@@ -429,6 +542,16 @@
+@@ -429,6 +558,16 @@
          page_size: usize,
          region_size: Option<u64>,
          cache_size: usize,
@@ -385,7 +401,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -441,21 +564,24 @@
+@@ -441,21 +580,24 @@
              region_size,
              cache_size,
              true,
@@ -423,7 +439,7 @@
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -502,6 +628,9 @@
+@@ -502,6 +644,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -433,7 +449,7 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +647,46 @@
+@@ -518,6 +663,46 @@
  }
  
  impl Database {
@@ -480,7 +496,7 @@
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +740,17 @@
+@@ -571,9 +756,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -499,7 +515,7 @@
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +796,7 @@
+@@ -619,6 +812,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -507,7 +523,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +807,7 @@
+@@ -629,6 +823,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -515,7 +531,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +822,7 @@
+@@ -643,6 +838,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -523,7 +539,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +832,7 @@
+@@ -652,6 +848,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -531,7 +547,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +841,7 @@
+@@ -660,6 +857,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -539,7 +555,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +858,218 @@
+@@ -676,6 +874,310 @@
          }
  
          Ok(compacted)
@@ -591,6 +607,98 @@
 +    pub fn write_wait_observer(&self) -> impl Fn() -> bool + Send + Sync + 'static + use<> {
 +        let tracker = self.transaction_tracker.clone();
 +        move || tracker.has_waiting_write_transactions()
++    }
++
++    /// The allocator's maintained `(free pages, region pages)` and the free
++    /// pages that end the last region, which a trim gives back without
++    /// relocation. Reads the maintained totals and the bounded tail run under
++    /// the allocator state lock, never a page or the full bitmap. `None` while
++    /// the totals are untrusted (repair in progress, a poisoned allocator
++    /// pager, or a failed rebuild), when no decision may use them.
++    #[doc(hidden)]
++    pub fn allocator_free_totals(&self) -> Option<(u64, u64, u64)> {
++        self.mem.allocator_free_totals()
++    }
++
++    /// Independent recount of every region's free bits, for agreement tests.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn allocator_free_totals_recount_for_test(&self) -> Result<(u64, u64, u64)> {
++        self.mem.recount_free_totals_for_test()
++    }
++
++    /// Per region: `(length, free pages, trailing free pages, highest free
++    /// order)`, from every region's bitmap. Test diagnostics only.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn region_free_pages_for_test(&self) -> Vec<(u32, u32, u32, Option<u8>)> {
++        self.mem.region_free_pages_for_test()
++    }
++
++    /// Whether a saved allocator-state table is still the lazy allocator
++    /// source, and the last page (region, page index) that table occupies.
++    /// Test diagnostics only.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn allocator_state_placement_for_test(&self) -> Result<(bool, Option<(u32, u32)>)> {
++        let saved_source = self.mem.has_saved_allocator_source();
++        let mut highest = None;
++        if let Some(tree) = Self::get_allocator_state_table(&self.mem)?
++            && let Some(root) = tree.get_root()
++        {
++            let pages = crate::tree_store::AllPageNumbersBtreeIter::new(
++                root.root,
++                <crate::transactions::AllocatorStateKey as Value>::fixed_width(),
++                <&[u8] as Value>::fixed_width(),
++                self.mem.clone(),
++                PageHint::None,
++            )?;
++            for page in pages {
++                let page = page?;
++                let last = ((page.page_index + 1) << page.page_order) - 1;
++                highest = highest.max(Some((page.region, last)));
++            }
++        }
++        Ok((saved_source, highest))
++    }
++
++    /// Drop trust in the maintained totals: the next save writes none, so the
++    /// next open rebuilds them.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn distrust_allocator_free_totals_for_test(&self) {
++        self.mem.distrust_free_totals_for_test();
++    }
++
++    /// Change how the next allocator-state save on this thread treats the
++    /// free totals; the mode is consumed by that save.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn set_free_totals_save_for_test(mode: Option<FreeTotalsSaveForTest>) {
++        TransactionalMemory::set_free_totals_save_for_test(mode);
++    }
++
++    /// Install (or clear) a callback that runs on this thread as each
++    /// free-total rebuild begins, before any bitmap word is counted.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn set_free_total_recount_start_hook_for_test(hook: Option<Box<dyn Fn()>>) {
++        TransactionalMemory::set_free_total_recount_start_hook_for_test(hook);
++    }
++
++    /// Regions visited on the calling thread to compute free-total geometry,
++    /// cumulatively. Ordinary opens, saves, trims and resizes visit none.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn free_total_geometry_region_visits_for_test() -> u64 {
++        TransactionalMemory::free_total_geometry_region_visits_for_test()
++    }
++
++    /// Completed free-total rebuilds on the calling thread, cumulatively.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn free_total_recounts_for_test() -> u64 {
++        TransactionalMemory::free_total_recounts_for_test()
 +    }
 +
 +    #[doc(hidden)]
@@ -758,7 +866,7 @@
      }
  
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,6 +1285,7 @@
+@@ -891,6 +1393,7 @@
          Ok([data_root, system_root])
      }
  
@@ -766,7 +874,7 @@
      fn new(
          file: Box<dyn StorageBackend>,
          allow_initialize: bool,
-@@ -898,6 +1293,9 @@
+@@ -898,6 +1401,9 @@
          region_size: Option<u64>,
          cache_size: usize,
          repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
@@ -776,7 +884,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -910,6 +1308,7 @@
+@@ -910,6 +1416,7 @@
              region_size,
              cache_size,
              false,
@@ -784,7 +892,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +1318,12 @@
+@@ -919,7 +1426,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -798,7 +906,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,8 +1348,21 @@
+@@ -944,8 +1456,21 @@
  
          let db = Database {
              mem,
@@ -821,7 +929,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,12 +1452,27 @@
+@@ -1035,12 +1560,27 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -849,7 +957,7 @@
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +1488,143 @@
+@@ -1056,16 +1596,143 @@
  
          Ok(())
      }
@@ -995,7 +1103,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +1665,8 @@
+@@ -1106,6 +1773,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -1004,7 +1112,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +1686,8 @@
+@@ -1125,6 +1794,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -1013,7 +1121,7 @@
          }
      }
  
-@@ -1157,13 +1720,37 @@
+@@ -1157,13 +1828,37 @@
          self
      }
  
@@ -1052,7 +1160,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +1762,7 @@
+@@ -1175,6 +1870,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -1060,7 +1168,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +1771,75 @@
+@@ -1183,26 +1879,75 @@
              .open(path)?;
  
          Database::new(
@@ -1138,7 +1246,7 @@
          )
      }
  
-@@ -1222,6 +1859,36 @@
+@@ -1222,6 +1967,36 @@
              self.page_size,
              None,
              self.cache_size,
@@ -1175,7 +1283,7 @@
          )
      }
  
-@@ -1236,6 +1903,31 @@
+@@ -1236,6 +2011,31 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1207,7 +1315,7 @@
          )
      }
  
-@@ -1251,6 +1943,9 @@
+@@ -1251,6 +2051,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1217,7 +1325,7 @@
          )
      }
  }
-@@ -1260,18 +1955,215 @@
+@@ -1260,18 +2063,215 @@
          f.debug_struct("Database").finish()
      }
  }
@@ -1616,7 +1724,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +138,30 @@
+@@ -106,3 +138,34 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -1643,6 +1751,10 @@
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
 +pub use db::allocator_metadata_test_seams::observe_allocator_region_loads_for_test;
++
++#[cfg(feature = "test-seams")]
++#[doc(hidden)]
++pub use db::FreeTotalsSaveForTest;
 +
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
@@ -3416,7 +3528,34 @@
  const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
      SystemTableDefinition::new("next_savepoint_id");
  pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
-@@ -562,7 +623,10 @@
+@@ -196,6 +257,8 @@
+     Region(u32),
+     RegionTracker,
+     TransactionId,
++    /// Allocator-wide free and region page totals of the saved snapshot.
++    FreeTotals,
+ }
+ 
+ impl Value for AllocatorStateKey {
+@@ -216,6 +279,7 @@
+             3 => Self::Region(u32::from_le_bytes(data[1..].try_into().unwrap())),
+             4 => Self::RegionTracker,
+             5 => Self::TransactionId,
++            6 => Self::FreeTotals,
+             _ => unreachable!(),
+         }
+     }
+@@ -236,6 +300,9 @@
+             }
+             Self::TransactionId => {
+                 result[0] = 5;
++            }
++            Self::FreeTotals => {
++                result[0] = 6;
+             }
+             AllocatorStateKey::Deprecated => {
+                 result[0] = 0;
+@@ -562,7 +629,10 @@
  }
  
  struct TableNamespace<'db> {
@@ -3428,7 +3567,7 @@
      allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
      table_tree: TableTreeMut<'db>,
-@@ -585,8 +649,10 @@
+@@ -585,8 +655,10 @@
              freed_pages.clone(),
              allocated.clone(),
          );
@@ -3440,7 +3579,7 @@
              table_tree,
              freed_pages,
              allocated_pages: allocated,
-@@ -620,8 +686,9 @@
+@@ -620,8 +692,9 @@
          let root = self
              .table_tree
              .get_or_create_table::<K, V>(name, table_type)?;
@@ -3451,7 +3590,7 @@
  
          Ok(root)
      }
-@@ -748,9 +815,126 @@
+@@ -748,9 +821,126 @@
          table: &BtreeMut<K, V>,
          length: u64,
      ) {
@@ -3578,7 +3717,7 @@
      }
  }
  
-@@ -814,6 +998,19 @@
+@@ -814,6 +1004,19 @@
          // shared tracker, so dropping them is sufficient.
          self.invalidated.clear();
      }
@@ -3598,7 +3737,7 @@
  }
  
  /// A read/write transaction
-@@ -832,9 +1029,77 @@
+@@ -832,9 +1035,77 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
@@ -3676,7 +3815,7 @@
  }
  
  impl WriteTransaction {
-@@ -850,8 +1115,16 @@
+@@ -850,8 +1121,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -3693,7 +3832,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +1137,111 @@
+@@ -864,9 +1143,111 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -3805,7 +3944,7 @@
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1267,29 @@
+@@ -892,6 +1273,29 @@
              return Ok(true);
          }
  
@@ -3835,7 +3974,7 @@
          Ok(false)
      }
  
-@@ -1349,7 +1747,225 @@
+@@ -1349,7 +1753,225 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -4061,7 +4200,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +1989,13 @@
+@@ -1373,6 +1995,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -4075,7 +4214,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +2007,21 @@
+@@ -1384,10 +2013,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -4098,7 +4237,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +2046,29 @@
+@@ -1412,7 +2052,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -4129,7 +4268,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +2114,39 @@
+@@ -1458,9 +2120,39 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -4169,7 +4308,7 @@
      }
  
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +2155,45 @@
+@@ -1469,11 +2161,45 @@
              self.two_phase_commit = true;
          }
  
@@ -4217,7 +4356,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +2204,102 @@
+@@ -1484,6 +2210,102 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -4320,7 +4459,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,18 +2443,39 @@
+@@ -1627,18 +2449,39 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -4364,7 +4503,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2517,17 @@
+@@ -1680,7 +2523,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -4383,7 +4522,7 @@
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2535,11 @@
+@@ -1688,6 +2541,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -4395,7 +4534,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2550,146 @@
+@@ -1698,6 +2556,146 @@
              self.mem.free(page, &mut PageTrackerPolicy::Ignore);
          }
  
@@ -4542,7 +4681,7 @@
          Ok(())
      }
  
-@@ -1766,6 +2758,9 @@
+@@ -1766,6 +2764,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -4552,7 +4691,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2818,384 @@
+@@ -1823,46 +2824,384 @@
          Ok(progress)
      }
  
@@ -4967,7 +5106,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +3370,18 @@
+@@ -2037,6 +3376,18 @@
          })
      }
  
@@ -4986,7 +5125,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +3452,148 @@
+@@ -2107,18 +3458,148 @@
      tree: TableTree,
  }
  
@@ -5136,7 +5275,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3610,69 @@
+@@ -2135,12 +3616,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -5207,7 +5346,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +3693,7 @@
+@@ -2161,7 +3699,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -5216,7 +5355,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +3721,7 @@
+@@ -2189,7 +3727,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -5225,7 +5364,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +3749,7 @@
+@@ -2217,7 +3755,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -5234,7 +5373,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +3795,15 @@
+@@ -2263,7 +3801,15 @@
  
  #[cfg(test)]
  mod test {
@@ -5251,7 +5390,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3824,919 @@
+@@ -2284,4 +3830,919 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -14588,7 +14727,7 @@
      FILE_FORMAT_VERSION3, ShrinkPolicy, TransactionalMemory, xxh3_checksum,
 --- a/src/tree_store/page_store/page_manager.rs
 +++ b/src/tree_store/page_store/page_manager.rs
-@@ -1,13 +1,17 @@
+@@ -1,13 +1,19 @@
 +use crate::ScratchBackend;
  use crate::transaction_tracker::TransactionId;
 +#[cfg(feature = "contextdb-internal")]
@@ -14603,11 +14742,13 @@
  use crate::tree_store::page_store::header::{DB_HEADER_SIZE, DatabaseHeader, MAGICNUMBER};
  use crate::tree_store::page_store::layout::DatabaseLayout;
 -use crate::tree_store::page_store::region::{Allocators, RegionTracker};
-+use crate::tree_store::page_store::region::{Allocators, RegionTracker, SavedBitmapWindow};
++use crate::tree_store::page_store::region::{
++    Allocators, FREE_TOTALS_ENCODED_LEN, FreeTotals, RegionTracker, SavedBitmapWindow, layout_pages,
++};
  use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
  use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
  use crate::{CacheStats, StorageBackend};
-@@ -18,11 +22,119 @@
+@@ -18,11 +24,119 @@
  #[cfg(debug_assertions)]
  use std::collections::HashSet;
  use std::convert::TryInto;
@@ -14727,7 +14868,33 @@
  use std::sync::atomic::{AtomicBool, Ordering};
  use std::thread;
  
-@@ -82,21 +194,51 @@
+@@ -75,6 +189,25 @@
+     hash128_with_seed(data, 0)
+ }
+ 
++#[cfg(feature = "test-seams")]
++thread_local! {
++    /// Completed free-total recounts on this thread. Production-dead.
++    static FREE_TOTAL_RECOUNTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++    /// Runs as a recount on this thread begins, so a test can arm a storage
++    /// fault that fires inside the count. Production-dead.
++    static FREE_TOTAL_RECOUNT_START: std::cell::RefCell<Option<Box<dyn Fn()>>> =
++        const { std::cell::RefCell::new(None) };
++    /// How the next allocator-state save on this thread treats the free
++    /// totals. Production-dead.
++    static FREE_TOTALS_SAVE_OVERRIDE: std::cell::RefCell<Option<crate::db::FreeTotalsSaveForTest>> =
++        const { std::cell::RefCell::new(None) };
++}
++
++#[cfg(feature = "test-seams")]
++fn free_totals_save_override() -> Option<crate::db::FreeTotalsSaveForTest> {
++    FREE_TOTALS_SAVE_OVERRIDE.with(|slot| slot.borrow().clone())
++}
++
+ struct InMemoryState {
+     header: DatabaseHeader,
+     // TODO: we should make this an Option because it is only valid after the Database initializes it
+@@ -82,21 +215,51 @@
  }
  
  impl InMemoryState {
@@ -14787,7 +14954,7 @@
      }
  }
  
-@@ -108,6 +250,8 @@
+@@ -108,6 +271,8 @@
      // True if the allocator state was corrupted when the file was opened
      // TODO: maybe we can remove this flag now that CheckedBackend exists?
      needs_recovery: AtomicBool,
@@ -14796,7 +14963,7 @@
      storage: PagedCachedFile,
      state: Mutex<InMemoryState>,
      // The number of PageMut which are outstanding
-@@ -129,6 +273,38 @@
+@@ -129,6 +294,38 @@
  }
  
  impl TransactionalMemory {
@@ -14835,7 +15002,7 @@
      pub(crate) fn new(
          file: Box<dyn StorageBackend>,
          // Allow initializing a new database in an empty file
-@@ -137,9 +313,10 @@
+@@ -137,9 +334,10 @@
          requested_region_size: Option<u64>,
          cache_size: usize,
          read_only: bool,
@@ -14847,7 +15014,7 @@
          let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
          let region_size = min(
              region_size,
-@@ -147,7 +324,19 @@
+@@ -147,7 +345,19 @@
          );
          assert!(region_size.is_power_of_two());
  
@@ -14868,7 +15035,7 @@
  
          let initial_storage_len = storage.raw_file_len()?;
  
-@@ -226,12 +415,17 @@
+@@ -226,12 +436,17 @@
          }
          let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
          let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
@@ -14889,7 +15056,7 @@
              if read_only {
                  return Err(DatabaseError::RepairAborted);
              }
-@@ -252,12 +446,17 @@
+@@ -252,12 +467,17 @@
                  .copy_from_slice(&header.to_bytes(true));
              storage.flush()?;
          }
@@ -14910,7 +15077,7 @@
  
          assert!(page_size >= DB_HEADER_SIZE);
  
-@@ -265,6 +464,8 @@
+@@ -265,6 +485,8 @@
              allocated_since_commit: Mutex::new(Default::default()),
              unpersisted: Mutex::new(Default::default()),
              needs_recovery: AtomicBool::new(needs_recovery),
@@ -14919,7 +15086,7 @@
              storage,
              state: Mutex::new(state),
              #[cfg(debug_assertions)]
-@@ -280,12 +481,81 @@
+@@ -280,12 +502,81 @@
          })
      }
  
@@ -15001,7 +15168,7 @@
      }
  
      #[cfg(debug_assertions)]
-@@ -295,23 +565,30 @@
+@@ -295,23 +586,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -15038,7 +15205,7 @@
          }
      }
  
-@@ -346,7 +623,9 @@
+@@ -346,7 +644,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -15049,7 +15216,7 @@
  
          Ok(was_clean)
      }
-@@ -379,7 +658,8 @@
+@@ -379,7 +679,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -15059,7 +15226,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,7 +672,9 @@
+@@ -392,7 +693,9 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -15070,15 +15237,20 @@
      }
  
      fn write_header(&self, header: &DatabaseHeader) -> Result {
-@@ -405,6 +687,7 @@
+@@ -405,7 +708,12 @@
      }
  
      pub(crate) fn end_repair(&self) -> Result<()> {
 +        self.check_io_errors()?;
          let mut state = self.state.lock().unwrap();
++        // Repair re-marked every reachable page without moving the totals.
++        // Rebuild them before recovery state clears; a failed recount fails
++        // the repair like any other repair I/O failure.
++        Self::recount_free_totals(&mut state)?;
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
-@@ -419,30 +702,25 @@
+         let result = self.storage.flush();
+@@ -419,30 +727,37 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -15119,10 +15291,22 @@
 +        }
 +
 +        drop(tree.insert_zeroed_reserve(&AllocatorStateKey::RegionTracker, region_tracker_len)?);
++        // Reserved before anything is encoded, so the encode allocates nothing.
++        #[cfg(feature = "test-seams")]
++        let reserved_totals_len = match free_totals_save_override() {
++            Some(crate::db::FreeTotalsSaveForTest::Omit) => None,
++            Some(crate::db::FreeTotalsSaveForTest::Write(bytes)) => Some(bytes.len()),
++            _ => Some(FREE_TOTALS_ENCODED_LEN),
++        };
++        #[cfg(not(feature = "test-seams"))]
++        let reserved_totals_len = Some(FREE_TOTALS_ENCODED_LEN);
++        if let Some(len) = reserved_totals_len {
++            drop(tree.insert_zeroed_reserve(&AllocatorStateKey::FreeTotals, len)?);
++        }
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +736,45 @@
+@@ -458,43 +773,83 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -15183,7 +15367,45 @@
 +            .allocators
 +            .region_tracker
 +            .encode_into(destination.value_mut());
++        // The totals describe the same snapshot as the bitmaps above: nothing
++        // allocates or frees between those encodes and this commit. Untrusted
++        // totals are not written; the reserved value stays all-zero (format
++        // 0), which every load rejects, so the next open recounts. That is
++        // terminal for this save, not a reason to retry it.
++        let encoded_totals = state.allocators.encode_free_totals(&state.header.layout());
++        drop(state);
++        drop(destination);
++        #[cfg(feature = "test-seams")]
++        let encoded_totals: Option<Vec<u8>> = match FREE_TOTALS_SAVE_OVERRIDE
++            .with(|slot| slot.borrow_mut().take())
++        {
++            Some(crate::db::FreeTotalsSaveForTest::FailBeforeEncode) => {
++                return Err(StorageError::Io(io::Error::other(
++                    "injected failure before the free totals were encoded",
++                )));
++            }
++            Some(crate::db::FreeTotalsSaveForTest::FailAfterEncode) => {
++                if let Some(encoded) = encoded_totals {
++                    let mut destination = tree.get_mut(&AllocatorStateKey::FreeTotals)?.unwrap();
++                    destination.value_mut()[..FREE_TOTALS_ENCODED_LEN].copy_from_slice(&encoded);
++                }
++                return Err(StorageError::Io(io::Error::other(
++                    "injected failure after the free totals were encoded",
++                )));
++            }
++            Some(crate::db::FreeTotalsSaveForTest::Omit) => None,
++            Some(crate::db::FreeTotalsSaveForTest::Write(bytes)) => Some(bytes),
++            None => encoded_totals.map(|encoded| encoded.to_vec()),
++        };
++        if let Some(encoded) = encoded_totals {
++            // Reserved and already written in this transaction, so this
++            // borrow allocates nothing.
++            let mut destination = tree.get_mut(&AllocatorStateKey::FreeTotals)?.unwrap();
++            let len = encoded.len();
++            destination.value_mut()[..len].copy_from_slice(&encoded);
++        }
 +
++        let state = self.state.lock().unwrap();
 +        if let Some(error) = state
 +            .allocators
 +            .pager()
@@ -15194,7 +15416,163 @@
          Ok(true)
      }
  
-@@ -519,12 +799,58 @@
+@@ -516,15 +871,216 @@
+         Ok(transaction_id == self.get_last_committed_transaction_id()?)
+     }
+ 
++    fn saved_free_totals(tree: &AllocatorStateTree) -> Result<Option<Vec<u8>>> {
++        Ok(tree
++            .get(&AllocatorStateKey::FreeTotals)?
++            .map(|value| value.value().to_vec()))
++    }
++
++    /// Adopt the saved totals for the committed geometry, or rebuild them
++    /// from the loaded bitmaps when the value is absent, unwritten or does not
++    /// fit that geometry.
++    fn adopt_or_recount_free_totals(state: &mut InMemoryState, saved: Option<&[u8]>) -> Result {
++        let layout = state.header.layout();
++        match saved.and_then(|bytes| FreeTotals::decode_for_layout(bytes, &layout)) {
++            Some(totals) => {
++                state.allocators.set_free_totals(totals);
++                Ok(())
++            }
++            None => Self::recount_free_totals(state),
++        }
++    }
++
++    /// Rebuild the totals from every region's bitmap. The totals become
++    /// trusted only if the complete count finished with a healthy pager; a
++    /// failed count publishes nothing and returns the storage error, and the
++    /// totals stay untrusted for the rest of this open.
++    fn recount_free_totals(state: &mut InMemoryState) -> Result {
++        state.allocators.mark_free_totals_untrusted();
++        #[cfg(feature = "test-seams")]
++        FREE_TOTAL_RECOUNT_START.with(|hook| {
++            if let Some(hook) = hook.borrow().as_ref() {
++                hook();
++            }
++        });
++        let layout = state.header.layout();
++        let mut free_pages = 0u64;
++        for region in 0..layout.num_regions() {
++            free_pages += u64::from(state.get_region(region).count_free_pages());
++        }
++        if let Some(error) = state
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
++        let region_pages = layout_pages(&layout);
++        if free_pages > region_pages {
++            return Err(StorageError::Corrupted(
++                "allocator free pages exceed the region pages".to_owned(),
++            ));
++        }
++        #[cfg(feature = "test-seams")]
++        FREE_TOTAL_RECOUNTS.with(|count| count.set(count.get() + 1));
++        state
++            .allocators
++            .set_recounted_free_totals(free_pages, region_pages);
++        Ok(())
++    }
++
++    /// Completed free-total recounts on the calling thread, cumulatively.
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn free_total_recounts_for_test() -> u64 {
++        FREE_TOTAL_RECOUNTS.with(std::cell::Cell::get)
++    }
++
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn free_total_geometry_region_visits_for_test() -> u64 {
++        crate::tree_store::page_store::region::geometry_region_visits_for_test()
++    }
++
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn set_free_totals_save_for_test(mode: Option<crate::db::FreeTotalsSaveForTest>) {
++        FREE_TOTALS_SAVE_OVERRIDE.with(|slot| *slot.borrow_mut() = mode);
++    }
++
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn set_free_total_recount_start_hook_for_test(hook: Option<Box<dyn Fn()>>) {
++        FREE_TOTAL_RECOUNT_START.with(|slot| *slot.borrow_mut() = hook);
++    }
++
++    /// Drop trust in the maintained totals, as a poisoned allocator would.
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn distrust_free_totals_for_test(&self) {
++        self.state
++            .lock()
++            .unwrap()
++            .allocators
++            .mark_free_totals_untrusted();
++    }
++
++    /// Trusted `(free pages, region pages, trailing free pages)`; `None` while
++    /// untrusted. The trailing free pages end the last region: a trim gives
++    /// them back without relocating anything. Counting them walks the free
++    /// buddy blocks that end at the tail, which coalescing bounds by the order
++    /// count; `try_shrink` does the same on every shrinking commit.
++    pub(crate) fn allocator_free_totals(&self) -> Option<(u64, u64, u64)> {
++        let mut state = self.state.lock().unwrap();
++        let (free, pages) = state.allocators.free_totals()?;
++        let trailing = Self::trailing_free_pages(&mut state)?;
++        Some((free, pages, trailing))
++    }
++
++    fn trailing_free_pages(state: &mut InMemoryState) -> Option<u64> {
++        let last = state.header.layout().num_regions().checked_sub(1)?;
++        let trailing = u64::from(state.get_region(last).trailing_free_pages());
++        // A pager fault while reading the tail leaves no trusted answer.
++        state.allocators.free_totals()?;
++        Some(trailing)
++    }
++
++    /// Independent order-weighted recount of every region's free bits, for
++    /// agreement tests. Leaves the maintained totals untouched.
++    /// Per region: `(length, free pages, trailing free pages, highest free
++    /// order)`. Reads every region's bitmap. Test diagnostics only.
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn region_free_pages_for_test(&self) -> Vec<(u32, u32, u32, Option<u8>)> {
++        let mut state = self.state.lock().unwrap();
++        let regions = state.header.layout().num_regions();
++        (0..regions)
++            .map(|region| {
++                let allocator = state.get_region(region);
++                (
++                    allocator.len(),
++                    allocator.count_free_pages(),
++                    allocator.trailing_free_pages(),
++                    allocator.highest_free_order(),
++                )
++            })
++            .collect()
++    }
++
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn recount_free_totals_for_test(&self) -> Result<(u64, u64, u64)> {
++        let mut state = self.state.lock().unwrap();
++        let layout = state.header.layout();
++        let mut free_pages = 0u64;
++        for region in 0..layout.num_regions() {
++            free_pages += u64::from(state.get_region(region).count_free_pages());
++        }
++        let trailing = u64::from(
++            state
++                .get_region(layout.num_regions() - 1)
++                .trailing_free_pages(),
++        );
++        if let Some(error) = state
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
++        Ok((free_pages, layout_pages(&layout), trailing))
++    }
++
      pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
          assert!(self.is_valid_allocator_state(tree)?);
  
@@ -15235,8 +15613,10 @@
 +            // Saved tracker words remain in the durable source and share
 +            // AllocatorPager's fixed windows with regional bitmap words.
 +            // Geometry masks slots past the real regions without loading them.
++            let saved_totals = Self::saved_free_totals(tree)?;
 +            let mut state = self.state.lock().unwrap();
 +            state.allocators.set_saved_source(source)?;
++            Self::adopt_or_recount_free_totals(&mut state, saved_totals.as_deref())?;
 +            state.header.recovery_required = false;
 +            self.needs_recovery.store(false, Ordering::Release);
 +            return Ok(());
@@ -15255,23 +15635,29 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -536,12 +862,13 @@
+@@ -533,15 +1089,19 @@
+                 .value(),
+         );
+ 
++        let saved_totals = Self::saved_free_totals(tree)?;
          let mut state = self.state.lock().unwrap();
          state.allocators = Allocators {
              region_tracker,
 -            region_allocators,
 +            regions,
 +            paged: None,
++            free_totals: FreeTotals::untrusted(),
          };
  
          // Resize the allocators to match the current file size
          let layout = state.header.layout();
 -        state.allocators.resize_to(layout);
 +        state.allocators.resize_to(layout)?;
++        Self::adopt_or_recount_free_totals(&mut state, saved_totals.as_deref())?;
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +881,15 @@
+@@ -554,8 +1114,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -15289,7 +15675,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -586,6 +920,32 @@
+@@ -586,6 +1153,32 @@
          result
      }
  
@@ -15322,7 +15708,7 @@
      #[allow(clippy::too_many_arguments)]
      fn commit_inner(
          &self,
-@@ -612,6 +972,7 @@
+@@ -612,6 +1205,7 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -15330,7 +15716,7 @@
  
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
-@@ -658,6 +1019,96 @@
+@@ -658,6 +1252,96 @@
          );
          state.header = header;
          self.read_from_secondary.store(false, Ordering::Release);
@@ -15427,7 +15813,7 @@
          // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
          // TODO: maybe we can remove the whole read_from_secondary flag?
          drop(state);
-@@ -678,6 +1129,7 @@
+@@ -678,6 +1362,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -15435,9 +15821,11 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -726,7 +1178,9 @@
+@@ -725,8 +1410,11 @@
+             state
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
++            state.allocators.note_freed(page_number.page_order);
              #[cfg(debug_assertions)]
 -            assert!(self.allocated_pages.lock().unwrap().remove(page_number));
 +            if cfg!(test) || state.allocators.pager().is_none() {
@@ -15446,7 +15834,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -776,6 +1230,23 @@
+@@ -776,6 +1464,23 @@
          })
      }
  
@@ -15470,7 +15858,7 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -871,7 +1342,9 @@
+@@ -871,7 +1576,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -15481,7 +15869,15 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -953,12 +1426,32 @@
+@@ -881,6 +1588,7 @@
+         state
+             .get_region_mut(region_index)
+             .free(page.page_index, page.page_order);
++        state.allocators.note_freed(page.page_order);
+         // Ensure that the region is marked as having free space
+         state
+             .get_region_tracker_mut()
+@@ -953,12 +1661,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -15516,7 +15912,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,7 +1517,27 @@
+@@ -1024,7 +1752,28 @@
              } else {
                  region.alloc(required_order)
              };
@@ -15529,6 +15925,7 @@
 +                return Err(error);
 +            }
              if let Some(page) = r {
++                state.allocators.note_allocated(required_order);
 +                // Keep the tracker exact for the region just used: a region
 +                // this allocation filled is recorded full now, not left for a
 +                // later allocation (or the next open, from the saved tracker)
@@ -15544,7 +15941,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +1574,7 @@
+@@ -1061,7 +1810,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -15553,7 +15950,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1107,13 +1620,20 @@
+@@ -1107,13 +1856,20 @@
  
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -15575,7 +15972,21 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1135,7 +1655,7 @@
+@@ -1123,7 +1879,12 @@
+         allocation_size: usize,
+         allocated: &mut PageTrackerPolicy,
+     ) -> Result<PageMut<'txn>> {
+-        let result = self.allocate_helper(allocation_size, false, true);
++        // Lowest-first placement: the first free block of an order can sit
++        // at the very end of the file (growth from an odd length leaves small
++        // buddy blocks at both ends), and one page there stops every trim and
++        // makes the free space before it look reclaimable. Taking the lowest
++        // free pages keeps the end of the file free for the trim.
++        let result = self.allocate_helper(allocation_size, true, true);
+         if let Ok(ref page) = result {
+             allocated.insert(page.get_page_number());
+         }
+@@ -1135,7 +1896,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -15584,7 +15995,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +1665,7 @@
+@@ -1145,7 +1906,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -15593,7 +16004,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +1678,41 @@
+@@ -1158,8 +1919,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -15636,7 +16047,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +1781,433 @@
+@@ -1228,4 +2022,433 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }
@@ -16213,15 +16624,125 @@
              self.order_trackers[i].set(region);
          }
      }
-@@ -101,12 +171,51 @@
+@@ -101,12 +171,161 @@
  
  pub(super) struct Allocators {
      pub(super) region_tracker: RegionTracker,
 -    pub(super) region_allocators: Vec<BuddyAllocator>,
 +    pub(super) regions: Vec<BuddyAllocator>,
 +    pub(super) paged: Option<PagedRegions>,
- }
- 
++    pub(super) free_totals: FreeTotals,
++}
++
++/// Allocator-wide free and region page totals, maintained by net deltas at
++/// each successful allocation, free and resize so a compaction decision reads
++/// them without visiting a bitmap word or a page. Fixed size: the resident
++/// envelope stays independent of the region count.
++///
++/// Untrusted totals (repair in progress, a poisoned pager, or no valid saved
++/// value at load) are never published, saved or consumed. Only a complete
++/// recount whose pager stayed healthy makes them trusted again.
++#[derive(Clone, Copy, Debug)]
++pub(super) struct FreeTotals {
++    free_pages: u64,
++    region_pages: u64,
++    trusted: bool,
++}
++
++/// Encoded size of the saved [`FreeTotals`]:
++/// `[u32 format][u32 regions][u64 region pages][u64 free pages]`. An all-zero
++/// value (format 0) is the reserved-but-unwritten state and never valid.
++pub(crate) const FREE_TOTALS_ENCODED_LEN: usize = 24;
++const FREE_TOTALS_FORMAT: u32 = 1;
++
++#[cfg(feature = "test-seams")]
++thread_local! {
++    /// Regions visited to compute free-total geometry on this thread.
++    /// Production-dead.
++    static GEOMETRY_REGION_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++#[cfg(feature = "test-seams")]
++pub(crate) fn geometry_region_visits_for_test() -> u64 {
++    GEOMETRY_REGION_VISITS.with(std::cell::Cell::get)
++}
++
++/// Total region pages of a layout by arithmetic: every region but the
++/// trailing one is full. Visits no region, so its cost is the same at any
++/// region count.
++pub(super) fn layout_pages(layout: &DatabaseLayout) -> u64 {
++    u64::from(layout.num_full_regions()) * u64::from(layout.full_region_layout().num_pages())
++        + layout
++            .trailing_region_layout()
++            .map_or(0, |trailing| u64::from(trailing.num_pages()))
++}
++
++impl FreeTotals {
++    fn all_free(layout: &DatabaseLayout) -> Self {
++        let pages = layout_pages(layout);
++        Self {
++            free_pages: pages,
++            region_pages: pages,
++            trusted: true,
++        }
++    }
++
++    pub(super) fn untrusted() -> Self {
++        Self {
++            free_pages: 0,
++            region_pages: 0,
++            trusted: false,
++        }
++    }
++
++    /// Encode the totals as saved with the allocator state that describes the
++    /// same snapshot, or `None` when they must not be saved.
++    pub(super) fn encode(&self, layout: &DatabaseLayout) -> Option<[u8; FREE_TOTALS_ENCODED_LEN]> {
++        if !self.trusted || self.region_pages != layout_pages(layout) {
++            return None;
++        }
++        let mut out = [0u8; FREE_TOTALS_ENCODED_LEN];
++        out[0..4].copy_from_slice(&FREE_TOTALS_FORMAT.to_le_bytes());
++        out[4..8].copy_from_slice(&layout.num_regions().to_le_bytes());
++        out[8..16].copy_from_slice(&self.region_pages.to_le_bytes());
++        out[16..24].copy_from_slice(&self.free_pages.to_le_bytes());
++        Some(out)
++    }
++
++    /// Adopt saved totals for the committed geometry. The value is written
++    /// before the commit's trim, and a trim removes only trailing free pages of
++    /// the last region (possibly the whole region), so the committed totals are
++    /// `free - (saved pages - committed pages)` over the committed pages. Any
++    /// other relation between the saved and the committed geometry rejects it.
++    pub(super) fn decode_for_layout(bytes: &[u8], layout: &DatabaseLayout) -> Option<Self> {
++        if bytes.len() != FREE_TOTALS_ENCODED_LEN {
++            return None;
++        }
++        let format = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
++        let regions = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
++        let saved_pages = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
++        let saved_free = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
++        let committed_regions = layout.num_regions();
++        let committed_pages = layout_pages(layout);
++        if format != FREE_TOTALS_FORMAT
++            || saved_free > saved_pages
++            || !(regions == committed_regions || regions == committed_regions + 1)
++            || committed_pages > saved_pages
++        {
++            return None;
++        }
++        let trimmed = saved_pages - committed_pages;
++        if trimmed > saved_free {
++            return None;
++        }
++        Some(Self {
++            free_pages: saved_free - trimmed,
++            region_pages: committed_pages,
++            trusted: true,
++        })
++    }
++}
++
 +pub(super) struct PagedRegions {
 +    pager: Arc<AllocatorPager>,
 +    layout: Arc<Mutex<DatabaseLayout>>,
@@ -16230,8 +16751,8 @@
 +    // The saved table measured too large to retire at (saved regions, layout
 +    // regions, layout bytes, window bytes). Unchanged inputs keep the verdict.
 +    oversized_source: Option<(u32, u32, u64, usize)>,
-+}
-+
+ }
+ 
  impl Allocators {
 +    /// A paged allocator's operation peak is `W * P + H + C`: W windows the
 +    /// writer's cache share admits (at least 32), P=4096 bytes each plus their
@@ -16267,7 +16788,7 @@
          let initial_regions = max(INITIAL_REGIONS, layout.num_regions());
          let mut region_tracker = RegionTracker::new(initial_regions, MAX_MAX_PAGE_ORDER + 1);
          for i in 0..layout.num_regions() {
-@@ -117,30 +226,421 @@
+@@ -117,30 +336,532 @@
              );
              let max_order = allocator.get_max_order();
              region_tracker.mark_free(max_order, i);
@@ -16284,6 +16805,7 @@
 -    pub(crate) fn xxh3_hash(&self) -> u128 {
 +            regions,
 +            paged: None,
++            free_totals: FreeTotals::all_free(&layout),
 +        }
 +    }
 +
@@ -16312,6 +16834,7 @@
 +                active: None,
 +                oversized_source: None,
 +            }),
++            free_totals: FreeTotals::all_free(&layout),
 +        })
 +    }
 +
@@ -16325,7 +16848,74 @@
 +        Ok(AllocatorPager::cache_bytes_taken(cache_bytes))
 +    }
 +
++    /// Trusted `(free pages, region pages)`, or `None` while the totals are
++    /// untrusted. Reads no bitmap word.
++    pub(super) fn free_totals(&self) -> Option<(u64, u64)> {
++        (self.free_totals.trusted && !self.pager_poisoned())
++            .then_some((self.free_totals.free_pages, self.free_totals.region_pages))
++    }
++
++    /// Encode the totals for the allocator-state save, or `None` when they
++    /// must not be saved.
++    pub(super) fn encode_free_totals(
++        &self,
++        layout: &DatabaseLayout,
++    ) -> Option<[u8; FREE_TOTALS_ENCODED_LEN]> {
++        if self.pager_poisoned() {
++            return None;
++        }
++        self.free_totals.encode(layout)
++    }
++
++    pub(super) fn set_free_totals(&mut self, totals: FreeTotals) {
++        self.free_totals = totals;
++    }
++
++    /// Publish a completed recount as the trusted totals.
++    pub(super) fn set_recounted_free_totals(&mut self, free_pages: u64, region_pages: u64) {
++        self.free_totals = FreeTotals {
++            free_pages,
++            region_pages,
++            trusted: true,
++        };
++    }
++
++    pub(super) fn mark_free_totals_untrusted(&mut self) {
++        self.free_totals.trusted = false;
++    }
++
++    fn pager_poisoned(&self) -> bool {
++        self.paged
++            .as_ref()
++            .is_some_and(|paged| paged.pager.is_poisoned())
++    }
++
++    /// Net effect of a successful extent allocation of `order`. Call only after
++    /// the allocation returned a page and the pager reported no failure.
++    pub(super) fn note_allocated(&mut self, order: u8) {
++        let pages = 1u64 << order;
++        match self.free_totals.free_pages.checked_sub(pages) {
++            Some(free) if !self.pager_poisoned() => self.free_totals.free_pages = free,
++            _ => self.free_totals.trusted = false,
++        }
++    }
++
++    /// Net effect of freeing an extent of `order`. The buddy free returns
++    /// nothing, so a pager poisoned by that call leaves the totals untrusted.
++    pub(super) fn note_freed(&mut self, order: u8) {
++        let pages = 1u64 << order;
++        match self.free_totals.free_pages.checked_add(pages) {
++            Some(free) if !self.pager_poisoned() && free <= self.free_totals.region_pages => {
++                self.free_totals.free_pages = free;
++            }
++            _ => self.free_totals.trusted = false,
++        }
++    }
++
 +    pub(super) fn set_saved_source(&mut self, source: Arc<SavedBitmapWindow>) -> io::Result<()> {
++        // The saved bitmaps replace the in-memory ones; the loader adopts the
++        // saved totals or recounts.
++        self.free_totals.trusted = false;
 +        if let Some(paged) = &mut self.paged {
 +            paged.active = None;
 +            paged.oversized_source = None;
@@ -16349,6 +16939,13 @@
 +    }
 +
 +    pub(super) fn reset_for_repair(&mut self, layout: DatabaseLayout) -> io::Result<()> {
++        let result = self.reset_for_repair_inner(layout);
++        // Repair re-marks every reachable page; `end_repair` recounts.
++        self.free_totals.trusted = false;
++        result
++    }
++
++    fn reset_for_repair_inner(&mut self, layout: DatabaseLayout) -> io::Result<()> {
 +        if let Some(paged) = &mut self.paged {
 +            *paged.layout.lock().unwrap() = layout;
 +            paged.active = None;
@@ -16598,7 +17195,42 @@
  
 -    pub(super) fn resize_to(&mut self, new_layout: DatabaseLayout) {
 -        let shrink = match (new_layout.num_regions() as usize).cmp(&self.region_allocators.len()) {
++    /// Resize every region to `new_layout`. Growth adds free pages and a trim
++    /// removes only trailing free pages, so both totals move by the change in
++    /// region pages.
 +    pub(super) fn resize_to(&mut self, new_layout: DatabaseLayout) -> io::Result<()> {
++        let old_pages = match &self.paged {
++            Some(paged) => layout_pages(&paged.layout.lock().unwrap()),
++            // Every region but the last is full, so the old page count is
++            // arithmetic over the region count and the last region's length.
++            None => self.regions.last().map_or(0, |last| {
++                (self.regions.len() as u64 - 1)
++                    * u64::from(new_layout.full_region_layout().num_pages())
++                    + u64::from(last.len())
++            }),
++        };
++        let result = self.resize_to_inner(new_layout);
++        let new_pages = layout_pages(&new_layout);
++        let totals = &mut self.free_totals;
++        let adjusted = if new_pages >= old_pages {
++            totals.free_pages.checked_add(new_pages - old_pages)
++        } else {
++            totals.free_pages.checked_sub(old_pages - new_pages)
++        };
++        match adjusted {
++            Some(free) if result.is_ok() && free <= new_pages => {
++                totals.free_pages = free;
++                totals.region_pages = new_pages;
++            }
++            _ => totals.trusted = false,
++        }
++        if self.pager_poisoned() {
++            self.free_totals.trusted = false;
++        }
++        result
++    }
++
++    fn resize_to_inner(&mut self, new_layout: DatabaseLayout) -> io::Result<()> {
 +        if self.paged.is_some() {
 +            let old_layout = *self.paged.as_ref().unwrap().layout.lock().unwrap();
 +            match new_layout.num_regions().cmp(&old_layout.num_regions()) {
@@ -16700,7 +17332,7 @@
                  let last_region = new_layout
                      .trailing_region_layout()
                      .unwrap_or_else(|| new_layout.full_region_layout());
-@@ -148,7 +648,7 @@
+@@ -148,7 +869,7 @@
                      cmp::Ordering::Less => true,
                      cmp::Ordering::Equal => {
                          // No-op
@@ -16709,7 +17341,7 @@
                      }
                      cmp::Ordering::Greater => false,
                  }
-@@ -158,26 +658,25 @@
+@@ -158,26 +879,25 @@
  
          if shrink {
              // Drop all regions that were removed
@@ -16741,7 +17373,7 @@
                      assert!(new_region.num_pages() >= allocator.len());
                      if new_region.num_pages() != allocator.len() {
                          allocator.resize(new_region.num_pages());
-@@ -195,9 +694,10 @@
+@@ -195,9 +915,10 @@
                          self.region_tracker.resize(i + 1);
                      }
                      self.region_tracker.mark_free(highest_free, i);
@@ -16750,9 +17382,11 @@
                  }
              }
          }
+-    }
+-}
 +        Ok(())
-     }
- }
++    }
++}
 --- a/src/tree_store/table_tree.rs
 +++ b/src/tree_store/table_tree.rs
 @@ -34,6 +34,18 @@
