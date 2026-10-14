@@ -3275,6 +3275,21 @@ impl ProofAdmission {
     /// Admit `bytes` before they are allocated. A refusal is the existing typed
     /// budget error and leaves this transaction to abort with nothing written.
     pub(super) fn admit(&mut self, bytes: usize) -> Result<()> {
+        self.admit_for(
+            bytes,
+            "maintain_committed_proof",
+            "Raise MEMORY_LIMIT to admit the proof this transaction maintains.",
+        )
+    }
+
+    /// [`Self::admit`] for writer work this admission funds under its own
+    /// operation name, so a refusal names what asked for the bytes.
+    pub(super) fn admit_for(
+        &mut self,
+        bytes: usize,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
         if let Some(reader) = &self.reader_budget {
             if let Err(error) = reader.try_reserve(
                 bytes,
@@ -3293,12 +3308,7 @@ impl ProofAdmission {
                 accountant.charge_retained(bytes);
             } else {
                 loop {
-                    match accountant.try_allocate_for(
-                        bytes,
-                        "content_identity",
-                        "maintain_committed_proof",
-                        "Raise MEMORY_LIMIT to admit the proof this transaction maintains.",
-                    ) {
+                    match accountant.try_allocate_for(bytes, "content_identity", operation, hint) {
                         Ok(()) => break,
                         Err(refusal) => {
                             // Evict before refusing. The work asking for these
@@ -7042,8 +7052,8 @@ impl RedbPersistence {
         groups: Option<&super::custody_groups::GroupPlan>,
     ) -> Result<DirectTypedImageDigest> {
         Self::reconcile_ddl_selectors_in_write(write_txn, mutations, admission)?;
-        super::content_size::reconcile_row_heads(write_txn, mutations)?;
-        Self::apply_writer_row_heads_in_write(write_txn, mutations)?;
+        super::content_size::reconcile_row_heads(write_txn, mutations, admission)?;
+        Self::apply_writer_row_heads_in_write(write_txn, mutations, admission)?;
         for (ordinal, mutation) in mutations.iter().enumerate() {
             if mutation.family == SCHEMA_RECORD_FAMILY {
                 if mutations[ordinal + 1..].iter().any(|later| {
@@ -8550,6 +8560,19 @@ pub(crate) mod original_writer {
             Self::new(&self.original, self.scratch_owner.clone())
         }
         pub(crate) fn admit(&mut self, bytes: usize) -> Result<()> {
+            self.admit_for(
+                bytes,
+                "maintain_committed_proof",
+                "Raise MEMORY_LIMIT to admit the proof this transaction maintains.",
+            )
+        }
+        /// [`Self::admit`] under its own operation name.
+        pub(crate) fn admit_for(
+            &mut self,
+            bytes: usize,
+            operation: &'static str,
+            hint: &'static str,
+        ) -> Result<()> {
             let next = self
                 .held
                 .checked_add(bytes)
@@ -8558,8 +8581,8 @@ pub(crate) mod original_writer {
                 &mut self.original,
                 bytes,
                 "content_identity",
-                "maintain_committed_proof",
-                "Raise MEMORY_LIMIT to admit the proof this transaction maintains.",
+                operation,
+                hint,
             )?;
             self.held = next;
             self.peak.set(self.peak.get().max(next));
@@ -9003,8 +9026,8 @@ pub(crate) mod original_writer {
             groups: Option<&super::super::custody_groups::GroupPlan>,
         ) -> Result<DirectTypedImageDigest> {
             Self::reconcile_owned_ddl_selectors_in_write(write_txn, mutations, admission)?;
-            super::super::content_size::reconcile_row_heads(write_txn, mutations)?;
-            Self::apply_writer_row_heads_in_write(write_txn, mutations)?;
+            super::super::content_size::reconcile_row_heads(write_txn, mutations, admission)?;
+            Self::apply_writer_row_heads_in_write(write_txn, mutations, admission)?;
             for (ordinal, mutation) in mutations.iter().enumerate() {
                 if mutation.family == SCHEMA_RECORD_FAMILY {
                     if mutations[ordinal + 1..].iter().any(|later| {

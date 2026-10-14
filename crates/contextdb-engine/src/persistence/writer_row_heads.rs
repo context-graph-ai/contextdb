@@ -1,5 +1,9 @@
 //! A row's latest physical identity is maintained beside logical publication.
 use super::*;
+
+#[cfg(test)]
+#[path = "held_relations_tests.rs"]
+mod held_relations_tests;
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("writer_row_heads");
 const ROOT_KEY: &str = "row_heads_root";
 fn damage(reason: &str) -> Error {
@@ -42,6 +46,123 @@ fn route(key: &[u8]) -> Result<(&str, RowId)> {
     let row = RowId(u64::from_le_bytes(key[end + 8..].try_into().unwrap()));
     Ok((table, row))
 }
+/// The writer admission a row-head reconciliation pass charges what it holds
+/// to: the general writer's or the owned transaction host's.
+pub(super) trait RowHeadAdmission {
+    fn admit_held_relations(&mut self, bytes: usize) -> Result<()>;
+    fn release_held_relations(&mut self, bytes: usize);
+}
+const HOLD_RELATIONS: &str = "hold_row_head_relations";
+const HOLD_RELATIONS_HINT: &str =
+    "Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to.";
+impl RowHeadAdmission for content_identity::ProofAdmission {
+    fn admit_held_relations(&mut self, bytes: usize) -> Result<()> {
+        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)
+    }
+    fn release_held_relations(&mut self, bytes: usize) {
+        self.release(bytes);
+    }
+}
+impl RowHeadAdmission for content_identity::original_writer::ProofAdmission {
+    fn admit_held_relations(&mut self, bytes: usize) -> Result<()> {
+        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)
+    }
+    fn release_held_relations(&mut self, bytes: usize) {
+        self.release(bytes);
+    }
+}
+
+type HeldRelation<'txn> = redb::Table<'txn, &'static [u8], &'static [u8]>;
+
+/// Bytes redb retains for one held relation beyond its slot here: the open
+/// handle's copy of the storage name, and the transaction's open-table entry
+/// (another copy of the name beside a caller location) in a hash table that
+/// can be half empty after it grows.
+pub(super) fn held_relation_native_bytes(relation_name: &str) -> usize {
+    2 * relation_name.len()
+        + 2 * std::mem::size_of::<(String, &'static std::panic::Location<'static>)>()
+}
+
+/// The relations one row-head reconciliation pass holds open, each opened once
+/// on first use however the rows of different tables interleave. Every open
+/// and close of a protected relation makes the write transaction finalize the
+/// checksums of every page it has dirtied there, so reopening one per row (or
+/// per change of table) costs the rows already written.
+///
+/// What holding them retains grows with the distinct tables the transaction
+/// touches, so it is admitted before it is allocated: the sorted slot vector
+/// (old and new capacity while it grows) and each relation's native retention.
+/// [`Self::close`] drops every handle and then returns the whole charge; a pass
+/// that fails part-way closes them the same way.
+pub(super) struct HeldRelations<'name, 'txn> {
+    open: Vec<(&'name str, HeldRelation<'txn>)>,
+    charged: usize,
+}
+impl<'name, 'txn> HeldRelations<'name, 'txn> {
+    pub(super) fn new() -> Self {
+        Self {
+            open: Vec::new(),
+            charged: 0,
+        }
+    }
+
+    /// The relation of `table`, stored under the name `relation_name` gives on
+    /// its first use. A refusal leaves that relation unopened.
+    pub(super) fn get(
+        &mut self,
+        write: &'txn redb::WriteTransaction,
+        table: &'name str,
+        relation_name: impl FnOnce() -> String,
+        admission: &mut impl RowHeadAdmission,
+    ) -> Result<&HeldRelation<'txn>> {
+        let slot = match self.open.binary_search_by(|(open, _)| (*open).cmp(table)) {
+            Ok(slot) => slot,
+            Err(slot) => {
+                let relation_name = relation_name();
+                let native = held_relation_native_bytes(&relation_name);
+                admission.admit_held_relations(native)?;
+                self.charged += native;
+                if self.open.len() == self.open.capacity() {
+                    let entry = std::mem::size_of::<(&str, HeldRelation<'txn>)>();
+                    let old = self.open.capacity();
+                    let capacity = old
+                        .checked_mul(2)
+                        .map(|n| n.max(4))
+                        .ok_or_else(|| Error::Other("held relation capacity overflow".into()))?;
+                    let bytes = capacity
+                        .checked_mul(entry)
+                        .ok_or_else(|| Error::Other("held relation layout overflow".into()))?;
+                    admission.admit_held_relations(bytes)?;
+                    self.charged += bytes;
+                    let mut next = Vec::with_capacity(capacity);
+                    next.append(&mut self.open);
+                    drop(std::mem::replace(&mut self.open, next));
+                    admission.release_held_relations(old * entry);
+                    self.charged -= old * entry;
+                }
+                let relation = write
+                    .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name))
+                    .map_err(RedbPersistence::storage_error)?;
+                self.open.insert(slot, (table, relation));
+                slot
+            }
+        };
+        Ok(&self.open[slot].1)
+    }
+
+    /// Bytes admitted for what is held now.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(super) fn charged(&self) -> usize {
+        self.charged
+    }
+
+    /// Close every held relation, then return what holding them was admitted.
+    pub(super) fn close(self, admission: &mut impl RowHeadAdmission) {
+        let Self { open, charged } = self;
+        drop(open);
+        admission.release_held_relations(charged);
+    }
+}
 fn logical_key(table: &str, row: RowId) -> Vec<u8> {
     let mut key = Vec::with_capacity(table.len() + 24);
     key.extend_from_slice(&(table.len() as u64).to_le_bytes());
@@ -61,19 +182,23 @@ impl RedbPersistence {
     pub(super) fn apply_writer_row_heads_in_write(
         write: &redb::WriteTransaction,
         mutations: &[content_identity::ContentIdentityMutation],
+        admission: &mut impl RowHeadAdmission,
+    ) -> Result<()> {
+        // Only the heads table is written here; the held relations are read.
+        let mut relations = HeldRelations::new();
+        let applied = Self::apply_writer_row_heads_holding(write, mutations, admission, &mut relations);
+        relations.close(admission);
+        applied
+    }
+
+    fn apply_writer_row_heads_holding<'name, 'txn>(
+        write: &'txn redb::WriteTransaction,
+        mutations: &'name [content_identity::ContentIdentityMutation],
+        admission: &mut impl RowHeadAdmission,
+        relations: &mut HeldRelations<'name, 'txn>,
     ) -> Result<()> {
         let mut heads = write.open_table(TABLE).map_err(Self::storage_error)?;
         let mut family_exists = std::collections::HashMap::new();
-        // Each relation stays open for the whole pass, however the rows of
-        // different tables interleave. Each open and close of a protected
-        // relation makes the write transaction finalize the checksums of every
-        // page it has dirtied there, so reopening it per row (or per change of
-        // table) costs the rows already written. Only the heads table is
-        // written here; the relations are read.
-        let mut open_relations: std::collections::HashMap<
-            &str,
-            redb::Table<'_, &'static [u8], &'static [u8]>,
-        > = std::collections::HashMap::new();
         for mutation in mutations {
             let Some(projection) = mutation.row_head else {
                 continue;
@@ -100,12 +225,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 continue;
             }
-            let relation = match open_relations.entry(table) {
-                std::collections::hash_map::Entry::Occupied(open) => open.into_mut(),
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(write.open_table(relation).map_err(Self::storage_error)?)
-                }
-            };
+            let relation = relations.get(write, table, || name.clone(), admission)?;
             let old = heads
                 .get(mutation.logical_key.as_slice())
                 .map_err(Self::storage_error)?
