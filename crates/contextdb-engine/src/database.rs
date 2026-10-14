@@ -24245,9 +24245,6 @@ impl MaintenanceContext {
         if previous_sample.is_none() {
             let min_interval = *self.auto_compact_min_interval.lock();
             let mut last = self.last_auto_compact_at.lock();
-            if last.is_none() {
-                *last = inherited_storage_decision_instant(persistence, min_interval);
-            }
             if !last.is_none_or(|at| at.elapsed() >= min_interval) {
                 return Ok(CompactionReport::default());
             }
@@ -24275,9 +24272,7 @@ impl MaintenanceContext {
         if previous_sample.is_none() && fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD
         {
             // The claim stands: a completed negative check starts the
-            // interval, so the next cycle -- or the next process to open
-            // this store -- does not repeat the walk.
-            record_storage_decision_time(&self.tx_mgr, persistence);
+            // interval, so the next cycle does not repeat the walk.
             return Ok(CompactionReport::default());
         }
         let bytes_before = self.file_bytes();
@@ -24304,7 +24299,6 @@ impl MaintenanceContext {
         let duration_micros = start.elapsed().as_micros() as u64;
         if progress.complete {
             *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
-            record_storage_decision_time(&self.tx_mgr, persistence);
         }
         let bytes_after = self.file_bytes();
         Ok(CompactionReport {
@@ -24987,7 +24981,6 @@ impl MaintenanceContext {
             )?;
             if progress.complete {
                 *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
-                record_storage_decision_time(&self.tx_mgr, persistence);
             }
             report.compacted = true;
             report.file_bytes_after = self.file_bytes();
@@ -26892,42 +26885,6 @@ impl MaintenanceContext {
         *self.last_maintenance_cycle_at.lock() = Some(std::time::Instant::now());
         Ok(report)
     }
-}
-
-/// Local configuration key holding the wall-clock milliseconds of the store's
-/// last completed automatic compaction decision: a check that found the file
-/// below [`REDB_COMPACT_FRAGMENTATION_THRESHOLD`], or a completed sweep. A
-/// freshly opened handle inherits it, so [`AUTO_COMPACT_MIN_INTERVAL`] spans
-/// processes instead of restarting -- and re-walking the store -- at every open.
-pub(crate) const STORAGE_DECISION_AT_CONFIG_KEY: &str = "maintenance_storage_decision_at_ms";
-
-/// Remember a completed decision durably. Best effort by design: the value
-/// only spares a later process a repeated check, so failing to write it
-/// costs that one check and never the cycle that already did its work.
-fn record_storage_decision_time(tx_mgr: &DatabaseTransactionHost, persistence: &RedbPersistence) {
-    let at = Wallclock::now().0;
-    let _ = publish_direct_metadata(tx_mgr, || {
-        persistence.flush_config_value(STORAGE_DECISION_AT_CONFIG_KEY, &at)
-    });
-}
-
-/// The in-process instant equivalent to the store's last durable decision,
-/// when that decision is still inside `min_interval`. A stamp from the future
-/// (a clock that stepped back) counts as just now.
-fn inherited_storage_decision_instant(
-    persistence: &RedbPersistence,
-    min_interval: Duration,
-) -> Option<std::time::Instant> {
-    let at = persistence
-        .load_config_value::<u64>(STORAGE_DECISION_AT_CONFIG_KEY)
-        .ok()
-        .flatten()?;
-    let elapsed = Duration::from_millis(Wallclock::now().0.saturating_sub(at));
-    if elapsed >= min_interval {
-        return None;
-    }
-    let now = std::time::Instant::now();
-    Some(now.checked_sub(elapsed).unwrap_or(now))
 }
 
 /// The storage-statistics decisions a cycle defers until its caller has
@@ -65220,7 +65177,6 @@ impl Database {
         self.vector_store.evict_reloadable_raw_partitions();
         let duration_micros = start.elapsed().as_micros() as u64;
         *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
-        record_storage_decision_time(&self.tx_mgr, persistence);
         let bytes_after = self.disk_file_size();
         Ok(CompactionReport {
             ran: true,
