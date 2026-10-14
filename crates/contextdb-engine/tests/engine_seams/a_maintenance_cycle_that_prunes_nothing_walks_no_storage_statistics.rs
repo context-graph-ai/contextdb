@@ -214,11 +214,15 @@ fn observe(rows: usize, clock: &AtomicU64) -> Observation {
         agreed_ratio(&db);
         let start = per_table * process / 4;
         let end = per_table * (process + 1) / 4;
-        db.execute(
-            &format!("DELETE FROM links WHERE id >= {start} AND id < {end}"),
-            &p,
-        )
-        .unwrap();
+        // Small statements, each inside the default statement read limits.
+        for low in (start..end).step_by(128) {
+            let high = (low + 128).min(end);
+            db.execute(
+                &format!("DELETE FROM links WHERE id >= {low} AND id < {high}"),
+                &p,
+            )
+            .unwrap();
+        }
         agreed_ratio(&db);
         db.close().unwrap();
     }
