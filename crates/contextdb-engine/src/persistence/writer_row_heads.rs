@@ -1023,7 +1023,7 @@ impl RedbPersistence {
         // relational pages and belongs to the row family's backend work.
         #[cfg(any(test, feature = "test-seams"))]
         root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         let _body_reads = crate::writer_query_test_seams::physical_operation(
             crate::writer_query_test_seams::PhysicalFamily::Row,
             table,
