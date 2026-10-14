@@ -940,6 +940,14 @@ impl Database {
         TransactionalMemory::set_free_total_recount_start_hook_for_test(hook);
     }
 
+    /// Regions visited on the calling thread to compute free-total geometry,
+    /// cumulatively. Ordinary opens, saves, trims and resizes visit none.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn free_total_geometry_region_visits_for_test() -> u64 {
+        TransactionalMemory::free_total_geometry_region_visits_for_test()
+    }
+
     /// Completed free-total rebuilds on the calling thread, cumulatively.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]

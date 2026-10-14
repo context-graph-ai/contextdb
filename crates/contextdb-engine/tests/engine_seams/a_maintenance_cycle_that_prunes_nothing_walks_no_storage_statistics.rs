@@ -95,6 +95,7 @@ struct Work {
     pages: u64,
     pages_under_pruning_guard: u64,
     recounts: u64,
+    geometry_region_visits: u64,
 }
 
 fn work(db: &Database) -> Work {
@@ -104,6 +105,7 @@ fn work(db: &Database) -> Work {
         pages,
         pages_under_pruning_guard,
         recounts: Database::__allocator_free_total_recounts_for_test(),
+        geometry_region_visits: Database::__allocator_geometry_region_visits_for_test(),
     }
 }
 
@@ -114,6 +116,7 @@ fn since(before: Work, after: Work) -> Work {
         pages_under_pruning_guard: after.pages_under_pruning_guard
             - before.pages_under_pruning_guard,
         recounts: after.recounts - before.recounts,
+        geometry_region_visits: after.geometry_region_visits - before.geometry_region_visits,
     }
 }
 
@@ -286,7 +289,8 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
                 *work,
                 Work::default(),
                 "cycle {cycle} (first, warm, then one per expiring cohort) reads no \
-                 statistics, walks no page under the pruning guard, rebuilds no totals"
+                 statistics, walks no page under the pruning guard, rebuilds no totals \
+                 and visits no region for allocator geometry"
             );
         }
         assert!(

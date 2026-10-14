@@ -197,7 +197,26 @@ pub(super) struct FreeTotals {
 pub(crate) const FREE_TOTALS_ENCODED_LEN: usize = 24;
 const FREE_TOTALS_FORMAT: u32 = 1;
 
+#[cfg(feature = "test-seams")]
+thread_local! {
+    /// Regions visited to compute free-total geometry on this thread.
+    /// Production-dead.
+    static GEOMETRY_REGION_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn geometry_region_visits_for_test() -> u64 {
+    GEOMETRY_REGION_VISITS.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "test-seams")]
+fn note_geometry_region_visits(regions: u64) {
+    GEOMETRY_REGION_VISITS.with(|visits| visits.set(visits.get() + regions));
+}
+
 pub(super) fn layout_pages(layout: &DatabaseLayout) -> u64 {
+    #[cfg(feature = "test-seams")]
+    note_geometry_region_visits(u64::from(layout.num_regions()));
     (0..layout.num_regions())
         .map(|region| u64::from(layout.region_layout(region).num_pages()))
         .sum()
@@ -722,11 +741,14 @@ impl Allocators {
     pub(super) fn resize_to(&mut self, new_layout: DatabaseLayout) -> io::Result<()> {
         let old_pages = match &self.paged {
             Some(paged) => layout_pages(&paged.layout.lock().unwrap()),
-            None => self
-                .regions
-                .iter()
-                .map(|region| u64::from(region.len()))
-                .sum(),
+            None => {
+                #[cfg(feature = "test-seams")]
+                note_geometry_region_visits(self.regions.len() as u64);
+                self.regions
+                    .iter()
+                    .map(|region| u64::from(region.len()))
+                    .sum()
+            }
         };
         let result = self.resize_to_inner(new_layout);
         let new_pages = layout_pages(&new_layout);

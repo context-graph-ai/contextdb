@@ -894,6 +894,11 @@ impl TransactionalMemory {
     }
 
     #[cfg(feature = "test-seams")]
+    pub(crate) fn free_total_geometry_region_visits_for_test() -> u64 {
+        crate::tree_store::page_store::region::geometry_region_visits_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
     pub(crate) fn set_free_total_recount_start_hook_for_test(hook: Option<Box<dyn Fn()>>) {
         FREE_TOTAL_RECOUNT_START.with(|slot| *slot.borrow_mut() = hook);
     }

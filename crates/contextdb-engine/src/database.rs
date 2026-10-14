@@ -65020,6 +65020,14 @@ impl Database {
         redb::Database::free_total_recounts_for_test()
     }
 
+    /// Production-dead: regions visited on the calling thread to compute the
+    /// allocator's free-total geometry, cumulatively.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __allocator_geometry_region_visits_for_test() -> u64 {
+        redb::Database::free_total_geometry_region_visits_for_test()
+    }
+
     /// Production-dead: the maintained allocator free-page ratio the
     /// maintenance decisions read, and the same ratio from an independent
     /// recount of every allocator bitmap (which does not count as a rebuild).

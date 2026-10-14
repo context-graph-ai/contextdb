@@ -1862,3 +1862,38 @@ fn allocator_free_total_rebuild_fault_refuses_the_open_and_publishes_nothing() {
     assert_totals_exact(&db, "rebuilt after the refused open");
     assert_row(&db, 0, 0x35);
 }
+
+/// Free-total geometry is layout arithmetic: opening, an ordinary trimming
+/// commit, a relocation batch and a trimming clean close visit no region,
+/// whether the store holds one region or many.
+#[test]
+fn allocator_free_total_geometry_costs_the_same_at_one_and_many_regions() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let mut visits = Vec::new();
+    for rows in [1u64, 48] {
+        let path = dir.path().join(format!("geometry-{rows}.redb"));
+        let regions = create_regions(&path, rows);
+        let before = redb::Database::free_total_geometry_region_visits_for_test();
+        let db = builder().open(&path).expect("open fixture");
+        remove_rows(&db, rows - 1..rows);
+        db.begin_write()
+            .expect("begin trimming commit")
+            .commit()
+            .expect("ordinary commit releases and trims");
+        let mut cursor = redb::CompactionCursor::default();
+        db.compact_step(&mut cursor, 8, |_| Ok(()))
+            .expect("one relocation batch");
+        assert_totals_exact(&db, "after trim and relocation");
+        drop(db);
+        visits.push((
+            regions,
+            redb::Database::free_total_geometry_region_visits_for_test() - before,
+        ));
+    }
+    assert!(visits[1].0 > visits[0].0, "the fixtures differ in region count");
+    assert_eq!(
+        (visits[0].1, visits[1].1),
+        (0, 0),
+        "open, trim, relocation and save visit no region for free-total geometry: {visits:?}"
+    );
+}
