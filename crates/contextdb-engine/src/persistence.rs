@@ -37265,23 +37265,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     )
                 })
                 .transpose()?;
-            // Checkpoints written before the measurement could be unknown
-            // carry a bare ratio; exact decoding tells the two layouts apart.
             let checkpoint: (u8, Option<String>, bool, Vec<usize>, bool, Option<f64>) =
-                match Self::decode_exact(value.value()) {
-                    Ok(checkpoint) => checkpoint,
-                    Err(_) => {
-                        let (phase, table, advance, position, active, ratio): (
-                            u8,
-                            Option<String>,
-                            bool,
-                            Vec<usize>,
-                            bool,
-                            f64,
-                        ) = Self::decode_exact(value.value())?;
-                        (phase, table, advance, position, active, Some(ratio))
-                    }
-                };
+                Self::decode_exact(value.value())?;
             Ok(Some((checkpoint, memory)))
         })?;
         if let Some(((phase, table, advance, position, active, ratio), memory)) = checkpoint {
