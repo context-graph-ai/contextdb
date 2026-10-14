@@ -419,20 +419,56 @@ impl BuddyAllocator {
 
     // Allocates a page of the given order at the lowest index possible. Will split a higher order page,
     // to get one of lower index
+    //
+    // Each order's lowest free block is read, never allocated, to compare
+    // positions; only the chosen block is taken and split down. A free block
+    // of one order never starts where a free block of another order does, so
+    // the lowest start is unique.
     pub(crate) fn alloc_lowest(&mut self, order: u8) -> Option<u32> {
+        if self.poisoned() || order > self.max_order {
+            return None;
+        }
+        let mut best: Option<(u32, u32, u8)> = None;
+        for found in order..=self.max_order {
+            if let Some(index) = self.get_order_free(found).find_first_unset() {
+                let index_at_order = index << (found - order);
+                if best.is_none_or(|(lowest, _, _)| index_at_order < lowest) {
+                    best = Some((index_at_order, index, found));
+                }
+            }
+        }
         if self.poisoned() {
             return None;
         }
-        // Lowest index at the requested order
-        let mut best_index_at_order = self.alloc_inner(order)?;
-        // Best (index, order) found
-        let mut best = (best_index_at_order, order);
+        let (index_at_order, mut index, mut found) = best?;
+        self.get_order_free_mut(found).set(index);
+        // Split the page, until we get to the requested order
+        while found > order {
+            let (free1, free2) = (index * 2, index * 2 + 1);
+            let allocator = self.get_order_free_mut(found - 1);
+            debug_assert!(allocator.get(free1));
+            debug_assert!(allocator.get(free2));
+            allocator.clear(free2);
+            index = free1;
+            found -= 1;
+        }
+        if self.poisoned() {
+            return None;
+        }
+        assert_eq!(index, index_at_order);
 
-        // Find the lowest index at which we can fill this allocation, across all orders
+        Some(index)
+    }
+
+    /// The previous lowest-address search, which allocated a block at every
+    /// higher order to compare positions; kept as the equivalence oracle.
+    #[cfg(test)]
+    fn alloc_lowest_by_trial(&mut self, order: u8) -> Option<u32> {
+        let mut best_index_at_order = self.alloc_inner(order)?;
+        let mut best = (best_index_at_order, order);
         let mut multiplier = 2;
         for i in (order + 1)..=self.max_order {
             if let Some(index) = self.alloc_inner(i) {
-                #[cfg(test)]
                 TENTATIVE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
                 let index_at_order = index * multiplier;
                 if index_at_order < best_index_at_order {
@@ -445,22 +481,12 @@ impl BuddyAllocator {
             }
             multiplier *= 2;
         }
-
-        // Split the page, until we get to the requested order
         while best.1 > order {
             let (best_index, best_order) = best;
             let (free1, free2) = (best_index * 2, best_index * 2 + 1);
-            let allocator = self.get_order_free_mut(best_order - 1);
-            debug_assert!(allocator.get(free1));
-            debug_assert!(allocator.get(free2));
-            allocator.clear(free2);
+            self.get_order_free_mut(best_order - 1).clear(free2);
             best = (free1, best_order - 1);
         }
-        if self.poisoned() {
-            return None;
-        }
-        assert_eq!(best.0, best_index_at_order);
-
         Some(best.0)
     }
 
@@ -584,6 +610,36 @@ mod test {
             "three lowest allocations made {tentative} tentative higher-order allocations"
         );
         assert_eq!(allocator.count_allocated_pages(), 5);
+    }
+
+    /// The read-only search returns what the trial-allocation search did and
+    /// leaves the same free index, across random allocation and free orders.
+    #[test]
+    fn lowest_allocation_matches_the_trial_allocation_search() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        let seed = rand::rng().random();
+        println!("seed={seed}");
+        let mut rng = StdRng::seed_from_u64(seed);
+        let pages = 4096;
+        let mut allocator = BuddyAllocator::new(pages, pages);
+        let mut held: Vec<(u32, u8)> = Vec::new();
+        for _ in 0..4000 {
+            if held.is_empty() || rng.random_bool(0.6) {
+                let order = rng.random_range(0..=4u8);
+                let mut oracle = BuddyAllocator::from_bytes(&allocator.to_vec());
+                let expected = oracle.alloc_lowest_by_trial(order);
+                let actual = allocator.alloc_lowest(order);
+                assert_eq!(actual, expected, "order {order}");
+                assert_eq!(allocator.to_vec(), oracle.to_vec(), "free index after order {order}");
+                if let Some(page) = actual {
+                    held.push((page, order));
+                }
+            } else {
+                let (page, order) = held.swap_remove(rng.random_range(0..held.len()));
+                allocator.free(page, order);
+            }
+        }
     }
 
     #[test]
