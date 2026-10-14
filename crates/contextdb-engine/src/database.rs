@@ -30954,8 +30954,6 @@ impl Database {
         };
         persistence.set_disk_limit(effective_disk_limit)?;
 
-        Self::migrate_policy_hold_indexes(&persistence, &accountant)?;
-
         let all_meta = persistence.load_all_table_meta()?;
         // A `TableMeta`/`ColumnDef` payload with fewer fields than the required
         // schema layout refuses the whole root. No opener reads past this
@@ -81532,8 +81530,6 @@ impl Database {
     }
 
     const POLICY_HOLD_INDEX_PREFIX: &'static str = "sync_policy_hold_select.v1.";
-    const POLICY_HOLD_INDEXED_PREFIX: &'static str = "sync_policy_hold_indexed.v1.";
-    const POLICY_HOLD_MIGRATION_CURSOR: &'static str = "sync_policy_hold_index_cursor.v1";
 
     fn policy_hold_memory(
         accountant: crate::memory_accounting::AccountantHandle,
@@ -81584,14 +81580,6 @@ impl Database {
         Ok(indexes)
     }
 
-    fn policy_hold_index_marker(key: &str) -> String {
-        format!(
-            "{}{}",
-            Self::POLICY_HOLD_INDEXED_PREFIX,
-            blake3::hash(key.as_bytes()).to_hex()
-        )
-    }
-
     fn policy_hold_index_values(
         key: &str,
         hold: &DurablePolicyHold,
@@ -81601,60 +81589,9 @@ impl Database {
             .iter()
             .map(|index| Ok((index.clone(), RedbPersistence::encode_config_value(&key)?)))
             .collect::<Result<Vec<_>>>()?;
-        values.push((
-            Self::policy_hold_index_marker(key),
-            RedbPersistence::encode_config_value(&true)?,
-        ));
         Ok(values)
     }
 
-    /// Index policy-hold physical addresses outside delivery. Each record's indexes
-    /// and resume cursor commit together; reopening skips already indexed values.
-    fn migrate_policy_hold_indexes(
-        persistence: &RedbPersistence,
-        accountant: &crate::memory_accounting::AccountantHandle,
-    ) -> Result<()> {
-        let mut cursor_memory = Self::policy_hold_memory(accountant.clone());
-        let mut cursor: Option<String> = persistence
-            .load_config_value_admitted(Self::POLICY_HOLD_MIGRATION_CURSOR, &cursor_memory)?;
-        loop {
-            let memory = Self::policy_hold_memory(accountant.clone());
-            let Some(key) = persistence.next_config_key(
-                Self::POLICY_HOLD_PREFIX,
-                cursor.as_deref(),
-                &memory,
-            )?
-            else {
-                break;
-            };
-            if !persistence.config_value_exists(&Self::policy_hold_index_marker(&key))? {
-                let hold: DurablePolicyHold = persistence
-                    .load_config_value_admitted(&key, &memory)?
-                    .expect("migration key came from the same owned store");
-                let mut values = Self::policy_hold_index_values(&key, &hold)?;
-                let release_key = Self::policy_hold_release_key(&hold)?;
-                if persistence.config_value_exists(&release_key)? {
-                    values.push((
-                        RedbPersistence::policy_hold_release_marker(&release_key)
-                            .expect("policy release key"),
-                        RedbPersistence::encode_config_value(&true)?,
-                    ));
-                }
-                values.push((
-                    Self::POLICY_HOLD_MIGRATION_CURSOR.into(),
-                    RedbPersistence::encode_config_value(&key)?,
-                ));
-                persistence.update_indexed_config_values(&values, &[])?;
-            }
-            cursor = Some(key);
-            cursor_memory = memory;
-        }
-        drop(cursor_memory);
-        if persistence.config_value_exists(Self::POLICY_HOLD_MIGRATION_CURSOR)? {
-            persistence.remove_config_value(Self::POLICY_HOLD_MIGRATION_CURSOR)?;
-        }
-        Ok(())
-    }
 
     fn policy_hold_matches_scope(
         hold: &DurablePolicyHold,
@@ -81976,7 +81913,6 @@ impl Database {
             }
             if let Some(persistence) = &self.persistence {
                 let mut removes = Self::policy_hold_index_keys(key, hold)?;
-                removes.push(Self::policy_hold_index_marker(key));
                 removes.push(key.clone());
                 self.publish_direct_metadata(|| {
                     persistence.update_indexed_config_values(&[], &removes)
