@@ -950,6 +950,26 @@ impl Database {
         self.mem.region_free_pages_for_test()
     }
 
+    /// Whether a saved allocator-state table is still the lazy allocator
+    /// source, and the last page (region, page index) that table occupies.
+    /// Test diagnostics only.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn allocator_state_placement_for_test(&self) -> Result<(bool, Option<(u32, u32)>)> {
+        let saved_source = self.mem.has_saved_allocator_source();
+        let mut highest = None;
+        if let Some(tree) = Self::get_allocator_state_table(&self.mem)?
+            && let Some(pages) = tree.all_pages_iter()?
+        {
+            for page in pages {
+                let page = page?;
+                let last = ((page.page_index + 1) << page.page_order) - 1;
+                highest = highest.max(Some((page.region, last)));
+            }
+        }
+        Ok((saved_source, highest))
+    }
+
     /// Drop trust in the maintained totals: the next save writes none, so the
     /// next open rebuilds them.
     #[cfg(feature = "test-seams")]

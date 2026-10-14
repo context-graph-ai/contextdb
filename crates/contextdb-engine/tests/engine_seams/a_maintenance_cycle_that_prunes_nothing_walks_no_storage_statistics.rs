@@ -183,7 +183,8 @@ fn observe(rows: usize, clock: &AtomicU64) -> Observation {
 
     // The first cycle after the open, then a warm one. Neither prunes.
     println!(
-        "rows={rows} after open: regions={:?} totals={:?} exact={:?}",
+        "rows={rows} after open: allocator_state={:?} regions={:?} totals={:?} exact={:?}",
+        db.__allocator_state_placement_for_test().unwrap(),
         db.__allocator_regions_for_test().unwrap(),
         db.__allocator_free_totals_for_test().unwrap(),
         db.__storage_fragmentation_ratio_for_test().unwrap(),

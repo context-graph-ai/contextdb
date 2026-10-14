@@ -65054,6 +65054,18 @@ impl Database {
         persistence.with_db(|db| Ok(db.region_free_pages_for_test()))
     }
 
+    /// Production-dead: whether the saved allocator-state table is still the
+    /// lazy allocator source, and the last page it occupies.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __allocator_state_placement_for_test(&self) -> Result<(bool, Option<(u32, u32)>)> {
+        let persistence = self.persistence.as_ref().expect("file fixture");
+        persistence.with_db(|db| {
+            db.allocator_state_placement_for_test()
+                .map_err(crate::persistence::RedbPersistence::storage_error)
+        })
+    }
+
     /// Production-dead: the maintained allocator free-page ratio the
     /// maintenance decisions read, and the same ratio from an independent
     /// recount of every allocator bitmap (which does not count as a rebuild).
