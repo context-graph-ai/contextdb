@@ -810,7 +810,7 @@ fn crash_at_the_first_cohort_publication(test: &str, cut: &str) {
         assert_eq!(after, before);
         before.0
     } else {
-        // The first cohort is durable, named by its own commit, and only it.
+        // The first cohort is durable, named by the commit it ends at, and only it.
         assert_eq!(after.0, through);
         assert_eq!(after.2, Some(after.1), "coverage names that LSN's commit");
         assert_eq!(after.3, CRASH_SUFFIX_ROWS + 1 - first);

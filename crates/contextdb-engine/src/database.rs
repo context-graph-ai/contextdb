@@ -79014,14 +79014,15 @@ impl Database {
     ) -> Result<Vec<TriggerAuditEntry>> {
         let _operation = self.open_operation()?;
         let read_memory = self.declared_reader_memory()?;
-        // A read: the admitting declared reader owns every decode before
-        // persistence is entered, never the writer's fallback.
-        let decode = crate::read_image_memory::ImageMemory::operation_reader(
-            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-            read_memory.clone(),
-        )?;
-        let _decode = decode.enter();
         let (history, credit) = if let Some(persistence) = &self.persistence {
+            // A read: the admitting declared reader owns every decode before
+            // persistence is entered, never the writer's fallback. The
+            // volatile history below decodes nothing.
+            let decode = crate::read_image_memory::ImageMemory::operation_reader(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                read_memory.clone(),
+            )?;
+            let _decode = decode.enter();
             let (history, credit) =
                 persistence.load_trigger_audit_history_with_read_memory(Some(read_memory))?;
             (history, credit)
