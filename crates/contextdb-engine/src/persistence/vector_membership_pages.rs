@@ -253,20 +253,23 @@ pub(super) fn begin_pending_frontier(
     })
 }
 
-/// Publish complete import coverage without disturbing a replacement's counters.
+/// Publish import coverage without disturbing a replacement's counters.
 /// The raw frontier and native graph are committed in the same transaction.
+/// Coverage ends at the cohort the import absorbed: `absorbed_from` is the
+/// frontier it continued, and `absorbed_live_inserts` / `absorbed_tombstones`
+/// are what that cohort retires from the maintained counters. When later
+/// changes are already committed, they stay pending at the published
+/// frontier instead of being cleared.
 pub(super) fn publish_native_tail_frontier(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
     frontier: TxId,
     base_frontier: TxId,
+    absorbed_from: TxId,
+    absorbed_live_inserts: u64,
+    absorbed_tombstones: u64,
 ) -> Result<()> {
     update_pending_summary(write, partition, |summary| {
-        if summary.max_tx > frontier {
-            return Err(corruption(
-                "native tail frontier is behind committed membership",
-            ));
-        }
         if summary
             .base_pending
             .as_ref()
@@ -286,10 +289,37 @@ pub(super) fn publish_native_tail_frontier(
             .ok_or_else(|| corruption("native tail base frontier has no maintained counters"))?;
             summary.base_pending = Some(base);
         }
+        if summary.max_tx <= frontier {
+            summary.pending = PendingCounts {
+                covered_tx: frontier,
+                pending_inserts: 0,
+                tombstones: 0,
+            };
+            return Ok(());
+        }
+        // A committed prefix of the suffix: its maintained counters lose
+        // exactly what this cohort covered, and keep every later change.
+        if absorbed_from == TxId(0) || summary.pending.covered_tx != absorbed_from {
+            return Err(corruption(
+                "native tail frontier is behind committed membership",
+            ));
+        }
         summary.pending = PendingCounts {
             covered_tx: frontier,
-            pending_inserts: 0,
-            tombstones: 0,
+            pending_inserts: summary
+                .pending
+                .pending_inserts
+                .checked_sub(absorbed_live_inserts)
+                .ok_or_else(|| {
+                    corruption("native tail cohort retires more inserts than are pending")
+                })?,
+            tombstones: summary
+                .pending
+                .tombstones
+                .checked_sub(absorbed_tombstones)
+                .ok_or_else(|| {
+                    corruption("native tail cohort retires more tombstones than are pending")
+                })?,
         };
         Ok(())
     })
