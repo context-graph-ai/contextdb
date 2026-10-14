@@ -982,6 +982,7 @@ fn merge_result(total: &mut ApplyResult, part: ApplyResult) {
 /// Native cursor producer and the original seven-field custody tuple check.
 /// The caller supplies the FIRST original committed-view incarnation read.
 /// The handler's response must independently perform its SECOND original read.
+#[cfg(feature = "sync-orchestration")]
 pub(crate) fn native_outcome_cursor_after(
     memory: &crate::read_image_memory::NativeDeliveryImage,
     tenant: &TenantId,

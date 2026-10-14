@@ -1680,6 +1680,7 @@ fn evidence_eq(a: &RowEvidence<'_>, b: &RowEvidence<'_>) -> Decoded<bool> {
 }
 /// Companions are source-selected loans with their own prepaid raw windows.
 /// No Legacy resident admission fact or owned Record is used as evidence.
+#[cfg(feature = "sync-orchestration")]
 pub(crate) fn verify_companions(
     record: &RecordView<'_>,
     views: &[super::store::NativeCustodyView<'_>],
