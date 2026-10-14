@@ -28663,6 +28663,65 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
+    /// The raw config entries under `prefix`, loaded in two passes of one
+    /// read transaction: the first sizes them through borrowed guards and
+    /// passes the exact load bytes (slots, key and value copies) to `admit`;
+    /// only then does the second copy them into an exact-capacity list.
+    pub(crate) fn load_config_values_raw_admitted(
+        &self,
+        prefix: &str,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let config_table = match read_txn.open_table(CONFIG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let overflow = || Error::Other("config load size overflow".into());
+            let mut count = 0usize;
+            let mut bytes = 0usize;
+            for entry in config_table.range(prefix..).map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                let key = key.value();
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                count = count.checked_add(1).ok_or_else(overflow)?;
+                bytes = bytes
+                    .checked_add(key.len())
+                    .and_then(|b| b.checked_add(value.value().len()))
+                    .ok_or_else(overflow)?;
+            }
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            let slots = count
+                .checked_mul(std::mem::size_of::<(String, Vec<u8>)>())
+                .and_then(|b| b.checked_add(bytes))
+                .ok_or_else(overflow)?;
+            admit(slots)?;
+            let mut out = Vec::with_capacity(count);
+            for entry in config_table.range(prefix..).map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                let key = key.value();
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if out.len() == count {
+                    return Err(Error::Other(
+                        "config entries changed inside one read".into(),
+                    ));
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::writer_query_test_seams::note_config_enumeration(key);
+                out.push((key.to_string(), value.value().to_vec()));
+            }
+            Ok(out)
+        })
+    }
+
     /// The raw config value for exactly `key`, if present.
     pub(crate) fn load_config_value_raw(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.with_db(|db| {

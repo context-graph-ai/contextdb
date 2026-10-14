@@ -257,6 +257,110 @@ pub(crate) struct Store {
     pub selected_records: u64,
     pub read_visits: u64,
     pub validation_visits: u64,
+    /// The admitted size of each tenant entry a durable store mirrors, so a
+    /// removal releases exactly what its insertion admitted.
+    mirror_sizes: BTreeMap<String, usize>,
+    /// A durable store's writer admission for its tenant mirror (`records`,
+    /// `groups`, `mirror_sizes`). Declared last, so it is released only once
+    /// every mirrored container above has been freed.
+    tenant_mirror: Option<MirrorCharge>,
+}
+
+/// A validated delta's tenant-mirror growth: the writer admission and each
+/// tenant entry's admitted size, adopted by the store at publication.
+pub(crate) struct TenantGrowth {
+    pub(crate) sizes: AdmittedKeys<String, usize>,
+    pub(crate) charge: MirrorCharge,
+}
+
+/// Bytes admitted to a writer accountant for the durable tenant mirror,
+/// released on drop. Two charges on the same accountant combine without a
+/// refund.
+pub(crate) struct MirrorCharge {
+    writer: crate::memory_accounting::AccountantHandle,
+    bytes: usize,
+}
+impl MirrorCharge {
+    pub(crate) fn new(writer: crate::memory_accounting::AccountantHandle) -> Self {
+        Self { writer, bytes: 0 }
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+    /// Admit `bytes` before the allocation they fund.
+    pub(crate) fn admit(&mut self, label: &'static str, bytes: usize) -> Result<()> {
+        bracket(label, PROBE_PRE, bytes, self.bytes);
+        if refusal_injected(label) {
+            bracket(label, PROBE_REFUSED, bytes, self.bytes);
+            return Err(injected_refusal(label, bytes));
+        }
+        if let Err(refused) = self.writer.try_allocate_for(
+            bytes,
+            "custody",
+            "tenant_mirror",
+            "Raise MEMORY_LIMIT to hold the tenant policy mirror.",
+        ) {
+            bracket(label, PROBE_REFUSED, bytes, self.bytes);
+            return Err(refused);
+        }
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(invalid)?;
+        Ok(())
+    }
+    /// The allocation the last admission funded exists.
+    pub(crate) fn post(&self, label: &'static str) {
+        bracket(label, PROBE_POST, 0, self.bytes);
+    }
+    /// Release `bytes` after what they funded is freed.
+    pub(crate) fn release(&mut self, bytes: usize) -> Result<()> {
+        self.bytes = self.bytes.checked_sub(bytes).ok_or_else(invalid)?;
+        self.writer.release(bytes);
+        Ok(())
+    }
+    /// Take over `other`'s admission on the same writer, without a refund.
+    pub(crate) fn adopt(&mut self, mut other: MirrorCharge) -> Result<()> {
+        if !std::ptr::eq(self.writer.as_ptr(), other.writer.as_ptr()) {
+            return Err(invalid());
+        }
+        self.bytes = self.bytes.checked_add(other.bytes).ok_or_else(invalid)?;
+        other.bytes = 0;
+        Ok(())
+    }
+}
+impl Drop for MirrorCharge {
+    fn drop(&mut self) {
+        self.writer.release(self.bytes);
+    }
+}
+
+/// The most std's `BTreeMap<K, V>` allocates for one node: an internal node
+/// of `CAPACITY = 11` entries and 12 edges, plus its header. Each mirrored
+/// insertion admits a whole node per tree it touches: n insertions then fund
+/// n nodes, at least the `1 + ceil(2n/5)` a tree of n entries can hold.
+fn node_bytes<K, V>() -> usize {
+    11 * (std::mem::size_of::<K>() + std::mem::size_of::<V>())
+        + 12 * std::mem::size_of::<usize>()
+        + 16
+}
+
+/// The bytes one mirrored tenant entry may hold: its key copies, its decoded
+/// body (`decoded`, as the charged decoder measured it), its group names and
+/// memberships, its size record, and a node per tree insertion.
+pub(crate) fn mirror_entry_bytes(key: &str, record: &Record, decoded: usize) -> Result<usize> {
+    let mut bytes = key
+        .len()
+        .checked_mul(2)
+        .and_then(|b| b.checked_add(decoded))
+        .and_then(|b| b.checked_add(node_bytes::<String, Record>()))
+        .and_then(|b| b.checked_add(node_bytes::<String, usize>()))
+        .ok_or_else(invalid)?;
+    for group in groups(record)? {
+        bytes = bytes
+            .checked_add(group.len() + key.len())
+            .and_then(|b| b.checked_add(node_bytes::<String, BTreeSet<String>>()))
+            .and_then(|b| b.checked_add(node_bytes::<String, ()>()))
+            .ok_or_else(invalid)?;
+    }
+    Ok(bytes)
 }
 
 // A reader may return the last admitted immutable snapshot while its successor
@@ -550,6 +654,103 @@ impl Store {
         });
         Ok(store)
     }
+    /// A durable view whose tenant mirror is charged to `writer`: each raw
+    /// entry is decoded on a charged decoder, checked natively, its mirror
+    /// size admitted before it is inserted, and only then the decoder's
+    /// transient charge released (acquire, then release).
+    pub(crate) fn durable_admitted(
+        parts: [Vec<(String, Vec<u8>)>; 2],
+        writer: crate::memory_accounting::AccountantHandle,
+    ) -> Result<Self> {
+        let mut store = Self::default();
+        let mut mirror = MirrorCharge::new(writer.clone());
+        let memory = crate::read_image_memory::ImageMemory::charging_for(
+            writer.clone(),
+            "custody",
+            "tenant_mirror",
+            "Raise MEMORY_LIMIT to hold the tenant policy mirror.",
+        );
+        for (key, bytes) in parts.into_iter().flatten() {
+            if !key.starts_with("tenant_") {
+                return Err(invalid());
+            }
+            work::decoded(1);
+            let (record, charged) = durable::decode_charged(&memory, &bytes)?;
+            let checked = native_check(&memory, &key, &bytes)
+                .and_then(|()| mirror_entry_bytes(&key, &record, charged))
+                .and_then(|size| mirror.admit("custody_tenant_mirror", size).map(|()| size));
+            let size = match checked {
+                Ok(size) => size,
+                Err(error) => {
+                    drop(record);
+                    memory.release(charged);
+                    return Err(error);
+                }
+            };
+            drop(bytes);
+            store.insert(key.clone(), record)?;
+            store.mirror_sizes.insert(key, size);
+            mirror.post("custody_tenant_mirror");
+            memory.release(charged);
+        }
+        let empty = BTreeMap::new();
+        for record in store.records.values() {
+            let view = store.companions(record, &empty)?;
+            super::records::validate_record(record, &view)?;
+        }
+        store.durable = Some(DurableSource {
+            pinned: None,
+            writer,
+        });
+        store.tenant_mirror = Some(mirror);
+        Ok(store)
+    }
+    /// Publish a validated delta: its tenant growth is adopted first, then
+    /// each entry is inserted with the size its validation admitted.
+    pub(crate) fn publish(
+        &mut self,
+        records: DeltaRecords,
+        growth: Option<TenantGrowth>,
+    ) -> Result<()> {
+        let sizes = match growth {
+            Some(TenantGrowth { sizes, charge }) => {
+                self.adopt_tenant_growth(charge)?;
+                Some(sizes)
+            }
+            None => None,
+        };
+        for (key, record) in records.into_sorted() {
+            match record {
+                Some(record) => match sizes.as_ref().and_then(|s| s.get(key.as_str())) {
+                    Some(size) => self.insert_sized(key, record, *size)?,
+                    None => self.insert(key, record)?,
+                },
+                None => self.remove(&key)?,
+            }
+        }
+        Ok(())
+    }
+    /// Take over a validated delta's tenant growth at publication.
+    pub(crate) fn adopt_tenant_growth(&mut self, growth: MirrorCharge) -> Result<()> {
+        match &mut self.tenant_mirror {
+            Some(mirror) => mirror.adopt(growth),
+            None => Ok(()),
+        }
+    }
+    /// Publish one validated tenant entry whose size its delta admitted.
+    pub(crate) fn insert_sized(&mut self, key: String, record: Record, size: usize) -> Result<()> {
+        if self.tenant_mirror.is_some() && self.mirrors(&key) {
+            self.insert(key.clone(), record)?;
+            self.mirror_sizes.insert(key, size);
+            return Ok(());
+        }
+        self.insert(key, record)
+    }
+    /// The tenant mirror's writer admission.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn tenant_mirror_charge(&self) -> usize {
+        self.tenant_mirror.as_ref().map_or(0, MirrorCharge::bytes)
+    }
     /// The companion memo, admitted to the store's writer before it exists.
     pub(crate) fn ensure_companion_memo(&mut self) -> Result<()> {
         if self.checked.is_some() {
@@ -666,6 +867,17 @@ impl Store {
         Ok(())
     }
     pub fn remove(&mut self, key: &str) -> Result<()> {
+        self.remove_unsized(key)?;
+        // The entry's record, key copies and memberships are freed: release
+        // what its insertion admitted.
+        if let Some(size) = self.mirror_sizes.remove(key)
+            && let Some(mirror) = self.tenant_mirror.as_mut()
+        {
+            mirror.release(size)?;
+        }
+        Ok(())
+    }
+    fn remove_unsized(&mut self, key: &str) -> Result<()> {
         if let Some(record) = self.records.remove(key) {
             if let Record::Root { submission, .. } = &record {
                 self.local_roots.remove(submission);
@@ -996,14 +1208,18 @@ impl Store {
         deletes: &[String],
         memory: Arc<crate::read_image_memory::ImageMemory>,
         db: &crate::Database,
-    ) -> Result<(DeltaRecords, CustodyCharge)> {
-        if self.durable.is_some() {
+    ) -> Result<(DeltaRecords, CustodyCharge, Option<TenantGrowth>)> {
+        if let Some(source) = &self.durable {
             let durable_memory = memory.clone();
-            if let Some((delta, visits, retained)) = self
-                .durable_read(|r| durable::validate_delta(r, writes, deletes, durable_memory, db))?
-            {
+            let mut growth = TenantGrowth {
+                sizes: AdmittedKeys::new(memory.clone(), "custody_tenant_sizes"),
+                charge: MirrorCharge::new(source.writer.clone()),
+            };
+            if let Some((delta, visits, retained)) = self.durable_read(|r| {
+                durable::validate_delta(r, writes, deletes, durable_memory, db, &mut growth)
+            })? {
                 self.validation_visits += visits;
-                return Ok((delta, retained));
+                return Ok((delta, retained, Some(growth)));
             }
         }
         let retained = CustodyCharge::new(memory.clone());
@@ -1063,7 +1279,7 @@ impl Store {
         for (key, record) in delta {
             admitted.insert_with(key.as_str(), key.len(), || key.clone(), record)?;
         }
-        Ok((admitted, retained))
+        Ok((admitted, retained, None))
     }
 }
 
@@ -2671,6 +2887,7 @@ mod durable {
         deletes: &[String],
         memory: Arc<ImageMemory>,
         db: &crate::Database,
+        growth: &mut super::TenantGrowth,
     ) -> Result<(DeltaRecords, u64, Scratch)> {
         admission_probe_start();
         let errors = error_reserve(&memory)?;
@@ -2692,7 +2909,20 @@ mod durable {
             }
             retained.admit_at("custody_delta_slot", entry_slot_bytes())?;
             retained.post("custody_delta_slot");
-            let record = decode_checked(&memory, &mut retained, key, bytes)?;
+            work::validation_decoded(1);
+            let (record, charged) = decode_charged(&memory, bytes)?;
+            retained.adopt(charged)?;
+            native_check(&memory, key, bytes)?;
+            if key.starts_with("tenant_") {
+                // The mirror's growth, admitted to the writer now; publication
+                // adopts it without a refund.
+                let size = super::mirror_entry_bytes(key, &record, charged)?;
+                growth.charge.admit("custody_tenant_growth", size)?;
+                growth
+                    .sizes
+                    .insert_with(key.as_str(), key.len(), || key.clone(), size)?;
+                growth.charge.post("custody_tenant_growth");
+            }
             delta.insert_with(key.as_str(), key.len(), || key.clone(), Some(record))?;
         }
         // Committed records this validation reads, each decoded once.

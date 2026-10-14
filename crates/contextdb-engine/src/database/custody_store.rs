@@ -27,6 +27,7 @@ enum CustodyRoot {
 pub(crate) struct CustodyDelta {
     _publication: crate::custody::store::Publication,
     records: crate::custody::store::DeltaRecords,
+    tenant_growth: Option<crate::custody::store::TenantGrowth>,
     bytes: BTreeMap<String, Option<Vec<u8>>>,
     /// The writer admission of `records`, released only after they are
     /// published or the commit aborts. Declared last so it drops last.
@@ -142,13 +143,23 @@ impl Database {
                 // The delivery journal stays durable and is read through the
                 // derived group index. Only the bounded tenant policy and
                 // binding records are mirrored.
-                for prefix in ["tenant_table_policy.v1.", "tenant_policy_binding.v1."] {
-                    entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
-                }
-                *cache = Some(Store::durable(
-                    std::mem::take(&mut entries),
-                    self.accountant.clone(),
-                )?);
+                // Each prefix's raw entries are sized first and admitted to
+                // the writer before they are loaded; the raw load is released
+                // once the mirror (admitted entry by entry) is built.
+                let mut raw = crate::custody::store::MirrorCharge::new(self.accountant.clone());
+                let mut load = |prefix: &str| {
+                    persistence.load_config_values_raw_admitted(prefix, &mut |bytes| {
+                        raw.admit("custody_tenant_raw", bytes)?;
+                        raw.post("custody_tenant_raw");
+                        Ok(())
+                    })
+                };
+                let parts = [
+                    load("tenant_table_policy.v1.")?,
+                    load("tenant_policy_binding.v1.")?,
+                ];
+                *cache = Some(Store::durable_admitted(parts, self.accountant.clone())?);
+                drop(raw);
             } else {
                 if let Some(image) = &self.committed_image_startup {
                     entries.extend(image.config_source.load_image_custody_config()?);
@@ -1312,13 +1323,14 @@ impl Database {
         #[cfg(feature = "test-seams")]
         LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST
             .with(|last| *last.borrow_mut() = Some(memory.clone()));
-        let (records, retained, publication) =
+        let (records, retained, tenant_growth, publication) =
             self.with_custody_store_at(CustodyRoot::Latest, |store| {
-                let (records, retained) =
+                let (records, retained, tenant_growth) =
                     store.validate_delta(&ws.config_writes, &ws.config_deletes, memory, self)?;
                 Ok((
                     records,
                     retained,
+                    tenant_growth,
                     crate::custody::store::Publication::begin(&store.publications),
                 ))
             })?;
@@ -1333,6 +1345,7 @@ impl Database {
         Ok(Some(CustodyDelta {
             _publication: publication,
             records,
+            tenant_growth,
             bytes,
             _retained: retained,
         }))
@@ -1341,13 +1354,9 @@ impl Database {
         let mut cache = self.custody_cache.lock();
         // A discard may have invalidated the old view while publishing its rows.
         if let Some(store) = cache.as_mut() {
-            for (key, record) in delta.records.into_sorted() {
-                match record {
-                    Some(record) => store.insert(key, record),
-                    None => store.remove(&key),
-                }
+            store
+                .publish(delta.records, delta.tenant_growth)
                 .expect("prevalidated custody key/index delta");
-            }
         }
         if !delta.bytes.is_empty() {
             let mut memory = self.custody_metadata.lock();
