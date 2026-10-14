@@ -32,15 +32,16 @@ const WRITER_LIMIT: usize = 512 * 1024 * 1024;
 const TARGET_ID: i64 = 1_000_000;
 const DECODE: &str = "writer_source/decode_stored_value";
 // Exact writer decode charge of one import-tail call on this fixture, per
-// absorbed vector and fixed. Per vector, the stored f32 body alone is charged
-// 48 + 16 * (DIMENSION - 1) = 24,608 bytes while it decodes (the decoder's
-// geometric-growth admission) plus DIMENSION * 4 = 6,144 for its owned copy;
-// the remaining 4,107 bytes are the vector's journal record, index name,
-// decode control and its share of the native append's page decodes.
-const DECODE_BYTES_PER_VECTOR: usize = 34_859;
-// The fixed part includes the final pass that finds the route covered.
+// absorbed vector and fixed (cumulative admissions; each value's charge is
+// returned before the next decodes). The stored f32 body is decoded into
+// exactly its length and its 6,144 bytes adopt the workspace's prepaid
+// credit, so they are not charged here; the rest is each vector's journal
+// record, index name, decode control and its share of the native append's
+// page decodes. The fixed part includes the final pass that finds the route
+// covered.
+const DECODE_BYTES_PER_VECTOR: usize = 6_808;
 const DECODE_BYTES_FIXED: usize = 57_128;
-const DECODE_ADMISSIONS_PER_VECTOR: usize = 1_554;
+const DECODE_ADMISSIONS_PER_VECTOR: usize = 28;
 const DECODE_ADMISSIONS_FIXED: usize = 369;
 
 fn vector_for(id: i64) -> Vec<f32> {
