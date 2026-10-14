@@ -487,6 +487,8 @@ pub(crate) fn admission_probe_start() {
 pub(crate) const PROBE_PRE: u8 = 0;
 pub(crate) const PROBE_POST: u8 = 1;
 pub(crate) const PROBE_REFUSED: u8 = 2;
+/// A charge was just refunded; what it funded must already be freed.
+pub(crate) const PROBE_RELEASED: u8 = 3;
 #[cfg(feature = "test-seams")]
 thread_local! {
     static BRACKET_PROBE: std::cell::Cell<Option<fn(&'static str, u8, usize, usize)>> =
@@ -1571,6 +1573,7 @@ mod durable {
             let bytes = bytes.min(self.bytes);
             self.memory.release(bytes);
             self.bytes -= bytes;
+            bracket("custody_release", PROBE_RELEASED, bytes, self.memory.held());
         }
         fn reset(&mut self) {
             self.memory.release(self.bytes);
@@ -1589,6 +1592,14 @@ mod durable {
                 memory: self.memory.clone(),
                 bytes,
             })
+        }
+        /// Take over every byte `other` holds on the same memory, without a
+        /// refund.
+        pub(crate) fn adopt_charge(&mut self, mut other: Scratch) -> Result<()> {
+            let bytes = other.bytes;
+            let debit = other.detach(bytes)?;
+            drop(other);
+            self.adopt_debit(debit)
         }
         /// Adopt a detached debit on the same memory, without a reservation.
         pub(crate) fn adopt_debit(&mut self, debit: Debit) -> Result<()> {
@@ -1615,6 +1626,12 @@ mod durable {
     impl Drop for Scratch {
         fn drop(&mut self) {
             self.memory.release(self.bytes);
+            bracket(
+                "custody_release",
+                PROBE_RELEASED,
+                self.bytes,
+                self.memory.held(),
+            );
         }
     }
 
@@ -1902,6 +1919,27 @@ mod durable {
             self.entries.push_within((key, value))?;
             self.order.insert(at, index)?;
             Ok(true)
+        }
+        /// Replace the value at `probe` in place, answering the old value,
+        /// or hand `value` back when `probe` is absent. No allocation.
+        pub(crate) fn replace<Q: Ord + ?Sized>(
+            &mut self,
+            probe: &Q,
+            value: V,
+        ) -> std::result::Result<V, V>
+        where
+            K: std::borrow::Borrow<Q>,
+        {
+            match self.search(probe) {
+                Ok(at) => {
+                    let index = self.order.as_slice()[at] as usize;
+                    Ok(std::mem::replace(
+                        &mut self.entries.as_mut_slice()[index].1,
+                        value,
+                    ))
+                }
+                Err(_) => Err(value),
+            }
         }
         pub(crate) fn len(&self) -> usize {
             self.entries.len()
@@ -2359,17 +2397,9 @@ mod durable {
                 .ok()
                 .map(|i| &records[by_key.as_slice()[i]])
         };
-        // The memo of loaded companions: fixed slots, keys owned by
-        // `memo_keys` until eviction.
-        let mut memo_slots = Scratch::new(memory.clone());
-        memo_slots.admit_at(
-            "custody_closure_memo",
-            slot_bytes::<(String, Probed)>(COMPANION_MEMO)?,
-        )?;
-        let mut memo: std::collections::VecDeque<(String, Probed)> =
-            std::collections::VecDeque::with_capacity(COMPANION_MEMO);
-        memo_slots.post("custody_closure_memo");
-        let mut memo_keys = Scratch::new(memory.clone());
+        // The memo of loaded companions, one owner of its entries, their
+        // key bytes and its slots.
+        let mut memo = MemoRing::new(memory)?;
         // Keys reached so far, as digests, and the closure keys to validate.
         let mut seen: AdmittedKeys<[u8; 32], ()> =
             AdmittedKeys::new(memory.clone(), "custody_closure_seen");
@@ -2389,8 +2419,7 @@ mod durable {
                 next_answer += 1;
                 (keys[next_answer - 1].as_str(), None, None)
             } else if let Some((owned, debit)) = queue.pop() {
-                let found = if in_answer(&owned).is_some() || memo.iter().any(|(k, _)| *k == owned)
-                {
+                let found = if in_answer(&owned).is_some() || memo.contains(&owned) {
                     None
                 } else {
                     Some(load(r, memory, &owned)?.ok_or_else(invalid)?)
@@ -2412,7 +2441,7 @@ mod durable {
             let record = match &loaded_self {
                 Some(probed) => probed.record(),
                 None => in_answer(key)
-                    .or_else(|| memo.iter().find(|(k, _)| k == key).map(|(_, p)| p.record()))
+                    .or_else(|| memo.find(key))
                     .ok_or_else(invalid)?,
             };
             let mut call = Scratch::new(memory.clone());
@@ -2423,7 +2452,7 @@ mod durable {
                 companions.len(),
             )?;
             for companion in companions.keys() {
-                if in_answer(companion).is_some() || memo.iter().any(|(k, _)| k == companion) {
+                if in_answer(companion).is_some() || memo.contains(companion) {
                     continue;
                 }
                 // An absent companion is simply not in the view; a required
@@ -2441,11 +2470,7 @@ mod durable {
                 )?;
                 for companion in companions.keys() {
                     if let Some(found) = in_answer(companion)
-                        .or_else(|| {
-                            memo.iter()
-                                .find(|(k, _)| k == companion)
-                                .map(|(_, p)| p.record())
-                        })
+                        .or_else(|| memo.find(companion))
                         .or_else(|| {
                             loaded
                                 .as_slice()
@@ -2469,7 +2494,7 @@ mod durable {
                     continue;
                 }
                 let present = loaded.as_slice().iter().any(|(k, _)| k == companion)
-                    || memo.iter().any(|(k, _)| k == companion);
+                    || memo.contains(companion);
                 if !present {
                     continue;
                 }
@@ -2481,21 +2506,11 @@ mod durable {
             drop(loaded_self);
             drop(owned_key);
             // Move each loaded companion into the memo: its key's debit
-            // moves from `call` to `memo_keys`; an evicted entry drops
-            // before its key's bytes are released.
+            // moves from `call` to the memo's key owner.
             let (loaded, loaded_capacity) = loaded.into_parts();
             for (owned, probed) in loaded {
-                if memo.len() == COMPANION_MEMO {
-                    if let Some((evicted, evicted_probe)) = memo.pop_front() {
-                        let bytes = evicted.len();
-                        drop(evicted_probe);
-                        drop(evicted);
-                        memo_keys.release(bytes);
-                    }
-                }
                 let debit = call.detach(owned.len())?;
-                memo_keys.adopt_debit(debit)?;
-                memo.push_back((owned, probed));
+                memo.push(owned, probed, debit)?;
             }
             drop(loaded_capacity);
             drop(companions);
@@ -2509,9 +2524,59 @@ mod durable {
             }
         }
         drop(memo);
-        drop(memo_keys);
-        drop(memo_slots);
         Ok(())
+    }
+
+    /// The closure walk's memo of loaded companions. Its fields drop in
+    /// declaration order, so on every exit (success, refusal or damage) the
+    /// entries are freed before their key bytes and slots are refunded.
+    struct MemoRing {
+        entries: std::collections::VecDeque<(String, Probed)>,
+        keys: Scratch,
+        slots: Scratch,
+    }
+    impl MemoRing {
+        fn new(memory: &Arc<ImageMemory>) -> Result<Self> {
+            let mut slots = Scratch::new(memory.clone());
+            slots.admit_at(
+                "custody_closure_memo",
+                slot_bytes::<(String, Probed)>(COMPANION_MEMO)?,
+            )?;
+            let entries = std::collections::VecDeque::with_capacity(COMPANION_MEMO);
+            slots.post("custody_closure_memo");
+            Ok(Self {
+                entries,
+                keys: Scratch::new(memory.clone()),
+                slots,
+            })
+        }
+        fn contains(&self, key: &str) -> bool {
+            self.entries.iter().any(|(k, _)| k == key)
+        }
+        fn find(&self, key: &str) -> Option<&Record> {
+            self.entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, probed)| probed.record())
+        }
+        /// Keep `key`'s record, adopting its key bytes' `debit`; when full,
+        /// the oldest entry is freed before its key bytes are released.
+        fn push(&mut self, key: String, probed: Probed, debit: Debit) -> Result<()> {
+            if self.entries.len() == COMPANION_MEMO
+                && let Some((evicted, evicted_probe)) = self.entries.pop_front()
+            {
+                let bytes = evicted.len();
+                drop(evicted_probe);
+                drop(evicted);
+                self.keys.release(bytes);
+            }
+            if self.entries.len() == self.entries.capacity() {
+                return Err(invalid());
+            }
+            self.keys.adopt_debit(debit)?;
+            self.entries.push_back((key, probed));
+            Ok(())
+        }
     }
 
     pub(crate) fn select<S: AsRef<str>>(
@@ -2894,10 +2959,18 @@ mod durable {
         let mut retained = Scratch::new(memory.clone());
         let mut scratch = Scratch::new(memory.clone());
         let mut delta: DeltaRecords = AdmittedKeys::new(memory.clone(), "custody_delta");
+        // Each delta entry's decoded-body charge, by key digest, so a body a
+        // later write replaces is refunded only after it is freed.
+        let mut charges: AdmittedKeys<[u8; 32], usize> =
+            AdmittedKeys::new(memory.clone(), "custody_delta_charges");
+        // Persistence applies the deletes, then the writes in order; the delta
+        // is that same final overlay (last write wins).
         for key in deletes.iter().filter(|k| owned_key(k)) {
             retained.admit_at("custody_delta_slot", entry_slot_bytes())?;
             retained.post("custody_delta_slot");
-            delta.insert_with(key.as_str(), key.len(), || key.clone(), None)?;
+            if !delta.insert_with(key.as_str(), key.len(), || key.clone(), None)? {
+                retained.release(entry_slot_bytes());
+            }
         }
         for (key, bytes) in writes.iter().filter(|(k, _)| owned_key(k)) {
             // An unchanged committed record (for example the authority
@@ -2915,16 +2988,43 @@ mod durable {
             native_check(&memory, key, bytes)?;
             if key.starts_with("tenant_") {
                 // The mirror's growth, admitted to the writer now; publication
-                // adopts it without a refund.
+                // adopts it without a refund. A replaced write's growth is
+                // released only after the new one is admitted.
                 let size = super::mirror_entry_bytes(key, &record, charged)?;
                 growth.charge.admit("custody_tenant_growth", size)?;
-                growth
-                    .sizes
-                    .insert_with(key.as_str(), key.len(), || key.clone(), size)?;
+                match growth.sizes.replace(key.as_str(), size) {
+                    Ok(old) => growth.charge.release(old)?,
+                    Err(size) => {
+                        growth
+                            .sizes
+                            .insert_with(key.as_str(), key.len(), || key.clone(), size)?;
+                    }
+                }
                 growth.charge.post("custody_tenant_growth");
             }
-            delta.insert_with(key.as_str(), key.len(), || key.clone(), Some(record))?;
+            let digest = verified::digest(&[key.as_bytes()]);
+            match delta.replace(key.as_str(), Some(record)) {
+                Ok(old) => {
+                    // The earlier body (or delete) of this key is replaced:
+                    // it is freed here, then its body charge and slot are
+                    // refunded.
+                    drop(old);
+                    let old_charge = match charges.replace(&digest, charged) {
+                        Ok(old_charge) => old_charge,
+                        Err(charged) => {
+                            charges.insert_with(&digest, 0, || digest, charged)?;
+                            0
+                        }
+                    };
+                    retained.release(old_charge + entry_slot_bytes());
+                }
+                Err(record) => {
+                    delta.insert_with(key.as_str(), key.len(), || key.clone(), record)?;
+                    charges.insert_with(&digest, 0, || digest, charged)?;
+                }
+            }
         }
+        drop(charges);
         // Committed records this validation reads, each decoded once.
         let mut committed: AdmittedKeys<String, (Option<Record>, usize)> =
             AdmittedKeys::new(memory.clone(), "custody_committed");

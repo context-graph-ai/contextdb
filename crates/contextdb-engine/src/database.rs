@@ -9398,6 +9398,10 @@ pub(crate) struct ReceivedSchemaStage {
     received_schema_manifest: Option<(String, DurableReceivedSchemaManifest)>,
     in_memory_lineage_delta: InMemoryLineageDelta,
     pub(crate) write_set: WriteSet,
+    /// The funding of the ownership keys custody retirement moved into
+    /// `write_set`; declared after it, so it is released only after the write
+    /// set is dropped.
+    retired_custody_keys: Option<crate::custody::store::CustodyCharge>,
     pub(crate) durable_projection: ReceivedSchemaPersistenceProjection,
     pub(crate) structurally_dropped_tables: HashSet<String>,
     pub(crate) change_log_entries: Vec<ChangeLogEntry>,
@@ -35498,6 +35502,10 @@ impl Database {
             let mut committed_trigger_audit_entries = Vec::new();
             let in_memory_lineage_delta = std::cell::RefCell::new(None);
             let prepared_delivery_memory = std::cell::RefCell::new(None);
+            // The funding of the ownership keys custody retirement moves into
+            // the write set. Declared before the write set (`ws` below), so it
+            // is released only after the write set is dropped, committed or not.
+            let retired_custody_keys = std::cell::RefCell::new(None);
             let committed_graph_arrivals =
                 std::cell::RefCell::new(Vec::<(GraphIdentity, DurableGraphArrival)>::new());
             let validation_noop_count = std::cell::Cell::new(0_u64);
@@ -35818,7 +35826,7 @@ impl Database {
                                 ));
                             }
                         }
-                        *prepared_delivery_memory.borrow_mut() = self.prepare_custody_commit(ws, read_memory.clone())?;
+                        *prepared_delivery_memory.borrow_mut() = self.prepare_custody_commit(ws, read_memory.clone(), &mut retired_custody_keys.borrow_mut())?;
                         #[cfg(any(test, feature = "test-seams"))]
                         let projection_started = Instant::now();
                         let prepared_sink_events = self
@@ -35907,8 +35915,11 @@ impl Database {
                             take_local_commit_stage_fault_for_test(
                                 LocalCommitStageFaultPoint::AfterLocalErasureStageRegistration,
                             );
-                            *prepared_delivery_memory.borrow_mut() =
-                                self.prepare_custody_commit(ws, read_memory.clone())?;
+                            *prepared_delivery_memory.borrow_mut() = self.prepare_custody_commit(
+                                ws,
+                                read_memory.clone(),
+                                &mut retired_custody_keys.borrow_mut(),
+                            )?;
                         }
                         if self.persistence.is_none() {
                             *in_memory_lineage_delta.borrow_mut() =
@@ -41951,6 +41962,7 @@ impl Database {
                 received_schema_manifest,
                 in_memory_lineage_delta,
                 write_set,
+                retired_custody_keys: None,
                 durable_projection: ReceivedSchemaPersistenceProjection {
                     schema_noop: true,
                     affected_tables: HashSet::new(),
@@ -42342,6 +42354,9 @@ impl Database {
                 }
             }
         }
+        // The funding of the ownership keys custody retirement moves into the
+        // write set, declared first so every exit drops the write set before it.
+        let mut retired_custody_keys = None;
         let mut finalized_write_set = working
             .detached_sync_write_set
             .lock()
@@ -42394,8 +42409,11 @@ impl Database {
                     .push((record.key()?, crate::custody::records::encode(&record)?));
             }
         }
-        let custody_memory =
-            self.prepare_custody_commit(&mut finalized_write_set, read_memory.clone())?;
+        let custody_memory = self.prepare_custody_commit(
+            &mut finalized_write_set,
+            read_memory.clone(),
+            &mut retired_custody_keys,
+        )?;
         let in_memory_lineage_delta = if self.persistence.is_none() {
             Self::prepare_in_memory_lineage_delta(&finalized_write_set.config_writes)?
         } else {
@@ -42981,6 +42999,7 @@ impl Database {
             received_schema_manifest,
             in_memory_lineage_delta,
             write_set: finalized_write_set,
+            retired_custody_keys,
             durable_projection,
             structurally_dropped_tables,
             change_log_entries,

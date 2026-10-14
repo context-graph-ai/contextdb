@@ -553,14 +553,18 @@ impl ImageMemory {
         match result {
             Ok(value) => Ok(value),
             Err(error) => {
+                // The decoder's error is alive under this owner's charges
+                // (its text was bounded and admitted as it was built). The
+                // returned error is rendered bounded before the decoder's is
+                // dropped, and the charges are released only after that.
+                let returned = if self.admitted {
+                    Error::SyncError(ADMITTED_CODEC_ERROR.into())
+                } else {
+                    Error::SyncError(bounded_text("MessagePack decode error: ", &error))
+                };
+                drop(error);
                 self.release(self.held() - before);
-                if self.admitted {
-                    drop(error);
-                    return Err(Error::SyncError(ADMITTED_CODEC_ERROR.into()));
-                }
-                Err(Error::SyncError(format!(
-                    "MessagePack decode error: {error}"
-                )))
+                Err(returned)
             }
         }
     }
@@ -989,7 +993,7 @@ pub(crate) fn reserve_output(bytes: usize) -> Result<()> {
 
 fn admit_output<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
     let owner = active_owner().map_err(E::custom)?;
-    if owner.failure.lock().is_some() {
+    if owner.failed() {
         return Err(E::custom("read image admission refused"));
     }
     if owner.adopt_prepaid_output(bytes) {
@@ -1100,6 +1104,142 @@ where
     }
     deserializer.deserialize_seq(ExactVec(PhantomData))
 }
+/// The longest detail a decoder error carries; longer text is cut at a char
+/// boundary before any copy of it exists.
+pub(crate) const DECODE_ERROR_DETAIL_MAX: usize = 16 * 1024;
+
+/// Counts, or writes, at most `cap` bytes of formatted text, cut at a char
+/// boundary: a counting pass and a writing pass agree byte for byte.
+struct BoundedWriter<'a> {
+    out: Option<&'a mut String>,
+    len: usize,
+    cap: usize,
+    full: bool,
+}
+impl std::fmt::Write for BoundedWriter<'_> {
+    fn write_str(&mut self, part: &str) -> std::fmt::Result {
+        if self.full {
+            return Ok(());
+        }
+        let room = self.cap - self.len;
+        let mut end = part.len().min(room);
+        if end < part.len() {
+            while !part.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.full = true;
+        }
+        if let Some(out) = self.out.as_deref_mut() {
+            out.push_str(&part[..end]);
+        }
+        self.len += end;
+        Ok(())
+    }
+}
+/// The bytes `prefix` + `detail` renders to, bounded at
+/// `prefix.len() + DECODE_ERROR_DETAIL_MAX`.
+fn bounded_len(prefix: &str, detail: &dyn std::fmt::Display) -> usize {
+    use std::fmt::Write;
+    let mut counter = BoundedWriter {
+        out: None,
+        len: 0,
+        cap: prefix.len() + DECODE_ERROR_DETAIL_MAX,
+        full: false,
+    };
+    let _ = write!(counter, "{prefix}{detail}");
+    counter.len
+}
+/// `prefix` + `detail`, bounded, in a string allocated at exactly its length.
+pub(crate) fn bounded_text(prefix: &str, detail: &dyn std::fmt::Display) -> String {
+    use std::fmt::Write;
+    let len = bounded_len(prefix, detail);
+    let mut text = String::with_capacity(len);
+    let mut writer = BoundedWriter {
+        out: Some(&mut text),
+        len: 0,
+        cap: len,
+        full: false,
+    };
+    let _ = write!(writer, "{prefix}{detail}");
+    text
+}
+
+const ADMISSION_REFUSED: &str = "read image admission refused";
+
+/// The error a decoder's visitors build inside an admitted decode: its text
+/// is measured first, cut at `DECODE_ERROR_DETAIL_MAX`, admitted to the
+/// active owner and only then allocated, and it releases that admission after
+/// its text is freed. Converting it into the decoder's own error type admits
+/// that copy before it exists; a refused admission keeps the owner's typed
+/// refusal and carries only the fixed static text.
+#[derive(Debug)]
+struct BoundedDecodeError {
+    text: Option<String>,
+    charge: Option<(Arc<ImageMemory>, usize)>,
+}
+impl BoundedDecodeError {
+    fn refused() -> Self {
+        Self {
+            text: None,
+            charge: None,
+        }
+    }
+    fn into_error<E: de::Error>(self) -> E {
+        let Some(text) = self.text.as_deref() else {
+            return E::custom(ADMISSION_REFUSED);
+        };
+        if let Ok(owner) = active_owner()
+            && let Err(error) = owner.reserve(text.len())
+        {
+            owner.keep_refusal(error);
+            return E::custom(ADMISSION_REFUSED);
+        }
+        E::custom(text)
+    }
+}
+impl Drop for BoundedDecodeError {
+    fn drop(&mut self) {
+        self.text = None;
+        if let Some((owner, bytes)) = self.charge.take() {
+            owner.release(bytes);
+        }
+    }
+}
+impl std::fmt::Display for BoundedDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text.as_deref().unwrap_or(ADMISSION_REFUSED))
+    }
+}
+impl std::error::Error for BoundedDecodeError {}
+impl de::Error for BoundedDecodeError {
+    fn custom<T: std::fmt::Display>(message: T) -> Self {
+        let len = bounded_len("", &message);
+        let Ok(owner) = active_owner() else {
+            return Self {
+                text: Some(bounded_text("", &message)),
+                charge: None,
+            };
+        };
+        if owner.failed() {
+            return Self::refused();
+        }
+        if let Err(error) = owner.reserve(len) {
+            owner.keep_refusal(error);
+            return Self::refused();
+        }
+        Self {
+            text: Some(bounded_text("", &message)),
+            charge: Some((owner, len)),
+        }
+    }
+}
+/// A visitor's answer with its bounded error carried into the decoder's own.
+fn bounded<T, E: de::Error>(
+    answer: std::result::Result<T, BoundedDecodeError>,
+) -> std::result::Result<T, E> {
+    answer.map_err(BoundedDecodeError::into_error)
+}
+
 fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
     let owner = active_owner().map_err(E::custom)?;
     if owner.failed() {
@@ -1143,8 +1283,10 @@ pub(crate) fn decode<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize)
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
+            let returned = Error::Other(bounded_text("bincode decode error: ", &error));
+            drop(error);
             owner.release(owner.held() - before);
-            Err(Error::Other(format!("bincode decode error: {error}")))
+            Err(returned)
         }
     }
 }
@@ -1250,52 +1392,52 @@ impl<'de, VV: Visitor<'de>> Visitor<'de> for V<VV> {
         self.inner.expecting(f)
     }
     fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_bool(value)
+        bounded(self.inner.visit_bool::<BoundedDecodeError>(value))
     }
     fn visit_i8<E: de::Error>(self, value: i8) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i8(value)
+        bounded(self.inner.visit_i8::<BoundedDecodeError>(value))
     }
     fn visit_i16<E: de::Error>(self, value: i16) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i16(value)
+        bounded(self.inner.visit_i16::<BoundedDecodeError>(value))
     }
     fn visit_i32<E: de::Error>(self, value: i32) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i32(value)
+        bounded(self.inner.visit_i32::<BoundedDecodeError>(value))
     }
     fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i64(value)
+        bounded(self.inner.visit_i64::<BoundedDecodeError>(value))
     }
     fn visit_i128<E: de::Error>(self, value: i128) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_i128(value)
+        bounded(self.inner.visit_i128::<BoundedDecodeError>(value))
     }
     fn visit_u8<E: de::Error>(self, value: u8) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u8(value)
+        bounded(self.inner.visit_u8::<BoundedDecodeError>(value))
     }
     fn visit_u16<E: de::Error>(self, value: u16) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u16(value)
+        bounded(self.inner.visit_u16::<BoundedDecodeError>(value))
     }
     fn visit_u32<E: de::Error>(self, value: u32) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u32(value)
+        bounded(self.inner.visit_u32::<BoundedDecodeError>(value))
     }
     fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u64(value)
+        bounded(self.inner.visit_u64::<BoundedDecodeError>(value))
     }
     fn visit_u128<E: de::Error>(self, value: u128) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_u128(value)
+        bounded(self.inner.visit_u128::<BoundedDecodeError>(value))
     }
     fn visit_f32<E: de::Error>(self, value: f32) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_f32(value)
+        bounded(self.inner.visit_f32::<BoundedDecodeError>(value))
     }
     fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_f64(value)
+        bounded(self.inner.visit_f64::<BoundedDecodeError>(value))
     }
     fn visit_char<E: de::Error>(self, value: char) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_char(value)
+        bounded(self.inner.visit_char::<BoundedDecodeError>(value))
     }
     fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_unit()
+        bounded(self.inner.visit_unit::<BoundedDecodeError>())
     }
     fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-        self.inner.visit_none()
+        bounded(self.inner.visit_none::<BoundedDecodeError>())
     }
     fn visit_some<D: de::Deserializer<'de>>(
         self,
@@ -1311,25 +1453,25 @@ impl<'de, VV: Visitor<'de>> Visitor<'de> for V<VV> {
     }
     fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
         admit(value.len())?;
-        self.inner.visit_str(value)
+        bounded(self.inner.visit_str::<BoundedDecodeError>(value))
     }
     fn visit_borrowed_str<E: de::Error>(
         self,
         value: &'de str,
     ) -> std::result::Result<Self::Value, E> {
         admit(value.len())?;
-        self.inner.visit_borrowed_str(value)
+        bounded(self.inner.visit_borrowed_str::<BoundedDecodeError>(value))
     }
     fn visit_bytes<E: de::Error>(self, value: &[u8]) -> std::result::Result<Self::Value, E> {
         admit(value.len())?;
-        self.inner.visit_bytes(value)
+        bounded(self.inner.visit_bytes::<BoundedDecodeError>(value))
     }
     fn visit_borrowed_bytes<E: de::Error>(
         self,
         value: &'de [u8],
     ) -> std::result::Result<Self::Value, E> {
         admit(value.len())?;
-        self.inner.visit_borrowed_bytes(value)
+        bounded(self.inner.visit_borrowed_bytes::<BoundedDecodeError>(value))
     }
     fn visit_seq<A: de::SeqAccess<'de>>(self, a: A) -> std::result::Result<Self::Value, A::Error> {
         let exact = self.heap && admit_exact_sequence::<A::Error>(a.size_hint())?;

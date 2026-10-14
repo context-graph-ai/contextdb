@@ -8,6 +8,8 @@ thread_local! {
     static CUSTODY_VALIDATION_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST: std::cell::RefCell<Option<Arc<crate::read_image_memory::ImageMemory>>> = const { std::cell::RefCell::new(None) };
     static LAST_CUSTODY_RETAINED_BYTES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LAST_RETIRED_FUNDING_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MEASURED_READER_FOR_TEST: std::cell::RefCell<Option<Arc<crate::read_image_memory::ImageMemory>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A captured writer root held by a test.
@@ -299,6 +301,42 @@ impl Database {
         ))
     }
     #[cfg(feature = "test-seams")]
+    /// Measurement only: commit raw custody CONFIG deletes and writes, in
+    /// order, in one transaction, with ordinary custody validation.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __commit_custody_records_for_test(
+        &self,
+        deletes: &[&str],
+        writes: &[(&str, Vec<u8>)],
+    ) -> Result<()> {
+        let tx = self.begin()?;
+        self.tx_mgr.with_write_set(tx, |ws| {
+            for key in deletes {
+                ws.config_deletes.push((*key).to_owned());
+            }
+            for (key, value) in writes {
+                ws.config_writes.push(((*key).to_owned(), value.clone()));
+            }
+        })?;
+        let committed = self.commit(tx);
+        *self.custody_cache.lock() = None;
+        committed
+    }
+    /// Measurement only: the bytes this thread's last custody retirement held
+    /// admitted for the ownership keys it moved into its write set.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __last_retired_custody_funding_for_test() -> usize {
+        LAST_RETIRED_FUNDING_FOR_TEST.with(std::cell::Cell::get)
+    }
+    /// Measurement only: what the reader memory of this thread's running
+    /// `__custody_caller_with_limit_for_test` holds admitted now.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_measured_held_for_test() -> Option<usize> {
+        MEASURED_READER_FOR_TEST.with(|reader| reader.borrow().as_ref().map(|memory| memory.held()))
+    }
     fn raw_custody_commit_for_test(
         &self,
         key: &str,
@@ -598,6 +636,7 @@ impl Database {
             _ => None,
         };
         let (accountant, memory) = Self::measured_memory_for_test(limit);
+        MEASURED_READER_FOR_TEST.with(|reader| *reader.borrow_mut() = Some(memory.clone()));
         let read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = memory.clone();
         let answer = match caller {
             "select" => self.custody_records_in(&[arg.to_owned()], read),
@@ -615,6 +654,7 @@ impl Database {
         let keys = answer.and_then(|records| records.iter().map(Record::key).collect());
         // What the caller's reader memory still holds once the answer dropped.
         let held = memory.held();
+        MEASURED_READER_FOR_TEST.with(|reader| *reader.borrow_mut() = None);
         drop(memory);
         drop(accountant);
         (keys, held)
@@ -1043,11 +1083,11 @@ impl Database {
         ws: &mut WriteSet,
         snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<()> {
+    ) -> Result<Option<CustodyCharge>> {
         use crate::custody::records::RowRef;
         use crate::custody::store::{AdmittedVec, CustodyCharge, Selector, render_row_group};
         if ws.relational_deletes.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // A manifest names rows only of a delivery root table and the member
         // tables that root declares. Deletes elsewhere own no custody record,
@@ -1066,10 +1106,12 @@ impl Database {
             .iter()
             .any(|(table, _, _)| delivery_table(table))
         {
-            return Ok(());
+            return Ok(None);
         }
         let Some(root) = self.writer_read_root()? else {
-            return self.retire_changed_custody_roots_resident(ws, snapshot, read_memory);
+            return self
+                .retire_changed_custody_roots_resident(ws, snapshot, read_memory)
+                .map(|()| None);
         };
         // Retirement working memory: the writer's, with its control admitted.
         let memory =
@@ -1120,7 +1162,7 @@ impl Database {
             })?;
             let rendered = (|| -> Result<()> {
                 let Some(key) = key else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 admit(table.len())?;
                 let reference = RowRef {
@@ -1136,7 +1178,7 @@ impl Database {
         }
         drop(source);
         if selectors.len() == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let mut keys = crate::custody::store::KeyList::with_exact(
             memory.clone(),
@@ -1153,7 +1195,9 @@ impl Database {
             keys.as_slice(),
         )?;
         drop(keys);
-        let mut scratch = CustodyCharge::new(memory.clone());
+        // Retired ownership keys, admitted as they are copied.
+        let mut retired =
+            crate::custody::store::KeyList::new(memory.clone(), "custody_retire_root_keys");
         for record in selected.iter() {
             let Record::Manifest(m) = record else {
                 continue;
@@ -1169,9 +1213,10 @@ impl Database {
             }) {
                 continue;
             }
-            // The ownership key, rendered from the life's finite encoding at
-            // its exact length and admitted before the copy exists.
+            // The ownership key, rendered from the life's finite encoding.
             let key = crate::custody::store::render_root_key(&mut group, &m.root_life)?;
+            // A re-registration can replace the same local ownership key in
+            // this commit.
             if ws
                 .config_writes
                 .iter()
@@ -1180,17 +1225,45 @@ impl Database {
                     .config_deletes
                     .iter()
                     .any(|deleted| deleted.as_str() == key)
+                || retired.as_slice().iter().any(|held| held.as_str() == key)
             {
                 continue;
             }
-            let owned_key = scratch.own_key("custody_retire_root_key", key)?;
-            // The key moves into the commit's write set, whose delete entries
-            // commit validation admits next (`validate_delta`).
-            let debit = scratch.detach(owned_key.len())?;
-            ws.config_deletes.push(owned_key);
-            drop(debit);
+            retired.push(key)?;
         }
-        Ok(())
+        drop(selected);
+        // The write set's delete list is the destination: its grown buffer
+        // and every key moved into it are admitted to `funding` before they
+        // exist there, and `funding` is held by the caller for as long as the
+        // write set lives (published, aborted or dropped).
+        let mut funding = CustodyCharge::new(memory.clone());
+        if retired.len() == 0 {
+            return Ok(Some(funding));
+        }
+        let needed = ws
+            .config_deletes
+            .len()
+            .checked_add(retired.len())
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        if ws.config_deletes.capacity() < needed {
+            let bytes = needed
+                .checked_mul(std::mem::size_of::<String>())
+                .and_then(|bytes| bytes.checked_add(crate::sync_types::held::ALLOCATION_BYTES))
+                .ok_or_else(crate::custody::canonical::invalid)?;
+            funding.admit_at("custody_retire_write_set", bytes)?;
+            let mut grown = Vec::with_capacity(needed);
+            if grown.capacity() > needed {
+                return Err(crate::custody::canonical::invalid());
+            }
+            grown.append(&mut ws.config_deletes);
+            ws.config_deletes = grown;
+            funding.post("custody_retire_write_set");
+        }
+        while let Some((key, debit)) = retired.pop() {
+            funding.adopt_debit(debit)?;
+            ws.config_deletes.push(key);
+        }
+        Ok(Some(funding))
     }
 
     /// The resident form, for a store without a durable writer root.
@@ -1294,21 +1367,35 @@ impl Database {
         Ok(())
     }
 
+    /// Retire changed roots, then validate the commit's custody delta.
+    /// `retired` receives the funding of the ownership keys retirement moved
+    /// into `ws`; the caller declares it before the write set so it is
+    /// released only after the write set is dropped.
     pub(super) fn prepare_custody_commit(
         &self,
         ws: &mut WriteSet,
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        retired: &mut Option<crate::custody::store::CustodyCharge>,
     ) -> Result<Option<CustodyDelta>> {
         #[cfg(feature = "test-seams")]
         if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) {
             return Ok(None);
         }
-        self.retire_changed_custody_roots(
+        let funding = self.retire_changed_custody_roots(
             ws,
             self.scoped_writer_root()
                 .map_or_else(|| self.snapshot_for_read(), |root| root.snapshot),
             read_memory.clone(),
         )?;
+        #[cfg(feature = "test-seams")]
+        LAST_RETIRED_FUNDING_FOR_TEST
+            .with(|last| last.set(funding.as_ref().map_or(0, CustodyCharge::bytes)));
+        if let Some(funding) = funding {
+            match retired {
+                Some(held) => held.adopt_charge(funding)?,
+                None => *retired = Some(funding),
+            }
+        }
         if !ws.config_writes.iter().any(|(key, _)| owned_key(key))
             && !ws.config_deletes.iter().any(|key| owned_key(key))
         {

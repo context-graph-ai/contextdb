@@ -104,8 +104,13 @@ mod writer_recycle_baseline_cost;
 #[path = "engine_seams/writer_file_ownership_survives_recycle.rs"]
 mod writer_file_ownership_survives_recycle;
 
+#[path = "engine_seams/a_custody_commit_validates_the_last_write_of_each_key.rs"]
+mod a_custody_commit_validates_the_last_write_of_each_key;
 #[path = "engine_seams/a_damaged_delivered_terminal_is_refused_never_excluded.rs"]
 mod a_damaged_delivered_terminal_is_refused_never_excluded;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/a_long_decoder_error_is_bounded_before_it_is_built.rs"]
+mod a_long_decoder_error_is_bounded_before_it_is_built;
 #[path = "engine_seams/a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic.rs"]
 mod a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic;
 #[path = "engine_seams/a_partial_closure_never_certifies_custody_evidence.rs"]
@@ -129,6 +134,8 @@ mod custody_fixture;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/custody_history_commits_do_not_hydrate_the_delivery_journal.rs"]
 mod custody_history_commits_do_not_hydrate_the_delivery_journal;
+#[path = "engine_seams/custody_long_key_fixture.rs"]
+mod custody_long_key_fixture;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/custody_reads_admit_every_buffer_before_allocating.rs"]
 mod custody_reads_admit_every_buffer_before_allocating;
@@ -152,6 +159,11 @@ mod paged_initial_replacement_and_reclamation_progress_under_writes;
 mod pending_delivery_pages_resume_without_gaps;
 #[path = "engine_seams/pending_delivery_reads_only_the_pending_tail.rs"]
 mod pending_delivery_reads_only_the_pending_tail;
+#[path = "engine_seams/retired_custody_keys_stay_funded_until_the_write_set_drops.rs"]
+mod retired_custody_keys_stay_funded_until_the_write_set_drops;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/the_closure_memo_frees_its_entries_before_refunding_them.rs"]
+mod the_closure_memo_frees_its_entries_before_refunding_them;
 #[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
 mod unpartitioned_vector_membership_pages_reload_at_constant_residency;
 #[path = "engine_seams/version_pruning_and_compaction_resume_finite_safe_batches.rs"]
