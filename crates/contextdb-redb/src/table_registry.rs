@@ -64,7 +64,12 @@ impl RegistryFunding {
         } else {
             self.live.fetch_sub(layout.size(), Ordering::SeqCst);
             #[cfg(feature = "test-seams")]
-            self.record(self.allocations.load(Ordering::SeqCst), address, layout, false);
+            self.record(
+                self.allocations.load(Ordering::SeqCst),
+                address,
+                layout,
+                false,
+            );
             #[cfg(not(feature = "test-seams"))]
             let _ = address;
         }
@@ -104,9 +109,7 @@ unsafe impl Allocator for RegistryAlloc {
         if funding.fallible.load(Ordering::SeqCst) {
             let credit = funding.credit.load(Ordering::SeqCst);
             if layout.size() > credit {
-                funding
-                    .refused_size
-                    .store(layout.size(), Ordering::SeqCst);
+                funding.refused_size.store(layout.size(), Ordering::SeqCst);
                 funding
                     .refused_align
                     .store(layout.align(), Ordering::SeqCst);
@@ -120,9 +123,7 @@ unsafe impl Allocator for RegistryAlloc {
             return Ok(block);
         }
         if funding.monitoring.load(Ordering::SeqCst) {
-            funding
-                .overdraft
-                .fetch_add(layout.size(), Ordering::SeqCst);
+            funding.overdraft.fetch_add(layout.size(), Ordering::SeqCst);
         }
         let block = Global.allocate(layout)?;
         funding.note(block.cast::<u8>().as_ptr() as usize, layout, true);

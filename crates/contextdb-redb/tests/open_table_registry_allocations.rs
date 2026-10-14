@@ -247,7 +247,11 @@ fn a_refused_probe_or_preparation_changes_nothing_and_overflow_is_distinguished(
     let mut held = Vec::new();
     for n in 0..100 {
         reserve_exactly(&write, 1);
-        held.push(write.open_table(definition(&format!("t{n}"))).expect("open"));
+        held.push(
+            write
+                .open_table(definition(&format!("t{n}")))
+                .expect("open"),
+        );
     }
     let before = write.open_table_registry_bytes();
     assert_eq!(
@@ -287,7 +291,11 @@ fn an_unfunded_growth_while_monitored_is_counted_as_an_overdraft() {
     let monitor = write.open_table_registry_monitor();
     let mut held = Vec::new();
     for n in 0..64 {
-        held.push(write.open_table(definition(&format!("t{n}"))).expect("open"));
+        held.push(
+            write
+                .open_table(definition(&format!("t{n}")))
+                .expect("open"),
+        );
     }
     assert!(
         monitor.overdraft_bytes() > 0,

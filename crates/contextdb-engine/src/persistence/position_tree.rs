@@ -126,7 +126,10 @@ impl PositionTree {
 
     /// Descend once. `order(position)` places the sought key relative to that
     /// position: `Less` goes left, `Greater` goes right, `Equal` is found.
-    pub(in crate::persistence) fn search(&self, mut order: impl FnMut(u32) -> Ordering) -> Result<u32, Vacancy> {
+    pub(in crate::persistence) fn search(
+        &self,
+        mut order: impl FnMut(u32) -> Ordering,
+    ) -> Result<u32, Vacancy> {
         let mut vacancy = Vacancy {
             path: [(NO_POSITION, false); MAX_DEPTH],
             depth: 0,
@@ -176,7 +179,10 @@ impl PositionTree {
 
     /// The last position in tree order for which `holds` is true, when it is
     /// true for a prefix of that order.
-    pub(in crate::persistence) fn last_where(&self, mut holds: impl FnMut(u32) -> bool) -> Option<u32> {
+    pub(in crate::persistence) fn last_where(
+        &self,
+        mut holds: impl FnMut(u32) -> bool,
+    ) -> Option<u32> {
         let mut found = None;
         let mut node = self.root;
         while node != NO_POSITION {
@@ -193,7 +199,10 @@ impl PositionTree {
 
     /// The first position in tree order for which `holds` is true, when it is
     /// true for a suffix of that order.
-    pub(in crate::persistence) fn first_where(&self, mut holds: impl FnMut(u32) -> bool) -> Option<u32> {
+    pub(in crate::persistence) fn first_where(
+        &self,
+        mut holds: impl FnMut(u32) -> bool,
+    ) -> Option<u32> {
         let mut found = None;
         let mut node = self.root;
         while node != NO_POSITION {

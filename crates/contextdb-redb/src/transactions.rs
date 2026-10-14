@@ -823,8 +823,7 @@ impl TableNamespace<'_> {
     fn registry_cost_to_reserve(
         &mut self,
         additional: usize,
-    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
-    {
+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
         let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
         match self.open_tables.try_reserve(additional) {
             Ok(()) => Ok(None),
@@ -858,8 +857,7 @@ impl TableNamespace<'_> {
     fn registry_cost_to_hold(
         &self,
         len: usize,
-    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
-    {
+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
         let mut scratch = crate::table_registry::new_open_tables(&self.registry_funding);
         let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
         match scratch.try_reserve(len) {
@@ -877,8 +875,10 @@ impl TableNamespace<'_> {
         &self,
         len: usize,
         credit: usize,
-    ) -> Result<crate::table_registry::RegistryReplacement, crate::table_registry::RegistryReserveError>
-    {
+    ) -> Result<
+        crate::table_registry::RegistryReplacement,
+        crate::table_registry::RegistryReserveError,
+    > {
         let mut map = crate::table_registry::new_open_tables(&self.registry_funding);
         let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
         map.try_reserve(len)
@@ -1839,7 +1839,13 @@ impl WriteTransaction {
     pub fn open_table_registry_install(
         &self,
         replacement: Option<crate::RegistryReplacement>,
-    ) -> Result<usize, (crate::RegistryReserveError, Option<crate::RegistryReplacement>)> {
+    ) -> Result<
+        usize,
+        (
+            crate::RegistryReserveError,
+            Option<crate::RegistryReplacement>,
+        ),
+    > {
         self.tables
             .lock()
             .unwrap()
@@ -1851,9 +1857,7 @@ impl WriteTransaction {
     #[cfg(feature = "contextdb-internal")]
     #[doc(hidden)]
     pub fn open_table_registry_monitor(&self) -> crate::RegistryMonitor {
-        crate::table_registry::RegistryMonitor::start(
-            &self.tables.lock().unwrap().registry_funding,
-        )
+        crate::table_registry::RegistryMonitor::start(&self.tables.lock().unwrap().registry_funding)
     }
 
     /// Whether `name` already has a staged root update in this transaction.

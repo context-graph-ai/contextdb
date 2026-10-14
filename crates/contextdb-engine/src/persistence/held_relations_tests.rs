@@ -123,17 +123,33 @@ fn holding_every_relation_is_admitted_exactly_and_returned_when_the_pass_ends() 
             charged(&ledger),
             "while holding, the accountant holds exactly the ledger's charges"
         );
-        let names: usize = tables.iter().map(|table| 2 * relation_name(table).len()).sum();
-        assert_eq!(ledger.names, names, "each handle's and registry key's name is admitted");
-        assert!(ledger.registry > 0, "holding grew the registry and funded it");
+        let names: usize = tables
+            .iter()
+            .map(|table| 2 * relation_name(table).len())
+            .sum();
         assert_eq!(
-            ledger.temp_name + ledger.names_pending + ledger.registry_pending
-                + ledger.scratch_pending + ledger.slots_pending + ledger.nodes_pending,
+            ledger.names, names,
+            "each handle's and registry key's name is admitted"
+        );
+        assert!(
+            ledger.registry > 0,
+            "holding grew the registry and funded it"
+        );
+        assert_eq!(
+            ledger.temp_name
+                + ledger.names_pending
+                + ledger.registry_pending
+                + ledger.scratch_pending
+                + ledger.slots_pending
+                + ledger.nodes_pending,
             0,
             "nothing is left provisional between lookups"
         );
         if baseline > 0 {
-            assert!(ledger.scratch > 0, "a baseline-sized replacement was prepared");
+            assert!(
+                ledger.scratch > 0,
+                "a baseline-sized replacement was prepared"
+            );
         }
         assert_eq!(take_held_overdraft(), 0, "no registry growth went unfunded");
     }
@@ -149,7 +165,10 @@ fn a_relation_that_does_not_fit_the_writer_budget_is_refused_before_it_is_opened
     let probe = Arc::new(MemoryAccountant::no_limit());
     let _ = hold_all(&db, &tables[..7], 0, &probe);
     let needs = probe.high_water_for_test();
-    assert!(needs > fits, "the seventh relation raises the peak: {fits} -> {needs}");
+    assert!(
+        needs > fits,
+        "the seventh relation raises the peak: {fits} -> {needs}"
+    );
     let owner = Arc::new(MemoryAccountant::with_budget(needs - 1));
     let write = db.begin_write().expect("begin");
     let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
@@ -174,8 +193,16 @@ fn a_relation_that_does_not_fit_the_writer_budget_is_refused_before_it_is_opened
             (_, other) => panic!("a typed budget refusal, not {other:?}"),
         }
     }
-    assert_eq!(owner.usage().used, 0, "a refused pass returns every admitted byte");
-    assert_eq!(write.open_table_registry_len(), 0, "no relation is left open");
+    assert_eq!(
+        owner.usage().used,
+        0,
+        "a refused pass returns every admitted byte"
+    );
+    assert_eq!(
+        write.open_table_registry_len(),
+        0,
+        "no relation is left open"
+    );
     assert_eq!(take_held_overdraft(), 0);
     drop(write);
 }
@@ -215,9 +242,7 @@ fn a_pass_that_fails_at_any_step_returns_everything_and_leaves_nothing_open() {
                 for n in 0..5 {
                     others.push(
                         write
-                            .open_table(TableDefinition::<&[u8], &[u8]>::new(&format!(
-                                "other_{n}"
-                            )))
+                            .open_table(TableDefinition::<&[u8], &[u8]>::new(&format!("other_{n}")))
                             .expect("open a baseline table"),
                     );
                 }
@@ -241,7 +266,11 @@ fn a_pass_that_fails_at_any_step_returns_everything_and_leaves_nothing_open() {
                     }
                 }
                 drop(admission);
-                assert_eq!(owner.usage().used, 0, "{label}: every admitted byte came back");
+                assert_eq!(
+                    owner.usage().used,
+                    0,
+                    "{label}: every admitted byte came back"
+                );
                 assert!(
                     write.open_table_registry_bytes() <= baseline_bytes,
                     "{label}: the grown registry array was freed"
@@ -251,7 +280,11 @@ fn a_pass_that_fails_at_any_step_returns_everything_and_leaves_nothing_open() {
                     5,
                     "{label}: only the baseline tables are open"
                 );
-                assert_eq!(take_held_overdraft(), 0, "{label}: no unfunded registry growth");
+                assert_eq!(
+                    take_held_overdraft(),
+                    0,
+                    "{label}: no unfunded registry growth"
+                );
                 drop(others);
                 drop(write);
             }
@@ -274,8 +307,8 @@ fn descending_first_use_holds_each_relation_with_logarithmic_work() {
     for count in [256usize, 512, 1_024, 2_048] {
         let tables: Vec<String> = (0..count).map(|n| format!("d{n:05}")).collect();
         let root = tempfile::tempdir().expect("fixture directory");
-        let db = redb::Database::create(root.path().join("descending.redb"))
-            .expect("create the store");
+        let db =
+            redb::Database::create(root.path().join("descending.redb")).expect("create the store");
         let write = db.begin_write().expect("begin the fixture write");
         for table in &tables {
             write
@@ -313,7 +346,10 @@ fn descending_first_use_holds_each_relation_with_logarithmic_work() {
         .expect("every relation is held");
         let work = commit_row_work::take_held_relation_work();
         let bound = held_relation_work_bound(order.len(), count);
-        eprintln!("held_relation_work tables={count} lookups={} work={work} bound={bound}", order.len());
+        eprintln!(
+            "held_relation_work tables={count} lookups={} work={work} bound={bound}",
+            order.len()
+        );
         assert_eq!(opened, count, "each relation opens once per pass");
         assert!(
             work <= bound,

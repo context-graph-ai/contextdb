@@ -1599,12 +1599,12 @@
  mod sealed;
  mod table;
 +mod table_registry;
-+#[cfg(feature = "contextdb-internal")]
-+#[doc(hidden)]
-+pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveError};
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
 +pub use table_registry::RegistryAllocationRecord;
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveError};
 +#[cfg(feature = "test-seams")]
 +mod table_write_observer;
 +#[cfg(feature = "test-seams")]
@@ -2588,7 +2588,7 @@
 +}
 --- /dev/null
 +++ b/src/table_registry.rs
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,252 @@
 +//! The write transaction's set of open tables.
 +//!
 +//! It is the same hash table and the same randomly seeded hasher as
@@ -2655,7 +2655,12 @@
 +        } else {
 +            self.live.fetch_sub(layout.size(), Ordering::SeqCst);
 +            #[cfg(feature = "test-seams")]
-+            self.record(self.allocations.load(Ordering::SeqCst), address, layout, false);
++            self.record(
++                self.allocations.load(Ordering::SeqCst),
++                address,
++                layout,
++                false,
++            );
 +            #[cfg(not(feature = "test-seams"))]
 +            let _ = address;
 +        }
@@ -2695,9 +2700,7 @@
 +        if funding.fallible.load(Ordering::SeqCst) {
 +            let credit = funding.credit.load(Ordering::SeqCst);
 +            if layout.size() > credit {
-+                funding
-+                    .refused_size
-+                    .store(layout.size(), Ordering::SeqCst);
++                funding.refused_size.store(layout.size(), Ordering::SeqCst);
 +                funding
 +                    .refused_align
 +                    .store(layout.align(), Ordering::SeqCst);
@@ -2711,9 +2714,7 @@
 +            return Ok(block);
 +        }
 +        if funding.monitoring.load(Ordering::SeqCst) {
-+            funding
-+                .overdraft
-+                .fetch_add(layout.size(), Ordering::SeqCst);
++            funding.overdraft.fetch_add(layout.size(), Ordering::SeqCst);
 +        }
 +        let block = Global.allocate(layout)?;
 +        funding.note(block.cast::<u8>().as_ptr() as usize, layout, true);
@@ -3389,8 +3390,7 @@
 +    fn registry_cost_to_reserve(
 +        &mut self,
 +        additional: usize,
-+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
-+    {
++    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
 +        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
 +        match self.open_tables.try_reserve(additional) {
 +            Ok(()) => Ok(None),
@@ -3424,8 +3424,7 @@
 +    fn registry_cost_to_hold(
 +        &self,
 +        len: usize,
-+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
-+    {
++    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
 +        let mut scratch = crate::table_registry::new_open_tables(&self.registry_funding);
 +        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
 +        match scratch.try_reserve(len) {
@@ -3443,8 +3442,10 @@
 +        &self,
 +        len: usize,
 +        credit: usize,
-+    ) -> Result<crate::table_registry::RegistryReplacement, crate::table_registry::RegistryReserveError>
-+    {
++    ) -> Result<
++        crate::table_registry::RegistryReplacement,
++        crate::table_registry::RegistryReserveError,
++    > {
 +        let mut map = crate::table_registry::new_open_tables(&self.registry_funding);
 +        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
 +        map.try_reserve(len)
@@ -3752,7 +3753,7 @@
          Ok(false)
      }
  
-@@ -1349,7 +1737,202 @@
+@@ -1349,7 +1737,206 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -3858,7 +3859,13 @@
 +    pub fn open_table_registry_install(
 +        &self,
 +        replacement: Option<crate::RegistryReplacement>,
-+    ) -> Result<usize, (crate::RegistryReserveError, Option<crate::RegistryReplacement>)> {
++    ) -> Result<
++        usize,
++        (
++            crate::RegistryReserveError,
++            Option<crate::RegistryReplacement>,
++        ),
++    > {
 +        self.tables
 +            .lock()
 +            .unwrap()
@@ -3870,9 +3877,7 @@
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
 +    pub fn open_table_registry_monitor(&self) -> crate::RegistryMonitor {
-+        crate::table_registry::RegistryMonitor::start(
-+            &self.tables.lock().unwrap().registry_funding,
-+        )
++        crate::table_registry::RegistryMonitor::start(&self.tables.lock().unwrap().registry_funding)
 +    }
 +
 +    /// Whether `name` already has a staged root update in this transaction.
@@ -3955,7 +3960,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +1956,13 @@
+@@ -1373,6 +1960,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -3969,7 +3974,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +1974,21 @@
+@@ -1384,10 +1978,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -3992,7 +3997,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +2013,29 @@
+@@ -1412,7 +2017,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -4023,7 +4028,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +2081,39 @@
+@@ -1458,9 +2085,39 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -4063,7 +4068,7 @@
      }
  
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +2122,45 @@
+@@ -1469,11 +2126,45 @@
              self.two_phase_commit = true;
          }
  
@@ -4111,7 +4116,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +2171,102 @@
+@@ -1484,6 +2175,102 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -4214,7 +4219,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,18 +2410,39 @@
+@@ -1627,18 +2414,39 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -4258,7 +4263,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2484,17 @@
+@@ -1680,7 +2488,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -4277,7 +4282,7 @@
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2502,11 @@
+@@ -1688,6 +2506,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -4289,7 +4294,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2517,146 @@
+@@ -1698,6 +2521,146 @@
              self.mem.free(page, &mut PageTrackerPolicy::Ignore);
          }
  
@@ -4436,7 +4441,7 @@
          Ok(())
      }
  
-@@ -1766,6 +2725,9 @@
+@@ -1766,6 +2729,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -4446,7 +4451,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2785,384 @@
+@@ -1823,46 +2789,384 @@
          Ok(progress)
      }
  
@@ -4861,7 +4866,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +3337,18 @@
+@@ -2037,6 +3341,18 @@
          })
      }
  
@@ -4880,7 +4885,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +3419,148 @@
+@@ -2107,18 +3423,148 @@
      tree: TableTree,
  }
  
@@ -5030,7 +5035,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3577,69 @@
+@@ -2135,12 +3581,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -5101,7 +5106,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +3660,7 @@
+@@ -2161,7 +3664,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -5110,7 +5115,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +3688,7 @@
+@@ -2189,7 +3692,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -5119,7 +5124,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +3716,7 @@
+@@ -2217,7 +3720,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -5128,7 +5133,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +3762,15 @@
+@@ -2263,7 +3766,15 @@
  
  #[cfg(test)]
  mod test {
@@ -5145,7 +5150,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3791,919 @@
+@@ -2284,4 +3795,919 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }

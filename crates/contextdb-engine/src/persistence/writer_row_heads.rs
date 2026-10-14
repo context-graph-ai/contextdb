@@ -1,6 +1,6 @@
 //! A row's latest physical identity is maintained beside logical publication.
-use super::*;
 use super::relational_version_manifest::position_tree::{NO_POSITION, PositionTree, Vacancy};
+use super::*;
 
 #[cfg(test)]
 #[path = "held_relations_tests.rs"]
@@ -223,7 +223,12 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         used
     }
 
-    fn first_use_named(&mut self, table: &'name str, name: &str, vacancy: Vacancy) -> Result<usize> {
+    fn first_use_named(
+        &mut self,
+        table: &'name str,
+        name: &str,
+        vacancy: Vacancy,
+    ) -> Result<usize> {
         let definition = TableDefinition::<&[u8], &[u8]>::new(name);
         let exists = self
             .write
@@ -384,7 +389,10 @@ impl<A: RowHeadAdmission> Drop for HeldRelations<'_, '_, '_, A> {
         // Put the tables open when the pass started back into the prepared
         // array, freeing the array this pass grew, without allocating.
         if self.ledger.registry > 0 {
-            match self.write.open_table_registry_install(self.replacement.take()) {
+            match self
+                .write
+                .open_table_registry_install(self.replacement.take())
+            {
                 Ok(freed) => {
                     debug_assert_eq!(freed, self.ledger.registry);
                     self.release(|ledger| &mut ledger.registry);

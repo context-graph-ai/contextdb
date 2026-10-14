@@ -1457,7 +1457,11 @@ pub(in super::super) mod commit_row_work {
 
     pub(in super::super::super) fn note_held_first_use(table: &str) {
         HELD_FIRST_USES.with(|uses| {
-            if let Some(pass) = uses.borrow_mut().as_mut().and_then(|passes| passes.last_mut()) {
+            if let Some(pass) = uses
+                .borrow_mut()
+                .as_mut()
+                .and_then(|passes| passes.last_mut())
+            {
                 pass.push(table.to_owned());
             }
         });
