@@ -11711,6 +11711,8 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub commit_index_entries: usize,
     pub commit_index_charge: usize,
     pub persistence_cache: usize,
+    /// The durable custody store's fixed companion memo, admitted to the writer.
+    pub custody_companion_memo: usize,
     pub current_membership_charge: usize,
     pub captured_membership_charge: usize,
     pub current_membership_by_table: std::collections::BTreeMap<String, usize>,
@@ -68700,6 +68702,11 @@ impl Database {
                 0
             };
             receipt.persistence_cache = self.persistence.as_ref().map_or(0, |p| p.cache_charge());
+            receipt.custody_companion_memo = self
+                .custody_cache
+                .lock()
+                .as_ref()
+                .map_or(0, crate::custody::store::Store::companion_memo_charge);
             (
                 receipt.current_membership_charge,
                 receipt.captured_membership_charge,
@@ -68777,6 +68784,7 @@ impl Database {
                 + receipt.change_log_charges.iter().sum::<usize>()
                 + receipt.commit_index_charge
                 + receipt.persistence_cache
+                + receipt.custody_companion_memo
                 + receipt.current_membership_charge
                 + receipt.captured_membership_charge
                 + receipt.sink_window_charge;

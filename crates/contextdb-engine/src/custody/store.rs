@@ -483,6 +483,13 @@ impl Store {
         }
         Ok(store)
     }
+    /// The writer bytes this store's companion memo holds admitted.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn companion_memo_charge(&self) -> usize {
+        self.checked_charge
+            .as_ref()
+            .map_or(0, |charge| charge.bytes())
+    }
     pub fn is_durable(&self) -> bool {
         self.durable.is_some()
     }
