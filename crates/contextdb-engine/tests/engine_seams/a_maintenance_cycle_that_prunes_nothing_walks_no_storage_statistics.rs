@@ -7,8 +7,11 @@ use contextdb_core::{Value, Wallclock};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const NOW: u64 = 1_800_000_000_000;
+const RETAIN_MILLIS: u64 = 3650 * 24 * 60 * 60 * 1000;
 const TABLES: [&str; 3] = ["retained_events", "passages", "links"];
 const ROWS_PER_STATEMENT: usize = 500;
 
@@ -72,9 +75,13 @@ struct Observation {
     pages_under_pruning_guard: u64,
     warm_cycle_micros: u128,
     warm_cycle_compacted: bool,
+    pruned_rows: u64,
+    pruning_ratio: f64,
+    pruning_pages_under_pruning_guard: u64,
 }
 
-fn observe(rows: usize) -> Observation {
+fn observe(rows: usize, clock: &AtomicU64) -> Observation {
+    clock.store(NOW, Ordering::SeqCst);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("growth.redb");
     seed(&path, rows);
@@ -104,6 +111,13 @@ fn observe(rows: usize) -> Observation {
     let (before, _) = db.__storage_statistics_pages_walked_for_test();
     let on_demand_ratio = db.__storage_fragmentation_ratio_for_test().unwrap().unwrap();
     let on_demand_pages = db.__storage_statistics_pages_walked_for_test().0 - before;
+
+    // Once the retained rows age out, the cycle that prunes them takes its
+    // decision on the exact pre-prune ratio, still never under the guard.
+    clock.store(NOW + RETAIN_MILLIS + 1, Ordering::SeqCst);
+    let (_, before_guarded) = db.__storage_statistics_pages_walked_for_test();
+    let pruning = db.run_maintenance_cycle().unwrap();
+    let (_, after_pruning_guarded) = db.__storage_statistics_pages_walked_for_test();
     db.close().unwrap();
     Observation {
         on_demand_pages,
@@ -113,14 +127,19 @@ fn observe(rows: usize) -> Observation {
         pages_under_pruning_guard: after_guarded - before_guarded,
         warm_cycle_micros,
         warm_cycle_compacted: warm.pruning.compacted || warm.compaction.ran,
+        pruned_rows: pruning.pruning.pruned_rows,
+        pruning_ratio: pruning.pruning.fragmentation_before,
+        pruning_pages_under_pruning_guard: after_pruning_guarded - before_guarded,
     }
 }
 
 #[test]
 fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_store_grows() {
-    let _clock = Wallclock::test_clock_guard(|| NOW);
-    let small = observe(10_000);
-    let large = observe(50_000);
+    let clock = Arc::new(AtomicU64::new(NOW));
+    let reader = clock.clone();
+    let _clock = Wallclock::test_clock_guard(move || reader.load(Ordering::SeqCst));
+    let small = observe(10_000, &clock);
+    let large = observe(50_000, &clock);
     for (rows, observation) in [(10_000, &small), (50_000, &large)] {
         println!(
             "rows={rows} on_demand_pages={} on_demand_ratio={} first_cycle_pages={} \
@@ -162,6 +181,19 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
         "a fresh open inside the interval of the store's last decision walks no statistics pages"
     );
     assert!(!small.warm_cycle_compacted && !large.warm_cycle_compacted);
+    for observation in [&small, &large] {
+        // Retention examines a fixed window per cycle, so one cycle may
+        // prune only part of the expired rows.
+        assert!(observation.pruned_rows > 0, "expired retained rows are pruned");
+        assert_eq!(
+            observation.pruning_ratio, observation.on_demand_ratio,
+            "a pruning cycle reports the exact ratio the store had before it pruned"
+        );
+        assert_eq!(
+            observation.pruning_pages_under_pruning_guard, 0,
+            "a pruning cycle measures the store with the pruning guard released"
+        );
+    }
     // Secondary, load-tolerant: the same empty cycle costs about the same at
     // five times the history. The 5 ms floor absorbs scheduler noise.
     let floor = 5_000;
