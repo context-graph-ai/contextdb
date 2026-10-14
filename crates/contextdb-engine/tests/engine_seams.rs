@@ -124,6 +124,8 @@ mod custody_fixture;
 #[path = "engine_seams/custody_history_commits_do_not_hydrate_the_delivery_journal.rs"]
 mod custody_history_commits_do_not_hydrate_the_delivery_journal;
 #[cfg(target_os = "linux")]
+#[path = "engine_seams/custody_admissions_are_bracketed_and_refusable.rs"]
+mod custody_admissions_are_bracketed_and_refusable;
 #[path = "engine_seams/custody_reads_admit_every_buffer_before_allocating.rs"]
 mod custody_reads_admit_every_buffer_before_allocating;
 #[path = "engine_seams/custody_reads_stay_on_the_operations_captured_root.rs"]

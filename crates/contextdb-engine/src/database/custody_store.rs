@@ -533,6 +533,74 @@ impl Database {
             self.with_custody_store(|store| store.select(&[selector.to_owned()], memory, self))?;
         answer.iter().map(Record::key).collect()
     }
+    /// Measurement only: report every labelled custody admission bracket on
+    /// this thread as `(label, phase, invoice bytes, operation bytes held)`;
+    /// phases are 0 before the reservation, 1 after the funded allocation
+    /// exists and 2 at a refusal.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __set_custody_bracket_probe_for_test(probe: Option<fn(&'static str, u8, usize, usize)>) {
+        crate::custody::store::set_bracket_probe_for_test(probe);
+    }
+    /// Measurement only: refuse the `occurrence`-th (1-based) custody
+    /// admission labelled `label` on this thread before it reserves. Answers
+    /// the previous setting, which is `None` once an injected refusal fired.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_refuse_at_for_test(
+        at: Option<(&'static str, usize)>,
+    ) -> Option<(&'static str, usize)> {
+        crate::custody::store::refuse_at_for_test(at)
+    }
+    /// Measurement only: one production custody read caller under a reader
+    /// memory of `limit` bytes. `caller` is `select` (`arg` a selector),
+    /// `authority`, `submission` (`arg` a submission id), `table` (`arg` a
+    /// table), `root` or `rows` (`arg` a stored manifest key whose root row
+    /// is read; resolved before the measured call) or `pending`. Answers the
+    /// answer's keys or the refusal, and the bytes still admitted once the
+    /// answer dropped.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_caller_with_limit_for_test(
+        &self,
+        caller: &str,
+        arg: &str,
+        limit: usize,
+    ) -> (Result<Vec<String>>, usize) {
+        let root = match caller {
+            "root" | "rows" => match self
+                .custody_records_in(&[arg.to_owned()], self.declared_reader_memory().unwrap())
+                .and_then(|records| match records.first() {
+                    Some(Record::Manifest(m)) => Ok(m.seal.root.clone()),
+                    _ => Err(crate::custody::canonical::invalid()),
+                }) {
+                Ok(root) => Some(root),
+                Err(error) => return (Err(error), 0),
+            },
+            _ => None,
+        };
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
+        let read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = memory.clone();
+        let answer = match caller {
+            "select" => self.custody_records_in(&[arg.to_owned()], read),
+            "authority" => self.custody_authority(read),
+            "submission" => match arg.parse() {
+                Ok(id) => self.custody_submission(id, read),
+                Err(_) => Err(crate::custody::canonical::invalid()),
+            },
+            "table" => self.custody_table(arg, read),
+            "root" => self.custody_root(root.as_ref().unwrap(), read),
+            "rows" => self.custody_rows(std::slice::from_ref(root.as_ref().unwrap()), read),
+            "pending" => self.custody_pending_manifests(read),
+            _ => Err(crate::custody::canonical::invalid()),
+        };
+        let keys = answer.and_then(|records| records.iter().map(Record::key).collect());
+        // What the caller's reader memory still holds once the answer dropped.
+        let held = memory.held();
+        drop(memory);
+        drop(accountant);
+        (keys, held)
+    }
     /// Measurement only: the stored edge terminal at `key` with `elements`
     /// small JSON values appended to its root key: a canonical record whose
     /// decoded size far exceeds its encoding (its signature no longer holds).

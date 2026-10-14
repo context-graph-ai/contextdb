@@ -399,8 +399,10 @@ pub(crate) fn set_bracket_probe_for_test(probe: Option<fn(&'static str, u8, usiz
 /// Measurement only: refuse the `occurrence`-th (1-based) admission labelled
 /// `label` on this thread, before it reserves anything.
 #[cfg(feature = "test-seams")]
-pub(crate) fn refuse_at_for_test(at: Option<(&'static str, usize)>) {
-    REFUSE_AT.with(|cell| cell.set(at));
+pub(crate) fn refuse_at_for_test(
+    at: Option<(&'static str, usize)>,
+) -> Option<(&'static str, usize)> {
+    REFUSE_AT.with(|cell| cell.replace(at))
 }
 /// One bracket edge: production-dead outside the measurement seam.
 #[inline]
@@ -1199,9 +1201,23 @@ fn native_check(
         memory.held(),
     );
     if refusal_injected("custody_native_funder") {
+        bracket(
+            "custody_native_funder",
+            PROBE_REFUSED,
+            funder_bytes,
+            memory.held(),
+        );
         return Err(injected_refusal("custody_native_funder", funder_bytes));
     }
-    memory.reserve(funder_bytes)?;
+    if let Err(refused) = memory.reserve(funder_bytes) {
+        bracket(
+            "custody_native_funder",
+            PROBE_REFUSED,
+            funder_bytes,
+            memory.held(),
+        );
+        return Err(refused);
+    }
     let funds = Arc::new(VerificationFunds {
         memory: memory.clone(),
         refusal: parking_lot::Mutex::new(None),
@@ -1211,6 +1227,7 @@ fn native_check(
     let checked = (|| -> std::result::Result<(), Failure> {
         bracket("custody_native_key", PROBE_PRE, 0, memory.held());
         if refusal_injected("custody_native_key") {
+            bracket("custody_native_key", PROBE_REFUSED, 0, memory.held());
             return Err(Failure::Unqualified(injected_refusal(
                 "custody_native_key",
                 0,
@@ -1229,6 +1246,7 @@ fn native_check(
         }
         bracket("custody_native_signature", PROBE_PRE, 0, memory.held());
         if refusal_injected("custody_native_signature") {
+            bracket("custody_native_signature", PROBE_REFUSED, 0, memory.held());
             return Err(Failure::Unqualified(injected_refusal(
                 "custody_native_signature",
                 0,
