@@ -695,11 +695,15 @@ impl Database {
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
-        self.custody_records_in(&["tenant_", "delivery_"], read_memory.clone())
+        self.custody_records_in_at(
+            CustodyRoot::Operation,
+            &["tenant_", "delivery_"],
+            read_memory.clone(),
+        )
     }
-    pub(crate) fn custody_records_in<S: AsRef<str>>(
+    pub(crate) fn custody_records_in(
         &self,
-        selectors: &[S],
+        selectors: &[String],
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
         self.custody_records_in_at(CustodyRoot::Operation, selectors, read_memory)
@@ -789,14 +793,19 @@ impl Database {
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
-        self.custody_records_in(&["@authority", "@policies"], read_memory.clone())
+        self.custody_records_in_at(
+            CustodyRoot::Operation,
+            &["@authority", "@policies"],
+            read_memory.clone(),
+        )
     }
     pub(crate) fn custody_submission(
         &self,
         submission: uuid::Uuid,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
-        self.custody_records_in(
+        self.custody_records_in_at(
+            CustodyRoot::Operation,
             &[crate::custody::store::Selector::submission(submission)?],
             read_memory.clone(),
         )

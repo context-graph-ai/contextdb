@@ -760,7 +760,7 @@ impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemory {
 pub(crate) const ADMITTED_CODEC_ERROR: &str = "MessagePack decode error: malformed input";
 
 /// A memory refusal kept by value until its owner's caller takes it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Refused {
     requested: usize,
     available: usize,
