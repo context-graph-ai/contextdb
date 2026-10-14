@@ -1315,7 +1315,7 @@ impl ManifestOverlay for [ContentIdentityMutation] {
         let mut selected: Option<&[u8]> = None;
         for mutation in self {
             #[cfg(any(test, feature = "test-seams"))]
-            commit_row_work::count_overlay_entries(1);
+            commit_row_work::count_overlay_comparisons(1);
             let key = overlay_coordinate(mutation);
             if mutation.logical_value.is_none()
                 || !std::ptr::eq(
@@ -1340,7 +1340,7 @@ fn latest_in_slice<'a>(
 ) -> Option<&'a ContentIdentityMutation> {
     pending.iter().rev().find(|mutation| {
         #[cfg(any(test, feature = "test-seams"))]
-        commit_row_work::count_overlay_entries(1);
+        commit_row_work::count_overlay_comparisons(1);
         overlay_coordinate(mutation) == coordinate
     })
 }
@@ -1389,7 +1389,7 @@ pub(in super::super) mod commit_row_work {
     use std::cell::Cell;
 
     thread_local! {
-        static OVERLAY_ENTRIES: Cell<u64> = const { Cell::new(0) };
+        static OVERLAY_COMPARISONS: Cell<u64> = const { Cell::new(0) };
         static PROTECTED_ROOT_EVENTS: Cell<u64> = const { Cell::new(0) };
     }
 
@@ -1404,14 +1404,17 @@ pub(in super::super) mod commit_row_work {
         PROTECTED_ROOT_EVENTS.with(|count| count.replace(0))
     }
 
-    /// Overlay work: pending deltas compared by the unindexed overlay, one
-    /// probe per lookup or candidate step by the indexed overlay.
-    pub(in super::super::super) fn count_overlay_entries(entries: usize) {
-        OVERLAY_ENTRIES.with(|count| count.set(count.get().saturating_add(entries as u64)));
+    /// Overlay work in one unit for every overlay: one comparison of a
+    /// pending delta's coordinate (a list element the unindexed overlay
+    /// examines, a tree node the indexed overlay descends through while
+    /// indexing or seeking) or one rebalancing step on an indexing path.
+    pub(in super::super::super) fn count_overlay_comparisons(comparisons: usize) {
+        OVERLAY_COMPARISONS
+            .with(|count| count.set(count.get().saturating_add(comparisons as u64)));
     }
 
-    pub(in super::super::super) fn take_overlay_entries() -> u64 {
-        OVERLAY_ENTRIES.with(|count| count.replace(0))
+    pub(in super::super::super) fn take_overlay_comparisons() -> u64 {
+        OVERLAY_COMPARISONS.with(|count| count.replace(0))
     }
 }
 

@@ -1484,15 +1484,28 @@ impl RetainedReadSource {
     }
 }
 
-/// Publication-ordered manifest deltas plus sorted runs of their positions,
-/// each run ordered by (coordinate, position). Runs merge like a binary
-/// counter, so a position is copied O(log n) times in all and an overlay seek
-/// is one binary search per run instead of a rescan of every delta the rows
-/// before it staged. The runs hold four-byte positions, never a coordinate.
+/// Publication-ordered manifest deltas plus a height-balanced search tree over
+/// their positions, ordered by (coordinate, position). Delta `i` is tree node
+/// `i`, so a node holds two child positions and a height, never a copied
+/// coordinate. Indexing a delta and every overlay seek descend the tree once:
+/// O(log n) coordinate comparisons instead of a rescan of every delta the rows
+/// before it staged.
 pub(super) struct PendingManifestMutations {
-    runs: Vec<Vec<u32>>,
+    nodes: Vec<PendingIndexNode>,
+    root: u32,
     list: Vec<content_identity::ContentIdentityMutation>,
 }
+#[derive(Clone, Copy)]
+struct PendingIndexNode {
+    left: u32,
+    right: u32,
+    height: u8,
+}
+/// The absent child; a publication never holds `u32::MAX` deltas.
+const NO_PENDING_NODE: u32 = u32::MAX;
+/// The deepest root-to-leaf path of a height-balanced tree of fewer than
+/// `u32::MAX` nodes is under 1.45 log2(n + 2), so 64 entries always suffice.
+const PENDING_INDEX_MAX_DEPTH: usize = 64;
 impl std::ops::Deref for PendingManifestMutations {
     type Target = [content_identity::ContentIdentityMutation];
     fn deref(&self) -> &Self::Target {
@@ -1504,53 +1517,140 @@ impl PendingManifestMutations {
         manifest::overlay_coordinate(&self.list[position as usize])
     }
 
-    /// Bytes the next position's run and its merge cascade allocate.
-    fn index_bytes_for_next(&self) -> usize {
-        let mut bytes = PENDING_INDEX_POSITION_BYTES;
-        if self.runs.capacity() == 0 {
-            bytes += PENDING_INDEX_MAX_RUNS * std::mem::size_of::<Vec<u32>>();
+    fn height(&self, node: u32) -> u8 {
+        if node == NO_PENDING_NODE {
+            0
+        } else {
+            self.nodes[node as usize].height
         }
-        let mut length = 1usize;
-        for run in self.runs.iter().rev() {
-            if run.len() != length {
-                break;
-            }
-            length *= 2;
-            bytes += length * PENDING_INDEX_POSITION_BYTES;
-        }
-        bytes
     }
 
-    /// The position of the latest delta at `coordinate`.
+    fn update_height(&mut self, node: u32) {
+        let PendingIndexNode { left, right, .. } = self.nodes[node as usize];
+        self.nodes[node as usize].height = 1 + self.height(left).max(self.height(right));
+    }
+
+    fn rotate_right(&mut self, node: u32) -> u32 {
+        let pivot = self.nodes[node as usize].left;
+        self.nodes[node as usize].left = self.nodes[pivot as usize].right;
+        self.nodes[pivot as usize].right = node;
+        self.update_height(node);
+        self.update_height(pivot);
+        pivot
+    }
+
+    fn rotate_left(&mut self, node: u32) -> u32 {
+        let pivot = self.nodes[node as usize].right;
+        self.nodes[node as usize].right = self.nodes[pivot as usize].left;
+        self.nodes[pivot as usize].left = node;
+        self.update_height(node);
+        self.update_height(pivot);
+        pivot
+    }
+
+    /// The root of `node`'s subtree once its heights differ by at most one.
+    fn rebalance(&mut self, node: u32) -> u32 {
+        self.update_height(node);
+        let PendingIndexNode { left, right, .. } = self.nodes[node as usize];
+        if self.height(left) > self.height(right) + 1 {
+            let inner = self.nodes[left as usize];
+            if self.height(inner.left) < self.height(inner.right) {
+                self.nodes[node as usize].left = self.rotate_left(left);
+            }
+            return self.rotate_right(node);
+        }
+        if self.height(right) > self.height(left) + 1 {
+            let inner = self.nodes[right as usize];
+            if self.height(inner.right) < self.height(inner.left) {
+                self.nodes[node as usize].right = self.rotate_right(right);
+            }
+            return self.rotate_left(node);
+        }
+        node
+    }
+
+    /// Index the delta just pushed at `position` (the last one). Its node's
+    /// storage was admitted and reserved before the delta was pushed. A later
+    /// delta at an equal coordinate sorts after every earlier one.
+    fn index_last(&mut self, position: u32) {
+        debug_assert_eq!(position as usize + 1, self.list.len());
+        debug_assert!(self.nodes.len() < self.nodes.capacity());
+        self.nodes.push(PendingIndexNode {
+            left: NO_PENDING_NODE,
+            right: NO_PENDING_NODE,
+            height: 1,
+        });
+        let mut path = [(NO_PENDING_NODE, false); PENDING_INDEX_MAX_DEPTH];
+        let mut depth = 0;
+        let mut node = self.root;
+        while node != NO_PENDING_NODE {
+            #[cfg(any(test, feature = "test-seams"))]
+            manifest::commit_row_work::count_overlay_comparisons(1);
+            let left = self.coordinate(position) < self.coordinate(node);
+            path[depth] = (node, left);
+            depth += 1;
+            let entry = self.nodes[node as usize];
+            node = if left { entry.left } else { entry.right };
+        }
+        let mut subtree = position;
+        while let Some(parent) = depth.checked_sub(1) {
+            depth = parent;
+            #[cfg(any(test, feature = "test-seams"))]
+            manifest::commit_row_work::count_overlay_comparisons(1);
+            let (node, left) = path[depth];
+            if left {
+                self.nodes[node as usize].left = subtree;
+            } else {
+                self.nodes[node as usize].right = subtree;
+            }
+            subtree = self.rebalance(node);
+        }
+        self.root = subtree;
+    }
+
+    /// The position of the latest delta at `coordinate`: the largest
+    /// (coordinate, position) not after it, when its coordinate is equal.
     fn latest_position(&self, coordinate: &[u8]) -> Option<u32> {
-        self.runs
-            .iter()
-            .filter_map(|run| {
-                let end = run.partition_point(|&position| self.coordinate(position) <= coordinate);
-                let last = *run.get(end.checked_sub(1)?)?;
-                (self.coordinate(last) == coordinate).then_some(last)
-            })
-            .max()
+        let mut found = None;
+        let mut node = self.root;
+        while node != NO_PENDING_NODE {
+            #[cfg(any(test, feature = "test-seams"))]
+            manifest::commit_row_work::count_overlay_comparisons(1);
+            let entry = self.nodes[node as usize];
+            if self.coordinate(node) <= coordinate {
+                found = Some(node);
+                node = entry.right;
+            } else {
+                node = entry.left;
+            }
+        }
+        #[cfg(any(test, feature = "test-seams"))]
+        manifest::commit_row_work::count_overlay_comparisons(1);
+        found.filter(|&position| self.coordinate(position) == coordinate)
     }
 
     /// The smallest pending coordinate after `bound` (at it when inclusive).
     fn next_coordinate(&self, bound: &[u8], exclusive: bool) -> Option<&[u8]> {
-        self.runs
-            .iter()
-            .filter_map(|run| {
-                let start = run.partition_point(|&position| {
-                    let key = self.coordinate(position);
-                    if exclusive { key <= bound } else { key < bound }
-                });
-                run.get(start).map(|&position| self.coordinate(position))
-            })
-            .min()
+        let mut found = None;
+        let mut node = self.root;
+        while node != NO_PENDING_NODE {
+            #[cfg(any(test, feature = "test-seams"))]
+            manifest::commit_row_work::count_overlay_comparisons(1);
+            let entry = self.nodes[node as usize];
+            let key = self.coordinate(node);
+            let after = if exclusive { key > bound } else { key >= bound };
+            if after {
+                found = Some(key);
+                node = entry.left;
+            } else {
+                node = entry.right;
+            }
+        }
+        found
     }
 }
 impl manifest::ManifestOverlay for PendingManifestMutations {
     fn latest_present(&self, coordinate: &[u8]) -> Option<bool> {
-        #[cfg(any(test, feature = "test-seams"))]
-        manifest::commit_row_work::count_overlay_entries(1);
         self.latest_position(coordinate)
             .map(|position| self.list[position as usize].logical_value.is_some())
     }
@@ -1558,8 +1658,6 @@ impl manifest::ManifestOverlay for PendingManifestMutations {
     fn first_present_from(&self, start: &[u8], exclusive: bool) -> Option<&[u8]> {
         let (mut bound, mut exclusive) = (start, exclusive);
         loop {
-            #[cfg(any(test, feature = "test-seams"))]
-            manifest::commit_row_work::count_overlay_entries(1);
             let candidate = self.next_coordinate(bound, exclusive)?;
             if self
                 .latest_position(candidate)
@@ -1572,11 +1670,6 @@ impl manifest::ManifestOverlay for PendingManifestMutations {
     }
 }
 
-/// Runs a pending publication can hold: run lengths are distinct powers of
-/// two, so a `u32` position space never needs more than 33.
-const PENDING_INDEX_MAX_RUNS: usize = 33;
-const PENDING_INDEX_POSITION_BYTES: usize = std::mem::size_of::<u32>();
-
 /// Finite writer-funded publication deltas. Field order frees every mutation
 /// and the native container before its original proof invoices are returned.
 pub(super) struct PendingManifestPublication {
@@ -1587,7 +1680,8 @@ impl PendingManifestPublication {
     pub(super) fn new(admission: content_identity::OwnedProofAdmission) -> Self {
         Self {
             mutations: PendingManifestMutations {
-                runs: Vec::new(),
+                nodes: Vec::new(),
+                root: NO_PENDING_NODE,
                 list: Vec::new(),
             },
             admission,
@@ -1611,8 +1705,27 @@ impl PendingManifestPublication {
             self.admission
                 .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
         }
-        let position = u32::try_from(list.len())
-            .map_err(|_| Error::Other("manifest publication position overflow".into()))?;
+        let nodes = &mut self.mutations.nodes;
+        if nodes.len() == nodes.capacity() {
+            let old = nodes.capacity();
+            let capacity = old
+                .checked_mul(2)
+                .map(|n| n.max(4))
+                .ok_or_else(|| Error::Other("manifest publication capacity overflow".into()))?;
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<PendingIndexNode>())
+                .ok_or_else(|| Error::Other("manifest publication layout overflow".into()))?;
+            self.admission.admit(bytes)?;
+            let mut next = Vec::with_capacity(capacity);
+            next.extend_from_slice(nodes);
+            *nodes = next;
+            self.admission
+                .release(old * std::mem::size_of::<PendingIndexNode>());
+        }
+        let position = u32::try_from(self.mutations.list.len())
+            .ok()
+            .filter(|position| *position != NO_PENDING_NODE)
+            .ok_or_else(|| Error::Other("manifest publication position overflow".into()))?;
         let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
         self.admission.admit(bytes)?;
         let mutation = manifest::manifest_mutation(coordinate, present)?;
@@ -1621,54 +1734,9 @@ impl PendingManifestPublication {
                 + mutation.logical_value.as_ref().map_or(0, Vec::capacity),
             bytes
         );
-        let index_bytes = self.mutations.index_bytes_for_next();
-        if let Err(error) = self.admission.admit(index_bytes) {
-            drop(mutation);
-            self.admission.release(bytes);
-            return Err(error);
-        }
         self.mutations.list.push(mutation);
-        self.index_position(position);
+        self.mutations.index_last(position);
         Ok(())
-    }
-
-    /// Add `position` (the delta just pushed) as a run of one, then merge
-    /// equal-length tail runs. `index_bytes_for_next` admitted every buffer
-    /// this allocates, at exactly its length; each freed input is released.
-    fn index_position(&mut self, position: u32) {
-        if self.mutations.runs.capacity() == 0 {
-            self.mutations.runs.reserve_exact(PENDING_INDEX_MAX_RUNS);
-        }
-        let mut run = Vec::with_capacity(1);
-        run.push(position);
-        self.mutations.runs.push(run);
-        while let [.., older, newer] = self.mutations.runs.as_slice()
-            && older.len() == newer.len()
-        {
-            let newer = self.mutations.runs.pop().expect("tail run");
-            let older = self.mutations.runs.pop().expect("tail run");
-            let mut merged = Vec::with_capacity(older.len() + newer.len());
-            let (mut left, mut right) = (older.iter().peekable(), newer.iter().peekable());
-            // Every position in `newer` is later than every one in `older`,
-            // so equal coordinates keep publication order by taking `older`
-            // first.
-            while let (Some(&&l), Some(&&r)) = (left.peek(), right.peek()) {
-                if self.mutations.coordinate(l) <= self.mutations.coordinate(r) {
-                    merged.push(l);
-                    left.next();
-                } else {
-                    merged.push(r);
-                    right.next();
-                }
-            }
-            merged.extend(left);
-            merged.extend(right);
-            let freed = (older.len() + newer.len()) * PENDING_INDEX_POSITION_BYTES;
-            drop(older);
-            drop(newer);
-            self.admission.release(freed);
-            self.mutations.runs.push(merged);
-        }
     }
 }
 

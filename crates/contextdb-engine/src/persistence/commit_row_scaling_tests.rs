@@ -11,15 +11,19 @@
 //! (N = 512 to 4,096 for the update). Two exact work counters are read around
 //! each commit, on the committing thread:
 //!
-//! * pending manifest overlay probes made while each row's version membership
-//!   is overlaid on the unpublished deltas of the rows before it (each probe
-//!   is a binary search per sorted run of pending positions);
+//! * pending manifest overlay comparisons: every comparison of a pending
+//!   delta's coordinate made while each row's version membership is indexed
+//!   and overlaid on the unpublished deltas of the rows before it, plus every
+//!   rebalancing step of that index (the unindexed overlay of the base
+//!   revision counts one per list element it examines, in the same unit);
 //! * opens, closes, deletes and relocations of historical-root-protected
 //!   tables, each of which makes redb finalize the checksums of every page the
 //!   transaction has dirtied in the tables closed since the previous one.
 //!
-//! Doubling the rows may at most double the overlay work (plus a fixed
-//! allowance). Protected-table root events must not grow with the rows at
+//! Doubling the rows from N to 2N may at most grow the overlay comparisons by
+//! the N log N factor, 2N log2(2N) / (N log2 N), plus a fixed allowance: a
+//! seek is one root-to-leaf descent of a balanced index, never a rescan of
+//! the deltas already pending (which grows them 4x or 8x per doubling). Protected-table root events must not grow with the rows at
 //! all: each one costs work proportional to the pages already dirtied, so one
 //! per row (or one per change of table between consecutive rows) is
 //! quadratic. Wall time is printed as a fact and never asserted.
@@ -38,7 +42,7 @@ const PROTECTED_ROOT_EVENT_ALLOWANCE: u64 = 64;
 #[derive(Debug, Clone, Copy)]
 struct CommitWork {
     rows: usize,
-    overlay_entries: u64,
+    overlay_comparisons: u64,
     protected_root_events: u64,
 }
 
@@ -83,7 +87,7 @@ impl Measured {
 fn take_work(rows: usize) -> CommitWork {
     CommitWork {
         rows,
-        overlay_entries: commit_row_work::take_overlay_entries(),
+        overlay_comparisons: commit_row_work::take_overlay_comparisons(),
         protected_root_events: commit_row_work::take_protected_root_events(),
     }
 }
@@ -206,17 +210,18 @@ fn assert_linear(measured: Measured) {
     for rows in measured.row_counts() {
         let work = commit_one_transaction(rows, measured);
         assert!(
-            work.overlay_entries >= rows as u64,
+            work.overlay_comparisons >= rows as u64,
             "every committed row consults the pending manifest overlay: {work:?}"
         );
         if let Some(previous) = previous {
+            let n_log_n = |rows: usize| rows as u128 * u128::from(rows.ilog2());
+            let allowed = u128::from(previous.overlay_comparisons) * n_log_n(rows)
+                / n_log_n(previous.rows)
+                + u128::from(FIXED_ALLOWANCE);
             assert!(
-                work.overlay_entries
-                    <= previous
-                        .overlay_entries
-                        .saturating_mul(2)
-                        .saturating_add(FIXED_ALLOWANCE),
-                "overlay entries grew faster than the rows: {previous:?} -> {work:?}"
+                u128::from(work.overlay_comparisons) <= allowed,
+                "overlay comparisons grew faster than N log N: {previous:?} -> {work:?}, \
+                 allowed {allowed}"
             );
             assert!(
                 work.protected_root_events
@@ -253,4 +258,83 @@ fn an_import_alternating_between_two_tables_opens_each_relation_once_per_commit(
 #[test]
 fn an_update_alternating_between_two_tables_opens_each_relation_once_per_commit() {
     assert_linear(Measured::AlternatingUpdate);
+}
+
+/// The indexed overlay answers every seek exactly as a rescan of the
+/// publication-ordered list does: across duplicate coordinates, removals and
+/// re-additions, coordinates that prefix one another, and inclusive and
+/// exclusive bounds, after every delta of a deterministic sequence.
+#[test]
+fn the_indexed_pending_overlay_answers_every_seek_as_the_list_rescan_does() {
+    use super::{NO_PENDING_NODE, PendingManifestMutations};
+    use crate::persistence::content_identity::version_manifest::ManifestOverlay;
+    use crate::persistence::content_identity::{ContentIdentityMutation, LogicalFamily};
+
+    // A manifest key is the ordered-history magic, one kind byte, then the
+    // coordinate; the overlay reads only the coordinate.
+    const KEY_PREFIX: &[u8] = b"\xffcontextdb-history\0\x01";
+    const ALPHABET: [u8; 4] = [0x00, 0x01, 0x7f, 0xff];
+    let coordinates: Vec<Vec<u8>> = (1..=3)
+        .flat_map(|length| {
+            (0..ALPHABET.len().pow(length)).map(move |mut ordinal| {
+                (0..length)
+                    .map(|_| {
+                        let byte = ALPHABET[ordinal % ALPHABET.len()];
+                        ordinal /= ALPHABET.len();
+                        byte
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+    let mut probes = coordinates.clone();
+    probes.push(Vec::new());
+    let deltas = 1_500;
+    let mut index = PendingManifestMutations {
+        nodes: Vec::with_capacity(deltas),
+        root: NO_PENDING_NODE,
+        list: Vec::with_capacity(deltas),
+    };
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for delta in 0..deltas {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let coordinate = &coordinates[(state % coordinates.len() as u64) as usize];
+        let mut key = KEY_PREFIX.to_vec();
+        key.extend_from_slice(coordinate);
+        index.list.push(if (state >> 40) & 3 == 0 {
+            ContentIdentityMutation::remove(LogicalFamily::ChangeAndDdl, key)
+        } else {
+            ContentIdentityMutation::put(LogicalFamily::ChangeAndDdl, key, [1])
+        });
+        index.index_last(delta as u32);
+        // A balanced tree of n nodes is under 1.45 log2(n + 2) high.
+        let n = (delta + 2) as f64;
+        assert!(
+            f64::from(index.height(index.root)) <= 1.45 * n.log2(),
+            "the index stays balanced at {} deltas",
+            delta + 1
+        );
+        if delta % 37 != 0 && delta + 1 != deltas {
+            continue;
+        }
+        let list: &[ContentIdentityMutation] = &index.list;
+        for probe in &probes {
+            assert_eq!(
+                index.latest_present(probe),
+                list.latest_present(probe),
+                "latest delta at {probe:?} after {} deltas",
+                delta + 1
+            );
+            for exclusive in [false, true] {
+                assert_eq!(
+                    index.first_present_from(probe, exclusive),
+                    list.first_present_from(probe, exclusive),
+                    "first present from {probe:?} (exclusive {exclusive}) after {} deltas",
+                    delta + 1
+                );
+            }
+        }
+    }
 }
