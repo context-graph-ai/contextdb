@@ -65029,6 +65029,15 @@ impl Database {
         redb::Database::free_total_geometry_region_visits_for_test()
     }
 
+    /// Production-dead: the allocator's maintained `(free pages, region
+    /// pages, trailing free pages)`; `None` while untrusted.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __allocator_free_totals_for_test(&self) -> Result<Option<(u64, u64, u64)>> {
+        let persistence = self.persistence.as_ref().expect("file fixture");
+        persistence.with_db(|db| Ok(db.allocator_free_totals()))
+    }
+
     /// Production-dead: the maintained allocator free-page ratio the
     /// maintenance decisions read, and the same ratio from an independent
     /// recount of every allocator bitmap (which does not count as a rebuild).

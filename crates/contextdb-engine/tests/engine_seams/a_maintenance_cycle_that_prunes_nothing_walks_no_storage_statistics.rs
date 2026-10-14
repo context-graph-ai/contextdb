@@ -172,9 +172,19 @@ fn observe(rows: usize, clock: &AtomicU64) -> Observation {
     let mut pruning_ratios = Vec::new();
 
     // The first cycle after the open, then a warm one. Neither prunes.
+    println!(
+        "rows={rows} after open: totals={:?} exact={:?}",
+        db.__allocator_free_totals_for_test().unwrap(),
+        db.__storage_fragmentation_ratio_for_test().unwrap(),
+    );
     let before = work(&db);
     let first = db.run_maintenance_cycle().unwrap();
     cycles.push(since(before, work(&db)));
+    println!(
+        "rows={rows} first cycle: compaction={:?} totals={:?}",
+        first.compaction,
+        db.__allocator_free_totals_for_test().unwrap(),
+    );
     assert_eq!(first.pruning.pruned_rows, 0, "no row reaches its window");
 
     let before = work(&db);
@@ -182,6 +192,11 @@ fn observe(rows: usize, clock: &AtomicU64) -> Observation {
     let warm = db.run_maintenance_cycle().unwrap();
     let warm_cycle_micros = started.elapsed().as_micros();
     cycles.push(since(before, work(&db)));
+    println!(
+        "rows={rows} warm cycle: compaction={:?} totals={:?}",
+        warm.compaction,
+        db.__allocator_free_totals_for_test().unwrap(),
+    );
     assert_eq!(warm.pruning.pruned_rows, 0, "no row reaches its window");
 
     // Each cohort ages out in turn; each cycle prunes it and decides on the
@@ -368,6 +383,11 @@ fn first_automatic_decision(path: &std::path::Path) -> (f64, f64, bool, Work) {
     let db = open(path);
     let exact = db.__storage_fragmentation_ratio_for_test().unwrap().unwrap();
     let free = agreed_ratio(&db);
+    println!(
+        "{}: totals={:?}",
+        path.display(),
+        db.__allocator_free_totals_for_test().unwrap()
+    );
     let before = work(&db);
     let report = db.run_maintenance_cycle().unwrap();
     let cycle = since(before, work(&db));
