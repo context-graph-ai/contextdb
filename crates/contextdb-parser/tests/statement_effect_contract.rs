@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 // Custody adds two writes and three metadata reads; vector inspection and the
 // maintenance cadence add two reads, and the cadence declaration adds a write.
-const STATEMENT_VARIANT_COUNT: usize = 38;
+const STATEMENT_VARIANT_COUNT: usize = 40;
 
 #[test]
 fn binary_memory_declaration_accepts_quoted_and_unquoted_sizes() {

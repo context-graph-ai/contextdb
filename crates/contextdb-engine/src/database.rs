@@ -31171,6 +31171,8 @@ impl Database {
         let accountant = writer_budget.accountant();
         let vector_accountant = writer_budget.vector_accountant();
         persistence.require_current_content_identity()?;
+        let persisted_storage_compaction = persistence
+            .load_config_value::<StorageCompactionPolicy>(STORAGE_COMPACTION_CONFIG_KEY)?;
         let persisted_maintenance_poll_interval_ms = persistence
             .load_config_value::<u64>(MAINTENANCE_POLL_INTERVAL_CONFIG_KEY)?
             .filter(|milliseconds| *milliseconds != 0)
@@ -31440,9 +31442,7 @@ impl Database {
             .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
         db.vector_serving_cache_bytes
             .store(persisted_vector_serving_cache_bytes, Ordering::SeqCst);
-        if let Some(declared) =
-            persistence.load_config_value::<StorageCompactionPolicy>(STORAGE_COMPACTION_CONFIG_KEY)?
-        {
+        if let Some(declared) = persisted_storage_compaction {
             db.storage_compaction_policy.lock().declared = declared;
         }
 
