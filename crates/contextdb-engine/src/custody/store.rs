@@ -491,6 +491,8 @@ pub(crate) const PROBE_POST: u8 = 1;
 pub(crate) const PROBE_REFUSED: u8 = 2;
 /// A charge was just refunded; what it funded must already be freed.
 pub(crate) const PROBE_RELEASED: u8 = 3;
+/// An owner's destruction starts; nothing it owns is freed yet.
+pub(crate) const PROBE_DESTROY: u8 = 4;
 #[cfg(feature = "test-seams")]
 thread_local! {
     static BRACKET_PROBE: std::cell::Cell<Option<fn(&'static str, u8, usize, usize)>> =
@@ -2526,14 +2528,44 @@ mod durable {
     /// entries are freed before their key bytes and slots are refunded.
     struct MemoRing {
         entries: std::collections::VecDeque<(String, Probed)>,
-        keys: Scratch,
+        keys: MemoKeys,
         slots: Scratch,
+    }
+    /// The memo's key-byte owner. Its refund is reported (measurement only)
+    /// just before it happens, so a test can check the keys were freed first.
+    struct MemoKeys(Scratch);
+    impl std::ops::Deref for MemoKeys {
+        type Target = Scratch;
+        fn deref(&self) -> &Scratch {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for MemoKeys {
+        fn deref_mut(&mut self) -> &mut Scratch {
+            &mut self.0
+        }
+    }
+    impl Drop for MemoKeys {
+        fn drop(&mut self) {
+            bracket(
+                "custody_closure_memo_keys",
+                PROBE_RELEASED,
+                self.0.bytes(),
+                self.0.memory().held(),
+            );
+        }
     }
     impl Drop for MemoRing {
         fn drop(&mut self) {
             // Measurement only; the fields drop after this, in order.
             #[cfg(feature = "test-seams")]
             LAST_MEMO_KEY_BYTES.with(|last| last.set((self.entries.len(), self.keys.bytes())));
+            bracket(
+                "custody_closure_memo_destroy",
+                PROBE_DESTROY,
+                self.keys.bytes(),
+                self.keys.memory().held(),
+            );
         }
     }
     #[cfg(feature = "test-seams")]
@@ -2558,7 +2590,7 @@ mod durable {
             slots.post("custody_closure_memo");
             Ok(Self {
                 entries,
-                keys: Scratch::new(memory.clone()),
+                keys: MemoKeys(Scratch::new(memory.clone())),
                 slots,
             })
         }

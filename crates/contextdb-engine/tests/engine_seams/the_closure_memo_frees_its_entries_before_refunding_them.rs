@@ -24,10 +24,15 @@ const AMPLE: usize = 256 * 1024 * 1024;
 /// read view): far below the memo's long keys this guards.
 const SLACK: isize = 32 * 1024;
 const RELEASED: u8 = 3;
+const DESTROY: u8 = 4;
 
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static EXCESS: AtomicIsize = AtomicIsize::new(isize::MIN);
 static RELEASES: AtomicUsize = AtomicUsize::new(0);
+/// Live allocations when the memo's destruction began, and how far they had
+/// fallen when its key bytes were refunded.
+static MEMO_DESTROY_LIVE: AtomicUsize = AtomicUsize::new(0);
+static FREED_BEFORE_KEY_REFUND: AtomicIsize = AtomicIsize::new(isize::MIN);
 static COUNTS: Mutex<Option<BTreeMap<&'static str, usize>>> = Mutex::new(None);
 
 fn probe(label: &'static str, phase: u8, _invoice: usize, _held: usize) {
@@ -36,6 +41,16 @@ fn probe(label: &'static str, phase: u8, _invoice: usize, _held: usize) {
         && let Some(counts) = counts.as_mut()
     {
         *counts.entry(label).or_default() += 1;
+    }
+    if phase == DESTROY && label == "custody_closure_memo_destroy" {
+        MEMO_DESTROY_LIVE.store(live_allocations_for_test(), Ordering::SeqCst);
+        return;
+    }
+    if phase == RELEASED && label == "custody_closure_memo_keys" {
+        let freed = MEMO_DESTROY_LIVE.load(Ordering::SeqCst) as isize
+            - live_allocations_for_test() as isize;
+        FREED_BEFORE_KEY_REFUND.store(freed, Ordering::SeqCst);
+        return;
     }
     if phase != RELEASED {
         return;
@@ -66,6 +81,7 @@ fn observed(edge: &Database) -> (Result<Vec<String>, Error>, usize, isize, usize
     .unwrap();
     EXCESS.store(isize::MIN, Ordering::SeqCst);
     RELEASES.store(0, Ordering::SeqCst);
+    FREED_BEFORE_KEY_REFUND.store(isize::MIN, Ordering::SeqCst);
     BASE.store(live_allocations_for_test(), Ordering::SeqCst);
     Database::__set_custody_bracket_probe_for_test(Some(probe));
     let (answer, held) =
@@ -135,6 +151,14 @@ async fn memo_order() {
         assert_eq!(held, 0, "view #{occurrence}: nothing stays admitted");
         // The memo the unwind destroyed held the long keys this guards.
         let (entries, key_bytes) = Database::__last_closure_memo_for_test();
+        // The memo's entries, its long keys among them, were freed before
+        // their key bytes were refunded.
+        let freed = FREED_BEFORE_KEY_REFUND.load(Ordering::SeqCst);
+        assert!(
+            freed >= key_bytes as isize,
+            "view #{occurrence}: only {freed} bytes were freed before the memo's \
+             {key_bytes} key bytes were refunded"
+        );
         assert!(
             // Beyond the slack and the operation's admitted-but-unused
             // error reserve (about 32 KiB), which the reader's held bytes
@@ -150,7 +174,8 @@ async fn memo_order() {
         );
         println!(
             "S3_MEMO_ORDER view={occurrence}/{views} excess={excess} releases={releases} \
-             memo_entries={entries} memo_key_bytes={key_bytes}"
+             memo_entries={entries} memo_key_bytes={key_bytes} freed_before_refund={}",
+            FREED_BEFORE_KEY_REFUND.load(Ordering::SeqCst)
         );
     }
     drop(client);
