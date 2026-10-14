@@ -332,18 +332,35 @@ pub(super) fn advance_native_candidate_frontier(
     partition: &VectorPartitionRef,
     previous: TxId,
     next: TxId,
+    absorbed_live_inserts: impl FnOnce() -> Result<u64>,
 ) -> Result<()> {
     update_pending_summary(write, partition, |summary| {
+        let max_tx = summary.max_tx;
         let candidate = summary
             .candidate_pending
             .as_mut()
             .filter(|counts| counts.covered_tx == previous)
             .ok_or_else(|| corruption("native candidate lost its maintained frontier"))?;
-        if summary.max_tx > next || next < previous {
+        if next < previous {
             return Err(corruption("native candidate has stale membership coverage"));
         }
         candidate.covered_tx = next;
-        candidate.pending_inserts = 0;
+        // The catch-up covered exactly one committed LSN: it retires that
+        // LSN's still-live inserts and keeps every later one pending. Its
+        // tombstones stay: catch-up inserts nodes, it never removes the
+        // deleted nodes still in the candidate graph.
+        // Only a later commit keeps inserts pending, so only then are the
+        // absorbed range's memberships read back to count what it retires.
+        candidate.pending_inserts = if max_tx > next {
+            candidate
+                .pending_inserts
+                .checked_sub(absorbed_live_inserts()?)
+                .ok_or_else(|| {
+                    corruption("native candidate catch-up retires more inserts than are pending")
+                })?
+        } else {
+            0
+        };
         Ok(())
     })
 }

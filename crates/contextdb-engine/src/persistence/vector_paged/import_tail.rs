@@ -1259,11 +1259,90 @@ impl PagedVectorPersistence for NativeImportCandidate {
                     .map_err(RedbPersistence::storage_error)?
                     .insert(key.as_slice(), seal_value(&key, &payload).as_slice())
                     .map_err(RedbPersistence::storage_error)?;
+                // Retire exactly the absorbed LSN range's still-live inserts.
+                // A record outside (previous, next] is not this cohort.
+                let absorbed_live_inserts = || -> Result<u64> {
+                    let mut live_inserts = 0u64;
+                    if let Some((lower, upper)) =
+                        RedbPersistence::vector_partition_journal_suffix_bounds(
+                            &owner.partition.index,
+                            &owner.partition.partition_key,
+                            previous.frontier_lsn,
+                            Some(next.frontier_lsn),
+                        )?
+                    {
+                        let outside =
+                            |tx: TxId| tx <= previous.frontier_tx || tx > next.frontier_tx;
+                        let mut upserted = std::collections::BTreeSet::new();
+                        {
+                            let journal = write
+                                .open_table(VECTOR_PARTITION_JOURNAL_TABLE)
+                                .map_err(RedbPersistence::storage_error)?;
+                            for entry in journal
+                                .range(lower.as_slice()..upper.as_slice())
+                                .map_err(RedbPersistence::storage_error)?
+                            {
+                                let (_, value) = entry.map_err(RedbPersistence::storage_error)?;
+                                let record: VectorPartitionJournalRecord =
+                                    owner.persistence.decode_expected_vector_partition_metadata(
+                                        VectorPartitionRecordKind::Journal,
+                                        value.value(),
+                                        &owner.partition.index,
+                                        &owner.partition.partition_key,
+                                    )?;
+                                match record.change {
+                                    VectorPartitionJournalChange::Upsert(membership) => {
+                                        if outside(membership.visible_from) {
+                                            return Err(corruption(
+                                                "native candidate cohort is not its own committed transaction range",
+                                            ));
+                                        }
+                                        upserted.insert(
+                                            RedbPersistence::vector_partition_membership_key(
+                                                &membership,
+                                            ),
+                                        );
+                                    }
+                                    VectorPartitionJournalChange::Tombstone(tombstone) => {
+                                        if outside(tombstone.deleted_tx) {
+                                            return Err(corruption(
+                                                "native candidate cohort is not its own committed transaction range",
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let memberships = write
+                            .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                            .map_err(RedbPersistence::storage_error)?;
+                        for key in upserted {
+                            let Some(value) = memberships
+                                .get(key.as_slice())
+                                .map_err(RedbPersistence::storage_error)?
+                            else {
+                                continue;
+                            };
+                            let membership: VectorPartitionMembershipRecord =
+                                owner.persistence.decode_expected_vector_partition_metadata(
+                                    VectorPartitionRecordKind::Membership,
+                                    value.value(),
+                                    &owner.partition.index,
+                                    &owner.partition.partition_key,
+                                )?;
+                            if membership.deleted_tx.is_none() {
+                                live_inserts += 1;
+                            }
+                        }
+                    }
+                    Ok(live_inserts)
+                };
                 vector_membership_pages::advance_native_candidate_frontier(
                     &write,
                     &owner.partition,
                     previous.frontier_tx,
                     next.frontier_tx,
+                    absorbed_live_inserts,
                 )?;
                 let name = page_table_name(owner.storage_id);
                 let table = TableDefinition::<&[u8], &[u8]>::new(&name);

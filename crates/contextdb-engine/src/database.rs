@@ -24064,8 +24064,10 @@ impl MaintenanceContext {
         catalog: &VectorPartitionGenerationCatalogRecord,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
+        // Installing a published catalog is writer work: its layout and
+        // route copies are admitted by the writer.
         let mut maintenance_vector_copy_owner =
-            crate::vector_read_memory::admission(read_memory.clone());
+            contextdb_vector::VectorCopyAdmission::new(self.finalization.accountant.vector_budget()?);
         let _publication_read = writer_read::suspend_root_for_manager(&self.tx_mgr);
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());

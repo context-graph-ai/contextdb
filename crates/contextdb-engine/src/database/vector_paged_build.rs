@@ -209,11 +209,36 @@ impl Database {
             return Ok(());
         };
         install_paged_root_capture(persistence, &self.tx_mgr);
-        for (partition, frontier) in persistence.load_construction_floors()? {
+        // Reopen streams the durable inventory one record at a time instead
+        // of materializing it. Each record is decoded under its own writer
+        // owner, which funds it until that record's registration is done.
+        let record_owner = || -> Result<crate::read_image_memory::ImageMemoryScope> {
+            Ok(crate::read_image_memory::ImageMemory::operation_writer(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            )?
+            .enter())
+        };
+        let mut floor_cursor = None;
+        loop {
+            let _decode = record_owner()?;
+            let Some((key, partition, frontier)) =
+                persistence.next_construction_floor_after(floor_cursor.as_deref())?
+            else {
+                break;
+            };
             self.snapshot_registry
                 .hold_construction_floor(&partition, SnapshotId::from_tx(frontier));
+            floor_cursor = Some(key);
         }
-        for (partition, record) in persistence.load_paged_build_records()? {
+        let mut record_cursor: Option<Vec<u8>> = None;
+        loop {
+            let _decode = record_owner()?;
+            let Some((key, partition, record)) =
+                persistence.next_paged_build_record_after(record_cursor.as_deref())?
+            else {
+                break;
+            };
+            record_cursor = Some(key);
             let mut record_copy_owner = copy_owner.scratch();
             let copy_owner = &mut record_copy_owner;
             let progress = record.progress()?;
@@ -436,6 +461,43 @@ impl MaintenanceContext {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
         force_paged: bool,
     ) -> Result<Option<VectorPartitionPublicationOutcome>> {
+        self.advance_paged_vector_build_bounded(
+            partition,
+            copy_owner,
+            read_memory,
+            force_paged,
+            None,
+        )
+    }
+
+    /// Advance this route's replacement toward an import's fixed target:
+    /// a fresh build pins its frontier at the target, and a complete build
+    /// catches up only commits at or before it, publishing at its truthful
+    /// frontier otherwise. Never chases commits after the target.
+    pub(super) fn advance_paged_vector_build_toward(
+        &self,
+        partition: &VectorPartitionRef,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        target: (TxId, Lsn),
+    ) -> Result<Option<VectorPartitionPublicationOutcome>> {
+        self.advance_paged_vector_build_bounded(
+            partition,
+            copy_owner,
+            read_memory,
+            true,
+            Some(target),
+        )
+    }
+
+    fn advance_paged_vector_build_bounded(
+        &self,
+        partition: &VectorPartitionRef,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        force_paged: bool,
+        target: Option<(TxId, Lsn)>,
+    ) -> Result<Option<VectorPartitionPublicationOutcome>> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(None);
         };
@@ -549,11 +611,12 @@ impl MaintenanceContext {
                 }
                 record
             }
-            None => match self.start_paged_vector_build(
+            None => match self.start_paged_vector_build_at(
                 partition,
                 persistence,
                 copy_owner,
                 force_paged,
+                target,
             )? {
                 Some(record) => record,
                 None => return Ok(None),
@@ -600,11 +663,22 @@ impl MaintenanceContext {
                         contextdb_vector::hnsw::observe_paged_hnsw_build();
                     }
                     let mut checkpoint = || self.build_checkpoint();
-                    let stepped = self.vector.step_partition_paged_build_with_plan(
-                        partition,
-                        plan,
-                        &mut checkpoint,
-                    );
+                    // Each source body's decode is charged to this writer for
+                    // that one body; the batch plan funds the body it keeps.
+                    let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                        0,
+                    )?;
+                    let stepped = {
+                        let _decode = decode.enter();
+                        self.vector.step_partition_paged_build_with_plan(
+                            partition,
+                            plan,
+                            &mut checkpoint,
+                        )
+                    };
                     let durable = self
                         .vector
                         .partition_paged_build_progress(partition)
@@ -622,6 +696,7 @@ impl MaintenanceContext {
                             &record,
                             &progress,
                             copy_owner,
+                            target.map(|(_, lsn)| lsn),
                         )?
                     {
                         return Ok(Some(VectorPartitionPublicationOutcome::default()));
@@ -868,6 +943,20 @@ impl MaintenanceContext {
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         force_paged: bool,
     ) -> Result<Option<PagedBuildRecord>> {
+        self.start_paged_vector_build_at(partition, persistence, copy_owner, force_paged, None)
+    }
+
+    /// Start a replacement build whose frontier is `frontier` when given (an
+    /// import's fixed target, never later than the store's current one), or
+    /// the store's current frontier.
+    fn start_paged_vector_build_at(
+        &self,
+        partition: &VectorPartitionRef,
+        persistence: &Arc<RedbPersistence>,
+        copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        force_paged: bool,
+        frontier: Option<(TxId, Lsn)>,
+    ) -> Result<Option<PagedBuildRecord>> {
         let schema_binding = persistence.vector_schema_binding(&partition.index)?;
         let Some(info) = self.vector.try_partition_info(
             &partition.index,
@@ -939,9 +1028,26 @@ impl MaintenanceContext {
         let record = self
             .tx_mgr
             .with_commit_lock(|| -> Result<Option<PagedBuildRecord>> {
-                let frontier_tx = self.tx_mgr.current_tx_max();
-                let frontier_lsn = self.tx_mgr.current_lsn();
-                let total = persistence.vector_partition_live_membership_count(partition)?;
+                let (frontier_tx, frontier_lsn) =
+                    frontier.unwrap_or((self.tx_mgr.current_tx_max(), self.tx_mgr.current_lsn()));
+                // A frontier before the current one sources exactly the
+                // memberships visible at it, so it is counted at it.
+                let total = if frontier.is_some() {
+                    let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                        0,
+                    )?;
+                    let _decode = decode.enter();
+                    persistence.vector_partition_live_membership_count_at(
+                        partition,
+                        frontier_tx,
+                        frontier_lsn,
+                    )?
+                } else {
+                    persistence.vector_partition_live_membership_count(partition)?
+                };
                 if total == 0 {
                     // An empty route keeps the existing delete-only publication.
                     return Ok(None);
@@ -1233,7 +1339,10 @@ impl MaintenanceContext {
             },
         );
         let mut checkpoint = || self.build_checkpoint();
-        let mut publication_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        // Publication is writer work: its layout copy is admitted by the writer.
+        let mut publication_copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            self.finalization.accountant.vector_budget()?,
+        );
         let published = self.publish_direct_metadata(|| {
             self.vector
                 .with_partition_generation_publication(partition, || -> Result<_> {
