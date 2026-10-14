@@ -123,6 +123,10 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
         0
     );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
+    // The checks below inspect durable and serving state directly; their own
+    // decodes are writer work, so the refusal's zero headroom is lifted
+    // first. No maintenance runs until the retry below.
+    db.accountant.set_budget(None).unwrap();
     assert_eq!(
         persistence
             .load_vector_partition_generation_catalog_for(
@@ -158,7 +162,6 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
             .1
             .is_empty()
     );
-    db.accountant.set_budget(None).unwrap();
     let retry = db.run_maintenance_cycle().unwrap();
     assert!(retry.vector.first_failure.is_none(), "{retry:?}");
     assert_eq!(
