@@ -19119,9 +19119,13 @@ pub struct PruningReport {
     /// Whether this cycle advanced durable storage compaction. A bounded
     /// sweep may require subsequent maintenance cycles to finish.
     pub compacted: bool,
-    /// The storage layer's observed dead-space fraction as it stood BEFORE
-    /// this cycle pruned anything — accumulated waste that survived page reuse
-    /// from earlier cycles, not the space this prune just released. It is the
+    /// The allocator's free-page ratio (free pages over region pages) as it
+    /// stood BEFORE this cycle pruned anything — accumulated waste that
+    /// survived page reuse from earlier cycles, not the space this prune just
+    /// released. It counts whole free pages, the only space a relocation can
+    /// give back, not unused bytes inside live pages, and it is no promise
+    /// that this fraction of the file can be returned at once. `0.0` when the
+    /// allocator's totals are untrusted, a state that takes no decision. It is the
     /// value the compaction decision was taken on, so a cycle that pruned rows
     /// compacted exactly when this reached
     /// [`REDB_COMPACT_FRAGMENTATION_THRESHOLD`]. A cycle that pruned NOTHING
@@ -24222,7 +24226,11 @@ impl MaintenanceContext {
     /// separately from any scoped cleanup pass's own compact decision.
     /// Starts a sweep only after the configured interval and fragmentation
     /// threshold are satisfied. An active sweep advances one bounded durable
-    /// batch per cycle; completion starts the next interval. It runs outside
+    /// batch per cycle; completion starts the next interval, and so does a
+    /// check that found the file below the threshold. The threshold is
+    /// measured on the allocator's maintained free-page ratio -- the pages a
+    /// whole-page relocation can actually give back -- which costs the same
+    /// at any store size; untrusted totals take no decision. It runs outside
     /// the commit lock, since
     /// this is called from `run_cycle` after both `run_pruning` and
     /// `run_currency` have already returned.
@@ -24244,13 +24252,16 @@ impl MaintenanceContext {
         }
         let fragmentation_before = match previous_sample {
             Some(sample) => sample,
-            None => vector_source_page_admission::with_preparation_source_page_admission(
-                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                || persistence.fragmentation_ratio(),
-            )?,
+            None => match persistence.allocator_free_page_ratio()? {
+                Some(ratio) => ratio,
+                None => return Ok(CompactionReport::default()),
+            },
         };
         if previous_sample.is_none() && fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD
         {
+            // A completed negative check starts the interval just as a
+            // completed sweep does.
+            *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
             return Ok(CompactionReport::default());
         }
         let bytes_before = self.file_bytes();
@@ -24860,11 +24871,14 @@ impl MaintenanceContext {
         // deliberate: a large prune of a previously tight file may not compact
         // until the next cycle, which is the rare-not-per-cycle posture the
         // constant's own doc describes.
-        let fragmentation_before = self
-            .persistence
-            .as_ref()
-            .map(|persistence| persistence.fragmentation_ratio().unwrap_or(0.0))
-            .unwrap_or(0.0);
+        //
+        // The sample is the allocator's maintained free-page ratio, read
+        // without visiting a page, so a cycle's decision costs the same at
+        // any store size. `None` (untrusted totals) takes no decision.
+        let fragmentation_before = match self.persistence.as_ref() {
+            Some(persistence) => persistence.allocator_free_page_ratio()?,
+            None => None,
+        };
         let now = Wallclock::now();
         self.stamp_expired_rows_for(now, RetentionPreparation::Prune)?;
         let mut report = self
@@ -24885,7 +24899,7 @@ impl MaintenanceContext {
                 retention_source_admission_error(error, RetentionPreparation::Prune)
             })?;
         report.file_bytes_before = file_bytes_before;
-        report.fragmentation_before = fragmentation_before;
+        report.fragmentation_before = fragmentation_before.unwrap_or(0.0);
         // Compaction itself still runs AFTER the prune (there is no point
         // rewriting the file before the rows leave it) and OUTSIDE the commit
         // lock: redb compaction takes the redb mutex with `&mut` and must not
@@ -24895,6 +24909,7 @@ impl MaintenanceContext {
         // input and the receipt are one number, never a derived stand-in.
         if report.pruned_rows > 0
             && let Some(persistence) = self.persistence.as_ref()
+            && let Some(fragmentation_before) = fragmentation_before
             && fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD
         {
             let (progress, _) = publish_storage_compaction_batch(
