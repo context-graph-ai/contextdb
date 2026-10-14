@@ -130,6 +130,16 @@ durable, retrying with the same `SinkEvent::action_id` after a failure or
 restart.
 <!-- enforced by: tests/integration/transactional_callback_delivery.rs::callback_created_dependency_commits_with_observation_and_pending_delivery, tests/integration/transactional_callback_delivery.rs::final_commit_validation_failure_discards_callback_records_delivery_and_event, tests/integration/transactional_callback_delivery.rs::late_plugin_refusal_after_preparation_publishes_no_records_delivery_or_event, tests/integration/transactional_callback_delivery.rs::restart_after_commit_recovers_pending_action_and_delivers_committed_records -->
 
+Delivery is at least once: after a crash or an uncertain outcome the sink may see the same
+`SinkEvent::action_id` again, so a receiver deduplicates by it. There is no cross-event order
+promise. An event the sink's registration cannot see (another context or scope label) stays queued
+and is retried on a later pass over the queue, behind events queued after it. A file-backed store
+keeps at most 1,024 queued events, or 1 MiB of decoded events, of each sink in memory and reads the
+rest from the store as delivery reaches it. A window the writer memory limit cannot hold is counted
+in `SinkMetrics::window_refusals` and flagged by `SinkMetrics::window_refused`; those events stay
+queued and are delivered once the limit admits them.
+<!-- enforced by: opening_a_store_holds_a_bounded_window_of_queued_events::opening_a_store_holds_the_same_window_however_many_events_are_queued, opening_a_store_holds_a_bounded_window_of_queued_events::events_a_registration_cannot_see_never_hide_the_ones_it_can, opening_a_store_holds_a_bounded_window_of_queued_events::a_window_the_writer_budget_cannot_hold_is_refused_observably_and_resumes_when_it_can -->
+
 `DROP TRIGGER` requires an administrative handle and is refused inside a trigger callback,
 including its transaction-bound handle, with `Error::TriggerRequiresAdmin`. The refusal
 preserves the active trigger.
