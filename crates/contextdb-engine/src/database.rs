@@ -81611,12 +81611,10 @@ impl Database {
         key: &str,
         hold: &DurablePolicyHold,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let indexes = Self::policy_hold_index_keys(key, hold)?;
-        let mut values = indexes
+        Self::policy_hold_index_keys(key, hold)?
             .iter()
             .map(|index| Ok((index.clone(), RedbPersistence::encode_config_value(&key)?)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(values)
+            .collect()
     }
 
     fn policy_hold_matches_scope(
