@@ -61008,8 +61008,12 @@ impl Database {
         sink: &str,
     ) -> BTreeMap<RowId, HashMap<String, Value>> {
         let _operation = self.assert_open_operation();
-        self.event_bus
-            .authoritative_purge_memory_sink_queue_for_test(sink)
+        // A bounded queue mirrors only its resident window; the rest of its
+        // pending entries are read from the store.
+        self.pending_sink_entries_for_test(sink)
+            .into_iter()
+            .map(|entry| (entry.row_id, entry.event.row_values))
+            .collect()
     }
 
     #[cfg(any(test, feature = "test-seams"))]

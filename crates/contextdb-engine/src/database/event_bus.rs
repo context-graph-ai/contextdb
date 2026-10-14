@@ -756,20 +756,6 @@ impl EventBusState {
         drop(publication._overlap);
         self.waiters.notify_all();
     }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn authoritative_purge_memory_sink_queue_for_test(
-        &self,
-        sink: &str,
-    ) -> BTreeMap<RowId, HashMap<String, Value>> {
-        self.queues
-            .lock()
-            .get(sink)
-            .into_iter()
-            .flat_map(|queue| queue.entries.iter())
-            .map(|entry| (entry.row_id, entry.event.row_values.clone()))
-            .collect()
-    }
 }
 
 /// Opaque full queue replacement for authoritative purge.  Keeping the
@@ -2111,18 +2097,46 @@ impl Database {
     #[cfg(test)]
     pub fn sink_queue_entries_for_test(&self, sink: &str) -> Vec<(u64, SinkEvent)> {
         let _operation = self.assert_open_operation();
-        self.event_bus
-            .queues
-            .lock()
-            .get(sink)
-            .map(|queue| {
-                queue
-                    .entries
-                    .iter()
-                    .map(|entry| (entry.id, entry.event.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.pending_sink_entries_for_test(sink)
+            .into_iter()
+            .map(|entry| (entry.id, entry.event))
+            .collect()
+    }
+
+    /// Every pending entry of one sink in id order: the resident window's
+    /// entries as held, and a bounded queue's entries that are only in the
+    /// store, decoded from there.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn pending_sink_entries_for_test(&self, sink: &str) -> Vec<SinkQueueEntry> {
+        let (mut entries, needs_store) = match self.event_bus.queues.lock().get(sink) {
+            Some(queue) => (
+                queue.entries.iter().cloned().collect::<Vec<_>>(),
+                !queue.all_resident(),
+            ),
+            None => return Vec::new(),
+        };
+        if needs_store && let Some(persistence) = self.persistence.as_ref() {
+            let resident = entries.iter().map(|entry| entry.id).collect::<HashSet<_>>();
+            let owner = crate::read_image_memory::ImageMemory::operation_writer(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            )
+            .expect("test decode owner");
+            owner.scope(|| {
+                persistence
+                    .visit_sink_queue(sink, |id, bytes| {
+                        if !resident.contains(&id) {
+                            let mut entry =
+                                RedbPersistence::decode_config_value::<SinkQueueEntry>(bytes)?;
+                            entry.event.action_id = entry.id;
+                            entries.push(entry);
+                        }
+                        Ok(())
+                    })
+                    .expect("pending sink entries are readable");
+            });
+            entries.sort_by_key(|entry| entry.id);
+        }
+        entries
     }
 
     #[doc(hidden)]
