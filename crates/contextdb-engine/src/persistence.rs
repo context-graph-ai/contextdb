@@ -41935,21 +41935,18 @@ graph_commit_result }.map_err(Self::storage_error)?;
             .accountant())
     }
 
-    /// A standalone persistence read has the default declared reader limit.
-    /// Database callers install their own operation child before entering here;
-    /// actual write methods install their writer scope before borrowing the file.
+    /// Read routes install their reader owner before entering here, and a
+    /// Database operation its own owner. A decode that arrives without one is
+    /// writer-side work on this store: it is charged to the store's own
+    /// writer accountant -- the declared MEMORY_LIMIT -- never to a private
+    /// reader at the shipped default that no consumer declared.
     fn reader_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         if let Ok(owner) = crate::read_image_memory::active_owner() {
             return Ok(owner.enter());
         }
-        let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
-            crate::OwnerReadConfig::default().limits.limits.memory,
-        );
-        Ok(crate::read_image_memory::ImageMemory::operation_reader(
+        crate::read_image_memory::ImageMemory::enter_writer_operation(
             self.require_decode_accountant()?,
-            declared.child()?,
-        )?
-        .enter())
+        )
     }
 
     fn writer_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
