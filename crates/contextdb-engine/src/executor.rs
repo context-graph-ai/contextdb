@@ -6699,7 +6699,7 @@ fn execute_plan_once(
                 .storage_compaction_policy()
                 .settings()
                 .into_iter()
-                .map(|(name, value, declared)| {
+                .map(|(name, value, declared)| -> Result<Vec<Value>> {
                     let value = match value {
                         crate::database::StorageCompactionValue::Ratio(ratio) => {
                             Value::Float64(ratio)
