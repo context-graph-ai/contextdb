@@ -444,16 +444,25 @@ schema, and never synced. Undeclared values use these defaults:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `START_RATIO` | 0.5 | Automatic and post-prune compaction start once the share of the file a tidy-up could give back by moving pages reaches this. That share is interior free pages over the pages a trim would leave. Must be greater than 0 and less than 1. |
-| `MIN_INTERVAL` | 1 hour | Minimum time between automatic attempts. A check that finds the file below the start ratio also starts the interval. Takes `MILLISECONDS`, `SECONDS`, `MINUTES` or `HOURS`. `0` checks every cycle. |
-| `STOP_RATIO` | 0.05 | Explicit compaction (`.maintenance compact`) keeps sweeping while the share is above this and a sweep still shrinks the file. At least 0 and less than 1. |
+| `START_RATIO` | 0.5 | Automatic and post-prune compaction start once the share of the file a tidy-up could give back by moving pages reaches this. That share is interior free pages over the pages a trim would leave. Greater than 0 and at most 1. |
+| `MIN_INTERVAL` | 1 hour | Minimum time between automatic attempts. A check that finds the file below the start ratio also starts the interval. Takes `MILLISECONDS`, `SECONDS`, `MINUTES` or `HOURS`. Must be positive and at most 9,223,372,036,854,775,807 ms, so `SHOW` reports it exactly. |
+| `STOP_RATIO` | 0.05 | Explicit compaction (`.maintenance compact`) keeps sweeping while the share is at or above this and a sweep still shrinks the file; when the share cannot be measured, it keeps sweeping while sweeps shrink the file. Greater than 0 and at most 1. |
 | `MAX_SWEEPS` | 8 | The most sweeps one explicit compaction runs. At least 1. |
 
 Each `SET STORAGE_COMPACTION` names only the clauses it changes; the others keep their values.
 `SET STORAGE_COMPACTION DEFAULT` returns every setting to its default and removes the
 declaration. `SHOW STORAGE_COMPACTION` returns one row per setting with `setting`, `value` and
 `source`; `source` is `declared` or `default`. For a file-backed database the declaration
-persists across opens. `.maintenance status` shows the same values and sources.
+persists across opens. `.maintenance status` shows the same values and sources, and every
+maintenance and compaction receipt names the policy that governed it.
+
+A value outside its range, or a clause named twice in one statement, is refused with
+`InvalidStorageCompactionDeclaration` and changes nothing. The Rust setter
+`Database::set_storage_compaction` refuses the same values with the same issue, and a persisted
+declaration is checked again when the store opens. Concurrent declarations apply one at a time,
+so each keeps the clauses the other did not name, and the live setting is always the persisted
+one.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::the_rust_setter_refuses_what_sql_refuses_and_changes_nothing, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::the_longest_interval_shows_exactly_and_a_longer_one_is_refused, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::concurrent_declarations_of_different_settings_both_survive_in_live_show_and_reopen, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_default_racing_a_declaration_leaves_live_show_and_reopen_agreeing -->
 <!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::storage_compaction_declarations_show_their_source_and_survive_reopen, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_start_ratio_changes_when_automatic_compaction_starts, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_stop_rule_changes_how_many_sweeps_compact_now_runs, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_minimum_interval_changes_when_a_negative_check_repeats -->
 
 ---

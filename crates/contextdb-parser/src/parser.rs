@@ -4088,7 +4088,13 @@ fn build_set_disk_limit(pair: Pair<'_, Rule>) -> Result<SetDiskLimitValue> {
     }
 }
 
+/// Ranges are the engine's to judge (`StorageCompactionPolicy::validate`), so
+/// the statement and the Rust setter refuse identically. Only what a parser
+/// alone can see is refused here: a number too large to hold, and a clause
+/// named twice.
 fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSetting> {
+    use contextdb_core::StorageCompactionDeclarationIssue as Issue;
+    let refuse = |issue| Error::InvalidStorageCompactionDeclaration { issue };
     fn ratio(pair: Pair<'_, Rule>, name: &str) -> Result<f64> {
         let text = pair
             .into_inner()
@@ -4100,42 +4106,32 @@ fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSet
             .parse::<f64>()
             .map_err(|_| Error::ParseError(format!("STORAGE_COMPACTION {name} is not a number")))
     }
-    fn integer(pair: Pair<'_, Rule>, name: &str) -> Result<u64> {
+    fn integer(pair: Pair<'_, Rule>, name: &str) -> Result<Option<u64>> {
         let text = pair
             .into_inner()
             .find(|part| part.as_rule() == Rule::integer)
             .ok_or_else(|| {
                 Error::ParseError(format!("STORAGE_COMPACTION {name} is missing a value"))
             })?;
-        text.as_str().parse::<u64>().map_err(|_| {
-            Error::ParseError(format!(
-                "STORAGE_COMPACTION {name} is outside the numeric range"
-            ))
-        })
+        Ok(text.as_str().parse::<u64>().ok())
+    }
+    fn once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
+        if slot.replace(value).is_some() {
+            return Err(Error::InvalidStorageCompactionDeclaration {
+                issue: contextdb_core::StorageCompactionDeclarationIssue::DuplicateClause,
+            });
+        }
+        Ok(())
     }
     let mut clauses = StorageCompactionClauses::default();
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::storage_compaction_default => return Ok(StorageCompactionSetting::Default),
             Rule::storage_compaction_start_ratio => {
-                let value = ratio(part, "START_RATIO")?;
-                if !(value > 0.0 && value < 1.0) {
-                    return Err(Error::ParseError(
-                        "STORAGE_COMPACTION START_RATIO must be greater than 0 and less than 1"
-                            .to_string(),
-                    ));
-                }
-                clauses.start_ratio = Some(value);
+                once(&mut clauses.start_ratio, ratio(part, "START_RATIO")?)?;
             }
             Rule::storage_compaction_stop_ratio => {
-                let value = ratio(part, "STOP_RATIO")?;
-                if !(0.0..1.0).contains(&value) {
-                    return Err(Error::ParseError(
-                        "STORAGE_COMPACTION STOP_RATIO must be at least 0 and less than 1"
-                            .to_string(),
-                    ));
-                }
-                clauses.stop_ratio = Some(value);
+                once(&mut clauses.stop_ratio, ratio(part, "STOP_RATIO")?)?;
             }
             Rule::storage_compaction_min_interval => {
                 let unit = part
@@ -4150,26 +4146,16 @@ fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSet
                     "SECONDS" => 1_000,
                     _ => 1,
                 };
-                let value = integer(part, "MIN_INTERVAL")?;
-                clauses.min_interval_ms = Some(value.checked_mul(multiplier).ok_or_else(|| {
-                    Error::ParseError(
-                        "STORAGE_COMPACTION MIN_INTERVAL is outside the numeric range".to_string(),
-                    )
-                })?);
+                let milliseconds = integer(part, "MIN_INTERVAL")?
+                    .and_then(|value| value.checked_mul(multiplier))
+                    .ok_or_else(|| refuse(Issue::MinIntervalOutOfRange))?;
+                once(&mut clauses.min_interval_ms, milliseconds)?;
             }
             Rule::storage_compaction_max_sweeps => {
-                let value = integer(part, "MAX_SWEEPS")?;
-                let value = u32::try_from(value).map_err(|_| {
-                    Error::ParseError(
-                        "STORAGE_COMPACTION MAX_SWEEPS is outside the numeric range".to_string(),
-                    )
-                })?;
-                if value == 0 {
-                    return Err(Error::ParseError(
-                        "STORAGE_COMPACTION MAX_SWEEPS must be at least 1".to_string(),
-                    ));
-                }
-                clauses.max_sweeps = Some(value);
+                let sweeps = integer(part, "MAX_SWEEPS")?
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| refuse(Issue::MaxSweepsOutOfRange))?;
+                once(&mut clauses.max_sweeps, sweeps)?;
             }
             other => return Err(unexpected_rule(other, "build_storage_compaction")),
         }

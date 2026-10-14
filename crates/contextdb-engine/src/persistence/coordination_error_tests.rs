@@ -42,7 +42,7 @@ fn closed_writer_ownership_refuses_recovery_compaction_and_cursor_pin_with_typed
         persistence
             .compact_incremental(
                 Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
-                0.0,
+                Some(0.0),
             )
             .expect_err("closed ownership refuses compaction"),
         "storage reclamation",
@@ -85,7 +85,7 @@ fn poisoned_writer_state_refuses_recovery_compaction_and_cursor_pin_with_typed_p
         persistence
             .compact_incremental(
                 Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
-                0.0,
+                Some(0.0),
             )
             .expect_err("poisoned ownership refuses compaction"),
         "storage reclamation",

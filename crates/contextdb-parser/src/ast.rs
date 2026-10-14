@@ -124,14 +124,17 @@ pub enum StorageCompactionSetting {
     Declare(StorageCompactionClauses),
 }
 
-/// The clauses one `SET STORAGE_COMPACTION` statement declared.
+/// The clauses one `SET STORAGE_COMPACTION` statement declared. Ranges are
+/// checked by the engine when the declaration is applied, for SQL and Rust
+/// callers alike.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct StorageCompactionClauses {
-    /// Reclaimable share of the file at which compaction starts, in (0, 1).
+    /// Reclaimable share of the file at which compaction starts, in (0, 1].
     pub start_ratio: Option<f64>,
-    /// Minimum time between automatic compaction attempts.
+    /// Minimum time between automatic compaction attempts: positive, at most
+    /// `i64::MAX` milliseconds.
     pub min_interval_ms: Option<u64>,
-    /// Explicit compaction stops sweeping below this reclaimable share, in [0, 1).
+    /// Explicit compaction stops sweeping below this reclaimable share, in (0, 1].
     pub stop_ratio: Option<f64>,
     /// The most sweeps one explicit compaction runs, at least 1.
     pub max_sweeps: Option<u32>,

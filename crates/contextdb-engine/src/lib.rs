@@ -196,7 +196,7 @@ pub use database::{
 pub use database::{
     CompactionReport, MaintenancePolicy, MaintenanceReport, MaintenanceStatus, PruningReport,
     REDB_COMPACT_FRAGMENTATION_THRESHOLD, RETENTION_CLOCK_SKEW_TOLERANCE, SnapshotPin,
-    TableSizeEstimate,
+    StorageCompactionPolicy, StorageCompactionValue, TableSizeEstimate,
 };
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]

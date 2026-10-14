@@ -15,7 +15,9 @@ use contextdb_core::read_contract::{
 };
 use contextdb_engine::QueryResult;
 use contextdb_engine::database::QueryTrace;
-use contextdb_engine::{CompactionReport, MaintenanceReport};
+use contextdb_engine::{
+    CompactionReport, MaintenanceReport, StorageCompactionPolicy, StorageCompactionValue,
+};
 use contextdb_engine::{
     DirectEventsStatus, DirectIndexDirection, DirectMaintenanceStatus, DirectPropagationRule,
     DirectSchema, DirectVectorQuantization, OwnerConfigurationSource, OwnerConfiguredValue,
@@ -294,7 +296,43 @@ fn compaction_report_fields(report: &CompactionReport) -> Value {
         "bytes_after": report.bytes_after,
         "file_shrank": report.file_shrank,
         "fragmentation_before": report.fragmentation_before,
+        "policy": compaction_policy_fields(&report.policy),
     })
+}
+
+/// The storage compaction policy that governed one receipt: each setting's
+/// value and whether it was `declared` or the `default`.
+fn compaction_policy_fields(policy: &StorageCompactionPolicy) -> Value {
+    let mut fields = Map::new();
+    for (name, value, declared) in policy.settings() {
+        let value = match value {
+            StorageCompactionValue::Ratio(ratio) => json!(ratio),
+            StorageCompactionValue::Count(count) => json!(count),
+        };
+        fields.insert(
+            name.to_string(),
+            json!({ "value": value, "source": if declared { "declared" } else { "default" } }),
+        );
+    }
+    Value::Object(fields)
+}
+
+/// The same policy as one text token,
+/// `start_ratio:0.5(default),min_interval_ms:3600000(default),…`.
+pub(crate) fn compaction_policy_text(policy: &StorageCompactionPolicy) -> String {
+    policy
+        .settings()
+        .into_iter()
+        .map(|(name, value, declared)| {
+            let value = match value {
+                StorageCompactionValue::Ratio(ratio) => ratio.to_string(),
+                StorageCompactionValue::Count(count) => count.to_string(),
+            };
+            let source = if declared { "declared" } else { "default" };
+            format!("{name}:{value}({source})")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// `.maintenance compact` under `--json`: the explicit, on-demand

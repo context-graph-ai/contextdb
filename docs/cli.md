@@ -494,7 +494,7 @@ caller-driven`, which starts no background worker and leaves scheduling to this
 command. An idle file-backed store prints one line of counters:
 
 ```text
-pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message=none vector_failure_recovery_action=none vector_failure_recovery_instruction=none
+pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message=none vector_failure_recovery_action=none vector_failure_recovery_instruction=none auto_compact_fragmentation_before=unknown compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),stop_ratio:0.05(default),max_sweeps:8(default)
 ```
 
 `--json` emits one `maintenance_cycle` document with those same facts as named
@@ -509,15 +509,26 @@ back by moving pages. On the automatic path, that share is interior free pages o
 a trim would leave, and compaction starts when it reaches the declared start ratio (0.5 by
 default; see `SET STORAGE_COMPACTION` in the query language reference). `.maintenance compact`
 reports the exact storage statistics ratio. When nothing was measured, the field is unknown:
-JSON `null`, text `fragmentation_before=unknown`. That covers a cycle that took no decision, a
-store whose allocator totals are not trusted, a failed measurement, and an in-memory store. It
-is never reported as 0.
-<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::untrusted_free_page_totals_report_unknown_fragmentation_and_take_no_decision -->
+JSON `null`, text `fragmentation_before=unknown` (`auto_compact_fragmentation_before=unknown` in
+the `.maintenance run` line). That covers a cycle with no check due, a store whose allocator
+totals are not trusted, a failed measurement, and an in-memory store. A check that found the
+file below the start ratio reports what it measured. Every later batch of a sweep reports the
+measurement that sweep started on, so a sweep that started unmeasured stays unknown until it
+completes, across reopen. It is never reported as 0.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::untrusted_free_page_totals_report_unknown_fragmentation_and_take_no_decision, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::an_unknown_measurement_stays_unknown_when_an_interrupted_sweep_resumes, read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
+
+Each compaction receipt also names the storage compaction policy that governed it. JSON carries
+a `policy` object under `compaction`, mapping each setting to its `value` and `source`
+(`declared` or `default`). Text carries one `compaction_policy=` token, for example
+`compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),stop_ratio:0.05(default),max_sweeps:8(default)`.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::every_maintenance_receipt_names_the_policy_that_governed_it, read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
 
 `.maintenance status` adds a `storage_compaction` list. Each entry is a `setting`, `value` and
 `source`; `source` is `declared` or `default`. The text form adds one line, for example
 `storage_compaction start_ratio=0.5(default) min_interval_ms=3600000(default) stop_ratio=0.05(default) max_sweeps=8(default)`.
-<!-- enforced by: read_cli_journeys_metadata::maintenance_status_and_explain_keep_their_own_document_keys -->
+Both read routes show the same declaration and sources: the committed file when no writer is
+open, and the live owner when one is.
+<!-- enforced by: read_cli_journeys_metadata::maintenance_status_and_explain_keep_their_own_document_keys, read_cli_journeys_metadata::a_declared_storage_compaction_shows_its_source_through_both_read_routes -->
 
 ### Trace vs Explain
 

@@ -6695,41 +6695,40 @@ fn execute_plan_once(
             Ok(OwnedQueryResult::empty())
         }
         PhysicalPlan::ShowStorageCompaction => {
-            let policy = db.storage_compaction_policy();
-            let source = |declared: bool| {
-                Value::Text(if declared { "declared" } else { "default" }.to_string())
-            };
-            let setting = |name: &str| Value::Text(name.to_string());
+            let rows = db
+                .storage_compaction_policy()
+                .settings()
+                .into_iter()
+                .map(|(name, value, declared)| {
+                    let value = match value {
+                        crate::database::StorageCompactionValue::Ratio(ratio) => {
+                            Value::Float64(ratio)
+                        }
+                        // A declared interval is at most `i64::MAX` ms, so
+                        // every count is shown exactly.
+                        crate::database::StorageCompactionValue::Count(count) => {
+                            Value::Int64(i64::try_from(count).map_err(|_| {
+                                Error::InvalidStorageCompactionDeclaration {
+                                    issue: contextdb_core::StorageCompactionDeclarationIssue::MinIntervalOutOfRange,
+                                }
+                            })?)
+                        }
+                    };
+                    let source = if declared { "declared" } else { "default" };
+                    Ok(vec![
+                        Value::Text(name.to_string()),
+                        value,
+                        Value::Text(source.to_string()),
+                    ])
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(OwnedQueryResult::new(QueryResult {
                 columns: vec![
                     "setting".to_string(),
                     "value".to_string(),
                     "source".to_string(),
                 ],
-                rows: vec![
-                    vec![
-                        setting("start_ratio"),
-                        Value::Float64(policy.start_ratio()),
-                        source(policy.start_ratio.is_some()),
-                    ],
-                    vec![
-                        setting("min_interval_ms"),
-                        Value::Int64(
-                            i64::try_from(policy.min_interval().as_millis()).unwrap_or(i64::MAX),
-                        ),
-                        source(policy.min_interval_ms.is_some()),
-                    ],
-                    vec![
-                        setting("stop_ratio"),
-                        Value::Float64(policy.stop_ratio()),
-                        source(policy.stop_ratio.is_some()),
-                    ],
-                    vec![
-                        setting("max_sweeps"),
-                        Value::Int64(i64::from(policy.max_sweeps())),
-                        source(policy.max_sweeps.is_some()),
-                    ],
-                ],
+                rows,
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
                 cascade: None,

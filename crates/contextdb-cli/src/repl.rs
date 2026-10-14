@@ -1362,7 +1362,8 @@ pub(crate) fn handle_meta_command(
                                  vector_failure_requested_bytes={} vector_failure_available_bytes={} \
                                  vector_failure_current_bytes={} vector_failure_budget_limit_bytes={} \
                                  vector_failure_message={} vector_failure_recovery_action={} \
-                                 vector_failure_recovery_instruction={}",
+                                 vector_failure_recovery_instruction={} \
+                                 auto_compact_fragmentation_before={} compaction_policy={}",
                                 report.pruning.pruned_rows,
                                 report.pruning.rows_deferred_for_readers,
                                 report.currency.pruned_versions,
@@ -1387,6 +1388,11 @@ pub(crate) fn handle_meta_command(
                                 failure_details.map_or("none", |details| details.recovery_action()),
                                 failure_details
                                     .map_or("none", |details| details.recovery_instruction),
+                                report.compaction.fragmentation_before.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
+                                json_output::compaction_policy_text(&report.compaction.policy),
                             );
                         }
                     }
@@ -1404,7 +1410,7 @@ pub(crate) fn handle_meta_command(
                         } else {
                             println!(
                                 "ran={} duration_micros={} bytes_before={} bytes_after={} \
-                                 file_shrank={} fragmentation_before={}",
+                                 file_shrank={} fragmentation_before={} compaction_policy={}",
                                 report.ran,
                                 report.duration_micros,
                                 render_optional_value(report.bytes_before),
@@ -1414,6 +1420,7 @@ pub(crate) fn handle_meta_command(
                                     || "unknown".to_string(),
                                     |ratio| ratio.to_string()
                                 ),
+                                json_output::compaction_policy_text(&report.policy),
                             );
                         }
                     }

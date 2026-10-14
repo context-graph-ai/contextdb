@@ -19869,7 +19869,8 @@ pub struct RedbPersistence {
     storage_compaction: Mutex<(
         redb::CompactionCursor,
         redb::CompactionProgress,
-        f64,
+        // The measurement the active sweep started on; `None` when unknown.
+        Option<f64>,
         Option<PersistenceBytes>,
     )>,
     #[cfg(any(test, feature = "test-seams"))]
@@ -37047,7 +37048,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<Option<u64>> {
-        let fragmentation = self.fragmentation_ratio()?;
+        let fragmentation = Some(self.fragmentation_ratio()?);
         loop {
             let (progress, recycled) =
                 self.compact_incremental(accountant.clone(), fragmentation)?;
@@ -37167,7 +37168,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
     }
 
-    pub(crate) fn storage_compaction_fragmentation_ratio(&self) -> Result<Option<f64>> {
+    /// `Some` while a storage compaction sweep is active, holding the
+    /// measurement that sweep started on -- itself `None` when that
+    /// measurement was unknown. Whether a sweep is active never depends on
+    /// whether it was measured.
+    pub(crate) fn active_storage_compaction(&self) -> Result<Option<Option<f64>>> {
         let state = self
             .storage_compaction
             .lock()
@@ -37260,8 +37265,23 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     )
                 })
                 .transpose()?;
-            let checkpoint: (u8, Option<String>, bool, Vec<usize>, bool, f64) =
-                Self::decode_exact(value.value())?;
+            // Checkpoints written before the measurement could be unknown
+            // carry a bare ratio; exact decoding tells the two layouts apart.
+            let checkpoint: (u8, Option<String>, bool, Vec<usize>, bool, Option<f64>) =
+                match Self::decode_exact(value.value()) {
+                    Ok(checkpoint) => checkpoint,
+                    Err(_) => {
+                        let (phase, table, advance, position, active, ratio): (
+                            u8,
+                            Option<String>,
+                            bool,
+                            Vec<usize>,
+                            bool,
+                            f64,
+                        ) = Self::decode_exact(value.value())?;
+                        (phase, table, advance, position, active, Some(ratio))
+                    }
+                };
             Ok(Some((checkpoint, memory)))
         })?;
         if let Some(((phase, table, advance, position, active, ratio), memory)) = checkpoint {
@@ -37301,7 +37321,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(crate) fn compact_incremental(
         &self,
         accountant: crate::memory_accounting::AccountantHandle,
-        fragmentation_ratio: f64,
+        fragmentation_ratio: Option<f64>,
     ) -> Result<(redb::CompactionProgress, Option<u64>)> {
         #[cfg(target_os = "linux")]
         {
@@ -47422,7 +47442,7 @@ mod empty_declared_index_readiness_tests {
     ) -> Result<(redb::CompactionProgress, Option<u64>)> {
         store.compact_incremental(
             Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
-            0.5,
+            Some(0.5),
         )
     }
 

@@ -245,7 +245,7 @@ impl Database {
             persistence,
             &self.accountant,
             &self.publication_interrupted,
-            persistence.fragmentation_ratio().unwrap_or(0.0),
+            persistence.fragmentation_ratio().ok(),
         )?;
         Ok((
             progress.complete,
