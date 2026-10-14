@@ -24076,8 +24076,9 @@ impl MaintenanceContext {
     ) -> Result<()> {
         // Installing a published catalog is writer work: its layout and
         // route copies are admitted by the writer.
-        let mut maintenance_vector_copy_owner =
-            contextdb_vector::VectorCopyAdmission::new(self.finalization.accountant.vector_budget()?);
+        let mut maintenance_vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(
+            self.finalization.accountant.vector_budget()?,
+        );
         let _publication_read = writer_read::suspend_root_for_manager(&self.tx_mgr);
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());

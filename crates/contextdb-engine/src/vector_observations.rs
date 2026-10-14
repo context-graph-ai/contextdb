@@ -387,8 +387,8 @@ pub(crate) fn emit_import_rebuild_step_for_test(import_decode_held: usize) {
     }
 }
 
-/// Membership records decoded to count a build's live inputs at its
-/// frontier, in total and while a build start held the commit lock.
+// Membership records decoded to count a build's live inputs at its
+// frontier, in total and while a build start held the commit lock.
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static BUILD_START_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
