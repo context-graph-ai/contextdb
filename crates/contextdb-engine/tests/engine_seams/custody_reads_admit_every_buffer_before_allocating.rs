@@ -135,13 +135,16 @@ async fn memo() {
     // The handle's own store is charged to its writer accountant.
     edge.__custody_keys_for_test(None, "delivery_root.v1.")
         .unwrap();
+    // The store also holds its tenant policy mirror charged to the writer
+    // (design P2.2); read from the live store, no rebuild.
+    let (mirror, _) = edge.__custody_tenant_mirror_for_test().unwrap();
     let with_store = edge.accountant().usage().used;
     edge.__drop_custody_store_for_test();
     let without_store = edge.accountant().usage().used;
     assert_eq!(
         with_store - without_store,
-        bytes,
-        "dropping the store releases exactly its memo"
+        bytes + mirror,
+        "dropping the store releases exactly its memo and its tenant mirror"
     );
     println!("S3_ADMIT memo bytes={bytes}");
 }

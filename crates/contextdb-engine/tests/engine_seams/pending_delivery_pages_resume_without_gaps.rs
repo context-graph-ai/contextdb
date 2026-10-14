@@ -56,11 +56,15 @@ async fn arm(broker: &InProcessBroker, second: &Hub, units: usize) {
     );
 
     if units > 128 {
-        // A limit that runs out on a later page refuses and releases.
+        // A limit that runs out on a later page refuses and releases. Every
+        // custody read first admits its error reserve (design A4,
+        // 2 * (16 KiB + 64) bytes), so the sweep starts above it.
+        const ERROR_RESERVE: usize = 2 * (16 * 1024 + 64);
         let mut later_page = 0;
         for step in 1..=128usize {
-            let (answer, examined, held) = edge.__custody_pending_with_limit_for_test(step * 256);
-            assert_eq!(held, 0, "limit {}: nothing stays admitted", step * 256);
+            let limit = ERROR_RESERVE + step * 256;
+            let (answer, examined, held) = edge.__custody_pending_with_limit_for_test(limit);
+            assert_eq!(held, 0, "limit {limit}: nothing stays admitted");
             match answer {
                 Ok(keys) => assert_eq!(keys, expected),
                 Err(error) => {
