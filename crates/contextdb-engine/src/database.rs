@@ -26678,6 +26678,7 @@ impl MaintenanceContext {
     }
 
     /// One whole cycle for a caller that does not hold the pruning guard.
+    #[cfg(any(test, feature = "test-seams"))]
     fn run_cycle(
         &self,
         gate: CurrencyGate,
@@ -65046,7 +65047,7 @@ impl Database {
             let _held = crate::persistence::PruningGuardHeldForTest::enter();
             context.run_pruning_deferring_decision(read_memory.clone())?
         };
-        context.finish_pruning_decision(Some(&self.pruning_guard), &mut report, decision)?;
+        context.finish_pruning_decision(Some(&*self.pruning_guard), &mut report, decision)?;
         Ok(report)
     }
 
@@ -65078,7 +65079,7 @@ impl Database {
             let _held = crate::persistence::PruningGuardHeldForTest::enter();
             context.run_cycle_deferring_storage_decisions(CurrencyGate::Always, read_memory.clone())?
         };
-        context.finish_storage_decisions(Some(&self.pruning_guard), report, decisions)
+        context.finish_storage_decisions(Some(&*self.pruning_guard), report, decisions)
     }
 
     /// Production-dead: how many times `retire_snapshot_free_vector_partitions`
@@ -66611,7 +66612,7 @@ impl Database {
                         })
                 };
                 match cycle.and_then(|(report, decisions)| {
-                    context.finish_storage_decisions(Some(&pruning_guard), report, decisions)
+                    context.finish_storage_decisions(Some(&*pruning_guard), report, decisions)
                 }) {
                     Ok(report) => log_maintenance_cycle(&report),
                     Err(err) => log_pruning_error(&err),
