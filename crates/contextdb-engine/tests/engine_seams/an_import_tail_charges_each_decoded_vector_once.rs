@@ -7,7 +7,7 @@
 //! paid for, never accumulated across stored values that are already freed -- and
 //! an import whose new vectors exceed the writer budget must still complete,
 //! in committed cohorts, without the budget being raised.
-use contextdb_core::{Value, Wallclock, read_contract::ReadLimits};
+use contextdb_core::{Lsn, TxId, Value, Wallclock, read_contract::ReadLimits};
 use contextdb_engine::memory_accounting::{
     BudgetLedgerEntry, take_budget_ledger_for_test, watch_budget_ledger_for_test,
 };
@@ -630,25 +630,37 @@ fn nearest(db: &Database, query: Vec<f32>) -> Vec<Vec<Value>> {
     .rows
 }
 
-/// Inserts the one route's maintained counters hold pending at its serving
-/// coverage. (SHOW VECTOR_PARTITIONS reports a native tail's counters at its
-/// base, for consolidation; readers are admitted from these.)
-fn pending_inserts(db: &Database) -> usize {
-    let pending = db
+/// The one route's serving coverage: its LSN, its transaction, the commit
+/// transaction the commit index records at that LSN, and the inserts its
+/// maintained counters still hold pending there. (SHOW VECTOR_PARTITIONS
+/// reports a native tail's counters at its base, for consolidation; readers
+/// are admitted from these.)
+fn serving(db: &Database) -> (Lsn, TxId, Option<TxId>, usize) {
+    let routes = db
         .vector_serving_pending_inserts_for_test("points", "embedding")
         .unwrap();
-    assert_eq!(pending.len(), 1, "{pending:?}");
-    pending[0].1
+    assert_eq!(routes.len(), 1, "{routes:?}");
+    routes[0]
 }
 
-/// Resume the import tail and prove it decodes exactly the pending vectors,
-/// never one an earlier cohort already covered, then finishes the route.
-fn resume_reads_exactly_the_pending(db: &Database, pending: usize) {
-    let replayed = Arc::new(AtomicUsize::new(0));
+fn pending_inserts(db: &Database) -> usize {
+    serving(db).3
+}
+
+/// Resume the import tail and prove it decodes exactly the pending vectors:
+/// each one once, every one committed after `covered`, none the durable
+/// coverage already holds. Then the route is finished and searchable.
+fn resume_reads_exactly_the_pending(db: &Database, covered: Lsn, pending: usize) {
+    let replayed = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let observed = replayed.clone();
     let replay = observe_journal_replay(Arc::new(move |event| {
-        if matches!(event.work, VectorJournalReplayWork::Vector { .. }) {
-            observed.fetch_add(1, Ordering::SeqCst);
+        if let VectorJournalReplayWork::Vector {
+            row_id,
+            created_tx,
+            lsn,
+        } = event.work
+        {
+            observed.lock().push((row_id, created_tx, lsn));
         }
     }));
     let (loads, observation) = record_loads(|_| None, CRASH_LIMIT);
@@ -656,10 +668,14 @@ fn resume_reads_exactly_the_pending(db: &Database, pending: usize) {
     drop(observation);
     drop(replay);
     let loads = std::mem::take(&mut *loads.lock());
-    assert_eq!(
-        replayed.load(Ordering::SeqCst),
-        pending,
-        "resume decodes only what is still pending, never an absorbed cohort"
+    let replayed = std::mem::take(&mut *replayed.lock());
+    let distinct: std::collections::BTreeSet<_> = replayed.iter().copied().collect();
+    assert_eq!(replayed.len(), pending, "each pending vector is read once");
+    assert_eq!(distinct.len(), pending, "no vector is read twice");
+    assert!(
+        replayed.iter().all(|(_, _, lsn)| *lsn > covered),
+        "no vector of the durable coverage (through LSN {}) is read again",
+        covered.0
     );
     assert_eq!(
         loads
@@ -697,13 +713,20 @@ fn an_import_interrupted_after_one_cohort_publishes_only_that_cohort_and_resumes
     assert!(interrupted.is_err(), "{interrupted:?}");
     assert_eq!(loads.len(), 2, "{loads:?}");
     let first = loads[0].enter.cohort_vectors;
+    let through = loads[0]
+        .enter
+        .cohort_through
+        .expect("the first cohort is a committed prefix of the suffix");
     assert!(matches!(
         loads[1].exit.boundary,
         ImportTailLoadBoundaryForTest::Refused { .. }
     ));
-    // Coverage ends at the first cohort: every later insert stays pending,
-    // exactly, and the counters say so durably.
-    assert_eq!(pending_inserts(&db), CRASH_SUFFIX_ROWS + 1 - first);
+    // Coverage ends at the first cohort's last commit, named by its own
+    // transaction; every later insert stays pending, exactly.
+    let (lsn, tx, commit_tx, pending) = serving(&db);
+    assert_eq!(lsn, through);
+    assert_eq!(commit_tx, Some(tx), "coverage names that LSN's commit");
+    assert_eq!(pending, CRASH_SUFFIX_ROWS + 1 - first);
     // The target is in a later cohort: answered from the pending suffix.
     let mut target = vec![0.0; DIMENSION];
     target[0] = 1.0;
@@ -711,61 +734,109 @@ fn an_import_interrupted_after_one_cohort_publishes_only_that_cohort_and_resumes
     db.close().unwrap();
     let db = Database::open_with_options(&path, crash_options()).unwrap();
     assert_eq!(
-        pending_inserts(&db),
-        CRASH_SUFFIX_ROWS + 1 - first,
+        serving(&db),
+        (lsn, tx, commit_tx, pending),
         "the partial coverage and its counters survive a restart"
     );
-    resume_reads_exactly_the_pending(&db, CRASH_SUFFIX_ROWS + 1 - first);
+    resume_reads_exactly_the_pending(&db, through, pending);
+}
+
+/// Run `persist_import_vector_tails` in a child process that dies at the
+/// first cohort's publication `cut`, then prove what reopen and resume see.
+fn crash_at_the_first_cohort_publication(test: &str, cut: &str) {
+    use contextdb_engine::writer_commit_test_seams::{CommitBoundary, observe};
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    if let (Ok(path), Ok(out)) = (
+        std::env::var("S7_IMPORT_COHORT_CRASH_PATH"),
+        std::env::var("S7_IMPORT_COHORT_CRASH_OUT"),
+    ) {
+        let boundary = if cut == "before" {
+            CommitBoundary::GenerationBeforeRedb
+        } else {
+            CommitBoundary::GenerationAfterRedb
+        };
+        let db = Database::open_with_options(path, crash_options()).unwrap();
+        let first = Arc::new(parking_lot::Mutex::new(None::<(u64, usize)>));
+        let loaded = first.clone();
+        let _loads = observe_import_tail_loads_for_test(Arc::new(move |event| {
+            if let ImportTailLoadBoundaryForTest::Loaded { vectors, .. } = event.boundary {
+                let mut first = loaded.lock();
+                if first.is_none() {
+                    *first = Some((event.cohort_through.expect("a committed prefix").0, vectors));
+                }
+            }
+            None
+        }));
+        observe(
+            Arc::new(move |at| {
+                if at == boundary
+                    && let Some((lsn, vectors)) = *first.lock()
+                {
+                    std::fs::write(&out, format!("{lsn} {vectors}")).unwrap();
+                    std::process::exit(77);
+                }
+            }),
+            || db.persist_import_vector_tails(),
+        )
+        .unwrap();
+        panic!("the first cohort's publication boundary must be reached");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cohort-crash.db");
+    let out = root.path().join("first-cohort");
+    let db = fixture(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS);
+    let before = serving(&db);
+    assert_eq!(before.3, CRASH_SUFFIX_ROWS + 1);
+    db.close().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg(test)
+        .args(["--exact", "--nocapture"])
+        .env("S7_IMPORT_COHORT_CRASH_PATH", &path)
+        .env("S7_IMPORT_COHORT_CRASH_OUT", &out)
+        .status()
+        .unwrap();
+    assert_eq!(child.code(), Some(77), "the {cut} cut is reached");
+    let reported = std::fs::read_to_string(&out).unwrap();
+    let mut fields = reported.split(' ');
+    let through = Lsn(fields.next().unwrap().parse().unwrap());
+    let first: usize = fields.next().unwrap().parse().unwrap();
+    let db = Database::open_with_options(&path, crash_options()).unwrap();
+    let after = serving(&db);
+    eprintln!(
+        "{cut} the first cohort's publication: before={before:?} after={after:?} through={through:?} first={first}"
+    );
+    let covered = if cut == "before" {
+        // Nothing of the first cohort is durable: exactly the old coverage.
+        assert_eq!(after, before);
+        before.0
+    } else {
+        // The first cohort is durable, named by its own commit, and only it.
+        assert_eq!(after.0, through);
+        assert_eq!(after.2, Some(after.1), "coverage names that LSN's commit");
+        assert_eq!(after.3, CRASH_SUFFIX_ROWS + 1 - first);
+        through
+    };
+    let mut target = vec![0.0; DIMENSION];
+    target[0] = 1.0;
+    assert_eq!(nearest(&db, target), vec![vec![Value::Int64(TARGET_ID)]]);
+    resume_reads_exactly_the_pending(&db, covered, after.3);
 }
 
 #[test]
 fn a_crash_between_import_cohorts_keeps_later_cohorts_pending_and_resumes_without_reading_them_twice()
  {
-    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
-    if let Ok(path) = std::env::var("S7_IMPORT_COHORT_CRASH_PATH") {
-        let db = Database::open_with_options(path, crash_options()).unwrap();
-        // The first cohort is published; the process dies as the second
-        // cohort's load begins, before it reads anything.
-        let loads = Arc::new(AtomicUsize::new(0));
-        let _observation = observe_import_tail_loads_for_test(Arc::new(move |event| {
-            if event.boundary == ImportTailLoadBoundaryForTest::Enter
-                && loads.fetch_add(1, Ordering::SeqCst) == 1
-            {
-                std::process::exit(77);
-            }
-            None
-        }));
-        db.persist_import_vector_tails().unwrap();
-        panic!("the second cohort's load must be reached");
-    }
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("cohort-crash.db");
-    let db = fixture(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS);
-    assert_eq!(pending_inserts(&db), CRASH_SUFFIX_ROWS + 1);
-    db.close().unwrap();
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("an_import_tail_charges_each_decoded_vector_once::a_crash_between_import_cohorts_keeps_later_cohorts_pending_and_resumes_without_reading_them_twice")
-        .args(["--exact", "--nocapture"])
-        .env("S7_IMPORT_COHORT_CRASH_PATH", &path)
-        .status()
-        .unwrap();
-    assert_eq!(
-        child.code(),
-        Some(77),
-        "the second cohort's start is reached"
+    crash_at_the_first_cohort_publication(
+        "an_import_tail_charges_each_decoded_vector_once::a_crash_between_import_cohorts_keeps_later_cohorts_pending_and_resumes_without_reading_them_twice",
+        "after",
     );
-    let db = Database::open_with_options(&path, crash_options()).unwrap();
-    // A cohort publication is durable only once the store commits durably
-    // after it; the crash may lose the first cohort's publication but never
-    // leaves coverage and counters disagreeing. Whatever survived, exactly
-    // the rest is pending, and resume reads exactly that.
-    let pending = pending_inserts(&db);
-    eprintln!("after the crash: pending_inserts={pending}");
-    assert!(pending <= CRASH_SUFFIX_ROWS + 1 && pending > 0, "{pending}");
-    let mut target = vec![0.0; DIMENSION];
-    target[0] = 1.0;
-    assert_eq!(nearest(&db, target), vec![vec![Value::Int64(TARGET_ID)]]);
-    resume_reads_exactly_the_pending(&db, pending);
+}
+
+#[test]
+fn a_crash_before_the_first_cohort_is_durable_keeps_the_old_coverage_and_resumes_from_it() {
+    crash_at_the_first_cohort_publication(
+        "an_import_tail_charges_each_decoded_vector_once::a_crash_before_the_first_cohort_is_durable_keeps_the_old_coverage_and_resumes_from_it",
+        "before",
+    );
 }
 
 fn absorb_quantized(quantization: &str) {

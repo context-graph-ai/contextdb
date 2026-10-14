@@ -162,3 +162,9 @@ mod writer_tail_reuse_is_bounded_across_physical_opens;
 
 #[path = "engine_seams/import_tail_survives_restart_without_history_reconstruction.rs"]
 mod import_tail_survives_restart_without_history_reconstruction;
+#[path = "engine_seams/a_vector_search_decodes_under_its_request_owner.rs"]
+mod a_vector_search_decodes_under_its_request_owner;
+#[path = "engine_seams/reads_and_writes_are_charged_to_their_own_declared_limits.rs"]
+mod reads_and_writes_are_charged_to_their_own_declared_limits;
+#[path = "engine_seams/trigger_audit_history_is_charged_once_to_the_declared_reader.rs"]
+mod trigger_audit_history_is_charged_once_to_the_declared_reader;
