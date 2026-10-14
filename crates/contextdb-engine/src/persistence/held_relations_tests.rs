@@ -35,149 +35,229 @@ fn store(tables: &[String]) -> (tempfile::TempDir, redb::Database) {
     (root, db)
 }
 
-/// The accountant's high water after holding each table in turn, and the
-/// charge then held, with no limit.
-fn charges(tables: &[String]) -> Vec<(usize, usize)> {
-    let (_root, db) = store(tables);
-    let owner = Arc::new(MemoryAccountant::no_limit());
-    let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
-    let write = db.begin_write().expect("begin");
-    let mut held = HeldRelations::new();
-    let mut seen = Vec::new();
-    for table in tables {
-        held.get(&write, table, || relation_name(table), &mut admission)
-            .expect("an unlimited budget admits every relation");
-        seen.push((owner.high_water_for_test(), held.charged()));
-    }
-    held.close(&mut admission);
-    seen
+/// Usage the holder's installed and provisional charges account for.
+fn charged(ledger: &HoldLedger) -> usize {
+    ledger.temp_name
+        + ledger.names_pending
+        + ledger.names
+        + ledger.registry_pending
+        + ledger.registry
+        + ledger.scratch_pending
+        + ledger.scratch
+        + ledger.slots_pending
+        + ledger.slots
+        + ledger.nodes_pending
+        + ledger.nodes
 }
 
-#[test]
-fn holding_every_relation_a_commit_writes_is_admitted_and_returned_on_close() {
-    let tables = tables();
-    let (_root, db) = store(&tables);
-    let owner = Arc::new(MemoryAccountant::no_limit());
-    let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
-    assert_eq!(owner.usage().used, 0);
+/// Opens `baseline` other tables first, so the registry the pass grows was
+/// not empty when it started.
+fn hold_all(
+    db: &redb::Database,
+    tables: &[String],
+    baseline: usize,
+    owner: &Arc<MemoryAccountant>,
+) -> (usize, HoldLedger, usize, usize) {
     let write = db.begin_write().expect("begin");
-    let mut held = HeldRelations::new();
-    // Rows of every table, interleaved twice over: each relation opens once.
-    for round in 0..2 {
-        for table in tables.iter().rev().chain(&tables) {
-            let relation = held
-                .get(&write, table, || relation_name(table), &mut admission)
-                .expect("an unlimited budget admits every relation");
-            assert!(
-                relation.get(b"row".as_slice()).expect("read").is_some(),
-                "round {round}: the held relation reads its own body"
-            );
-        }
+    let mut others = Vec::new();
+    for n in 0..baseline {
+        others.push(
+            write
+                .open_table(TableDefinition::<&[u8], &[u8]>::new(&format!("other_{n}")))
+                .expect("open a baseline table"),
+        );
     }
-    let native: usize = tables
-        .iter()
-        .map(|table| held_relation_native_bytes(&relation_name(table)))
-        .sum();
-    assert!(
-        held.charged() >= native,
-        "every relation's native retention is admitted: {} < {native}",
-        held.charged()
-    );
+    let baseline_bytes = write.open_table_registry_bytes();
+    let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
+    let (peak_ledger, held_usage) = {
+        let mut held = HeldRelations::new(&write, &mut admission).expect("a holder");
+        for round in 0..2 {
+            for table in tables.iter().rev().chain(tables) {
+                let relation = held
+                    .get(table)
+                    .expect("an unlimited budget admits every relation")
+                    .expect("the relation exists");
+                assert!(
+                    relation.get(b"row".as_slice()).expect("read").is_some(),
+                    "round {round}: the held relation reads its own body"
+                );
+            }
+        }
+        let ledger = held.ledger();
+        (ledger, owner.usage().used)
+    };
+    let after_bytes = write.open_table_registry_bytes();
     assert_eq!(
         owner.usage().used,
-        held.charged(),
-        "the accountant holds exactly what the held relations were admitted"
+        0,
+        "dropping the holder returns every admitted byte while the transaction lives"
     );
-    held.close(&mut admission);
-    assert_eq!(owner.usage().used, 0, "closing returns every admitted byte");
-    // Each relation was closed: it opens again.
-    for table in &tables {
+    assert!(
+        after_bytes <= baseline_bytes,
+        "the registry is back to at most a baseline-sized array: {after_bytes} after, \
+         {baseline_bytes} before"
+    );
+    assert_eq!(write.open_table_registry_len(), baseline);
+    drop(others);
+    // Each held relation was closed: it opens again.
+    for table in tables {
         drop(
             write
                 .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name(table)))
                 .expect("a closed relation opens again"),
         );
     }
+    drop(write);
+    (held_usage, peak_ledger, baseline_bytes, after_bytes)
+}
+
+#[test]
+fn holding_every_relation_is_admitted_exactly_and_returned_when_the_pass_ends() {
+    let tables = tables();
+    let (_root, db) = store(&tables);
+    for baseline in [0usize, 5, 37] {
+        let owner = Arc::new(MemoryAccountant::no_limit());
+        let (held_usage, ledger, _, _) = hold_all(&db, &tables, baseline, &owner);
+        assert_eq!(
+            held_usage,
+            charged(&ledger),
+            "while holding, the accountant holds exactly the ledger's charges"
+        );
+        let names: usize = tables.iter().map(|table| 2 * relation_name(table).len()).sum();
+        assert_eq!(ledger.names, names, "each handle's and registry key's name is admitted");
+        assert!(ledger.registry > 0, "holding grew the registry and funded it");
+        assert_eq!(
+            ledger.temp_name + ledger.names_pending + ledger.registry_pending
+                + ledger.scratch_pending + ledger.slots_pending + ledger.nodes_pending,
+            0,
+            "nothing is left provisional between lookups"
+        );
+        if baseline > 0 {
+            assert!(ledger.scratch > 0, "a baseline-sized replacement was prepared");
+        }
+        assert_eq!(take_held_overdraft(), 0, "no registry growth went unfunded");
+    }
 }
 
 #[test]
 fn a_relation_that_does_not_fit_the_writer_budget_is_refused_before_it_is_opened() {
     let tables = tables();
-    let seen = charges(&tables);
-    // The seventh relation raises the peak past every earlier one; a budget
-    // one byte under it admits the first six only.
-    let refused = 6;
-    assert!(
-        seen[refused].0 > seen[refused - 1].0,
-        "the fixture's seventh relation raises the high water: {seen:?}"
-    );
     let (_root, db) = store(&tables);
-    let owner = Arc::new(MemoryAccountant::with_budget(seen[refused].0 - 1));
-    let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
+    let probe = Arc::new(MemoryAccountant::no_limit());
+    let _ = hold_all(&db, &tables[..6], 0, &probe);
+    let fits = probe.high_water_for_test();
+    let probe = Arc::new(MemoryAccountant::no_limit());
+    let _ = hold_all(&db, &tables[..7], 0, &probe);
+    let needs = probe.high_water_for_test();
+    assert!(needs > fits, "the seventh relation raises the peak: {fits} -> {needs}");
+    let owner = Arc::new(MemoryAccountant::with_budget(needs - 1));
     let write = db.begin_write().expect("begin");
-    let mut held = HeldRelations::new();
-    for table in &tables[..refused] {
-        held.get(&write, table, || relation_name(table), &mut admission)
-            .expect("the first relations fit");
-    }
-    let refusal = held
-        .get(
-            &write,
-            &tables[refused],
-            || relation_name(&tables[refused]),
-            &mut admission,
-        )
-        .err()
-        .expect("the relation past the budget is refused");
-    match &refusal {
-        Error::MemoryBudgetExceeded { operation, .. } => {
-            assert_eq!(operation, "hold_row_head_relations", "{refusal:?}")
+    let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
+    {
+        let mut held = HeldRelations::new(&write, &mut admission).expect("a holder");
+        let mut refusal = None;
+        for round in 0..2 {
+            for table in tables[..7].iter().rev().chain(&tables[..7]) {
+                if let Err(error) = held.get(table) {
+                    refusal = Some((round, error));
+                    break;
+                }
+            }
+            if refusal.is_some() {
+                break;
+            }
         }
-        other => panic!("a typed budget refusal, not {other:?}"),
+        match refusal.expect("a relation past the budget is refused") {
+            (_, Error::MemoryBudgetExceeded { operation, .. }) => {
+                assert_eq!(operation, "hold_row_head_relations")
+            }
+            (_, other) => panic!("a typed budget refusal, not {other:?}"),
+        }
     }
-    assert!(
-        owner.usage().used < seen[refused].0,
-        "nothing past the budget was charged"
-    );
-    // The refused relation was never opened, so nothing holds it.
-    drop(
-        write
-            .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name(
-                &tables[refused],
-            )))
-            .expect("the refused relation was not left open"),
-    );
-    held.close(&mut admission);
-    assert_eq!(
-        owner.usage().used,
-        0,
-        "a refused pass returns every admitted byte"
-    );
-}
-
-#[test]
-fn a_pass_that_unwinds_without_closing_returns_its_charge_with_its_admission() {
-    let tables = tables();
-    let (_root, db) = store(&tables);
-    let owner = Arc::new(MemoryAccountant::no_limit());
-    let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
-    let write = db.begin_write().expect("begin");
-    let mut held = HeldRelations::new();
-    for table in &tables {
-        held.get(&write, table, || relation_name(table), &mut admission)
-            .expect("an unlimited budget admits every relation");
-    }
-    assert!(owner.usage().used > 0);
-    drop(held);
-    drop(admission);
-    assert_eq!(
-        owner.usage().used,
-        0,
-        "an aborted commit's admission returns what the dropped relations held"
-    );
+    assert_eq!(owner.usage().used, 0, "a refused pass returns every admitted byte");
+    assert_eq!(write.open_table_registry_len(), 0, "no relation is left open");
+    assert_eq!(take_held_overdraft(), 0);
     drop(write);
 }
 
+/// Every point between a first use's admissions and allocations, failing as
+/// an error and as a panic, at a first and at a later registry growth, over a
+/// non-empty registry: whatever was admitted comes back, the grown registry
+/// array is freed, and no relation stays open.
+#[test]
+fn a_pass_that_fails_at_any_step_returns_everything_and_leaves_nothing_open() {
+    const STEPS: [HoldStep; 16] = [
+        HoldStep::AdmitName,
+        HoldStep::BuildName,
+        HoldStep::ProbeRegistry,
+        HoldStep::AdmitRegistry,
+        HoldStep::AdmitScratch,
+        HoldStep::PrepareScratch,
+        HoldStep::AfterScratch,
+        HoldStep::Reserve,
+        HoldStep::AfterReserve,
+        HoldStep::AdmitSlots,
+        HoldStep::GrowSlots,
+        HoldStep::AdmitNodes,
+        HoldStep::GrowNodes,
+        HoldStep::AdmitNames,
+        HoldStep::Open,
+        HoldStep::Install,
+    ];
+    let tables = tables();
+    let (_root, db) = store(&tables);
+    for step in STEPS {
+        for fault in [HoldFault::Error, HoldFault::Panic] {
+            for skip in [0usize, 2] {
+                let owner = Arc::new(MemoryAccountant::no_limit());
+                let write = db.begin_write().expect("begin");
+                let mut others = Vec::new();
+                for n in 0..5 {
+                    others.push(
+                        write
+                            .open_table(TableDefinition::<&[u8], &[u8]>::new(&format!(
+                                "other_{n}"
+                            )))
+                            .expect("open a baseline table"),
+                    );
+                }
+                let baseline_bytes = write.open_table_registry_bytes();
+                let mut admission =
+                    content_identity::ProofAdmission::new(Some(owner.clone().into()));
+                inject_hold_fault(step, fault, skip);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut held = HeldRelations::new(&write, &mut admission)?;
+                    for table in &tables {
+                        held.get(table)?;
+                    }
+                    Ok::<_, Error>(())
+                }));
+                let fired = !clear_hold_fault();
+                let label = format!("{step:?} {fault:?} skip {skip}");
+                if fired {
+                    match (&outcome, fault) {
+                        (Ok(Err(_)), HoldFault::Error) | (Err(_), HoldFault::Panic) => {}
+                        _ => panic!("{label}: the injected fault surfaced as itself"),
+                    }
+                }
+                drop(admission);
+                assert_eq!(owner.usage().used, 0, "{label}: every admitted byte came back");
+                assert!(
+                    write.open_table_registry_bytes() <= baseline_bytes,
+                    "{label}: the grown registry array was freed"
+                );
+                assert_eq!(
+                    write.open_table_registry_len(),
+                    5,
+                    "{label}: only the baseline tables are open"
+                );
+                assert_eq!(take_held_overdraft(), 0, "{label}: no unfunded registry growth");
+                drop(others);
+                drop(write);
+            }
+        }
+    }
+}
 /// `(2R + 4T)·H + 4T` with `H = ⌈log2(T+1)⌉ + 1`: R lookups and T first uses
 /// over a balanced index, plus at most 2T slot and 2T node relocations.
 fn held_relation_work_bound(lookups: usize, tables: usize) -> u64 {

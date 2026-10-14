@@ -8,6 +8,9 @@ use content_identity::version_manifest as manifest;
 #[path = "commit_row_scaling_tests.rs"]
 mod commit_row_scaling_tests;
 
+#[path = "position_tree.rs"]
+pub(super) mod position_tree;
+
 impl RedbPersistence {
     /// Coalesced postings need an interval subtraction only when another
     /// physical version of this row survives. Fully retired postings keep the
@@ -1491,21 +1494,9 @@ impl RetainedReadSource {
 /// O(log n) coordinate comparisons instead of a rescan of every delta the rows
 /// before it staged.
 pub(super) struct PendingManifestMutations {
-    nodes: Vec<PendingIndexNode>,
-    root: u32,
+    index: position_tree::PositionTree,
     list: Vec<content_identity::ContentIdentityMutation>,
 }
-#[derive(Clone, Copy)]
-struct PendingIndexNode {
-    left: u32,
-    right: u32,
-    height: u8,
-}
-/// The absent child; a publication never holds `u32::MAX` deltas.
-const NO_PENDING_NODE: u32 = u32::MAX;
-/// The deepest root-to-leaf path of a height-balanced tree of fewer than
-/// `u32::MAX` nodes is under 1.45 log2(n + 2), so 64 entries always suffice.
-const PENDING_INDEX_MAX_DEPTH: usize = 64;
 impl std::ops::Deref for PendingManifestMutations {
     type Target = [content_identity::ContentIdentityMutation];
     fn deref(&self) -> &Self::Target {
@@ -1517,113 +1508,40 @@ impl PendingManifestMutations {
         manifest::overlay_coordinate(&self.list[position as usize])
     }
 
-    fn height(&self, node: u32) -> u8 {
-        if node == NO_PENDING_NODE {
-            0
-        } else {
-            self.nodes[node as usize].height
-        }
-    }
-
-    fn update_height(&mut self, node: u32) {
-        let PendingIndexNode { left, right, .. } = self.nodes[node as usize];
-        self.nodes[node as usize].height = 1 + self.height(left).max(self.height(right));
-    }
-
-    fn rotate_right(&mut self, node: u32) -> u32 {
-        let pivot = self.nodes[node as usize].left;
-        self.nodes[node as usize].left = self.nodes[pivot as usize].right;
-        self.nodes[pivot as usize].right = node;
-        self.update_height(node);
-        self.update_height(pivot);
-        pivot
-    }
-
-    fn rotate_left(&mut self, node: u32) -> u32 {
-        let pivot = self.nodes[node as usize].right;
-        self.nodes[node as usize].right = self.nodes[pivot as usize].left;
-        self.nodes[pivot as usize].left = node;
-        self.update_height(node);
-        self.update_height(pivot);
-        pivot
-    }
-
-    /// The root of `node`'s subtree once its heights differ by at most one.
-    fn rebalance(&mut self, node: u32) -> u32 {
-        self.update_height(node);
-        let PendingIndexNode { left, right, .. } = self.nodes[node as usize];
-        if self.height(left) > self.height(right) + 1 {
-            let inner = self.nodes[left as usize];
-            if self.height(inner.left) < self.height(inner.right) {
-                self.nodes[node as usize].left = self.rotate_left(left);
-            }
-            return self.rotate_right(node);
-        }
-        if self.height(right) > self.height(left) + 1 {
-            let inner = self.nodes[right as usize];
-            if self.height(inner.right) < self.height(inner.left) {
-                self.nodes[node as usize].right = self.rotate_right(right);
-            }
-            return self.rotate_left(node);
-        }
-        node
-    }
-
     /// Index the delta just pushed at `position` (the last one). Its node's
     /// storage was admitted and reserved before the delta was pushed. A later
     /// delta at an equal coordinate sorts after every earlier one.
     fn index_last(&mut self, position: u32) {
         debug_assert_eq!(position as usize + 1, self.list.len());
-        debug_assert!(self.nodes.len() < self.nodes.capacity());
-        self.nodes.push(PendingIndexNode {
-            left: NO_PENDING_NODE,
-            right: NO_PENDING_NODE,
-            height: 1,
-        });
-        let mut path = [(NO_PENDING_NODE, false); PENDING_INDEX_MAX_DEPTH];
-        let mut depth = 0;
-        let mut node = self.root;
-        while node != NO_PENDING_NODE {
-            #[cfg(any(test, feature = "test-seams"))]
-            manifest::commit_row_work::count_overlay_comparisons(1);
-            let left = self.coordinate(position) < self.coordinate(node);
-            path[depth] = (node, left);
-            depth += 1;
-            let entry = self.nodes[node as usize];
-            node = if left { entry.left } else { entry.right };
-        }
-        let mut subtree = position;
-        while let Some(parent) = depth.checked_sub(1) {
-            depth = parent;
-            #[cfg(any(test, feature = "test-seams"))]
-            manifest::commit_row_work::count_overlay_comparisons(1);
-            let (node, left) = path[depth];
-            if left {
-                self.nodes[node as usize].left = subtree;
-            } else {
-                self.nodes[node as usize].right = subtree;
-            }
-            subtree = self.rebalance(node);
-        }
-        self.root = subtree;
+        let coordinate = self.coordinate(position);
+        let vacancy = self
+            .index
+            .search(|node| {
+                #[cfg(any(test, feature = "test-seams"))]
+                manifest::commit_row_work::count_overlay_comparisons(1);
+                if coordinate < self.coordinate(node) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            })
+            .err()
+            .expect("an index of positions never finds the position being added");
+        let steps = self.index.insert_at(vacancy, position);
+        #[cfg(any(test, feature = "test-seams"))]
+        manifest::commit_row_work::count_overlay_comparisons(steps);
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let _ = steps;
     }
 
     /// The position of the latest delta at `coordinate`: the largest
     /// (coordinate, position) not after it, when its coordinate is equal.
     fn latest_position(&self, coordinate: &[u8]) -> Option<u32> {
-        let mut found = None;
-        let mut node = self.root;
-        while node != NO_PENDING_NODE {
+        let found = self.index.last_where(|node| {
             #[cfg(any(test, feature = "test-seams"))]
             manifest::commit_row_work::count_overlay_comparisons(1);
-            let entry = self.nodes[node as usize];
-            if self.coordinate(node) <= coordinate {
-                found = Some(node);
-                node = entry.right;
-            } else {
-                node = entry.left;
-            }
-        }
+            self.coordinate(node) <= coordinate
+        });
         #[cfg(any(test, feature = "test-seams"))]
         manifest::commit_row_work::count_overlay_comparisons(1);
         found.filter(|&position| self.coordinate(position) == coordinate)
@@ -1631,22 +1549,14 @@ impl PendingManifestMutations {
 
     /// The smallest pending coordinate after `bound` (at it when inclusive).
     fn next_coordinate(&self, bound: &[u8], exclusive: bool) -> Option<&[u8]> {
-        let mut found = None;
-        let mut node = self.root;
-        while node != NO_PENDING_NODE {
-            #[cfg(any(test, feature = "test-seams"))]
-            manifest::commit_row_work::count_overlay_comparisons(1);
-            let entry = self.nodes[node as usize];
-            let key = self.coordinate(node);
-            let after = if exclusive { key > bound } else { key >= bound };
-            if after {
-                found = Some(key);
-                node = entry.left;
-            } else {
-                node = entry.right;
-            }
-        }
-        found
+        self.index
+            .first_where(|node| {
+                #[cfg(any(test, feature = "test-seams"))]
+                manifest::commit_row_work::count_overlay_comparisons(1);
+                let key = self.coordinate(node);
+                if exclusive { key > bound } else { key >= bound }
+            })
+            .map(|position| self.coordinate(position))
     }
 }
 impl manifest::ManifestOverlay for PendingManifestMutations {
@@ -1680,8 +1590,7 @@ impl PendingManifestPublication {
     pub(super) fn new(admission: content_identity::OwnedProofAdmission) -> Self {
         Self {
             mutations: PendingManifestMutations {
-                nodes: Vec::new(),
-                root: NO_PENDING_NODE,
+                index: position_tree::PositionTree::new(),
                 list: Vec::new(),
             },
             admission,
@@ -1705,26 +1614,24 @@ impl PendingManifestPublication {
             self.admission
                 .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
         }
-        let nodes = &mut self.mutations.nodes;
-        if nodes.len() == nodes.capacity() {
-            let old = nodes.capacity();
+        let index = &mut self.mutations.index;
+        if index.len() == index.capacity() {
+            let node = position_tree::PositionTree::NODE_BYTES;
+            let old = index.capacity();
             let capacity = old
                 .checked_mul(2)
                 .map(|n| n.max(4))
                 .ok_or_else(|| Error::Other("manifest publication capacity overflow".into()))?;
             let bytes = capacity
-                .checked_mul(std::mem::size_of::<PendingIndexNode>())
+                .checked_mul(node)
                 .ok_or_else(|| Error::Other("manifest publication layout overflow".into()))?;
             self.admission.admit(bytes)?;
-            let mut next = Vec::with_capacity(capacity);
-            next.extend_from_slice(nodes);
-            *nodes = next;
-            self.admission
-                .release(old * std::mem::size_of::<PendingIndexNode>());
+            index.grow(capacity);
+            self.admission.release(old * node);
         }
         let position = u32::try_from(self.mutations.list.len())
             .ok()
-            .filter(|position| *position != NO_PENDING_NODE)
+            .filter(|position| *position != position_tree::NO_POSITION)
             .ok_or_else(|| Error::Other("manifest publication position overflow".into()))?;
         let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
         self.admission.admit(bytes)?;

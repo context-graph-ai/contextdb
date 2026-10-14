@@ -267,7 +267,8 @@ fn an_update_alternating_between_two_tables_opens_each_relation_once_per_commit(
 /// exclusive bounds, after every delta of a deterministic sequence.
 #[test]
 fn the_indexed_pending_overlay_answers_every_seek_as_the_list_rescan_does() {
-    use super::{NO_PENDING_NODE, PendingManifestMutations};
+    use super::PendingManifestMutations;
+    use super::position_tree::PositionTree;
     use crate::persistence::content_identity::version_manifest::ManifestOverlay;
     use crate::persistence::content_identity::{ContentIdentityMutation, LogicalFamily};
 
@@ -292,10 +293,10 @@ fn the_indexed_pending_overlay_answers_every_seek_as_the_list_rescan_does() {
     probes.push(Vec::new());
     let deltas = 1_500;
     let mut index = PendingManifestMutations {
-        nodes: Vec::with_capacity(deltas),
-        root: NO_PENDING_NODE,
+        index: PositionTree::new(),
         list: Vec::with_capacity(deltas),
     };
+    index.index.grow(deltas);
     let mut state = 0x2545_f491_4f6c_dd1du64;
     for delta in 0..deltas {
         state ^= state << 13;
@@ -313,7 +314,7 @@ fn the_indexed_pending_overlay_answers_every_seek_as_the_list_rescan_does() {
         // A balanced tree of n nodes is under 1.45 log2(n + 2) high.
         let n = (delta + 2) as f64;
         assert!(
-            f64::from(index.height(index.root)) <= 1.45 * n.log2(),
+            f64::from(index.index.height()) <= 1.45 * n.log2(),
             "the index stays balanced at {} deltas",
             delta + 1
         );

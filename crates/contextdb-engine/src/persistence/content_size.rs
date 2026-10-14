@@ -398,18 +398,16 @@ pub(super) fn reconcile_row_heads(
     mutations: &[content_identity::ContentIdentityMutation],
     admission: &mut impl writer_row_heads::RowHeadAdmission,
 ) -> Result<()> {
-    // The held relations are only read here.
-    let mut relations = writer_row_heads::HeldRelations::new();
-    let reconciled = reconcile_row_heads_holding(write, mutations, admission, &mut relations);
-    relations.close(admission);
-    reconciled
+    // The held relations are only read here. Dropping the holder closes them
+    // and returns what holding them was admitted, on success and failure.
+    let mut relations = writer_row_heads::HeldRelations::new(write, admission)?;
+    reconcile_row_heads_holding(write, mutations, &mut relations)
 }
 
-fn reconcile_row_heads_holding<'name, 'txn>(
+fn reconcile_row_heads_holding<'name, 'txn, A: writer_row_heads::RowHeadAdmission>(
     write: &'txn redb::WriteTransaction,
     mutations: &'name [content_identity::ContentIdentityMutation],
-    admission: &mut impl writer_row_heads::RowHeadAdmission,
-    relations: &mut writer_row_heads::HeldRelations<'name, 'txn>,
+    relations: &mut writer_row_heads::HeldRelations<'name, 'txn, '_, A>,
 ) -> Result<()> {
     let mut heads = write
         .open_table(ROW_LIVE)
@@ -461,29 +459,21 @@ fn reconcile_row_heads_holding<'name, 'txn>(
         if let (Some((prior_head, _)), Some(next_head)) = (prior, head)
             && rank(prior_head) > rank(next_head)
         {
-            let relation = relations.get(
-                write,
-                table,
-                || RedbPersistence::rel_table_name(table),
-                admission,
-            )?;
-            if relation
-                .get(prior_head.as_slice())
-                .map_err(RedbPersistence::storage_error)?
-                .is_some()
+            // An absent family holds no prior body.
+            if let Some(relation) = relations.get(table)?
+                && relation
+                    .get(prior_head.as_slice())
+                    .map_err(RedbPersistence::storage_error)?
+                    .is_some()
             {
                 continue;
             }
         }
         let new = if mutation.logical_value.is_some() {
             let head = head.ok_or_else(|| corrupt("live row has no physical head"))?;
-            let relation = relations.get(
-                write,
-                table,
-                || RedbPersistence::rel_table_name(table),
-                admission,
-            )?;
-            relation
+            relations
+                .get(table)?
+                .ok_or_else(|| corrupt("live row has no stored body"))?
                 .get(head.as_slice())
                 .map_err(RedbPersistence::storage_error)?
                 .ok_or_else(|| corrupt("live row has no stored body"))?
