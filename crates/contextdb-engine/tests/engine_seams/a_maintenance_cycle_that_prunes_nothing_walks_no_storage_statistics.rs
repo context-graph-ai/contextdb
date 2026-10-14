@@ -89,6 +89,12 @@ fn seed(path: &std::path::Path, rows: usize, clock: &AtomicU64) {
         "rows={rows} seed compact_now: {compaction:?} regions={:?}",
         db.__allocator_regions_for_test().unwrap()
     );
+    let interior_free = agreed_ratio(&db);
+    assert!(
+        compaction.file_shrank && interior_free < 0.05,
+        "a full explicit compaction ends with the file close to its data: \
+         {compaction:?} interior_free={interior_free}"
+    );
     db.close().unwrap();
 }
 

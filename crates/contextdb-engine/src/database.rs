@@ -27012,6 +27012,13 @@ pub struct CompactionReport {
 /// engine's OWN unattended background attempt.
 pub const AUTO_COMPACT_MIN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// Explicit compaction ([`Database::compact_now`]) repeats its sweep while
+/// more than this fraction of the file that a trim would leave is interior
+/// free pages and the previous sweep still shrank the file.
+const EXPLICIT_COMPACTION_TIGHT_RATIO: f64 = 0.05;
+/// The most sweeps one explicit compaction runs.
+const EXPLICIT_COMPACTION_MAX_SWEEPS: usize = 8;
+
 /// A worker whose clock runs ahead of the holder's stamps its rows in the
 /// future. Drift within this much is ordinary fleet skew: the row ages
 /// normally and is never reported. Beyond it the stamp is an operator event —
@@ -65077,6 +65084,10 @@ impl Database {
     /// Explicit operator compaction drains finite relocation transactions,
     /// allowing recording and reads between batches. It bypasses the automatic
     /// fragmentation/interval gates and resets that interval on completion.
+    /// It repeats whole sweeps until interior free pages are below 5% of the
+    /// file or a further sweep stops shrinking it (at most eight), so it ends
+    /// with the file close to its data rather than with a first sweep's
+    /// copies pinning the end.
     /// The storage handle is recycled only when no storage reader owns it;
     /// otherwise existing snapshots retain their handle and source pages.
     /// A reopen failure preserves the durable file and returns the existing
@@ -65107,19 +65118,40 @@ impl Database {
                 .attach_durable_raw_partition_loaders(raw_loaders)?;
         }
         let start = Instant::now();
-        let recycled = loop {
-            let (progress, recycled) = publish_storage_compaction_batch(
-                &self.tx_mgr,
-                persistence,
-                &self.finalization.accountant,
-                &self.publication_interrupted,
-                fragmentation_before,
-            )?;
-            if progress.complete {
-                break recycled;
+        // One sweep copies each page before its old address is released, so
+        // when the front of the file has no room yet its copies land behind
+        // the old end and the space they vacate opens up inside the file
+        // only after the sweep. A further sweep moves that tail into the
+        // released interior. Sweep again while interior free pages remain
+        // and the previous sweep still shrank the file (the first sweep
+        // always gets a successor), up to a fixed number of sweeps.
+        let mut recycled = None;
+        let mut sweep_bytes_before = bytes_before;
+        for sweep in 0..EXPLICIT_COMPACTION_MAX_SWEEPS {
+            recycled = loop {
+                let (progress, recycled) = publish_storage_compaction_batch(
+                    &self.tx_mgr,
+                    persistence,
+                    &self.finalization.accountant,
+                    &self.publication_interrupted,
+                    fragmentation_before,
+                )?;
+                if progress.complete {
+                    break recycled;
+                }
+                std::thread::yield_now();
+            };
+            let sweep_bytes_after = self.disk_file_size();
+            let shrank = matches!(
+                (sweep_bytes_before, sweep_bytes_after),
+                (Some(before), Some(after)) if after < before
+            );
+            let interior_free = persistence.allocator_free_page_ratio()?.unwrap_or(0.0);
+            if interior_free < EXPLICIT_COMPACTION_TIGHT_RATIO || (sweep > 0 && !shrank) {
+                break;
             }
-            std::thread::yield_now();
-        };
+            sweep_bytes_before = sweep_bytes_after;
+        }
         self.vector_store.evict_reloadable_raw_partitions();
         let duration_micros = start.elapsed().as_micros() as u64;
         *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
