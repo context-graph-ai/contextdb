@@ -126,7 +126,10 @@ fn untrusted_free_page_totals_report_unknown_fragmentation_and_take_no_decision(
         format!("{pruning:?}").contains("fragmentation_before: None"),
         "an unmeasured pre-prune ratio reads unknown, never 0: {pruning:?}"
     );
-    assert!(!pruning.compacted, "no compaction decision without a measurement");
+    assert!(
+        !pruning.compacted,
+        "no compaction decision without a measurement"
+    );
 
     let cycle = db.run_maintenance_cycle().unwrap();
     assert!(
@@ -146,7 +149,10 @@ fn a_declared_start_ratio_changes_when_automatic_compaction_starts() {
     payload_store(&default_path, |key| key % 10 != 3);
     let db = open(&default_path);
     let free = reclaimable(&db);
-    assert!(free > 0.05 && free < 0.5, "fixture reclaimable ratio {free}");
+    assert!(
+        free > 0.05 && free < 0.5,
+        "fixture reclaimable ratio {free}"
+    );
     assert!(!db.run_maintenance_cycle().unwrap().compaction.ran);
     db.close().unwrap();
 
@@ -170,8 +176,14 @@ fn a_declared_stop_rule_changes_how_many_sweeps_compact_now_runs() {
     let mut sweeps = Vec::new();
     for (name, declaration) in [
         ("default", None),
-        ("one-sweep", Some("SET STORAGE_COMPACTION STOP_RATIO 0 MAX_SWEEPS 1")),
-        ("three-sweeps", Some("SET STORAGE_COMPACTION STOP_RATIO 0 MAX_SWEEPS 3")),
+        (
+            "one-sweep",
+            Some("SET STORAGE_COMPACTION STOP_RATIO 0 MAX_SWEEPS 1"),
+        ),
+        (
+            "three-sweeps",
+            Some("SET STORAGE_COMPACTION STOP_RATIO 0 MAX_SWEEPS 3"),
+        ),
     ] {
         let path = directory.path().join(format!("{name}.redb"));
         payload_store(&path, |key| key % 8 == 7);
@@ -185,7 +197,10 @@ fn a_declared_stop_rule_changes_how_many_sweeps_compact_now_runs() {
         db.close().unwrap();
     }
     println!("sweeps: {sweeps:?}");
-    assert_eq!(sweeps[0].1, 1, "by default one sweep leaves this store tight");
+    assert_eq!(
+        sweeps[0].1, 1,
+        "by default one sweep leaves this store tight"
+    );
     assert_eq!(sweeps[1].1, 1, "MAX_SWEEPS 1 stops after one sweep");
     assert!(
         sweeps[2].1 >= 2 && sweeps[2].1 <= 3,
@@ -199,7 +214,10 @@ fn a_declared_minimum_interval_changes_when_a_negative_check_repeats() {
     let mut checks = Vec::new();
     for (name, declaration) in [
         ("default", None),
-        ("every-cycle", Some("SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS")),
+        (
+            "every-cycle",
+            Some("SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS"),
+        ),
     ] {
         let path = directory.path().join(format!("{name}.redb"));
         payload_store(&path, |key| key % 10 != 3);
@@ -210,7 +228,10 @@ fn a_declared_minimum_interval_changes_when_a_negative_check_repeats() {
         let before = Database::__automatic_compaction_checks_for_test();
         assert!(!db.run_maintenance_cycle().unwrap().compaction.ran);
         assert!(!db.run_maintenance_cycle().unwrap().compaction.ran);
-        checks.push((name, Database::__automatic_compaction_checks_for_test() - before));
+        checks.push((
+            name,
+            Database::__automatic_compaction_checks_for_test() - before,
+        ));
         db.close().unwrap();
     }
     assert_eq!(
@@ -226,16 +247,32 @@ fn storage_compaction_declarations_show_their_source_and_survive_reopen() {
     let path = directory.path().join("declared.redb");
     let db = open(&path);
     let defaults = vec![
-        ("start_ratio".to_owned(), "0.5".to_owned(), "default".to_owned()),
+        (
+            "start_ratio".to_owned(),
+            "0.5".to_owned(),
+            "default".to_owned(),
+        ),
         (
             "min_interval_ms".to_owned(),
             "3600000".to_owned(),
             "default".to_owned(),
         ),
-        ("stop_ratio".to_owned(), "0.05".to_owned(), "default".to_owned()),
-        ("max_sweeps".to_owned(), "8".to_owned(), "default".to_owned()),
+        (
+            "stop_ratio".to_owned(),
+            "0.05".to_owned(),
+            "default".to_owned(),
+        ),
+        (
+            "max_sweeps".to_owned(),
+            "8".to_owned(),
+            "default".to_owned(),
+        ),
     ];
-    assert_eq!(shown(&db), defaults, "undeclared settings are today's defaults");
+    assert_eq!(
+        shown(&db),
+        defaults,
+        "undeclared settings are today's defaults"
+    );
     db.execute(
         "SET STORAGE_COMPACTION START_RATIO 0.4 MIN_INTERVAL 30 MINUTES",
         &p(),
@@ -244,16 +281,32 @@ fn storage_compaction_declarations_show_their_source_and_survive_reopen() {
     db.execute("SET STORAGE_COMPACTION MAX_SWEEPS 4", &p())
         .unwrap();
     let declared = vec![
-        ("start_ratio".to_owned(), "0.4".to_owned(), "declared".to_owned()),
+        (
+            "start_ratio".to_owned(),
+            "0.4".to_owned(),
+            "declared".to_owned(),
+        ),
         (
             "min_interval_ms".to_owned(),
             "1800000".to_owned(),
             "declared".to_owned(),
         ),
-        ("stop_ratio".to_owned(), "0.05".to_owned(), "default".to_owned()),
-        ("max_sweeps".to_owned(), "4".to_owned(), "declared".to_owned()),
+        (
+            "stop_ratio".to_owned(),
+            "0.05".to_owned(),
+            "default".to_owned(),
+        ),
+        (
+            "max_sweeps".to_owned(),
+            "4".to_owned(),
+            "declared".to_owned(),
+        ),
     ];
-    assert_eq!(shown(&db), declared, "each clause is declared independently");
+    assert_eq!(
+        shown(&db),
+        declared,
+        "each clause is declared independently"
+    );
     db.close().unwrap();
     drop(db);
 
@@ -268,9 +321,17 @@ fn storage_compaction_declarations_show_their_source_and_survive_reopen() {
     ] {
         assert!(db.execute(refused, &p()).is_err(), "{refused} is refused");
     }
-    assert_eq!(shown(&db), declared, "a refused declaration changes nothing");
+    assert_eq!(
+        shown(&db),
+        declared,
+        "a refused declaration changes nothing"
+    );
     db.execute("SET STORAGE_COMPACTION DEFAULT", &p()).unwrap();
-    assert_eq!(shown(&db), defaults, "DEFAULT returns to the silent defaults");
+    assert_eq!(
+        shown(&db),
+        defaults,
+        "DEFAULT returns to the silent defaults"
+    );
     db.close().unwrap();
     drop(db);
     let db = open(&path);

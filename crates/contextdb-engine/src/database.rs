@@ -31575,7 +31575,9 @@ impl Database {
             None => None,
         };
         let persisted_storage_compaction = config_value(STORAGE_COMPACTION_CONFIG_KEY)
-            .map(crate::persistence::RedbPersistence::decode_config_value::<StorageCompactionPolicy>)
+            .map(
+                crate::persistence::RedbPersistence::decode_config_value::<StorageCompactionPolicy>,
+            )
             .transpose()?;
         let persisted_maintenance_poll_interval_ms =
             config_value(MAINTENANCE_POLL_INTERVAL_CONFIG_KEY)

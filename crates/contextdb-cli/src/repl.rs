@@ -1410,9 +1410,10 @@ pub(crate) fn handle_meta_command(
                                 render_optional_value(report.bytes_before),
                                 render_optional_value(report.bytes_after),
                                 report.file_shrank,
-                                report
-                                    .fragmentation_before
-                                    .map_or_else(|| "unknown".to_string(), |ratio| ratio.to_string()),
+                                report.fragmentation_before.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
                             );
                         }
                     }

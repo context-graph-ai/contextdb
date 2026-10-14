@@ -4093,7 +4093,9 @@ fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSet
         let text = pair
             .into_inner()
             .find(|part| part.as_rule() == Rule::storage_compaction_ratio)
-            .ok_or_else(|| Error::ParseError(format!("STORAGE_COMPACTION {name} is missing a value")))?;
+            .ok_or_else(|| {
+                Error::ParseError(format!("STORAGE_COMPACTION {name} is missing a value"))
+            })?;
         text.as_str()
             .parse::<f64>()
             .map_err(|_| Error::ParseError(format!("STORAGE_COMPACTION {name} is not a number")))
@@ -4102,9 +4104,13 @@ fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSet
         let text = pair
             .into_inner()
             .find(|part| part.as_rule() == Rule::integer)
-            .ok_or_else(|| Error::ParseError(format!("STORAGE_COMPACTION {name} is missing a value")))?;
+            .ok_or_else(|| {
+                Error::ParseError(format!("STORAGE_COMPACTION {name} is missing a value"))
+            })?;
         text.as_str().parse::<u64>().map_err(|_| {
-            Error::ParseError(format!("STORAGE_COMPACTION {name} is outside the numeric range"))
+            Error::ParseError(format!(
+                "STORAGE_COMPACTION {name} is outside the numeric range"
+            ))
         })
     }
     let mut clauses = StorageCompactionClauses::default();
