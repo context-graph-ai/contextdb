@@ -26,6 +26,13 @@ fn buddy_page(page_number: u32) -> u32 {
     page_number ^ 1
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Blocks `alloc_lowest` allocated at a higher order only to compare
+    /// positions, for the work-count test.
+    pub(super) static TENTATIVE_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // Handles allocation of dynamically sized pages, supports pages of up to page_size * 2^max_order bytes
 //
 // Pages are marked free at only a single order, and it must always be the largest order
@@ -425,6 +432,8 @@ impl BuddyAllocator {
         let mut multiplier = 2;
         for i in (order + 1)..=self.max_order {
             if let Some(index) = self.alloc_inner(i) {
+                #[cfg(test)]
+                TENTATIVE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
                 let index_at_order = index * multiplier;
                 if index_at_order < best_index_at_order {
                     self.free_inner(best.0, best.1);
@@ -555,7 +564,27 @@ impl BuddyAllocator {
 
 #[cfg(test)]
 mod test {
-    use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
+    use crate::tree_store::page_store::buddy_allocator::{BuddyAllocator, TENTATIVE_ALLOCATIONS};
+
+    /// A lowest-address allocation decides by reading each order's lowest
+    /// free block; it allocates only the block it returns, never one per
+    /// higher order to compare positions.
+    #[test]
+    fn lowest_allocation_writes_only_the_block_it_returns() {
+        let mut allocator = BuddyAllocator::new(1024, 1024);
+        // Free blocks now sit at every order from 0 upward.
+        assert_eq!(allocator.alloc_lowest(0), Some(0));
+        let before = TENTATIVE_ALLOCATIONS.with(std::cell::Cell::get);
+        assert_eq!(allocator.alloc_lowest(0), Some(1));
+        assert_eq!(allocator.alloc_lowest(1), Some(1));
+        assert_eq!(allocator.alloc_lowest(0), Some(4));
+        let tentative = TENTATIVE_ALLOCATIONS.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            tentative, 0,
+            "three lowest allocations made {tentative} tentative higher-order allocations"
+        );
+        assert_eq!(allocator.count_allocated_pages(), 5);
+    }
 
     #[test]
     fn record_alloc_buddy() {
