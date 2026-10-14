@@ -1236,10 +1236,10 @@ impl Database {
         // and every key moved into it are admitted to `funding` before they
         // exist there, and `funding` is held by the caller for as long as the
         // write set lives (published, aborted or dropped).
-        let mut funding = crate::custody::store::CustodyCharge::new(memory.clone());
         if retired.len() == 0 {
-            return Ok(Some(funding));
+            return Ok(None);
         }
+        let mut funding = crate::custody::store::CustodyCharge::new(memory.clone());
         let needed = ws
             .config_deletes
             .len()
@@ -1369,13 +1369,15 @@ impl Database {
 
     /// Retire changed roots, then validate the commit's custody delta.
     /// `retired` receives the funding of the ownership keys retirement moved
-    /// into `ws`; the caller declares it before the write set so it is
-    /// released only after the write set is dropped.
+    /// into `ws` (one per call); the caller declares it before the write set
+    /// so it is released only after the write set is dropped. Its own list
+    /// holds at most one entry per preparation of the commit (two when a
+    /// discard drain is present).
     pub(super) fn prepare_custody_commit(
         &self,
         ws: &mut WriteSet,
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        retired: &mut Option<crate::custody::store::CustodyCharge>,
+        retired: &mut Vec<crate::custody::store::CustodyCharge>,
     ) -> Result<Option<CustodyDelta>> {
         #[cfg(feature = "test-seams")]
         if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) {
@@ -1395,11 +1397,10 @@ impl Database {
                     .map_or(0, crate::custody::store::CustodyCharge::bytes),
             )
         });
+        // One funding per call: a commit that also drains discards prepares
+        // twice, each call on its own operation memory.
         if let Some(funding) = funding {
-            match retired {
-                Some(held) => held.adopt_charge(funding)?,
-                None => *retired = Some(funding),
-            }
+            retired.push(funding);
         }
         if !ws.config_writes.iter().any(|(key, _)| owned_key(key))
             && !ws.config_deletes.iter().any(|key| owned_key(key))

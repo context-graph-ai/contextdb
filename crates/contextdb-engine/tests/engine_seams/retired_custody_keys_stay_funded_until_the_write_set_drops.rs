@@ -4,7 +4,9 @@
 //! dropped: the retirement's funding covers at least every key's bytes and
 //! its list slot. A refusal while the destination grows, or at a late key
 //! copy, refuses the statement typed with nothing durable changed, and the
-//! ample retry retires exactly every root.
+//! ample retry retires exactly every root. A transaction that discards local
+//! rows and also deletes a registered root prepares its custody commit twice;
+//! it commits and retires exactly that root.
 use crate::custody_fixture::*;
 use crate::custody_long_key_fixture::*;
 use contextdb_core::{Error, Value};
@@ -68,20 +70,54 @@ async fn retired_custody_keys_stay_funded_until_the_write_set_drops() {
         );
     }
 
+    // A discard and an ordinary delete of one registered root in one
+    // transaction: custody commit preparation runs once per drain, each with
+    // its own funding, and the commit retires exactly that root.
+    edge.execute(
+        "CREATE TABLE local_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC PUSH ONLY",
+        &HashMap::new(),
+    )
+    .unwrap();
+    edge.execute("INSERT INTO local_notes VALUES (1, 'local')", &HashMap::new())
+        .unwrap();
+    let mixed = edge.begin().unwrap();
+    edge.execute_in_tx(mixed, "DISCARD FROM local_notes WHERE id = 1", &HashMap::new())
+        .unwrap();
+    edge.execute_in_tx(
+        mixed,
+        &format!("DELETE FROM {} WHERE id = $id", long_table()),
+        &HashMap::from([("id".into(), Value::Uuid(root_id(ROOTS - 1)))]),
+    )
+    .unwrap();
+    let committed = edge.commit(mixed);
+    assert!(
+        committed.is_ok(),
+        "a discard with an ordinary root delete commits: {committed:?}"
+    );
+    let remaining = long_root_keys(&edge);
+    assert_eq!(remaining.len(), ROOTS - 1, "exactly the deleted root is retired");
+    assert!(remaining.iter().all(|key| roots.contains(key)));
+    let roots = remaining;
+    let key_bytes: usize = roots.iter().map(String::len).sum();
+
     // The ample statement retires every root, its keys funded throughout.
     retire_all(&edge, 1).unwrap();
     let funded = Database::__last_retired_custody_funding_for_test();
-    let slots = ROOTS * std::mem::size_of::<String>();
+    let slots = roots.len() * std::mem::size_of::<String>();
     assert!(
         funded >= key_bytes + slots,
-        "the write set's {ROOTS} retired keys ({key_bytes} bytes) and their slots \
-         ({slots} bytes) were funded by only {funded} bytes"
+        "the write set's {} retired keys ({key_bytes} bytes) and their slots \
+         ({slots} bytes) were funded by only {funded} bytes",
+        roots.len()
     );
     assert!(
         long_root_keys(&edge).is_empty(),
         "every long root is retired exactly once"
     );
-    println!("S3_RETIRE roots={ROOTS} key_bytes={key_bytes} funded={funded}");
+    println!(
+        "S3_RETIRE roots={} key_bytes={key_bytes} funded={funded}",
+        roots.len()
+    );
 
     drop(client);
     drop(edge);

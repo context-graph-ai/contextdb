@@ -9401,7 +9401,7 @@ pub(crate) struct ReceivedSchemaStage {
     /// The funding of the ownership keys custody retirement moved into
     /// `write_set`; declared after it, so it is released only after the write
     /// set is dropped.
-    retired_custody_keys: Option<crate::custody::store::CustodyCharge>,
+    retired_custody_keys: Vec<crate::custody::store::CustodyCharge>,
     pub(crate) durable_projection: ReceivedSchemaPersistenceProjection,
     pub(crate) structurally_dropped_tables: HashSet<String>,
     pub(crate) change_log_entries: Vec<ChangeLogEntry>,
@@ -35505,7 +35505,7 @@ impl Database {
             // The funding of the ownership keys custody retirement moves into
             // the write set. Declared before the write set (`ws` below), so it
             // is released only after the write set is dropped, committed or not.
-            let retired_custody_keys = std::cell::RefCell::new(None);
+            let retired_custody_keys = std::cell::RefCell::new(Vec::with_capacity(2));
             let committed_graph_arrivals =
                 std::cell::RefCell::new(Vec::<(GraphIdentity, DurableGraphArrival)>::new());
             let validation_noop_count = std::cell::Cell::new(0_u64);
@@ -41962,7 +41962,7 @@ impl Database {
                 received_schema_manifest,
                 in_memory_lineage_delta,
                 write_set,
-                retired_custody_keys: None,
+                retired_custody_keys: Vec::new(),
                 durable_projection: ReceivedSchemaPersistenceProjection {
                     schema_noop: true,
                     affected_tables: HashSet::new(),
@@ -42356,7 +42356,7 @@ impl Database {
         }
         // The funding of the ownership keys custody retirement moves into the
         // write set, declared first so every exit drops the write set before it.
-        let mut retired_custody_keys = None;
+        let mut retired_custody_keys = Vec::with_capacity(1);
         let mut finalized_write_set = working
             .detached_sync_write_set
             .lock()
@@ -43543,7 +43543,13 @@ impl Database {
         // only after Redb succeeds, immediately before publication moves the
         // prepared memory image into place.
         let committed_result = std::cell::RefCell::new(None);
-        let committed_write_set = std::cell::RefCell::new(None);
+        // The stage's write set moves into the transaction (never copied);
+        // the funding of the custody ownership keys retirement moved into it
+        // moves here with it. Declared before the commit's result, which owns
+        // that write set afterwards, so the funding is released only after
+        // every holder of those keys is gone.
+        let moved_retired_custody_keys = std::cell::RefCell::new(Vec::new());
+        let applied = std::cell::Cell::new(false);
         let published_stage = std::cell::RefCell::new(None::<ReceivedSchemaStage>);
         let policy_releases = std::cell::RefCell::new(Vec::new());
         let policy_release_memory = std::cell::RefCell::new(Vec::new());
@@ -43658,8 +43664,12 @@ impl Database {
                     let replacement = self
                         .received_schema_stages
                         .lock()
-                        .get(&lsn)
-                        .map(|stage| stage.write_set.clone())
+                        .get_mut(&lsn)
+                        .map(|stage| {
+                            *moved_retired_custody_keys.borrow_mut() =
+                                std::mem::take(&mut stage.retired_custody_keys);
+                            std::mem::take(&mut stage.write_set)
+                        })
                         .ok_or_else(|| {
                             Error::Other(
                                 "received-schema stage disappeared before prepare".to_string(),
@@ -43678,8 +43688,8 @@ impl Database {
                     ));
                     Ok(())
                 },
-                |lsn, write_set| {
-                    *committed_write_set.borrow_mut() = Some(write_set.clone());
+                |lsn, _write_set| {
+                    applied.set(true);
                     debug_assert!(
                         registration
                             .borrow()
@@ -43735,7 +43745,7 @@ impl Database {
         if let Some(watch) = publication_watch.into_inner() {
             watch.completed();
         }
-        committed?;
+        let (_, committed_write_set) = committed?;
         #[cfg(any(test, feature = "test-seams"))]
         self.emit_writer_memory_ownership_receipt_for_test("commit");
         #[cfg(any(test, feature = "test-seams"))]
@@ -43743,8 +43753,9 @@ impl Database {
             "transaction-commit-total",
             commit_started.elapsed().as_nanos(),
         );
-        if let Some(write_set) = committed_write_set.into_inner() {
-            self.plugin.post_commit(&write_set, CommitSource::SyncPull);
+        if applied.get() {
+            self.plugin
+                .post_commit(&committed_write_set, CommitSource::SyncPull);
         }
         let result = committed_result.into_inner().ok_or_else(|| {
             Error::Other(

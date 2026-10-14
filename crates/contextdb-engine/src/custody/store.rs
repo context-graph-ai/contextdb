@@ -1593,14 +1593,6 @@ mod durable {
                 bytes,
             })
         }
-        /// Take over every byte `other` holds on the same memory, without a
-        /// refund.
-        pub(crate) fn adopt_charge(&mut self, mut other: Scratch) -> Result<()> {
-            let bytes = other.bytes;
-            let debit = other.detach(bytes)?;
-            drop(other);
-            self.adopt_debit(debit)
-        }
         /// Adopt a detached debit on the same memory, without a reservation.
         pub(crate) fn adopt_debit(&mut self, debit: Debit) -> Result<()> {
             if !Arc::ptr_eq(&self.memory, &debit.memory) {
