@@ -2260,8 +2260,14 @@ mod tests {
         let database = include_str!("../database.rs");
         let declared = declared_fields(database);
         assert!(declared.len() > 100, "parsed the Database declaration");
-        let mut sites = written_fields(include_str!("cron.rs"), "let mut construction = super::DatabaseConstruction {");
-        sites.extend(written_fields(database, "let mut construction = DatabaseConstruction {"));
+        let mut sites = written_fields(
+            include_str!("cron.rs"),
+            "let mut construction = super::DatabaseConstruction {",
+        );
+        sites.extend(written_fields(
+            database,
+            "let mut construction = DatabaseConstruction {",
+        ));
         assert_eq!(sites.len(), 3, "the three hand-built Database initializers");
         for (site, writes) in sites.iter().enumerate() {
             let mut mismatches = Vec::new();
