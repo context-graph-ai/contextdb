@@ -1601,3 +1601,208 @@ fn region_tracker_allocations_stay_bounded_across_reopen_append_and_recycle() {
         );
     }
 }
+
+/// The maintained free totals equal an independent recount of every bitmap.
+fn assert_totals_exact(db: &redb::Database, context: &str) {
+    let recount = db
+        .allocator_free_totals_recount_for_test()
+        .expect("recount allocator bitmaps");
+    assert_eq!(
+        db.allocator_free_totals(),
+        Some(recount),
+        "{context}: maintained (free, region) pages equal the bitmap recount"
+    );
+}
+
+/// Opens the store, returning how many free-total rebuilds the open ran.
+fn open_counting_rebuilds(path: &Path) -> (redb::Database, u64) {
+    let before = redb::Database::free_total_recounts_for_test();
+    let db = builder().open(path).expect("reopen fixture");
+    (db, redb::Database::free_total_recounts_for_test() - before)
+}
+
+fn insert_rows(db: &redb::Database, keys: std::ops::Range<u64>, marker: u8) {
+    let write = db.begin_write().expect("begin insert");
+    {
+        let mut table = write.open_table(TABLE).expect("open table");
+        for key in keys {
+            table.insert(key, value(marker).as_slice()).expect("insert");
+        }
+    }
+    write.commit().expect("commit insert");
+}
+
+fn remove_rows(db: &redb::Database, keys: std::ops::Range<u64>) {
+    let write = db.begin_write().expect("begin remove");
+    {
+        let mut table = write.open_table(TABLE).expect("open table");
+        for key in keys {
+            table.remove(key).expect("remove");
+        }
+    }
+    write.commit().expect("commit remove");
+}
+
+/// Every allocation, free, split and coalesce, growth across regions, abort,
+/// reader-held free and trimming clean close moves the totals exactly as the
+/// bitmaps move; a reopen after a trimming close adopts the saved totals
+/// without rebuilding them, including when the trim removed whole regions.
+#[test]
+fn allocator_free_totals_track_the_bitmaps_and_survive_trimming_reopen() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("free-totals.redb");
+    let db = builder().create(&path).expect("create fixture");
+    assert_totals_exact(&db, "fresh store");
+
+    insert_rows(&db, 0..8, 0x11);
+    assert_totals_exact(&db, "growth across regions");
+
+    // Mixed small values split and coalesce buddy orders.
+    let small: TableDefinition<u64, &[u8]> = TableDefinition::new("small_orders");
+    let write = db.begin_write().expect("begin small values");
+    {
+        let mut table = write.open_table(small).expect("open small table");
+        for key in 0..64u64 {
+            let bytes = vec![0x5a; 64 << (key % 7)];
+            table.insert(key, bytes.as_slice()).expect("insert small");
+        }
+    }
+    write.commit().expect("commit small values");
+    assert_totals_exact(&db, "mixed orders");
+
+    let aborted = db.begin_write().expect("begin aborted write");
+    {
+        let mut table = aborted.open_table(TABLE).expect("open table");
+        for key in 100..104 {
+            table.insert(key, value(0x77).as_slice()).expect("insert");
+        }
+    }
+    aborted.abort().expect("abort");
+    assert_totals_exact(&db, "rolled back allocations");
+
+    let held = db.begin_read().expect("hold old root");
+    remove_rows(&db, 2..4);
+    assert_totals_exact(&db, "frees held for a live reader");
+    drop(held);
+    db.begin_write()
+        .expect("begin release")
+        .commit()
+        .expect("release held frees");
+    assert_totals_exact(&db, "held frees released");
+
+    drop(db);
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 0, "a clean close saves totals the reopen adopts");
+    assert_totals_exact(&db, "reopen");
+    insert_rows(&db, 200..206, 0x22);
+    assert_totals_exact(&db, "growth after reopen");
+}
+
+/// The saved totals are taken before the commit trims the file. A reopen maps
+/// them onto the trimmed geometry, both when the trim shortens the last
+/// region and when it removes whole trailing regions, without a rebuild.
+#[test]
+fn allocator_free_totals_adopt_the_trimmed_geometry_on_reopen() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("trimmed-totals.redb");
+    let db = builder().create(&path).expect("create fixture");
+    insert_rows(&db, 0..8, 0x61);
+    drop(db);
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 0);
+    assert_totals_exact(&db, "seeded");
+
+    // The newest row sits at the file's tail: freeing it leaves trailing
+    // free pages in the last region for the clean close to trim.
+    let regions = db.allocator_regions_for_test();
+    let length = std::fs::metadata(&path).unwrap().len();
+    remove_rows(&db, 7..8);
+    db.begin_write().unwrap().commit().unwrap();
+    assert_totals_exact(&db, "tail freed");
+    drop(db);
+    assert!(
+        std::fs::metadata(&path).unwrap().len() < length,
+        "the clean close must actually trim the file"
+    );
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 0, "totals saved before a trim are adopted after it");
+    assert_totals_exact(&db, "reopen after trim");
+    assert_row(&db, 6, 0x61);
+
+    // Free several trailing rows so whole trailing regions become free.
+    remove_rows(&db, 3..7);
+    db.begin_write().unwrap().commit().unwrap();
+    assert_totals_exact(&db, "trailing regions freed");
+    drop(db);
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(
+        rebuilds, 0,
+        "a clean close that removes regions still saves adoptable totals"
+    );
+    assert!(
+        db.allocator_regions_for_test() < regions,
+        "the fixture must actually remove a region ({regions} before)"
+    );
+    assert_totals_exact(&db, "reopen after region removal");
+    assert_row(&db, 2, 0x61);
+}
+
+/// Totals that lost trust are never saved: the reserved value stays unwritten,
+/// the save is not retried, and the next open rebuilds exact totals once.
+#[test]
+fn allocator_untrusted_free_totals_are_not_saved_and_rebuild_once_on_reopen() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("untrusted.redb");
+    let db = builder().create(&path).expect("create fixture");
+    insert_rows(&db, 0..4, 0x31);
+    db.distrust_allocator_free_totals_for_test();
+    assert_eq!(db.allocator_free_totals(), None, "untrusted totals are not published");
+    insert_rows(&db, 4..5, 0x32);
+    assert_eq!(
+        db.allocator_free_totals(),
+        None,
+        "later deltas do not restore trust"
+    );
+    drop(db);
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 1, "the unwritten saved value is rejected and rebuilt once");
+    assert_totals_exact(&db, "rebuilt after an untrusted save");
+    drop(db);
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 0, "the rebuilt totals are saved by the next clean close");
+    assert_totals_exact(&db, "adopted after rebuild");
+}
+
+/// A poisoned allocator publishes no totals, and the repaired reopen rebuilds
+/// them exactly once.
+#[test]
+fn allocator_free_totals_after_poison_are_withheld_and_rebuilt_by_repair() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("poisoned-totals.redb");
+    let fault = Arc::new(ScratchFault::default());
+    let db = builder()
+        .create_with_backend(fault_backend(&path, &fault))
+        .expect("create fault-capable fixture");
+    insert_rows(&db, 0..2, 0x41);
+    fault.fail_writes.store(true, Ordering::SeqCst);
+    let write = db.begin_write().expect("begin failing write");
+    let failure = first_refusal(write, 2..130, 0x42, "scratch failure must refuse commit");
+    assert!(failure.contains("injected allocator scratch write failure"));
+    assert_eq!(
+        db.allocator_free_totals(),
+        None,
+        "a poisoned allocator publishes no totals"
+    );
+    drop(db);
+
+    let before = redb::Database::free_total_recounts_for_test();
+    let (db, repaired) = reopen_with_repair(&path, "repair the poisoned writer's store");
+    assert!(repaired, "the poisoned writer left a store that needs repair");
+    assert_eq!(
+        redb::Database::free_total_recounts_for_test() - before,
+        1,
+        "repair rebuilds the totals once"
+    );
+    assert_totals_exact(&db, "after repair");
+    assert_row(&db, 1, 0x41);
+}

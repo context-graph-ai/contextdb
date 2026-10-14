@@ -11,7 +11,9 @@ use crate::tree_store::page_store::cached_file::PagedCachedFile;
 use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
 use crate::tree_store::page_store::header::{DB_HEADER_SIZE, DatabaseHeader, MAGICNUMBER};
 use crate::tree_store::page_store::layout::DatabaseLayout;
-use crate::tree_store::page_store::region::{Allocators, RegionTracker, SavedBitmapWindow};
+use crate::tree_store::page_store::region::{
+    Allocators, FREE_TOTALS_ENCODED_LEN, FreeTotals, RegionTracker, SavedBitmapWindow, layout_pages,
+};
 use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
 use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
 use crate::{CacheStats, StorageBackend};
@@ -185,6 +187,12 @@ fn ceil_log2(x: usize) -> u8 {
 
 pub(crate) fn xxh3_checksum(data: &[u8]) -> Checksum {
     hash128_with_seed(data, 0)
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    /// Completed free-total recounts on this thread. Production-dead.
+    static FREE_TOTAL_RECOUNTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 struct InMemoryState {
@@ -689,6 +697,10 @@ impl TransactionalMemory {
     pub(crate) fn end_repair(&self) -> Result<()> {
         self.check_io_errors()?;
         let mut state = self.state.lock().unwrap();
+        // Repair re-marked every reachable page without moving the totals.
+        // Rebuild them before recovery state clears; a failed recount fails
+        // the repair like any other repair I/O failure.
+        Self::recount_free_totals(&mut state)?;
         state.header.recovery_required = false;
         self.write_header(&state.header)?;
         let result = self.storage.flush();
@@ -721,6 +733,8 @@ impl TransactionalMemory {
         }
 
         drop(tree.insert_zeroed_reserve(&AllocatorStateKey::RegionTracker, region_tracker_len)?);
+        // Reserved before anything is encoded, so the encode allocates nothing.
+        drop(tree.insert_zeroed_reserve(&AllocatorStateKey::FreeTotals, FREE_TOTALS_ENCODED_LEN)?);
 
         tree.insert(
             &AllocatorStateKey::TransactionId,
@@ -767,7 +781,22 @@ impl TransactionalMemory {
             .allocators
             .region_tracker
             .encode_into(destination.value_mut());
+        // The totals describe the same snapshot as the bitmaps above: nothing
+        // allocates or frees between those encodes and this commit. Untrusted
+        // totals are not written; the reserved value stays all-zero (format
+        // 0), which every load rejects, so the next open recounts. That is
+        // terminal for this save, not a reason to retry it.
+        let encoded_totals = state.allocators.encode_free_totals(&state.header.layout());
+        drop(state);
+        drop(destination);
+        if let Some(encoded) = encoded_totals {
+            // Reserved and already written in this transaction, so this
+            // borrow allocates nothing.
+            let mut destination = tree.get_mut(&AllocatorStateKey::FreeTotals)?.unwrap();
+            destination.value_mut()[..FREE_TOTALS_ENCODED_LEN].copy_from_slice(&encoded);
+        }
 
+        let state = self.state.lock().unwrap();
         if let Some(error) = state
             .allocators
             .pager()
@@ -794,6 +823,99 @@ impl TransactionalMemory {
             TransactionId::new(u64::from_le_bytes(value.value().try_into().unwrap()));
 
         Ok(transaction_id == self.get_last_committed_transaction_id()?)
+    }
+
+    fn saved_free_totals(tree: &AllocatorStateTree) -> Result<Option<Vec<u8>>> {
+        Ok(tree
+            .get(&AllocatorStateKey::FreeTotals)?
+            .map(|value| value.value().to_vec()))
+    }
+
+    /// Adopt the saved totals for the committed geometry, or rebuild them
+    /// from the loaded bitmaps when the value is absent, unwritten or does not
+    /// fit that geometry.
+    fn adopt_or_recount_free_totals(state: &mut InMemoryState, saved: Option<&[u8]>) -> Result {
+        let layout = state.header.layout();
+        match saved.and_then(|bytes| FreeTotals::decode_for_layout(bytes, &layout)) {
+            Some(totals) => {
+                state.allocators.set_free_totals(totals);
+                Ok(())
+            }
+            None => Self::recount_free_totals(state),
+        }
+    }
+
+    /// Rebuild the totals from every region's bitmap. The totals become
+    /// trusted only if the complete count finished with a healthy pager; a
+    /// failed count publishes nothing and returns the storage error, and the
+    /// totals stay untrusted for the rest of this open.
+    fn recount_free_totals(state: &mut InMemoryState) -> Result {
+        state.allocators.mark_free_totals_untrusted();
+        let layout = state.header.layout();
+        let mut free_pages = 0u64;
+        for region in 0..layout.num_regions() {
+            free_pages += u64::from(state.get_region(region).count_free_pages());
+        }
+        if let Some(error) = state
+            .allocators
+            .pager()
+            .and_then(|pager| pager.storage_failure())
+        {
+            return Err(error);
+        }
+        let region_pages = layout_pages(&layout);
+        if free_pages > region_pages {
+            return Err(StorageError::Corrupted(
+                "allocator free pages exceed the region pages".to_owned(),
+            ));
+        }
+        #[cfg(feature = "test-seams")]
+        FREE_TOTAL_RECOUNTS.with(|count| count.set(count.get() + 1));
+        state
+            .allocators
+            .set_recounted_free_totals(free_pages, region_pages);
+        Ok(())
+    }
+
+    /// Completed free-total recounts on the calling thread, cumulatively.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn free_total_recounts_for_test() -> u64 {
+        FREE_TOTAL_RECOUNTS.with(std::cell::Cell::get)
+    }
+
+    /// Drop trust in the maintained totals, as a poisoned allocator would.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn distrust_free_totals_for_test(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .mark_free_totals_untrusted();
+    }
+
+    /// Trusted `(free pages, region pages)`; `None` while untrusted.
+    pub(crate) fn allocator_free_totals(&self) -> Option<(u64, u64)> {
+        self.state.lock().unwrap().allocators.free_totals()
+    }
+
+    /// Independent order-weighted recount of every region's free bits, for
+    /// agreement tests. Leaves the maintained totals untouched.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn recount_free_totals_for_test(&self) -> Result<(u64, u64)> {
+        let mut state = self.state.lock().unwrap();
+        let layout = state.header.layout();
+        let mut free_pages = 0u64;
+        for region in 0..layout.num_regions() {
+            free_pages += u64::from(state.get_region(region).count_free_pages());
+        }
+        if let Some(error) = state
+            .allocators
+            .pager()
+            .and_then(|pager| pager.storage_failure())
+        {
+            return Err(error);
+        }
+        Ok((free_pages, layout_pages(&layout)))
     }
 
     pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
@@ -836,8 +958,10 @@ impl TransactionalMemory {
             // Saved tracker words remain in the durable source and share
             // AllocatorPager's fixed windows with regional bitmap words.
             // Geometry masks slots past the real regions without loading them.
+            let saved_totals = Self::saved_free_totals(tree)?;
             let mut state = self.state.lock().unwrap();
             state.allocators.set_saved_source(source)?;
+            Self::adopt_or_recount_free_totals(&mut state, saved_totals.as_deref())?;
             state.header.recovery_required = false;
             self.needs_recovery.store(false, Ordering::Release);
             return Ok(());
@@ -859,16 +983,19 @@ impl TransactionalMemory {
                 .value(),
         );
 
+        let saved_totals = Self::saved_free_totals(tree)?;
         let mut state = self.state.lock().unwrap();
         state.allocators = Allocators {
             region_tracker,
             regions,
             paged: None,
+            free_totals: FreeTotals::untrusted(),
         };
 
         // Resize the allocators to match the current file size
         let layout = state.header.layout();
         state.allocators.resize_to(layout)?;
+        Self::adopt_or_recount_free_totals(&mut state, saved_totals.as_deref())?;
         drop(state);
 
         self.state.lock().unwrap().header.recovery_required = false;
@@ -1177,6 +1304,7 @@ impl TransactionalMemory {
             state
                 .get_region_mut(region_index)
                 .free(page_number.page_index, page_number.page_order);
+            state.allocators.note_freed(page_number.page_order);
             #[cfg(debug_assertions)]
             if cfg!(test) || state.allocators.pager().is_none() {
                 assert!(self.allocated_pages.lock().unwrap().remove(page_number));
@@ -1354,6 +1482,7 @@ impl TransactionalMemory {
         state
             .get_region_mut(region_index)
             .free(page.page_index, page.page_order);
+        state.allocators.note_freed(page.page_order);
         // Ensure that the region is marked as having free space
         state
             .get_region_tracker_mut()
@@ -1526,6 +1655,7 @@ impl TransactionalMemory {
                 return Err(error);
             }
             if let Some(page) = r {
+                state.allocators.note_allocated(required_order);
                 // Keep the tracker exact for the region just used: a region
                 // this allocation filled is recorded full now, not left for a
                 // later allocation (or the next open, from the saved tracker)

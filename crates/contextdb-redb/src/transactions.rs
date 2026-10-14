@@ -257,6 +257,8 @@ pub(crate) enum AllocatorStateKey {
     Region(u32),
     RegionTracker,
     TransactionId,
+    /// Allocator-wide free and region page totals of the saved snapshot.
+    FreeTotals,
 }
 
 impl Value for AllocatorStateKey {
@@ -277,6 +279,7 @@ impl Value for AllocatorStateKey {
             3 => Self::Region(u32::from_le_bytes(data[1..].try_into().unwrap())),
             4 => Self::RegionTracker,
             5 => Self::TransactionId,
+            6 => Self::FreeTotals,
             _ => unreachable!(),
         }
     }
@@ -297,6 +300,9 @@ impl Value for AllocatorStateKey {
             }
             Self::TransactionId => {
                 result[0] = 5;
+            }
+            Self::FreeTotals => {
+                result[0] = 6;
             }
             AllocatorStateKey::Deprecated => {
                 result[0] = 0;

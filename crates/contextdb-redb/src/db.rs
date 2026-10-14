@@ -908,6 +908,37 @@ impl Database {
         move || tracker.has_waiting_write_transactions()
     }
 
+    /// The allocator's maintained `(free pages, region pages)`, read under the
+    /// allocator state lock without visiting a bitmap word or a page. `None`
+    /// while the totals are untrusted (repair in progress, a poisoned
+    /// allocator pager, or a failed rebuild), when no decision may use them.
+    #[doc(hidden)]
+    pub fn allocator_free_totals(&self) -> Option<(u64, u64)> {
+        self.mem.allocator_free_totals()
+    }
+
+    /// Independent recount of every region's free bits, for agreement tests.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn allocator_free_totals_recount_for_test(&self) -> Result<(u64, u64)> {
+        self.mem.recount_free_totals_for_test()
+    }
+
+    /// Drop trust in the maintained totals: the next save writes none, so the
+    /// next open rebuilds them.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn distrust_allocator_free_totals_for_test(&self) {
+        self.mem.distrust_free_totals_for_test();
+    }
+
+    /// Completed free-total rebuilds on the calling thread, cumulatively.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn free_total_recounts_for_test() -> u64 {
+        TransactionalMemory::free_total_recounts_for_test()
+    }
+
     #[doc(hidden)]
     pub fn storage_statistics_snapshot(&self) -> Result<crate::StorageStatisticsSnapshot> {
         let write = self.begin_write().map_err(|e| e.into_storage_error())?;

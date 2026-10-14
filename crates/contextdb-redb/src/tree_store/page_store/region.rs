@@ -173,6 +173,103 @@ pub(super) struct Allocators {
     pub(super) region_tracker: RegionTracker,
     pub(super) regions: Vec<BuddyAllocator>,
     pub(super) paged: Option<PagedRegions>,
+    pub(super) free_totals: FreeTotals,
+}
+
+/// Allocator-wide free and region page totals, maintained by net deltas at
+/// each successful allocation, free and resize so a compaction decision reads
+/// them without visiting a bitmap word or a page. Fixed size: the resident
+/// envelope stays independent of the region count.
+///
+/// Untrusted totals (repair in progress, a poisoned pager, or no valid saved
+/// value at load) are never published, saved or consumed. Only a complete
+/// recount whose pager stayed healthy makes them trusted again.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FreeTotals {
+    free_pages: u64,
+    region_pages: u64,
+    trusted: bool,
+}
+
+/// Encoded size of the saved [`FreeTotals`]:
+/// `[u32 format][u32 regions][u64 region pages][u64 free pages]`. An all-zero
+/// value (format 0) is the reserved-but-unwritten state and never valid.
+pub(crate) const FREE_TOTALS_ENCODED_LEN: usize = 24;
+const FREE_TOTALS_FORMAT: u32 = 1;
+
+pub(super) fn layout_pages(layout: &DatabaseLayout) -> u64 {
+    (0..layout.num_regions())
+        .map(|region| u64::from(layout.region_layout(region).num_pages()))
+        .sum()
+}
+
+impl FreeTotals {
+    fn all_free(layout: &DatabaseLayout) -> Self {
+        let pages = layout_pages(layout);
+        Self {
+            free_pages: pages,
+            region_pages: pages,
+            trusted: true,
+        }
+    }
+
+    pub(super) fn untrusted() -> Self {
+        Self {
+            free_pages: 0,
+            region_pages: 0,
+            trusted: false,
+        }
+    }
+
+    /// Encode the totals as saved with the allocator state that describes the
+    /// same snapshot, or `None` when they must not be saved.
+    pub(super) fn encode(
+        &self,
+        layout: &DatabaseLayout,
+    ) -> Option<[u8; FREE_TOTALS_ENCODED_LEN]> {
+        if !self.trusted || self.region_pages != layout_pages(layout) {
+            return None;
+        }
+        let mut out = [0u8; FREE_TOTALS_ENCODED_LEN];
+        out[0..4].copy_from_slice(&FREE_TOTALS_FORMAT.to_le_bytes());
+        out[4..8].copy_from_slice(&layout.num_regions().to_le_bytes());
+        out[8..16].copy_from_slice(&self.region_pages.to_le_bytes());
+        out[16..24].copy_from_slice(&self.free_pages.to_le_bytes());
+        Some(out)
+    }
+
+    /// Adopt saved totals for the committed geometry. The value is written
+    /// before the commit's trim, and a trim removes only trailing free pages of
+    /// the last region (possibly the whole region), so the committed totals are
+    /// `free - (saved pages - committed pages)` over the committed pages. Any
+    /// other relation between the saved and the committed geometry rejects it.
+    pub(super) fn decode_for_layout(bytes: &[u8], layout: &DatabaseLayout) -> Option<Self> {
+        if bytes.len() != FREE_TOTALS_ENCODED_LEN {
+            return None;
+        }
+        let format = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let regions = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+        let saved_pages = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        let saved_free = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        let committed_regions = layout.num_regions();
+        let committed_pages = layout_pages(layout);
+        if format != FREE_TOTALS_FORMAT
+            || saved_free > saved_pages
+            || !(regions == committed_regions || regions == committed_regions + 1)
+            || committed_pages > saved_pages
+        {
+            return None;
+        }
+        let trimmed = saved_pages - committed_pages;
+        if trimmed > saved_free {
+            return None;
+        }
+        Some(Self {
+            free_pages: saved_free - trimmed,
+            region_pages: committed_pages,
+            trusted: true,
+        })
+    }
 }
 
 pub(super) struct PagedRegions {
@@ -233,6 +330,7 @@ impl Allocators {
             region_tracker,
             regions,
             paged: None,
+            free_totals: FreeTotals::all_free(&layout),
         }
     }
 
@@ -261,6 +359,7 @@ impl Allocators {
                 active: None,
                 oversized_source: None,
             }),
+            free_totals: FreeTotals::all_free(&layout),
         })
     }
 
@@ -274,7 +373,74 @@ impl Allocators {
         Ok(AllocatorPager::cache_bytes_taken(cache_bytes))
     }
 
+    /// Trusted `(free pages, region pages)`, or `None` while the totals are
+    /// untrusted. Reads no bitmap word.
+    pub(super) fn free_totals(&self) -> Option<(u64, u64)> {
+        (self.free_totals.trusted && !self.pager_poisoned())
+            .then_some((self.free_totals.free_pages, self.free_totals.region_pages))
+    }
+
+    /// Encode the totals for the allocator-state save, or `None` when they
+    /// must not be saved.
+    pub(super) fn encode_free_totals(
+        &self,
+        layout: &DatabaseLayout,
+    ) -> Option<[u8; FREE_TOTALS_ENCODED_LEN]> {
+        if self.pager_poisoned() {
+            return None;
+        }
+        self.free_totals.encode(layout)
+    }
+
+    pub(super) fn set_free_totals(&mut self, totals: FreeTotals) {
+        self.free_totals = totals;
+    }
+
+    /// Publish a completed recount as the trusted totals.
+    pub(super) fn set_recounted_free_totals(&mut self, free_pages: u64, region_pages: u64) {
+        self.free_totals = FreeTotals {
+            free_pages,
+            region_pages,
+            trusted: true,
+        };
+    }
+
+    pub(super) fn mark_free_totals_untrusted(&mut self) {
+        self.free_totals.trusted = false;
+    }
+
+    fn pager_poisoned(&self) -> bool {
+        self.paged
+            .as_ref()
+            .is_some_and(|paged| paged.pager.is_poisoned())
+    }
+
+    /// Net effect of a successful extent allocation of `order`. Call only after
+    /// the allocation returned a page and the pager reported no failure.
+    pub(super) fn note_allocated(&mut self, order: u8) {
+        let pages = 1u64 << order;
+        match self.free_totals.free_pages.checked_sub(pages) {
+            Some(free) if !self.pager_poisoned() => self.free_totals.free_pages = free,
+            _ => self.free_totals.trusted = false,
+        }
+    }
+
+    /// Net effect of freeing an extent of `order`. The buddy free returns
+    /// nothing, so a pager poisoned by that call leaves the totals untrusted.
+    pub(super) fn note_freed(&mut self, order: u8) {
+        let pages = 1u64 << order;
+        match self.free_totals.free_pages.checked_add(pages) {
+            Some(free) if !self.pager_poisoned() && free <= self.free_totals.region_pages => {
+                self.free_totals.free_pages = free;
+            }
+            _ => self.free_totals.trusted = false,
+        }
+    }
+
     pub(super) fn set_saved_source(&mut self, source: Arc<SavedBitmapWindow>) -> io::Result<()> {
+        // The saved bitmaps replace the in-memory ones; the loader adopts the
+        // saved totals or recounts.
+        self.free_totals.trusted = false;
         if let Some(paged) = &mut self.paged {
             paged.active = None;
             paged.oversized_source = None;
@@ -298,6 +464,13 @@ impl Allocators {
     }
 
     pub(super) fn reset_for_repair(&mut self, layout: DatabaseLayout) -> io::Result<()> {
+        let result = self.reset_for_repair_inner(layout);
+        // Repair re-marks every reachable page; `end_repair` recounts.
+        self.free_totals.trusted = false;
+        result
+    }
+
+    fn reset_for_repair_inner(&mut self, layout: DatabaseLayout) -> io::Result<()> {
         if let Some(paged) = &mut self.paged {
             *paged.layout.lock().unwrap() = layout;
             paged.active = None;
@@ -543,7 +716,40 @@ impl Allocators {
         result
     }
 
+    /// Resize every region to `new_layout`. Growth adds free pages and a trim
+    /// removes only trailing free pages, so both totals move by the change in
+    /// region pages.
     pub(super) fn resize_to(&mut self, new_layout: DatabaseLayout) -> io::Result<()> {
+        let old_pages = match &self.paged {
+            Some(paged) => layout_pages(&paged.layout.lock().unwrap()),
+            None => self
+                .regions
+                .iter()
+                .map(|region| u64::from(region.len()))
+                .sum(),
+        };
+        let result = self.resize_to_inner(new_layout);
+        let new_pages = layout_pages(&new_layout);
+        let totals = &mut self.free_totals;
+        let adjusted = if new_pages >= old_pages {
+            totals.free_pages.checked_add(new_pages - old_pages)
+        } else {
+            totals.free_pages.checked_sub(old_pages - new_pages)
+        };
+        match adjusted {
+            Some(free) if result.is_ok() && free <= new_pages => {
+                totals.free_pages = free;
+                totals.region_pages = new_pages;
+            }
+            _ => totals.trusted = false,
+        }
+        if self.pager_poisoned() {
+            self.free_totals.trusted = false;
+        }
+        result
+    }
+
+    fn resize_to_inner(&mut self, new_layout: DatabaseLayout) -> io::Result<()> {
         if self.paged.is_some() {
             let old_layout = *self.paged.as_ref().unwrap().layout.lock().unwrap();
             match new_layout.num_regions().cmp(&old_layout.num_regions()) {

@@ -172,6 +172,15 @@ thread_local! {
     static STORAGE_STATISTICS_PAGES_WALKED_UNDER_PRUNING_GUARD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
     static PRUNING_GUARD_HELD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Storage statistics snapshots captured on this thread; each capture
+    /// already counts the system tables and the allocator's free pages.
+    static STORAGE_STATISTICS_CAPTURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub(crate) fn storage_statistics_captures_for_test() -> u64 {
+    STORAGE_STATISTICS_CAPTURES.with(std::cell::Cell::get)
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -37244,9 +37253,29 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// stood at capture. A caller that may not need the ratio captures first
     /// and walks only once it knows it does.
     pub(crate) fn storage_statistics_sample(&self) -> Result<redb::StorageStatisticsSnapshot> {
+        #[cfg(any(test, feature = "test-seams"))]
+        STORAGE_STATISTICS_CAPTURES.with(|captures| captures.set(captures.get() + 1));
         self.with_db(|db| {
             db.storage_statistics_snapshot()
                 .map_err(Self::storage_error)
+        })
+    }
+
+    /// The allocator's free pages over its region pages, from the totals the
+    /// allocator maintains as it allocates and frees: no page or bitmap word
+    /// is read, so the cost is the same at any store size. This is the input
+    /// of the maintenance compaction decisions, because whole free pages are
+    /// what relocation gives back; in-page slack is not. `None` while the
+    /// totals are untrusted, when no decision may be taken.
+    pub(crate) fn allocator_free_page_ratio(&self) -> Result<Option<f64>> {
+        self.with_db(|db| {
+            Ok(db.allocator_free_totals().map(|(free, pages)| {
+                if pages == 0 {
+                    0.0
+                } else {
+                    free as f64 / pages as f64
+                }
+            }))
         })
     }
 
