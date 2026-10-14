@@ -1303,6 +1303,16 @@ mod durable {
             self.memory.release(self.bytes);
         }
     }
+    impl Debit {
+        /// The debit's bytes stay held by its memory, now owned by whatever
+        /// the memory's own drop settles; only the handle is dropped.
+        fn settle(self) -> usize {
+            let this = std::mem::ManuallyDrop::new(self);
+            // SAFETY: `this` is never dropped; its handle is moved out once.
+            drop(unsafe { std::ptr::read(&this.memory) });
+            this.bytes
+        }
+    }
     impl Scratch {
         pub(crate) fn new(memory: Arc<ImageMemory>) -> Self {
             Self { memory, bytes: 0 }
@@ -1370,7 +1380,7 @@ mod durable {
                 return Err(invalid());
             }
             self.bytes = self.bytes.checked_add(debit.bytes).ok_or_else(invalid)?;
-            std::mem::forget(debit);
+            debit.settle();
             Ok(())
         }
         /// A copy of `key` admitted at exactly its length.
@@ -2089,7 +2099,7 @@ mod durable {
         let AnswerBuild { records, mut owner } = build;
         let bytes = owner.bytes();
         // The answer owns these bytes now; the memory keeps holding them.
-        std::mem::forget(owner.detach(bytes)?);
+        owner.detach(bytes)?.settle();
         Ok(AdmittedRecords { records, memory })
     }
 
