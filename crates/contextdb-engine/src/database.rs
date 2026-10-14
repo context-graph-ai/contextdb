@@ -25013,7 +25013,7 @@ impl MaintenanceContext {
         // Nothing declares RETAIN, so there is nothing this pass could prune,
         // no fragmentation decision it could take, and no report field it could
         // fill. Bail BEFORE the commit lock and candidate selection.
-        let policy = self.storage_compaction_policy();
+        let policy = self.storage_compaction_policy.lock().declared;
         if !self.has_retention_work() {
             return Ok(PruningReport {
                 policy,
