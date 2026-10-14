@@ -546,7 +546,7 @@ fn a_commit_releases_each_holder_charge_only_after_what_it_funds_is_freed() {
     assert_eq!(overrun, None, "a charge outlived nothing it funded: {overrun:?}");
     assert_eq!(charged, [0; 6], "every charge was released");
     assert!(live.is_empty(), "every funded allocation was freed: {live:?}");
-    for step in [HoldStep::Reserve, HoldStep::GrowSlots, HoldStep::GrowNodes, HoldStep::PrepareScratch] {
+    for step in [HoldStep::Reserve, HoldStep::GrowSlots, HoldStep::GrowNodes] {
         assert!(
             arrivals[step as usize] >= 2,
             "{step:?} happened in both passes: {arrivals:?}"
@@ -591,13 +591,25 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
     db.commit(tx).expect("the dry run commits");
     let total = take_hold_arrivals();
     db.close().expect("close");
+    // A commit's passes start with no table open, so no baseline-sized
+    // replacement is prepared there; those steps are covered over a
+    // non-empty registry by the holder-level matrix above.
+    const BASELINE_ONLY: [HoldStep; 3] = [
+        HoldStep::AdmitScratch,
+        HoldStep::PrepareScratch,
+        HoldStep::AfterScratch,
+    ];
     for step in STEPS {
         let arrivals = total[step as usize];
+        if BASELINE_ONLY.contains(&step) {
+            assert_eq!(arrivals, 0, "{step:?}: a commit's passes start with an empty registry");
+            continue;
+        }
         assert!(arrivals > 0, "{step:?} is reached by a commit");
         let mut skips = vec![0, arrivals / 2, arrivals - 1];
         skips.dedup();
         let mut faults = vec![HoldFault::Error, HoldFault::Panic];
-        if matches!(step, HoldStep::PrepareScratch | HoldStep::Reserve) {
+        if step == HoldStep::Reserve {
             faults.push(HoldFault::GlobalAllocation);
         }
         for fault in faults {
