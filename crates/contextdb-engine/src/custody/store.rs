@@ -1411,7 +1411,9 @@ mod durable {
     /// and every record it loads is admitted to `memory`. A check that passed
     /// at this root before is remembered in the store's fixed memo. A missing
     /// or damaged record anywhere in the closure refuses with the custody
-    /// corruption error. The verifier itself is the admitted one.
+    /// corruption error. The verifier itself is the admitted one. A memo entry
+    /// certifies a key's whole closure: entries are published only after the
+    /// walk completes, so a refusal part way through leaves none behind.
     fn validate_answer(
         r: &CustodyReader,
         keys: &[String],
@@ -1447,6 +1449,10 @@ mod durable {
         // Keys reached so far and the closure keys still to validate.
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut queue: Vec<String> = Vec::new();
+        // Certifications of this walk, published to the store's memo only once
+        // the whole reachable closure has validated and every admission it
+        // needed has succeeded. A failed or refused walk publishes none.
+        let mut staged: Vec<[u8; 32]> = Vec::new();
         for key in keys {
             if !seen.contains(key) {
                 scratch.admit_key(key)?;
@@ -1528,8 +1534,9 @@ mod durable {
                     .collect::<Vec<_>>();
                 validate_record_owned(db, record, &view)?;
             }
-            if let Some(memo) = r.companion_memo() {
-                memo.remember(checked);
+            if r.companion_memo().is_some() {
+                reserve_admitted(&mut staged, &mut scratch)?;
+                staged.push(checked);
             }
             // Every present companion joins the closure once.
             for (companion, _) in &loaded {
@@ -1559,6 +1566,13 @@ mod durable {
                     memo.pop_front();
                 }
                 memo.push_back(entry);
+            }
+        }
+        // The whole closure validated: publish its certifications. Nothing
+        // here can fail or allocate.
+        if let Some(memo) = r.companion_memo() {
+            for checked in staged.iter() {
+                memo.remember(*checked);
             }
         }
         Ok(())
