@@ -265,6 +265,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             }
         }
         maintenance_payload_allocated(pointer as usize, layout.size());
+        super::super::writer_row_heads::staging_witness::allocated(pointer as usize, layout.size());
         crate::vector_read_memory::native_ownership_proof::allocated(pointer, layout, window);
         pointer
     }
@@ -310,6 +311,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             };
             watch.before.store(before, AtomicOrdering::SeqCst);
         }
+        super::super::writer_row_heads::staging_witness::freed(pointer as usize, layout.size());
         crate::vector_read_memory::native_ownership_proof::before_free(
             pointer,
             layout,

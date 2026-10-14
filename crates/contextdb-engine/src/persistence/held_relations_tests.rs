@@ -359,3 +359,125 @@ fn descending_first_use_holds_each_relation_with_logarithmic_work() {
         drop(write);
     }
 }
+
+/// The holder builds the same storage name redb's callers use.
+#[test]
+fn the_holder_builds_the_storage_name_every_caller_uses() {
+    for table in ["t", "imported", &"x".repeat(400)] {
+        assert_eq!(
+            format!("{RELATION_PREFIX}{table}"),
+            RedbPersistence::rel_table_name(table)
+        );
+    }
+}
+
+/// A real commit writing one row into a long-named table. Each reconciliation
+/// pass opens that table's relation while it is not yet staged (the root hook
+/// flushes staged roots on every protected close), so closing it stages a new
+/// key. Allocations of exactly the storage name's length are recorded in
+/// order with the holder's charges. While a pass holds the relation's name
+/// charge (2 × the name), every name copy allocated (the handle's name, the
+/// registry key, and the key staging allocates on close) is freed before the
+/// charge is released, and no more than two copies are ever alive at once.
+/// Before that charge, the first use allocates exactly one name: the admitted
+/// temporary, and no unadmitted second copy.
+#[test]
+fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_until_after_it_is_freed()
+{
+    use super::staging_witness::{self, Event};
+    let table = format!("s{}", "t".repeat(776));
+    let name_len = RELATION_PREFIX.len() + table.len();
+    let root = tempfile::tempdir().expect("fixture directory");
+    let db = crate::Database::open(root.path().join("staging.db")).expect("open the database");
+    db.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
+    db.execute(
+        &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, payload TEXT NOT NULL)"),
+        &std::collections::HashMap::new(),
+    )
+    .expect("declare the table");
+    let tx = db.begin().expect("begin");
+    db.execute_in_tx(
+        tx,
+        &format!("INSERT INTO {table} VALUES ('{}', 'one row')", uuid::Uuid::from_u128(7)),
+        &std::collections::HashMap::new(),
+    )
+    .expect("stage one row");
+    staging_witness::arm(name_len);
+    db.commit(tx).expect("commit the row");
+    let events = staging_witness::take();
+    let names = 2 * name_len;
+    let mut windows = 0;
+    let mut index = 0;
+    while let Some(start) = events[index..]
+        .iter()
+        .position(|event| *event == Event::Admit(names))
+        .map(|offset| index + offset)
+    {
+        let end = start
+            + events[start..]
+                .iter()
+                .position(|event| *event == Event::Release(names))
+                .expect("the names charge is released");
+        let temp = events[..start]
+            .iter()
+            .rposition(|event| *event == Event::Admit(name_len))
+            .expect("the temporary name is admitted first");
+        let before: Vec<_> = events[temp + 1..start]
+            .iter()
+            .filter(|event| matches!(event, Event::Alloc(_)))
+            .collect();
+        assert_eq!(
+            before.len(),
+            1,
+            "the first use builds exactly one name copy before redb's: {:?}",
+            &events[temp..=start]
+        );
+        assert_eq!(
+            events[temp + 1..start]
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    Event::Staged(staged) => Some(*staged),
+                    _ => None,
+                }),
+            Some(false),
+            "the relation was not staged when the pass first used it"
+        );
+        let mut live = std::collections::HashSet::new();
+        let mut allocated = 0;
+        let mut peak = 0;
+        for event in &events[start + 1..end] {
+            match *event {
+                Event::Alloc(address) => {
+                    live.insert(address);
+                    allocated += 1;
+                    peak = peak.max(live.len());
+                }
+                Event::Free(address) => {
+                    live.remove(&address);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            allocated >= 3,
+            "the handle's name, the registry key and the staged key are all allocated \
+             while the charge is held: {:?}",
+            &events[start..=end]
+        );
+        assert!(
+            live.is_empty(),
+            "every name copy made under the charge is freed before it is released: {:?}",
+            &events[start..=end]
+        );
+        assert!(
+            peak <= 2,
+            "no more name copies are alive than the charge funds: {:?}",
+            &events[start..=end]
+        );
+        windows += 1;
+        index = end + 1;
+    }
+    assert_eq!(windows, 2, "both reconciliation passes held the relation: {events:?}");
+    db.close().expect("close");
+}

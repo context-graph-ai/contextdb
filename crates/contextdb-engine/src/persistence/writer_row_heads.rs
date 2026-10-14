@@ -58,18 +58,107 @@ const HOLD_RELATIONS_HINT: &str =
     "Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to.";
 impl RowHeadAdmission for content_identity::ProofAdmission {
     fn admit_held_relations(&mut self, bytes: usize) -> Result<()> {
-        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)
+        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)?;
+        #[cfg(test)]
+        staging_witness::charged(true, bytes);
+        Ok(())
     }
     fn release_held_relations(&mut self, bytes: usize) {
         self.release(bytes);
+        #[cfg(test)]
+        staging_witness::charged(false, bytes);
     }
 }
 impl RowHeadAdmission for content_identity::original_writer::ProofAdmission {
     fn admit_held_relations(&mut self, bytes: usize) -> Result<()> {
-        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)
+        self.admit_for(bytes, HOLD_RELATIONS, HOLD_RELATIONS_HINT)?;
+        #[cfg(test)]
+        staging_witness::charged(true, bytes);
+        Ok(())
     }
     fn release_held_relations(&mut self, bytes: usize) {
         self.release(bytes);
+        #[cfg(test)]
+        staging_witness::charged(false, bytes);
+    }
+}
+
+/// One ordered record, on the test thread, of the holder's charges and of
+/// every allocation and free of one chosen size (a storage name's length),
+/// fed by the lib test binary's global allocator. Recording never allocates:
+/// the log is a fixed array, and a full log is reported, not truncated.
+#[cfg(test)]
+pub(crate) mod staging_witness {
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Event {
+        Admit(usize),
+        Release(usize),
+        Alloc(usize),
+        Free(usize),
+        /// Whether a relation was already staged when the holder first used it.
+        Staged(bool),
+    }
+
+    const CAPACITY: usize = 4096;
+    thread_local! {
+        static SIZE: Cell<usize> = const { Cell::new(0) };
+        static LEN: Cell<usize> = const { Cell::new(0) };
+        static LOG: RefCell<[Option<Event>; CAPACITY]> = const { RefCell::new([None; CAPACITY]) };
+    }
+
+    fn push(event: Event) {
+        let _ = SIZE.try_with(|size| {
+            if size.get() == 0 {
+                return;
+            }
+            LEN.with(|len| {
+                let index = len.get();
+                if index < CAPACITY {
+                    LOG.with(|log| log.borrow_mut()[index] = Some(event));
+                }
+                len.set(index + 1);
+            });
+        });
+    }
+
+    /// Start recording, watching allocations of exactly `size` bytes.
+    pub(crate) fn arm(size: usize) {
+        LEN.with(|len| len.set(0));
+        SIZE.with(|watched| watched.set(size));
+    }
+
+    /// Stop recording and return the log.
+    pub(crate) fn take() -> Vec<Event> {
+        SIZE.with(|watched| watched.set(0));
+        let len = LEN.with(Cell::get);
+        assert!(len <= CAPACITY, "the staging witness held every event");
+        LOG.with(|log| log.borrow()[..len].iter().map(|event| event.unwrap()).collect())
+    }
+
+    pub(crate) fn allocated(address: usize, size: usize) {
+        if SIZE.try_with(Cell::get).is_ok_and(|watched| watched != 0 && watched == size) {
+            push(Event::Alloc(address));
+        }
+    }
+
+    pub(crate) fn freed(address: usize, size: usize) {
+        if SIZE.try_with(Cell::get).is_ok_and(|watched| watched != 0 && watched == size) {
+            push(Event::Free(address));
+        }
+    }
+
+    pub(crate) fn charged(admitted: bool, bytes: usize) {
+        push(if admitted {
+            Event::Admit(bytes)
+        } else {
+            Event::Release(bytes)
+        });
+    }
+
+    pub(crate) fn staged(staged: bool) {
+        push(Event::Staged(staged));
     }
 }
 
@@ -216,7 +305,9 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         let mut name = String::with_capacity(name_len);
         name.push_str(RELATION_PREFIX);
         name.push_str(table);
-        debug_assert_eq!(name, RedbPersistence::rel_table_name(table));
+        // Compared in place: building the reference name here would be an
+        // unadmitted second copy.
+        debug_assert_eq!(name.strip_prefix(RELATION_PREFIX), Some(table));
         let used = self.first_use_named(table, &name, vacancy);
         drop(name);
         self.release(|ledger| &mut ledger.temp_name);
@@ -234,6 +325,8 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
             .write
             .table_exists(definition)
             .map_err(RedbPersistence::storage_error)?;
+        #[cfg(test)]
+        staging_witness::staged(self.write.pending_table_update_contains(name));
         let position = u32::try_from(self.slots.len())
             .ok()
             .filter(|position| *position != NO_POSITION)
