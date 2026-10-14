@@ -9,11 +9,14 @@ use contextdb_vector::hnsw::paged_builder::{
 };
 use redb::ReadableDatabase;
 
-/// Share of the declared writer memory limit one import cohort's decoded
+/// Share of the writer's effective memory limit one import cohort's decoded
 /// vectors may take: the paged build's own batch share (one batch workspace
-/// per sixteenth of the declared writer budget, `vector_paged_build.rs`).
-/// A tight budget absorbs an import in more, smaller cohorts instead of
-/// refusing it; without a limit the whole suffix is one cohort.
+/// per sixteenth of the writer budget, `vector_paged_build.rs`). The
+/// effective limit is the declared one, or, when none is declared, the
+/// inherited process ceiling every writer admission already enforces. A
+/// tight budget absorbs an import in more, smaller cohorts instead of
+/// refusing it; an undeclared limit bounds cohorts exactly as a declared one
+/// of that size would.
 const IMPORT_COHORT_BUDGET_SHARE: usize = 16;
 
 /// What the next cohort of a route's uncovered suffix, up to the import's
@@ -286,10 +289,16 @@ impl MaintenanceContext {
     /// Bytes of decoded vectors one import cohort may retain: a sixteenth
     /// of the declared writer limit (unlimited without one).
     fn import_cohort_share(&self) -> usize {
-        self.finalization
-            .accountant
-            .usage()
+        let usage = self.finalization.accountant.usage();
+        // Undeclared: what this writer holds plus what the process ceiling
+        // still admits, the same envelope its admissions are checked against.
+        usage
             .limit
+            .or_else(|| {
+                usage
+                    .available
+                    .map(|available| available.saturating_add(usage.used))
+            })
             .map_or(usize::MAX, |limit| limit / IMPORT_COHORT_BUDGET_SHARE)
     }
 
@@ -914,4 +923,128 @@ fn native_tail_write_bound(
         .and_then(|bytes| bytes.checked_add(plan.max_points.saturating_mul(4096)))
         .and_then(|bytes| bytes.checked_add(64 * 1024))
         .ok_or_else(|| Error::Other("native vector disk write admission overflow".into()))
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod undeclared_limit_tests {
+    use crate::{Database, DatabaseOpenOptions, MaintenancePolicy};
+    use contextdb_core::{Value, Wallclock};
+    use std::collections::HashMap;
+
+    const DIMENSION: usize = 384;
+    const BASE_ROWS: i64 = 16;
+    const COMMITS: i64 = 64;
+    const PER_COMMIT: i64 = 1024;
+    /// The child's whole-process ceiling: far below the suffix's decoded
+    /// vectors (65,536 x 1,536 B = 96 MiB), far above a cohort.
+    const PROCESS_CEILING: usize = 64 * 1024 * 1024;
+    const CHILD_PATH: &str = "S7_UNDECLARED_LIMIT_PATH";
+
+    fn options() -> DatabaseOpenOptions {
+        // No writer memory limit is declared.
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..DatabaseOpenOptions::default()
+        }
+    }
+
+    fn vector_for(id: i64) -> Vec<f32> {
+        let mut values: Vec<f32> = (0..DIMENSION)
+            .map(|lane| ((id as f32) * 0.618 + lane as f32 * 0.37).sin() * 0.25)
+            .collect();
+        values[(id as usize) % DIMENSION] += 4.0;
+        values
+    }
+
+    fn pending(db: &Database) -> usize {
+        let routes = db
+            .vector_serving_pending_inserts_for_test("points", "embedding")
+            .unwrap();
+        assert_eq!(routes.len(), 1, "{routes:?}");
+        routes[0].3
+    }
+
+    #[test]
+    fn an_undeclared_writer_limit_bounds_import_cohorts_by_the_process_ceiling() {
+        let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+        if let Ok(path) = std::env::var(CHILD_PATH) {
+            crate::memory_accounting::set_process_ceiling_for_test(Some(PROCESS_CEILING));
+            let db = Database::open_with_options(&path, options()).unwrap();
+            assert_eq!(db.memory_limit(), None, "no writer limit is declared");
+            assert_eq!(
+                db.persist_import_vector_tails().unwrap(),
+                true,
+                "the suffix is absorbed in cohorts bounded by the process ceiling"
+            );
+            assert_eq!(pending(&db), 0);
+            db.close().unwrap();
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("undeclared.db");
+        {
+            let db = Database::open_with_options(&path, options()).unwrap();
+            db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
+            for id in 0..BASE_ROWS {
+                db.execute(
+                    "INSERT INTO points VALUES ($id, 1, $v)",
+                    &HashMap::from([
+                        ("id".into(), Value::Int64(id)),
+                        ("v".into(), Value::Vector(vector_for(id))),
+                    ]),
+                )
+                .unwrap();
+            }
+            while db
+                .run_maintenance_cycle()
+                .unwrap()
+                .vector
+                .remaining_partitions
+                != 0
+            {}
+            for commit in 0..COMMITS {
+                let first = 1_000_000 + commit * PER_COMMIT;
+                let mut sql = String::from("INSERT INTO points VALUES ");
+                let mut params = HashMap::new();
+                for row in 0..PER_COMMIT {
+                    if row > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("($i{row}, 1, $v{row})"));
+                    params.insert(format!("i{row}"), Value::Int64(first + row));
+                    params.insert(format!("v{row}"), Value::Vector(vector_for(first + row)));
+                }
+                db.execute(&sql, &params).unwrap();
+            }
+            assert_eq!(pending(&db), (COMMITS * PER_COMMIT) as usize);
+            db.close().unwrap();
+        }
+        let test = concat!(
+            module_path!(),
+            "::an_undeclared_writer_limit_bounds_import_cohorts_by_the_process_ceiling"
+        )
+        .trim_start_matches("contextdb_engine::");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(test)
+            .args(["--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_PATH, &path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let db = Database::open_with_options(&path, options()).unwrap();
+        assert_eq!(pending(&db), 0, "the whole suffix is covered");
+        let nearest = db
+            .execute(
+                "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                &HashMap::from([("q".into(), Value::Vector(vector_for(1_000_000 + 40_000)))]),
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(nearest, vec![vec![Value::Int64(1_000_000 + 40_000)]]);
+    }
 }
