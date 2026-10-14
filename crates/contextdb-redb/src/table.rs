@@ -60,7 +60,7 @@ impl TableStats {
 
 /// A table containing key-value mappings
 pub struct Table<'txn, K: Key + 'static, V: Value + 'static> {
-    name: String,
+    name: Box<str>,
     transaction: &'txn WriteTransaction,
     tree: BtreeMut<'txn, K, V>,
 }
@@ -81,7 +81,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         transaction: &'txn WriteTransaction,
     ) -> Table<'txn, K, V> {
         Table {
-            name: name.to_string(),
+            name: Box::from(name),
             transaction,
             tree: BtreeMut::new(
                 table_root,

@@ -1568,7 +1568,7 @@
  };
  pub use error::{
      CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
-@@ -79,19 +83,40 @@
+@@ -79,19 +83,47 @@
      ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
      Table, TableStats,
  };
@@ -1598,6 +1598,13 @@
  mod multimap_table;
  mod sealed;
  mod table;
++mod table_registry;
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveError};
++#[cfg(feature = "test-seams")]
++#[doc(hidden)]
++pub use table_registry::RegistryAllocationRecord;
 +#[cfg(feature = "test-seams")]
 +mod table_write_observer;
 +#[cfg(feature = "test-seams")]
@@ -1609,7 +1616,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +131,30 @@
+@@ -106,3 +138,30 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -2369,6 +2376,24 @@
 +}
 --- a/src/table.rs
 +++ b/src/table.rs
+@@ -60,7 +60,7 @@
+ 
+ /// A table containing key-value mappings
+ pub struct Table<'txn, K: Key + 'static, V: Value + 'static> {
+-    name: String,
++    name: Box<str>,
+     transaction: &'txn WriteTransaction,
+     tree: BtreeMut<'txn, K, V>,
+ }
+@@ -81,7 +81,7 @@
+         transaction: &'txn WriteTransaction,
+     ) -> Table<'txn, K, V> {
+         Table {
+-            name: name.to_string(),
++            name: Box::from(name),
+             transaction,
+             tree: BtreeMut::new(
+                 table_root,
 @@ -215,7 +215,23 @@
          if value_len + key_len > MAX_PAIR_LENGTH {
              return Err(StorageError::ValueTooLarge(value_len + key_len));
@@ -2559,6 +2584,260 @@
 +                    (key, value)
 +                })
 +            }))
++    }
++}
+--- /dev/null
++++ b/src/table_registry.rs
+@@ -0,0 +1,251 @@
++//! The write transaction's set of open tables.
++//!
++//! It is the same hash table and the same randomly seeded hasher as
++//! `std::collections::HashMap`, with an allocator a caller can fund: every
++//! array the registry allocates or frees passes through [`RegistryAlloc`], so
++//! its exact requested `Layout` is known before it is allocated (by a refused
++//! fallible reserve) and accounted for when it is freed.
++
++use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
++use std::hash::RandomState;
++use std::panic;
++use std::ptr::NonNull;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++pub(crate) type OpenTables =
++    hashbrown::HashMap<Box<str>, &'static panic::Location<'static>, RandomState, RegistryAlloc>;
++
++pub(crate) fn new_open_tables(funding: &Arc<RegistryFunding>) -> OpenTables {
++    hashbrown::HashMap::with_hasher_in(RandomState::new(), RegistryAlloc(funding.clone()))
++}
++
++/// What a registry allocation request is checked against.
++#[derive(Default)]
++pub(crate) struct RegistryFunding {
++    /// Set for a caller's whole pass: an allocation made outside a funded
++    /// reserve while it is set is counted as an overdraft.
++    monitoring: AtomicBool,
++    /// Set only inside one funded reserve or probe.
++    fallible: AtomicBool,
++    /// Bytes deposited for the current funded reserve.
++    credit: AtomicUsize,
++    refused_size: AtomicUsize,
++    refused_align: AtomicUsize,
++    live: AtomicUsize,
++    peak: AtomicUsize,
++    overdraft: AtomicUsize,
++    allocations: AtomicUsize,
++    #[cfg(feature = "test-seams")]
++    records: std::sync::Mutex<Option<Vec<RegistryAllocationRecord>>>,
++}
++
++/// One allocation or free of a registry array, in the order they happened.
++#[cfg(feature = "test-seams")]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct RegistryAllocationRecord {
++    pub generation: usize,
++    pub address: usize,
++    pub size: usize,
++    pub align: usize,
++    pub allocated: bool,
++}
++
++impl RegistryFunding {
++    fn note(&self, address: usize, layout: Layout, allocated: bool) {
++        if allocated {
++            let generation = self.allocations.fetch_add(1, Ordering::SeqCst);
++            let live = self.live.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
++            self.peak.fetch_max(live, Ordering::SeqCst);
++            #[cfg(feature = "test-seams")]
++            self.record(generation, address, layout, true);
++            #[cfg(not(feature = "test-seams"))]
++            let _ = (generation, address);
++        } else {
++            self.live.fetch_sub(layout.size(), Ordering::SeqCst);
++            #[cfg(feature = "test-seams")]
++            self.record(self.allocations.load(Ordering::SeqCst), address, layout, false);
++            #[cfg(not(feature = "test-seams"))]
++            let _ = address;
++        }
++    }
++
++    #[cfg(feature = "test-seams")]
++    fn record(&self, generation: usize, address: usize, layout: Layout, allocated: bool) {
++        if let Some(records) = self.records.lock().unwrap().as_mut() {
++            records.push(RegistryAllocationRecord {
++                generation,
++                address,
++                size: layout.size(),
++                align: layout.align(),
++                allocated,
++            });
++        }
++    }
++
++    fn take_refused(&self) -> Option<Layout> {
++        let size = self.refused_size.swap(0, Ordering::SeqCst);
++        let align = self.refused_align.swap(0, Ordering::SeqCst);
++        if align == 0 {
++            return None;
++        }
++        Layout::from_size_align(size, align).ok()
++    }
++}
++
++/// The registry's allocator. Outside a funded reserve it is the global
++/// allocator, exactly as before.
++#[derive(Clone)]
++pub(crate) struct RegistryAlloc(Arc<RegistryFunding>);
++
++unsafe impl Allocator for RegistryAlloc {
++    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
++        let funding = &*self.0;
++        if funding.fallible.load(Ordering::SeqCst) {
++            let credit = funding.credit.load(Ordering::SeqCst);
++            if layout.size() > credit {
++                funding
++                    .refused_size
++                    .store(layout.size(), Ordering::SeqCst);
++                funding
++                    .refused_align
++                    .store(layout.align(), Ordering::SeqCst);
++                return Err(AllocError);
++            }
++            let block = Global.allocate(layout)?;
++            funding
++                .credit
++                .store(credit - layout.size(), Ordering::SeqCst);
++            funding.note(block.cast::<u8>().as_ptr() as usize, layout, true);
++            return Ok(block);
++        }
++        if funding.monitoring.load(Ordering::SeqCst) {
++            funding
++                .overdraft
++                .fetch_add(layout.size(), Ordering::SeqCst);
++        }
++        let block = Global.allocate(layout)?;
++        funding.note(block.cast::<u8>().as_ptr() as usize, layout, true);
++        Ok(block)
++    }
++
++    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
++        let address = ptr.as_ptr() as usize;
++        // SAFETY: forwarded unchanged; every block came from `Global`.
++        unsafe { Global.deallocate(ptr, layout) };
++        self.0.note(address, layout, false);
++    }
++}
++
++/// Sets the per-call funded state and restores it on every exit.
++pub(crate) struct FundedCall<'a>(&'a RegistryFunding);
++impl<'a> FundedCall<'a> {
++    pub(crate) fn enter(funding: &'a RegistryFunding, credit: usize) -> Self {
++        funding.take_refused();
++        funding.credit.store(credit, Ordering::SeqCst);
++        funding.fallible.store(true, Ordering::SeqCst);
++        Self(funding)
++    }
++
++    /// The layout the last refused allocation asked for, if this call
++    /// refused one.
++    pub(crate) fn refused(&self) -> Option<Layout> {
++        self.0.take_refused()
++    }
++
++    pub(crate) fn allocations(&self) -> usize {
++        self.0.allocations.load(Ordering::SeqCst)
++    }
++}
++impl Drop for FundedCall<'_> {
++    fn drop(&mut self) {
++        self.0.fallible.store(false, Ordering::SeqCst);
++        self.0.credit.store(0, Ordering::SeqCst);
++    }
++}
++
++/// Why the cost of a registry change could not be learned or paid.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum RegistryReserveError {
++    /// The requested capacity overflows the hash table's layout arithmetic;
++    /// nothing was asked of the allocator.
++    CapacityOverflow,
++    /// The allocator refused this exact layout: the credit did not cover it,
++    /// or the global allocator failed. The registry is unchanged.
++    AllocError(Layout),
++    /// A prepared replacement cannot hold the open tables without growing.
++    ReplacementTooSmall,
++}
++
++pub(crate) fn reserve_error(
++    error: hashbrown::TryReserveError,
++    call: &FundedCall<'_>,
++) -> RegistryReserveError {
++    match error {
++        hashbrown::TryReserveError::CapacityOverflow => RegistryReserveError::CapacityOverflow,
++        hashbrown::TryReserveError::AllocError { layout } => {
++            RegistryReserveError::AllocError(call.refused().unwrap_or(layout))
++        }
++    }
++}
++
++/// An empty registry array reserved ahead of time, so that putting the open
++/// tables back into a baseline-sized array later allocates nothing.
++pub struct RegistryReplacement {
++    pub(crate) map: OpenTables,
++}
++impl RegistryReplacement {
++    /// The bytes this replacement's array holds.
++    pub fn allocation_bytes(&self) -> usize {
++        self.map.allocation_size()
++    }
++}
++
++/// Counts allocations of the registry made outside a funded reserve for as
++/// long as it is held, and restores the previous state when dropped.
++pub struct RegistryMonitor {
++    funding: Arc<RegistryFunding>,
++    previous: bool,
++    overdraft_at_start: usize,
++}
++impl RegistryMonitor {
++    pub(crate) fn start(funding: &Arc<RegistryFunding>) -> Self {
++        let previous = funding.monitoring.swap(true, Ordering::SeqCst);
++        Self {
++            funding: funding.clone(),
++            previous,
++            overdraft_at_start: funding.overdraft.load(Ordering::SeqCst),
++        }
++    }
++
++    /// Bytes the registry allocated outside a funded reserve since this
++    /// monitor started.
++    pub fn overdraft_bytes(&self) -> usize {
++        self.funding.overdraft.load(Ordering::SeqCst) - self.overdraft_at_start
++    }
++}
++impl Drop for RegistryMonitor {
++    fn drop(&mut self) {
++        self.funding
++            .monitoring
++            .store(self.previous, Ordering::SeqCst);
++    }
++}
++
++#[cfg(feature = "test-seams")]
++impl RegistryFunding {
++    pub(crate) fn start_recording(&self) {
++        *self.records.lock().unwrap() = Some(Vec::new());
++    }
++
++    pub(crate) fn take_records(&self) -> Vec<RegistryAllocationRecord> {
++        self.records.lock().unwrap().take().unwrap_or_default()
++    }
++
++    pub(crate) fn live_and_peak(&self) -> (usize, usize) {
++        (
++            self.live.load(Ordering::SeqCst),
++            self.peak.load(Ordering::SeqCst),
++        )
 +    }
 +}
 --- /dev/null
@@ -3068,10 +3347,160 @@
  const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
      SystemTableDefinition::new("next_savepoint_id");
  pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
-@@ -816,6 +877,19 @@
-     }
+@@ -562,7 +623,8 @@
  }
  
+ struct TableNamespace<'db> {
+-    open_tables: HashMap<String, &'static panic::Location<'static>>,
++    open_tables: crate::table_registry::OpenTables,
++    registry_funding: Arc<crate::table_registry::RegistryFunding>,
+     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
+     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+     table_tree: TableTreeMut<'db>,
+@@ -585,8 +647,10 @@
+             freed_pages.clone(),
+             allocated.clone(),
+         );
++        let registry_funding = Arc::new(crate::table_registry::RegistryFunding::default());
+         Self {
+-            open_tables: Default::default(),
++            open_tables: crate::table_registry::new_open_tables(&registry_funding),
++            registry_funding,
+             table_tree,
+             freed_pages,
+             allocated_pages: allocated,
+@@ -621,7 +685,7 @@
+             .table_tree
+             .get_or_create_table::<K, V>(name, table_type)?;
+         self.open_tables
+-            .insert(name.to_string(), panic::Location::caller());
++            .insert(Box::from(name), panic::Location::caller());
+ 
+         Ok(root)
+     }
+@@ -752,6 +816,116 @@
+         self.table_tree
+             .stage_update_table_root(name, table.get_root(), length);
+     }
++
++    /// The exact layout a reserve of `additional` open tables would allocate,
++    /// learned by refusing it: the registry keeps its entries and allocation.
++    #[cfg(feature = "contextdb-internal")]
++    fn registry_cost_to_reserve(
++        &mut self,
++        additional: usize,
++    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
++    {
++        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
++        match self.open_tables.try_reserve(additional) {
++            Ok(()) => Ok(None),
++            Err(error) => match crate::table_registry::reserve_error(error, &call) {
++                crate::table_registry::RegistryReserveError::AllocError(layout) => Ok(Some(layout)),
++                other => Err(other),
++            },
++        }
++    }
++
++    /// Reserve room for `additional` open tables, paying with `credit` bytes.
++    /// Returns the bytes of the array this replaced, which is now freed.
++    #[cfg(feature = "contextdb-internal")]
++    fn registry_reserve_with(
++        &mut self,
++        additional: usize,
++        credit: usize,
++    ) -> Result<usize, crate::table_registry::RegistryReserveError> {
++        let before = self.open_tables.allocation_size();
++        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
++        let allocations = call.allocations();
++        match self.open_tables.try_reserve(additional) {
++            Ok(()) if call.allocations() != allocations => Ok(before),
++            Ok(()) => Ok(0),
++            Err(error) => Err(crate::table_registry::reserve_error(error, &call)),
++        }
++    }
++
++    /// The exact layout an empty registry array for `len` tables allocates.
++    #[cfg(feature = "contextdb-internal")]
++    fn registry_cost_to_hold(
++        &self,
++        len: usize,
++    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
++    {
++        let mut scratch = crate::table_registry::new_open_tables(&self.registry_funding);
++        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
++        match scratch.try_reserve(len) {
++            Ok(()) => Ok(None),
++            Err(error) => match crate::table_registry::reserve_error(error, &call) {
++                crate::table_registry::RegistryReserveError::AllocError(layout) => Ok(Some(layout)),
++                other => Err(other),
++            },
++        }
++    }
++
++    /// An empty registry array for `len` tables, paid with `credit` bytes.
++    #[cfg(feature = "contextdb-internal")]
++    fn registry_prepare_replacement(
++        &self,
++        len: usize,
++        credit: usize,
++    ) -> Result<crate::table_registry::RegistryReplacement, crate::table_registry::RegistryReserveError>
++    {
++        let mut map = crate::table_registry::new_open_tables(&self.registry_funding);
++        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
++        map.try_reserve(len)
++            .map_err(|error| crate::table_registry::reserve_error(error, &call))?;
++        drop(call);
++        Ok(crate::table_registry::RegistryReplacement { map })
++    }
++
++    /// Move the open tables into `replacement` (or, with none, into an
++    /// unallocated registry when no table is open) and free the current
++    /// array, allocating nothing. Returns the freed array's bytes. On refusal
++    /// the registry and the replacement are returned unchanged.
++    #[cfg(feature = "contextdb-internal")]
++    fn registry_install_replacement(
++        &mut self,
++        replacement: Option<crate::table_registry::RegistryReplacement>,
++    ) -> Result<
++        usize,
++        (
++            crate::table_registry::RegistryReserveError,
++            Option<crate::table_registry::RegistryReplacement>,
++        ),
++    > {
++        let mut next = match replacement {
++            Some(replacement) if replacement.map.capacity() >= self.open_tables.len() => {
++                replacement.map
++            }
++            None if self.open_tables.is_empty() => {
++                crate::table_registry::new_open_tables(&self.registry_funding)
++            }
++            other => {
++                return Err((
++                    crate::table_registry::RegistryReserveError::ReplacementTooSmall,
++                    other,
++                ));
++            }
++        };
++        // `next` has room for every entry, so these inserts allocate nothing;
++        // a monitored caller would see any allocation as an overdraft.
++        for (name, location) in self.open_tables.drain() {
++            next.insert(name, location);
++        }
++        let previous = std::mem::replace(&mut self.open_tables, next);
++        let freed = previous.allocation_size();
++        drop(previous);
++        Ok(freed)
++    }
+ }
+ 
+ // Transaction-local savepoint lifecycle state.
+@@ -814,6 +988,19 @@
+         // shared tracker, so dropping them is sufficient.
+         self.invalidated.clear();
+     }
++}
++
 +/// Transaction-local normal-table root lifecycle. Policy and witness storage belong to callers.
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
@@ -3083,12 +3512,10 @@
 +    AfterDelete,
 +    BeforeRelocate,
 +    AfterRelocate,
-+}
-+
+ }
+ 
  /// A read/write transaction
- ///
- /// Only a single [`WriteTransaction`] may exist at a time
-@@ -832,9 +906,77 @@
+@@ -832,9 +1019,77 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
@@ -3166,7 +3593,7 @@
  }
  
  impl WriteTransaction {
-@@ -850,8 +992,16 @@
+@@ -850,8 +1105,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -3183,7 +3610,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +1014,111 @@
+@@ -864,9 +1127,111 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -3295,7 +3722,7 @@
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1144,29 @@
+@@ -892,6 +1257,29 @@
              return Ok(true);
          }
  
@@ -3325,7 +3752,7 @@
          Ok(false)
      }
  
-@@ -1349,7 +1624,47 @@
+@@ -1349,7 +1737,202 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -3348,6 +3775,161 @@
 +            .table_tree
 +            .get_table::<K, V>(definition.name(), TableType::Normal)?
 +            .is_some())
++    }
++
++    /// Open tables registered in this transaction.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_len(&self) -> usize {
++        self.tables.lock().unwrap().open_tables.len()
++    }
++
++    /// Bytes of the open-table registry's array.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_bytes(&self) -> usize {
++        self.tables.lock().unwrap().open_tables.allocation_size()
++    }
++
++    /// The exact layout the registry would allocate to make room for
++    /// `additional` more open tables, or `None` when it already has room. The
++    /// registry keeps its entries and its allocation (a tombstone-only rehash
++    /// may reorder slots without allocating).
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_cost_to_reserve(
++        &self,
++        additional: usize,
++    ) -> Result<Option<std::alloc::Layout>, crate::RegistryReserveError> {
++        self.tables
++            .lock()
++            .unwrap()
++            .registry_cost_to_reserve(additional)
++    }
++
++    /// Make room for `additional` more open tables with at most `credit`
++    /// newly allocated bytes. Returns the bytes of the array this freed (zero
++    /// when nothing was reallocated). On refusal the registry is unchanged.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_reserve(
++        &self,
++        additional: usize,
++        credit: usize,
++    ) -> Result<usize, crate::RegistryReserveError> {
++        self.tables
++            .lock()
++            .unwrap()
++            .registry_reserve_with(additional, credit)
++    }
++
++    /// The exact layout of an empty registry array holding `len` tables, or
++    /// `None` when such an array allocates nothing.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_cost_to_hold(
++        &self,
++        len: usize,
++    ) -> Result<Option<std::alloc::Layout>, crate::RegistryReserveError> {
++        self.tables.lock().unwrap().registry_cost_to_hold(len)
++    }
++
++    /// Allocate, with at most `credit` bytes, an empty registry array for
++    /// `len` tables to be installed later without allocating.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_prepare(
++        &self,
++        len: usize,
++        credit: usize,
++    ) -> Result<crate::RegistryReplacement, crate::RegistryReserveError> {
++        self.tables
++            .lock()
++            .unwrap()
++            .registry_prepare_replacement(len, credit)
++    }
++
++    /// Move the open tables into `replacement`, or into an unallocated
++    /// registry when none is given and no table is open, freeing the current
++    /// array without allocating. Returns the freed bytes; on refusal both are
++    /// returned unchanged.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_install(
++        &self,
++        replacement: Option<crate::RegistryReplacement>,
++    ) -> Result<usize, (crate::RegistryReserveError, Option<crate::RegistryReplacement>)> {
++        self.tables
++            .lock()
++            .unwrap()
++            .registry_install_replacement(replacement)
++    }
++
++    /// Count registry allocations made outside a funded reserve until the
++    /// returned monitor drops.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_table_registry_monitor(&self) -> crate::RegistryMonitor {
++        crate::table_registry::RegistryMonitor::start(
++            &self.tables.lock().unwrap().registry_funding,
++        )
++    }
++
++    /// Whether `name` already has a staged root update in this transaction.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn pending_table_update_contains(&self, name: &str) -> bool {
++        self.tables
++            .lock()
++            .unwrap()
++            .table_tree
++            .pending_table_update_contains(name)
++    }
++
++    /// Start recording every registry array allocation and free.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn open_table_registry_record_for_test(&self) {
++        self.tables
++            .lock()
++            .unwrap()
++            .registry_funding
++            .start_recording();
++    }
++
++    /// The recorded registry allocations and frees, plus live and peak bytes.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn open_table_registry_records_for_test(
++        &self,
++    ) -> (Vec<crate::RegistryAllocationRecord>, usize, usize) {
++        let tables = self.tables.lock().unwrap();
++        let (live, peak) = tables.registry_funding.live_and_peak();
++        (tables.registry_funding.take_records(), live, peak)
++    }
++
++    /// The address and length of every registry key box.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn open_table_registry_keys_for_test(&self) -> Vec<(usize, usize)> {
++        self.tables
++            .lock()
++            .unwrap()
++            .open_tables
++            .keys()
++            .map(|key| (key.as_ptr() as usize, key.len()))
++            .collect()
++    }
++
++    /// Staged root updates: (entries, capacity).
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn pending_table_updates_for_test(&self) -> (usize, usize) {
++        self.tables
++            .lock()
++            .unwrap()
++            .table_tree
++            .pending_table_updates_for_test()
 +    }
 +
 +    /// Return the finalized root header of a user table after its open handles
@@ -3373,7 +3955,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +1688,13 @@
+@@ -1373,6 +1956,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -3387,7 +3969,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +1706,21 @@
+@@ -1384,10 +1974,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -3410,7 +3992,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +1745,29 @@
+@@ -1412,7 +2013,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -3441,7 +4023,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +1813,39 @@
+@@ -1458,9 +2081,39 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -3481,7 +4063,7 @@
      }
  
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +1854,45 @@
+@@ -1469,11 +2122,45 @@
              self.two_phase_commit = true;
          }
  
@@ -3529,7 +4111,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +1903,102 @@
+@@ -1484,6 +2171,102 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -3632,7 +4214,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,18 +2142,39 @@
+@@ -1627,18 +2410,39 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -3676,7 +4258,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2216,17 @@
+@@ -1680,7 +2484,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -3695,7 +4277,7 @@
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2234,11 @@
+@@ -1688,6 +2502,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -3707,7 +4289,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2249,146 @@
+@@ -1698,6 +2517,146 @@
              self.mem.free(page, &mut PageTrackerPolicy::Ignore);
          }
  
@@ -3854,7 +4436,7 @@
          Ok(())
      }
  
-@@ -1766,6 +2457,9 @@
+@@ -1766,6 +2725,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -3864,7 +4446,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2517,384 @@
+@@ -1823,46 +2785,384 @@
          Ok(progress)
      }
  
@@ -4279,7 +4861,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +3069,18 @@
+@@ -2037,6 +3337,18 @@
          })
      }
  
@@ -4298,7 +4880,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +3151,148 @@
+@@ -2107,18 +3419,148 @@
      tree: TableTree,
  }
  
@@ -4448,7 +5030,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3309,69 @@
+@@ -2135,12 +3577,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -4519,7 +5101,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +3392,7 @@
+@@ -2161,7 +3660,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -4528,7 +5110,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +3420,7 @@
+@@ -2189,7 +3688,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -4537,7 +5119,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +3448,7 @@
+@@ -2217,7 +3716,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -4546,7 +5128,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +3494,15 @@
+@@ -2263,7 +3762,15 @@
  
  #[cfg(test)]
  mod test {
@@ -4563,7 +5145,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3523,919 @@
+@@ -2284,4 +3791,919 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -15169,7 +15751,37 @@
              freed_pages,
              allocated_pages,
          }
-@@ -372,6 +410,14 @@
+@@ -288,8 +326,27 @@
+         let dirty = table_root
+             .as_ref()
+             .is_some_and(|header| self.mem.uncommitted(header.root));
+-        self.pending_table_updates
+-            .insert(name.to_string(), (table_root, length, dirty));
++        // Restaging a table already staged replaces its entry in place,
++        // without allocating a key that the map would drop again.
++        if let Some(entry) = self.pending_table_updates.get_mut(name) {
++            *entry = (table_root, length, dirty);
++        } else {
++            self.pending_table_updates
++                .insert(name.to_string(), (table_root, length, dirty));
++        }
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn pending_table_update_contains(&self, name: &str) -> bool {
++        self.pending_table_updates.contains_key(name)
++    }
++
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn pending_table_updates_for_test(&self) -> (usize, usize) {
++        (
++            self.pending_table_updates.len(),
++            self.pending_table_updates.capacity(),
++        )
+     }
+ 
+     pub(crate) fn clear_root_updates_and_close(&mut self) {
+@@ -372,6 +429,14 @@
                  }
              }
              self.tree.insert(&name.as_str(), &definition)?;
@@ -15184,7 +15796,7 @@
          }
          Ok(self)
      }
-@@ -544,7 +590,23 @@
+@@ -544,7 +609,23 @@
                      .insert(new_name.to_string(), update);
              }
              assert!(self.tree.remove(&name)?.is_some());
@@ -15208,7 +15820,7 @@
          } else {
              return Err(TableError::TableDoesNotExist(name.to_string()));
          }
-@@ -570,6 +632,8 @@
+@@ -570,6 +651,8 @@
              for page in pages {
                  if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                      freed_pages.push(page);
@@ -15217,7 +15829,7 @@
                  }
              }
              drop(allocated_pages);
-@@ -578,6 +642,14 @@
+@@ -578,6 +661,14 @@
              self.pending_table_updates.remove(name);
  
              let found = self.tree.remove(&name)?.is_some();
@@ -15232,7 +15844,7 @@
              return Ok(found);
          }
  
-@@ -594,6 +666,14 @@
+@@ -594,6 +685,14 @@
          } else {
              let table = InternalTableDefinition::new::<K, V>(table_type, None, 0);
              self.tree.insert(&name, &table)?;
@@ -15247,7 +15859,7 @@
              table
          };
  
-@@ -675,6 +755,104 @@
+@@ -675,6 +774,104 @@
  
          self.tree.relocate(relocation_map)?;
  
@@ -15352,7 +15964,7 @@
          Ok(())
      }
  
-@@ -783,3 +961,107 @@
+@@ -783,3 +980,107 @@
          assert_eq!(x, y);
      }
  }

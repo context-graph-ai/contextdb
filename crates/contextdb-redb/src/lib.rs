@@ -109,6 +109,13 @@ mod error;
 mod multimap_table;
 mod sealed;
 mod table;
+mod table_registry;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveError};
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use table_registry::RegistryAllocationRecord;
 #[cfg(feature = "test-seams")]
 mod table_write_observer;
 #[cfg(feature = "test-seams")]

@@ -326,8 +326,27 @@ impl TableTreeMut<'_> {
         let dirty = table_root
             .as_ref()
             .is_some_and(|header| self.mem.uncommitted(header.root));
-        self.pending_table_updates
-            .insert(name.to_string(), (table_root, length, dirty));
+        // Restaging a table already staged replaces its entry in place,
+        // without allocating a key that the map would drop again.
+        if let Some(entry) = self.pending_table_updates.get_mut(name) {
+            *entry = (table_root, length, dirty);
+        } else {
+            self.pending_table_updates
+                .insert(name.to_string(), (table_root, length, dirty));
+        }
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn pending_table_update_contains(&self, name: &str) -> bool {
+        self.pending_table_updates.contains_key(name)
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn pending_table_updates_for_test(&self) -> (usize, usize) {
+        (
+            self.pending_table_updates.len(),
+            self.pending_table_updates.capacity(),
+        )
     }
 
     pub(crate) fn clear_root_updates_and_close(&mut self) {

@@ -623,7 +623,8 @@ impl<'db> SystemNamespace<'db> {
 }
 
 struct TableNamespace<'db> {
-    open_tables: HashMap<String, &'static panic::Location<'static>>,
+    open_tables: crate::table_registry::OpenTables,
+    registry_funding: Arc<crate::table_registry::RegistryFunding>,
     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     table_tree: TableTreeMut<'db>,
@@ -646,8 +647,10 @@ impl TableNamespace<'_> {
             freed_pages.clone(),
             allocated.clone(),
         );
+        let registry_funding = Arc::new(crate::table_registry::RegistryFunding::default());
         Self {
-            open_tables: Default::default(),
+            open_tables: crate::table_registry::new_open_tables(&registry_funding),
+            registry_funding,
             table_tree,
             freed_pages,
             allocated_pages: allocated,
@@ -682,7 +685,7 @@ impl TableNamespace<'_> {
             .table_tree
             .get_or_create_table::<K, V>(name, table_type)?;
         self.open_tables
-            .insert(name.to_string(), panic::Location::caller());
+            .insert(Box::from(name), panic::Location::caller());
 
         Ok(root)
     }
@@ -812,6 +815,116 @@ impl TableNamespace<'_> {
         self.open_tables.remove(name).unwrap();
         self.table_tree
             .stage_update_table_root(name, table.get_root(), length);
+    }
+
+    /// The exact layout a reserve of `additional` open tables would allocate,
+    /// learned by refusing it: the registry keeps its entries and allocation.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_cost_to_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
+    {
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
+        match self.open_tables.try_reserve(additional) {
+            Ok(()) => Ok(None),
+            Err(error) => match crate::table_registry::reserve_error(error, &call) {
+                crate::table_registry::RegistryReserveError::AllocError(layout) => Ok(Some(layout)),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// Reserve room for `additional` open tables, paying with `credit` bytes.
+    /// Returns the bytes of the array this replaced, which is now freed.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_reserve_with(
+        &mut self,
+        additional: usize,
+        credit: usize,
+    ) -> Result<usize, crate::table_registry::RegistryReserveError> {
+        let before = self.open_tables.allocation_size();
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
+        let allocations = call.allocations();
+        match self.open_tables.try_reserve(additional) {
+            Ok(()) if call.allocations() != allocations => Ok(before),
+            Ok(()) => Ok(0),
+            Err(error) => Err(crate::table_registry::reserve_error(error, &call)),
+        }
+    }
+
+    /// The exact layout an empty registry array for `len` tables allocates.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_cost_to_hold(
+        &self,
+        len: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError>
+    {
+        let mut scratch = crate::table_registry::new_open_tables(&self.registry_funding);
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
+        match scratch.try_reserve(len) {
+            Ok(()) => Ok(None),
+            Err(error) => match crate::table_registry::reserve_error(error, &call) {
+                crate::table_registry::RegistryReserveError::AllocError(layout) => Ok(Some(layout)),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// An empty registry array for `len` tables, paid with `credit` bytes.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_prepare_replacement(
+        &self,
+        len: usize,
+        credit: usize,
+    ) -> Result<crate::table_registry::RegistryReplacement, crate::table_registry::RegistryReserveError>
+    {
+        let mut map = crate::table_registry::new_open_tables(&self.registry_funding);
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
+        map.try_reserve(len)
+            .map_err(|error| crate::table_registry::reserve_error(error, &call))?;
+        drop(call);
+        Ok(crate::table_registry::RegistryReplacement { map })
+    }
+
+    /// Move the open tables into `replacement` (or, with none, into an
+    /// unallocated registry when no table is open) and free the current
+    /// array, allocating nothing. Returns the freed array's bytes. On refusal
+    /// the registry and the replacement are returned unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_install_replacement(
+        &mut self,
+        replacement: Option<crate::table_registry::RegistryReplacement>,
+    ) -> Result<
+        usize,
+        (
+            crate::table_registry::RegistryReserveError,
+            Option<crate::table_registry::RegistryReplacement>,
+        ),
+    > {
+        let mut next = match replacement {
+            Some(replacement) if replacement.map.capacity() >= self.open_tables.len() => {
+                replacement.map
+            }
+            None if self.open_tables.is_empty() => {
+                crate::table_registry::new_open_tables(&self.registry_funding)
+            }
+            other => {
+                return Err((
+                    crate::table_registry::RegistryReserveError::ReplacementTooSmall,
+                    other,
+                ));
+            }
+        };
+        // `next` has room for every entry, so these inserts allocate nothing;
+        // a monitored caller would see any allocation as an overdraft.
+        for (name, location) in self.open_tables.drain() {
+            next.insert(name, location);
+        }
+        let previous = std::mem::replace(&mut self.open_tables, next);
+        let freed = previous.allocation_size();
+        drop(previous);
+        Ok(freed)
     }
 }
 
@@ -1643,6 +1756,161 @@ impl WriteTransaction {
             .table_tree
             .get_table::<K, V>(definition.name(), TableType::Normal)?
             .is_some())
+    }
+
+    /// Open tables registered in this transaction.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_len(&self) -> usize {
+        self.tables.lock().unwrap().open_tables.len()
+    }
+
+    /// Bytes of the open-table registry's array.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_bytes(&self) -> usize {
+        self.tables.lock().unwrap().open_tables.allocation_size()
+    }
+
+    /// The exact layout the registry would allocate to make room for
+    /// `additional` more open tables, or `None` when it already has room. The
+    /// registry keeps its entries and its allocation (a tombstone-only rehash
+    /// may reorder slots without allocating).
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_cost_to_reserve(
+        &self,
+        additional: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::RegistryReserveError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_cost_to_reserve(additional)
+    }
+
+    /// Make room for `additional` more open tables with at most `credit`
+    /// newly allocated bytes. Returns the bytes of the array this freed (zero
+    /// when nothing was reallocated). On refusal the registry is unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_reserve(
+        &self,
+        additional: usize,
+        credit: usize,
+    ) -> Result<usize, crate::RegistryReserveError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_reserve_with(additional, credit)
+    }
+
+    /// The exact layout of an empty registry array holding `len` tables, or
+    /// `None` when such an array allocates nothing.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_cost_to_hold(
+        &self,
+        len: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::RegistryReserveError> {
+        self.tables.lock().unwrap().registry_cost_to_hold(len)
+    }
+
+    /// Allocate, with at most `credit` bytes, an empty registry array for
+    /// `len` tables to be installed later without allocating.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_prepare(
+        &self,
+        len: usize,
+        credit: usize,
+    ) -> Result<crate::RegistryReplacement, crate::RegistryReserveError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_prepare_replacement(len, credit)
+    }
+
+    /// Move the open tables into `replacement`, or into an unallocated
+    /// registry when none is given and no table is open, freeing the current
+    /// array without allocating. Returns the freed bytes; on refusal both are
+    /// returned unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_install(
+        &self,
+        replacement: Option<crate::RegistryReplacement>,
+    ) -> Result<usize, (crate::RegistryReserveError, Option<crate::RegistryReplacement>)> {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_install_replacement(replacement)
+    }
+
+    /// Count registry allocations made outside a funded reserve until the
+    /// returned monitor drops.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_monitor(&self) -> crate::RegistryMonitor {
+        crate::table_registry::RegistryMonitor::start(
+            &self.tables.lock().unwrap().registry_funding,
+        )
+    }
+
+    /// Whether `name` already has a staged root update in this transaction.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn pending_table_update_contains(&self, name: &str) -> bool {
+        self.tables
+            .lock()
+            .unwrap()
+            .table_tree
+            .pending_table_update_contains(name)
+    }
+
+    /// Start recording every registry array allocation and free.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_record_for_test(&self) {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_funding
+            .start_recording();
+    }
+
+    /// The recorded registry allocations and frees, plus live and peak bytes.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_records_for_test(
+        &self,
+    ) -> (Vec<crate::RegistryAllocationRecord>, usize, usize) {
+        let tables = self.tables.lock().unwrap();
+        let (live, peak) = tables.registry_funding.live_and_peak();
+        (tables.registry_funding.take_records(), live, peak)
+    }
+
+    /// The address and length of every registry key box.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_keys_for_test(&self) -> Vec<(usize, usize)> {
+        self.tables
+            .lock()
+            .unwrap()
+            .open_tables
+            .keys()
+            .map(|key| (key.as_ptr() as usize, key.len()))
+            .collect()
+    }
+
+    /// Staged root updates: (entries, capacity).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn pending_table_updates_for_test(&self) -> (usize, usize) {
+        self.tables
+            .lock()
+            .unwrap()
+            .table_tree
+            .pending_table_updates_for_test()
     }
 
     /// Return the finalized root header of a user table after its open handles
