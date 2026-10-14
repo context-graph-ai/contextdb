@@ -290,16 +290,13 @@ impl MaintenanceContext {
     /// of the declared writer limit (unlimited without one).
     fn import_cohort_share(&self) -> usize {
         let usage = self.finalization.accountant.usage();
-        // Undeclared: what this writer holds plus what the process ceiling
-        // still admits, the same envelope its admissions are checked against.
+        // Undeclared: the whole-process ceiling is this writer's effective
+        // limit (an undeclared writer is not a member of the process
+        // aggregate, so its own `available` does not carry that ceiling).
         usage
             .limit
-            .or_else(|| {
-                usage
-                    .available
-                    .map(|available| available.saturating_add(usage.used))
-            })
-            .map_or(usize::MAX, |limit| limit / IMPORT_COHORT_BUDGET_SHARE)
+            .unwrap_or_else(crate::memory_accounting::effective_process_ceiling)
+            / IMPORT_COHORT_BUDGET_SHARE
     }
 
     /// The transaction the commit index records at exactly `lsn`.

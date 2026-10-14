@@ -896,6 +896,16 @@ pub(crate) fn process_aggregate_bytes_for_test() -> usize {
 
 /// (aggregate bytes, recorded process ceiling) for receipts and rows.
 #[allow(dead_code)] // Keep the aggregate receipt seam available to memory-accounting tests.
+/// The whole-process ceiling writers are bounded by: the recorded domain
+/// ceiling, else the inherited one. It is the effective limit of a writer
+/// that declares none.
+pub(crate) fn effective_process_ceiling() -> usize {
+    PROCESS_WRITER_BUDGET_DOMAIN
+        .read()
+        .ceiling
+        .unwrap_or_else(inherited_process_ceiling)
+}
+
 pub(crate) fn process_aggregate_snapshot() -> (usize, Option<usize>) {
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
     (
