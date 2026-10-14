@@ -1054,28 +1054,38 @@ impl MaintenanceContext {
                     partition.index.table, partition.index.column
                 ))
             })?;
+        // A frontier before the current one sources exactly the memberships
+        // visible at it, so it is counted at it. That frontier is fixed and
+        // its snapshot is pinned by the caller, so the count -- one decode
+        // per membership record -- runs before the commit lock, which then
+        // covers only the build record's write.
+        let total_at_frontier = match frontier {
+            Some((frontier_tx, frontier_lsn)) => {
+                let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
+                    0,
+                )?;
+                let _decode = decode.enter();
+                Some(persistence.vector_partition_live_membership_count_at(
+                    partition,
+                    frontier_tx,
+                    frontier_lsn,
+                )?)
+            }
+            None => None,
+        };
         let record = self
             .tx_mgr
             .with_commit_lock(|| -> Result<Option<PagedBuildRecord>> {
+                #[cfg(any(test, feature = "test-seams"))]
+                let _locked = crate::vector_observations::enter_build_start_lock_for_test();
                 let (frontier_tx, frontier_lsn) =
                     frontier.unwrap_or((self.tx_mgr.current_tx_max(), self.tx_mgr.current_lsn()));
-                // A frontier before the current one sources exactly the
-                // memberships visible at it, so it is counted at it.
-                let total = if frontier.is_some() {
-                    let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
-                        crate::memory_accounting::AccountantHandle::clone(
-                            &self.finalization.accountant,
-                        ),
-                        0,
-                    )?;
-                    let _decode = decode.enter();
-                    persistence.vector_partition_live_membership_count_at(
-                        partition,
-                        frontier_tx,
-                        frontier_lsn,
-                    )?
-                } else {
-                    persistence.vector_partition_live_membership_count(partition)?
+                let total = match total_at_frontier {
+                    Some(total) => total,
+                    None => persistence.vector_partition_live_membership_count(partition)?,
                 };
                 if total == 0 {
                     // An empty route keeps the existing delete-only publication.

@@ -3554,6 +3554,8 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
             {
                 let (_, value) = entry.map_err(Self::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::vector_observations::note_membership_count_decode_for_test();
                 let record: VectorPartitionMembershipRecord = self
                     .decode_expected_vector_partition_metadata(
                         VectorPartitionRecordKind::Membership,

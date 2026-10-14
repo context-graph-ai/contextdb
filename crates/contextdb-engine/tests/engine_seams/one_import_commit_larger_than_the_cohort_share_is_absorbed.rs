@@ -8,7 +8,9 @@
 //! old serving coverage and resumes after the last durable batch.
 use contextdb_core::{Lsn, TxId, Value, Wallclock};
 use contextdb_engine::database::resident_history_test_seams;
-use contextdb_engine::vector_observations::observe_import_rebuild_steps_for_test;
+use contextdb_engine::vector_observations::{
+    observe_import_rebuild_steps_for_test, take_membership_count_decodes_for_test,
+};
 use contextdb_engine::vector_read_memory::unowned_decodes_for_test;
 use contextdb_engine::writer_commit_test_seams::{CommitBoundary, last_build_successor, observe};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
@@ -79,10 +81,19 @@ fn store_with_one_large_commit(path: &std::path::Path) {
 
 /// A built 16-row route, then one commit of `rows` vectors, closed.
 fn store_with_one_commit_of(path: &std::path::Path, rows: usize) {
+    store_with_base_and_one_commit(path, 0, rows);
+}
+
+/// A built route of 16 + `extra_base` rows, then one commit of `rows`
+/// vectors, closed.
+fn store_with_base_and_one_commit(path: &std::path::Path, extra_base: usize, rows: usize) {
     let db = Database::open_with_options(path, options(ROOMY)).unwrap();
     db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
     for id in 0..BASE_ROWS {
         insert_one(&db, id);
+    }
+    for first in (0..extra_base).step_by(256) {
+        one_commit(&db, 500_000 + first as i64, 256.min(extra_base - first));
     }
     while db
         .run_maintenance_cycle()
@@ -360,6 +371,35 @@ fn a_rebuild_holds_the_same_decode_charge_at_every_step_whatever_its_size() {
     assert_eq!(
         envelopes[0].2, envelopes[1].2,
         "the same envelope at both build sizes: {envelopes:?}"
+    );
+}
+
+#[test]
+fn a_fresh_rebuild_counts_its_inputs_outside_the_commit_lock_at_any_partition_size() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let mut runs = Vec::new();
+    for extra_base in [0, 2048] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("count-outside-lock.db");
+        store_with_base_and_one_commit(&path, extra_base, 1024);
+        let db = Database::open_with_options(&path, options(TIGHT)).unwrap();
+        take_membership_count_decodes_for_test();
+        assert!(db.persist_import_vector_tails().unwrap());
+        let (total, under_lock) = take_membership_count_decodes_for_test();
+        eprintln!(
+            "fresh rebuild over {} memberships: {total} counted, {under_lock} under the commit lock",
+            BASE_ROWS as usize + extra_base + 1024
+        );
+        assert_eq!(serving_pending(&db), 0);
+        // The count reads every membership once, before the commit lock.
+        assert_eq!(total, BASE_ROWS as usize + extra_base + 1024);
+        runs.push((total, under_lock));
+    }
+    assert!(runs[1].0 > runs[0].0, "{runs:?}");
+    assert_eq!(
+        (runs[0].1, runs[1].1),
+        (0, 0),
+        "no membership is decoded under the commit lock at either size: {runs:?}"
     );
 }
 

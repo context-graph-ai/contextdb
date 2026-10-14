@@ -386,3 +386,43 @@ pub(crate) fn emit_import_rebuild_step_for_test(import_decode_held: usize) {
         observer(import_decode_held);
     }
 }
+
+/// Membership records decoded to count a build's live inputs at its
+/// frontier, in total and while a build start held the commit lock.
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static BUILD_START_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MEMBERSHIP_COUNT_DECODES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) struct BuildStartLockForTest(bool);
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for BuildStartLockForTest {
+    fn drop(&mut self) {
+        BUILD_START_LOCK_HELD.with(|held| held.set(self.0));
+    }
+}
+
+/// Marks the span in which a paged build start holds the commit lock.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn enter_build_start_lock_for_test() -> BuildStartLockForTest {
+    BuildStartLockForTest(BUILD_START_LOCK_HELD.with(|held| held.replace(true)))
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn note_membership_count_decode_for_test() {
+    let locked = BUILD_START_LOCK_HELD.with(std::cell::Cell::get);
+    MEMBERSHIP_COUNT_DECODES.with(|count| {
+        let (total, under_lock) = count.get();
+        count.set((total + 1, under_lock + usize::from(locked)));
+    });
+}
+
+/// `(total, under the build start's commit lock)` membership decodes made
+/// to count build inputs on this thread since the last call; resets both.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn take_membership_count_decodes_for_test() -> (usize, usize) {
+    MEMBERSHIP_COUNT_DECODES.with(|count| count.replace((0, 0)))
+}
