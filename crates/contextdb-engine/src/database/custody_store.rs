@@ -499,7 +499,8 @@ impl Database {
         (validated, accountant.usage().used)
     }
     /// Measurement only: the canonical bytes of the record at `key` after one
-    /// named field change, signed fields untouched (`admission_owning_state`).
+    /// named field change, signed fields untouched (`admission_owning_state`,
+    /// `admission_certificate`).
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __custody_mutated_record_for_test(&self, key: &str, mutation: &str) -> Result<Vec<u8>> {
@@ -511,9 +512,26 @@ impl Database {
             ("admission_owning_state", Record::ObjectAdmission(admission)) => {
                 admission.owning_state.token[0] ^= 1;
             }
+            ("admission_certificate", Record::ObjectAdmission(admission)) => {
+                admission.certificate[0] ^= 1;
+            }
             _ => return Err(Error::Other(format!("no mutation {mutation} for {key}"))),
         }
         encode(&record)
+    }
+    /// Measurement only: one ordinary custody selection under a standalone
+    /// reader memory of `limit` bytes, at the operation's own captured root.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_keys_with_limit_for_test(
+        &self,
+        selector: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let (_accountant, memory) = Self::measured_memory_for_test(limit);
+        let answer =
+            self.with_custody_store(|store| store.select(&[selector.to_owned()], memory, self))?;
+        answer.iter().map(Record::key).collect()
     }
     /// Measurement only: the stored edge terminal at `key` with `elements`
     /// small JSON values appended to its root key: a canonical record whose

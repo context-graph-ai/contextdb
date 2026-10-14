@@ -105,6 +105,8 @@ mod writer_file_ownership_survives_recycle;
 mod a_damaged_delivered_terminal_is_refused_never_excluded;
 #[path = "engine_seams/a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic.rs"]
 mod a_malformed_custody_record_refuses_with_the_custody_codec_diagnostic;
+#[path = "engine_seams/a_partial_closure_never_certifies_custody_evidence.rs"]
+mod a_partial_closure_never_certifies_custody_evidence;
 #[path = "engine_seams/an_incomplete_custody_index_refuses_without_loading_the_journal.rs"]
 mod an_incomplete_custody_index_refuses_without_loading_the_journal;
 #[path = "engine_seams/buffer_pool_share_evicts_and_recharges_under_the_writer_budget.rs"]
