@@ -24072,10 +24072,11 @@ impl MaintenanceContext {
     fn install_published_vector_catalog_at_boundary(
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         // Installing a published catalog is writer work: its layout and
-        // route copies are admitted by the writer.
+        // route copies are admitted by the writer, never the caller's
+        // reader.
         let mut maintenance_vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(
             self.finalization.accountant.vector_budget()?,
         );
