@@ -339,3 +339,110 @@ fn the_indexed_pending_overlay_answers_every_seek_as_the_list_rescan_does() {
         }
     }
 }
+
+const HELD_TABLES: usize = 32;
+const HOLD_RELATIONS: &str = "content_identity/hold_row_head_relations";
+
+/// A store with `HELD_TABLES` long-named tables and one staged transaction
+/// writing one row to each, under a declared memory limit.
+fn many_table_commit(limit: usize) -> (tempfile::TempDir, Database, contextdb_core::TxId) {
+    let root = tempfile::tempdir().expect("fixture directory");
+    let db = Database::open(root.path().join("tables.db")).expect("open the database");
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    let tables: Vec<String> = (0..HELD_TABLES)
+        .map(|n| format!("held_{n:02}_{}", "x".repeat(200)))
+        .collect();
+    for table in &tables {
+        db.execute(
+            &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, payload TEXT NOT NULL)"),
+            &HashMap::new(),
+        )
+        .expect("declare one table");
+    }
+    db.set_memory_limit(Some(limit)).expect("declare the limit");
+    let tx = db.begin().expect("one transaction for every table");
+    for (n, table) in tables.iter().enumerate() {
+        db.execute_in_tx(
+            tx,
+            &format!("INSERT INTO {table} VALUES ($id, 'one row')"),
+            &HashMap::from([(
+                "id".into(),
+                Value::Uuid(uuid::Uuid::from_u128(0x4e1d << 112 | n as u128)),
+            )]),
+        )
+        .expect("stage one row");
+    }
+    (root, db, tx)
+}
+
+/// The relations a commit holds open while it reconciles its row heads grow
+/// with the tables it writes, so they are admitted to the writer budget: the
+/// ledger shows the charge, and the same commit under a limit one byte below
+/// the point that charge first raises it to is refused with nothing committed.
+#[test]
+fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
+    use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
+    let ample = 1 << 32;
+    let (_root, db, tx) = many_table_commit(ample);
+    watch_budget_ledger_for_test();
+    db.commit(tx).expect("an ample limit commits every table");
+    let ledger = take_budget_ledger_for_test();
+    let held: usize = ledger
+        .iter()
+        .filter(|entry| entry.what == HOLD_RELATIONS)
+        .map(|entry| entry.bytes)
+        .sum();
+    assert!(
+        held >= 2 * HELD_TABLES * 200,
+        "holding a relation per written table is admitted to the writer budget: \
+         {held} bytes charged as {HOLD_RELATIONS}"
+    );
+    // The first relation charge that raises the commit's usage above every
+    // earlier point of it: a limit one byte below is refused by that charge.
+    let mut high = 0;
+    let mut tight = None;
+    for entry in &ledger {
+        if entry.what == HOLD_RELATIONS && entry.used_after > high {
+            tight = Some(entry.used_after - 1);
+            break;
+        }
+        high = high.max(entry.used_after);
+    }
+    let tight = tight.expect("some relation charge raises the commit's peak");
+    db.close().expect("close the measured store");
+
+    let (_root, db, tx) = many_table_commit(tight);
+    let refusal = db
+        .commit(tx)
+        .expect_err("the relations do not fit the tight limit");
+    match &refusal {
+        contextdb_core::Error::MemoryBudgetExceeded { operation, .. } => assert_eq!(
+            operation, "hold_row_head_relations",
+            "the refusal names what asked for the bytes: {refusal:?}"
+        ),
+        other => panic!("a typed budget refusal, not {other:?}"),
+    }
+    db.set_memory_limit(Some(ample)).expect("raise the limit");
+    let committed: usize = (0..HELD_TABLES)
+        .map(|n| {
+            db.execute(
+                &format!("SELECT id FROM held_{n:02}_{}", "x".repeat(200)),
+                &HashMap::new(),
+            )
+            .expect("read one table")
+            .rows
+            .len()
+        })
+        .sum();
+    assert_eq!(committed, 0, "a refused commit leaves every table as it was");
+    db.execute(
+        &format!(
+            "INSERT INTO held_00_{} VALUES ('{}', 'after refusal')",
+            "x".repeat(200),
+            uuid::Uuid::from_u128(1)
+        ),
+        &HashMap::new(),
+    )
+    .expect("the store keeps committing after the refusal");
+    db.close().expect("close the refused store");
+}
