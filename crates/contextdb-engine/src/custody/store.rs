@@ -166,9 +166,15 @@ pub(crate) mod work {
     pub(crate) static PENDING_EXAMINED: AtomicU64 = AtomicU64::new(0);
     pub(crate) fn pending_examined(n: u64) {
         PENDING_EXAMINED.fetch_add(n, Ordering::Relaxed);
+        THREAD_PENDING_EXAMINED.with(|count| count.set(count.get() + n));
     }
+    thread_local! {
+        static THREAD_PENDING_EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    /// Pending entries examined on the calling thread only, so concurrent
+    /// tests never inflate one test's count.
     pub(crate) fn pending_examined_total() -> u64 {
-        PENDING_EXAMINED.load(Ordering::Relaxed)
+        THREAD_PENDING_EXAMINED.with(std::cell::Cell::get)
     }
     pub(crate) fn hydrated(n: u64) {
         HYDRATED.fetch_add(n, Ordering::Relaxed);
