@@ -19,34 +19,50 @@ const MODE: &str = "CONTEXTDB_TENANT_MIRROR_TABLES";
 /// Allocator rounding and the read transaction the build opens.
 const SLACK: usize = 16 * 1024;
 
+/// One policy per table `t000..`, beside the fixture's own two.
+fn expectation_for(tables: usize) -> ApplicationTablePolicyExpectation {
+    let mut expectation = expectation();
+    for table in 0..tables {
+        expectation = expectation
+            .expect_table(&format!("t{table:03}"), MEMBER_CLAUSES)
+            .unwrap();
+    }
+    expectation
+}
+fn declare_tables(db: &Database, tables: usize) {
+    for table in 0..tables {
+        db.execute(
+            &format!("CREATE TABLE t{table:03} (id UUID PRIMARY KEY) {MEMBER_CLAUSES}"),
+            &p(),
+        )
+        .unwrap();
+    }
+}
+
 async fn mirror(tables: usize) {
     let dir = tempfile::tempdir().unwrap();
     let broker = InProcessBroker::new();
     let hub = start_hub(&broker, Arc::new(Database::open_memory())).await;
+    declare_tables(&hub.db, tables);
+    hub.db
+        .__seed_tenant_table_policies_for_test(
+            contextdb_core::TenantId::from(TENANT),
+            expectation_for(tables),
+        )
+        .unwrap();
     let path = dir.path().join("edge.db");
     {
         let edge = Arc::new(open(&path, None));
         let client = edge_client(&edge, &broker, &dir.path().join("edge.key"));
-        let mut expectation = ApplicationTablePolicyExpectation::new();
-        for table in 0..tables {
-            expectation = expectation
-                .expect_table(&format!("t{table:03}"), MEMBER_CLAUSES)
-                .unwrap();
-        }
         client
             .__seed_application_table_policy_binding_for_test(
-                expectation,
+                expectation_for(tables),
                 edge.declared_reader_memory().unwrap(),
             )
             .await
             .unwrap();
-        for table in 0..tables {
-            edge.execute(
-                &format!("CREATE TABLE t{table:03} (id UUID PRIMARY KEY) {MEMBER_CLAUSES}"),
-                &p(),
-            )
-            .unwrap();
-        }
+        declare(&edge);
+        declare_tables(&edge, tables);
         drop(client);
         Arc::into_inner(edge).unwrap().close().unwrap();
     }
