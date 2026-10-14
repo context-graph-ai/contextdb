@@ -941,11 +941,14 @@ mod undeclared_limit_tests {
     const CHILD_PATH: &str = "S7_UNDECLARED_LIMIT_PATH";
 
     fn options() -> DatabaseOpenOptions {
-        // No writer memory limit is declared.
-        DatabaseOpenOptions {
+        // No writer memory limit is declared. The reader is roomy: opening
+        // a store with this history is not what this test is about.
+        let mut options = DatabaseOpenOptions {
             maintenance_policy: MaintenancePolicy::CallerDriven,
             ..DatabaseOpenOptions::default()
-        }
+        };
+        options.owner_reads.limits.limits.memory = 1 << 30;
+        options
     }
 
     fn vector_for(id: i64) -> Vec<f32> {
