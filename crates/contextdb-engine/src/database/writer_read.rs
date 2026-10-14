@@ -1591,7 +1591,7 @@ impl Database {
                     if let Some(tx) = tx
                         && self.tx_mgr.with_read(tx, |ws| {
                             row_matches_delete_predicates(
-                                &ws.relational_delete_predicates,
+                                ws.relational_delete_predicates,
                                 table,
                                 row.value(),
                             )
@@ -1969,7 +1969,7 @@ impl Database {
                 if let Some((tx, _)) = overlay
                     && self.tx_mgr.with_read(tx, |ws| {
                         row_matches_delete_predicates(
-                            &ws.relational_delete_predicates,
+                            ws.relational_delete_predicates,
                             table,
                             row.value(),
                         )

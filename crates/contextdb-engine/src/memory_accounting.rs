@@ -2303,15 +2303,14 @@ impl OwnedMemoryReservation {
         if writer.accountant.as_ptr() != self.accountant().as_ptr() {
             return None;
         }
-        if let Some(control) = &self.own_control {
-            if control
+        if let Some(control) = &self.own_control
+            && (control
                 .accountant
                 .as_ref()
                 .is_none_or(|owner| owner.as_ptr() != self.accountant().as_ptr())
-                || control.registration != Some((writer.stable_identity, writer.epoch))
-            {
-                return None;
-            }
+                || control.registration != Some((writer.stable_identity, writer.epoch)))
+        {
+            return None;
         }
         writer.visit_retained_source_controls(visit)
     }
@@ -5606,7 +5605,7 @@ fn source_copy_aux(
             let mut invoices = Vec::with_capacity(source.len());
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
-                let bytes: contextdb_core::Result<usize> = (|| Ok(body.0.len()))();
+                let bytes: contextdb_core::Result<usize> = Ok(body.0.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push((body.0.as_str().to_owned(), body.1, body.2));
@@ -5790,7 +5789,7 @@ fn source_copy_aux(
             let mut invoices = Vec::with_capacity(source.len());
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
-                let bytes: contextdb_core::Result<usize> = (|| Ok(body.1.len()))();
+                let bytes: contextdb_core::Result<usize> = Ok(body.1.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push((body.0, body.1.as_str().to_owned(), body.2, body.3));
@@ -5832,7 +5831,7 @@ fn source_copy_aux(
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
                 let bytes: contextdb_core::Result<usize> =
-                    (|| source_add(body.0.table.len(), body.0.column.len()))();
+                    source_add(body.0.table.len(), body.0.column.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push((
@@ -5885,7 +5884,7 @@ fn source_copy_aux(
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
                 let bytes: contextdb_core::Result<usize> =
-                    (|| source_add(body.0.table.len(), body.0.column.len()))();
+                    source_add(body.0.table.len(), body.0.column.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push((
@@ -5938,7 +5937,7 @@ fn source_copy_aux(
             let mut invoices = Vec::with_capacity(source.len());
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
-                let bytes: contextdb_core::Result<usize> = (|| Ok(body.0.len()))();
+                let bytes: contextdb_core::Result<usize> = Ok(body.0.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push((body.0.as_str().to_owned(), body.1, body.2, body.3));
@@ -5975,8 +5974,7 @@ fn source_copy_aux(
             let mut invoices = Vec::with_capacity(source.len());
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
-                let bytes: contextdb_core::Result<usize> =
-                    (|| source_add(body.0.len(), body.1.len()))();
+                let bytes: contextdb_core::Result<usize> = source_add(body.0.len(), body.1.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push((body.0.as_str().to_owned(), body.1.as_slice().to_vec()));
@@ -6019,7 +6017,7 @@ fn source_copy_aux(
             let mut invoices = Vec::with_capacity(source.len());
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
-                let bytes: contextdb_core::Result<usize> = (|| Ok(body.len()))();
+                let bytes: contextdb_core::Result<usize> = Ok(body.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push(body.as_str().to_owned());
@@ -6056,7 +6054,7 @@ fn source_copy_aux(
             let mut invoices = Vec::with_capacity(source.len());
             let mut bodies = Vec::with_capacity(source.len());
             for body in source {
-                let bytes: contextdb_core::Result<usize> = (|| Ok(body.len()))();
+                let bytes: contextdb_core::Result<usize> = Ok(body.len());
                 let charge = SourceCharge::admit_funded(funder.clone(), bytes?)?;
                 invoices.push(OriginalAuxInvoice::from_charge(charge));
                 bodies.push(body.as_str().to_owned());
@@ -6164,14 +6162,14 @@ fn source_sidecar_price<V: Copy>(
             )?;
         }
     }
-    if let Some((table, _, Some(_))) = change {
-        if !maps.contains_key(table) {
-            count = source_add(count, 1)?;
-            bytes = source_add(
-                source_add(bytes, table.len())?,
-                source_native_map_bytes::<contextdb_core::RowId, V>(1)?,
-            )?;
-        }
+    if let Some((table, _, Some(_))) = change
+        && !maps.contains_key(table)
+    {
+        count = source_add(count, 1)?;
+        bytes = source_add(
+            source_add(bytes, table.len())?,
+            source_native_map_bytes::<contextdb_core::RowId, V>(1)?,
+        )?;
     }
     source_add(
         bytes,
@@ -6213,7 +6211,7 @@ fn source_sidecar_copy<V: Copy>(
         }
         let mut inner = std::collections::HashMap::with_capacity(len);
         for (row, value) in map {
-            if !selected.is_some_and(|(id, _)| id == *row) {
+            if selected.is_none_or(|(id, _)| id != *row) {
                 inner.insert(*row, *value);
             }
         }
@@ -6222,12 +6220,12 @@ fn source_sidecar_copy<V: Copy>(
         }
         copied.insert(table.as_str().to_owned(), inner);
     }
-    if let Some((table, row, Some(value))) = change {
-        if !maps.contains_key(table) {
-            let mut inner = std::collections::HashMap::with_capacity(1);
-            inner.insert(row, value);
-            copied.insert(table.to_owned(), inner);
-        }
+    if let Some((table, row, Some(value))) = change
+        && !maps.contains_key(table)
+    {
+        let mut inner = std::collections::HashMap::with_capacity(1);
+        inner.insert(row, value);
+        copied.insert(table.to_owned(), inner);
     }
     copied
 }
@@ -8434,7 +8432,7 @@ impl MemoryAccountant {
             self.used.rollback_local_only(bytes);
             return Err(
                 contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
-                    operation: operation,
+                    operation,
                     requested_bytes: bytes,
                     available_bytes: available,
                     budget_limit_bytes: ceiling,
@@ -8583,8 +8581,8 @@ impl MemoryAccountant {
             {
                 return Err(
                     contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                        subsystem: subsystem,
-                        operation: operation,
+                        subsystem,
+                        operation,
                         requested_bytes: bytes,
                         available_bytes: 0,
                         budget_limit_bytes: self.used.load(Ordering::SeqCst),
@@ -8601,8 +8599,8 @@ impl MemoryAccountant {
             {
                 return Err(
                     contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                        subsystem: subsystem,
-                        operation: operation,
+                        subsystem,
+                        operation,
                         requested_bytes: bytes,
                         available_bytes: 0,
                         budget_limit_bytes: self.used.load(Ordering::SeqCst),
@@ -8714,12 +8712,12 @@ impl MemoryAccountant {
                     available_bytes,
                     ..
                 } => contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                    subsystem: subsystem,
-                    operation: operation,
+                    subsystem,
+                    operation,
                     requested_bytes,
                     budget_limit_bytes,
                     available_bytes,
-                    hint: hint,
+                    hint,
                 },
                 other => other,
             })

@@ -1004,9 +1004,8 @@ mod undeclared_limit_tests {
                     None
                 }),
             );
-            assert_eq!(
+            assert!(
                 db.persist_import_vector_tails().unwrap(),
-                true,
                 "the suffix is absorbed in cohorts bounded by the process ceiling"
             );
             drop(observation);

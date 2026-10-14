@@ -450,7 +450,7 @@ impl RedbPersistence {
             std::slice::from_ref(&mutation),
             &[],
             &mut content_identity::original_writer::ProofAdmission::new(
-                &frame.original,
+                frame.original,
                 self.proof_scratch_owner(),
             )?,
         )?;

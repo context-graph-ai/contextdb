@@ -1525,8 +1525,7 @@ impl PendingManifestMutations {
                     std::cmp::Ordering::Greater
                 }
             })
-            .err()
-            .expect("an index of positions never finds the position being added");
+            .expect_err("an index of positions never finds the position being added");
         let steps = self.index.insert_at(vacancy, position);
         #[cfg(any(test, feature = "test-seams"))]
         manifest::commit_row_work::count_overlay_comparisons(steps);

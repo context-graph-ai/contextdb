@@ -3330,8 +3330,8 @@ impl WriterSnapshot {
             control,
         )
         .map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))?;
-        let result = cursor.lock().unwrap_or_else(|p| p.into_inner()).next_text();
-        result
+
+        cursor.lock().unwrap_or_else(|p| p.into_inner()).next_text()
     }
 }
 

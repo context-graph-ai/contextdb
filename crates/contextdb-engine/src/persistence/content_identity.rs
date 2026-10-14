@@ -9436,7 +9436,7 @@ pub(crate) mod original_writer {
             if coalescing_result.is_err() {
                 admission.release(admission.held() - coalescing_admission_start);
             }
-            let mut coalesced = CoalescedDirectory::new(coalescing_result?, admission);
+            let coalesced = CoalescedDirectory::new(coalescing_result?, admission);
 
             assign_open_projections(
                 &mut roots,

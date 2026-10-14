@@ -8075,7 +8075,7 @@ fn exec_update(
                     || db
                         .committed_row_at(&p.table, row.row_id, snapshot, read_memory.clone())?
                         .is_some();
-                let (new_row_id, before_counts, after_counts) = match db
+                let (_new_row_id, before_counts, after_counts) = match db
                     .replace_row_after_update_validation_counted_owned(
                         txid,
                         &p.table,
@@ -8114,7 +8114,7 @@ fn exec_update(
                 }
             };
             let before_counts = db.write_set_counts(txid)?;
-            let new_row_id = match db.replace_row_after_update_validation_owned(
+            let _new_row_id = match db.replace_row_after_update_validation_owned(
                 txid,
                 &p.table,
                 row.row_id,

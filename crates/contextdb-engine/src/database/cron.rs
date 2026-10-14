@@ -2163,6 +2163,289 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+// Reserved scoped commit retains the original pair until terminal cleanup.
+impl Database {
+    fn run_cron_callback_transaction_owned(
+        &self,
+        host: &EngineDatabaseTransactions,
+        store: &crate::persistent_store::OwnedPersistentCompositeStore,
+        callback: CronCallback,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Lsn> {
+        let events = &store.events;
+        self.validate_owned_cron_store(events, host, store)?;
+        store.with_owned_terminal_apply_scope(|| {
+            let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
+
+            let _callback_thread = self.cron.enter_callback_thread_scope();
+            let tx = self.begin_for_internal_write()?;
+            let mut event_registration = None::<event_bus::OwnedEventStageRegistration>;
+            let original_identity = std::cell::Cell::new(None);
+            let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+            let pending_trigger_active_guards =
+                std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
+            let mut committed_trigger_audit_entries = Vec::new();
+            // Cron callbacks are arbitrary user code and can stage vector writes
+            // while the tx manager's commit mutex is held. Acquire current vector
+            // schema refs before entering that mutex so DDL keeps the normal
+            // schema-gate -> commit-mutex lock order.
+            let mut vector_schema_guard = Some(self.vector_schema_read_many(
+                self.vector_store_schema_refs(&mut vector_copy_owner.borrow_mut())?,
+            ));
+            let delete_release_bytes =
+                std::cell::RefCell::new(None::<event_bus::OwnedDeleteReleaseBytes>);
+            // Armed just before the durable apply; see `PublicationInterruptionWatch`
+            // in `database.rs`. A scheduled job's commit is durable the moment the
+            // manager applies it, and its sink events, trigger audits and commit
+            // event reach memory only afterwards -- so an unwind in between leaves
+            // this handle behind its own durable image, exactly as it does on the
+            // local and received doors, and it must stop serving until reopened.
+            let publication_watch =
+                std::cell::RefCell::new(None::<super::PublicationInterruptionWatch>);
+            let result = host.commit_reserved_terminal_scoped(
+                tx,
+                read_memory.clone(),
+                |scope, reserved_lsn| {
+                    let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
+                        let prior_lsn = slot.replace(Some(reserved_lsn));
+                        let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
+                        let this_db = self.identity();
+                        let prior_db =
+                            CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
+                        let gate_id = self.vector_schema_gate_id();
+                        let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                            .with(|gate_slot| gate_slot.replace(Some(gate_id)));
+                        let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
+                        // Keep the original external CoreResult catch boundary. Only
+                        // its outcome is lifted; temporary preparation remains outside it.
+                        let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)))
+                            .map(|result| result.map_err(TemporaryFailure::from_error));
+                        if let Ok(Ok(())) = &result
+                            && let Err(error) = self
+                                .prepare_active_trigger_write_set_for_dispatch_owned(
+                                    scope,
+                                    tx,
+                                    &mut vector_copy_owner.borrow_mut(),
+                                    read_memory.clone(),
+                                )
+                        {
+                            result = Ok(Err(error));
+                        }
+                        if let Ok(Ok(())) = &result {
+                            match self.dispatch_triggers_for_tx_owned(
+                                scope,
+                                tx,
+                                &mut vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            ) {
+                                Ok(outcome) => {
+                                    *pending_trigger_audits.borrow_mut() = outcome.pending;
+                                    pending_trigger_active_guards
+                                        .borrow_mut()
+                                        .extend(outcome.active_guards);
+                                }
+                                Err((error, active_guards)) => {
+                                    pending_trigger_active_guards
+                                        .borrow_mut()
+                                        .extend(active_guards);
+                                    result = Ok(Err(error));
+                                }
+                            }
+                        }
+                        if let Ok(Ok(())) = &result
+                            && let Err(error) = self
+                                .prepare_active_trigger_write_set_for_dispatch_owned(
+                                    scope,
+                                    tx,
+                                    &mut vector_copy_owner.borrow_mut(),
+                                    read_memory.clone(),
+                                )
+                        {
+                            result = Ok(Err(error));
+                        }
+                        CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
+                        CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
+                        CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                            .with(|gate_slot| gate_slot.set(prior_gate));
+                        CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
+                        slot.replace(prior_lsn);
+                        result
+                    });
+                    match callback_result {
+                        // The paired temporary door supplies the authentic identity
+                        // even when no metadata node exists. It restores the SAME
+                        // original source before the reserved host detaches it.
+                        Ok(Ok(())) => scope.prepare_temporary(
+                            tx,
+                            |peer| Ok(peer.identity),
+                            |_, _, identity| {
+                                original_identity.set(Some(identity));
+                                Ok(())
+                            },
+                        ),
+                        Ok(Err(error)) => Err(error),
+                        Err(payload) => Err(TemporaryFailure::from_error(Error::Other(format!(
+                            "cron callback panicked: {}",
+                            panic_payload_to_string(payload)
+                        )))),
+                    }
+                },
+                |guard, peer| {
+                    if !guard.read().is_empty() {
+                        debug_assert!(
+                            guard.with_legacy(|ws| !Self::write_set_touches_vector_schema(ws)
+                                || vector_schema_guard.is_some())
+                        );
+                        self.rewrite_txid_placeholders_in_prepared_write_set(tx, guard)?;
+                        let _validation = self.commit_validate_in_prepared_write_set(
+                            tx,
+                            guard,
+                            peer,
+                            &mut vector_copy_owner.borrow_mut(),
+                            read_memory.clone(),
+                        )?;
+                        guard.with_legacy(|ws| {
+                            self.plugin.pre_commit(ws, CommitSource::AutoCommit)
+                        })?;
+                        let prepared_sink_events = self
+                            .prepare_owned_sink_events_in_prepared_write_set(
+                                events,
+                                host,
+                                guard,
+                                &[],
+                                read_memory.clone(),
+                            )?;
+                        if !prepared_sink_events.is_empty() {
+                            self.stage_next_action_id_in_prepared_write_set(
+                                guard,
+                                self.event_bus.next_action_id(),
+                            )?;
+                        }
+                        let commit_lsn = *guard.read().commit_lsn;
+                        let lsn = commit_lsn.ok_or_else(|| {
+                            Error::Other("native cron preparation requires its reserved LSN".into())
+                        })?;
+                        let identity = original_identity.get().ok_or_else(|| {
+                            Error::Other(
+                                "native cron preparation requires its original terminal identity"
+                                    .into(),
+                            )
+                        })?;
+                        let registration = events.stage_owned_commit_events(
+                            lsn,
+                            event_bus::OwnedCommitEventStage {
+                                identity,
+                                events: prepared_sink_events,
+                                ddl: None,
+                                schema: None,
+                            },
+                        )?;
+                        store.bind_owned_registered_event_apply(&registration)?;
+                        event_registration = Some(registration);
+                        if let Some(lsn) = commit_lsn {
+                            let pending = pending_trigger_audits.borrow();
+                            committed_trigger_audit_entries = guard.with_legacy(|ws| {
+                                self.committed_trigger_audits_for_pending(&pending, ws, lsn)
+                            });
+                            self.stage_trigger_audits_for_persistence(
+                                lsn,
+                                &committed_trigger_audit_entries,
+                            );
+                        }
+                        *delete_release_bytes.borrow_mut() = Some(
+                            self.prepare_owned_delete_release_bytes_in_prepared_write_set(
+                                events,
+                                host,
+                                guard,
+                                &mut vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            )?,
+                        );
+                    }
+                    *publication_watch.borrow_mut() = Some(
+                        super::PublicationInterruptionWatch::arm(&self.publication_interrupted),
+                    );
+                    Ok(())
+                },
+            );
+
+            match result {
+                Ok((lsn, terminal)) => {
+                    // Permanent detach already moved the original journal into terminal.
+                    // Observe the immutable original source while both owners remain held.
+                    terminal.with_legacy(|ws| {
+                        if !ws.is_empty() {
+                            #[cfg(test)]
+                            super::take_local_commit_stage_fault_for_test(
+                                super::LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
+                            );
+                            assert_eq!(
+                                terminal.identity(),
+                                original_identity
+                                    .get()
+                                    .expect("original native cron identity"),
+                                "native cron publishes the same original terminal",
+                            );
+                            self.settle_owned_delete_release_bytes(
+                                delete_release_bytes
+                                    .borrow_mut()
+                                    .take()
+                                    .expect("prepared native cron delete release"),
+                            );
+                            drop(vector_schema_guard.take());
+                            self.plugin.post_commit(ws, CommitSource::AutoCommit);
+                            let staged = event_registration
+                                .take()
+                                .expect("prepared native cron event registration")
+                                .take()
+                                .expect("same registered native cron events");
+                            let stage = staged.try_into_inner().unwrap_or_else(|_| {
+                                panic!("native cron event stage still borrowed after durable apply")
+                            });
+                            events.publish_owned_sink_events_to_memory(stage.events);
+                            self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
+                            self.publish_commit_event_if_subscribers(
+                                ws,
+                                CommitSource::AutoCommit,
+                                lsn,
+                            );
+                        }
+                    });
+                    if let Some(watch) = publication_watch.borrow_mut().take() {
+                        watch.completed();
+                    }
+                    drop(terminal);
+                    Ok(lsn)
+                }
+                Err(failure) => {
+                    if let Some(watch) = publication_watch.borrow_mut().take() {
+                        watch.completed();
+                    }
+                    let (error, pair) = failure.into_parts();
+                    // A retained original must not take a newly installed same-key
+                    // source or journal. Only None reaches qualified paired rollback.
+                    if let Some(lsn) = pair.as_ref().and_then(|pair| pair.commit_lsn()) {
+                        self.discard_staged_trigger_audits_for_persistence(lsn);
+                    }
+                    drop(event_registration.take());
+                    drop(delete_release_bytes.borrow_mut().take());
+                    if pair.is_none() {
+                        let _ = host.rollback_terminal(tx).map(|terminal| {
+                            self.remove_original_terminal_stages(terminal.identity().original_tx);
+                            drop(terminal);
+                        });
+                    }
+                    let pending = pending_trigger_audits.borrow();
+                    self.append_rolled_back_trigger_audits(&pending, tx, &error.to_string())?;
+                    drop(pair);
+                    Err(error)
+                }
+            }
+        })?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2414,290 +2697,5 @@ mod tests {
             "a reopen recovers the complete committed state, the scheduled row included"
         );
         reopened.close().unwrap();
-    }
-}
-
-// Reserved scoped commit retains the original pair until terminal cleanup.
-impl Database {
-    fn run_cron_callback_transaction_owned(
-        &self,
-        host: &EngineDatabaseTransactions,
-        store: &crate::persistent_store::OwnedPersistentCompositeStore,
-        callback: CronCallback,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Lsn> {
-        let events = &store.events;
-        self.validate_owned_cron_store(events, host, store)?;
-        store.with_owned_terminal_apply_scope(|| {
-            let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
-
-            let _callback_thread = self.cron.enter_callback_thread_scope();
-            let tx = self.begin_for_internal_write()?;
-            let mut event_registration = None::<event_bus::OwnedEventStageRegistration>;
-            let original_identity = std::cell::Cell::new(None);
-            let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
-            let pending_trigger_active_guards =
-                std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
-            let mut committed_trigger_audit_entries = Vec::new();
-            // Cron callbacks are arbitrary user code and can stage vector writes
-            // while the tx manager's commit mutex is held. Acquire current vector
-            // schema refs before entering that mutex so DDL keeps the normal
-            // schema-gate -> commit-mutex lock order.
-            let mut vector_schema_guard = Some(self.vector_schema_read_many(
-                self.vector_store_schema_refs(&mut vector_copy_owner.borrow_mut())?,
-            ));
-            let delete_release_bytes =
-                std::cell::RefCell::new(None::<event_bus::OwnedDeleteReleaseBytes>);
-            // Armed just before the durable apply; see `PublicationInterruptionWatch`
-            // in `database.rs`. A scheduled job's commit is durable the moment the
-            // manager applies it, and its sink events, trigger audits and commit
-            // event reach memory only afterwards -- so an unwind in between leaves
-            // this handle behind its own durable image, exactly as it does on the
-            // local and received doors, and it must stop serving until reopened.
-            let publication_watch =
-                std::cell::RefCell::new(None::<super::PublicationInterruptionWatch>);
-            let result = host.commit_reserved_terminal_scoped(
-                tx,
-                read_memory.clone(),
-                |scope, reserved_lsn| {
-                    let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
-                        let prior_lsn = slot.replace(Some(reserved_lsn));
-                        let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
-                        let this_db = self.identity();
-                        let prior_db =
-                            CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
-                        let gate_id = self.vector_schema_gate_id();
-                        let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
-                            .with(|gate_slot| gate_slot.replace(Some(gate_id)));
-                        let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
-                        // Keep the original external CoreResult catch boundary. Only
-                        // its outcome is lifted; temporary preparation remains outside it.
-                        let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)))
-                            .map(|result| result.map_err(TemporaryFailure::from_error));
-                        if let Ok(Ok(())) = &result {
-                            if let Err(error) = self
-                                .prepare_active_trigger_write_set_for_dispatch_owned(
-                                    scope,
-                                    tx,
-                                    &mut vector_copy_owner.borrow_mut(),
-                                    read_memory.clone(),
-                                )
-                            {
-                                result = Ok(Err(error));
-                            }
-                        }
-                        if let Ok(Ok(())) = &result {
-                            match self.dispatch_triggers_for_tx_owned(
-                                scope,
-                                tx,
-                                &mut vector_copy_owner.borrow_mut(),
-                                read_memory.clone(),
-                            ) {
-                                Ok(outcome) => {
-                                    *pending_trigger_audits.borrow_mut() = outcome.pending;
-                                    pending_trigger_active_guards
-                                        .borrow_mut()
-                                        .extend(outcome.active_guards);
-                                }
-                                Err((error, active_guards)) => {
-                                    pending_trigger_active_guards
-                                        .borrow_mut()
-                                        .extend(active_guards);
-                                    result = Ok(Err(error));
-                                }
-                            }
-                        }
-                        if let Ok(Ok(())) = &result {
-                            if let Err(error) = self
-                                .prepare_active_trigger_write_set_for_dispatch_owned(
-                                    scope,
-                                    tx,
-                                    &mut vector_copy_owner.borrow_mut(),
-                                    read_memory.clone(),
-                                )
-                            {
-                                result = Ok(Err(error));
-                            }
-                        }
-                        CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
-                        CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
-                        CRON_CALLBACK_VECTOR_SCHEMA_GATE
-                            .with(|gate_slot| gate_slot.set(prior_gate));
-                        CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
-                        slot.replace(prior_lsn);
-                        result
-                    });
-                    match callback_result {
-                        // The paired temporary door supplies the authentic identity
-                        // even when no metadata node exists. It restores the SAME
-                        // original source before the reserved host detaches it.
-                        Ok(Ok(())) => scope.prepare_temporary(
-                            tx,
-                            |peer| Ok(peer.identity),
-                            |_, _, identity| {
-                                original_identity.set(Some(identity));
-                                Ok(())
-                            },
-                        ),
-                        Ok(Err(error)) => Err(error),
-                        Err(payload) => Err(TemporaryFailure::from_error(Error::Other(format!(
-                            "cron callback panicked: {}",
-                            panic_payload_to_string(payload)
-                        )))),
-                    }
-                },
-                |guard, peer| {
-                    if !guard.read().is_empty() {
-                        debug_assert!(
-                            guard.with_legacy(|ws| !Self::write_set_touches_vector_schema(ws)
-                                || vector_schema_guard.is_some())
-                        );
-                        self.rewrite_txid_placeholders_in_prepared_write_set(tx, guard)?;
-                        let _validation = self.commit_validate_in_prepared_write_set(
-                            tx,
-                            guard,
-                            peer,
-                            &mut vector_copy_owner.borrow_mut(),
-                            read_memory.clone(),
-                        )?;
-                        guard.with_legacy(|ws| {
-                            self.plugin.pre_commit(ws, CommitSource::AutoCommit)
-                        })?;
-                        let prepared_sink_events = self
-                            .prepare_owned_sink_events_in_prepared_write_set(
-                                events,
-                                host,
-                                guard,
-                                &[],
-                                read_memory.clone(),
-                            )?;
-                        if !prepared_sink_events.is_empty() {
-                            self.stage_next_action_id_in_prepared_write_set(
-                                guard,
-                                self.event_bus.next_action_id(),
-                            )?;
-                        }
-                        let commit_lsn = *guard.read().commit_lsn;
-                        let lsn = commit_lsn.ok_or_else(|| {
-                            Error::Other("native cron preparation requires its reserved LSN".into())
-                        })?;
-                        let identity = original_identity.get().ok_or_else(|| {
-                            Error::Other(
-                                "native cron preparation requires its original terminal identity"
-                                    .into(),
-                            )
-                        })?;
-                        let registration = events.stage_owned_commit_events(
-                            lsn,
-                            event_bus::OwnedCommitEventStage {
-                                identity,
-                                events: prepared_sink_events,
-                                ddl: None,
-                                schema: None,
-                            },
-                        )?;
-                        store.bind_owned_registered_event_apply(&registration)?;
-                        event_registration = Some(registration);
-                        if let Some(lsn) = commit_lsn {
-                            let pending = pending_trigger_audits.borrow();
-                            committed_trigger_audit_entries = guard.with_legacy(|ws| {
-                                self.committed_trigger_audits_for_pending(&pending, ws, lsn)
-                            });
-                            self.stage_trigger_audits_for_persistence(
-                                lsn,
-                                &committed_trigger_audit_entries,
-                            );
-                        }
-                        *delete_release_bytes.borrow_mut() = Some(
-                            self.prepare_owned_delete_release_bytes_in_prepared_write_set(
-                                events,
-                                host,
-                                guard,
-                                &mut vector_copy_owner.borrow_mut(),
-                                read_memory.clone(),
-                            )?,
-                        );
-                    }
-                    *publication_watch.borrow_mut() = Some(
-                        super::PublicationInterruptionWatch::arm(&self.publication_interrupted),
-                    );
-                    Ok(())
-                },
-            );
-
-            match result {
-                Ok((lsn, terminal)) => {
-                    // Permanent detach already moved the original journal into terminal.
-                    // Observe the immutable original source while both owners remain held.
-                    terminal.with_legacy(|ws| {
-                        if !ws.is_empty() {
-                            #[cfg(test)]
-                            super::take_local_commit_stage_fault_for_test(
-                                super::LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
-                            );
-                            assert_eq!(
-                                terminal.identity(),
-                                original_identity
-                                    .get()
-                                    .expect("original native cron identity"),
-                                "native cron publishes the same original terminal",
-                            );
-                            self.settle_owned_delete_release_bytes(
-                                delete_release_bytes
-                                    .borrow_mut()
-                                    .take()
-                                    .expect("prepared native cron delete release"),
-                            );
-                            drop(vector_schema_guard.take());
-                            self.plugin.post_commit(ws, CommitSource::AutoCommit);
-                            let staged = event_registration
-                                .take()
-                                .expect("prepared native cron event registration")
-                                .take()
-                                .expect("same registered native cron events");
-                            let stage = staged.try_into_inner().unwrap_or_else(|_| {
-                                panic!("native cron event stage still borrowed after durable apply")
-                            });
-                            events.publish_owned_sink_events_to_memory(stage.events);
-                            self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
-                            self.publish_commit_event_if_subscribers(
-                                ws,
-                                CommitSource::AutoCommit,
-                                lsn,
-                            );
-                        }
-                    });
-                    if let Some(watch) = publication_watch.borrow_mut().take() {
-                        watch.completed();
-                    }
-                    drop(terminal);
-                    Ok(lsn)
-                }
-                Err(failure) => {
-                    if let Some(watch) = publication_watch.borrow_mut().take() {
-                        watch.completed();
-                    }
-                    let (error, pair) = failure.into_parts();
-                    // A retained original must not take a newly installed same-key
-                    // source or journal. Only None reaches qualified paired rollback.
-                    if let Some(lsn) = pair.as_ref().and_then(|pair| pair.commit_lsn()) {
-                        self.discard_staged_trigger_audits_for_persistence(lsn);
-                    }
-                    drop(event_registration.take());
-                    drop(delete_release_bytes.borrow_mut().take());
-                    if pair.is_none() {
-                        let _ = host.rollback_terminal(tx).map(|terminal| {
-                            self.remove_original_terminal_stages(terminal.identity().original_tx);
-                            drop(terminal);
-                        });
-                    }
-                    let pending = pending_trigger_audits.borrow();
-                    self.append_rolled_back_trigger_audits(&pending, tx, &error.to_string())?;
-                    drop(pair);
-                    Err(error)
-                }
-            }
-        })?
     }
 }

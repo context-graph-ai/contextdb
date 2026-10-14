@@ -2265,39 +2265,6 @@ fn logical_write_set_data_entry_count(
         .saturating_add(ws.vector_moves.len())
 }
 
-#[cfg(test)]
-mod sync_effect_tests {
-    use super::*;
-
-    #[test]
-    fn vector_move_delta_is_a_typed_received_trigger_effect() {
-        let db = Database::open_memory();
-        let tx = db.begin().unwrap();
-        let before = db.tx_mgr.cloned_write_set(tx).unwrap();
-        db.tx_mgr
-            .with_write_set(tx, |ws| {
-                ws.vector_moves.push((
-                    VectorIndexRef::new("items", "embedding"),
-                    RowId(1),
-                    RowId(2),
-                    tx,
-                ));
-            })
-            .unwrap();
-        let error = db
-            .validate_sync_trigger_effects(tx, "received_insert", &before)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::SyncTriggerEffectNotAllowed {
-                ref trigger_name,
-                ref effect,
-            } if trigger_name == "received_insert" && effect == "vector insert/delete/move"
-        ));
-        db.rollback(tx).unwrap();
-    }
-}
-
 // Scoped consumers keep exceptional temporary custody through callbacks and audits.
 impl Database {
     pub(super) fn dispatch_triggers_for_tx_owned(
@@ -3056,5 +3023,38 @@ impl Database {
         } else {
             events.publish_owned_sink_events_to_memory(stage.events);
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_effect_tests {
+    use super::*;
+
+    #[test]
+    fn vector_move_delta_is_a_typed_received_trigger_effect() {
+        let db = Database::open_memory();
+        let tx = db.begin().unwrap();
+        let before = db.tx_mgr.cloned_write_set(tx).unwrap();
+        db.tx_mgr
+            .with_write_set(tx, |ws| {
+                ws.vector_moves.push((
+                    VectorIndexRef::new("items", "embedding"),
+                    RowId(1),
+                    RowId(2),
+                    tx,
+                ));
+            })
+            .unwrap();
+        let error = db
+            .validate_sync_trigger_effects(tx, "received_insert", &before)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::SyncTriggerEffectNotAllowed {
+                ref trigger_name,
+                ref effect,
+            } if trigger_name == "received_insert" && effect == "vector insert/delete/move"
+        ));
+        db.rollback(tx).unwrap();
     }
 }
