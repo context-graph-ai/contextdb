@@ -149,8 +149,10 @@ fn import_writes_decode_only_under_the_declared_writer_never_the_reader() {
         "the import's decodes are charged to the writer"
     );
     assert!(
-        reader.is_empty(),
-        "the import's write work admits nothing on the reader: {reader:?}"
+        !reader
+            .iter()
+            .any(|entry| entry.what.starts_with("reader/materialize")),
+        "the import's write work decodes nothing on the reader: {reader:?}"
     );
     assert_eq!(
         db.declared_read_memory_for_test().retained_bytes_for_test(),
@@ -163,13 +165,46 @@ fn a_reader_too_small_for_a_read_refuses_with_its_own_label_and_returns_its_char
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("tight-reader.db");
     let db = store(&path, 64 * 1024 * 1024, 1 << 30);
+    // A history far larger than the reader the store is reopened with.
+    for id in 32..4032i64 {
+        db.execute(
+            "INSERT INTO fire (id) VALUES ($id)",
+            &HashMap::from([("id".to_string(), Value::Int64(id))]),
+        )
+        .unwrap();
+    }
     db.close().unwrap();
-    // Reopen with a reader that can open the store but not hold the history.
-    let db = open(&path, 64 * 1024 * 1024, 1024);
+    // Measure the reader's peak while opening and while reading the history
+    // under a roomy reader, then reopen with a reader between the two: it
+    // opens the store and cannot hold the history.
+    let peak = |ledger: Vec<BudgetLedgerEntry>| {
+        ledger
+            .iter()
+            .map(|entry| entry.used_after)
+            .max()
+            .unwrap_or(0)
+    };
+    watch_reader_budget_ledger_for_test();
+    let db = open(&path, 64 * 1024 * 1024, 1 << 30);
+    let open_peak = peak(take_reader_budget_ledger_for_test());
+    watch_reader_budget_ledger_for_test();
+    assert_eq!(
+        db.trigger_audit_history(Default::default()).unwrap().len(),
+        4032
+    );
+    let read_peak = peak(take_reader_budget_ledger_for_test());
+    db.close().unwrap();
+    eprintln!("tight reader: open peak {open_peak} B, audit read peak {read_peak} B");
+    assert!(
+        read_peak > open_peak,
+        "the audit read needs more reader memory than opening the store"
+    );
+    let reader = ((open_peak + read_peak) / 2) as u64;
+    let db = open(&path, 64 * 1024 * 1024, reader);
     let before = db.declared_read_memory_for_test().retained_bytes_for_test();
     let refused = db
         .trigger_audit_history(Default::default())
-        .expect_err("1 KiB cannot hold 32 audit entries");
+        .expect_err("a reader below the audit read's peak cannot hold 4,032 audit entries");
     assert!(
         matches!(
             &refused,

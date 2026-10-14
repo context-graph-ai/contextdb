@@ -38,11 +38,13 @@ const DECODE: &str = "writer_source/decode_stored_value";
 // credit, so they are not charged here; the rest is each vector's journal
 // record, index name, decode control and its share of the native append's
 // page decodes. The fixed part includes the final pass that finds the route
-// covered.
-const DECODE_BYTES_PER_VECTOR: usize = 6_808;
-const DECODE_BYTES_FIXED: usize = 57_128;
-const DECODE_ADMISSIONS_PER_VECTOR: usize = 28;
-const DECODE_ADMISSIONS_FIXED: usize = 369;
+// covered. Grouping the suffix into whole-LSN cohorts reads journal keys
+// only, so it decodes nothing (one 1,726-byte, 7-admission journal decode
+// per record fewer than counting by payload).
+const DECODE_BYTES_PER_VECTOR: usize = 5_082;
+const DECODE_BYTES_FIXED: usize = 55_402;
+const DECODE_ADMISSIONS_PER_VECTOR: usize = 21;
+const DECODE_ADMISSIONS_FIXED: usize = 362;
 
 fn vector_for(id: i64) -> Vec<f32> {
     (0..DIMENSION)
