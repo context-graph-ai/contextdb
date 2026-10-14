@@ -434,8 +434,16 @@ fn an_unknown_measurement_stays_unknown_when_an_interrupted_sweep_resumes() {
     db.close().unwrap();
 }
 
-/// Two `SET STORAGE_COMPACTION` statements run on two threads while the
-/// first is paused after its declaration is durable and before it is live.
+fn setting_of(sql: &str) -> StorageCompactionSetting {
+    match contextdb_parser::parse(sql).unwrap() {
+        contextdb_parser::Statement::SetStorageCompaction(setting) => setting,
+        other => panic!("{sql} is not a storage compaction declaration: {other:?}"),
+    }
+}
+
+/// Two storage compaction declarations run through the setter on two
+/// threads while the first is paused after its declaration is durable and
+/// before it is live.
 fn race_declarations(first: &'static str, second: &'static str, before: Option<&str>) -> (
     Vec<(String, String, String)>,
     Vec<(String, String, String)>,
@@ -450,7 +458,7 @@ fn race_declarations(first: &'static str, second: &'static str, before: Option<&
     let entered = db.__storage_compaction_update_entries_for_test();
     let pause = db.__pause_after_storage_compaction_persist_for_test();
     let first_db = db.clone();
-    let first = thread::spawn(move || first_db.execute(first, &p()).map(|_| ()));
+    let first = thread::spawn(move || first_db.set_storage_compaction(&setting_of(first)));
     assert!(
         pause.wait_until_reached_blocking(),
         "the first declaration reaches the point after it is durable"
@@ -460,7 +468,7 @@ fn race_declarations(first: &'static str, second: &'static str, before: Option<&
         "a declaration holds the shared setting lock from its read through its live publication"
     );
     let second_db = db.clone();
-    let second = thread::spawn(move || second_db.execute(second, &p()).map(|_| ()));
+    let second = thread::spawn(move || second_db.set_storage_compaction(&setting_of(second)));
     db.__wait_for_storage_compaction_update_entry_for_test(entered + 2);
     assert_eq!(
         shown(&db),
