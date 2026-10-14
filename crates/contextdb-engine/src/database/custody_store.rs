@@ -370,8 +370,10 @@ impl Database {
     }
     /// Measurement only: build one durable custody store against a standalone
     /// writer accountant of `limit` bytes: the ordinary form, or (`pinned`)
-    /// the detached received-unit form at the latest root. Returns the bytes
-    /// that accountant held while the store lived and after it dropped.
+    /// the detached received-unit form at the latest root. An unused store
+    /// must hold nothing; its first durable read creates the companion memo.
+    /// Returns the bytes that accountant held while the store lived and after
+    /// it dropped.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __custody_memo_admission_for_test(
@@ -383,11 +385,19 @@ impl Database {
             crate::memory_accounting::MemoryAccountant::with_budget(limit),
         )
         .into();
-        let store = if pinned {
+        let mut store = if pinned {
             Store::durable_pinned(self.latest_custody_root()?, accountant.clone())?
         } else {
             Store::durable(BTreeMap::new(), accountant.clone())?
         };
+        let unused = accountant.usage().used;
+        if unused != 0 {
+            return Err(Error::Other(format!(
+                "an unused durable store holds {unused} bytes"
+            )));
+        }
+        // The first durable read creates the memo.
+        store.ensure_companion_memo()?;
         let during = accountant.usage().used;
         drop(store);
         Ok((during, accountant.usage().used))

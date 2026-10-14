@@ -219,6 +219,9 @@ pub(crate) mod work {
 #[derive(Clone)]
 pub(crate) struct DurableSource {
     pinned: Option<Arc<crate::persistence::writer_source::WriterSnapshot>>,
+    /// The writer that funds the companion memo once the first durable read
+    /// needs it.
+    writer: crate::memory_accounting::AccountantHandle,
 }
 
 #[derive(Default)]
@@ -451,7 +454,9 @@ impl Store {
     }
     /// A durable view: `tenant_entries` are the tenant policy and binding
     /// records only; every delivery record is read at a captured writer root.
-    /// Its companion memo is admitted to `writer` before it is allocated.
+    /// Its companion memo is created by the first durable read and admitted
+    /// to `writer` before it is allocated, so a store that never reads its
+    /// delivery journal holds nothing for it.
     pub fn durable(
         tenant_entries: BTreeMap<String, Vec<u8>>,
         writer: crate::memory_accounting::AccountantHandle,
@@ -459,18 +464,31 @@ impl Store {
         if tenant_entries.keys().any(|key| !key.starts_with("tenant_")) {
             return Err(invalid());
         }
-        let charge = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+        let mut store = Self::from_entries(tenant_entries)?;
+        store.durable = Some(DurableSource {
+            pinned: None,
             writer,
+        });
+        Ok(store)
+    }
+    /// The companion memo, admitted to the store's writer before it exists.
+    pub(crate) fn ensure_companion_memo(&mut self) -> Result<()> {
+        if self.checked.is_some() {
+            return Ok(());
+        }
+        let Some(source) = &self.durable else {
+            return Ok(());
+        };
+        let charge = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            source.writer.clone(),
             CompanionMemo::BYTES,
             "custody",
             "companion_memo",
             "Raise MEMORY_LIMIT to open durable custody reads.",
         )?;
-        let mut store = Self::from_entries(tenant_entries)?;
-        store.durable = Some(DurableSource { pinned: None });
-        store.checked_charge = Some(charge);
-        store.checked = Some(Arc::new(CompanionMemo::new()));
-        Ok(store)
+        self.checked_charge = Some(charge);
+        self.checked = Some(Arc::new(CompanionMemo::new()));
+        Ok(())
     }
     /// A durable view that reads only `root`, whoever asks.
     pub fn durable_pinned(
@@ -515,6 +533,7 @@ impl Store {
         if self.durable.is_none() {
             return Ok(None);
         }
+        self.ensure_companion_memo()?;
         let root = self.read_root.clone().ok_or_else(invalid)?;
         root.with_custody_read(self.checked.clone(), read)?
             .map(Some)
