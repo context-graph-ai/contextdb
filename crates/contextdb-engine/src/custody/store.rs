@@ -454,9 +454,9 @@ impl Store {
     }
     /// A durable view: `tenant_entries` are the tenant policy and binding
     /// records only; every delivery record is read at a captured writer root.
-    /// Its companion memo is created by the first durable read and admitted
-    /// to `writer` before it is allocated, so a store that never reads its
-    /// delivery journal holds nothing for it.
+    /// Its companion memo is created after the first durable read that decodes
+    /// delivery records, admitted to `writer` before it is allocated, so a
+    /// store that never reads its delivery journal holds nothing for it.
     pub fn durable(
         tenant_entries: BTreeMap<String, Vec<u8>>,
         writer: crate::memory_accounting::AccountantHandle,
@@ -533,11 +533,23 @@ impl Store {
         if self.durable.is_none() {
             return Ok(None);
         }
-        self.ensure_companion_memo()?;
         let root = self.read_root.clone().ok_or_else(invalid)?;
-        root.with_custody_read(self.checked.clone(), read)?
+        let mut found_delivery = false;
+        let answer = root
+            .with_custody_read(self.checked.clone(), |r| {
+                let answer = read(r);
+                found_delivery = r.found_delivery();
+                answer
+            })?
             .map(Some)
-            .ok_or_else(crate::persistence::custody_source::incomplete_custody_index)
+            .ok_or_else(crate::persistence::custody_source::incomplete_custody_index);
+        // A store that has read delivery records keeps a companion memo for
+        // the reads after this one. It is only a cache of passed checks: if
+        // the writer refuses its admission, reads simply repeat the checks.
+        if found_delivery {
+            let _ = self.ensure_companion_memo();
+        }
+        answer
     }
     fn mirrors(&self, key: &str) -> bool {
         self.durable.is_none() || !key.starts_with("delivery_")

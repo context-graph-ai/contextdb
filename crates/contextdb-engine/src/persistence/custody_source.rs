@@ -72,6 +72,8 @@ pub(crate) struct CustodyReader {
     root: [u8; 32],
     /// The owning store's memo of companion checks already passed.
     checked: Option<Arc<crate::custody::store::CompanionMemo>>,
+    /// Whether this view has found any committed delivery-journal record.
+    found_delivery: std::cell::Cell<bool>,
 }
 
 impl CustodyReader {
@@ -82,6 +84,10 @@ impl CustodyReader {
     }
     pub(crate) fn companion_memo(&self) -> Option<&crate::custody::store::CompanionMemo> {
         self.checked.as_deref()
+    }
+    /// Whether this view has found any committed delivery-journal record.
+    pub(crate) fn found_delivery(&self) -> bool {
+        self.found_delivery.get()
     }
     fn open(read: &redb::ReadTransaction) -> Result<Self> {
         struct Fingerprint(blake3::Hasher);
@@ -123,6 +129,7 @@ impl CustodyReader {
             damaged,
             root,
             checked: None,
+            found_delivery: std::cell::Cell::new(false),
         })
     }
     /// Visit exactly `key`'s stored value, if committed.
@@ -135,7 +142,12 @@ impl CustodyReader {
             return visit(None);
         };
         match config.get(key).map_err(RedbPersistence::storage_error)? {
-            Some(value) => visit(Some(value.value())),
+            Some(value) => {
+                if key.starts_with("delivery_") {
+                    self.found_delivery.set(true);
+                }
+                visit(Some(value.value()))
+            }
             None => visit(None),
         }
     }
