@@ -41864,6 +41864,17 @@ graph_commit_result }.map_err(Self::storage_error)?;
         if let Ok(owner) = crate::read_image_memory::active_owner() {
             return Ok(owner.enter());
         }
+        // A maintenance route inspection is generation preparation: its
+        // decodes are refused under that operation, like its page reads.
+        if vector_membership_source::in_maintenance_inspection() {
+            return Ok(crate::read_image_memory::ImageMemory::charging_for(
+                self.require_decode_accountant()?,
+                "vector_maintenance",
+                "prepare_vector_generation",
+                "Raise MEMORY_LIMIT before inspecting this maintained route.",
+            )
+            .enter());
+        }
         crate::read_image_memory::ImageMemory::enter_writer_operation(
             self.require_decode_accountant()?,
         )

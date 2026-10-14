@@ -65,6 +65,11 @@ pub(crate) fn with_maintenance_inspection<T>(inspect: impl FnOnce() -> T) -> T {
     inspect()
 }
 
+/// Whether this thread is inside a maintenance route inspection.
+pub(crate) fn in_maintenance_inspection() -> bool {
+    MAINTENANCE_INSPECTION.with(std::cell::Cell::get)
+}
+
 impl MembershipOwner {
     pub(crate) fn historical_operation(&self) -> bool {
         operation_for(self).is_some_and(|context| context.historical)
