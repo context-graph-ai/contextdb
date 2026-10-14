@@ -58,6 +58,9 @@ fn seed(path: &std::path::Path, rows: usize) {
             start = end;
         }
     }
+    // Leave the file tight, as a long-running store settles after its own
+    // compaction, so no cycle below has a compaction to start.
+    db.compact_now().unwrap();
     db.close().unwrap();
 }
 
@@ -66,7 +69,9 @@ struct Observation {
     on_demand_ratio: f64,
     first_cycle_pages: u64,
     warm_cycle_pages: u64,
+    pages_under_pruning_guard: u64,
     warm_cycle_micros: u128,
+    warm_cycle_compacted: bool,
 }
 
 fn observe(rows: usize) -> Observation {
@@ -81,31 +86,33 @@ fn observe(rows: usize) -> Observation {
         vec![vec![Value::Int64((rows / TABLES.len()) as i64)]]
     );
 
-    let before = db.__storage_statistics_pages_walked_for_test();
+    // The first cycle of a fresh open, then a warm one. Neither prunes.
+    let (before, before_guarded) = db.__storage_statistics_pages_walked_for_test();
     let first = db.run_maintenance_cycle().unwrap();
-    let first_cycle_pages = db.__storage_statistics_pages_walked_for_test() - before;
+    let (after_first, _) = db.__storage_statistics_pages_walked_for_test();
+    let first_cycle_pages = after_first - before;
     assert_eq!(first.pruning.pruned_rows, 0, "no row reaches its window");
 
-    let before = db.__storage_statistics_pages_walked_for_test();
     let started = std::time::Instant::now();
     let warm = db.run_maintenance_cycle().unwrap();
     let warm_cycle_micros = started.elapsed().as_micros();
-    let warm_cycle_pages = db.__storage_statistics_pages_walked_for_test() - before;
+    let (after_warm, after_guarded) = db.__storage_statistics_pages_walked_for_test();
+    let warm_cycle_pages = after_warm - after_first;
     assert_eq!(warm.pruning.pruned_rows, 0, "no row reaches its window");
-    assert!(!warm.pruning.compacted);
-    assert!(!warm.compaction.ran);
 
     // The diagnostic a caller explicitly asks for still walks and is exact.
-    let before = db.__storage_statistics_pages_walked_for_test();
+    let (before, _) = db.__storage_statistics_pages_walked_for_test();
     let on_demand_ratio = db.__storage_fragmentation_ratio_for_test().unwrap().unwrap();
-    let on_demand_pages = db.__storage_statistics_pages_walked_for_test() - before;
+    let on_demand_pages = db.__storage_statistics_pages_walked_for_test().0 - before;
     db.close().unwrap();
     Observation {
         on_demand_pages,
         on_demand_ratio,
         first_cycle_pages,
         warm_cycle_pages,
+        pages_under_pruning_guard: after_guarded - before_guarded,
         warm_cycle_micros,
+        warm_cycle_compacted: warm.pruning.compacted || warm.compaction.ran,
     }
 }
 
@@ -117,11 +124,12 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
     for (rows, observation) in [(10_000, &small), (50_000, &large)] {
         println!(
             "rows={rows} on_demand_pages={} on_demand_ratio={} first_cycle_pages={} \
-             warm_cycle_pages={} warm_cycle_micros={}",
+             warm_cycle_pages={} pages_under_pruning_guard={} warm_cycle_micros={}",
             observation.on_demand_pages,
             observation.on_demand_ratio,
             observation.first_cycle_pages,
             observation.warm_cycle_pages,
+            observation.pages_under_pruning_guard,
             observation.warm_cycle_micros,
         );
     }
@@ -133,11 +141,19 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
     );
     assert!((0.0..=1.0).contains(&small.on_demand_ratio));
     assert!((0.0..=1.0).contains(&large.on_demand_ratio));
+    // The import's vector-tail persistence waits on the pruning guard, so
+    // no store-proportional walk may happen while a cycle holds it.
+    assert_eq!(
+        (small.pages_under_pruning_guard, large.pages_under_pruning_guard),
+        (0, 0),
+        "no statistics page is walked while the pruning guard is held"
+    );
     assert_eq!(
         (small.warm_cycle_pages, large.warm_cycle_pages),
         (0, 0),
         "a cycle that prunes nothing and has no compaction due walks no statistics pages"
     );
+    assert!(!small.warm_cycle_compacted && !large.warm_cycle_compacted);
     // Secondary, load-tolerant: the same empty cycle costs about the same at
     // five times the history. The 5 ms floor absorbs scheduler noise.
     let floor = 5_000;

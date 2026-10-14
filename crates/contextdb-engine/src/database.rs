@@ -64921,6 +64921,8 @@ impl Database {
     ) -> Result<PruningReport> {
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
+        #[cfg(any(test, feature = "test-seams"))]
+        let _held = crate::persistence::PruningGuardHeldForTest::enter();
         self.maintenance_context().run_pruning(read_memory.clone())
     }
 
@@ -64946,6 +64948,8 @@ impl Database {
         let mut operation = self.assert_open_operation();
         operation.release_schema_publication_for_online_maintenance();
         let _guard = self.pruning_guard.lock();
+        #[cfg(any(test, feature = "test-seams"))]
+        let _held = crate::persistence::PruningGuardHeldForTest::enter();
         self.maintenance_context()
             .run_cycle(CurrencyGate::Always, read_memory.clone())
     }
@@ -64975,12 +64979,13 @@ impl Database {
     }
 
     /// Production-dead: application pages the storage fragmentation
-    /// statistics walk has visited on the calling thread, cumulatively. A
+    /// statistics walk has visited on the calling thread, cumulatively, and
+    /// how many of those it visited while holding the pruning guard. A
     /// caller-driven maintenance cycle runs on the calling thread, so the
     /// difference across one cycle is that cycle's statistics work.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
-    pub fn __storage_statistics_pages_walked_for_test(&self) -> u64 {
+    pub fn __storage_statistics_pages_walked_for_test(&self) -> (u64, u64) {
         crate::persistence::storage_statistics_pages_walked_for_test()
     }
 
@@ -66458,6 +66463,8 @@ impl Database {
                 #[cfg(test)]
                 thread_wakes.fetch_add(1, Ordering::SeqCst);
                 let _guard = pruning_guard.lock();
+                #[cfg(any(test, feature = "test-seams"))]
+                let _held = crate::persistence::PruningGuardHeldForTest::enter();
                 // ONE loop, every job. Each pass carries its OWN cheap gate so a
                 // quiet node does near-zero work per tick: the currency pass is
                 // gated on superseded-version count, the retention pass bails

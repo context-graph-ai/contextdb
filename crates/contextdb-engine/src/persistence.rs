@@ -167,12 +167,40 @@ thread_local! {
     /// thread. Production-dead: the maintenance growth proofs read it to show a
     /// cycle's statistics work does not grow with the store.
     static STORAGE_STATISTICS_PAGES_WALKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The subset of those pages walked while this thread held the database's
+    /// pruning guard, which the import's vector-tail persistence also waits on.
+    static STORAGE_STATISTICS_PAGES_WALKED_UNDER_PRUNING_GUARD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    static PRUNING_GUARD_HELD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
-pub(crate) fn storage_statistics_pages_walked_for_test() -> u64 {
-    STORAGE_STATISTICS_PAGES_WALKED.with(std::cell::Cell::get)
+pub(crate) fn storage_statistics_pages_walked_for_test() -> (u64, u64) {
+    (
+        STORAGE_STATISTICS_PAGES_WALKED.with(std::cell::Cell::get),
+        STORAGE_STATISTICS_PAGES_WALKED_UNDER_PRUNING_GUARD.with(std::cell::Cell::get),
+    )
+}
+
+/// Production-dead marker: this thread holds the pruning guard while it lives.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub(crate) struct PruningGuardHeldForTest(());
+
+#[cfg(any(test, feature = "test-seams"))]
+impl PruningGuardHeldForTest {
+    pub(crate) fn enter() -> Self {
+        PRUNING_GUARD_HELD_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self(())
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for PruningGuardHeldForTest {
+    fn drop(&mut self) {
+        PRUNING_GUARD_HELD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 
 thread_local! {
@@ -37231,14 +37259,15 @@ graph_commit_result }.map_err(Self::storage_error)?;
     ) -> Result<f64> {
         let stats = sample.stats().map_err(Self::storage_error)?;
         #[cfg(any(test, feature = "test-seams"))]
-        STORAGE_STATISTICS_PAGES_WALKED.with(|walked| {
-            walked.set(
-                walked
-                    .get()
-                    .saturating_add(stats.leaf_pages())
-                    .saturating_add(stats.branch_pages()),
-            )
-        });
+        {
+            let pages = stats.leaf_pages().saturating_add(stats.branch_pages());
+            STORAGE_STATISTICS_PAGES_WALKED
+                .with(|walked| walked.set(walked.get().saturating_add(pages)));
+            if PRUNING_GUARD_HELD_DEPTH.with(std::cell::Cell::get) > 0 {
+                STORAGE_STATISTICS_PAGES_WALKED_UNDER_PRUNING_GUARD
+                    .with(|walked| walked.set(walked.get().saturating_add(pages)));
+            }
+        }
         let stored = stats.stored_bytes();
         let metadata = stats.metadata_bytes();
         let fragmented = stats.fragmented_bytes();
