@@ -64974,6 +64974,27 @@ impl Database {
         *self.last_maintenance_cycle_at.lock() = None;
     }
 
+    /// Production-dead: application pages the storage fragmentation
+    /// statistics walk has visited on the calling thread, cumulatively. A
+    /// caller-driven maintenance cycle runs on the calling thread, so the
+    /// difference across one cycle is that cycle's statistics work.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __storage_statistics_pages_walked_for_test(&self) -> u64 {
+        crate::persistence::storage_statistics_pages_walked_for_test()
+    }
+
+    /// Production-dead: the exact on-demand fragmentation ratio, computed by
+    /// the full statistics walk a diagnostic caller asks for.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __storage_fragmentation_ratio_for_test(&self) -> Result<Option<f64>> {
+        self.persistence
+            .as_ref()
+            .map(|persistence| persistence.fragmentation_ratio())
+            .transpose()
+    }
+
     /// Explicit operator compaction drains finite relocation transactions,
     /// allowing recording and reads between batches. It bypasses the automatic
     /// fragmentation/interval gates and resets that interval on completion.

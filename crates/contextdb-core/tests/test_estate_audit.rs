@@ -497,8 +497,9 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     ("contextdb-vector", 199, RSN_TEST_COUNT),
     ("contextdb-parser", 137, RSN_TEST_COUNT),
     ("contextdb-planner", 10, RSN_TEST_COUNT),
-    // Approved continued-growth proof: unique-key predicate writes match current-entry reads.
-    ("contextdb-engine", 4503, RSN_TEST_COUNT),
+    // Approved continued-growth proofs: unique-key predicate writes match current-entry reads;
+    // a maintenance cycle that prunes nothing walks no storage statistics as the store grows.
+    ("contextdb-engine", 4504, RSN_TEST_COUNT),
     ("contextdb-server", 421, RSN_TEST_COUNT),
     ("contextdb-cli", 270, RSN_TEST_COUNT),
 ];

@@ -161,6 +161,20 @@ use std::sync::{Arc, Mutex};
 static HOOK_SWAP: Mutex<()> = Mutex::new(());
 static READER_BREADCRUMB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static READER_SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    /// Application pages the fragmentation statistics walk visited on this
+    /// thread. Production-dead: the maintenance growth proofs read it to show a
+    /// cycle's statistics work does not grow with the store.
+    static STORAGE_STATISTICS_PAGES_WALKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub(crate) fn storage_statistics_pages_walked_for_test() -> u64 {
+    STORAGE_STATISTICS_PAGES_WALKED.with(std::cell::Cell::get)
+}
+
 thread_local! {
     // The provider runs synchronously during physical owner cursor admission.
     // That caller holds the commit mutex and may never wait on an OS registry lock.
@@ -37191,21 +37205,48 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// writer boundary; application-page traversal uses a read snapshot after
     /// persistence access has been released.
     pub(crate) fn fragmentation_ratio(&self) -> Result<f64> {
-        let read_txn = self.with_db(|db| {
+        let sample = self.storage_statistics_sample()?;
+        Self::sampled_fragmentation_ratio(&sample)
+    }
+
+    /// Captures the point-in-time statistics snapshot without walking it.
+    /// Capturing costs one short writer boundary and the system totals; the
+    /// application-page walk happens only if [`Self::sampled_fragmentation_ratio`]
+    /// is later asked for the ratio, and then reports the file exactly as it
+    /// stood at capture. A caller that may not need the ratio captures first
+    /// and walks only once it knows it does.
+    pub(crate) fn storage_statistics_sample(&self) -> Result<redb::StorageStatisticsSnapshot> {
+        self.with_db(|db| {
             db.storage_statistics_snapshot()
                 .map_err(Self::storage_error)
-        })?;
-        {
-            let stats = read_txn.stats().map_err(Self::storage_error)?;
-            let stored = stats.stored_bytes();
-            let metadata = stats.metadata_bytes();
-            let fragmented = stats.fragmented_bytes();
-            let total = stored.saturating_add(metadata).saturating_add(fragmented);
-            if total == 0 {
-                Ok(0.0)
-            } else {
-                Ok(fragmented as f64 / total as f64)
-            }
+        })
+    }
+
+    /// The exact fragmentation ratio of a captured sample. This walks every
+    /// application page reachable from the sample's snapshot, so its cost is
+    /// proportional to the store; it is never part of a cycle that has no
+    /// decision to take.
+    pub(crate) fn sampled_fragmentation_ratio(
+        sample: &redb::StorageStatisticsSnapshot,
+    ) -> Result<f64> {
+        let stats = sample.stats().map_err(Self::storage_error)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        STORAGE_STATISTICS_PAGES_WALKED.with(|walked| {
+            walked.set(
+                walked
+                    .get()
+                    .saturating_add(stats.leaf_pages())
+                    .saturating_add(stats.branch_pages()),
+            )
+        });
+        let stored = stats.stored_bytes();
+        let metadata = stats.metadata_bytes();
+        let fragmented = stats.fragmented_bytes();
+        let total = stored.saturating_add(metadata).saturating_add(fragmented);
+        if total == 0 {
+            Ok(0.0)
+        } else {
+            Ok(fragmented as f64 / total as f64)
         }
     }
 
