@@ -6,6 +6,10 @@
 //! its exact requested `Layout` is known before it is allocated (by a refused
 //! fallible reserve) and accounted for when it is freed.
 
+// The funding methods are reached only through the hidden
+// `contextdb-internal` surface; without it the registry is a plain map.
+#![cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
+
 use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 use std::hash::RandomState;
 use std::panic;

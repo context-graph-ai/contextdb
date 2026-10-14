@@ -2588,7 +2588,7 @@
 +}
 --- /dev/null
 +++ b/src/table_registry.rs
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,256 @@
 +//! The write transaction's set of open tables.
 +//!
 +//! It is the same hash table and the same randomly seeded hasher as
@@ -2596,6 +2596,10 @@
 +//! array the registry allocates or frees passes through [`RegistryAlloc`], so
 +//! its exact requested `Layout` is known before it is allocated (by a refused
 +//! fallible reserve) and accounted for when it is freed.
++
++// The funding methods are reached only through the hidden
++// `contextdb-internal` surface; without it the registry is a plain map.
++#![cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 +
 +use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 +use std::hash::RandomState;
