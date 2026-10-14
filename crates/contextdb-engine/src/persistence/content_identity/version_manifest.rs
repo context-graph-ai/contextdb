@@ -1419,6 +1419,49 @@ pub(in super::super) mod commit_row_work {
     pub(in super::super::super) fn take_overlay_comparisons() -> u64 {
         OVERLAY_COMPARISONS.with(|count| count.replace(0))
     }
+
+    thread_local! {
+        static HELD_RELATION_WORK: Cell<u64> = const { Cell::new(0) };
+        static HELD_FIRST_USES: std::cell::RefCell<Option<Vec<Vec<String>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Held-relation cache work in one unit: a table-name comparison, a
+    /// rebalancing step, a slot or index node relocated when its vector grows,
+    /// or a held handle shifted by an insertion.
+    pub(in super::super::super) fn count_held_relation_work(units: usize) {
+        HELD_RELATION_WORK.with(|count| count.set(count.get().saturating_add(units as u64)));
+    }
+
+    pub(in super::super::super) fn take_held_relation_work() -> u64 {
+        HELD_RELATION_WORK.with(|count| count.replace(0))
+    }
+
+    /// Start recording, per reconciliation pass, the tables in the order the
+    /// pass first used them.
+    pub(in super::super::super) fn watch_held_first_uses() {
+        HELD_FIRST_USES.with(|uses| *uses.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(in super::super::super) fn take_held_first_uses() -> Vec<Vec<String>> {
+        HELD_FIRST_USES.with(|uses| uses.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(in super::super::super) fn note_held_pass() {
+        HELD_FIRST_USES.with(|uses| {
+            if let Some(passes) = uses.borrow_mut().as_mut() {
+                passes.push(Vec::new());
+            }
+        });
+    }
+
+    pub(in super::super::super) fn note_held_first_use(table: &str) {
+        HELD_FIRST_USES.with(|uses| {
+            if let Some(pass) = uses.borrow_mut().as_mut().and_then(|passes| passes.last_mut()) {
+                pass.push(table.to_owned());
+            }
+        });
+    }
 }
 
 pub(in super::super) fn manifest_mutation_bytes(coordinate: &[u8], present: bool) -> Result<usize> {

@@ -177,3 +177,69 @@ fn a_pass_that_unwinds_without_closing_returns_its_charge_with_its_admission() {
     );
     drop(write);
 }
+
+/// `(2R + 4T)·H + 4T` with `H = ⌈log2(T+1)⌉ + 1`: R lookups and T first uses
+/// over a balanced index, plus at most 2T slot and 2T node relocations.
+fn held_relation_work_bound(lookups: usize, tables: usize) -> u64 {
+    let height = (usize::BITS - tables.leading_zeros()) as usize + 1;
+    ((2 * lookups + 4 * tables) * height + 4 * tables) as u64
+}
+
+/// Tables first used in descending name order are each opened once, every
+/// lookup answers with its own table, and the cache work stays logarithmic:
+/// inserting each new relation in front of every held one is quadratic.
+#[test]
+fn descending_first_use_holds_each_relation_with_logarithmic_work() {
+    use crate::persistence::content_identity::version_manifest::commit_row_work;
+    for count in [256usize, 512, 1_024, 2_048] {
+        let tables: Vec<String> = (0..count).map(|n| format!("d{n:05}")).collect();
+        let root = tempfile::tempdir().expect("fixture directory");
+        let db = redb::Database::create(root.path().join("descending.redb"))
+            .expect("create the store");
+        let write = db.begin_write().expect("begin the fixture write");
+        for table in &tables {
+            write
+                .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name(table)))
+                .expect("create one relation")
+                .insert(b"row".as_slice(), table.as_bytes())
+                .expect("store the relation's own body");
+        }
+        write.commit().expect("commit the fixture");
+        let mut order: Vec<String> = tables.iter().rev().cloned().collect();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut shuffled = tables.clone();
+        for index in (1..shuffled.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            shuffled.swap(index, (state % (index as u64 + 1)) as usize);
+        }
+        order.extend(shuffled);
+        let owner = Arc::new(MemoryAccountant::no_limit());
+        let mut admission = content_identity::ProofAdmission::new(Some(owner.clone().into()));
+        let write = db.begin_write().expect("begin");
+        commit_row_work::take_held_relation_work();
+        let opened = hold_in_order_for_test(&write, &order, &mut admission, |table, relation| {
+            assert_eq!(
+                relation
+                    .get(b"row".as_slice())
+                    .expect("read")
+                    .expect("the relation's body")
+                    .value(),
+                table.as_bytes(),
+                "a lookup answers with its own table's relation"
+            );
+        })
+        .expect("every relation is held");
+        let work = commit_row_work::take_held_relation_work();
+        let bound = held_relation_work_bound(order.len(), count);
+        eprintln!("held_relation_work tables={count} lookups={} work={work} bound={bound}", order.len());
+        assert_eq!(opened, count, "each relation opens once per pass");
+        assert!(
+            work <= bound,
+            "held-relation work grew faster than its logarithmic bound at {count} tables: \
+             {work} > {bound}"
+        );
+        drop(write);
+    }
+}

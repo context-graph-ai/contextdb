@@ -449,3 +449,73 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
     .expect("the store keeps committing after the refusal");
     db.close().expect("close the refused store");
 }
+
+/// One transaction writing one row into each of T tables, staged in
+/// descending name order. Both row-head reconciliation passes must first use
+/// the tables in that order, open each exactly once, and do held-relation
+/// work within `(2R + 4T)·H + 4T` per pass (R ≤ 2T lookups: a pass may look a
+/// row's relation up twice). Inserting each newly used relation in front of
+/// every held one costs T(T−1)/2 handle moves per pass instead.
+#[test]
+fn a_commit_writing_tables_in_descending_order_holds_each_once_with_logarithmic_work() {
+    for count in [64usize, 128, 256] {
+        let root = tempfile::tempdir().expect("fixture directory");
+        let db = Database::open(root.path().join("descending.db")).expect("open the database");
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let tables: Vec<String> = (0..count).map(|n| format!("desc_{n:04}")).collect();
+        for table in &tables {
+            db.execute(
+                &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, payload TEXT NOT NULL)"),
+                &HashMap::new(),
+            )
+            .expect("declare one table");
+        }
+        let tx = db.begin().expect("one transaction for every table");
+        for (n, table) in tables.iter().enumerate().rev() {
+            db.execute_in_tx(
+                tx,
+                &format!("INSERT INTO {table} VALUES ($id, 'one row')"),
+                &HashMap::from([(
+                    "id".into(),
+                    Value::Uuid(uuid::Uuid::from_u128(0xde5c << 112 | n as u128)),
+                )]),
+            )
+            .expect("stage one row");
+        }
+        commit_row_work::take_held_relation_work();
+        commit_row_work::take_protected_root_events();
+        commit_row_work::watch_held_first_uses();
+        db.commit(tx).expect("commit every table");
+        let passes = commit_row_work::take_held_first_uses();
+        let work = commit_row_work::take_held_relation_work();
+        let events = commit_row_work::take_protected_root_events();
+        let height = (usize::BITS - count.leading_zeros()) as u64 + 1;
+        let per_pass = (2 * 2 * count as u64 + 4 * count as u64) * height + 4 * count as u64;
+        eprintln!(
+            "held_relation_descending tables={count} passes={} work={work} bound={} events={events}",
+            passes.len(),
+            2 * per_pass
+        );
+        assert_eq!(passes.len(), 2, "two reconciliation passes ran: {passes:?}");
+        let expected: Vec<String> = tables.iter().rev().cloned().collect();
+        for pass in &passes {
+            assert_eq!(
+                pass, &expected,
+                "each pass first uses every table once, in the descending order rows arrive"
+            );
+        }
+        assert!(
+            work <= 2 * per_pass,
+            "held-relation work grew faster than its logarithmic bound at {count} tables: \
+             {work} > {}",
+            2 * per_pass
+        );
+        // The rows' own writes and both passes each open and close every
+        // relation once: protected root events stay linear in the tables.
+        assert!(
+            events <= 8 * count as u64 + PROTECTED_ROOT_EVENT_ALLOWANCE,
+            "protected root events grew faster than the tables: {events}"
+        );
+        db.close().expect("close the database");
+    }
+}

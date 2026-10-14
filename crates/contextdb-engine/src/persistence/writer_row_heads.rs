@@ -100,6 +100,8 @@ pub(super) struct HeldRelations<'name, 'txn> {
 }
 impl<'name, 'txn> HeldRelations<'name, 'txn> {
     pub(super) fn new() -> Self {
+        #[cfg(any(test, feature = "test-seams"))]
+        content_identity::version_manifest::commit_row_work::note_held_pass();
         Self {
             open: Vec::new(),
             charged: 0,
@@ -115,9 +117,15 @@ impl<'name, 'txn> HeldRelations<'name, 'txn> {
         relation_name: impl FnOnce() -> String,
         admission: &mut impl RowHeadAdmission,
     ) -> Result<&HeldRelation<'txn>> {
-        let slot = match self.open.binary_search_by(|(open, _)| (*open).cmp(table)) {
+        let slot = match self.open.binary_search_by(|(open, _)| {
+            #[cfg(any(test, feature = "test-seams"))]
+            content_identity::version_manifest::commit_row_work::count_held_relation_work(1);
+            (*open).cmp(table)
+        }) {
             Ok(slot) => slot,
             Err(slot) => {
+                #[cfg(any(test, feature = "test-seams"))]
+                content_identity::version_manifest::commit_row_work::note_held_first_use(table);
                 let relation_name = relation_name();
                 let native = held_relation_native_bytes(&relation_name);
                 admission.admit_held_relations(native)?;
@@ -135,6 +143,10 @@ impl<'name, 'txn> HeldRelations<'name, 'txn> {
                     admission.admit_held_relations(bytes)?;
                     self.charged += bytes;
                     let mut next = Vec::with_capacity(capacity);
+                    #[cfg(any(test, feature = "test-seams"))]
+                    content_identity::version_manifest::commit_row_work::count_held_relation_work(
+                        self.open.len(),
+                    );
                     next.append(&mut self.open);
                     drop(std::mem::replace(&mut self.open, next));
                     admission.release_held_relations(old * entry);
@@ -143,6 +155,10 @@ impl<'name, 'txn> HeldRelations<'name, 'txn> {
                 let relation = write
                     .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name))
                     .map_err(RedbPersistence::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                content_identity::version_manifest::commit_row_work::count_held_relation_work(
+                    self.open.len() - slot,
+                );
                 self.open.insert(slot, (table, relation));
                 slot
             }
@@ -163,6 +179,35 @@ impl<'name, 'txn> HeldRelations<'name, 'txn> {
         admission.release_held_relations(charged);
     }
 }
+/// Look up `order`'s tables through one pass's holder, handing each lookup's
+/// handle to `check`; returns how many relations the pass opened.
+#[cfg(test)]
+pub(super) fn hold_in_order_for_test(
+    write: &redb::WriteTransaction,
+    order: &[String],
+    admission: &mut content_identity::ProofAdmission,
+    mut check: impl FnMut(&str, &HeldRelation<'_>),
+) -> Result<usize> {
+    let mut held = HeldRelations::new();
+    let mut opened = 0;
+    let result = (|| {
+        for table in order {
+            let before = held.open.len();
+            let relation = held.get(
+                write,
+                table,
+                || RedbPersistence::rel_table_name(table),
+                admission,
+            )?;
+            check(table, relation);
+            opened += held.open.len() - before;
+        }
+        Ok(opened)
+    })();
+    held.close(admission);
+    result
+}
+
 fn logical_key(table: &str, row: RowId) -> Vec<u8> {
     let mut key = Vec::with_capacity(table.len() + 24);
     key.extend_from_slice(&(table.len() as u64).to_le_bytes());
