@@ -1,7 +1,7 @@
 //! A durable store mirrors its tenant policy and binding records in memory,
-//! and that mirror is charged to the writer before it is built. Across the
-//! tree boundaries std's `BTreeMap` crosses (a singleton, a leaf split at 12
-//! entries, a root split at 67), what building the mirror leaves allocated
+//! and that mirror is charged to the writer before it is built. For a binding
+//! that declares 1, 12 and 67 tables (its body grows with each), what
+//! building the mirror leaves allocated
 //! never exceeds what the writer admitted for it, and the admission stays
 //! within a bounded multiple of what is allocated. Dropping the store
 //! releases exactly the mirror's admission.
@@ -74,9 +74,11 @@ async fn mirror(tables: usize) {
     let before = live_allocations_for_test();
     let (charge, entries) = edge.__custody_tenant_mirror_for_test().unwrap();
     let allocated = live_allocations_for_test().saturating_sub(before);
-    assert!(
-        entries > tables,
-        "{tables} tables: one policy per table and a binding are mirrored ({entries})"
+    // An edge mirrors its one policy binding, which carries every declared
+    // table's policy: the mirrored body grows with `tables`.
+    assert_eq!(
+        entries, 1,
+        "{tables} tables: the edge mirrors its policy binding"
     );
     assert_eq!(
         edge.accountant().usage().used - used,
