@@ -312,12 +312,12 @@ fn statement_effect_marks_only_the_inspection_variants_as_reads() {
         .filter(|(_, expected_effect, _)| *expected_effect == StatementEffect::Read)
         .count();
     assert_eq!(
-        declared_read_count, 12,
-        "exactly twelve current Statement variants are declared reads"
+        declared_read_count, 13,
+        "exactly thirteen current Statement variants are declared reads"
     );
     assert_eq!(
         parsed_cases.len() - declared_read_count,
-        26,
+        27,
         "every other current Statement variant is declared a write"
     );
 
