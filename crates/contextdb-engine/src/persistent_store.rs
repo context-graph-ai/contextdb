@@ -474,6 +474,10 @@ thread_local! {
 }
 struct OwnedTerminalApplyScope {
     previous: Option<OwnedTerminalApplyBinding>,
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     control: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl Drop for OwnedTerminalApplyScope {
@@ -796,6 +800,10 @@ struct OriginalMetadataPublicationReservation {
     root: Option<crate::memory_accounting::OwnedMemoryReservation>,
 }
 thread_local! {static ORIGINAL_METADATA_PUBLICATION:std::cell::Cell<*mut OriginalMetadataPublicationOwner>=const{std::cell::Cell::new(std::ptr::null_mut())};}
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 struct OriginalMetadataPublicationScope(*mut OriginalMetadataPublicationOwner);
 impl Drop for OriginalMetadataPublicationScope {
     fn drop(&mut self) {
@@ -803,6 +811,10 @@ impl Drop for OriginalMetadataPublicationScope {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl OwnedPersistentCompositeStore {
     /// The private host keeps this control owner outside the Any Box across
     /// the existing metadata publication gate, including failure and unwind.
@@ -1168,6 +1180,10 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
 /// Memory-only Native hosts use the same erase/source/history publication
 /// kernel. Preparation is completed while the original source is still lent;
 /// no combined-stage guard crosses the actual memory apply.
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) fn apply_owned_memory_store(
     store: &CompositeStore,
     events: &crate::database::event_bus::OwnedEventBusHandle,

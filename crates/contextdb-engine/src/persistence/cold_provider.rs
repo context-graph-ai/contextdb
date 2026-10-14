@@ -379,6 +379,10 @@ impl ColdCommittedProvider<'_> {
     /// The scalar descriptor is separately store-funded under an original
     /// UNTAGGED handle. It does not remove the retained WriterSchema or certify
     /// WriterSnapshot construction/registry/publication.
+    #[allow(
+        private_interfaces,
+        reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
+    )]
     pub(crate) fn scalar_metadata_unqualified(
         &self,
     ) -> Result<super::super::native_storage_admission::ColdMetadataOwner> {

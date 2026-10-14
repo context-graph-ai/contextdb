@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "the error type is returned by value across the crate; boxing it would change every signature"
+)]
 use super::*;
 
 const CRON_SCHEDULES_CONFIG_KEY: &str = "__cron_schedules";

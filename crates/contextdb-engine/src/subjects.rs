@@ -26,6 +26,10 @@ pub fn delivery_outcomes_subject(tenant_id: &str) -> String {
 
 /// Format a native subject from borrowed pieces under its original invoice.
 /// Existing public subject constructors retain their legacy signatures.
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) fn read_bound_subject(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     tenant_id: &str,

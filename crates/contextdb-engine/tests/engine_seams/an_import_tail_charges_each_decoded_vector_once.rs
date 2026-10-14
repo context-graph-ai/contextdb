@@ -481,6 +481,10 @@ fn options(limit: usize) -> DatabaseOpenOptions {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 fn partition_status(db: &Database) -> HashMap<String, Value> {
     let result = db
         .execute(

@@ -1704,11 +1704,19 @@ impl RowReadAdmission<'_> {
 // Each payload owns its exact allocation invoice; this paid control holds only
 // the original owner and the execution entry's weak checkpoint link.
 #[cfg(feature = "sync-orchestration")]
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) struct NativeDeliveryImage {
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     context: crate::executor::bounded::NativeReadOpenContext,
 }
 #[cfg(feature = "sync-orchestration")]
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl NativeDeliveryImage {
     pub(crate) fn try_new(
         context: crate::executor::bounded::NativeReadOpenContext,
@@ -1768,6 +1776,10 @@ pub(crate) struct NativeDeliveryBytes {
     // The physical buffer is freed before its invoice settles, including
     // partially filled or rejected decodes. No Vec or invoice escapes alone.
     bytes: Vec<u8>,
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     invoice: contextdb_core::read_memory::ReadCredit,
 }
 #[cfg(feature = "sync-orchestration")]
@@ -1782,6 +1794,10 @@ impl NativeDeliveryBytes {
 
 #[cfg(feature = "sync-orchestration")]
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) enum NativeDeliveryAllocationError {
     Resource(Error),
     Layout,
@@ -1799,12 +1815,20 @@ impl From<Error> for NativeDeliveryAllocationError {
 /// strings/buffers must arrive with its own producer credit. No outer-frame
 /// certification, Arc budget adapter or implicit owner acquisition exists.
 #[cfg(feature = "sync-orchestration")]
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) struct NativeSelectionHold<T> {
     values: Vec<T>,
     invoice: contextdb_core::read_memory::ReadCredit,
     slots: usize,
 }
 #[cfg(feature = "sync-orchestration")]
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl<T> NativeSelectionHold<T> {
     pub(crate) fn try_new(
         owner: &contextdb_core::read_memory::ReadMemoryOwner,

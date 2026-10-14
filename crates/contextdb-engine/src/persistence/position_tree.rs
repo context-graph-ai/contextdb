@@ -126,6 +126,10 @@ impl PositionTree {
 
     /// Descend once. `order(position)` places the sought key relative to that
     /// position: `Less` goes left, `Greater` goes right, `Equal` is found.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error type is returned by value across the crate; boxing it would change every signature"
+    )]
     pub(in crate::persistence) fn search(
         &self,
         mut order: impl FnMut(u32) -> Ordering,

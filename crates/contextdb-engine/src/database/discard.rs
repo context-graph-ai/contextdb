@@ -485,6 +485,10 @@ impl OwnedDiscardQueueCustody {
     /// The caller already owns the original commit mutex and read-erasure
     /// fence. Its own prepared DELETE events already exclude selected discard
     /// rows. Purge filtering applies to old queues, never to this own append.
+    #[allow(
+        private_interfaces,
+        reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
+    )]
     pub(crate) fn prepare_for_commit_locked_discard(
         events: &event_bus::OwnedEventBusHandle,
         own_append: &mut event_bus::OwnedPreparedSinkEvents,

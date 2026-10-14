@@ -22049,6 +22049,10 @@ mod writecost_missing_index_tests;
 /// Private storage-operation companion only. No SQL planning/default target
 /// methods switch to Native, and no unsupported method delegates to Legacy.
 #[cfg(feature = "sync-orchestration")]
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) fn native_point_row(
     database: &Database,
     key: &(contextdb_core::TableName, RowId),

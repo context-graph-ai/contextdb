@@ -2061,6 +2061,10 @@ mod native_snapshot_tests {
                     assert_eq!(first_count.load(Ordering::SeqCst), 1);
                     assert_eq!(later_count.load(Ordering::SeqCst), 1);
                     assert_eq!(new_count.load(Ordering::SeqCst), 1);
+                    #[allow(
+                        clippy::drop_non_drop,
+                        reason = "the drop marks where the pinned test value goes out of scope"
+                    )]
                     drop(newer);
                     // The linked value drops in place here, including unwind.
                 }
@@ -2295,6 +2299,10 @@ mod native_snapshot_tests {
                     }
                     outer.as_mut().take_next_callback().unwrap().call();
                     assert_eq!(count.load(Ordering::SeqCst), 1);
+                    #[allow(
+                        clippy::drop_non_drop,
+                        reason = "the drop marks where the pinned test value goes out of scope"
+                    )]
                     drop(outer);
                 }
                 empty(token);

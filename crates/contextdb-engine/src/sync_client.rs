@@ -6278,6 +6278,10 @@ mod tests {
 
 /// Private native envelope companion; byte/text producers own or borrow only
 /// storage funded by the exact supplied operation. No legacy image adapter.
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) fn decode_native_sync_envelope(
     memory: &crate::read_image_memory::NativeDeliveryImage,
     data: &[u8],

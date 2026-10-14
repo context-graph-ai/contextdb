@@ -8523,6 +8523,10 @@ pub(crate) mod original_writer {
         reservation: OwnedMemoryReservation,
     }
     impl ProofAdmission {
+        #[allow(
+            private_interfaces,
+            reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
+        )]
         pub(crate) fn new(
             original: &OwnedMemoryReservation,
             scratch_owner: Option<std::sync::Weak<super::super::writer_file::LockedWriterFile>>,
@@ -9005,7 +9009,7 @@ pub(crate) mod original_writer {
         }
     }
 
-    /// The exact payload capacity mutation_tree_key requests for this encoding.
+    // The exact payload capacity mutation_tree_key requests for this encoding.
 
     impl RedbPersistence {
         pub(crate) fn apply_owned_content_identity_with_manifests_in_write(
@@ -9018,6 +9022,10 @@ pub(crate) mod original_writer {
                 write_txn, mutations, manifests, admission, None,
             )
         }
+        #[allow(
+            private_interfaces,
+            reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
+        )]
         pub(crate) fn apply_owned_content_identity_with_manifests_and_groups_in_write(
             write_txn: &redb::WriteTransaction,
             mutations: &[ContentIdentityMutation],

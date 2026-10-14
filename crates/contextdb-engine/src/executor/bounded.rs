@@ -19936,6 +19936,10 @@ impl<T> Clone for NativeControlWeak<T> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl<T> NativeControlWeak<T> {
     fn upgrade(&self) -> Option<NativeControlStrong<T>> {
         use std::sync::atomic::Ordering;
@@ -19976,8 +19980,16 @@ impl<T> NativeControlWeak<T> {
 // Generic identity/checkpoint prototype only: NativeRequestControl is absent.
 // Later integration must pass that same executing control's checkpoint method,
 // preserving its cancellation, deadline and aggregate work without a new owner.
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 struct NativeVectorReadCheckpoint<T>(NativeControlWeak<T>);
 
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl<T> NativeVectorReadCheckpoint<T> {
     fn from_control(control: &NativeControlStrong<T>) -> Self {
         Self(control.downgrade())
@@ -20008,6 +20020,10 @@ struct NativeRequestControl {
 struct NativeRequestState {
     started_ms: u64,
     work_units: u64,
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     rows_so_far: u64,
     bytes_so_far: u64,
 }
@@ -20053,6 +20069,10 @@ impl NativeReadExecutionEntry {
             control: self.control.downgrade(),
         }
     }
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     pub(crate) fn belongs_to(&self, context: &NativeReadOpenContext) -> bool {
         context.control.belongs_to(&self.control)
     }
@@ -20078,6 +20098,10 @@ impl NativeRequestControl {
         Ok(())
     }
 }
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl NativeReadOpenContext {
     pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
         self.control
@@ -20148,6 +20172,10 @@ impl NativeReadOpenContext {
 }
 
 #[cfg(feature = "sync-orchestration")]
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(super) fn execute_native_point_read(
     database: &Database,
     key: &(contextdb_core::TableName, RowId),

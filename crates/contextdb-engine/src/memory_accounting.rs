@@ -380,9 +380,7 @@ impl contextdb_tx::staged_source::RetainedControlSource for WriterUse {
         &self,
         kind: contextdb_tx::staged_source::RetainedControlKind,
     ) -> Option<contextdb_tx::staged_source::RetainedControlIdentity> {
-        use contextdb_tx::staged_source::{
-            RetainedControlIdentity, RetainedControlKind, RetainedControlSource,
-        };
+        use contextdb_tx::staged_source::{RetainedControlIdentity, RetainedControlKind};
         if kind != RetainedControlKind::WriterRegistration {
             return self.accountant.retained_control_identity(kind);
         }
@@ -1293,6 +1291,10 @@ pub(crate) struct WriterBudget {
     vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>,
 }
 impl WriterBudget {
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     pub(crate) fn prepare_source_funder(
         &self,
     ) -> contextdb_core::Result<contextdb_tx::SourceFunder> {
@@ -2452,6 +2454,10 @@ impl OwnedMemoryReservation {
         self.bytes = 0;
         Ok(charge)
     }
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "the method consumes funding held behind &mut self and cannot take self by value"
+    )]
     pub(crate) fn into_source_row_invoice_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
@@ -2459,6 +2465,14 @@ impl OwnedMemoryReservation {
         self.source_invoice_for(funder)
             .map(contextdb_tx::OriginalRowInvoice::from_charge)
     }
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "the method consumes funding held behind &mut self and cannot take self by value"
+    )]
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     pub(crate) fn into_source_vector_invoice_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
@@ -2468,6 +2482,10 @@ impl OwnedMemoryReservation {
     }
     /// Auxiliary bodies transfer the original reservation rather than a
     /// post-mutation byte estimate.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "the method consumes funding held behind &mut self and cannot take self by value"
+    )]
     pub(crate) fn into_source_aux_invoice_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
@@ -4419,11 +4437,19 @@ mod redb_allocator_state_tests {
 
 /// A fixed native provider pins the actual original writer, not a current role.
 /// It has no payload/root/invoice back-reference, so retained sources are acyclic.
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 struct NativeSourceProvider {
     accountant: Option<AccountantHandle>,
     writer: Option<WriterUse>,
     control: Option<ControlCredit>,
 }
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl NativeSourceProvider {
     fn native_origin(&self) -> contextdb_core::Result<contextdb_tx::NativeSourceOrigin> {
         let accountant = self
@@ -5136,12 +5162,20 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
 }
 impl OwnedMemoryReservation {
     /// Host transfer preserves the original standard receiver allocation.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "the method consumes funding held behind &mut self and cannot take self by value"
+    )]
     pub(crate) fn into_source_invoice(
         &mut self,
     ) -> contextdb_core::Result<contextdb_tx::OriginalRowInvoice> {
         self.into_source_charge()
             .map(contextdb_tx::OriginalRowInvoice::from_charge)
     }
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "the method consumes funding held behind &mut self and cannot take self by value"
+    )]
     fn into_source_charge(&mut self) -> contextdb_core::Result<contextdb_tx::SourceCharge> {
         let receiver = self.accountant().standard_arc().ok_or_else(|| {
             contextdb_core::Error::Other("native source transfer requires an opaque funder".into())
@@ -5353,6 +5387,10 @@ pub(crate) fn preparation_row_map_bytes(members: usize) -> contextdb_core::Resul
     source_row_map_bytes(members)
 }
 
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 pub(crate) fn preparation_check_row_capacity(
     row: &contextdb_core::VersionedRow,
 ) -> contextdb_core::Result<()> {
@@ -6229,14 +6267,15 @@ fn source_sidecar_copy<V: Copy>(
     }
     copied
 }
+type SourceCopyChange<'a> = (
+    &'a str,
+    contextdb_core::RowId,
+    Option<(contextdb_core::Lsn, u8)>,
+    Option<usize>,
+);
 fn source_copy_sidecars(
     maps: contextdb_tx::staged_source::SidecarsBorrow<'_>,
-    change: Option<(
-        &str,
-        contextdb_core::RowId,
-        Option<(contextdb_core::Lsn, u8)>,
-        Option<usize>,
-    )>,
+    change: Option<SourceCopyChange<'_>>,
     funder: contextdb_tx::SourceFunder,
 ) -> contextdb_core::Result<contextdb_tx::staged_source::AdmittedSidecars> {
     let lsns = change.map(|(table, row, source, _)| (table, row, source.map(|v| v.0)));
@@ -8399,6 +8438,10 @@ pub(crate) fn clone_persistence_original_writer(
 // Legacy kernels above remain byte-identical. Only the refusal representation
 // is static; no owned Error is constructed and subsequently mapped.
 impl MemoryAccountant {
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     pub(crate) fn try_allocate_native(
         &self,
         bytes: usize,
@@ -8731,6 +8774,10 @@ impl MemoryAccountant {
 }
 
 impl StoreAccountantHandle {
+    #[allow(
+        dead_code,
+        reason = "native delivery code is staged ahead of its first non-test caller"
+    )]
     pub(crate) fn try_allocate_for_original_native(
         &self,
         bytes: usize,
@@ -8742,6 +8789,10 @@ impl StoreAccountantHandle {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "native delivery code is staged ahead of its first non-test caller"
+)]
 impl OwnedMemoryReservation {
     /// A genuine new grant from the originating reservation, retaining its
     /// existing writer epoch rather than discovering a later registration.
