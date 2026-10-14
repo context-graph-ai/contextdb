@@ -36,6 +36,8 @@ mod a_saved_graph_load_checks_its_bytes_once;
 mod a_saved_graph_search_reports_its_distance_work;
 #[path = "vector/a_store_reopens_after_every_vector_maintenance_commit.rs"]
 mod a_store_reopens_after_every_vector_maintenance_commit;
+#[path = "vector/a_synced_vector_policy_change_keeps_the_receivers_graphs.rs"]
+mod a_synced_vector_policy_change_keeps_the_receivers_graphs;
 #[path = "vector/a_tied_frontier_cannot_hide_a_smaller_row.rs"]
 mod a_tied_frontier_cannot_hide_a_smaller_row;
 #[cfg(unix)]
