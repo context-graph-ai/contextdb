@@ -2,12 +2,18 @@ use super::allocator_pager::AllocatorPager;
 use crate::tree_store::page_store::hash128_with_seed;
 use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const HEIGHT_OFFSET: usize = 0;
 const END_OFFSETS: usize = HEIGHT_OFFSET + size_of::<u32>();
 
 pub(crate) struct BtreeBitmap {
     heights: Vec<U64GroupedBitmap>,
+    // The one-word root summary, kept resident once read and forgotten on any
+    // mutation. A fixed 16 bytes per bitmap: free-space questions about an
+    // untouched order are answered without loading its root window.
+    root_word: AtomicU64,
+    root_known: AtomicBool,
 }
 
 // Stores a 64-way bit-tree of allocated ids.
@@ -18,6 +24,31 @@ pub(crate) struct BtreeBitmap {
 // layer data: u64s
 // ...consecutive layers. Except for the last level, all sub-trees of the root must be complete
 impl BtreeBitmap {
+    fn from_heights(heights: Vec<U64GroupedBitmap>) -> Self {
+        Self {
+            heights,
+            root_word: AtomicU64::new(0),
+            root_known: AtomicBool::new(false),
+        }
+    }
+
+    fn root(&self) -> u64 {
+        if self.root_known.load(Ordering::Relaxed) {
+            return self.root_word.load(Ordering::Relaxed);
+        }
+        let root = self.get_level(0).word(0);
+        // A poisoned read answers "full" once and is not remembered.
+        if !self.get_level(0).poisoned() {
+            self.root_word.store(root, Ordering::Relaxed);
+            self.root_known.store(true, Ordering::Relaxed);
+        }
+        root
+    }
+
+    fn forget_root(&self) {
+        self.root_known.store(false, Ordering::Relaxed);
+    }
+
     pub(crate) fn poisoned(&self) -> bool {
         self.heights.iter().any(U64GroupedBitmap::poisoned)
     }
@@ -25,6 +56,7 @@ impl BtreeBitmap {
         for height in &mut self.heights {
             height.materialize_paged_words();
         }
+        self.forget_root();
     }
     pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
         self.heights.capacity() * size_of::<U64GroupedBitmap>()
@@ -55,7 +87,17 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn find_first_unset(&self) -> Option<u32> {
-        if let Some(mut entry) = self.get_level(0).first_unset(0, 64) {
+        // The root level holds at most 64 bits, so the resident root word is
+        // the whole of `get_level(0).first_unset(0, 64)`.
+        let root_entry = if self.get_level(0).len() == 0 {
+            None
+        } else {
+            match self.root().trailing_ones() {
+                64 => None,
+                free => Some(free),
+            }
+        };
+        if let Some(mut entry) = root_entry {
             let mut height = 0;
 
             while height < self.get_height() - 1 {
@@ -132,7 +174,7 @@ impl BtreeBitmap {
             metadata += size_of::<u32>();
         }
 
-        Self { heights }
+        Self::from_heights(heights)
     }
 
     // Initializes a new allocator, with no ids free
@@ -152,7 +194,7 @@ impl BtreeBitmap {
         // Reverse so that the root is at index 0
         heights.reverse();
 
-        Self { heights }
+        Self::from_heights(heights)
     }
 
     // Like new(), but pads the tree height for max_capacity so resize()
@@ -204,7 +246,7 @@ impl BtreeBitmap {
                 )
             })
             .collect();
-        Self { heights }
+        Self::from_heights(heights)
     }
 
     fn height_for_capacity(mut capacity: u32) -> usize {
@@ -217,6 +259,7 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn resize(&mut self, mut new_len: u32, full: bool) {
+        self.forget_root();
         for height in self.heights.iter_mut().rev() {
             height.resize(new_len, full);
             new_len = new_len.div_ceil(64);
@@ -238,6 +281,7 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn set(&mut self, i: u32) {
+        self.forget_root();
         if self.poisoned() {
             return;
         }
@@ -249,6 +293,7 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn clear(&mut self, i: u32) {
+        self.forget_root();
         if self.poisoned() {
             return;
         }

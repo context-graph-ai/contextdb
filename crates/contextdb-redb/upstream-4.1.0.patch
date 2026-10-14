@@ -10674,19 +10674,56 @@
  pub(crate) enum PageTrackerPolicy {
 --- a/src/tree_store/page_store/bitmap.rs
 +++ b/src/tree_store/page_store/bitmap.rs
-@@ -1,5 +1,7 @@
+@@ -1,11 +1,19 @@
 -use crate::tree_store::page_store::xxh3_checksum;
 +use super::allocator_pager::AllocatorPager;
 +use crate::tree_store::page_store::hash128_with_seed;
  use std::mem::size_of;
 +use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
  
  const HEIGHT_OFFSET: usize = 0;
  const END_OFFSETS: usize = HEIGHT_OFFSET + size_of::<u32>();
-@@ -16,12 +18,32 @@
+ 
+ pub(crate) struct BtreeBitmap {
+     heights: Vec<U64GroupedBitmap>,
++    // The one-word root summary, kept resident once read and forgotten on any
++    // mutation. A fixed 16 bytes per bitmap: free-space questions about an
++    // untouched order are answered without loading its root window.
++    root_word: AtomicU64,
++    root_known: AtomicBool,
+ }
+ 
+ // Stores a 64-way bit-tree of allocated ids.
+@@ -16,12 +24,58 @@
  // layer data: u64s
  // ...consecutive layers. Except for the last level, all sub-trees of the root must be complete
  impl BtreeBitmap {
++    fn from_heights(heights: Vec<U64GroupedBitmap>) -> Self {
++        Self {
++            heights,
++            root_word: AtomicU64::new(0),
++            root_known: AtomicBool::new(false),
++        }
++    }
++
++    fn root(&self) -> u64 {
++        if self.root_known.load(Ordering::Relaxed) {
++            return self.root_word.load(Ordering::Relaxed);
++        }
++        let root = self.get_level(0).word(0);
++        // A poisoned read answers "full" once and is not remembered.
++        if !self.get_level(0).poisoned() {
++            self.root_word.store(root, Ordering::Relaxed);
++            self.root_known.store(true, Ordering::Relaxed);
++        }
++        root
++    }
++
++    fn forget_root(&self) {
++        self.root_known.store(false, Ordering::Relaxed);
++    }
++
 +    pub(crate) fn poisoned(&self) -> bool {
 +        self.heights.iter().any(U64GroupedBitmap::poisoned)
 +    }
@@ -10694,6 +10731,7 @@
 +        for height in &mut self.heights {
 +            height.materialize_paged_words();
 +        }
++        self.forget_root();
 +    }
 +    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
 +        self.heights.capacity() * size_of::<U64GroupedBitmap>()
@@ -10717,7 +10755,24 @@
      }
  
      pub(crate) fn get(&self, i: u32) -> bool {
-@@ -39,10 +61,7 @@
+@@ -33,16 +87,23 @@
+     }
+ 
+     pub(crate) fn find_first_unset(&self) -> Option<u32> {
+-        if let Some(mut entry) = self.get_level(0).first_unset(0, 64) {
++        // The root level holds at most 64 bits, so the resident root word is
++        // the whole of `get_level(0).first_unset(0, 64)`.
++        let root_entry = if self.get_level(0).len() == 0 {
++            None
++        } else {
++            match self.root().trailing_ones() {
++                64 => None,
++                free => Some(free),
++            }
++        };
++        if let Some(mut entry) = root_entry {
+             let mut height = 0;
+ 
              while height < self.get_height() - 1 {
                  height += 1;
                  entry *= 64;
@@ -10729,7 +10784,7 @@
              }
  
              Some(entry)
-@@ -68,26 +87,27 @@
+@@ -68,26 +129,27 @@
          result
      }
  
@@ -10777,7 +10832,25 @@
      }
  
      pub(crate) fn from_bytes(data: &[u8]) -> Self {
-@@ -152,6 +172,41 @@
+@@ -112,7 +174,7 @@
+             metadata += size_of::<u32>();
+         }
+ 
+-        Self { heights }
++        Self::from_heights(heights)
+     }
+ 
+     // Initializes a new allocator, with no ids free
+@@ -132,7 +194,7 @@
+         // Reverse so that the root is at index 0
+         heights.reverse();
+ 
+-        Self { heights }
++        Self::from_heights(heights)
+     }
+ 
+     // Like new(), but pads the tree height for max_capacity so resize()
+@@ -152,6 +214,41 @@
          result
      }
  
@@ -10813,13 +10886,21 @@
 +                )
 +            })
 +            .collect();
-+        Self { heights }
++        Self::from_heights(heights)
 +    }
 +
      fn height_for_capacity(mut capacity: u32) -> usize {
          let mut height = 1;
          while capacity > 64 {
-@@ -171,18 +226,36 @@
+@@ -162,6 +259,7 @@
+     }
+ 
+     pub(crate) fn resize(&mut self, mut new_len: u32, full: bool) {
++        self.forget_root();
+         for height in self.heights.iter_mut().rev() {
+             height.resize(new_len, full);
+             new_len = new_len.div_ceil(64);
+@@ -171,18 +269,38 @@
  
      // Returns the first unset id, and sets it
      pub(crate) fn alloc(&mut self) -> Option<u32> {
@@ -10836,6 +10917,7 @@
      }
  
      pub(crate) fn set(&mut self, i: u32) {
++        self.forget_root();
 +        if self.poisoned() {
 +            return;
 +        }
@@ -10847,6 +10929,7 @@
      }
  
      pub(crate) fn clear(&mut self, i: u32) {
++        self.forget_root();
 +        if self.poisoned() {
 +            return;
 +        }
@@ -10857,7 +10940,7 @@
          self.update_to_root(i, false);
      }
  
-@@ -221,9 +294,30 @@
+@@ -221,9 +339,30 @@
  pub(crate) struct U64GroupedBitmap {
      len: u32,
      data: Vec<u64>,
@@ -10888,7 +10971,7 @@
      fn required_words(elements: u32) -> usize {
          let words = elements.div_ceil(64);
          words as usize
-@@ -231,40 +325,117 @@
+@@ -231,40 +370,117 @@
  
      pub fn new_full(len: u32, capacity: u32) -> Self {
          let data = vec![u64::MAX; Self::required_words(capacity)];
@@ -11024,7 +11107,7 @@
      }
  
      pub fn from_bytes(serialized: &[u8]) -> Self {
-@@ -282,7 +453,11 @@
+@@ -282,7 +498,11 @@
              data.push(value);
          }
  
@@ -11037,7 +11120,7 @@
      }
  
      fn data_index_of(bit: u32) -> (usize, usize) {
-@@ -294,11 +469,9 @@
+@@ -294,11 +514,9 @@
      }
  
      fn count_unset(&self) -> u32 {
@@ -11052,7 +11135,7 @@
      }
  
      fn first_unset(&self, start_bit: u32, end_bit: u32) -> Option<u32> {
-@@ -309,7 +482,7 @@
+@@ -309,7 +527,7 @@
  
          let (index, bit) = Self::data_index_of(start_bit);
          let mask = (1 << bit) - 1;
@@ -11061,7 +11144,7 @@
          let group = group | mask;
          match group.trailing_ones() {
              64 => None,
-@@ -322,7 +495,7 @@
+@@ -322,7 +540,7 @@
      }
  
      pub fn resize(&mut self, new_len: u32, full: bool) {
@@ -11070,7 +11153,7 @@
              let default_value = if full { u64::MAX } else { 0 };
              self.data
                  .resize(Self::required_words(new_len), default_value);
-@@ -344,7 +517,7 @@
+@@ -344,7 +562,7 @@
      pub fn get(&self, bit: u32) -> bool {
          assert!(bit < self.len);
          let (index, bit_index) = Self::data_index_of(bit);
@@ -11079,7 +11162,7 @@
          group & U64GroupedBitmap::select_mask(bit_index) != 0
      }
  
-@@ -352,9 +525,9 @@
+@@ -352,9 +570,9 @@
      pub fn set(&mut self, bit: u32) -> bool {
          assert!(bit < self.len);
          let (index, bit_index) = Self::data_index_of(bit);
@@ -11091,7 +11174,7 @@
  
          group == u64::MAX
      }
-@@ -362,7 +535,7 @@
+@@ -362,7 +580,7 @@
      pub fn clear(&mut self, bit: u32) {
          assert!(bit < self.len, "{bit} must be less than {}", self.len);
          let (index, bit_index) = Self::data_index_of(bit);
@@ -15293,7 +15376,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +1781,404 @@
+@@ -1228,4 +1781,433 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }
@@ -15602,6 +15685,35 @@
 +            "{report}"
 +        );
 +        assert!(sixteen <= eight + MEASURED_ALLOCATIONS / 8, "{report}");
++    }
++
++    /// At the 32-window floor an allocation's working set stays resident:
++    /// every order's one-word summary root is answered without a window, so
++    /// what an allocation touches (the order-0 descent and the tracker words
++    /// it changes) fits the floor, and steady-state allocations reload almost
++    /// nothing at any store size: at most one window per 4 allocations, which
++    /// covers order-0 leaf windows the allocations walk into.
++    #[test]
++    fn allocation_window_loads_at_the_floor_stay_resident() {
++        let mut work = Vec::new();
++        for (gib, layout) in [
++            (1, layout(0, Some(SMALL_STORE_PAGES))),
++            (8, layout(LARGE_STORE_FULL_REGIONS, None)),
++            (16, layout(2 * LARGE_STORE_FULL_REGIONS, None)),
++        ] {
++            let mut state = fragmented_state(layout);
++            let (words, loads) = allocation_work(&mut state);
++            work.push((gib, words, loads));
++        }
++        println!(
++            "(GiB, words, window loads) for {MEASURED_ALLOCATIONS} allocations at the floor: {work:?}"
++        );
++        for (gib, _, loads) in &work {
++            assert!(
++                *loads <= MEASURED_ALLOCATIONS / 4,
++                "{gib} GiB store reloaded {loads} windows: {work:?}"
++            );
++        }
 +    }
 +
 +    /// Finding the highest free order after an allocation reads a bounded
