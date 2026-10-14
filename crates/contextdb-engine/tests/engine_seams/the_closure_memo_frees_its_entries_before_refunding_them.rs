@@ -1,6 +1,6 @@
 //! A durable custody read's closure walk keeps loaded companions in a memo
-//! whose keys can be kilobytes long (here: the long-named roots of undelivered
-//! units, reached from their manifests). On every exit, success or a refusal
+//! whose keys can be kilobytes long (here: the roots of a table with an
+//! 8 KiB name, reached from their units' delivered terminals). On every exit, success or a refusal
 //! late in the walk with the memo populated, each entry is freed before its
 //! key bytes are refunded: at every refund, what this read has allocated
 //! never exceeds what its reader memory still holds admitted.
@@ -69,7 +69,7 @@ fn observed(edge: &Database) -> (Result<Vec<String>, Error>, usize, isize, usize
     BASE.store(live_allocations_for_test(), Ordering::SeqCst);
     Database::__set_custody_bracket_probe_for_test(Some(probe));
     let (answer, held) =
-        edge.__custody_caller_with_limit_for_test("select", "delivery_manifest.v1.", AMPLE);
+        edge.__custody_caller_with_limit_for_test("select", "delivery_edge_outcome.v1.", AMPLE);
     Database::__set_custody_bracket_probe_for_test(None);
     (
         answer,
@@ -87,7 +87,8 @@ async fn memo_order() {
     for unit in 0..UNITS {
         commit_long_unit(&edge, unit);
     }
-    // Undelivered: each manifest's closure reaches its long-keyed root.
+    // Delivered: each terminal's closure reaches its unit's long-keyed root.
+    client.push().await.unwrap();
     edge.execute(
         "CREATE TABLE local_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC OFF",
         &std::collections::HashMap::new(),
@@ -98,7 +99,7 @@ async fn memo_order() {
     let (warm, held, _, _) = observed(&edge);
     let counts = COUNTS.lock().unwrap().take().unwrap();
     let terminals = warm.unwrap();
-    assert_eq!(terminals.len(), UNITS, "one manifest per unit");
+    assert_eq!(terminals.len(), UNITS, "one terminal per unit");
     assert_eq!(held, 0);
     let views = counts["custody_closure_view"];
     assert!(
@@ -135,7 +136,9 @@ async fn memo_order() {
         // The memo the unwind destroyed held the long keys this guards.
         let (entries, key_bytes) = Database::__last_closure_memo_for_test();
         assert!(
-            key_bytes > 2 * SLACK as usize,
+            // Beyond the slack and the operation's admitted-but-unused
+            // 32 KiB error reserve, which the reader's held bytes include.
+            key_bytes > 4 * SLACK as usize,
             "view #{occurrence}: the memo held {entries} entries with only {key_bytes} key bytes"
         );
         assert!(releases > 0);
