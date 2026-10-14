@@ -1083,7 +1083,7 @@ impl Database {
         ws: &mut WriteSet,
         snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Option<CustodyCharge>> {
+    ) -> Result<Option<crate::custody::store::CustodyCharge>> {
         use crate::custody::records::RowRef;
         use crate::custody::store::{AdmittedVec, CustodyCharge, Selector, render_row_group};
         if ws.relational_deletes.is_empty() {
@@ -1162,7 +1162,7 @@ impl Database {
             })?;
             let rendered = (|| -> Result<()> {
                 let Some(key) = key else {
-                    return Ok(None);
+                    return Ok(());
                 };
                 admit(table.len())?;
                 let reference = RowRef {
@@ -1236,7 +1236,7 @@ impl Database {
         // and every key moved into it are admitted to `funding` before they
         // exist there, and `funding` is held by the caller for as long as the
         // write set lives (published, aborted or dropped).
-        let mut funding = CustodyCharge::new(memory.clone());
+        let mut funding = crate::custody::store::CustodyCharge::new(memory.clone());
         if retired.len() == 0 {
             return Ok(Some(funding));
         }
@@ -1388,8 +1388,13 @@ impl Database {
             read_memory.clone(),
         )?;
         #[cfg(feature = "test-seams")]
-        LAST_RETIRED_FUNDING_FOR_TEST
-            .with(|last| last.set(funding.as_ref().map_or(0, CustodyCharge::bytes)));
+        LAST_RETIRED_FUNDING_FOR_TEST.with(|last| {
+            last.set(
+                funding
+                    .as_ref()
+                    .map_or(0, crate::custody::store::CustodyCharge::bytes),
+            )
+        });
         if let Some(funding) = funding {
             match retired {
                 Some(held) => held.adopt_charge(funding)?,
