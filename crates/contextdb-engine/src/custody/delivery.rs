@@ -211,13 +211,13 @@ pub(crate) fn apply(
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(ApplyResult, Vec<WireDeliveryOutcome>)> {
-    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+    let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
         "reader",
         "decode_custody_metadata",
         "Reduce selected custody metadata.",
-    );
+    )?;
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -635,13 +635,13 @@ pub(crate) fn fetch(
     since: Option<&[u8]>,
     read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<WireDeliveryOutcome>> {
-    let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+    let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
         "reader",
         "decode_custody_metadata",
         "Reduce selected custody metadata.",
-    );
+    )?;
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 

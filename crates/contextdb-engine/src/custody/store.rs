@@ -152,7 +152,10 @@ fn copy_records<'a>(
 }
 
 /// Admitted bytes held by one custody operation, released on drop.
-pub(crate) use durable::{DeltaRecords, Scratch as CustodyCharge};
+pub(crate) use durable::{
+    AdmittedKeys, AdmittedVec, DeltaRecords, KeyList, Scratch as CustodyCharge, Selector,
+    error_reserve, render_root_key, render_row_group,
+};
 pub(crate) use verified::CompanionMemo;
 
 /// Test-seam measurement of custody-journal work (process-wide).
@@ -717,9 +720,9 @@ impl Store {
             memory,
         )
     }
-    pub fn select(
+    pub fn select<S: AsRef<str>>(
         &mut self,
-        selectors: &[&str],
+        selectors: &[S],
         memory: Arc<crate::read_image_memory::ImageMemory>,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
@@ -737,13 +740,14 @@ impl Store {
         let (count, answer) = {
             let mut slots = 0usize;
             for selector in selectors {
+                let selector = selector.as_ref();
                 slots = slots
                     .checked_add(if let Some(group) = selector.strip_prefix('@') {
                         self.groups.get(group).map_or(0, BTreeSet::len)
                     } else {
                         self.records
                             .range::<str, _>((
-                                std::ops::Bound::Included(selector.as_str()),
+                                std::ops::Bound::Included(selector),
                                 std::ops::Bound::Unbounded,
                             ))
                             .take_while(|(key, _)| key.starts_with(selector))
@@ -754,6 +758,7 @@ impl Store {
             let scratch = KeyScratch::new(memory.clone(), slots)?;
             let mut keys = Vec::with_capacity(slots);
             for selector in selectors {
+                let selector = selector.as_ref();
                 if let Some(group) = selector.strip_prefix('@') {
                     if let Some(found) = self.groups.get(group) {
                         keys.extend(found.iter());
@@ -762,7 +767,7 @@ impl Store {
                     keys.extend(
                         self.records
                             .range::<str, _>((
-                                std::ops::Bound::Included(selector.as_str()),
+                                std::ops::Bound::Included(selector),
                                 std::ops::Bound::Unbounded,
                             ))
                             .take_while(|(key, _)| key.starts_with(selector))
@@ -1281,19 +1286,19 @@ mod durable {
         }
     }
     impl Scratch {
-        pub(super) fn new(memory: Arc<ImageMemory>) -> Self {
+        pub(crate) fn new(memory: Arc<ImageMemory>) -> Self {
             Self { memory, bytes: 0 }
         }
         /// Bytes this owner holds admitted now.
         pub(crate) fn bytes(&self) -> usize {
             self.bytes
         }
-        pub(super) fn memory(&self) -> &Arc<ImageMemory> {
+        pub(crate) fn memory(&self) -> &Arc<ImageMemory> {
             &self.memory
         }
         /// Admit `bytes` under `label` before the allocation they fund. The
         /// caller reports the allocation's completion with [`Self::post`].
-        pub(super) fn admit_at(&mut self, label: &'static str, bytes: usize) -> Result<()> {
+        pub(crate) fn admit_at(&mut self, label: &'static str, bytes: usize) -> Result<()> {
             bracket(label, PROBE_PRE, bytes, self.memory.held());
             if refusal_injected(label) {
                 bracket(label, PROBE_REFUSED, bytes, self.memory.held());
@@ -1308,17 +1313,17 @@ mod durable {
             Ok(())
         }
         /// The allocation funded by the last `admit_at(label, ..)` exists.
-        pub(super) fn post(&self, label: &'static str) {
+        pub(crate) fn post(&self, label: &'static str) {
             bracket(label, PROBE_POST, 0, self.memory.held());
             admission_probe(self.memory.held());
         }
         /// An admission whose funded allocation follows immediately.
-        pub(super) fn admit(&mut self, bytes: usize) -> Result<()> {
+        pub(crate) fn admit(&mut self, bytes: usize) -> Result<()> {
             self.admit_at("custody_scratch", bytes)?;
             self.post("custody_scratch");
             Ok(())
         }
-        pub(super) fn release(&mut self, bytes: usize) {
+        pub(crate) fn release(&mut self, bytes: usize) {
             let bytes = bytes.min(self.bytes);
             self.memory.release(bytes);
             self.bytes -= bytes;
@@ -1329,12 +1334,12 @@ mod durable {
         }
         /// Take over `bytes` this owner's memory already holds charged (a
         /// charged decode's result), to release with the rest on drop.
-        pub(super) fn adopt(&mut self, bytes: usize) -> Result<()> {
+        pub(crate) fn adopt(&mut self, bytes: usize) -> Result<()> {
             self.bytes = self.bytes.checked_add(bytes).ok_or_else(invalid)?;
             Ok(())
         }
         /// Detach `bytes` of this owner's charge without a refund.
-        pub(super) fn detach(&mut self, bytes: usize) -> Result<Debit> {
+        pub(crate) fn detach(&mut self, bytes: usize) -> Result<Debit> {
             self.bytes = self.bytes.checked_sub(bytes).ok_or_else(invalid)?;
             Ok(Debit {
                 memory: self.memory.clone(),
@@ -1342,7 +1347,7 @@ mod durable {
             })
         }
         /// Adopt a detached debit on the same memory, without a reservation.
-        pub(super) fn adopt_debit(&mut self, debit: Debit) -> Result<()> {
+        pub(crate) fn adopt_debit(&mut self, debit: Debit) -> Result<()> {
             if !Arc::ptr_eq(&self.memory, &debit.memory) {
                 return Err(invalid());
             }
@@ -1351,7 +1356,7 @@ mod durable {
             Ok(())
         }
         /// A copy of `key` admitted at exactly its length.
-        pub(super) fn own_key(&mut self, label: &'static str, key: &str) -> Result<String> {
+        pub(crate) fn own_key(&mut self, label: &'static str, key: &str) -> Result<String> {
             self.admit_at(label, key.len())?;
             let owned = key.to_owned();
             if owned.capacity() > key.len() {
@@ -1387,14 +1392,14 @@ mod durable {
         label: &'static str,
     }
     impl<T> AdmittedVec<T> {
-        pub(super) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+        pub(crate) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
             Self {
                 items: Vec::new(),
                 owner: Scratch::new(memory),
                 label,
             }
         }
-        pub(super) fn with_exact(
+        pub(crate) fn with_exact(
             memory: Arc<ImageMemory>,
             label: &'static str,
             n: usize,
@@ -1432,53 +1437,53 @@ mod durable {
             self.owner.post(self.label);
             Ok(())
         }
-        pub(super) fn reserve_one(&mut self) -> Result<()> {
+        pub(crate) fn reserve_one(&mut self) -> Result<()> {
             if self.items.len() == self.items.capacity() {
                 self.grow()?;
             }
             Ok(())
         }
         /// Push after capacity is admitted; never reallocates unfunded.
-        pub(super) fn push(&mut self, value: T) -> Result<()> {
+        pub(crate) fn push(&mut self, value: T) -> Result<()> {
             self.reserve_one()?;
             self.items.push(value);
             Ok(())
         }
         /// Push into already admitted capacity only.
-        pub(super) fn push_within(&mut self, value: T) -> Result<()> {
+        pub(crate) fn push_within(&mut self, value: T) -> Result<()> {
             if self.items.len() == self.items.capacity() {
                 return Err(invalid());
             }
             self.items.push(value);
             Ok(())
         }
-        pub(super) fn as_slice(&self) -> &[T] {
+        pub(crate) fn as_slice(&self) -> &[T] {
             &self.items
         }
-        pub(super) fn as_mut_slice(&mut self) -> &mut [T] {
+        pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
             &mut self.items
         }
-        pub(super) fn len(&self) -> usize {
+        pub(crate) fn len(&self) -> usize {
             self.items.len()
         }
-        pub(super) fn pop(&mut self) -> Option<T> {
+        pub(crate) fn pop(&mut self) -> Option<T> {
             self.items.pop()
         }
-        pub(super) fn clear(&mut self) {
+        pub(crate) fn clear(&mut self) {
             self.items.clear();
         }
-        pub(super) fn insert(&mut self, index: usize, value: T) -> Result<()> {
+        pub(crate) fn insert(&mut self, index: usize, value: T) -> Result<()> {
             self.reserve_one()?;
             self.items.insert(index, value);
             Ok(())
         }
-        pub(super) fn retain_first_of_runs(&mut self, same: impl FnMut(&mut T, &mut T) -> bool) {
+        pub(crate) fn retain_first_of_runs(&mut self, same: impl FnMut(&mut T, &mut T) -> bool) {
             self.items.dedup_by(same);
         }
-        pub(super) fn memory(&self) -> &Arc<ImageMemory> {
+        pub(crate) fn memory(&self) -> &Arc<ImageMemory> {
             self.owner.memory()
         }
-        pub(super) fn into_parts(self) -> (Vec<T>, Scratch) {
+        pub(crate) fn into_parts(self) -> (Vec<T>, Scratch) {
             let this = std::mem::ManuallyDrop::new(self);
             // SAFETY: `this` is never dropped; each field is moved out once.
             unsafe { (std::ptr::read(&this.items), std::ptr::read(&this.owner)) }
@@ -1492,13 +1497,13 @@ mod durable {
         keys: Scratch,
     }
     impl KeyList {
-        pub(super) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+        pub(crate) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
             Self {
                 items: AdmittedVec::new(memory.clone(), label),
                 keys: Scratch::new(memory),
             }
         }
-        pub(super) fn with_exact(
+        pub(crate) fn with_exact(
             memory: Arc<ImageMemory>,
             label: &'static str,
             n: usize,
@@ -1508,28 +1513,28 @@ mod durable {
                 keys: Scratch::new(memory),
             })
         }
-        pub(super) fn push(&mut self, key: &str) -> Result<()> {
+        pub(crate) fn push(&mut self, key: &str) -> Result<()> {
             self.items.reserve_one()?;
             let owned = self.keys.own_key(self.items.label, key)?;
             self.items.push_within(owned)
         }
         /// Move a key owned by another list's key owner on the same memory.
-        pub(super) fn push_owned(&mut self, key: String, debit: Debit) -> Result<()> {
+        pub(crate) fn push_owned(&mut self, key: String, debit: Debit) -> Result<()> {
             self.items.reserve_one()?;
             self.keys.adopt_debit(debit)?;
             self.items.push_within(key)
         }
-        pub(super) fn pop(&mut self) -> Option<(String, Debit)> {
+        pub(crate) fn pop(&mut self) -> Option<(String, Debit)> {
             let key = self.items.pop()?;
             let debit = self.keys.detach(key.len()).ok()?;
             Some((key, debit))
         }
-        pub(super) fn clear(&mut self) {
+        pub(crate) fn clear(&mut self) {
             let bytes: usize = self.items.as_slice().iter().map(String::len).sum();
             self.items.clear();
             self.keys.release(bytes);
         }
-        pub(super) fn sort_dedup(&mut self) {
+        pub(crate) fn sort_dedup(&mut self) {
             self.items.as_mut_slice().sort_unstable();
             let mut removed = 0usize;
             self.items.retain_first_of_runs(|a, b| {
@@ -1542,14 +1547,14 @@ mod durable {
             });
             self.keys.release(removed);
         }
-        pub(super) fn as_slice(&self) -> &[String] {
+        pub(crate) fn as_slice(&self) -> &[String] {
             self.items.as_slice()
         }
-        pub(super) fn len(&self) -> usize {
+        pub(crate) fn len(&self) -> usize {
             self.items.len()
         }
         /// Move every key out with its debit into `into`.
-        pub(super) fn drain_into(&mut self, into: &mut KeyList) -> Result<()> {
+        pub(crate) fn drain_into(&mut self, into: &mut KeyList) -> Result<()> {
             while let Some((key, debit)) = self.pop() {
                 into.push_owned(key, debit)?;
             }
@@ -1582,7 +1587,7 @@ mod durable {
         keys: Scratch,
     }
     impl<K: KeyBytes, V> AdmittedKeys<K, V> {
-        pub(super) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+        pub(crate) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
             Self {
                 entries: AdmittedVec::new(memory.clone(), label),
                 order: AdmittedVec::new(memory.clone(), label),
@@ -1598,13 +1603,13 @@ mod durable {
                 .as_slice()
                 .binary_search_by(|index| entries[*index as usize].0.borrow().cmp(key))
         }
-        pub(super) fn contains<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+        pub(crate) fn contains<Q: Ord + ?Sized>(&self, key: &Q) -> bool
         where
             K: std::borrow::Borrow<Q>,
         {
             self.search(key).is_ok()
         }
-        pub(super) fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+        pub(crate) fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
         where
             K: std::borrow::Borrow<Q>,
         {
@@ -1613,7 +1618,7 @@ mod durable {
         }
         /// Insert `key` (built by `make` after its `heap` bytes are admitted)
         /// unless present. Answers whether it was inserted.
-        pub(super) fn insert_with<Q: Ord + ?Sized>(
+        pub(crate) fn insert_with<Q: Ord + ?Sized>(
             &mut self,
             probe: &Q,
             heap: usize,
@@ -1654,22 +1659,22 @@ mod durable {
             self.order.insert(at, index)?;
             Ok(true)
         }
-        pub(super) fn len(&self) -> usize {
+        pub(crate) fn len(&self) -> usize {
             self.entries.len()
         }
-        pub(super) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
             let entries = self.entries.as_slice();
             self.order.as_slice().iter().map(move |index| {
                 let (k, v) = &entries[*index as usize];
                 (k, v)
             })
         }
-        pub(super) fn keys(&self) -> impl Iterator<Item = &K> {
+        pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
             self.iter().map(|(k, _)| k)
         }
         /// Entries in key order, consumed; every charge is held by the
         /// iterator until it drops.
-        pub(super) fn into_sorted(self) -> SortedEntries<K, V> {
+        pub(crate) fn into_sorted(self) -> SortedEntries<K, V> {
             let Self {
                 mut entries,
                 order,
@@ -1688,7 +1693,7 @@ mod durable {
         }
     }
     impl<K: KeyBytes> AdmittedKeys<K, ()> {
-        pub(super) fn insert_key(&mut self, key: &str) -> Result<bool>
+        pub(crate) fn insert_key(&mut self, key: &str) -> Result<bool>
         where
             K: std::borrow::Borrow<str> + From<String>,
         {
@@ -1732,7 +1737,7 @@ mod durable {
     /// Decode one stored record into an answer charged to `owner`, once:
     /// the charged decode first (malformed input keeps the established codec
     /// diagnostic), then the native canonical, key and signature checks.
-    pub(super) fn decode_stored(
+    pub(crate) fn decode_stored(
         memory: &Arc<ImageMemory>,
         owner: &mut Scratch,
         key: &str,
@@ -1750,7 +1755,7 @@ mod durable {
     /// allocated. Answers the record and the bytes it holds charged. A
     /// malformed record refuses with the custody codec's established
     /// diagnostic; an admission refusal passes through unchanged.
-    pub(super) fn decode_charged(
+    pub(crate) fn decode_charged(
         memory: &Arc<ImageMemory>,
         bytes: &[u8],
     ) -> Result<(Record, usize)> {
@@ -1814,7 +1819,7 @@ mod durable {
     }
     /// One transiently decoded record and its admission. The record drops
     /// before its charge (field order).
-    pub(super) struct Probed {
+    pub(crate) struct Probed {
         record: Option<Record>,
         owner: Scratch,
     }
@@ -1825,7 +1830,7 @@ mod durable {
     }
 
     #[cfg(feature = "test-seams")]
-    pub(super) fn probe_for_test(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn probe_for_test(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<()> {
         let _errors = error_reserve(memory)?;
         probe_stored(memory, key, bytes).map(drop)
     }
@@ -1894,6 +1899,11 @@ mod durable {
             std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
         }
     }
+    impl AsRef<str> for Selector {
+        fn as_ref(&self) -> &str {
+            self.as_str()
+        }
+    }
 
     /// The companion selectors the resident index answers, on the stack.
     fn companion_selectors(record: &Record) -> Result<([Option<Selector>; 2], usize)> {
@@ -1925,7 +1935,7 @@ mod durable {
     /// from its fields without building its group list. Mirrors `groups()`
     /// for the selector families companions use; checked against it by
     /// `joins_parity_for_test`.
-    pub(super) fn joins(key: &str, record: &Record, selector: &str) -> Result<bool> {
+    pub(crate) fn joins(key: &str, record: &Record, selector: &str) -> Result<bool> {
         let Some(group) = selector.strip_prefix('@') else {
             return Ok(key.starts_with(selector));
         };
@@ -1995,21 +2005,21 @@ mod durable {
     }
 
     /// Admitted, sorted and deduplicated key list for `selectors`.
-    fn selected_keys(
+    fn selected_keys<S: AsRef<str>>(
         r: &CustodyReader,
-        selectors: &[&str],
+        selectors: &[S],
         memory: &Arc<ImageMemory>,
     ) -> Result<KeyList> {
         let mut count = 0usize;
         for selector in selectors {
-            visit_selector(r, selector, memory, &mut |_| {
+            visit_selector(r, selector.as_ref(), memory, &mut |_| {
                 count = count.checked_add(1).ok_or_else(invalid)?;
                 Ok(())
             })?;
         }
         let mut keys = KeyList::with_exact(memory.clone(), "custody_selected_keys", count)?;
         for selector in selectors {
-            visit_selector(r, selector, memory, &mut |key| {
+            visit_selector(r, selector.as_ref(), memory, &mut |key| {
                 if keys.len() == count {
                     return Err(invalid());
                 }
@@ -2260,9 +2270,9 @@ mod durable {
         Ok(())
     }
 
-    pub(super) fn select(
+    pub(crate) fn select<S: AsRef<str>>(
         r: &CustodyReader,
-        selectors: &[&str],
+        selectors: &[S],
         memory: Arc<ImageMemory>,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
@@ -2277,7 +2287,7 @@ mod durable {
     /// Every submission group with a record of `table`, plus authority.
     /// This administrative count is proportional to the table's units by
     /// definition; it holds only the relevant keys, never the journal.
-    pub(super) fn select_table(
+    pub(crate) fn select_table(
         r: &CustodyReader,
         table: &str,
         memory: Arc<ImageMemory>,
@@ -2333,15 +2343,38 @@ mod durable {
     /// The group name `prefix` + hex of `row`'s canonical reference bytes,
     /// rendered into `buffer` (admitted, grown by doubling) from the finite
     /// encoding: no intermediate `RowRef::bytes()` or hex string.
-    pub(super) fn render_row_group<'b>(
+    pub(crate) fn render_row_group<'b>(
         buffer: &'b mut AdmittedVec<u8>,
         prefix: &str,
         row: &RowRef,
     ) -> Result<&'b str> {
-        let len = finite_len(|e| {
+        render_finite_hex(buffer, prefix, &|e| {
             row.encode_finite(e);
             Ok(())
-        })?;
+        })
+    }
+
+    /// The local ownership key `delivery_root.v1.` + hex of `life`'s
+    /// canonical encoding, rendered like [`render_row_group`].
+    pub(crate) fn render_root_key<'b>(
+        buffer: &'b mut AdmittedVec<u8>,
+        life: &LocalLifeAnchor,
+    ) -> Result<&'b str> {
+        render_finite_hex(buffer, "delivery_root.v1.", &|e| {
+            life.encode_finite(e);
+            Ok(())
+        })
+    }
+
+    /// `prefix` + hex of the finite encoding `encode` emits, in `buffer`
+    /// (admitted, grown by doubling): the raw bytes land in the tail and
+    /// expand to hex in place from the back, so no second buffer exists.
+    fn render_finite_hex<'b>(
+        buffer: &'b mut AdmittedVec<u8>,
+        prefix: &str,
+        encode: &dyn Fn(&mut super::super::canonical::FiniteEncoder<'_>) -> Result<()>,
+    ) -> Result<&'b str> {
+        let len = finite_len(encode)?;
         let total = len
             .checked_mul(2)
             .and_then(|n| n.checked_add(prefix.len()))
@@ -2352,19 +2385,14 @@ mod durable {
         }
         buffer.items.resize(total, 0);
         buffer.items[..prefix.len()].copy_from_slice(prefix.as_bytes());
-        // Emit the raw bytes into the tail, then expand to hex in place from
-        // the back, so no second buffer exists.
         let tail = total - len;
         super::super::canonical::finite_emit_with_error(
             &mut buffer.items[tail..],
-            |e| {
-                row.encode_finite(e);
-                Ok(())
-            },
+            encode,
             invalid,
         )?;
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        for i in (0..len).rev() {
+        for i in 0..len {
             let byte = buffer.items[tail + i];
             buffer.items[prefix.len() + 2 * i] = HEX[usize::from(byte >> 4)];
             buffer.items[prefix.len() + 2 * i + 1] = HEX[usize::from(byte & 15)];
@@ -2372,7 +2400,7 @@ mod durable {
         std::str::from_utf8(&buffer.items[..total]).map_err(|_| invalid())
     }
 
-    pub(super) fn select_rows(
+    pub(crate) fn select_rows(
         r: &CustodyReader,
         rows: &[RowRef],
         memory: Arc<ImageMemory>,
@@ -2458,7 +2486,7 @@ mod durable {
     /// The answer is not: it materializes every pending manifest, each key
     /// and decoded record admitted to the reader's memory, so a large pending
     /// set is refused by the reader limit rather than held unadmitted.
-    pub(super) fn pending(
+    pub(crate) fn pending(
         r: &CustodyReader,
         memory: Arc<ImageMemory>,
         db: &crate::Database,
@@ -2609,7 +2637,7 @@ mod durable {
     /// map entry, decoded body, group name, plan and verification workspace
     /// is admitted before it is allocated. The returned delta's own bytes
     /// stay admitted in its own charges until the caller publishes or aborts.
-    pub(super) fn validate_delta(
+    pub(crate) fn validate_delta(
         r: &CustodyReader,
         writes: &[(String, Vec<u8>)],
         deletes: &[String],
@@ -2780,7 +2808,7 @@ mod durable {
     /// `records`, over every selector-family group any of them joins.
     /// Answers how many (record, group) pairs were compared.
     #[cfg(feature = "test-seams")]
-    pub(super) fn joins_parity_for_test(records: &[(String, Record)]) -> Result<usize> {
+    pub(crate) fn joins_parity_for_test(records: &[(String, Record)]) -> Result<usize> {
         let mut families: Vec<String> = Vec::new();
         for (_, record) in records {
             for group in groups(record)? {
@@ -2814,7 +2842,7 @@ mod durable {
     /// Measurement only: `render_row_group` equals `root_group` for every
     /// row reference the records name.
     #[cfg(feature = "test-seams")]
-    pub(super) fn row_group_parity_for_test(
+    pub(crate) fn row_group_parity_for_test(
         records: &[(String, Record)],
         memory: Arc<ImageMemory>,
     ) -> Result<usize> {

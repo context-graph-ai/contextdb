@@ -29,6 +29,10 @@ pub(crate) struct ImageMemory {
     /// owner, or a per-call owner it creates, adopts that credit instead of
     /// charging the same bytes a second time.
     prepaid_output: Option<Arc<PrepaidOutput>>,
+    // An admitted reader keeps a refusal by value (no owned error text) and
+    // answers codec failures with a bounded static class text.
+    admitted: bool,
+    refused: parking_lot::Mutex<Option<Refused>>,
     // Last custody field pins the original writer epoch through image refund.
     _writer_custody: Option<crate::memory_accounting::StoreAccountantHandle>,
 }
@@ -55,6 +59,8 @@ impl ImageMemory {
             failure: parking_lot::Mutex::new(None),
             per_call: None,
             prepaid_output: None,
+            admitted: false,
+            refused: parking_lot::Mutex::new(None),
             _writer_custody: None,
         })
     }
@@ -92,6 +98,8 @@ impl ImageMemory {
             failure: parking_lot::Mutex::new(None),
             per_call: None,
             prepaid_output: None,
+            admitted: false,
+            refused: parking_lot::Mutex::new(None),
             _writer_custody: writer_custody,
         })
     }
@@ -112,6 +120,8 @@ impl ImageMemory {
             failure: parking_lot::Mutex::new(None),
             per_call: None,
             prepaid_output: None,
+            admitted: false,
+            refused: parking_lot::Mutex::new(None),
             _writer_custody: None,
         })
     }
@@ -137,6 +147,8 @@ impl ImageMemory {
             failure: parking_lot::Mutex::new(None),
             per_call: None,
             prepaid_output: None,
+            admitted: false,
+            refused: parking_lot::Mutex::new(None),
             _writer_custody: None,
         })
     }
@@ -191,6 +203,44 @@ impl ImageMemory {
         Ok(call.enter())
     }
 
+    /// The admitted form of [`Self::charging_reader_for`]: the shared
+    /// owner's own control is admitted to the reader before the owner is
+    /// allocated, and the final holder releases it from Drop. A refusal is
+    /// kept by value until the caller takes it, and a malformed input answers
+    /// the bounded static class text [`ADMITTED_CODEC_ERROR`]. The control is
+    /// refunded in Drop just before the shared allocation is freed: a fixed
+    /// residue of `size_of::<ImageMemory>() + 2 * size_of::<usize>()` bytes
+    /// for that instant, freed rather than retained.
+    pub(crate) fn admitted_reader_for(
+        accountant: crate::memory_accounting::AccountantHandle,
+        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<Arc<Self>> {
+        let control = Self::admitted_control_bytes();
+        reader_budget.try_reserve(control, subsystem, operation, hint)?;
+        Ok(Arc::new(Self {
+            accountant,
+            subsystem,
+            operation,
+            hint,
+            reader_budget: Some(reader_budget),
+            held: AtomicUsize::new(control),
+            control_bytes: control,
+            failure: parking_lot::Mutex::new(None),
+            per_call: None,
+            prepaid_output: None,
+            admitted: true,
+            refused: parking_lot::Mutex::new(None),
+            _writer_custody: None,
+        }))
+    }
+    /// The shared allocation an admitted reader admits before it exists.
+    pub(crate) fn admitted_control_bytes() -> usize {
+        std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()
+    }
+
     pub(crate) fn reader_budget(
         &self,
     ) -> Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
@@ -221,6 +271,8 @@ impl ImageMemory {
             failure: parking_lot::Mutex::new(None),
             per_call: None,
             prepaid_output: None,
+            admitted: false,
+            refused: parking_lot::Mutex::new(None),
             _writer_custody: None,
         }))
     }
@@ -247,6 +299,8 @@ impl ImageMemory {
             failure: parking_lot::Mutex::new(None),
             per_call: None,
             prepaid_output: None,
+            admitted: false,
+            refused: parking_lot::Mutex::new(None),
             _writer_custody: writer_custody,
         }))
     }
@@ -500,6 +554,10 @@ impl ImageMemory {
             Ok(value) => Ok(value),
             Err(error) => {
                 self.release(self.held() - before);
+                if self.admitted {
+                    drop(error);
+                    return Err(Error::SyncError(ADMITTED_CODEC_ERROR.into()));
+                }
                 Err(Error::SyncError(format!(
                     "MessagePack decode error: {error}"
                 )))
@@ -550,7 +608,32 @@ impl ImageMemory {
         self.held.load(Ordering::SeqCst)
     }
     pub(crate) fn take_failure(&self) -> Option<Error> {
+        if let Some(refused) = self.refused.lock().take() {
+            return Some(Error::MemoryBudgetExceeded {
+                subsystem: self.subsystem.into(),
+                operation: self.operation.into(),
+                requested_bytes: refused.requested,
+                available_bytes: refused.available,
+                budget_limit_bytes: refused.limit,
+                hint: self.hint.into(),
+            });
+        }
         self.failure.lock().take()
+    }
+    fn failed(&self) -> bool {
+        self.refused.lock().is_some() || self.failure.lock().is_some()
+    }
+    /// Keep `error` as this owner's pending refusal: by value on an admitted
+    /// reader (the error is dropped here), owned otherwise.
+    fn keep_refusal(&self, error: Error) {
+        if self.admitted
+            && let Some(refused) = Refused::of(&error)
+        {
+            drop(error);
+            *self.refused.lock() = Some(refused);
+            return;
+        }
+        *self.failure.lock() = Some(error);
     }
     /// A separate row lifetime funded by this operation's existing capability.
     /// The parent remains live while a selected row is being replaced.
@@ -580,6 +663,8 @@ impl ImageMemory {
             failure: parking_lot::Mutex::new(None),
             per_call: None,
             prepaid_output: None,
+            admitted: self.admitted,
+            refused: parking_lot::Mutex::new(None),
             _writer_custody: self._writer_custody.clone(),
         }))
     }
@@ -614,7 +699,11 @@ impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemory {
             Err(error) => {
                 // Serde's fixed sentinel cannot carry a core Error. Keep the
                 // original refusal in this same owner's established sideband.
-                if let Error::MemoryBudgetExceeded {
+                if self.admitted
+                    && let Some(refused) = Refused::of(&error)
+                {
+                    *self.refused.lock() = Some(refused);
+                } else if let Error::MemoryBudgetExceeded {
                     requested_bytes,
                     available_bytes,
                     budget_limit_bytes,
@@ -663,6 +752,53 @@ impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemory {
     }
     fn release(&self, bytes: usize) {
         ImageMemory::release(self, bytes);
+    }
+}
+
+/// The bounded static class text an admitted reader answers for malformed
+/// input; the decoder's own message is never formatted.
+pub(crate) const ADMITTED_CODEC_ERROR: &str = "MessagePack decode error: malformed input";
+
+/// A memory refusal kept by value until its owner's caller takes it.
+#[derive(Clone, Copy)]
+struct Refused {
+    requested: usize,
+    available: usize,
+    limit: usize,
+}
+impl Refused {
+    fn of(error: &Error) -> Option<Self> {
+        if let Error::MemoryBudgetExceeded {
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        } = error
+        {
+            return Some(Self {
+                requested: *requested_bytes,
+                available: *available_bytes,
+                limit: *budget_limit_bytes,
+            });
+        }
+        if let Error::ReadFailure(failure) = error {
+            use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
+            if let ReadFailureDetail::OwnerLimitExceeded(detail) = failure.detail()
+                && detail.limit == ReadFailureLimit::Memory
+            {
+                let limit = usize::try_from(detail.value).unwrap_or(usize::MAX);
+                let required = detail.required.as_ref().map_or(limit, |required| {
+                    usize::try_from(required.required_bytes).unwrap_or(usize::MAX)
+                });
+                let requested = required.saturating_sub(limit).max(1);
+                return Some(Self {
+                    requested,
+                    available: limit.saturating_sub(required.saturating_sub(requested)),
+                    limit,
+                });
+            }
+        }
+        None
     }
 }
 
@@ -966,11 +1102,11 @@ where
 }
 fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
     let owner = active_owner().map_err(E::custom)?;
-    if owner.failure.lock().is_some() {
+    if owner.failed() {
         return Err(E::custom("read image admission refused"));
     }
     if let Err(error) = owner.reserve(bytes) {
-        *owner.failure.lock() = Some(error);
+        owner.keep_refusal(error);
         return Err(E::custom("read image admission refused"));
     }
     Ok(())
@@ -2025,5 +2161,112 @@ mod exact_sequence_tests {
         bytes.truncate(bytes.len() - 8);
         assert!(decode::<Exact>(&bytes).is_err());
         assert_eq!(owner.held(), 0, "a failed decode returns its admission");
+    }
+}
+
+#[cfg(test)]
+mod admitted_reader_tests {
+    use super::*;
+    use contextdb_core::read_memory::ReadMemoryBudget;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A reader budget that records what it holds.
+    struct Counted {
+        held: AtomicUsize,
+        limit: usize,
+    }
+    impl ReadMemoryBudget for Counted {
+        fn try_reserve(
+            &self,
+            bytes: usize,
+            subsystem: &'static str,
+            operation: &'static str,
+            hint: &'static str,
+        ) -> Result<()> {
+            let held = self.held.load(Ordering::SeqCst);
+            if held + bytes > self.limit {
+                return Err(Error::MemoryBudgetExceeded {
+                    subsystem: subsystem.into(),
+                    operation: operation.into(),
+                    requested_bytes: bytes,
+                    available_bytes: self.limit - held,
+                    budget_limit_bytes: self.limit,
+                    hint: hint.into(),
+                });
+            }
+            self.held.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            self.held.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+    fn budget(limit: usize) -> Arc<Counted> {
+        Arc::new(Counted {
+            held: AtomicUsize::new(0),
+            limit,
+        })
+    }
+    fn reader(budget: &Arc<Counted>) -> Result<Arc<ImageMemory>> {
+        ImageMemory::admitted_reader_for(
+            ImageMemory::default_decode_accountant(),
+            budget.clone(),
+            "reader",
+            "decode_custody_metadata",
+            "Reduce selected custody metadata.",
+        )
+    }
+
+    /// The control is admitted before the shared owner exists; a reader that
+    /// cannot fund it is refused with nothing held.
+    #[test]
+    fn an_admitted_reader_is_refused_before_its_owner_exists() {
+        let control = ImageMemory::admitted_control_bytes();
+        let short = budget(control - 1);
+        let refused = reader(&short);
+        assert!(matches!(
+            refused,
+            Err(Error::MemoryBudgetExceeded { requested_bytes, .. }) if requested_bytes == control
+        ));
+        assert_eq!(short.held.load(Ordering::SeqCst), 0);
+    }
+
+    /// Every holder but the final one leaves the control charged; the final
+    /// holder's drop returns the reader to exactly what it held before.
+    #[test]
+    fn the_final_holder_releases_the_admitted_control() {
+        let control = ImageMemory::admitted_control_bytes();
+        let funded = budget(1 << 20);
+        let first = reader(&funded).unwrap();
+        assert_eq!(funded.held.load(Ordering::SeqCst), control);
+        assert_eq!(first.held(), control);
+        let second = first.clone();
+        let third = first.clone();
+        drop(first);
+        drop(third);
+        assert_eq!(funded.held.load(Ordering::SeqCst), control);
+        drop(second);
+        assert_eq!(funded.held.load(Ordering::SeqCst), 0);
+    }
+
+    /// A refusal during a decode is kept by value and rendered once taken;
+    /// malformed input answers the bounded static class text.
+    #[test]
+    fn an_admitted_reader_refuses_by_value_and_bounds_codec_text() {
+        let control = ImageMemory::admitted_control_bytes();
+        let funded = budget(control + 8);
+        let memory = reader(&funded).unwrap();
+        let long = rmp_serde::to_vec(&"x".repeat(4096)).unwrap();
+        let refused = memory.decode_msgpack::<String>(&long);
+        assert!(matches!(refused, Err(Error::MemoryBudgetExceeded { .. })));
+        assert!(memory.refused.lock().is_none());
+        assert_eq!(memory.held(), control);
+        let malformed = memory.decode_msgpack::<String>(&[0xc1]);
+        match malformed {
+            Err(Error::SyncError(text)) => assert_eq!(text, ADMITTED_CODEC_ERROR),
+            other => panic!("malformed input answered {other:?}"),
+        }
+        drop(memory);
+        assert_eq!(funded.held.load(Ordering::SeqCst), 0);
     }
 }
