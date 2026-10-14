@@ -162,6 +162,10 @@ pub use read_admission::{
 #[doc(hidden)]
 pub use db::allocator_metadata_test_seams::observe_allocator_region_loads_for_test;
 
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use db::FreeTotalsSaveForTest;
+
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
 pub use transactions::TableRootEvent;

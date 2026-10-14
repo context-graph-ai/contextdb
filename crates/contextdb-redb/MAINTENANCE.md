@@ -500,17 +500,36 @@ published (`Database::allocator_free_totals` returns `None`) or saved.
   bitmap. The recount publishes trust only if it completed with a healthy pager; otherwise it
   returns the storage error.
 
-**Accessors.** Production gets one hidden accessor, `Database::allocator_free_totals`. The
-test-seams accessors are an independent recount, a distrust seam, a thread-local rebuild
-counter, and a thread-local hook that runs as a rebuild begins, so a test can inject a storage
-fault inside the count.
+**Geometry by arithmetic.** Region pages come from layout arithmetic: full regions × full-region
+pages, plus the trailing region. The old page count in `resize_to` is (regions − 1) × full pages
+plus the last region's length. No open, save, trim or resize visits a region to compute them. A
+test-seams counter of geometry region visits proves this.
+
+**Accessors.** Production gets one hidden accessor, `Database::allocator_free_totals`. It
+returns `(free, region pages, trailing free pages)`. The trailing run comes from the last
+region's `trailing_free_pages()`, the same bounded walk over buddy blocks that `try_shrink` does
+on every shrinking commit.
+
+The test-seams accessors are:
+- an independent recount;
+- a distrust seam;
+- a thread-local rebuild counter;
+- a thread-local hook that runs as a rebuild begins, so a test can inject a storage fault inside
+  the count;
+- a one-shot save mode, `FreeTotalsSaveForTest`: omit the key, write chosen bytes, or fail before
+  or after the encode.
 
 **Tests.** The proofs are in `tests/allocator_residency_contract.rs`:
 - `allocator_free_totals_track_the_bitmaps_and_survive_trimming_reopen`
-- `allocator_free_totals_adopt_the_trimmed_geometry_on_reopen`
+- `allocator_free_totals_survive_an_intra_region_trim_at_close`
+- `allocator_free_totals_survive_region_removing_trims_at_close_and_in_ordinary_commits`
+- `allocator_free_totals_reject_absent_or_malformed_saved_values`
+- `allocator_free_totals_after_an_interrupted_save_are_rebuilt_by_repair`
+- `allocator_free_total_rebuild_fault_during_repair_refuses_the_open`
+- `allocator_free_total_geometry_costs_the_same_at_one_and_many_regions`
 - `allocator_untrusted_free_totals_are_not_saved_and_rebuild_once_on_reopen`
 - `allocator_free_totals_after_poison_are_withheld_and_rebuilt_by_repair`
 - `allocator_free_total_rebuild_fault_refuses_the_open_and_publishes_nothing`
 
-The patch sections for the four changed files were regenerated in place; the fork's other
+The patch sections for the changed files were regenerated in place; the fork's other
 sections are unchanged. Compiler and runtime results are recorded in the S9 handover, not here.

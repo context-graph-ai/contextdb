@@ -30,6 +30,22 @@ use log::{debug, info, warn};
 #[cfg(feature = "test-seams")]
 pub(crate) mod allocator_metadata_test_seams;
 
+/// How the next allocator-state save treats the free totals, for recovery
+/// tests. Production-dead.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum FreeTotalsSaveForTest {
+    /// Save without the free-totals key, as a store written before it existed.
+    Omit,
+    /// Save these bytes as the free-totals value instead of the real encoding.
+    Write(Vec<u8>),
+    /// Fail the save before the free totals are encoded.
+    FailBeforeEncode,
+    /// Fail the save after the free totals are encoded, before publication.
+    FailAfterEncode,
+}
+
 #[allow(clippy::len_without_is_empty)]
 /// Implements persistent storage for a database.
 pub trait StorageBackend: 'static + Debug + Send + Sync {
@@ -932,6 +948,14 @@ impl Database {
     #[doc(hidden)]
     pub fn distrust_allocator_free_totals_for_test(&self) {
         self.mem.distrust_free_totals_for_test();
+    }
+
+    /// Change how the next allocator-state save on this thread treats the
+    /// free totals; the mode is consumed by that save.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn set_free_totals_save_for_test(mode: Option<FreeTotalsSaveForTest>) {
+        TransactionalMemory::set_free_totals_save_for_test(mode);
     }
 
     /// Install (or clear) a callback that runs on this thread as each

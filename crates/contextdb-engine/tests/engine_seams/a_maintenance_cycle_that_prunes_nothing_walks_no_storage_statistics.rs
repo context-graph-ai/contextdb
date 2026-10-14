@@ -312,16 +312,8 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
             );
         }
     }
-    // Secondary, load-tolerant: the same empty cycle costs about the same at
-    // five times the history. The 5 ms floor absorbs scheduler noise. The
-    // deterministic counters above are the gate.
-    let floor = 5_000;
-    assert!(
-        large.warm_cycle_micros.max(floor) < 2 * small.warm_cycle_micros.max(floor),
-        "an empty cycle's wall time must not grow with the store: {} us vs {} us",
-        large.warm_cycle_micros,
-        small.warm_cycle_micros,
-    );
+    // The deterministic counters above are the gate. The empty cycle's wall
+    // time is printed with each observation as a diagnostic only.
 }
 
 const PAYLOAD: TableDefinition<u64, &[u8]> = TableDefinition::new("payload");

@@ -197,6 +197,15 @@ thread_local! {
     /// fault that fires inside the count. Production-dead.
     static FREE_TOTAL_RECOUNT_START: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
+    /// How the next allocator-state save on this thread treats the free
+    /// totals. Production-dead.
+    static FREE_TOTALS_SAVE_OVERRIDE: std::cell::RefCell<Option<crate::db::FreeTotalsSaveForTest>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-seams")]
+fn free_totals_save_override() -> Option<crate::db::FreeTotalsSaveForTest> {
+    FREE_TOTALS_SAVE_OVERRIDE.with(|slot| slot.borrow().clone())
 }
 
 struct InMemoryState {
@@ -738,7 +747,17 @@ impl TransactionalMemory {
 
         drop(tree.insert_zeroed_reserve(&AllocatorStateKey::RegionTracker, region_tracker_len)?);
         // Reserved before anything is encoded, so the encode allocates nothing.
-        drop(tree.insert_zeroed_reserve(&AllocatorStateKey::FreeTotals, FREE_TOTALS_ENCODED_LEN)?);
+        #[cfg(feature = "test-seams")]
+        let reserved_totals_len = match free_totals_save_override() {
+            Some(crate::db::FreeTotalsSaveForTest::Omit) => None,
+            Some(crate::db::FreeTotalsSaveForTest::Write(bytes)) => Some(bytes.len()),
+            _ => Some(FREE_TOTALS_ENCODED_LEN),
+        };
+        #[cfg(not(feature = "test-seams"))]
+        let reserved_totals_len = Some(FREE_TOTALS_ENCODED_LEN);
+        if let Some(len) = reserved_totals_len {
+            drop(tree.insert_zeroed_reserve(&AllocatorStateKey::FreeTotals, len)?);
+        }
 
         tree.insert(
             &AllocatorStateKey::TransactionId,
@@ -793,11 +812,34 @@ impl TransactionalMemory {
         let encoded_totals = state.allocators.encode_free_totals(&state.header.layout());
         drop(state);
         drop(destination);
+        #[cfg(feature = "test-seams")]
+        let encoded_totals: Option<Vec<u8>> = match FREE_TOTALS_SAVE_OVERRIDE
+            .with(|slot| slot.borrow_mut().take())
+        {
+            Some(crate::db::FreeTotalsSaveForTest::FailBeforeEncode) => {
+                return Err(StorageError::Io(io::Error::other(
+                    "injected failure before the free totals were encoded",
+                )));
+            }
+            Some(crate::db::FreeTotalsSaveForTest::FailAfterEncode) => {
+                if let Some(encoded) = encoded_totals {
+                    let mut destination = tree.get_mut(&AllocatorStateKey::FreeTotals)?.unwrap();
+                    destination.value_mut()[..FREE_TOTALS_ENCODED_LEN].copy_from_slice(&encoded);
+                }
+                return Err(StorageError::Io(io::Error::other(
+                    "injected failure after the free totals were encoded",
+                )));
+            }
+            Some(crate::db::FreeTotalsSaveForTest::Omit) => None,
+            Some(crate::db::FreeTotalsSaveForTest::Write(bytes)) => Some(bytes),
+            None => encoded_totals.map(|encoded| encoded.to_vec()),
+        };
         if let Some(encoded) = encoded_totals {
             // Reserved and already written in this transaction, so this
             // borrow allocates nothing.
             let mut destination = tree.get_mut(&AllocatorStateKey::FreeTotals)?.unwrap();
-            destination.value_mut()[..FREE_TOTALS_ENCODED_LEN].copy_from_slice(&encoded);
+            let len = encoded.len();
+            destination.value_mut()[..len].copy_from_slice(&encoded);
         }
 
         let state = self.state.lock().unwrap();
@@ -896,6 +938,11 @@ impl TransactionalMemory {
     #[cfg(feature = "test-seams")]
     pub(crate) fn free_total_geometry_region_visits_for_test() -> u64 {
         crate::tree_store::page_store::region::geometry_region_visits_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn set_free_totals_save_for_test(mode: Option<crate::db::FreeTotalsSaveForTest>) {
+        FREE_TOTALS_SAVE_OVERRIDE.with(|slot| *slot.borrow_mut() = mode);
     }
 
     #[cfg(feature = "test-seams")]

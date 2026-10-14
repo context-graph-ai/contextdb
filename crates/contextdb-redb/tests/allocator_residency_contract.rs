@@ -1707,53 +1707,230 @@ fn allocator_free_totals_track_the_bitmaps_and_survive_trimming_reopen() {
     assert_totals_exact(&db, "growth after reopen");
 }
 
-/// The saved totals are taken before the commit trims the file. A reopen maps
-/// them onto the trimmed geometry, both when the trim shortens the last
-/// region and when it removes whole trailing regions, without a rebuild.
+/// Region pages and region count, read from the maintained totals.
+fn geometry(db: &redb::Database) -> (u64, usize) {
+    let (_, pages, _) = db.allocator_free_totals().expect("trusted totals");
+    (pages, db.allocator_regions_for_test())
+}
+
+const SMALL: TableDefinition<u64, &[u8]> = TableDefinition::new("small_rows");
+
+/// A trim inside the last region, done only by the quick-repair close: the
+/// deletion commit leaves its pages pending, so no earlier commit can trim.
+/// The reopen keeps the region count, has fewer region pages, adopts the
+/// saved totals without a rebuild and agrees with a fresh recount.
 #[test]
-fn allocator_free_totals_adopt_the_trimmed_geometry_on_reopen() {
+fn allocator_free_totals_survive_an_intra_region_trim_at_close() {
     let dir = tempfile::tempdir().expect("fixture directory");
-    let path = dir.path().join("trimmed-totals.redb");
+    let path = dir.path().join("intra-region-trim.redb");
     let db = builder().create(&path).expect("create fixture");
-    insert_rows(&db, 0..8, 0x61);
+    let write = db.begin_write().expect("begin small rows");
+    {
+        let mut table = write.open_table(SMALL).expect("open small table");
+        for key in 0..12u64 {
+            table.insert(key, vec![0x71_u8; 64 << 10].as_slice()).expect("insert");
+        }
+    }
+    write.commit().expect("commit small rows");
     drop(db);
     let (db, rebuilds) = open_counting_rebuilds(&path);
     assert_eq!(rebuilds, 0);
     assert_totals_exact(&db, "seeded");
 
-    // The newest row sits at the file's tail: freeing it leaves trailing
-    // free pages in the last region for the clean close to trim.
-    let regions = db.allocator_regions_for_test();
-    let length = std::fs::metadata(&path).unwrap().len();
-    remove_rows(&db, 7..8);
-    db.begin_write().unwrap().commit().unwrap();
-    assert_totals_exact(&db, "tail freed");
+    let write = db.begin_write().expect("begin tail removal");
+    {
+        let mut table = write.open_table(SMALL).expect("open small table");
+        for key in 9..12u64 {
+            table.remove(key).expect("remove");
+        }
+    }
+    write.commit().expect("commit tail removal");
+    assert_totals_exact(&db, "tail removal pending");
+    let (pages_before, regions_before) = geometry(&db);
     drop(db);
-    assert!(
-        std::fs::metadata(&path).unwrap().len() < length,
-        "the clean close must actually trim the file"
-    );
-    let (db, rebuilds) = open_counting_rebuilds(&path);
-    assert_eq!(rebuilds, 0, "totals saved before a trim are adopted after it");
-    assert_totals_exact(&db, "reopen after trim");
-    assert_row(&db, 6, 0x61);
 
-    // Free several trailing rows so whole trailing regions become free.
-    remove_rows(&db, 3..7);
-    db.begin_write().unwrap().commit().unwrap();
-    assert_totals_exact(&db, "trailing regions freed");
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    let (pages_after, regions_after) = geometry(&db);
+    println!("intra-region trim: pages {pages_before} -> {pages_after}, regions {regions_before} -> {regions_after}");
+    assert_eq!(rebuilds, 0, "totals saved before the trim are adopted after it");
+    assert_eq!(regions_after, regions_before, "an intra-region trim keeps every region");
+    assert!(pages_after < pages_before, "the close must actually trim the last region");
+    assert_totals_exact(&db, "after the intra-region trim");
+}
+
+/// Trims that remove whole trailing regions, first only at the quick-repair
+/// close and then in an ordinary commit before the close. Each stage removes
+/// exactly the one freed region, and each reopen adopts exact totals.
+#[test]
+fn allocator_free_totals_survive_region_removing_trims_at_close_and_in_ordinary_commits() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("region-trim.redb");
+    create_regions(&path, 8);
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 0);
+    assert_totals_exact(&db, "seeded");
+
+    // Stage 1: the deletion's pages stay pending until the close, so only the
+    // quick-repair close can remove the freed region.
+    remove_rows(&db, 7..8);
+    let (_, regions_before_close) = geometry(&db);
+    assert_totals_exact(&db, "last row removed, pages pending");
     drop(db);
     let (db, rebuilds) = open_counting_rebuilds(&path);
+    let (_, regions_after_close) = geometry(&db);
+    println!("close trim: regions {regions_before_close} -> {regions_after_close}");
+    assert_eq!(rebuilds, 0, "a region-removing close saves adoptable totals");
     assert_eq!(
-        rebuilds, 0,
-        "a clean close that removes regions still saves adoptable totals"
+        regions_after_close,
+        regions_before_close - 1,
+        "the close removes exactly the freed trailing region"
+    );
+    assert_totals_exact(&db, "after the region-removing close");
+
+    // Stage 2: an ordinary commit releases the freed pages and trims the
+    // region itself, before any quick-repair close.
+    remove_rows(&db, 6..7);
+    let (_, regions_before_trim) = geometry(&db);
+    db.begin_write()
+        .expect("begin releasing commit")
+        .commit()
+        .expect("ordinary commit releases and trims");
+    let (_, regions_after_trim) = geometry(&db);
+    println!("ordinary trim: regions {regions_before_trim} -> {regions_after_trim}");
+    assert_eq!(
+        regions_after_trim,
+        regions_before_trim - 1,
+        "the ordinary commit removes exactly the freed trailing region"
+    );
+    assert_totals_exact(&db, "after the ordinary trimming commit");
+    drop(db);
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 0, "the close after an ordinary trim saves adoptable totals");
+    assert_eq!(geometry(&db).1, regions_after_trim);
+    assert_totals_exact(&db, "reopen after the ordinary trim");
+    assert_row(&db, 5, 0x35);
+}
+
+/// A saved value that is absent, the wrong length, the wrong format or the
+/// wrong geometry is rejected: the next open rebuilds exact totals once, and
+/// the close after it saves totals the following open adopts.
+#[test]
+fn allocator_free_totals_reject_absent_or_malformed_saved_values() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("malformed-totals.redb");
+    create_regions(&path, 6);
+    let (db, _) = open_counting_rebuilds(&path);
+    let (free, pages, _) = db.allocator_free_totals().expect("trusted totals");
+    let regions = u32::try_from(db.allocator_regions_for_test()).unwrap();
+    drop(db);
+    let encode = |format: u32, regions: u32, pages: u64, free: u64| {
+        let mut bytes = Vec::with_capacity(24);
+        bytes.extend_from_slice(&format.to_le_bytes());
+        bytes.extend_from_slice(&regions.to_le_bytes());
+        bytes.extend_from_slice(&pages.to_le_bytes());
+        bytes.extend_from_slice(&free.to_le_bytes());
+        bytes
+    };
+    let cases = [
+        ("absent", redb::FreeTotalsSaveForTest::Omit),
+        ("short", redb::FreeTotalsSaveForTest::Write(vec![1_u8; 23])),
+        ("format", redb::FreeTotalsSaveForTest::Write(encode(2, regions, pages, free))),
+        ("regions", redb::FreeTotalsSaveForTest::Write(encode(1, regions + 5, pages, free))),
+        ("pages", redb::FreeTotalsSaveForTest::Write(encode(1, regions, pages - 1, free))),
+        ("free", redb::FreeTotalsSaveForTest::Write(encode(1, regions, pages, pages + 1))),
+    ];
+    for (name, mode) in cases {
+        let db = builder().open(&path).expect("open fixture");
+        redb::Database::set_free_totals_save_for_test(Some(mode));
+        drop(db);
+        redb::Database::set_free_totals_save_for_test(None);
+        let (db, rebuilds) = open_counting_rebuilds(&path);
+        assert_eq!(rebuilds, 1, "{name}: the rejected saved value is rebuilt once");
+        assert_totals_exact(&db, name);
+        drop(db);
+        let (db, rebuilds) = open_counting_rebuilds(&path);
+        assert_eq!(rebuilds, 0, "{name}: the rebuilt totals are saved and adopted");
+        assert_totals_exact(&db, name);
+        drop(db);
+    }
+}
+
+/// A clean close interrupted before the totals are encoded, or after they are
+/// encoded but before publication, publishes nothing: the reopen repairs from
+/// the last durable root and rebuilds exact totals once.
+#[test]
+fn allocator_free_totals_after_an_interrupted_save_are_rebuilt_by_repair() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    for (name, mode) in [
+        ("before encode", redb::FreeTotalsSaveForTest::FailBeforeEncode),
+        ("after encode", redb::FreeTotalsSaveForTest::FailAfterEncode),
+    ] {
+        let path = dir.path().join(format!("interrupted-{}.redb", name.replace(' ', "-")));
+        create_regions(&path, 4);
+        let db = builder().open(&path).expect("open fixture");
+        insert_rows(&db, 4..6, 0x46);
+        redb::Database::set_free_totals_save_for_test(Some(mode));
+        drop(db);
+        redb::Database::set_free_totals_save_for_test(None);
+        let before = redb::Database::free_total_recounts_for_test();
+        let (db, repaired) = reopen_with_repair(&path, name);
+        assert!(repaired, "{name}: the interrupted save leaves a store that needs repair");
+        assert_eq!(
+            redb::Database::free_total_recounts_for_test() - before,
+            1,
+            "{name}: repair rebuilds the totals once"
+        );
+        assert_totals_exact(&db, name);
+        assert_row(&db, 5, 0x46);
+    }
+}
+
+/// A fault while repair rebuilds the totals refuses the open and completes no
+/// count; a later healthy open repairs and rebuilds exact totals once.
+#[test]
+fn allocator_free_total_rebuild_fault_during_repair_refuses_the_open() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("repair-rebuild-fault.redb");
+    create_regions(&path, 48);
+    let db = builder().open(&path).expect("open fixture");
+    insert_rows(&db, 48..50, 0x47);
+    redb::Database::set_free_totals_save_for_test(Some(
+        redb::FreeTotalsSaveForTest::FailBeforeEncode,
+    ));
+    drop(db);
+    redb::Database::set_free_totals_save_for_test(None);
+
+    let fault = Arc::new(ScratchFault::default());
+    let armed = Arc::clone(&fault);
+    redb::Database::set_free_total_recount_start_hook_for_test(Some(Box::new(move || {
+        armed.arm(ScratchOperation::Read, 1);
+        armed.fail_backend_reads.store(true, Ordering::SeqCst);
+    })));
+    let completed_before = redb::Database::free_total_recounts_for_test();
+    let opened = builder().open_with_backend(fault_backend(&path, &fault));
+    redb::Database::set_free_total_recount_start_hook_for_test(None);
+    assert!(
+        fault.fail_backend_reads.load(Ordering::SeqCst),
+        "the repair must reach its rebuild"
     );
     assert!(
-        db.allocator_regions_for_test() < regions,
-        "the fixture must actually remove a region ({regions} before)"
+        fault.hit() || fault.backend_read_failures.load(Ordering::SeqCst) > 0,
+        "the injected fault must fire inside the rebuild"
     );
-    assert_totals_exact(&db, "reopen after region removal");
-    assert_row(&db, 2, 0x61);
+    assert!(opened.is_err(), "a repair whose rebuild faults refuses the open");
+    drop(opened);
+    assert_eq!(
+        redb::Database::free_total_recounts_for_test(),
+        completed_before,
+        "the failed rebuild completed no count"
+    );
+
+    let before = redb::Database::free_total_recounts_for_test();
+    let (db, repaired) = reopen_with_repair(&path, "healthy repair after a faulted rebuild");
+    assert!(repaired);
+    assert_eq!(redb::Database::free_total_recounts_for_test() - before, 1);
+    assert_totals_exact(&db, "after the healthy repair");
+    assert_row(&db, 49, 0x47);
 }
 
 /// Totals that lost trust are never saved: the reserved value stays unwritten,
