@@ -19125,7 +19125,8 @@ pub struct PruningReport {
     /// value the compaction decision was taken on, so a cycle that pruned rows
     /// compacted exactly when this reached
     /// [`REDB_COMPACT_FRAGMENTATION_THRESHOLD`]. A cycle that pruned NOTHING
-    /// never compacts, whatever this reads.
+    /// takes no compaction decision, so it does not walk the store to measure
+    /// one and reports `0.0` here.
     pub fragmentation_before: f64,
     /// Rows carrying a timestamp further into the future than
     /// [`RETENTION_CLOCK_SKEW_TOLERANCE`]. They are never pruned early — and
@@ -24222,46 +24223,79 @@ impl MaintenanceContext {
     /// separately from any scoped cleanup pass's own compact decision.
     /// Starts a sweep only after the configured interval and fragmentation
     /// threshold are satisfied. An active sweep advances one bounded durable
-    /// batch per cycle; completion starts the next interval. It runs outside
-    /// the commit lock, since
-    /// this is called from `run_cycle` after both `run_pruning` and
-    /// `run_currency` have already returned.
-    fn maybe_auto_compact(&self) -> Result<CompactionReport> {
+    /// batch per cycle; completion starts the next interval, and so does a
+    /// check that found the file below the threshold. It runs outside the
+    /// commit lock and outside the pruning guard, after the rest of the cycle
+    /// has returned: the threshold check walks every page of the store, and
+    /// the import's vector-tail persistence waits on that guard. The guard is
+    /// retaken only around the one bounded compaction batch.
+    fn maybe_auto_compact(&self, pruning_guard: Option<&Mutex<()>>) -> Result<CompactionReport> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(CompactionReport::default());
         };
-        let min_interval = *self.auto_compact_min_interval.lock();
-        let due = self
-            .last_auto_compact_at
-            .lock()
-            .is_none_or(|at| at.elapsed() >= min_interval);
         let previous_sample = vector_source_page_admission::with_preparation_source_page_admission(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || persistence.storage_compaction_fragmentation_ratio(),
         )?;
-        if !due && previous_sample.is_none() {
-            return Ok(CompactionReport::default());
+        // A due check claims the interval before it walks, so a concurrent
+        // cycle (the engine-owned worker beside a caller-driven call) does not
+        // repeat the same whole-store walk. A failed check or batch returns
+        // the claim.
+        let mut claimed_from = None;
+        if previous_sample.is_none() {
+            let min_interval = *self.auto_compact_min_interval.lock();
+            let mut last = self.last_auto_compact_at.lock();
+            if !last.is_none_or(|at| at.elapsed() >= min_interval) {
+                return Ok(CompactionReport::default());
+            }
+            claimed_from = Some(*last);
+            *last = Some(std::time::Instant::now());
         }
+        let release_claim = |claimed_from: Option<Option<std::time::Instant>>| {
+            if let Some(previous) = claimed_from {
+                *self.last_auto_compact_at.lock() = previous;
+            }
+        };
         let fragmentation_before = match previous_sample {
             Some(sample) => sample,
-            None => vector_source_page_admission::with_preparation_source_page_admission(
+            None => match vector_source_page_admission::with_preparation_source_page_admission(
                 crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                 || persistence.fragmentation_ratio(),
-            )?,
+            ) {
+                Ok(ratio) => ratio,
+                Err(error) => {
+                    release_claim(claimed_from);
+                    return Err(error);
+                }
+            },
         };
         if previous_sample.is_none() && fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD
         {
+            // The claim stands: a completed negative check starts the
+            // interval, so the next cycle does not repeat the walk.
             return Ok(CompactionReport::default());
         }
         let bytes_before = self.file_bytes();
         let start = Instant::now();
-        let (progress, handle_recycle_micros) = publish_storage_compaction_batch(
-            &self.tx_mgr,
-            persistence,
-            &self.finalization.accountant,
-            &self.publication_interrupted,
-            fragmentation_before,
-        )?;
+        let batch = {
+            let _guard = pruning_guard.map(|guard| guard.lock());
+            #[cfg(any(test, feature = "test-seams"))]
+            let _held = pruning_guard.map(|_| crate::persistence::PruningGuardHeldForTest::enter());
+            publish_storage_compaction_batch(
+                &self.tx_mgr,
+                persistence,
+                &self.finalization.accountant,
+                &self.publication_interrupted,
+                fragmentation_before,
+            )
+        };
+        let (progress, handle_recycle_micros) = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                release_claim(claimed_from);
+                return Err(error);
+            }
+        };
         let duration_micros = start.elapsed().as_micros() as u64;
         if progress.complete {
             *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
@@ -24813,15 +24847,19 @@ impl MaintenanceContext {
         })
     }
 
-    fn run_pruning(
+    /// Retention without its compaction decision. When rows were pruned, the
+    /// returned sample is the store as it stood before the prune; the caller
+    /// passes it to [`Self::finish_pruning_decision`] once it has released the
+    /// pruning guard, because measuring it walks every page of the store.
+    fn run_pruning_deferring_decision(
         &self,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<PruningReport> {
+    ) -> Result<(PruningReport, Option<redb::StorageStatisticsSnapshot>)> {
         // Nothing declares RETAIN, so there is nothing this pass could prune,
         // no fragmentation decision it could take, and no report field it could
         // fill. Bail BEFORE the commit lock and candidate selection.
         if !self.has_retention_work() {
-            return Ok(PruningReport::default());
+            return Ok((PruningReport::default(), None));
         }
         // Admit the carry destination before expiry opens any row cursor. Its
         // published owner remains charged; this receipt covers the replacement
@@ -24860,11 +24898,17 @@ impl MaintenanceContext {
         // deliberate: a large prune of a previously tight file may not compact
         // until the next cycle, which is the rare-not-per-cycle posture the
         // constant's own doc describes.
-        let fragmentation_before = self
-            .persistence
-            .as_ref()
-            .map(|persistence| persistence.fragmentation_ratio().unwrap_or(0.0))
-            .unwrap_or(0.0);
+        //
+        // Only the snapshot is captured here, though. Measuring it walks every
+        // page of the store, and the ratio is consumed only by a cycle that
+        // pruned rows, so a cycle that prunes nothing never walks it. When
+        // rows were pruned the walk happens after the pruning guard is
+        // released and still reports the file exactly as it stood before
+        // this prune, because the sample is a point-in-time snapshot.
+        let statistics_sample = match self.persistence.as_ref() {
+            Some(persistence) => persistence.storage_statistics_sample().ok(),
+            None => None,
+        };
         let now = Wallclock::now();
         self.stamp_expired_rows_for(now, RetentionPreparation::Prune)?;
         let mut report = self
@@ -24885,18 +24929,49 @@ impl MaintenanceContext {
                 retention_source_admission_error(error, RetentionPreparation::Prune)
             })?;
         report.file_bytes_before = file_bytes_before;
+        report.fragmentation_before = 0.0;
+        report.file_bytes_after = self.file_bytes();
+        report.file_shrank = matches!(
+            (report.file_bytes_before, report.file_bytes_after),
+            (Some(before), Some(after)) if after < before
+        );
+        let decision = if report.pruned_rows > 0 {
+            statistics_sample
+        } else {
+            None
+        };
+        Ok((report, decision))
+    }
+
+    /// The compaction decision of a cycle that pruned rows, taken on the
+    /// pre-prune sample. Runs with the pruning guard RELEASED: the sample's
+    /// page walk is proportional to the store, and the import's vector-tail
+    /// persistence waits on that guard. The guard is retaken only around the
+    /// one bounded compaction batch the decision starts.
+    fn finish_pruning_decision(
+        &self,
+        pruning_guard: Option<&Mutex<()>>,
+        report: &mut PruningReport,
+        sample: Option<redb::StorageStatisticsSnapshot>,
+    ) -> Result<()> {
+        let (Some(sample), Some(persistence)) = (sample, self.persistence.as_ref()) else {
+            return Ok(());
+        };
+        let fragmentation_before =
+            RedbPersistence::sampled_fragmentation_ratio(&sample).unwrap_or(0.0);
+        // The sample is a storage read transaction; compaction must not run
+        // while one is outstanding on this thread.
+        drop(sample);
+        // The reported `fragmentation_before` is the decision input itself;
+        // the decision input and the receipt are one number, never a derived
+        // stand-in. Compaction still runs AFTER the prune (there is no point
+        // rewriting the file before the rows leave it) and outside the commit
+        // lock.
         report.fragmentation_before = fragmentation_before;
-        // Compaction itself still runs AFTER the prune (there is no point
-        // rewriting the file before the rows leave it) and OUTSIDE the commit
-        // lock: redb compaction takes the redb mutex with `&mut` and must not
-        // run while a txn is outstanding on this thread. Only the DECISION
-        // rides the pre-prune observation above, and the reported
-        // `fragmentation_before` is that same observed value — the decision
-        // input and the receipt are one number, never a derived stand-in.
-        if report.pruned_rows > 0
-            && let Some(persistence) = self.persistence.as_ref()
-            && fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD
-        {
+        if fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD {
+            let _guard = pruning_guard.map(|guard| guard.lock());
+            #[cfg(any(test, feature = "test-seams"))]
+            let _held = pruning_guard.map(|_| crate::persistence::PruningGuardHeldForTest::enter());
             let (progress, _) = publish_storage_compaction_batch(
                 &self.tx_mgr,
                 persistence,
@@ -24908,13 +24983,13 @@ impl MaintenanceContext {
                 *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
             }
             report.compacted = true;
+            report.file_bytes_after = self.file_bytes();
+            report.file_shrank = matches!(
+                (report.file_bytes_before, report.file_bytes_after),
+                (Some(before), Some(after)) if after < before
+            );
         }
-        report.file_bytes_after = self.file_bytes();
-        report.file_shrank = matches!(
-            (report.file_bytes_before, report.file_bytes_after),
-            (Some(before), Some(after)) if after < before
-        );
-        Ok(report)
+        Ok(())
     }
 
     /// Every table that DECLARES `HISTORY CURRENT ONLY` right now, whether it
@@ -26602,11 +26677,24 @@ impl MaintenanceContext {
         }
     }
 
+    /// One whole cycle for a caller that does not hold the pruning guard.
     fn run_cycle(
         &self,
         gate: CurrencyGate,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<MaintenanceReport> {
+        let (report, decisions) = self.run_cycle_deferring_storage_decisions(gate, read_memory)?;
+        self.finish_storage_decisions(None, report, decisions)
+    }
+
+    /// Everything a cycle does under the pruning guard. The storage
+    /// statistics decisions are returned instead of taken: the caller
+    /// releases the guard and hands them to [`Self::finish_storage_decisions`].
+    fn run_cycle_deferring_storage_decisions(
+        &self,
+        gate: CurrencyGate,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<(MaintenanceReport, DeferredStorageDecisions)> {
         let mut maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
         // Release obsolete graphs before another partition allocates its
@@ -26633,7 +26721,7 @@ impl MaintenanceContext {
             failed_partitions: cleanup_retry_failed_partitions,
         } = self.retry_vector_journal_truncations(read_memory.clone())?;
         cycle_failures.first = cycle_failures.first.or(cleanup_retry_failure);
-        let pruning = self.run_pruning(read_memory.clone())?;
+        let (pruning, prune_sample) = self.run_pruning_deferring_decision(read_memory.clone())?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;
         let currency = match self.run_currency(gate, read_memory.clone()) {
             Ok(report) => report,
@@ -26747,14 +26835,40 @@ impl MaintenanceContext {
         vector.first_failure = vector.first_failure_details.map(|details| details.failure);
         // Reclaim the deferred-free backlog before compaction, so compaction sees the free space.
         self.reclaim_deferred_storage()?;
-        // The rare, interval-gated automatic compaction path -- see
-        // `maybe_auto_compact`'s own doc comment. Runs LAST, after every
-        // scoped pass this cycle already did its own work, and (like every
-        // compact call) outside any commit lock.
-        let compaction = match self.maybe_auto_compact() {
+        let resource_refusal_reported = vector.first_failure.is_some();
+        Ok((
+            MaintenanceReport {
+                pruning,
+                currency,
+                vector,
+                pruned_trigger_audit_rows,
+                compaction: CompactionReport::default(),
+            },
+            DeferredStorageDecisions {
+                prune_sample,
+                resource_refusal_reported,
+            },
+        ))
+    }
+
+    /// The storage-statistics decisions of a cycle, taken with the pruning
+    /// guard released (`pruning_guard` is the guard the caller dropped, retaken
+    /// only around bounded compaction batches; `None` for a caller that never
+    /// held it). The pre-prune decision first, then the rare, interval-gated
+    /// automatic compaction path -- see `maybe_auto_compact`'s own doc
+    /// comment. Runs LAST, after every scoped pass this cycle already did its
+    /// own work, and (like every compact call) outside any commit lock.
+    fn finish_storage_decisions(
+        &self,
+        pruning_guard: Option<&Mutex<()>>,
+        mut report: MaintenanceReport,
+        decisions: DeferredStorageDecisions,
+    ) -> Result<MaintenanceReport> {
+        self.finish_pruning_decision(pruning_guard, &mut report.pruning, decisions.prune_sample)?;
+        report.compaction = match self.maybe_auto_compact(pruning_guard) {
             Ok(report) => report,
             Err(Error::MemoryBudgetExceeded { .. } | Error::DiskBudgetExceeded { .. })
-                if vector.first_failure.is_some() =>
+                if decisions.resource_refusal_reported =>
             {
                 // The cycle already exposes the first partition-local
                 // resource refusal. An opportunistic closing compaction uses
@@ -26768,14 +26882,19 @@ impl MaintenanceContext {
         // that dutifully drives an empty cycle is still driving, and must
         // never trip the caller-driven backlog warning.
         *self.last_maintenance_cycle_at.lock() = Some(std::time::Instant::now());
-        Ok(MaintenanceReport {
-            pruning,
-            currency,
-            vector,
-            pruned_trigger_audit_rows,
-            compaction,
-        })
+        Ok(report)
     }
+}
+
+/// The storage-statistics decisions a cycle defers until its caller has
+/// released the pruning guard.
+pub(crate) struct DeferredStorageDecisions {
+    /// The pre-prune snapshot, kept only when the cycle pruned rows.
+    prune_sample: Option<redb::StorageStatisticsSnapshot>,
+    /// The cycle already reports a partition-local resource refusal, so an
+    /// opportunistic closing compaction refused by the same exhausted limit
+    /// must not erase the cycle's report.
+    resource_refusal_reported: bool,
 }
 
 /// Observability: an operator must be able to see maintenance happen. Silent
@@ -64920,10 +65039,15 @@ impl Database {
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<PruningReport> {
         let _operation = self.assert_open_operation();
-        let _guard = self.pruning_guard.lock();
-        #[cfg(any(test, feature = "test-seams"))]
-        let _held = crate::persistence::PruningGuardHeldForTest::enter();
-        self.maintenance_context().run_pruning(read_memory.clone())
+        let context = self.maintenance_context();
+        let (mut report, decision) = {
+            let _guard = self.pruning_guard.lock();
+            #[cfg(any(test, feature = "test-seams"))]
+            let _held = crate::persistence::PruningGuardHeldForTest::enter();
+            context.run_pruning_deferring_decision(read_memory.clone())?
+        };
+        context.finish_pruning_decision(Some(&self.pruning_guard), &mut report, decision)?;
+        Ok(report)
     }
 
     /// Run ONE maintenance cycle synchronously: generic retention, the
@@ -64947,11 +65071,14 @@ impl Database {
     ) -> Result<MaintenanceReport> {
         let mut operation = self.assert_open_operation();
         operation.release_schema_publication_for_online_maintenance();
-        let _guard = self.pruning_guard.lock();
-        #[cfg(any(test, feature = "test-seams"))]
-        let _held = crate::persistence::PruningGuardHeldForTest::enter();
-        self.maintenance_context()
-            .run_cycle(CurrencyGate::Always, read_memory.clone())
+        let context = self.maintenance_context();
+        let (report, decisions) = {
+            let _guard = self.pruning_guard.lock();
+            #[cfg(any(test, feature = "test-seams"))]
+            let _held = crate::persistence::PruningGuardHeldForTest::enter();
+            context.run_cycle_deferring_storage_decisions(CurrencyGate::Always, read_memory.clone())?
+        };
+        context.finish_storage_decisions(Some(&self.pruning_guard), report, decisions)
     }
 
     /// Production-dead: how many times `retire_snapshot_free_vector_partitions`
@@ -66462,20 +66589,30 @@ impl Database {
                 }
                 #[cfg(test)]
                 thread_wakes.fetch_add(1, Ordering::SeqCst);
-                let _guard = pruning_guard.lock();
-                #[cfg(any(test, feature = "test-seams"))]
-                let _held = crate::persistence::PruningGuardHeldForTest::enter();
                 // ONE loop, every job. Each pass carries its OWN cheap gate so a
                 // quiet node does near-zero work per tick: the currency pass is
                 // gated on superseded-version count, the retention pass bails
                 // before the commit lock when no table declares RETAIN, and the
                 // audit pass takes no write transaction unless something aged
-                // out. No pass relies on another's gate.
-                match context
-                    .read_request_provider
-                    .request_budget()
-                    .and_then(|read_memory| context.run_cycle(CurrencyGate::Scheduled, read_memory))
-                {
+                // out. No pass relies on another's gate. The storage-statistics
+                // decisions follow with the pruning guard released.
+                let cycle = {
+                    let _guard = pruning_guard.lock();
+                    #[cfg(any(test, feature = "test-seams"))]
+                    let _held = crate::persistence::PruningGuardHeldForTest::enter();
+                    context
+                        .read_request_provider
+                        .request_budget()
+                        .and_then(|read_memory| {
+                            context.run_cycle_deferring_storage_decisions(
+                                CurrencyGate::Scheduled,
+                                read_memory,
+                            )
+                        })
+                };
+                match cycle.and_then(|(report, decisions)| {
+                    context.finish_storage_decisions(Some(&pruning_guard), report, decisions)
+                }) {
                     Ok(report) => log_maintenance_cycle(&report),
                     Err(err) => log_pruning_error(&err),
                 }
