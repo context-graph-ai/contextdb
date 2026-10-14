@@ -2088,6 +2088,35 @@ mod allocator_growth_tests {
         assert!(sixteen <= eight + MEASURED_ALLOCATIONS / 8, "{report}");
     }
 
+    /// At the 32-window floor an allocation's working set stays resident:
+    /// every order's one-word summary root is answered without a window, so
+    /// what an allocation touches (the order-0 descent and the tracker words
+    /// it changes) fits the floor, and steady-state allocations reload almost
+    /// nothing at any store size: at most one window per 4 allocations, which
+    /// covers order-0 leaf windows the allocations walk into.
+    #[test]
+    fn allocation_window_loads_at_the_floor_stay_resident() {
+        let mut work = Vec::new();
+        for (gib, layout) in [
+            (1, layout(0, Some(SMALL_STORE_PAGES))),
+            (8, layout(LARGE_STORE_FULL_REGIONS, None)),
+            (16, layout(2 * LARGE_STORE_FULL_REGIONS, None)),
+        ] {
+            let mut state = fragmented_state(layout);
+            let (words, loads) = allocation_work(&mut state);
+            work.push((gib, words, loads));
+        }
+        println!(
+            "(GiB, words, window loads) for {MEASURED_ALLOCATIONS} allocations at the floor: {work:?}"
+        );
+        for (gib, _, loads) in &work {
+            assert!(
+                *loads <= MEASURED_ALLOCATIONS / 4,
+                "{gib} GiB store reloaded {loads} windows: {work:?}"
+            );
+        }
+    }
+
     /// Finding the highest free order after an allocation reads a bounded
     /// number of bitmap words: the summary levels answer it, not a leaf sweep
     /// whose length is the region's page count.
