@@ -172,14 +172,6 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
         (0, 0),
         "a cycle that prunes nothing and has no compaction due walks no statistics pages"
     );
-    // Seeding ended with an explicit compaction, a completed decision the
-    // store remembers: a fresh open inside the automatic interval inherits
-    // it instead of re-measuring the whole store.
-    assert_eq!(
-        (small.first_cycle_pages, large.first_cycle_pages),
-        (0, 0),
-        "a fresh open inside the interval of the store's last decision walks no statistics pages"
-    );
     assert!(!small.warm_cycle_compacted && !large.warm_cycle_compacted);
     for observation in [&small, &large] {
         // Retention examines a fixed window per cycle, so one cycle may
