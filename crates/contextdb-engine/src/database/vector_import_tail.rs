@@ -950,9 +950,11 @@ mod undeclared_limit_tests {
     const BASE_ROWS: i64 = 16;
     const COMMITS: i64 = 64;
     const PER_COMMIT: i64 = 1024;
-    /// The child's whole-process ceiling: far below the suffix's decoded
-    /// vectors (65,536 x 1,536 B = 96 MiB), far above a cohort.
-    const PROCESS_CEILING: usize = 64 * 1024 * 1024;
+    /// The child's whole-process ceiling: the undeclared writer's fixed
+    /// 64 MiB page cache plus 64 MiB, below the suffix's decoded vectors
+    /// (65,536 x 1,536 B = 96 MiB) held as one cohort, far above a cohort
+    /// bounded by a sixteenth of it.
+    const PROCESS_CEILING: usize = 128 * 1024 * 1024;
     const CHILD_PATH: &str = "S7_UNDECLARED_LIMIT_PATH";
 
     fn options() -> DatabaseOpenOptions {
