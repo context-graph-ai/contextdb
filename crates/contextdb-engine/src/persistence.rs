@@ -41862,6 +41862,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// reader at the shipped default that no consumer declared.
     fn reader_decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         if let Ok(owner) = crate::read_image_memory::active_owner() {
+            // A request's per-call reader owner charges each decode call
+            // separately; every other owner is entered as is.
+            if owner.is_per_call() && owner.reader_budget().is_some() {
+                return owner.enter_call();
+            }
             return Ok(owner.enter());
         }
         // A maintenance route inspection is generation preparation: its
