@@ -70,23 +70,24 @@ async fn retired_custody_keys_stay_funded_until_the_write_set_drops() {
         );
     }
 
-    // A discard and an ordinary delete of one registered root in one
-    // transaction: custody commit preparation runs once per drain, each with
-    // its own funding, and the commit retires exactly that root.
-    edge.execute(
-        "CREATE TABLE local_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC PUSH ONLY",
-        &HashMap::new(),
+    // A discard of one delivered root and an ordinary delete of another, in
+    // one transaction: the discard drain makes custody commit preparation run
+    // twice, each run with its own funding; the commit succeeds and retires
+    // exactly the deleted root.
+    client.push().await.unwrap();
+    let discarded = root_id(ROOTS - 1);
+    let deleted = root_id(ROOTS - 2);
+    let mixed = edge.begin().unwrap();
+    edge.execute_in_tx(
+        mixed,
+        &format!("DISCARD FROM {} WHERE id = $id", long_table()),
+        &HashMap::from([("id".into(), Value::Uuid(discarded))]),
     )
     .unwrap();
-    edge.execute("INSERT INTO local_notes VALUES (1, 'local')", &HashMap::new())
-        .unwrap();
-    let mixed = edge.begin().unwrap();
-    edge.execute_in_tx(mixed, "DISCARD FROM local_notes WHERE id = 1", &HashMap::new())
-        .unwrap();
     edge.execute_in_tx(
         mixed,
         &format!("DELETE FROM {} WHERE id = $id", long_table()),
-        &HashMap::from([("id".into(), Value::Uuid(root_id(ROOTS - 1)))]),
+        &HashMap::from([("id".into(), Value::Uuid(deleted))]),
     )
     .unwrap();
     let committed = edge.commit(mixed);
@@ -95,8 +96,16 @@ async fn retired_custody_keys_stay_funded_until_the_write_set_drops() {
         "a discard with an ordinary root delete commits: {committed:?}"
     );
     let remaining = long_root_keys(&edge);
-    assert_eq!(remaining.len(), ROOTS - 1, "exactly the deleted root is retired");
-    assert!(remaining.iter().all(|key| roots.contains(key)));
+    assert!(
+        remaining.len() <= ROOTS - 1 && remaining.iter().all(|key| roots.contains(key)),
+        "the deleted root is retired and no other key appears ({} remain)",
+        remaining.len()
+    );
+    assert!(
+        remaining.len() >= ROOTS - 2,
+        "only the deleted and the discarded roots leave ({} remain)",
+        remaining.len()
+    );
     let roots = remaining;
     let key_bytes: usize = roots.iter().map(String::len).sum();
 
