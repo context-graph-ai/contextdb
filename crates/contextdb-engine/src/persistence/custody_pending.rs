@@ -459,8 +459,10 @@ fn terminal_verified(
         if diagnostic || !member.starts_with(DIAGNOSTIC_PREFIX) {
             return Ok(());
         }
+        // Mid-transaction, an entry this commit already removed can still
+        // be a group member until its own maintenance runs: it is absent.
         let Some(value) = config.get(member).map_err(RedbPersistence::storage_error)? else {
-            return Err(crate::custody::canonical::invalid());
+            return Ok(());
         };
         if let Ok(RecordView::Diagnostic {
             namespace,
@@ -510,8 +512,10 @@ fn terminal_verified(
             if admitted || !member.starts_with(ADMISSION_PREFIX) {
                 return Ok(());
             }
+            // Mid-transaction, an entry this commit already removed can still
+            // be a group member until its own maintenance runs: it is absent.
             let Some(value) = config.get(member).map_err(RedbPersistence::storage_error)? else {
-                return Err(crate::custody::canonical::invalid());
+                return Ok(());
             };
             let Ok(RecordView::ObjectAdmission(a)) = decode_record(value.value()) else {
                 return Ok(());
@@ -577,8 +581,10 @@ fn set_pending(
             if held || !member.starts_with(EDGE_OUTCOME_PREFIX) {
                 return Ok(());
             }
+            // Mid-transaction, an entry this commit already removed can still
+            // be a group member until its own maintenance runs: it is absent.
             let Some(value) = config.get(member).map_err(RedbPersistence::storage_error)? else {
-                return Err(crate::custody::canonical::invalid());
+                return Ok(());
             };
             let view = match decode_record(value.value()) {
                 Ok(view) => view,
