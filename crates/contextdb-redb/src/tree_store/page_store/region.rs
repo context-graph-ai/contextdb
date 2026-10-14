@@ -209,17 +209,14 @@ pub(crate) fn geometry_region_visits_for_test() -> u64 {
     GEOMETRY_REGION_VISITS.with(std::cell::Cell::get)
 }
 
-#[cfg(feature = "test-seams")]
-fn note_geometry_region_visits(regions: u64) {
-    GEOMETRY_REGION_VISITS.with(|visits| visits.set(visits.get() + regions));
-}
-
+/// Total region pages of a layout by arithmetic: every region but the
+/// trailing one is full. Visits no region, so its cost is the same at any
+/// region count.
 pub(super) fn layout_pages(layout: &DatabaseLayout) -> u64 {
-    #[cfg(feature = "test-seams")]
-    note_geometry_region_visits(u64::from(layout.num_regions()));
-    (0..layout.num_regions())
-        .map(|region| u64::from(layout.region_layout(region).num_pages()))
-        .sum()
+    u64::from(layout.num_full_regions()) * u64::from(layout.full_region_layout().num_pages())
+        + layout
+            .trailing_region_layout()
+            .map_or(0, |trailing| u64::from(trailing.num_pages()))
 }
 
 impl FreeTotals {
@@ -741,14 +738,12 @@ impl Allocators {
     pub(super) fn resize_to(&mut self, new_layout: DatabaseLayout) -> io::Result<()> {
         let old_pages = match &self.paged {
             Some(paged) => layout_pages(&paged.layout.lock().unwrap()),
-            None => {
-                #[cfg(feature = "test-seams")]
-                note_geometry_region_visits(self.regions.len() as u64);
-                self.regions
-                    .iter()
-                    .map(|region| u64::from(region.len()))
-                    .sum()
-            }
+            // Every region but the last is full, so the old page count is
+            // arithmetic over the region count and the last region's length.
+            None => self.regions.last().map_or(0, |last| {
+                (self.regions.len() as u64 - 1) * u64::from(new_layout.full_region_layout().num_pages())
+                    + u64::from(last.len())
+            }),
         };
         let result = self.resize_to_inner(new_layout);
         let new_pages = layout_pages(&new_layout);
