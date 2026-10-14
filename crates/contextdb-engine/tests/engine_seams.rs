@@ -178,3 +178,5 @@ mod opening_a_store_does_a_bounded_vector_journal_cleanup;
 mod reads_and_writes_are_charged_to_their_own_declared_limits;
 #[path = "engine_seams/trigger_audit_history_is_charged_once_to_the_declared_reader.rs"]
 mod trigger_audit_history_is_charged_once_to_the_declared_reader;
+#[path = "engine_seams/opening_a_store_holds_a_bounded_window_of_queued_events.rs"]
+mod opening_a_store_holds_a_bounded_window_of_queued_events;
