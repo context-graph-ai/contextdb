@@ -148,7 +148,11 @@ fn a_relation_that_does_not_fit_the_writer_budget_is_refused_before_it_is_opened
             .expect("the refused relation was not left open"),
     );
     held.close(&mut admission);
-    assert_eq!(owner.usage().used, 0, "a refused pass returns every admitted byte");
+    assert_eq!(
+        owner.usage().used,
+        0,
+        "a refused pass returns every admitted byte"
+    );
 }
 
 #[test]

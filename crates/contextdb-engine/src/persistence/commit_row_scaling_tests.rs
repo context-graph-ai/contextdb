@@ -434,7 +434,10 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
             .len()
         })
         .sum();
-    assert_eq!(committed, 0, "a refused commit leaves every table as it was");
+    assert_eq!(
+        committed, 0,
+        "a refused commit leaves every table as it was"
+    );
     db.execute(
         &format!(
             "INSERT INTO held_00_{} VALUES ('{}', 'after refusal')",

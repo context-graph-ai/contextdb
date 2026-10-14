@@ -186,7 +186,8 @@ impl RedbPersistence {
     ) -> Result<()> {
         // Only the heads table is written here; the held relations are read.
         let mut relations = HeldRelations::new();
-        let applied = Self::apply_writer_row_heads_holding(write, mutations, admission, &mut relations);
+        let applied =
+            Self::apply_writer_row_heads_holding(write, mutations, admission, &mut relations);
         relations.close(admission);
         applied
     }
