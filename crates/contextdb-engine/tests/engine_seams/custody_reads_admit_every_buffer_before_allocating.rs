@@ -20,6 +20,9 @@ const MODE: &str = "CONTEXTDB_CUSTODY_ADMISSION_MODE";
 /// Fixed allocations no custody owner admits: allocator rounding, the redb
 /// read view and its iterators. Every defect this test guards is larger.
 const SLACK: isize = 16 * 1024;
+/// The pending read allocates nothing per page besides its key list, so its
+/// slack is tighter: the list's unadmitted growth at a thousand keys exceeds it.
+const PENDING_SLACK: isize = 4 * 1024;
 
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static EXCESS: AtomicIsize = AtomicIsize::new(isize::MIN);
@@ -193,7 +196,7 @@ async fn pending_growth() {
                     refusals_during_visit += 1;
                     largest = largest.max(excess);
                     assert!(
-                        excess <= SLACK,
+                        excess <= PENDING_SLACK,
                         "limit {limit}: at the refusal after {examined} entries the key \
                          list held {excess} unadmitted bytes"
                     );
