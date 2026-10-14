@@ -327,9 +327,11 @@ const PAYLOAD: TableDefinition<u64, &[u8]> = TableDefinition::new("payload");
 const SLACK_VALUE_BYTES: usize = 4_100;
 const SLACK_ROWS: u64 = 4_096;
 
-/// A store whose rows each leave half a page unused; the rows `keep` rejects
-/// are removed, so their pages are allocator-free. Every `keep` used here
-/// keeps the last row, so no clean close trims the freed pages away.
+/// A store whose rows each leave half a page unused. It is compacted first,
+/// so building it leaves no free pages behind (relocation copies whole pages
+/// and keeps their slack); then the rows `keep` rejects are removed, so
+/// exactly their pages become allocator-free. Every `keep` used here keeps the
+/// last row, so no clean close trims the freed pages away.
 fn raw_payload_store(path: &std::path::Path, keep: impl Fn(u64) -> bool) {
     let initial = open(path);
     initial.close().unwrap();
@@ -344,6 +346,12 @@ fn raw_payload_store(path: &std::path::Path, keep: impl Fn(u64) -> bool) {
         }
     }
     write.commit().unwrap();
+    drop(db);
+    let compacted = open(path);
+    compacted.compact_now().unwrap();
+    compacted.close().unwrap();
+    drop(compacted);
+    let db = redb::Database::create(path).unwrap();
     let write = db.begin_write().unwrap();
     {
         let mut table = write.open_table(PAYLOAD).unwrap();
@@ -378,10 +386,10 @@ fn first_automatic_decision(path: &std::path::Path) -> (f64, f64, bool, Work) {
 fn automatic_compaction_starts_on_reclaimable_free_pages_and_not_on_in_page_slack() {
     let directory = tempfile::tempdir().unwrap();
 
-    // Slack-dominated: a quarter of the rows removed, every row's page half
-    // empty. Dead space by the exact statistics, mostly not reclaimable.
+    // Slack-dominated: one row in ten removed, every row's page half empty.
+    // Dead space by the exact statistics, mostly not reclaimable.
     let slack = directory.path().join("slack.redb");
-    raw_payload_store(&slack, |key| key % 4 != 1);
+    raw_payload_store(&slack, |key| key % 10 != 3);
     let (exact, free, ran, cycle) = first_automatic_decision(&slack);
     println!("slack store: exact={exact} allocator_free={free} ran={ran}");
     assert!(
