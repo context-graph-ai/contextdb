@@ -959,8 +959,15 @@ impl Database {
         let saved_source = self.mem.has_saved_allocator_source();
         let mut highest = None;
         if let Some(tree) = Self::get_allocator_state_table(&self.mem)?
-            && let Some(pages) = tree.all_pages_iter()?
+            && let Some(root) = tree.get_root()
         {
+            let pages = crate::tree_store::AllPageNumbersBtreeIter::new(
+                root.root,
+                <crate::transactions::AllocatorStateKey as Value>::fixed_width(),
+                <&[u8] as Value>::fixed_width(),
+                self.mem.clone(),
+                PageHint::None,
+            )?;
             for page in pages {
                 let page = page?;
                 let last = ((page.page_index + 1) << page.page_order) - 1;
