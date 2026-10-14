@@ -982,6 +982,25 @@ impl TransactionalMemory {
 
     /// Independent order-weighted recount of every region's free bits, for
     /// agreement tests. Leaves the maintained totals untouched.
+    /// Per region: `(length, free pages, trailing free pages, highest free
+    /// order)`. Reads every region's bitmap. Test diagnostics only.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn region_free_pages_for_test(&self) -> Vec<(u32, u32, u32, Option<u8>)> {
+        let mut state = self.state.lock().unwrap();
+        let regions = state.header.layout().num_regions();
+        (0..regions)
+            .map(|region| {
+                let allocator = state.get_region(region);
+                (
+                    allocator.len(),
+                    allocator.count_free_pages(),
+                    allocator.trailing_free_pages(),
+                    allocator.highest_free_order(),
+                )
+            })
+            .collect()
+    }
+
     #[cfg(feature = "test-seams")]
     pub(crate) fn recount_free_totals_for_test(&self) -> Result<(u64, u64, u64)> {
         let mut state = self.state.lock().unwrap();

@@ -65038,6 +65038,15 @@ impl Database {
         persistence.with_db(|db| Ok(db.allocator_free_totals()))
     }
 
+    /// Production-dead: per region `(length, free, trailing free, highest
+    /// free order)`, read from every allocator bitmap. Diagnostics only.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __allocator_regions_for_test(&self) -> Result<Vec<(u32, u32, u32, Option<u8>)>> {
+        let persistence = self.persistence.as_ref().expect("file fixture");
+        persistence.with_db(|db| Ok(db.region_free_pages_for_test()))
+    }
+
     /// Production-dead: the maintained allocator free-page ratio the
     /// maintenance decisions read, and the same ratio from an independent
     /// recount of every allocator bitmap (which does not count as a rebuild).

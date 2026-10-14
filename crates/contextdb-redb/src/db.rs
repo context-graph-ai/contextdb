@@ -942,6 +942,14 @@ impl Database {
         self.mem.recount_free_totals_for_test()
     }
 
+    /// Per region: `(length, free pages, trailing free pages, highest free
+    /// order)`, from every region's bitmap. Test diagnostics only.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn region_free_pages_for_test(&self) -> Vec<(u32, u32, u32, Option<u8>)> {
+        self.mem.region_free_pages_for_test()
+    }
+
     /// Drop trust in the maintained totals: the next save writes none, so the
     /// next open rebuilds them.
     #[cfg(feature = "test-seams")]

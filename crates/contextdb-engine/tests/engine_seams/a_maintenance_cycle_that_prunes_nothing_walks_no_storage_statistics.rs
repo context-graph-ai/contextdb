@@ -84,7 +84,11 @@ fn seed(path: &std::path::Path, rows: usize, clock: &AtomicU64) {
     insert_rows(&db, "links", 0..per_table);
     // Leave the file tight, as a long-running store settles after its own
     // compaction, so no cycle below has a compaction to start.
-    db.compact_now().unwrap();
+    let compaction = db.compact_now().unwrap();
+    println!(
+        "rows={rows} seed compact_now: {compaction:?} regions={:?}",
+        db.__allocator_regions_for_test().unwrap()
+    );
     db.close().unwrap();
 }
 
@@ -173,7 +177,8 @@ fn observe(rows: usize, clock: &AtomicU64) -> Observation {
 
     // The first cycle after the open, then a warm one. Neither prunes.
     println!(
-        "rows={rows} after open: totals={:?} exact={:?}",
+        "rows={rows} after open: regions={:?} totals={:?} exact={:?}",
+        db.__allocator_regions_for_test().unwrap(),
         db.__allocator_free_totals_for_test().unwrap(),
         db.__storage_fragmentation_ratio_for_test().unwrap(),
     );
