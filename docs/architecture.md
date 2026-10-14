@@ -491,6 +491,16 @@ exact work only within the active budget. Repair and first build run through mai
 query path, so an older valid route and ordinary relational/graph reads remain usable.
 <!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_lazy_replay_budget_contract::first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_ceiling, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors, vector_generation_quarantine_compaction_lock_contract::newer_catalog_format_quarantines_only_that_route, vector_generation_quarantine_compaction_lock_contract::corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds, vector_generation_quarantine_compaction_lock_contract::caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart, vector_generation_quarantine_compaction_lock_contract::engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle -->
 
+Opening a store reads at most 64 records of each route's change journal, whatever the number of
+changes waiting to be indexed. Damage to a later change record is reported by the first indexed read
+or maintenance pass that touches it; until then `SHOW VECTOR_PARTITIONS` reports the route `ready`.
+From then the route is quarantined with `availability_reason = corrupt_changes`: an indexed query
+refuses with the route unavailable, `AUTO` answers exactly only within the active budget, and repair
+starts at the next engine-owned maintenance wake (every 60 seconds by default) or the next
+caller-driven cycle, and needs the memory and disk of a rebuild. No indexed answer is served from a
+damaged change record.
+<!-- enforced by: opening_a_store_does_a_bounded_vector_journal_cleanup::the_open_reads_the_same_journal_records_however_long_the_suffix_is, opening_a_store_does_a_bounded_vector_journal_cleanup::damage_past_the_first_uncovered_record_is_reported_by_the_first_indexed_read -->
+
 A logical import can carry an owned mutable vector tail across physical writer closes. Each reopen
 validates the committed generation, journal frontier, schema and store identity, then charges the
 working set to that writer; a mismatch or refused cache admission drops it and uses ordinary recovery.
