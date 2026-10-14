@@ -151,6 +151,8 @@ fn copy_records<'a>(
     Ok(AdmittedRecords { records, memory })
 }
 
+#[cfg(feature = "test-seams")]
+pub(crate) use durable::last_memo_for_test;
 /// Admitted bytes held by one custody operation, released on drop.
 pub(crate) use durable::{
     AdmittedKeys, AdmittedVec, DeltaRecords, KeyList, Scratch as CustodyCharge, Selector,
@@ -2526,6 +2528,24 @@ mod durable {
         entries: std::collections::VecDeque<(String, Probed)>,
         keys: Scratch,
         slots: Scratch,
+    }
+    impl Drop for MemoRing {
+        fn drop(&mut self) {
+            // Measurement only; the fields drop after this, in order.
+            #[cfg(feature = "test-seams")]
+            LAST_MEMO_KEY_BYTES.with(|last| last.set((self.entries.len(), self.keys.bytes())));
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    thread_local! {
+        static LAST_MEMO_KEY_BYTES: std::cell::Cell<(usize, usize)> =
+            const { std::cell::Cell::new((0, 0)) };
+    }
+    /// Measurement only: `(entries, key bytes)` the last closure memo on this
+    /// thread held when it was destroyed.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn last_memo_for_test() -> (usize, usize) {
+        LAST_MEMO_KEY_BYTES.with(std::cell::Cell::get)
     }
     impl MemoRing {
         fn new(memory: &Arc<ImageMemory>) -> Result<Self> {

@@ -1,5 +1,6 @@
 //! A durable custody read's closure walk keeps loaded companions in a memo
-//! whose keys can be kilobytes long. On every exit, success or a refusal
+//! whose keys can be kilobytes long (here: the long-named roots of undelivered
+//! units, reached from their manifests). On every exit, success or a refusal
 //! late in the walk with the memo populated, each entry is freed before its
 //! key bytes are refunded: at every refund, what this read has allocated
 //! never exceeds what its reader memory still holds admitted.
@@ -50,18 +51,25 @@ fn probe(label: &'static str, phase: u8, _invoice: usize, _held: usize) {
 
 /// Run one terminal selection observed at every refund: its answer, the
 /// largest unadmitted excess at a refund, and how many refunds were seen.
-/// A fresh undelivered unit is committed first, so the read's root is new and
-/// no closure check certified at an earlier root is skipped: every read walks
-/// the same whole closure.
+/// A row of a local table is committed first, so the read's root is new and
+/// no closure check certified at an earlier root is skipped, while the custody
+/// journal is unchanged: every read walks the same whole closure.
 fn observed(edge: &Database) -> (Result<Vec<String>, Error>, usize, isize, usize) {
-    static NEXT: AtomicUsize = AtomicUsize::new(1_000);
-    commit_long_unit(edge, NEXT.fetch_add(1, Ordering::SeqCst));
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    edge.execute(
+        "INSERT INTO local_notes (id, body) VALUES ($id, 'moves the root')",
+        &std::collections::HashMap::from([(
+            "id".into(),
+            contextdb_core::Value::Int64(NEXT.fetch_add(1, Ordering::SeqCst) as i64),
+        )]),
+    )
+    .unwrap();
     EXCESS.store(isize::MIN, Ordering::SeqCst);
     RELEASES.store(0, Ordering::SeqCst);
     BASE.store(live_allocations_for_test(), Ordering::SeqCst);
     Database::__set_custody_bracket_probe_for_test(Some(probe));
     let (answer, held) =
-        edge.__custody_caller_with_limit_for_test("select", "delivery_edge_outcome.v1.", AMPLE);
+        edge.__custody_caller_with_limit_for_test("select", "delivery_manifest.v1.", AMPLE);
     Database::__set_custody_bracket_probe_for_test(None);
     (
         answer,
@@ -79,13 +87,18 @@ async fn memo_order() {
     for unit in 0..UNITS {
         commit_long_unit(&edge, unit);
     }
-    client.push().await.unwrap();
+    // Undelivered: each manifest's closure reaches its long-keyed root.
+    edge.execute(
+        "CREATE TABLE local_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC OFF",
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
     // Warm the pages and signature checks, counting the walk's view admissions.
     *COUNTS.lock().unwrap() = Some(BTreeMap::new());
     let (warm, held, _, _) = observed(&edge);
     let counts = COUNTS.lock().unwrap().take().unwrap();
     let terminals = warm.unwrap();
-    assert_eq!(terminals.len(), UNITS);
+    assert_eq!(terminals.len(), UNITS, "one manifest per unit");
     assert_eq!(held, 0);
     let views = counts["custody_closure_view"];
     assert!(
@@ -119,13 +132,22 @@ async fn memo_order() {
             "view #{occurrence}: the read refuses typed: {answer:?}"
         );
         assert_eq!(held, 0, "view #{occurrence}: nothing stays admitted");
+        // The memo the unwind destroyed held the long keys this guards.
+        let (entries, key_bytes) = Database::__last_closure_memo_for_test();
+        assert!(
+            key_bytes > 2 * SLACK as usize,
+            "view #{occurrence}: the memo held {entries} entries with only {key_bytes} key bytes"
+        );
         assert!(releases > 0);
         assert!(
             excess <= SLACK,
             "view #{occurrence}: at a refund during the unwind, {excess} bytes were still \
              allocated beyond what the reader held admitted"
         );
-        println!("S3_MEMO_ORDER view={occurrence}/{views} excess={excess} releases={releases}");
+        println!(
+            "S3_MEMO_ORDER view={occurrence}/{views} excess={excess} releases={releases} \
+             memo_entries={entries} memo_key_bytes={key_bytes}"
+        );
     }
     drop(client);
     drop(edge);
