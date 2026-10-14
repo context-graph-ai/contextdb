@@ -544,6 +544,13 @@ impl Database {
             self.with_custody_store(|store| store.select(&[selector.to_owned()], memory, self))?;
         answer.iter().map(Record::key).collect()
     }
+    /// Measurement only: build (or reuse) this handle's custody store and
+    /// answer `(its tenant mirror's writer admission, mirrored entries)`.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_tenant_mirror_for_test(&self) -> Result<(usize, usize)> {
+        self.with_custody_store(|store| Ok((store.tenant_mirror_charge(), store.records.len())))
+    }
     /// Measurement only: report every labelled custody admission bracket on
     /// this thread as `(label, phase, invoice bytes, operation bytes held)`;
     /// phases are 0 before the reservation, 1 after the funded allocation

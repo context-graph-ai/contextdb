@@ -75,6 +75,9 @@ mod retention_respects_edge_visibility;
 mod snapshot_visible_posting_membership_contract;
 #[path = "engine_seams/storage_compaction_online.rs"]
 mod storage_compaction_online;
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/the_custody_tenant_mirror_is_charged_to_its_writer.rs"]
+mod the_custody_tenant_mirror_is_charged_to_its_writer;
 #[path = "engine_seams/uncapped_graph_read_charges_the_frontier_it_resolves.rs"]
 mod uncapped_graph_read_charges_the_frontier_it_resolves;
 #[cfg(unix)]
