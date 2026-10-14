@@ -2171,6 +2171,7 @@ mod admitted_reader_tests {
     use std::sync::atomic::AtomicUsize;
 
     /// A reader budget that records what it holds.
+    #[derive(Debug)]
     struct Counted {
         held: AtomicUsize,
         limit: usize,
