@@ -34033,7 +34033,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
         Vec<TriggerAuditEntry>,
         Option<contextdb_core::read_memory::ReadCredit>,
     )> {
-        let _decode_scope = self.reader_decode_scope()?;
+        // With a declared reader, that reader funds every decode and keeps
+        // every returned entry, once: each entry is decoded under its own row
+        // owner of the reader, which pays the decoder's control and scratch
+        // before allocating and moves the entry's payload credit into the
+        // answer's credit; the answer adds only the entry's slot.
+        let decode = match &read_memory {
+            Some(read_memory) => Some(crate::read_image_memory::ImageMemory::operation_reader(
+                self.require_decode_accountant()?,
+                read_memory.clone(),
+            )?),
+            None => None,
+        };
+        let _decode_scope = match &decode {
+            Some(decode) => decode.enter(),
+            None => self.reader_decode_scope()?,
+        };
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(TRIGGER_AUDIT_TABLE) {
@@ -34046,19 +34061,23 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let mut credit = read_memory.map(contextdb_core::read_memory::ReadCredit::new);
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (_, value) = entry.map_err(Self::storage_error)?;
-                if let Some(credit) = &mut credit {
-                    credit.try_grow_for(
-                        value
-                            .value()
-                            .len()
-                            .saturating_add(std::mem::size_of::<TriggerAuditEntry>())
-                            .saturating_add(96),
-                        "reader",
-                        "trigger_audit_history",
-                        "Reduce the selected audit history or raise the declared read memory limit.",
-                    )?;
-                }
-                let decoded: TriggerAuditEntry = Self::decode(value.value())?;
+                let decoded: TriggerAuditEntry = match (&mut credit, &decode) {
+                    (Some(credit), Some(decode)) => {
+                        credit.try_grow_for(
+                            std::mem::size_of::<TriggerAuditEntry>().saturating_add(96),
+                            "reader",
+                            "trigger_audit_history",
+                            "Reduce the selected audit history or raise the declared read memory limit.",
+                        )?;
+                        let row = decode.row_owner()?;
+                        let decoded = row.scope(|| Self::decode(value.value()))?;
+                        credit.try_merge_prepaid(
+                            row.take_retained_credit(row.retained_payload_bytes())?,
+                        )?;
+                        decoded
+                    }
+                    _ => Self::decode(value.value())?,
+                };
                 entries.push(decoded);
             }
             Ok((entries, credit))

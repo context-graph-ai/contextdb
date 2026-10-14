@@ -41,16 +41,18 @@ impl Database {
 }
 
 impl Database {
-    /// Per route of `table.column`: the serving coverage's LSN and the
-    /// inserts its maintained counters still hold pending at that coverage's
-    /// transaction -- what a reader's captured suffix is admitted from.
+    /// Per route of `table.column`: the serving coverage's LSN and
+    /// transaction, the commit transaction the commit index records at that
+    /// LSN, and the inserts its maintained counters still hold pending at the
+    /// coverage's transaction -- what a reader's captured suffix is admitted
+    /// from.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn vector_serving_pending_inserts_for_test(
         &self,
         table: &str,
         column: &str,
-    ) -> Result<Vec<(Lsn, usize)>> {
+    ) -> Result<Vec<(Lsn, TxId, Option<TxId>, usize)>> {
         let _operation = self.assert_open_operation();
         let context = self.maintenance_context();
         let Some(persistence) = &context.persistence else {
@@ -81,7 +83,12 @@ impl Database {
                     serving.covered_tx,
                 )
             })?;
-            pending.push((serving.covered_lsn, inserts));
+            let commit_tx = self
+                .tx_mgr
+                .try_commit_index_floor(std::ops::Bound::Included(serving.covered_lsn))?
+                .filter(|(lsn, _)| *lsn == serving.covered_lsn)
+                .map(|(_, tx)| tx);
+            pending.push((serving.covered_lsn, serving.covered_tx, commit_tx, inserts));
         }
         Ok(pending)
     }
@@ -112,6 +119,7 @@ impl MaintenanceContext {
         &self,
         site: &'static str,
         cohort_vectors: usize,
+        cohort_through: Option<Lsn>,
         workspace_bytes: usize,
         kept_vector_bytes: usize,
         load: impl FnOnce() -> Result<(Vec<VectorEntry>, Lsn)>,
@@ -129,6 +137,7 @@ impl MaintenanceContext {
                 site,
                 crate::vector_observations::ImportTailLoadBoundaryForTest::Enter,
                 cohort_vectors,
+                cohort_through,
                 workspace_bytes,
                 Some(&owner),
             )?;
@@ -155,12 +164,13 @@ impl MaintenanceContext {
                 site,
                 boundary,
                 cohort_vectors,
+                cohort_through,
                 workspace_bytes,
                 survivor.as_ref(),
             )?;
         }
         #[cfg(not(feature = "test-seams"))]
-        let _ = (site, cohort_vectors, workspace_bytes);
+        let _ = (site, cohort_vectors, cohort_through, workspace_bytes);
         loaded
     }
 
@@ -170,6 +180,7 @@ impl MaintenanceContext {
         site: &'static str,
         boundary: crate::vector_observations::ImportTailLoadBoundaryForTest,
         cohort_vectors: usize,
+        cohort_through: Option<Lsn>,
         workspace_bytes: usize,
         owner: Option<&Arc<crate::read_image_memory::ImageMemory>>,
     ) -> Result<()> {
@@ -183,6 +194,7 @@ impl MaintenanceContext {
             writer_used: usage.used,
             writer_limit: usage.limit,
             cohort_vectors,
+            cohort_through,
             workspace_bytes,
             decode_owner: owner.map_or(("", ""), |owner| owner.labels()),
             decode_owner_funded_by_writer: owner
@@ -493,6 +505,7 @@ impl MaintenanceContext {
                 let entries = self.load_import_cohort(
                     "persist_import_vector_tail",
                     count,
+                    cohort_through,
                     workspace_bytes,
                     count.saturating_mul(layout.dimension.saturating_mul(4)),
                     || {
@@ -662,6 +675,7 @@ impl MaintenanceContext {
             let (entries, loaded_through) = self.load_import_cohort(
                 "catch_up_native_import_candidate",
                 count,
+                Some(through_lsn),
                 workspace_bytes,
                 count.saturating_mul(layout.dimension.saturating_mul(4)),
                 || {

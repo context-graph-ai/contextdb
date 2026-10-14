@@ -267,6 +267,9 @@ pub struct ImportTailLoadForTest {
     pub writer_limit: Option<usize>,
     /// Upserts admitted into this cohort's workspace.
     pub cohort_vectors: usize,
+    /// The last committed LSN the cohort covers when it is a committed
+    /// prefix of the suffix; `None` when it is the whole suffix.
+    pub cohort_through: Option<contextdb_core::Lsn>,
     /// The cohort's decoded-body workspace, admitted before the load.
     pub workspace_bytes: usize,
     /// `subsystem/operation` of the decode owner the load runs under.

@@ -12581,6 +12581,14 @@ impl SnapshotInspector {
         })?;
         // The digest and census share one physical transaction. Lazy process
         // caches do not describe the retained contents of the copied artifact.
+        // An inspection is a read: the declared reader owns its decodes.
+        let decode = crate::read_image_memory::ImageMemory::operation_reader(
+            crate::memory_accounting::AccountantHandle::clone(
+                &self.database.finalization.accountant,
+            ),
+            self.database.declared_reader_memory()?,
+        )?;
+        let _decode = decode.enter();
         let raw = persistence.raw_sync_apply_state_digest()?;
         Ok(SyncApplyStateInspection {
             digest: raw.digest,
@@ -79004,6 +79012,13 @@ impl Database {
     ) -> Result<Vec<TriggerAuditEntry>> {
         let _operation = self.open_operation()?;
         let read_memory = self.declared_reader_memory()?;
+        // A read: the admitting declared reader owns every decode before
+        // persistence is entered, never the writer's fallback.
+        let decode = crate::read_image_memory::ImageMemory::operation_reader(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            read_memory.clone(),
+        )?;
+        let _decode = decode.enter();
         let (history, credit) = if let Some(persistence) = &self.persistence {
             let (history, credit) =
                 persistence.load_trigger_audit_history_with_read_memory(Some(read_memory))?;

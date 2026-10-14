@@ -1213,6 +1213,16 @@ impl RequestContext {
             .vector_copies
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // The vector store's membership and body decodes for this request are
+        // its own reads: fund them from its reader budget when no operation
+        // owner is active, never from the private default decode accountant.
+        let decode = crate::read_image_memory::active_owner().is_err().then(|| {
+            crate::read_image_memory::ImageMemory::charging_reader(
+                crate::read_image_memory::ImageMemory::default_decode_accountant(),
+                self.reader_budget.clone(),
+            )
+        });
+        let _decode = decode.as_ref().map(|decode| decode.enter());
         operation(&mut owner)
     }
 

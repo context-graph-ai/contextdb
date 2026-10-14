@@ -166,3 +166,9 @@ mod import_tail_survives_restart_without_history_reconstruction;
 mod opening_a_store_charges_the_reader_the_same_however_long_its_history;
 #[path = "engine_seams/opening_a_store_does_a_bounded_vector_journal_cleanup.rs"]
 mod opening_a_store_does_a_bounded_vector_journal_cleanup;
+#[path = "engine_seams/a_vector_search_decodes_under_its_request_owner.rs"]
+mod a_vector_search_decodes_under_its_request_owner;
+#[path = "engine_seams/reads_and_writes_are_charged_to_their_own_declared_limits.rs"]
+mod reads_and_writes_are_charged_to_their_own_declared_limits;
+#[path = "engine_seams/trigger_audit_history_is_charged_once_to_the_declared_reader.rs"]
+mod trigger_audit_history_is_charged_once_to_the_declared_reader;
