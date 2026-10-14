@@ -1306,6 +1306,7 @@ impl MaintenanceContext {
             // kept by a private reader at the shipped default.
             let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
                 crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                0,
             )?;
             let _decode = decode.enter();
             persistence.truncate_vector_partition_journal_through_catalog_with_checkpoint(

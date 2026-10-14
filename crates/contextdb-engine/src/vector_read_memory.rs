@@ -334,6 +334,24 @@ thread_local! {
     static READER_PARENTS_CREATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static UNOWNED_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn note_unowned_decode_for_test() {
+    UNOWNED_DECODES.with(|count| count.set(count.get() + 1));
+}
+
+/// Decodes on this thread so far that found no operation owner and were
+/// charged to the private default decode accountant instead.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn unowned_decodes_for_test() -> u64 {
+    UNOWNED_DECODES.with(std::cell::Cell::get)
+}
+
 /// Declared reader parents constructed on this thread so far. A caller that
 /// should be funded by an existing owner proves it created none by comparing
 /// this count before and after.
