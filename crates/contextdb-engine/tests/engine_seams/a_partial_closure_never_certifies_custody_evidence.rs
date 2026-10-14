@@ -52,11 +52,19 @@ fn all_keys(edge: &Database, prefix: &str) -> Vec<String> {
 /// Every read of `terminal` at this root, repeated and after mid-closure
 /// budget refusals, refuses as corruption.
 fn always_refused(edge: &Database, terminal: &str, case: &str) {
-    // An independent read at the damaged root warms the store's memo.
-    let warm = edge.__custody_keys_for_test(None, "delivery_root.v1.");
+    // An independent read at the damaged root that succeeds (manifests carry
+    // no admission or certificate companions) creates and warms the store's
+    // memo at this very root.
+    let warm = edge.__custody_keys_for_test(None, "delivery_manifest.v1.");
+    assert_eq!(
+        warm.as_ref().map(Vec::len).ok(),
+        Some(4),
+        "{case}: the warming read succeeds at the damaged root: {warm:?}"
+    );
+    let reached = edge.__custody_keys_for_test(None, "delivery_root.v1.");
     assert!(
-        warm.as_ref().is_err_and(corruption),
-        "{case}: the warming read reaches the damage: {warm:?}"
+        reached.as_ref().is_err_and(corruption),
+        "{case}: a read whose closure reaches the damage refuses: {reached:?}"
     );
     for attempt in 0..3 {
         let answer = edge.__custody_keys_for_test(None, terminal);
