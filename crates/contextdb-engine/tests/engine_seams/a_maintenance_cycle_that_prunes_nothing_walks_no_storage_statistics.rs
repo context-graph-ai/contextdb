@@ -242,7 +242,10 @@ fn observe(rows: usize, clock: &AtomicU64) -> Observation {
 
     // The diagnostic a caller explicitly asks for still walks and is exact.
     let (before, _) = db.__storage_statistics_pages_walked_for_test();
-    let on_demand_ratio = db.__storage_fragmentation_ratio_for_test().unwrap().unwrap();
+    let on_demand_ratio = db
+        .__storage_fragmentation_ratio_for_test()
+        .unwrap()
+        .unwrap();
     let on_demand_pages = db.__storage_statistics_pages_walked_for_test().0 - before;
     db.close().unwrap();
     drop(db);
@@ -334,7 +337,10 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
             );
         }
         assert!(
-            observation.reopen_recounts.iter().all(|recounts| *recounts == 0),
+            observation
+                .reopen_recounts
+                .iter()
+                .all(|recounts| *recounts == 0),
             "every reopen after a trimming clean close adopts the saved totals: {:?}",
             observation.reopen_recounts
         );
@@ -406,7 +412,10 @@ fn raw_payload_store(path: &std::path::Path, keep: impl Fn(u64) -> bool) {
 /// whether automatic compaction started.
 fn first_automatic_decision(path: &std::path::Path) -> (f64, f64, bool, Work) {
     let db = open(path);
-    let exact = db.__storage_fragmentation_ratio_for_test().unwrap().unwrap();
+    let exact = db
+        .__storage_fragmentation_ratio_for_test()
+        .unwrap()
+        .unwrap();
     let free = agreed_ratio(&db);
     println!(
         "{}: totals={:?}",

@@ -10,14 +10,14 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 
 #[path = "engine_seams/a_count_a_constraint_already_bounds_is_not_maintained.rs"]
 mod a_count_a_constraint_already_bounds_is_not_maintained;
-#[path = "engine_seams/a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics.rs"]
-mod a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics;
 #[path = "engine_seams/a_declared_count_is_the_only_count_an_append_writes.rs"]
 mod a_declared_count_is_the_only_count_an_append_writes;
 #[path = "engine_seams/a_held_savepoint_makes_every_commit_list_its_allocated_pages.rs"]
 mod a_held_savepoint_makes_every_commit_list_its_allocated_pages;
 #[path = "engine_seams/a_large_journal_cleanup_is_charged_to_the_writer.rs"]
 mod a_large_journal_cleanup_is_charged_to_the_writer;
+#[path = "engine_seams/a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics.rs"]
+mod a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics;
 #[path = "engine_seams/aggregate_reads_complete_across_bounded_pages.rs"]
 mod aggregate_reads_complete_across_bounded_pages;
 #[path = "engine_seams/an_arriving_count_declaration_meets_the_same_door_a_local_one_does.rs"]

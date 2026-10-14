@@ -1728,7 +1728,9 @@ fn allocator_free_totals_survive_an_intra_region_trim_at_close() {
     {
         let mut table = write.open_table(SMALL).expect("open small table");
         for key in 0..12u64 {
-            table.insert(key, vec![0x71_u8; 64 << 10].as_slice()).expect("insert");
+            table
+                .insert(key, vec![0x71_u8; 64 << 10].as_slice())
+                .expect("insert");
         }
     }
     write.commit().expect("commit small rows");
@@ -1751,10 +1753,21 @@ fn allocator_free_totals_survive_an_intra_region_trim_at_close() {
 
     let (db, rebuilds) = open_counting_rebuilds(&path);
     let (pages_after, regions_after) = geometry(&db);
-    println!("intra-region trim: pages {pages_before} -> {pages_after}, regions {regions_before} -> {regions_after}");
-    assert_eq!(rebuilds, 0, "totals saved before the trim are adopted after it");
-    assert_eq!(regions_after, regions_before, "an intra-region trim keeps every region");
-    assert!(pages_after < pages_before, "the close must actually trim the last region");
+    println!(
+        "intra-region trim: pages {pages_before} -> {pages_after}, regions {regions_before} -> {regions_after}"
+    );
+    assert_eq!(
+        rebuilds, 0,
+        "totals saved before the trim are adopted after it"
+    );
+    assert_eq!(
+        regions_after, regions_before,
+        "an intra-region trim keeps every region"
+    );
+    assert!(
+        pages_after < pages_before,
+        "the close must actually trim the last region"
+    );
     assert_totals_exact(&db, "after the intra-region trim");
 }
 
@@ -1779,7 +1792,10 @@ fn allocator_free_totals_survive_region_removing_trims_at_close_and_in_ordinary_
     let (db, rebuilds) = open_counting_rebuilds(&path);
     let (_, regions_after_close) = geometry(&db);
     println!("close trim: regions {regions_before_close} -> {regions_after_close}");
-    assert_eq!(rebuilds, 0, "a region-removing close saves adoptable totals");
+    assert_eq!(
+        rebuilds, 0,
+        "a region-removing close saves adoptable totals"
+    );
     assert_eq!(
         regions_after_close,
         regions_before_close - 1,
@@ -1805,7 +1821,10 @@ fn allocator_free_totals_survive_region_removing_trims_at_close_and_in_ordinary_
     assert_totals_exact(&db, "after the ordinary trimming commit");
     drop(db);
     let (db, rebuilds) = open_counting_rebuilds(&path);
-    assert_eq!(rebuilds, 0, "the close after an ordinary trim saves adoptable totals");
+    assert_eq!(
+        rebuilds, 0,
+        "the close after an ordinary trim saves adoptable totals"
+    );
     assert_eq!(geometry(&db).1, regions_after_trim);
     assert_totals_exact(&db, "reopen after the ordinary trim");
     assert_row(&db, 5, 0x35);
@@ -1834,10 +1853,22 @@ fn allocator_free_totals_reject_absent_or_malformed_saved_values() {
     let cases = [
         ("absent", redb::FreeTotalsSaveForTest::Omit),
         ("short", redb::FreeTotalsSaveForTest::Write(vec![1_u8; 23])),
-        ("format", redb::FreeTotalsSaveForTest::Write(encode(2, regions, pages, free))),
-        ("regions", redb::FreeTotalsSaveForTest::Write(encode(1, regions + 5, pages, free))),
-        ("pages", redb::FreeTotalsSaveForTest::Write(encode(1, regions, pages - 1, free))),
-        ("free", redb::FreeTotalsSaveForTest::Write(encode(1, regions, pages, pages + 1))),
+        (
+            "format",
+            redb::FreeTotalsSaveForTest::Write(encode(2, regions, pages, free)),
+        ),
+        (
+            "regions",
+            redb::FreeTotalsSaveForTest::Write(encode(1, regions + 5, pages, free)),
+        ),
+        (
+            "pages",
+            redb::FreeTotalsSaveForTest::Write(encode(1, regions, pages - 1, free)),
+        ),
+        (
+            "free",
+            redb::FreeTotalsSaveForTest::Write(encode(1, regions, pages, pages + 1)),
+        ),
     ];
     for (name, mode) in cases {
         let db = builder().open(&path).expect("open fixture");
@@ -1845,11 +1876,17 @@ fn allocator_free_totals_reject_absent_or_malformed_saved_values() {
         drop(db);
         redb::Database::set_free_totals_save_for_test(None);
         let (db, rebuilds) = open_counting_rebuilds(&path);
-        assert_eq!(rebuilds, 1, "{name}: the rejected saved value is rebuilt once");
+        assert_eq!(
+            rebuilds, 1,
+            "{name}: the rejected saved value is rebuilt once"
+        );
         assert_totals_exact(&db, name);
         drop(db);
         let (db, rebuilds) = open_counting_rebuilds(&path);
-        assert_eq!(rebuilds, 0, "{name}: the rebuilt totals are saved and adopted");
+        assert_eq!(
+            rebuilds, 0,
+            "{name}: the rebuilt totals are saved and adopted"
+        );
         assert_totals_exact(&db, name);
         drop(db);
     }
@@ -1862,10 +1899,15 @@ fn allocator_free_totals_reject_absent_or_malformed_saved_values() {
 fn allocator_free_totals_after_an_interrupted_save_are_rebuilt_by_repair() {
     let dir = tempfile::tempdir().expect("fixture directory");
     for (name, mode) in [
-        ("before encode", redb::FreeTotalsSaveForTest::FailBeforeEncode),
+        (
+            "before encode",
+            redb::FreeTotalsSaveForTest::FailBeforeEncode,
+        ),
         ("after encode", redb::FreeTotalsSaveForTest::FailAfterEncode),
     ] {
-        let path = dir.path().join(format!("interrupted-{}.redb", name.replace(' ', "-")));
+        let path = dir
+            .path()
+            .join(format!("interrupted-{}.redb", name.replace(' ', "-")));
         create_regions(&path, 4);
         let db = builder().open(&path).expect("open fixture");
         insert_rows(&db, 4..6, 0x46);
@@ -1874,7 +1916,10 @@ fn allocator_free_totals_after_an_interrupted_save_are_rebuilt_by_repair() {
         redb::Database::set_free_totals_save_for_test(None);
         let before = redb::Database::free_total_recounts_for_test();
         let (db, repaired) = reopen_with_repair(&path, name);
-        assert!(repaired, "{name}: the interrupted save leaves a store that needs repair");
+        assert!(
+            repaired,
+            "{name}: the interrupted save leaves a store that needs repair"
+        );
         assert_eq!(
             redb::Database::free_total_recounts_for_test() - before,
             1,
@@ -1917,7 +1962,10 @@ fn allocator_free_total_rebuild_fault_during_repair_refuses_the_open() {
         fault.hit() || fault.backend_read_failures.load(Ordering::SeqCst) > 0,
         "the injected fault must fire inside the rebuild"
     );
-    assert!(opened.is_err(), "a repair whose rebuild faults refuses the open");
+    assert!(
+        opened.is_err(),
+        "a repair whose rebuild faults refuses the open"
+    );
     drop(opened);
     assert_eq!(
         redb::Database::free_total_recounts_for_test(),
@@ -1942,7 +1990,11 @@ fn allocator_untrusted_free_totals_are_not_saved_and_rebuild_once_on_reopen() {
     let db = builder().create(&path).expect("create fixture");
     insert_rows(&db, 0..4, 0x31);
     db.distrust_allocator_free_totals_for_test();
-    assert_eq!(db.allocator_free_totals(), None, "untrusted totals are not published");
+    assert_eq!(
+        db.allocator_free_totals(),
+        None,
+        "untrusted totals are not published"
+    );
     insert_rows(&db, 4..5, 0x32);
     assert_eq!(
         db.allocator_free_totals(),
@@ -1951,11 +2003,17 @@ fn allocator_untrusted_free_totals_are_not_saved_and_rebuild_once_on_reopen() {
     );
     drop(db);
     let (db, rebuilds) = open_counting_rebuilds(&path);
-    assert_eq!(rebuilds, 1, "the unwritten saved value is rejected and rebuilt once");
+    assert_eq!(
+        rebuilds, 1,
+        "the unwritten saved value is rejected and rebuilt once"
+    );
     assert_totals_exact(&db, "rebuilt after an untrusted save");
     drop(db);
     let (db, rebuilds) = open_counting_rebuilds(&path);
-    assert_eq!(rebuilds, 0, "the rebuilt totals are saved by the next clean close");
+    assert_eq!(
+        rebuilds, 0,
+        "the rebuilt totals are saved by the next clean close"
+    );
     assert_totals_exact(&db, "adopted after rebuild");
 }
 
@@ -1983,7 +2041,10 @@ fn allocator_free_totals_after_poison_are_withheld_and_rebuilt_by_repair() {
 
     let before = redb::Database::free_total_recounts_for_test();
     let (db, repaired) = reopen_with_repair(&path, "repair the poisoned writer's store");
-    assert!(repaired, "the poisoned writer left a store that needs repair");
+    assert!(
+        repaired,
+        "the poisoned writer left a store that needs repair"
+    );
     assert_eq!(
         redb::Database::free_total_recounts_for_test() - before,
         1,
@@ -2035,7 +2096,10 @@ fn allocator_free_total_rebuild_fault_refuses_the_open_and_publishes_nothing() {
     );
 
     let (db, rebuilds) = open_counting_rebuilds(&path);
-    assert_eq!(rebuilds, 1, "nothing was saved, so the healthy open rebuilds once");
+    assert_eq!(
+        rebuilds, 1,
+        "nothing was saved, so the healthy open rebuilds once"
+    );
     assert_totals_exact(&db, "rebuilt after the refused open");
     assert_row(&db, 0, 0x35);
 }
@@ -2067,7 +2131,10 @@ fn allocator_free_total_geometry_costs_the_same_at_one_and_many_regions() {
             redb::Database::free_total_geometry_region_visits_for_test() - before,
         ));
     }
-    assert!(visits[1].0 > visits[0].0, "the fixtures differ in region count");
+    assert!(
+        visits[1].0 > visits[0].0,
+        "the fixtures differ in region count"
+    );
     assert_eq!(
         (visits[0].1, visits[1].1),
         (0, 0),

@@ -239,10 +239,7 @@ impl FreeTotals {
 
     /// Encode the totals as saved with the allocator state that describes the
     /// same snapshot, or `None` when they must not be saved.
-    pub(super) fn encode(
-        &self,
-        layout: &DatabaseLayout,
-    ) -> Option<[u8; FREE_TOTALS_ENCODED_LEN]> {
+    pub(super) fn encode(&self, layout: &DatabaseLayout) -> Option<[u8; FREE_TOTALS_ENCODED_LEN]> {
         if !self.trusted || self.region_pages != layout_pages(layout) {
             return None;
         }
@@ -741,7 +738,8 @@ impl Allocators {
             // Every region but the last is full, so the old page count is
             // arithmetic over the region count and the last region's length.
             None => self.regions.last().map_or(0, |last| {
-                (self.regions.len() as u64 - 1) * u64::from(new_layout.full_region_layout().num_pages())
+                (self.regions.len() as u64 - 1)
+                    * u64::from(new_layout.full_region_layout().num_pages())
                     + u64::from(last.len())
             }),
         };
