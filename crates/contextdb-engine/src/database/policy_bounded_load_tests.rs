@@ -186,6 +186,9 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
         matches!(refused, Error::MemoryBudgetExceeded { .. }),
         "the refusal is typed: {refused}"
     );
+    // Reading the durable outcome back is writer work: lift the refusal's
+    // budget first. Nothing runs in between.
+    db.set_memory_limit(None).expect("lift the budget");
     assert!(
         persistence
             .load_config_value::<crate::protocol::RefusedSchemaUnitOutcome>(&key)
@@ -193,7 +196,6 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
             .is_some(),
         "memory refusal leaves the durable outcome intact"
     );
-    db.set_memory_limit(None).expect("lift the budget");
     let fixture_operation_reader_6 = db
         .declared_reader_memory()
         .expect("admit the actual fixture reader");
@@ -368,6 +370,9 @@ fn a_large_held_replay_is_refused_without_removing_its_pending_record() {
         matches!(refused, Error::MemoryBudgetExceeded { .. }),
         "the refusal is typed: {refused}"
     );
+    // Reading the durable unit back is writer work: lift the refusal's
+    // budget first. Nothing runs in between.
+    db.set_memory_limit(None).expect("lift the budget");
     assert!(
         persistence
             .load_config_value::<DurablePolicyHeldData>(&key)
