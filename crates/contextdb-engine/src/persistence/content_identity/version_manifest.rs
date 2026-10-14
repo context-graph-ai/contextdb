@@ -1362,8 +1362,7 @@ pub(in super::super) fn writer_manifest_next_pending<O: ManifestOverlay + ?Sized
     let pending_first = pending.first_present_from(start, exclusive);
     let mut stored = writer_manifest_next(write, start, exclusive, admission)?;
     while stored.as_deref().is_some_and(|key| {
-        pending_first.is_none_or(|first| key < first)
-            && pending.latest_present(key) == Some(false)
+        pending_first.is_none_or(|first| key < first) && pending.latest_present(key) == Some(false)
     }) {
         let key = stored.take().expect("selected predecessor");
         stored = writer_manifest_next(write, &key, true, admission)?;
@@ -1373,8 +1372,7 @@ pub(in super::super) fn writer_manifest_next_pending<O: ManifestOverlay + ?Sized
     }
     // A stored member equal to the pending coordinate is present (its latest
     // delta adds it) and is preferred, as an authenticated candidate.
-    let selected =
-        pending_first.filter(|key| stored.as_deref().is_none_or(|stored| *key < stored));
+    let selected = pending_first.filter(|key| stored.as_deref().is_none_or(|stored| *key < stored));
     if let Some(key) = selected {
         admission.admit(key.len())?;
         let selected = key.to_vec();
@@ -1415,8 +1413,7 @@ pub(in super::super) mod commit_row_work {
     /// examines, a tree node the indexed overlay descends through while
     /// indexing or seeking) or one rebalancing step on an indexing path.
     pub(in super::super::super) fn count_overlay_comparisons(comparisons: usize) {
-        OVERLAY_COMPARISONS
-            .with(|count| count.set(count.get().saturating_add(comparisons as u64)));
+        OVERLAY_COMPARISONS.with(|count| count.set(count.get().saturating_add(comparisons as u64)));
     }
 
     pub(in super::super::super) fn take_overlay_comparisons() -> u64 {

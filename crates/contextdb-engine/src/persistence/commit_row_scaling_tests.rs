@@ -217,8 +217,7 @@ fn assert_linear(measured: Measured) {
             work.overlay_comparisons >= rows as u64,
             "every committed row consults the pending manifest overlay: {work:?}"
         );
-        let allowed =
-            OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL * rows as u64 * u64::from(rows.ilog2());
+        let allowed = OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL * rows as u64 * u64::from(rows.ilog2());
         assert!(
             work.overlay_comparisons <= allowed,
             "overlay comparisons exceed {OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL} N log2 N: \
