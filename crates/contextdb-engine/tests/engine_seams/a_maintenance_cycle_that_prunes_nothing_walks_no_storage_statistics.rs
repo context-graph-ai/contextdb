@@ -198,6 +198,19 @@ fn observe(rows: usize, clock: &AtomicU64) -> Observation {
         db.__allocator_free_totals_for_test().unwrap(),
     );
     assert_eq!(first.pruning.pruned_rows, 0, "no row reaches its window");
+    // The cycle writes and may grow the file; the growth stays at the end,
+    // where a trim gives it back, so nothing reads as reclaimable and no
+    // automatic compaction starts.
+    assert!(
+        !first.compaction.ran,
+        "a freshly compacted store starts no automatic compaction: {:?}",
+        first.compaction
+    );
+    let interior_free = agreed_ratio(&db);
+    assert!(
+        interior_free < 0.05,
+        "growth after a compaction stays trimmable tail space: interior_free={interior_free}"
+    );
 
     let before = work(&db);
     let started = std::time::Instant::now();
