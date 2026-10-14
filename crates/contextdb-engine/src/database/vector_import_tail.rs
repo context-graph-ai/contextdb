@@ -991,10 +991,45 @@ mod undeclared_limit_tests {
             crate::memory_accounting::set_process_ceiling_for_test(Some(PROCESS_CEILING));
             let db = Database::open_with_options(&path, options()).unwrap();
             assert_eq!(db.memory_limit(), None, "no writer limit is declared");
+            // Each serving-tail cohort's admitted vectors, as it enters.
+            let cohorts = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let sink = cohorts.clone();
+            let observation = crate::vector_observations::observe_import_tail_loads_for_test(
+                std::sync::Arc::new(move |event| {
+                    if event.site == "persist_import_vector_tail"
+                        && matches!(
+                            event.boundary,
+                            crate::vector_observations::ImportTailLoadBoundaryForTest::Enter
+                        )
+                    {
+                        sink.lock().push(event.cohort_vectors);
+                    }
+                    None
+                }),
+            );
             assert_eq!(
                 db.persist_import_vector_tails().unwrap(),
                 true,
                 "the suffix is absorbed in cohorts bounded by the process ceiling"
+            );
+            drop(observation);
+            let cohorts = std::mem::take(&mut *cohorts.lock());
+            let high_water = db.write_memory_high_water_for_test();
+            eprintln!(
+                "undeclared limit: {} cohorts, largest {:?} vectors, writer high water {high_water}",
+                cohorts.len(),
+                cohorts.iter().max()
+            );
+            assert!(cohorts.len() > 1, "the suffix is split: {cohorts:?}");
+            assert!(
+                cohorts
+                    .iter()
+                    .all(|vectors| vectors * DIMENSION * 4 <= PROCESS_CEILING / 16),
+                "no cohort's decoded vectors exceed a sixteenth of the effective limit: {cohorts:?}"
+            );
+            assert!(
+                high_water <= PROCESS_CEILING,
+                "the writer stays within the process ceiling: {high_water}"
             );
             assert_eq!(pending(&db), 0);
             db.close().unwrap();
