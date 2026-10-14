@@ -1316,13 +1316,7 @@ pub(crate) fn handle_meta_command(
         }
         ".maintenance" => {
             if rest == "status" {
-                return answer_metadata(
-                    session_handle,
-                    MetadataRequest::MaintenanceStatus,
-                    None,
-                    input,
-                    session,
-                );
+                return answer_maintenance_status(session_handle, input, session);
             }
             // Running a cycle and compacting CHANGE the store, so they are the
             // live database's to do; only a writing session ever reaches here,
@@ -1416,7 +1410,9 @@ pub(crate) fn handle_meta_command(
                                 render_optional_value(report.bytes_before),
                                 render_optional_value(report.bytes_after),
                                 report.file_shrank,
-                                report.fragmentation_before,
+                                report
+                                    .fragmentation_before
+                                    .map_or_else(|| "unknown".to_string(), |ratio| ratio.to_string()),
                             );
                         }
                     }
@@ -1604,6 +1600,78 @@ fn answer_metadata(
             MetaCommandOutcome::failed()
         }
     }
+}
+
+/// `.maintenance status`: the loop's state from the metadata door, plus the
+/// store's storage compaction settings with each value's source
+/// (`SHOW STORAGE_COMPACTION`, a read the same session answers).
+fn answer_maintenance_status(
+    session_handle: &Session,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    note_read_route(session_handle, input, session);
+    let answer = match session_handle
+        .reader()
+        .metadata(MetadataRequest::MaintenanceStatus, None)
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            report_error(&error, input);
+            return MetaCommandOutcome::failed();
+        }
+    };
+    let compaction = match session_handle
+        .reader()
+        .execute("SHOW STORAGE_COMPACTION", &HashMap::new())
+    {
+        Ok(result) => result,
+        Err(error) => {
+            report_error(&error, input);
+            return MetaCommandOutcome::failed();
+        }
+    };
+    let MetadataBody::MaintenanceStatus { status } = &answer.body else {
+        publish_metadata(&answer, input);
+        return MetaCommandOutcome::done();
+    };
+    let settings: Vec<(String, String, String)> = compaction
+        .rows
+        .iter()
+        .map(|row| {
+            let text = |value: &contextdb_core::Value| match value {
+                contextdb_core::Value::Text(text) => text.clone(),
+                contextdb_core::Value::Int64(number) => number.to_string(),
+                contextdb_core::Value::Float64(number) => number.to_string(),
+                other => format!("{other:?}"),
+            };
+            (text(&row[0]), text(&row[1]), text(&row[2]))
+        })
+        .collect();
+    if input.output.json {
+        json_output::print_document(&json_output::maintenance_status_with_compaction_document(
+            status, &settings,
+        ));
+    } else {
+        println!(
+            "running={} retention_enabled={} currency_compaction_enabled={} \
+             active_maintenance_loops={} policy={}",
+            status.running,
+            status.retention_enabled,
+            status.currency_compaction_enabled,
+            status.active_maintenance_loops,
+            status.policy,
+        );
+        println!(
+            "storage_compaction {}",
+            settings
+                .iter()
+                .map(|(setting, value, source)| format!("{setting}={value}({source})"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    MetaCommandOutcome::done()
 }
 
 /// One metadata answer, rendered for whoever is reading.

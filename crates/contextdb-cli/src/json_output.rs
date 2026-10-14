@@ -768,6 +768,32 @@ pub(crate) fn maintenance_status_body_document(status: &DirectMaintenanceStatus)
     })
 }
 
+/// `.maintenance status`: the loop's state plus each storage compaction
+/// setting with its value and source (`declared` or `default`).
+pub(crate) fn maintenance_status_with_compaction_document(
+    status: &DirectMaintenanceStatus,
+    settings: &[(String, String, String)],
+) -> Value {
+    let mut document = maintenance_status_body_document(status);
+    if let Some(maintenance) = document
+        .get_mut("maintenance")
+        .and_then(Value::as_object_mut)
+    {
+        maintenance.insert(
+            "storage_compaction".to_string(),
+            Value::Array(
+                settings
+                    .iter()
+                    .map(|(setting, value, source)| {
+                        json!({ "setting": setting, "value": value, "source": source })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    document
+}
+
 /// `.events status` from the door's body: one bounded page whose items each
 /// say which of the four declared things they are.
 pub(crate) fn events_status_body_document(
@@ -1205,6 +1231,10 @@ mod tests {
 
         let report = db.run_maintenance_cycle().unwrap();
         let document = maintenance_report_document(&report);
+        assert!(
+            document["maintenance_cycle"]["compaction"]["fragmentation_before"].is_null(),
+            "an in-memory store measures nothing, so the receipt says unknown, never 0: {document}"
+        );
         let detail = &document["maintenance_cycle"]["vector"]["first_failure_details"];
         assert_eq!(
             document["maintenance_cycle"]["vector"]["first_failure"],

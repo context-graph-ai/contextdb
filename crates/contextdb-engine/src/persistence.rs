@@ -13234,10 +13234,11 @@ fn decode_read_raw_string_table(
 /// Values needed to construct the committed image are held in one small
 /// writer-maintained table. Other configuration stays behind the retained
 /// snapshot for later point reads.
-const READ_IMAGE_OPEN_CONFIG_KEYS: [&str; 15] = [
+const READ_IMAGE_OPEN_CONFIG_KEYS: [&str; 16] = [
     "memory_limit",
     "disk_limit",
     crate::database::MAINTENANCE_POLL_INTERVAL_CONFIG_KEY,
+    crate::database::STORAGE_COMPACTION_CONFIG_KEY,
     crate::database::VECTOR_SERVING_CACHE_CONFIG_KEY,
     crate::database::RETENTION_SYNC_PEER_CONFIG_KEY,
     TRIGGER_AUDIT_RING_CONFIG_KEY,

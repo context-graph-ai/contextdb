@@ -2381,9 +2381,9 @@ struct Pre2Database {
     /// run through one derived handle must throttle the automatic path on
     /// every other handle onto the same database too.
     last_auto_compact_at: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Engine open-config, test-only override of [`AUTO_COMPACT_MIN_INTERVAL`]
-    /// — see `__set_auto_compact_min_interval_for_test`.
-    auto_compact_min_interval: Arc<Mutex<Duration>>,
+    /// The declared storage compaction policy (`SET STORAGE_COMPACTION`) and
+    /// the test-only interval override. Shared, like the stamp above.
+    storage_compaction_policy: Arc<Mutex<crate::database::StorageCompactionState>>,
     sync_watermark: Arc<AtomicLsn>,
     closed: AtomicBool,
     close_progress: Arc<Mutex<CloseProgress>>,

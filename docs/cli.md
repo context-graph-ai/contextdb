@@ -504,6 +504,21 @@ fields (`pruned_rows`, `rows_deferred_for_readers`, `reclaimed_bytes`,
 Compaction byte counts and duration depend on the file.
 <!-- enforced by: read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
 
+A compaction receipt's `fragmentation_before` is the share of the file a tidy-up could give
+back by moving pages. On the automatic path, that share is interior free pages over the pages
+a trim would leave, and compaction starts when it reaches the declared start ratio (0.5 by
+default; see `SET STORAGE_COMPACTION` in the query language reference). `.maintenance compact`
+reports the exact storage statistics ratio. When nothing was measured, the field is unknown:
+JSON `null`, text `fragmentation_before=unknown`. That covers a cycle that took no decision, a
+store whose allocator totals are not trusted, a failed measurement, and an in-memory store. It
+is never reported as 0.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::untrusted_free_page_totals_report_unknown_fragmentation_and_take_no_decision -->
+
+`.maintenance status` adds a `storage_compaction` list. Each entry is a `setting`, `value` and
+`source`; `source` is `declared` or `default`. The text form adds one line, for example
+`storage_compaction start_ratio=0.5(default) min_interval_ms=3600000(default) stop_ratio=0.05(default) max_sweeps=8(default)`.
+<!-- enforced by: read_cli_journeys_metadata::maintenance_status_and_explain_keep_their_own_document_keys -->
+
 ### Trace vs Explain
 
 `.explain <sql>` has three deliberately different paths. An ordinary relational `SELECT` or `WITH`

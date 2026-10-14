@@ -15053,9 +15053,9 @@ pub struct Database {
     /// run through one derived handle must throttle the automatic path on
     /// every other handle onto the same database too.
     last_auto_compact_at: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Engine open-config, test-only override of [`AUTO_COMPACT_MIN_INTERVAL`]
-    /// — see `__set_auto_compact_min_interval_for_test`.
-    auto_compact_min_interval: Arc<Mutex<Duration>>,
+    /// The declared storage compaction policy (`SET STORAGE_COMPACTION`) and
+    /// the test-only interval override. Shared, like the stamp above.
+    storage_compaction_policy: Arc<Mutex<crate::database::StorageCompactionState>>,
     sync_watermark: Arc<AtomicLsn>,
     closed: AtomicBool,
     close_progress: Arc<Mutex<CloseProgress>>,
@@ -19230,18 +19230,20 @@ pub struct PruningReport {
     /// Whether this cycle advanced durable storage compaction. A bounded
     /// sweep may require subsequent maintenance cycles to finish.
     pub compacted: bool,
-    /// The allocator's reclaimable free-page ratio (interior free pages over
-    /// the pages a trim would leave) as it stood BEFORE this cycle pruned anything — accumulated waste that
-    /// survived page reuse from earlier cycles, not the space this prune just
-    /// released. It counts whole free pages, the only space a relocation can
-    /// give back, not unused bytes inside live pages, and it is no promise
-    /// that this fraction of the file can be returned at once. `0.0` when the
-    /// allocator's totals are untrusted, a state that takes no decision. It is the
+    /// The share of the file a tidy-up could give back by moving pages
+    /// (interior free pages over the pages a trim would leave), as it stood
+    /// BEFORE this cycle pruned anything: accumulated waste that survived page
+    /// reuse from earlier cycles, not the space this prune just released. It
+    /// counts whole free pages, the only space a relocation can give back, not
+    /// unused bytes inside live pages, and it is no promise that this fraction
+    /// of the file can be returned at once. `None` (unknown) when nothing was
+    /// measured -- the allocator's totals were untrusted or the store is
+    /// in-memory -- and then no compaction decision is taken. It is the
     /// value the compaction decision was taken on, so a cycle that pruned rows
-    /// compacted exactly when this reached
-    /// [`REDB_COMPACT_FRAGMENTATION_THRESHOLD`]. A cycle that pruned NOTHING
-    /// never compacts, whatever this reads.
-    pub fragmentation_before: f64,
+    /// compacted exactly when this reached the declared start ratio
+    /// ([`StorageCompactionPolicy::start_ratio`], 0.5 by default). A cycle that
+    /// pruned NOTHING never compacts, whatever this reads.
+    pub fragmentation_before: Option<f64>,
     /// Rows carrying a timestamp further into the future than
     /// [`RETENTION_CLOCK_SKEW_TOLERANCE`]. They are never pruned early — and
     /// never silently pinned either: every cycle they stay future-dated counts
@@ -23571,7 +23573,7 @@ pub(crate) struct MaintenanceContext {
     retention_deferred_edge_nodes: Arc<Mutex<RetentionDeferredEdges>>,
     last_maintenance_cycle_at: Arc<Mutex<Option<std::time::Instant>>>,
     last_auto_compact_at: Arc<Mutex<Option<std::time::Instant>>>,
-    auto_compact_min_interval: Arc<Mutex<Duration>>,
+    storage_compaction_policy: Arc<Mutex<crate::database::StorageCompactionState>>,
     /// Shared with the `Database` handle (same `Arc`) -- see that field's
     /// doc comment.
     #[cfg(any(test, feature = "test-seams"))]
@@ -23744,7 +23746,7 @@ impl MaintenanceCleanup {
                     }
                     23 => {
                         std::ptr::drop_in_place(std::ptr::addr_of_mut!(
-                            (*self.source).auto_compact_min_interval
+                            (*self.source).storage_compaction_policy
                         ));
                     }
                     24 => {
@@ -24379,7 +24381,8 @@ impl MaintenanceContext {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(CompactionReport::default());
         };
-        let min_interval = *self.auto_compact_min_interval.lock();
+        let policy = *self.storage_compaction_policy.lock();
+        let min_interval = policy.min_interval();
         let due = self
             .last_auto_compact_at
             .lock()
@@ -24398,12 +24401,13 @@ impl MaintenanceContext {
                 AUTOMATIC_COMPACTION_CHECKS.with(|checks| checks.set(checks.get() + 1));
                 match persistence.allocator_free_page_ratio()? {
                     Some(ratio) => ratio,
+                    // Untrusted totals: nothing measured, no decision taken,
+                    // and the receipt says unknown.
                     None => return Ok(CompactionReport::default()),
                 }
             }
         };
-        if previous_sample.is_none() && fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD
-        {
+        if previous_sample.is_none() && fragmentation_before < policy.declared.start_ratio() {
             // A completed negative check starts the interval just as a
             // completed sweep does.
             *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
@@ -24429,7 +24433,7 @@ impl MaintenanceContext {
             bytes_before,
             bytes_after,
             file_shrank: matches!((bytes_before, bytes_after), (Some(b), Some(a)) if a < b),
-            fragmentation_before,
+            fragmentation_before: Some(fragmentation_before),
             handle_recycled: handle_recycle_micros.is_some(),
             handle_recycle_micros: handle_recycle_micros.unwrap_or(0),
         })
@@ -25044,7 +25048,7 @@ impl MaintenanceContext {
                 retention_source_admission_error(error, RetentionPreparation::Prune)
             })?;
         report.file_bytes_before = file_bytes_before;
-        report.fragmentation_before = fragmentation_before.unwrap_or(0.0);
+        report.fragmentation_before = fragmentation_before;
         // Compaction itself still runs AFTER the prune (there is no point
         // rewriting the file before the rows leave it) and OUTSIDE the commit
         // lock: redb compaction takes the redb mutex with `&mut` and must not
@@ -25055,7 +25059,7 @@ impl MaintenanceContext {
         if report.pruned_rows > 0
             && let Some(persistence) = self.persistence.as_ref()
             && let Some(fragmentation_before) = fragmentation_before
-            && fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD
+            && fragmentation_before >= self.storage_compaction_policy.lock().declared.start_ratio()
         {
             let (progress, _) = publish_storage_compaction_batch(
                 &self.tx_mgr,
@@ -27121,7 +27125,14 @@ pub struct CompactionReport {
     pub bytes_before: Option<u64>,
     pub bytes_after: Option<u64>,
     pub file_shrank: bool,
-    pub fragmentation_before: f64,
+    /// The share of the file a tidy-up could give back by moving pages, as
+    /// measured for this call's decision. On the automatic path it is the
+    /// allocator's reclaimable free-page ratio compared with the declared start
+    /// ratio (0.5 by default); for an explicit compaction it is the exact
+    /// storage statistics ratio. `None` (unknown) when nothing was measured: no
+    /// decision was due, the allocator's totals were untrusted, the exact
+    /// measurement failed, or the store has no file.
+    pub fragmentation_before: Option<f64>,
     /// Whether the redb handle was closed and reopened as part of this
     /// compaction — see `RedbPersistence::compact`'s doc comment for why
     /// this is bundled into every compaction rather than left optional: a
@@ -27156,10 +27167,88 @@ pub const AUTO_COMPACT_MIN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Explicit compaction ([`Database::compact_now`]) repeats its sweep while
 /// more than this fraction of the file that a trim would leave is interior
-/// free pages and the previous sweep still shrank the file.
-const EXPLICIT_COMPACTION_TIGHT_RATIO: f64 = 0.05;
-/// The most sweeps one explicit compaction runs.
-const EXPLICIT_COMPACTION_MAX_SWEEPS: usize = 8;
+/// free pages and the previous sweep still shrank the file. The default of
+/// the declarable `STOP_RATIO`.
+pub const EXPLICIT_COMPACTION_TIGHT_RATIO: f64 = 0.05;
+/// The most sweeps one explicit compaction runs. The default of the
+/// declarable `MAX_SWEEPS`.
+pub const EXPLICIT_COMPACTION_MAX_SWEEPS: u32 = 8;
+
+/// Local configuration key of the declared [`StorageCompactionPolicy`].
+pub(crate) const STORAGE_COMPACTION_CONFIG_KEY: &str = "storage_compaction_policy";
+
+/// The storage compaction settings a store declared with
+/// `SET STORAGE_COMPACTION`. A field left `None` is undeclared and uses
+/// today's default, which `SHOW STORAGE_COMPACTION` reports with source
+/// `default`. Local store configuration: persisted with the store, never
+/// part of the schema and never synced.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct StorageCompactionPolicy {
+    /// Reclaimable share of the file at which automatic and pruning
+    /// compaction start ([`REDB_COMPACT_FRAGMENTATION_THRESHOLD`] by default).
+    pub start_ratio: Option<f64>,
+    /// Minimum time between automatic compaction attempts, in milliseconds
+    /// ([`AUTO_COMPACT_MIN_INTERVAL`] by default). Zero checks every cycle.
+    pub min_interval_ms: Option<u64>,
+    /// Explicit compaction stops sweeping once the reclaimable share is below
+    /// this ([`EXPLICIT_COMPACTION_TIGHT_RATIO`] by default).
+    pub stop_ratio: Option<f64>,
+    /// The most sweeps one explicit compaction runs
+    /// ([`EXPLICIT_COMPACTION_MAX_SWEEPS`] by default).
+    pub max_sweeps: Option<u32>,
+}
+
+impl StorageCompactionPolicy {
+    pub fn start_ratio(&self) -> f64 {
+        self.start_ratio
+            .unwrap_or(REDB_COMPACT_FRAGMENTATION_THRESHOLD)
+    }
+
+    pub fn min_interval(&self) -> Duration {
+        self.min_interval_ms
+            .map_or(AUTO_COMPACT_MIN_INTERVAL, Duration::from_millis)
+    }
+
+    pub fn stop_ratio(&self) -> f64 {
+        self.stop_ratio.unwrap_or(EXPLICIT_COMPACTION_TIGHT_RATIO)
+    }
+
+    pub fn max_sweeps(&self) -> u32 {
+        self.max_sweeps.unwrap_or(EXPLICIT_COMPACTION_MAX_SWEEPS)
+    }
+
+    /// Declare the clauses one statement named; omitted clauses keep their
+    /// current value.
+    fn declare(&mut self, clauses: contextdb_parser::StorageCompactionClauses) {
+        if clauses.start_ratio.is_some() {
+            self.start_ratio = clauses.start_ratio;
+        }
+        if clauses.min_interval_ms.is_some() {
+            self.min_interval_ms = clauses.min_interval_ms;
+        }
+        if clauses.stop_ratio.is_some() {
+            self.stop_ratio = clauses.stop_ratio;
+        }
+        if clauses.max_sweeps.is_some() {
+            self.max_sweeps = clauses.max_sweeps;
+        }
+    }
+}
+
+/// The declared policy shared by every handle onto one database, plus the
+/// test-only override of the automatic interval.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StorageCompactionState {
+    pub(crate) declared: StorageCompactionPolicy,
+    pub(crate) min_interval_override: Option<Duration>,
+}
+
+impl StorageCompactionState {
+    pub(crate) fn min_interval(&self) -> Duration {
+        self.min_interval_override
+            .unwrap_or_else(|| self.declared.min_interval())
+    }
+}
 
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
@@ -28541,8 +28630,8 @@ impl Database {
                 }
 
                 {
-                    std::ptr::addr_of_mut!((*construction.source).auto_compact_min_interval)
-                        .write(Arc::new(Mutex::new(AUTO_COMPACT_MIN_INTERVAL)));
+                    std::ptr::addr_of_mut!((*construction.source).storage_compaction_policy)
+                        .write(Arc::new(Mutex::new(StorageCompactionState::default())));
                     construction.initialized[105] = true;
                     #[cfg(test)]
                     r1_database_field_for_test(105);
@@ -30725,8 +30814,8 @@ impl Database {
                 }
 
                 {
-                    std::ptr::addr_of_mut!((*construction.source).auto_compact_min_interval)
-                        .write(self.auto_compact_min_interval.clone());
+                    std::ptr::addr_of_mut!((*construction.source).storage_compaction_policy)
+                        .write(self.storage_compaction_policy.clone());
                     construction.initialized[105] = true;
                     #[cfg(test)]
                     r1_database_field_for_test(105);
@@ -31351,6 +31440,11 @@ impl Database {
             .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
         db.vector_serving_cache_bytes
             .store(persisted_vector_serving_cache_bytes, Ordering::SeqCst);
+        if let Some(declared) =
+            persistence.load_config_value::<StorageCompactionPolicy>(STORAGE_COMPACTION_CONFIG_KEY)?
+        {
+            db.storage_compaction_policy.lock().declared = declared;
+        }
 
         for meta in all_meta.values() {
             if !meta.dag_edge_types.is_empty() {
@@ -31480,6 +31574,9 @@ impl Database {
             >(bytes)?),
             None => None,
         };
+        let persisted_storage_compaction = config_value(STORAGE_COMPACTION_CONFIG_KEY)
+            .map(crate::persistence::RedbPersistence::decode_config_value::<StorageCompactionPolicy>)
+            .transpose()?;
         let persisted_maintenance_poll_interval_ms =
             config_value(MAINTENANCE_POLL_INTERVAL_CONFIG_KEY)
                 .map(crate::persistence::RedbPersistence::decode_config_value::<u64>)
@@ -31720,6 +31817,9 @@ impl Database {
             .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
         db.vector_serving_cache_bytes
             .store(persisted_vector_serving_cache_bytes, Ordering::SeqCst);
+        if let Some(declared) = persisted_storage_compaction {
+            db.storage_compaction_policy.lock().declared = declared;
+        }
         // The sealed read image retains its durable destination,
         // so bindings and scoped custody credit agree with the live database.
         *db.retention_sync_peer.lock() = startup
@@ -65460,9 +65560,10 @@ impl Database {
     /// Explicit operator compaction drains finite relocation transactions,
     /// allowing recording and reads between batches. It bypasses the automatic
     /// fragmentation/interval gates and resets that interval on completion.
-    /// It repeats whole sweeps until interior free pages are below 5% of the
-    /// file or a further sweep stops shrinking it (at most eight), so it ends
-    /// with the file close to its data rather than with a first sweep's
+    /// It repeats whole sweeps until interior free pages are below the
+    /// declared stop ratio (5% by default) or a further sweep stops shrinking
+    /// the file, at most the declared number of sweeps (8 by default), so it
+    /// ends with the file close to its data rather than with a first sweep's
     /// copies pinning the end.
     /// The storage handle is recycled only when no storage reader owns it;
     /// otherwise existing snapshots retain their handle and source pages.
@@ -65479,8 +65580,11 @@ impl Database {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(CompactionReport::default());
         };
-        let fragmentation_before = persistence.fragmentation_ratio().unwrap_or(0.0);
+        // Explicit compaction measures exactly; a failed measurement is
+        // reported unknown, and the sweep itself does not depend on it.
+        let fragmentation_before = persistence.fragmentation_ratio().ok();
         let bytes_before = self.disk_file_size();
+        let policy = self.storage_compaction_policy.lock().declared;
         if !self.vector_store.has_durable_memberships() {
             let memberships = persistence.load_vector_partition_memberships()?;
             let raw_loaders = durable_raw_vector_partitions(
@@ -65505,7 +65609,7 @@ impl Database {
         let mut sweep_bytes_before = bytes_before;
         #[cfg(any(test, feature = "test-seams"))]
         EXPLICIT_COMPACTION_SWEEPS.with(|sweeps| sweeps.set(0));
-        for sweep in 0..EXPLICIT_COMPACTION_MAX_SWEEPS {
+        for sweep in 0..policy.max_sweeps() {
             #[cfg(any(test, feature = "test-seams"))]
             EXPLICIT_COMPACTION_SWEEPS.with(|sweeps| sweeps.set(sweeps.get() + 1));
             recycled = loop {
@@ -65514,7 +65618,7 @@ impl Database {
                     persistence,
                     &self.finalization.accountant,
                     &self.publication_interrupted,
-                    fragmentation_before,
+                    fragmentation_before.unwrap_or(0.0),
                 )?;
                 if progress.complete {
                     break recycled;
@@ -65527,7 +65631,7 @@ impl Database {
                 (Some(before), Some(after)) if after < before
             );
             let interior_free = persistence.allocator_free_page_ratio()?.unwrap_or(0.0);
-            if interior_free < EXPLICIT_COMPACTION_TIGHT_RATIO || (sweep > 0 && !shrank) {
+            if interior_free < policy.stop_ratio() || (sweep > 0 && !shrank) {
                 break;
             }
             sweep_bytes_before = sweep_bytes_after;
@@ -65558,7 +65662,7 @@ impl Database {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __set_auto_compact_min_interval_for_test(&self, interval: Duration) {
-        *self.auto_compact_min_interval.lock() = interval;
+        self.storage_compaction_policy.lock().min_interval_override = Some(interval);
     }
 
     /// Whether storage maintenance has more batches, followed by actual
@@ -65752,6 +65856,43 @@ impl Database {
         }
         self.vector_serving_cache_bytes
             .store(stored, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The storage compaction policy this store declares; undeclared fields
+    /// are `None` and use today's defaults.
+    pub fn storage_compaction_policy(&self) -> StorageCompactionPolicy {
+        self.storage_compaction_policy.lock().declared
+    }
+
+    /// Declare, persist and apply storage compaction settings
+    /// (`SET STORAGE_COMPACTION`). Clauses a statement omits keep their
+    /// value; `Default` returns every setting to its default and removes the
+    /// persisted declaration, so defaults stay silent.
+    pub fn set_storage_compaction(
+        &self,
+        setting: &contextdb_parser::StorageCompactionSetting,
+    ) -> Result<()> {
+        let _operation = self.open_operation()?;
+        let mut next = self.storage_compaction_policy();
+        match setting {
+            contextdb_parser::StorageCompactionSetting::Default => {
+                next = StorageCompactionPolicy::default();
+            }
+            contextdb_parser::StorageCompactionSetting::Declare(clauses) => next.declare(*clauses),
+        }
+        if let Some(persistence) = &self.persistence {
+            if next == StorageCompactionPolicy::default() {
+                self.publish_direct_metadata(|| {
+                    persistence.remove_config_value(STORAGE_COMPACTION_CONFIG_KEY)
+                })?;
+            } else {
+                self.publish_direct_metadata(|| {
+                    persistence.flush_config_value(STORAGE_COMPACTION_CONFIG_KEY, &next)
+                })?;
+            }
+        }
+        self.storage_compaction_policy.lock().declared = next;
         Ok(())
     }
 
@@ -66782,8 +66923,8 @@ impl Database {
                 }
 
                 {
-                    std::ptr::addr_of_mut!((*construction.source).auto_compact_min_interval)
-                        .write(self.auto_compact_min_interval.clone());
+                    std::ptr::addr_of_mut!((*construction.source).storage_compaction_policy)
+                        .write(self.storage_compaction_policy.clone());
                     construction.initialized[23] = true;
                 }
 
@@ -89916,7 +90057,7 @@ impl DatabaseConstruction {
                     }
                     105 => {
                         std::ptr::drop_in_place(std::ptr::addr_of_mut!(
-                            (*self.source).auto_compact_min_interval
+                            (*self.source).storage_compaction_policy
                         ));
                     }
                     106 => {

@@ -43,6 +43,8 @@ stmt = _{
     | show_maintenance_poll_interval
     | set_vector_serving_cache
     | show_vector_serving_cache
+    | set_storage_compaction
+    | show_storage_compaction
     | select_stmt
 }
 
@@ -89,6 +91,23 @@ show_vector_serving_cache = { ^"SHOW" ~ ^"VECTOR_SERVING_CACHE" }
 // suffixed size still parses as one.
 vector_serving_cache_value = { ^"none" | size_with_unit | integer }
 size_with_unit = { ASCII_DIGIT+ ~ ("G" | "M" | "K") }
+set_storage_compaction = {
+    ^"SET" ~ ^"STORAGE_COMPACTION" ~ (storage_compaction_default | storage_compaction_clause+)
+}
+show_storage_compaction = { ^"SHOW" ~ ^"STORAGE_COMPACTION" }
+storage_compaction_default = { ^"DEFAULT" }
+storage_compaction_clause = _{
+    storage_compaction_start_ratio
+    | storage_compaction_min_interval
+    | storage_compaction_stop_ratio
+    | storage_compaction_max_sweeps
+}
+storage_compaction_start_ratio = { ^"START_RATIO" ~ storage_compaction_ratio }
+storage_compaction_stop_ratio = { ^"STOP_RATIO" ~ storage_compaction_ratio }
+storage_compaction_ratio = { float | integer }
+storage_compaction_min_interval = { ^"MIN_INTERVAL" ~ integer ~ storage_compaction_interval_unit }
+storage_compaction_interval_unit = { ^"MILLISECONDS" | ^"SECONDS" | ^"MINUTES" | ^"HOURS" }
+storage_compaction_max_sweeps = { ^"MAX_SWEEPS" ~ integer }
 
 begin_stmt = { ^"BEGIN" }
 commit_stmt = { ^"COMMIT" }

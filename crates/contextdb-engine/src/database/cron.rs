@@ -1784,8 +1784,8 @@ impl Database {
                 }
 
                 {
-                    std::ptr::addr_of_mut!((*construction.source).auto_compact_min_interval)
-                        .write(self.auto_compact_min_interval.clone());
+                    std::ptr::addr_of_mut!((*construction.source).storage_compaction_policy)
+                        .write(self.storage_compaction_policy.clone());
                     construction.initialized[105] = true;
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(105);

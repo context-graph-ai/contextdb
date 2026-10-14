@@ -547,9 +547,11 @@ fn c7_compaction_rides_the_same_fragmentation_threshold_as_the_currency_path() {
         let cycle = db.run_pruning_cycle_checked().expect("prune cycle");
         assert_eq!(
             cycle.compacted,
-            cycle.fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD,
+            cycle
+                .fragmentation_before
+                .is_some_and(|ratio| ratio >= REDB_COMPACT_FRAGMENTATION_THRESHOLD),
             "compaction must trigger exactly on the shared threshold \
-             ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}), fragmentation was {}: {cycle:?}",
+             ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}), fragmentation was {:?}: {cycle:?}",
             cycle.fragmentation_before
         );
         if cycle.compacted {
@@ -665,7 +667,9 @@ fn c7_a_small_prune_on_a_live_file_reports_its_compaction_decision_honestly() {
     );
     assert_eq!(
         report.compacted,
-        report.fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD,
+        report
+            .fragmentation_before
+            .is_some_and(|ratio| ratio >= REDB_COMPACT_FRAGMENTATION_THRESHOLD),
         "the compaction decision must ride the shared threshold \
          ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}) in BOTH directions, whatever \
          ratio the file measures: {report:?}"

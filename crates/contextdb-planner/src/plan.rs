@@ -2,7 +2,7 @@ use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
     AlterAction, ColumnDef, ColumnRef, CompositeForeignKey, Cte, Expr, OnConflict, RetainOption,
     RowNumberWindow, SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef,
-    VectorSearchMode, WindowBindingId,
+    StorageCompactionSetting, VectorSearchMode, WindowBindingId,
 };
 
 /// ROW_NUMBER produces SQL INTEGER values represented as Value::Int64.
@@ -124,6 +124,8 @@ pub enum PhysicalPlan {
     ShowMaintenancePollInterval,
     SetVectorServingCache(Option<u64>),
     ShowVectorServingCache,
+    SetStorageCompaction(StorageCompactionSetting),
+    ShowStorageCompaction,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicyPlan),

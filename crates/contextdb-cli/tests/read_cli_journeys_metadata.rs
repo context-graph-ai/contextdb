@@ -293,6 +293,29 @@ fn maintenance_status_and_explain_keep_their_own_document_keys() {
     assert_eq!(maintenance["retention_enabled"], false);
     assert_eq!(maintenance["currency_compaction_enabled"], false);
     assert_eq!(maintenance["active_maintenance_loops"], 0);
+    let storage_compaction = maintenance["storage_compaction"]
+        .as_array()
+        .expect("`.maintenance status` lists the storage compaction settings");
+    let settings: Vec<(&str, &str, &str)> = storage_compaction
+        .iter()
+        .map(|setting| {
+            (
+                setting["setting"].as_str().unwrap(),
+                setting["value"].as_str().unwrap(),
+                setting["source"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        settings,
+        vec![
+            ("start_ratio", "0.5", "default"),
+            ("min_interval_ms", "3600000", "default"),
+            ("stop_ratio", "0.05", "default"),
+            ("max_sweeps", "8", "default"),
+        ],
+        "an undeclared store shows today's defaults with their source"
+    );
     expect_document(&docs, "explain", "`.explain` under --json");
 
     let text = run(&[store.path_str()], ".maintenance status\n");
@@ -303,6 +326,8 @@ fn maintenance_status_and_explain_keep_their_own_document_keys() {
         "currency_compaction_enabled=false",
         "active_maintenance_loops=0",
         "policy=engine_owned",
+        "storage_compaction start_ratio=0.5(default) min_interval_ms=3600000(default) \
+         stop_ratio=0.05(default) max_sweeps=8(default)",
     ] {
         assert!(
             text.stdout.contains(field),

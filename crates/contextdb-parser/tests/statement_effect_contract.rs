@@ -72,6 +72,8 @@ fn statement_variant(statement: &Statement) -> &'static str {
         Statement::ShowMaintenancePollInterval => "SHOW MAINTENANCE_POLL_INTERVAL",
         Statement::SetVectorServingCache(_) => "SET VECTOR_SERVING_CACHE",
         Statement::ShowVectorServingCache => "SHOW VECTOR_SERVING_CACHE",
+        Statement::SetStorageCompaction(_) => "SET STORAGE_COMPACTION",
+        Statement::ShowStorageCompaction => "SHOW STORAGE_COMPACTION",
         Statement::ShowSyncConflictPolicy => "SHOW SYNC_CONFLICT_POLICY",
         Statement::ShowVectorIndexes => "SHOW VECTOR_INDEXES",
         Statement::ShowVectorPartitions { .. } => "SHOW VECTOR_PARTITIONS",
@@ -198,6 +200,16 @@ fn statement_effect_marks_only_the_inspection_variants_as_reads() {
         (
             "SHOW VECTOR_SERVING_CACHE",
             "SHOW VECTOR_SERVING_CACHE",
+            StatementEffect::Read,
+        ),
+        (
+            "SET STORAGE_COMPACTION",
+            "SET STORAGE_COMPACTION START_RATIO 0.4 MAX_SWEEPS 4",
+            StatementEffect::Write,
+        ),
+        (
+            "SHOW STORAGE_COMPACTION",
+            "SHOW STORAGE_COMPACTION",
             StatementEffect::Read,
         ),
         (

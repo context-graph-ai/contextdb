@@ -432,6 +432,30 @@ persisted interval.
 For a file-backed database the value persists and governs later opens. Time wakes the engine-owned
 worker; the declared per-column thresholds decide whether vector consolidation runs.
 
+```sql
+SET STORAGE_COMPACTION START_RATIO 0.4 MIN_INTERVAL 30 MINUTES;
+SET STORAGE_COMPACTION STOP_RATIO 0.02 MAX_SWEEPS 4;
+SET STORAGE_COMPACTION DEFAULT;
+SHOW STORAGE_COMPACTION;
+```
+
+Storage compaction is a per-store setting, like the polling interval: local configuration, not
+schema, and never synced. Undeclared values use these defaults:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `START_RATIO` | 0.5 | Automatic and post-prune compaction start once the share of the file a tidy-up could give back by moving pages reaches this. That share is interior free pages over the pages a trim would leave. Must be greater than 0 and less than 1. |
+| `MIN_INTERVAL` | 1 hour | Minimum time between automatic attempts. A check that finds the file below the start ratio also starts the interval. Takes `MILLISECONDS`, `SECONDS`, `MINUTES` or `HOURS`. `0` checks every cycle. |
+| `STOP_RATIO` | 0.05 | Explicit compaction (`.maintenance compact`) keeps sweeping while the share is above this and a sweep still shrinks the file. At least 0 and less than 1. |
+| `MAX_SWEEPS` | 8 | The most sweeps one explicit compaction runs. At least 1. |
+
+Each `SET STORAGE_COMPACTION` names only the clauses it changes; the others keep their values.
+`SET STORAGE_COMPACTION DEFAULT` returns every setting to its default and removes the
+declaration. `SHOW STORAGE_COMPACTION` returns one row per setting with `setting`, `value` and
+`source`; `source` is `declared` or `default`. For a file-backed database the declaration
+persists across opens. `.maintenance status` shows the same values and sources.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::storage_compaction_declarations_show_their_source_and_survive_reopen, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_start_ratio_changes_when_automatic_compaction_starts, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_stop_rule_changes_how_many_sweeps_compact_now_runs, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::a_declared_minimum_interval_changes_when_a_negative_check_repeats -->
+
 ---
 
 Schema inspection preserves authored `CONTEXT_ID`, `SCOPE_LABEL (...)`, and

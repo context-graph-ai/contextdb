@@ -159,7 +159,7 @@ struct Observation {
     open_captures: u64,
     cycles: Vec<Work>,
     pruned_rows: Vec<u64>,
-    pruning_ratios: Vec<(f64, f64)>,
+    pruning_ratios: Vec<(Option<f64>, f64)>,
     reopen_recounts: Vec<u64>,
     on_demand_pages: u64,
     on_demand_ratio: f64,
@@ -352,7 +352,8 @@ fn a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics_as_the_st
         );
         for (reported, before) in &observation.pruning_ratios {
             assert_eq!(
-                reported, before,
+                *reported,
+                Some(*before),
                 "a pruning cycle reports the allocator free-page ratio the store had \
                  just before it pruned"
             );

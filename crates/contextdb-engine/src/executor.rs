@@ -6690,6 +6690,51 @@ fn execute_plan_once(
             trace: crate::database::QueryTrace::scan(),
             cascade: None,
         })),
+        PhysicalPlan::SetStorageCompaction(setting) => {
+            db.set_storage_compaction(setting)?;
+            Ok(OwnedQueryResult::empty())
+        }
+        PhysicalPlan::ShowStorageCompaction => {
+            let policy = db.storage_compaction_policy();
+            let source = |declared: bool| {
+                Value::Text(if declared { "declared" } else { "default" }.to_string())
+            };
+            let setting = |name: &str| Value::Text(name.to_string());
+            Ok(OwnedQueryResult::new(QueryResult {
+                columns: vec![
+                    "setting".to_string(),
+                    "value".to_string(),
+                    "source".to_string(),
+                ],
+                rows: vec![
+                    vec![
+                        setting("start_ratio"),
+                        Value::Float64(policy.start_ratio()),
+                        source(policy.start_ratio.is_some()),
+                    ],
+                    vec![
+                        setting("min_interval_ms"),
+                        Value::Int64(
+                            i64::try_from(policy.min_interval().as_millis()).unwrap_or(i64::MAX),
+                        ),
+                        source(policy.min_interval_ms.is_some()),
+                    ],
+                    vec![
+                        setting("stop_ratio"),
+                        Value::Float64(policy.stop_ratio()),
+                        source(policy.stop_ratio.is_some()),
+                    ],
+                    vec![
+                        setting("max_sweeps"),
+                        Value::Int64(i64::from(policy.max_sweeps())),
+                        source(policy.max_sweeps.is_some()),
+                    ],
+                ],
+                rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
+            }))
+        }
         PhysicalPlan::ShowMaintenancePollInterval => Ok(OwnedQueryResult::new(QueryResult {
             columns: vec!["milliseconds".to_string()],
             rows: vec![vec![Value::Int64(

@@ -11231,6 +11231,7 @@ fn ensure_supported_plan(plan: &PhysicalPlan) -> std::result::Result<(), Bounded
         | PhysicalPlan::ShowContentSize
         | PhysicalPlan::ShowMaintenancePollInterval
         | PhysicalPlan::ShowVectorServingCache
+        | PhysicalPlan::ShowStorageCompaction
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }
@@ -13140,6 +13141,7 @@ fn build_kernel_with_ctes<'plan>(
         | PhysicalPlan::ShowContentSize
         | PhysicalPlan::ShowMaintenancePollInterval
         | PhysicalPlan::ShowVectorServingCache
+        | PhysicalPlan::ShowStorageCompaction
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }

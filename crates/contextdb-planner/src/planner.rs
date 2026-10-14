@@ -103,6 +103,10 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::ShowMaintenancePollInterval => Ok(PhysicalPlan::ShowMaintenancePollInterval),
         Statement::SetVectorServingCache(bytes) => Ok(PhysicalPlan::SetVectorServingCache(*bytes)),
         Statement::ShowVectorServingCache => Ok(PhysicalPlan::ShowVectorServingCache),
+        Statement::SetStorageCompaction(setting) => {
+            Ok(PhysicalPlan::SetStorageCompaction(setting.clone()))
+        }
+        Statement::ShowStorageCompaction => Ok(PhysicalPlan::ShowStorageCompaction),
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
         Statement::DeclareTenantTablePolicy(declaration) => Ok(

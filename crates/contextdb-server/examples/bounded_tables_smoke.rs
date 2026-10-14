@@ -1454,7 +1454,12 @@ async fn run_s3_reclaim(db_path: &Path, retain_secs: u64, rows: u64, row_bytes: 
     emit("s3r.open_elapsed_secs", opened.elapsed().as_secs());
     emit("s3r.pruned_rows", pruning.pruned_rows);
     emit("s3r.reclaimed_bytes", pruning.reclaimed_bytes);
-    emit("s3r.fragmentation_before", pruning.fragmentation_before);
+    emit(
+        "s3r.fragmentation_before",
+        pruning
+            .fragmentation_before
+            .map_or_else(|| "unknown".to_string(), |ratio| ratio.to_string()),
+    );
     emit("s3r.compacted", pruning.compacted);
     emit("s3r.file_shrank", pruning.file_shrank);
     emit(

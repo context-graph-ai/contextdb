@@ -26,6 +26,10 @@ pub enum Statement {
     /// memory limit.
     SetVectorServingCache(Option<u64>),
     ShowVectorServingCache,
+    /// Declares storage compaction settings for this store, or returns every
+    /// setting to its default.
+    SetStorageCompaction(StorageCompactionSetting),
+    ShowStorageCompaction,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicy),
@@ -110,6 +114,27 @@ pub struct RouteWhereIn {
 pub enum SetMemoryLimitValue {
     Bytes(usize),
     None,
+}
+
+/// `SET STORAGE_COMPACTION`: either back to the defaults, or the clauses the
+/// statement declares. An omitted clause keeps its current value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StorageCompactionSetting {
+    Default,
+    Declare(StorageCompactionClauses),
+}
+
+/// The clauses one `SET STORAGE_COMPACTION` statement declared.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StorageCompactionClauses {
+    /// Reclaimable share of the file at which compaction starts, in (0, 1).
+    pub start_ratio: Option<f64>,
+    /// Minimum time between automatic compaction attempts.
+    pub min_interval_ms: Option<u64>,
+    /// Explicit compaction stops sweeping below this reclaimable share, in [0, 1).
+    pub stop_ratio: Option<f64>,
+    /// The most sweeps one explicit compaction runs, at least 1.
+    pub max_sweeps: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

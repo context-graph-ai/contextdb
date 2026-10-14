@@ -21,6 +21,7 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         | Statement::ShowContentSize
         | Statement::ShowMaintenancePollInterval
         | Statement::ShowVectorServingCache
+        | Statement::ShowStorageCompaction
         | Statement::ShowSyncConflictPolicy
         | Statement::ShowVectorIndexes
         | Statement::ShowTenantTablePolicy { .. }
@@ -48,6 +49,7 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         | Statement::SetDiskLimit(_)
         | Statement::SetMaintenancePollInterval(_)
         | Statement::SetVectorServingCache(_)
+        | Statement::SetStorageCompaction(_)
         | Statement::CreateSchedule { .. }
         | Statement::DropSchedule { .. }
         | Statement::CreateTrigger { .. }
