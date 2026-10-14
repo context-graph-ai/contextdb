@@ -499,8 +499,9 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     ("contextdb-planner", 10, RSN_TEST_COUNT),
     // Approved continued-growth proofs: unique-key predicate writes match current-entry reads;
     // a maintenance cycle that prunes nothing walks no storage statistics as the store grows;
-    // automatic compaction starts on reclaimable free pages and not on in-page slack.
-    ("contextdb-engine", 4505, RSN_TEST_COUNT),
+    // automatic compaction starts on reclaimable free pages and not on in-page slack;
+    // storage compaction is declarable and unmeasured fragmentation reads unknown (5 proofs).
+    ("contextdb-engine", 4510, RSN_TEST_COUNT),
     ("contextdb-server", 421, RSN_TEST_COUNT),
     ("contextdb-cli", 270, RSN_TEST_COUNT),
 ];

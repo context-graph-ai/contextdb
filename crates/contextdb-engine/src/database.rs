@@ -24393,10 +24393,14 @@ impl MaintenanceContext {
         }
         let fragmentation_before = match previous_sample {
             Some(sample) => sample,
-            None => match persistence.allocator_free_page_ratio()? {
-                Some(ratio) => ratio,
-                None => return Ok(CompactionReport::default()),
-            },
+            None => {
+                #[cfg(any(test, feature = "test-seams"))]
+                AUTOMATIC_COMPACTION_CHECKS.with(|checks| checks.set(checks.get() + 1));
+                match persistence.allocator_free_page_ratio()? {
+                    Some(ratio) => ratio,
+                    None => return Ok(CompactionReport::default()),
+                }
+            }
         };
         if previous_sample.is_none() && fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD
         {
@@ -27156,6 +27160,15 @@ pub const AUTO_COMPACT_MIN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const EXPLICIT_COMPACTION_TIGHT_RATIO: f64 = 0.05;
 /// The most sweeps one explicit compaction runs.
 const EXPLICIT_COMPACTION_MAX_SWEEPS: usize = 8;
+
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    /// Automatic compaction checks that read the free-page measurement on
+    /// this thread. Production-dead.
+    static AUTOMATIC_COMPACTION_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Sweeps the last explicit compaction on this thread ran. Production-dead.
+    static EXPLICIT_COMPACTION_SWEEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A worker whose clock runs ahead of the holder's stamps its rows in the
 /// future. Drift within this much is ordinary fleet skew: the row ages
@@ -65357,6 +65370,36 @@ impl Database {
         redb::Database::free_total_geometry_region_visits_for_test()
     }
 
+    /// Production-dead: drop trust in the allocator's free-page totals, as an
+    /// interrupted allocator-state save leaves them until a recount.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __distrust_allocator_free_totals_for_test(&self) {
+        let persistence = self.persistence.as_ref().expect("file fixture");
+        persistence
+            .with_db(|db| {
+                db.distrust_allocator_free_totals_for_test();
+                Ok(())
+            })
+            .expect("distrust allocator totals");
+    }
+
+    /// Production-dead: automatic compaction checks that read the free-page
+    /// measurement on the calling thread, cumulatively.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __automatic_compaction_checks_for_test() -> u64 {
+        AUTOMATIC_COMPACTION_CHECKS.with(std::cell::Cell::get)
+    }
+
+    /// Production-dead: sweeps the last explicit compaction on the calling
+    /// thread ran.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __explicit_compaction_sweeps_last_for_test() -> u64 {
+        EXPLICIT_COMPACTION_SWEEPS.with(std::cell::Cell::get)
+    }
+
     /// Production-dead: the allocator's maintained `(free pages, region
     /// pages, trailing free pages)`; `None` while untrusted.
     #[cfg(any(test, feature = "test-seams"))]
@@ -65460,7 +65503,11 @@ impl Database {
         // always gets a successor), up to a fixed number of sweeps.
         let mut recycled = None;
         let mut sweep_bytes_before = bytes_before;
+        #[cfg(any(test, feature = "test-seams"))]
+        EXPLICIT_COMPACTION_SWEEPS.with(|sweeps| sweeps.set(0));
         for sweep in 0..EXPLICIT_COMPACTION_MAX_SWEEPS {
+            #[cfg(any(test, feature = "test-seams"))]
+            EXPLICIT_COMPACTION_SWEEPS.with(|sweeps| sweeps.set(sweeps.get() + 1));
             recycled = loop {
                 let (progress, recycled) = publish_storage_compaction_batch(
                     &self.tx_mgr,

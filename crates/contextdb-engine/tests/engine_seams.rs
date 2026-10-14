@@ -73,6 +73,8 @@ mod recover_uncommitted_commit_index_tail;
 mod retention_respects_edge_visibility;
 #[path = "engine_seams/snapshot_visible_posting_membership_contract.rs"]
 mod snapshot_visible_posting_membership_contract;
+#[path = "engine_seams/storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown.rs"]
+mod storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown;
 #[path = "engine_seams/storage_compaction_online.rs"]
 mod storage_compaction_online;
 #[cfg(target_os = "linux")]
