@@ -671,6 +671,9 @@ struct ScratchFault {
     resizes: AtomicUsize,
     backend_reads: AtomicUsize,
     backend_read_bytes: AtomicUsize,
+    /// Once set, every main-file read fails; each refusal is counted.
+    fail_backend_reads: AtomicBool,
+    backend_read_failures: AtomicUsize,
     armed: Mutex<Option<(ScratchOperation, usize)>>,
     injected: AtomicBool,
     child_reads_only: AtomicBool,
@@ -774,6 +777,12 @@ impl StorageBackend for FaultBackend {
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        if self.fault.fail_backend_reads.load(Ordering::SeqCst) {
+            self.fault
+                .backend_read_failures
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(io::Error::other("injected main-file read failure"));
+        }
         self.inner.read(offset, out)?;
         self.fault.backend_reads.fetch_add(1, Ordering::SeqCst);
         self.fault
@@ -1805,4 +1814,51 @@ fn allocator_free_totals_after_poison_are_withheld_and_rebuilt_by_repair() {
     );
     assert_totals_exact(&db, "after repair");
     assert_row(&db, 1, 0x41);
+}
+
+/// A storage fault while the totals are being rebuilt refuses the open: the
+/// rebuild publishes nothing and completes no count, and the store keeps its
+/// unwritten saved value, so a later healthy open rebuilds exact totals once.
+#[test]
+fn allocator_free_total_rebuild_fault_refuses_the_open_and_publishes_nothing() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("rebuild-fault.redb");
+    create_regions(&path, 48);
+    let db = builder().open(&path).expect("open seeded fixture");
+    db.distrust_allocator_free_totals_for_test();
+    drop(db);
+
+    // Fail every main-file read from the moment the rebuild starts. Its
+    // first bitmap window comes from the saved allocator state on disk.
+    let fault = Arc::new(ScratchFault::default());
+    let armed = Arc::clone(&fault);
+    redb::Database::set_free_total_recount_start_hook_for_test(Some(Box::new(move || {
+        armed.fail_backend_reads.store(true, Ordering::SeqCst);
+    })));
+    let completed_before = redb::Database::free_total_recounts_for_test();
+    let opened = builder().open_with_backend(fault_backend(&path, &fault));
+    redb::Database::set_free_total_recount_start_hook_for_test(None);
+    assert!(
+        fault.fail_backend_reads.load(Ordering::SeqCst),
+        "the open must reach the rebuild"
+    );
+    assert!(
+        fault.backend_read_failures.load(Ordering::SeqCst) > 0,
+        "the injected fault must fire inside the rebuild"
+    );
+    assert!(
+        opened.is_err(),
+        "a rebuild that hit a storage fault refuses the open"
+    );
+    drop(opened);
+    assert_eq!(
+        redb::Database::free_total_recounts_for_test(),
+        completed_before,
+        "the failed rebuild completed no count"
+    );
+
+    let (db, rebuilds) = open_counting_rebuilds(&path);
+    assert_eq!(rebuilds, 1, "nothing was saved, so the healthy open rebuilds once");
+    assert_totals_exact(&db, "rebuilt after the refused open");
+    assert_row(&db, 0, 0x35);
 }

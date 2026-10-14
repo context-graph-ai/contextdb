@@ -932,6 +932,14 @@ impl Database {
         self.mem.distrust_free_totals_for_test();
     }
 
+    /// Install (or clear) a callback that runs on this thread as each
+    /// free-total rebuild begins, before any bitmap word is counted.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn set_free_total_recount_start_hook_for_test(hook: Option<Box<dyn Fn()>>) {
+        TransactionalMemory::set_free_total_recount_start_hook_for_test(hook);
+    }
+
     /// Completed free-total rebuilds on the calling thread, cumulatively.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]

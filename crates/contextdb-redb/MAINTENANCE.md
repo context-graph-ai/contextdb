@@ -501,14 +501,16 @@ published (`Database::allocator_free_totals` returns `None`) or saved.
   returns the storage error.
 
 **Accessors.** Production gets one hidden accessor, `Database::allocator_free_totals`. The
-test-seams accessors are an independent recount, a distrust seam, and a thread-local rebuild
-counter.
+test-seams accessors are an independent recount, a distrust seam, a thread-local rebuild
+counter, and a thread-local hook that runs as a rebuild begins, so a test can inject a storage
+fault inside the count.
 
 **Tests.** The proofs are in `tests/allocator_residency_contract.rs`:
 - `allocator_free_totals_track_the_bitmaps_and_survive_trimming_reopen`
 - `allocator_free_totals_adopt_the_trimmed_geometry_on_reopen`
 - `allocator_untrusted_free_totals_are_not_saved_and_rebuild_once_on_reopen`
 - `allocator_free_totals_after_poison_are_withheld_and_rebuilt_by_repair`
+- `allocator_free_total_rebuild_fault_refuses_the_open_and_publishes_nothing`
 
 The patch sections for the four changed files were regenerated in place; the fork's other
 sections are unchanged. Compiler and runtime results are recorded in the S9 handover, not here.

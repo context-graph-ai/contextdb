@@ -193,6 +193,10 @@ pub(crate) fn xxh3_checksum(data: &[u8]) -> Checksum {
 thread_local! {
     /// Completed free-total recounts on this thread. Production-dead.
     static FREE_TOTAL_RECOUNTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Runs as a recount on this thread begins, so a test can arm a storage
+    /// fault that fires inside the count. Production-dead.
+    static FREE_TOTAL_RECOUNT_START: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 struct InMemoryState {
@@ -851,6 +855,12 @@ impl TransactionalMemory {
     /// totals stay untrusted for the rest of this open.
     fn recount_free_totals(state: &mut InMemoryState) -> Result {
         state.allocators.mark_free_totals_untrusted();
+        #[cfg(feature = "test-seams")]
+        FREE_TOTAL_RECOUNT_START.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook();
+            }
+        });
         let layout = state.header.layout();
         let mut free_pages = 0u64;
         for region in 0..layout.num_regions() {
@@ -881,6 +891,11 @@ impl TransactionalMemory {
     #[cfg(feature = "test-seams")]
     pub(crate) fn free_total_recounts_for_test() -> u64 {
         FREE_TOTAL_RECOUNTS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn set_free_total_recount_start_hook_for_test(hook: Option<Box<dyn Fn()>>) {
+        FREE_TOTAL_RECOUNT_START.with(|slot| *slot.borrow_mut() = hook);
     }
 
     /// Drop trust in the maintained totals, as a poisoned allocator would.
