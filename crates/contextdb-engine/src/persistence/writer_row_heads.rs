@@ -64,11 +64,16 @@ impl RedbPersistence {
     ) -> Result<()> {
         let mut heads = write.open_table(TABLE).map_err(Self::storage_error)?;
         let mut family_exists = std::collections::HashMap::new();
-        // One open relation serves every consecutive head of its table. Each
-        // open and close of a protected relation makes the write transaction
-        // finalize the checksums of every page it has dirtied there, so
-        // reopening it per row costs the rows already written.
-        let mut open_relation: Option<(&str, redb::Table<'_, &'static [u8], &'static [u8]>)> = None;
+        // Each relation stays open for the whole pass, however the rows of
+        // different tables interleave. Each open and close of a protected
+        // relation makes the write transaction finalize the checksums of every
+        // page it has dirtied there, so reopening it per row (or per change of
+        // table) costs the rows already written. Only the heads table is
+        // written here; the relations are read.
+        let mut open_relations: std::collections::HashMap<
+            &str,
+            redb::Table<'_, &'static [u8], &'static [u8]>,
+        > = std::collections::HashMap::new();
         for mutation in mutations {
             let Some(projection) = mutation.row_head else {
                 continue;
@@ -95,17 +100,12 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 continue;
             }
-            if open_relation
-                .as_ref()
-                .is_none_or(|(open, _)| *open != table)
-            {
-                drop(open_relation.take());
-                open_relation = Some((
-                    table,
-                    write.open_table(relation).map_err(Self::storage_error)?,
-                ));
-            }
-            let relation = &open_relation.as_ref().expect("opened relation").1;
+            let relation = match open_relations.entry(table) {
+                std::collections::hash_map::Entry::Occupied(open) => open.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(write.open_table(relation).map_err(Self::storage_error)?)
+                }
+            };
             let old = heads
                 .get(mutation.logical_key.as_slice())
                 .map_err(Self::storage_error)?

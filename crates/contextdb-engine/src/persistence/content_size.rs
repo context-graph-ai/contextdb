@@ -393,23 +393,23 @@ pub(super) fn membership_transition(
     }
     Ok(())
 }
-type RelationSlot<'txn> = Option<(String, redb::Table<'txn, &'static [u8], &'static [u8]>)>;
+type OpenRelations<'txn> =
+    std::collections::HashMap<String, redb::Table<'txn, &'static [u8], &'static [u8]>>;
 
-/// The open relation of `table`, closing a different one first.
-fn open_relation_for<'slot, 'txn>(
+/// The open relation of `table`, opened on its first use in this pass.
+fn open_relation_for<'open, 'txn>(
     write: &'txn redb::WriteTransaction,
-    slot: &'slot mut RelationSlot<'txn>,
+    open: &'open mut OpenRelations<'txn>,
     table: &str,
-) -> Result<&'slot redb::Table<'txn, &'static [u8], &'static [u8]>> {
-    if slot.as_ref().is_none_or(|(open, _)| open.as_str() != table) {
-        drop(slot.take());
+) -> Result<&'open redb::Table<'txn, &'static [u8], &'static [u8]>> {
+    if !open.contains_key(table) {
         let relation_name = RedbPersistence::rel_table_name(table);
         let relation = write
             .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation_name))
             .map_err(RedbPersistence::storage_error)?;
-        *slot = Some((table.to_owned(), relation));
+        open.insert(table.to_owned(), relation);
     }
-    Ok(&slot.as_ref().expect("opened relation").1)
+    Ok(open.get(table).expect("opened relation"))
 }
 
 pub(super) fn reconcile_row_heads(
@@ -419,10 +419,11 @@ pub(super) fn reconcile_row_heads(
     let mut heads = write
         .open_table(ROW_LIVE)
         .map_err(RedbPersistence::storage_error)?;
-    // One open relation serves every consecutive head of its table: each open
-    // and close of a protected relation finalizes the checksums of every page
-    // the write transaction has dirtied there.
-    let mut open_relation: RelationSlot<'_> = None;
+    // Each relation stays open for the whole pass, however the rows of
+    // different tables interleave: each open and close of a protected relation
+    // finalizes the checksums of every page the write transaction has dirtied
+    // there. The relations are only read here.
+    let mut open_relations = OpenRelations::new();
     // Apply in source order: duplicate heads in one publication settle to the
     // final physical version without allocating a history-sized directory.
     for mutation in mutations {
@@ -470,7 +471,7 @@ pub(super) fn reconcile_row_heads(
         if let (Some((prior_head, _)), Some(next_head)) = (prior, head)
             && rank(prior_head) > rank(next_head)
         {
-            let relation = open_relation_for(write, &mut open_relation, table)?;
+            let relation = open_relation_for(write, &mut open_relations, table)?;
             if relation
                 .get(prior_head.as_slice())
                 .map_err(RedbPersistence::storage_error)?
@@ -481,7 +482,7 @@ pub(super) fn reconcile_row_heads(
         }
         let new = if mutation.logical_value.is_some() {
             let head = head.ok_or_else(|| corrupt("live row has no physical head"))?;
-            let relation = open_relation_for(write, &mut open_relation, table)?;
+            let relation = open_relation_for(write, &mut open_relations, table)?;
             relation
                 .get(head.as_slice())
                 .map_err(RedbPersistence::storage_error)?
