@@ -15441,6 +15441,10 @@ impl EngineDatabaseTransactions {
 }
 
 impl EngineDatabaseTransactions {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is contextdb_tx::manager::EngineTerminalFailure, a public type of another crate; boxing it would change that crate's API"
+    )]
     fn commit_terminal_scoped(
         &self,
         tx: TxId,
@@ -15492,6 +15496,10 @@ impl EngineDatabaseTransactions {
             .map_err(|failure| failure.map_peer(unwrap_temporary_peer))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is contextdb_tx::manager::EngineTerminalFailure, a public type of another crate; boxing it would change that crate's API"
+    )]
     fn commit_reserved_terminal_scoped(
         &self,
         tx: TxId,
@@ -16351,6 +16359,10 @@ struct DatabaseCommitScope<'s, 'b, 'm> {
     lower: &'s contextdb_tx::manager::EngineCommitScope<'b, 'm, DynStore>,
 }
 impl DatabaseCommitScope<'_, '_, '_> {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is contextdb_tx::manager::EngineTerminalFailure, a public type of another crate; boxing it would change that crate's API"
+    )]
     fn prepare_temporary<R, A>(
         &self,
         tx: TxId,
@@ -16636,10 +16648,10 @@ impl Drop for RetiredEngineMetadata {
     }
 }
 impl EngineMetadataJournal {
-    fn record<'a>(
-        head: &'a Option<MetadataNode<EngineMetadataRecord>>,
+    fn record(
+        head: &Option<MetadataNode<EngineMetadataRecord>>,
         tx: TxId,
-    ) -> Option<&'a EngineMetadataRecord> {
+    ) -> Option<&EngineMetadataRecord> {
         let mut cursor = head.as_ref();
         while let Some(node) = cursor {
             if node.get().tx == tx {
@@ -16649,10 +16661,10 @@ impl EngineMetadataJournal {
         }
         None
     }
-    fn record_mut<'a>(
-        head: &'a mut Option<MetadataNode<EngineMetadataRecord>>,
+    fn record_mut(
+        head: &mut Option<MetadataNode<EngineMetadataRecord>>,
         tx: TxId,
-    ) -> Option<&'a mut EngineMetadataRecord> {
+    ) -> Option<&mut EngineMetadataRecord> {
         let mut cursor = head.as_mut();
         while let Some(node) = cursor {
             if node.get().tx == tx {
@@ -24944,7 +24956,7 @@ impl MaintenanceContext {
         let identity = (table, row, created, lsn);
         let mut encoded_count = ByteCount(0);
         bincode::serde::encode_into_std_write(
-            &identity,
+            identity,
             &mut encoded_count,
             bincode::config::standard(),
         )
@@ -24962,7 +24974,7 @@ impl MaintenanceContext {
             .map_err(|_| Error::Other("retention config formatting failed".into()))?;
             let mut encoded = Vec::with_capacity(encoded_count.0);
             bincode::serde::encode_into_std_write(
-                &identity,
+                identity,
                 &mut encoded,
                 bincode::config::standard(),
             )
@@ -98632,13 +98644,12 @@ impl Database {
                         .transpose()
                 })?;
             let local_creation = creation.is_some() || offline;
-            if let Some(creation) = &creation {
-                if creation.creation_lsn != *guard.read().commit_lsn
+            if let Some(creation) = &creation
+                && (creation.creation_lsn != *guard.read().commit_lsn
                     || creation.local_row_id != row_id
-                    || creation.table_generation != generation
-                {
-                    return Err(invalid());
-                }
+                    || creation.table_generation != generation)
+            {
+                return Err(invalid());
             }
             let sidecar = if local_creation {
                 let lsn = creation
@@ -100763,7 +100774,7 @@ impl Database {
                     let Some(existing) = existing else { return Ok(()); };
                     existing.with_value(|existing| {
                     let from = existing.values.get(&sm.column).and_then(Value::as_text).unwrap_or("");
-                    match self.upsert_state_row_in_restricted_source(held, &entry.table, &sm.column, &existing,
+                    match self.upsert_state_row_in_restricted_source(held, &entry.table, &sm.column, existing,
                         &entry.target_state, tx, snapshot, read_memory.clone()) {
                         Ok(false) => return Ok(()), Ok(true) => (),
                         Err(Error::InvalidStateTransition(_)) => {
@@ -102269,6 +102280,10 @@ impl EngineDatabaseTransactions {
     /// The original existing full host gate, with a concrete non-event discard
     /// holder returned by preparation and exact peer identity forwarded before
     /// any registration. No mutable WriteSet/root or raw host escapes.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is contextdb_tx::manager::EngineTerminalFailure, a public type of another crate; boxing it would change that crate's API"
+    )]
     fn commit_discard_terminal_scoped(
         &self,
         tx: TxId,
