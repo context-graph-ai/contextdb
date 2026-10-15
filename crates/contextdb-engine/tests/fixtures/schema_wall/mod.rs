@@ -755,18 +755,33 @@ pub fn assert_affected_only(
         if table == "writer_recovery" {
             if event.table == "__redb_user_table_directory" {
                 assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
-                // Each of the three fixed controls opens and updates the table root.
-                assert!(*count <= 3 * (1 + contact_exchanges));
+                // Each of the three fixed controls, and the saved row counts of
+                // the tables a commit changed, open and update the table root.
+                assert!(
+                    *count <= 4 * (1 + contact_exchanges),
+                    "writer recovery root rewritten {count} times {event:?}"
+                );
             } else {
                 assert_eq!(event.operation, TableWriteOperationForTest::Insert);
+                if let Some(owner) = event.key.strip_prefix(b"row_versions:") {
+                    let owner = std::str::from_utf8(owner).expect("row count keys name tables");
+                    assert!(
+                        affected.contains(owner) || owner == "work_node_contacts",
+                        "unrelated saved row count {event:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            event.key.as_slice(),
+                            b"bounds" | b"commit_directory_root" | b"row_heads_root"
+                        ),
+                        "unexpected recovery control coordinate {event:?}"
+                    );
+                }
                 assert!(
-                    matches!(
-                        event.key.as_slice(),
-                        b"bounds" | b"commit_directory_root" | b"row_heads_root"
-                    ),
-                    "unexpected recovery control coordinate {event:?}"
+                    *count <= 1 + contact_exchanges,
+                    "recovery record written {count} times {event:?}"
                 );
-                assert!(*count <= 1 + contact_exchanges);
             }
             continue;
         }
