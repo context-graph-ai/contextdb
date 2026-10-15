@@ -1,5 +1,9 @@
 //! A private ordered witness for each retained physical relational version.
 use super::*;
+
+#[cfg(test)]
+#[path = "version_manifest_seek_tests.rs"]
+mod seek_tests;
 use contextdb_core::IndexDecl;
 
 const FORMAT: u8 = 1;
