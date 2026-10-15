@@ -15687,17 +15687,21 @@ impl VectorStore {
         moves: &[PartitionedVectorMove],
         reclaimable: &HashSet<VectorPartitionRef>,
     ) -> usize {
-        let route_bytes = |index: &VectorIndexRef, key: &VectorPartitionKey| {
+        // A route clone copies its index names; its partition key is shared
+        // (`VectorPartitionKey` clones are references), so the key's own
+        // bytes are charged once per distinct route below, never per clone.
+        let route_bytes = |index: &VectorIndexRef, _key: &VectorPartitionKey| {
             std::mem::size_of::<VectorPartitionRef>()
                 .saturating_add(index.table.len())
                 .saturating_add(index.column.len())
-                .saturating_add(key.estimated_bytes())
+                .saturating_add(VectorPartitionKey::shared_clone_bytes())
         };
         // Per row (one input item): projection keeps at most one row slot in
         // each of its row maps and event logs, and holds at most a few
         // transient route clones (candidate, touched and requested sets)
         // before deduplication drops them. Per distinct route the projection,
-        // cap and reclaim maps keep their own copies (the 32x term below).
+        // cap and reclaim maps keep their own clones (the 32x term below) of
+        // one shared key.
         let per_row = |route: usize| {
             route
                 .saturating_mul(4)
@@ -15767,7 +15771,9 @@ impl VectorStore {
                 .map(|entry| (&entry.index, &entry.partition_key)),
         );
         for (index, key) in routes {
-            bytes = bytes.saturating_add(route_bytes(index, key).saturating_mul(32));
+            bytes = bytes
+                .saturating_add(route_bytes(index, key).saturating_mul(32))
+                .saturating_add(key.estimated_bytes());
             // A durable projection probes only touched row identities; it
             // never builds a map proportional to durable history.
             if let Some(state) = self.try_partition_state(index, key)

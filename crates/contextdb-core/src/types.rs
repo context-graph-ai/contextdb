@@ -1047,8 +1047,29 @@ impl VectorPartitionComponent {
 /// Equality uses the typed components themselves, never a hash or rendered
 /// JSON. `canonical_bytes` is a fixed, versioned encoding used anywhere the
 /// identity crosses a persistence boundary.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct VectorPartitionKey(Vec<VectorPartitionComponent>);
+///
+/// The components are shared: a clone is a reference, so bookkeeping that
+/// keys several maps by the same route holds one copy of a long key, not one
+/// per map. The serialized form is the plain component sequence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(from = "VectorPartitionKeyRepr")]
+pub struct VectorPartitionKey(Arc<[VectorPartitionComponent]>);
+
+#[derive(Deserialize)]
+#[serde(rename = "VectorPartitionKey")]
+struct VectorPartitionKeyRepr(Vec<VectorPartitionComponent>);
+
+impl From<VectorPartitionKeyRepr> for VectorPartitionKey {
+    fn from(repr: VectorPartitionKeyRepr) -> Self {
+        Self(repr.0.into())
+    }
+}
+
+impl Serialize for VectorPartitionKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_newtype_struct("VectorPartitionKey", &*self.0)
+    }
+}
 
 impl VectorPartitionKey {
     const CANONICAL_VERSION: u8 = 1;
@@ -1058,7 +1079,7 @@ impl VectorPartitionKey {
     }
 
     pub fn from_components(components: Vec<VectorPartitionComponent>) -> Self {
-        Self(components)
+        Self(components.into())
     }
 
     /// Build a key from already type-checked row values. `None` means one of
@@ -1068,7 +1089,7 @@ impl VectorPartitionKey {
             .iter()
             .map(VectorPartitionComponent::from_value)
             .collect::<Option<Vec<_>>>()
-            .map(Self)
+            .map(|components| Self(components.into()))
     }
 
     pub fn components(&self) -> &[VectorPartitionComponent] {
@@ -1079,13 +1100,15 @@ impl VectorPartitionKey {
         self.0.is_empty()
     }
 
-    /// Memory retained by this key itself, including a large TEXT payload.
+    /// Memory retained by one copy of this key, including a large TEXT
+    /// payload. Clones share that copy (see [`Self::shared_clone_bytes`]).
     /// Hash-map/tree slot overhead is charged by the registry that owns it.
     pub fn estimated_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
             .saturating_add(
                 self.0
-                    .capacity()
+                    .len()
                     .saturating_mul(std::mem::size_of::<VectorPartitionComponent>()),
             )
             .saturating_add(
@@ -1096,11 +1119,16 @@ impl VectorPartitionKey {
             )
     }
 
+    /// What one more clone of an existing key retains: the shared reference.
+    pub const fn shared_clone_bytes() -> usize {
+        std::mem::size_of::<Self>()
+    }
+
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.push(Self::CANONICAL_VERSION);
         bytes.extend_from_slice(&(self.0.len() as u64).to_be_bytes());
-        for component in &self.0 {
+        for component in self.0.iter() {
             match component {
                 VectorPartitionComponent::Uuid(value) => {
                     bytes.push(0);
@@ -1215,7 +1243,7 @@ impl VectorPartitionKey {
         if cursor != bytes.len() {
             return Err("trailing bytes in vector partition key");
         }
-        Ok(Self(components))
+        Ok(Self(components.into()))
     }
 }
 
