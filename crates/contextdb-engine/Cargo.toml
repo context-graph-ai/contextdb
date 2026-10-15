@@ -124,6 +124,10 @@ path = "tests/cdb120_partition_insert_cost.rs"
 required-features = ["test-seams"]
 
 [[test]]
+name = "a_row_pays_for_its_partition_key_once"
+path = "tests/a_row_pays_for_its_partition_key_once.rs"
+
+[[test]]
 name = "bounded"
 path = "tests/bounded.rs"
 required-features = ["test-seams"]
