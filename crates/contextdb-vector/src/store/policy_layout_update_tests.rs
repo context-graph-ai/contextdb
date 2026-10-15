@@ -107,8 +107,16 @@ fn a_policy_update_that_does_not_fit_is_refused_before_it_copies_anything() {
         "a typed budget refusal: {refusal:?}"
     );
     drop(owner);
-    assert_eq!(budget.used(), 0, "a refused preparation leaves nothing charged");
-    assert_eq!(layout_of(&store, &index), layout, "the declaration is unchanged");
+    assert_eq!(
+        budget.used(),
+        0,
+        "a refused preparation leaves nothing charged"
+    );
+    assert_eq!(
+        layout_of(&store, &index),
+        layout,
+        "the declaration is unchanged"
+    );
 }
 
 #[test]
@@ -164,7 +172,11 @@ fn a_published_policy_update_changes_only_the_policy() {
     store.publish_policy_layout_update(prepared);
     assert_eq!(layout_of(&store, &index), changed);
     drop(owner);
-    assert_eq!(budget.used(), 0, "the published update's copy owner is returned");
+    assert_eq!(
+        budget.used(),
+        0,
+        "the published update's copy owner is returned"
+    );
     let mut reshaped = layout.clone();
     reshaped.partition_key_columns = vec!["other".into()];
     let mut owner = VectorCopyAdmission::new(budget.clone());

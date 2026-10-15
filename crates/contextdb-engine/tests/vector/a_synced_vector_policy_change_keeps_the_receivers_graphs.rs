@@ -248,8 +248,7 @@ fn assert_indexed_answers(edge: &Database, why: &str) {
     for index in 0..ROWS.len() {
         let (id, scope, embedding) = row(index);
         assert_eq!(
-            indexed_search(edge, scope, embedding)
-                .unwrap_or_else(|error| panic!("{why}: {error}")),
+            indexed_search(edge, scope, embedding).unwrap_or_else(|error| panic!("{why}: {error}")),
             vec![id]
         );
     }

@@ -41894,19 +41894,17 @@ impl Database {
         // applies it to the live column in place and keeps every partition
         // and graph, so the received ALTER does the same: it neither seeds a
         // vector replacement nor makes this unit copy the vectors.
-        let policy_only = |index: &VectorIndexRef| {
-            match (
-                live_vector_layouts.get(index),
-                projected_vector_layouts.get(index),
-            ) {
-                (Some(live), Some(projected)) => {
-                    live != projected
-                        && same_vector_storage_shape(live, projected)
-                        && !changed_vector_routes.contains(index)
-                        && !replaced_vector_refs.contains(index)
-                }
-                _ => false,
+        let policy_only = |index: &VectorIndexRef| match (
+            live_vector_layouts.get(index),
+            projected_vector_layouts.get(index),
+        ) {
+            (Some(live), Some(projected)) => {
+                live != projected
+                    && same_vector_storage_shape(live, projected)
+                    && !changed_vector_routes.contains(index)
+                    && !replaced_vector_refs.contains(index)
             }
+            _ => false,
         };
         // Admit the copied declarations, names and map before building it.
         let (policy_only_count, policy_only_bytes) = live_vector_layouts
@@ -42511,13 +42509,11 @@ impl Database {
         let mut vector_policy_layouts = Vec::new();
         let mut vector_policy_tables = HashSet::new();
         if !copy_vectors && !policy_only_vector_layouts.is_empty() {
-            vector_copy_owner.reserve(
-                policy_only_vector_layouts.len().saturating_mul(
-                    std::mem::size_of::<contextdb_vector::PreparedVectorPolicyLayout>()
-                        + 2 * std::mem::size_of::<String>()
-                        + 1,
-                ),
-            )?;
+            vector_copy_owner.reserve(policy_only_vector_layouts.len().saturating_mul(
+                std::mem::size_of::<contextdb_vector::PreparedVectorPolicyLayout>()
+                    + 2 * std::mem::size_of::<String>()
+                    + 1,
+            ))?;
             vector_policy_layouts.reserve_exact(policy_only_vector_layouts.len());
             vector_policy_tables.reserve(policy_only_vector_layouts.len());
             for (index, layout) in policy_only_vector_layouts.drain() {
@@ -43096,12 +43092,12 @@ impl Database {
             .iter()
             .filter(|table| !stage.vector_policy_tables.contains(*table))
             .any(|table| {
-            self.relational_store.table_meta(table).is_some_and(|meta| {
-                meta.columns
-                    .iter()
-                    .any(|column| matches!(column.column_type, ColumnType::Vector(_)))
-            })
-        });
+                self.relational_store.table_meta(table).is_some_and(|meta| {
+                    meta.columns
+                        .iter()
+                        .any(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                })
+            });
         if let Some(memberships) = stage.operational_memberships.take() {
             self.relational_store.apply_prepared_rows(
                 &stage
