@@ -11592,18 +11592,17 @@ fn in_transaction_prefix_count(
             })
     };
     // Every committed row the transaction may hide, once: deleted by identity,
-    // or restaged under the same identity by an update.
-    let mut hidden: Vec<RowId> = overlay.deleted.iter().copied().collect();
-    if let Some(staged) = overlay.staged_rows.as_ref() {
-        hidden.extend(
-            staged
-                .rows()
-                .map(|row| row.row_id)
-                .filter(|row_id| !overlay.deleted.contains(row_id)),
-        );
-    }
+    // or restaged under the same identity by an update. The identities are
+    // walked where they already live, one probe at a time, so nothing held
+    // here grows with what the transaction staged.
+    let restaged = overlay
+        .staged_rows
+        .iter()
+        .flat_map(|staged| staged.rows())
+        .map(|row| row.row_id)
+        .filter(|row_id| !overlay.deleted.contains(row_id));
     let mut count = i128::from(committed);
-    for row_id in hidden {
+    for row_id in overlay.deleted.iter().copied().chain(restaged) {
         let probe = Cell::new(0_usize);
         let original = context.with_source_page_admission(BoundedWorkSource::IndexRange, || {
             db.bounded_row_by_identity(
