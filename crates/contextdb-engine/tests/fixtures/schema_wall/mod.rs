@@ -895,7 +895,8 @@ pub fn assert_affected_only(
                         .expect("a row size key names its table"),
                     _ => event.key.as_slice(),
                 };
-                let owner = std::str::from_utf8(owner_bytes).expect("content-size owners are names");
+                let owner =
+                    std::str::from_utf8(owner_bytes).expect("content-size owners are names");
                 assert!(
                     affected.contains(owner),
                     "unrelated content-size write {event:?}"
