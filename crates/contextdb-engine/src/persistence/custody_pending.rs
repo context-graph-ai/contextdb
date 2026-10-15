@@ -356,6 +356,7 @@ pub(super) fn recompute_all(write: &redb::WriteTransaction, owner: &Owner) -> Re
     for entry in submissions.iter().map_err(RedbPersistence::storage_error)? {
         let (submission, _) = entry.map_err(RedbPersistence::storage_error)?;
         let submission = <[u8; 16]>::try_from(submission.value()).map_err(damage)?;
+        rechecked(1);
         set_pending(
             &groups,
             &config,
@@ -399,6 +400,7 @@ fn recompute(write: &redb::WriteTransaction, which: &[[u8; 16]], owner: &Owner) 
         )
         .transpose()?;
     for submission in which {
+        rechecked(1);
         set_pending(
             &groups,
             &config,
@@ -410,6 +412,21 @@ fn recompute(write: &redb::WriteTransaction, which: &[[u8; 16]], owner: &Owner) 
         )?;
     }
     Ok(())
+}
+
+/// Submissions whose pending membership commit maintenance re-verified,
+/// process-wide (measurement only).
+#[cfg(feature = "test-seams")]
+static RECHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[inline]
+fn rechecked(_n: u64) {
+    #[cfg(feature = "test-seams")]
+    RECHECKED.fetch_add(_n, std::sync::atomic::Ordering::Relaxed);
+}
+/// Measurement only: submissions re-verified by pending maintenance so far.
+#[cfg(feature = "test-seams")]
+pub(crate) fn rechecked_for_test() -> u64 {
+    RECHECKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn same_namespace(a: &Namespace<'_>, b: &Namespace<'_>) -> bool {

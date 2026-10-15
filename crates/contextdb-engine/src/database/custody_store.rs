@@ -330,6 +330,13 @@ impl Database {
     pub fn __last_closure_memo_for_test() -> (usize, usize) {
         crate::custody::store::last_memo_for_test()
     }
+    /// Measurement only: submissions whose pending-delivery membership commit
+    /// maintenance has re-verified so far, process-wide.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_pending_rechecks_for_test() -> u64 {
+        crate::persistence::RedbPersistence::custody_pending_rechecked_for_test()
+    }
     /// Measurement only: the bytes this thread's last custody retirement held
     /// admitted for the ownership keys it moved into its write set.
     #[cfg(feature = "test-seams")]

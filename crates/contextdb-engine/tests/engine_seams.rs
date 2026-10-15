@@ -159,6 +159,8 @@ mod paged_initial_replacement_and_reclamation_progress_under_writes;
 mod pending_delivery_pages_resume_without_gaps;
 #[path = "engine_seams/pending_delivery_reads_only_the_pending_tail.rs"]
 mod pending_delivery_reads_only_the_pending_tail;
+#[path = "engine_seams/pending_maintenance_stays_flat_as_delivered_history_grows.rs"]
+mod pending_maintenance_stays_flat_as_delivered_history_grows;
 #[path = "engine_seams/retired_custody_keys_stay_funded_until_the_write_set_drops.rs"]
 mod retired_custody_keys_stay_funded_until_the_write_set_drops;
 #[cfg(target_os = "linux")]

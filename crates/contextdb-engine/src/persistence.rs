@@ -42029,6 +42029,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )
     }
 
+    /// Measurement only: submissions re-verified by custody pending
+    /// maintenance so far, process-wide.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn custody_pending_rechecked_for_test() -> u64 {
+        custody_pending::rechecked_for_test()
+    }
+
     pub(super) fn write_read_custody_config_entry(
         write_txn: &redb::WriteTransaction,
         key: &str,
