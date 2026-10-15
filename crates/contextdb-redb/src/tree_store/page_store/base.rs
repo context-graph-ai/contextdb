@@ -9,9 +9,8 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Range;
-use std::sync::Arc;
 #[cfg(debug_assertions)]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub(crate) const MAX_VALUE_LENGTH: usize = 3 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PAIR_LENGTH: usize = 3 * 1024 * 1024 * 1024 + 768 * 1024 * 1024;

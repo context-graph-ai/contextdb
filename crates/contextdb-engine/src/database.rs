@@ -18,7 +18,7 @@ mod vector_generation_decode_owner_tests;
 #[cfg(test)]
 mod vector_journal_cleanup_cancellation_tests;
 mod vector_maintenance_inventory;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 mod vector_public_cycle_admission_tests;
 #[cfg(test)]
 mod vector_published_retry_source_admission_tests;
@@ -25758,7 +25758,7 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-seams"))]
+    #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn write_set_lock_is_held_for_test(&self) -> bool {
         self.tx_mgr.write_set_lock_is_held_for_test()
@@ -35360,11 +35360,7 @@ impl Database {
         );
         #[cfg(feature = "test-seams")]
         if let Some(stage_wall_nanos) = stats.stage_wall_nanos {
-            for (counter, delta) in self
-                .commit_stage_wall_nanos
-                .iter()
-                .zip(stage_wall_nanos.into_iter())
-            {
+            for (counter, delta) in self.commit_stage_wall_nanos.iter().zip(stage_wall_nanos) {
                 Self::add_commit_stat(counter, delta);
             }
         }
@@ -53221,7 +53217,7 @@ impl Database {
         // parked in a durable hold.
         let index_structures = {
             let (bytes, count) = self.relational_store.table_index_structure_bytes(table);
-            let per_index = if count == 0 { 0 } else { bytes / count } as i128;
+            let per_index = bytes.checked_div(count).unwrap_or(0) as i128;
             let old_indexes = old_meta.indexes.len() as i128;
             let new_indexes = new_meta.indexes.len() as i128;
             (new_indexes - old_indexes) * per_index
@@ -56576,12 +56572,7 @@ impl Database {
         let superseded = self.superseded_ddl_occurrence_marks(source)?;
         let mut ddl = Vec::with_capacity(changes.ddl.len());
         let mut ddl_lsn = Vec::with_capacity(changes.ddl_lsn.len());
-        for ((change, lsn), entry) in changes
-            .ddl
-            .into_iter()
-            .zip(changes.ddl_lsn.into_iter())
-            .zip(entries)
-        {
+        for ((change, lsn), entry) in changes.ddl.into_iter().zip(changes.ddl_lsn).zip(entries) {
             // Locally authored schema an authenticated vector has already
             // restated is settled provenance, so it never reaches the
             // fail-closed origin check below.

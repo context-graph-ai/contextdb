@@ -494,7 +494,7 @@ fn remove_completed_stage_at_root(
     parent.remove_held_tree_child(&leaf, stage, "completed oversized request stage")
 }
 
-#[cfg(any(test, feature = "test-seams"))]
+#[cfg(feature = "test-seams")]
 pub(super) fn snapshot_stage(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -1939,7 +1939,7 @@ fn stage_dir_from_root(
     }
 }
 
-#[cfg(all(unix, any(test, feature = "test-seams")))]
+#[cfg(all(unix, feature = "test-seams"))]
 fn stage_dir_optional_from_root(
     root: &StageDir,
     root_path: &Path,

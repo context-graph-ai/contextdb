@@ -118,6 +118,7 @@ pub struct DirectTypedImageDigest {
 
 /// One owned relational row in the committed image.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredRow {
     pub table: String,
     pub row_id: RowId,
@@ -126,6 +127,7 @@ pub struct DirectStoredRow {
 
 /// One owned graph edge, including all persisted edge properties.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredEdge {
     pub source: Uuid,
     pub target: Uuid,
@@ -143,6 +145,7 @@ pub enum DirectVectorQuantization {
 /// One decoded vector entry. Quantized stores are reconstructed into their
 /// owned queryable values during hydration, never by consulting the file later.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredVector {
     pub index: VectorIndexRef,
     pub row_id: RowId,

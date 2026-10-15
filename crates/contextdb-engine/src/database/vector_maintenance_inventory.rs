@@ -172,7 +172,7 @@ impl MaintenanceContext {
         slots: &mut Vec<T>,
     ) -> Result<()> {
         if slots.len() == slots.capacity() {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "test-seams"))]
             let _budget = vector_public_cycle_admission_tests::refuse_inventory_slot_for_test(
                 &self.accountant,
                 _slot,
@@ -990,21 +990,21 @@ impl MaintenanceContext {
                 let sort_bytes = candidate_sort_heap_bytes(candidates.len());
                 let mut sort_memory = OwnedMemoryReservation::new(Arc::clone(&self.accountant));
                 if sort_bytes != 0 {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "test-seams"))]
                     let _budget = vector_public_cycle_admission_tests::candidate_sort_budget_for_test(
                         &self.accountant,
                         candidates.len(),
                         sort_bytes,
                     );
                     sort_memory.try_grow_for(sort_bytes, "vector_maintenance", PREPARE, HINT)?;
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "test-seams"))]
                     vector_public_cycle_admission_tests::observe_candidate_sort_for_test(
                         &self.accountant,
                         candidates.iter().map(|candidate| (&candidate.partition, candidate.cold)),
                         false,
                     );
                     candidates.sort_by_key(|candidate| !candidate.cold);
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "test-seams"))]
                     vector_public_cycle_admission_tests::observe_candidate_sort_for_test(
                         &self.accountant,
                         candidates.iter().map(|candidate| (&candidate.partition, candidate.cold)),

@@ -21,7 +21,8 @@ use uuid::Uuid;
 const PARTITIONS: usize = 3;
 const PROBES: usize = 100;
 const K: usize = 10;
-const BREADTH_CANDIDATES: [usize; 7] = [10, 12, 16, 20, 24, 28, 32];
+// Include the query floor and the larger silent profile in the calibration.
+const BREADTH_CANDIDATES: [usize; 9] = [10, 12, 16, 20, 24, 28, 32, 100, 400];
 
 struct Counter(AtomicU64);
 

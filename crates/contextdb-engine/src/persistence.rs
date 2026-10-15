@@ -35452,5 +35452,5 @@ mod metadata_decode_guard_tests;
 #[path = "persistence/retained_raw_body_guard_tests.rs"]
 mod retained_raw_body_guard_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 mod change_reload_decode_tests;

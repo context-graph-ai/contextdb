@@ -12,7 +12,9 @@ pub use hnsw_rs::hnsw::{
 use hnsw_rs::hnswio::{decode_owned_graph, encode_owned_graph_into};
 use parking_lot::{Mutex, RwLock};
 #[cfg(feature = "test-seams")]
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+#[cfg(any(test, feature = "test-seams"))]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1121,7 +1123,7 @@ impl PagedHnsw {
     /// coordinate order so it is bit-for-bit the norm the per-visit
     /// accumulation used to produce.
     fn query_norm(query: &[f32]) -> f64 {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_paged_vector(|observer| observer.query_norm_computed());
         let mut norm = 0.0_f64;
         for &right in query {
@@ -1171,7 +1173,7 @@ impl PagedHnsw {
         if requested == 0 {
             return Ok(false);
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_paged_vector(|observer| observer.vector_decoded());
         let vector_end = point.vector_offset.checked_add(requested).ok_or(
             HnswBoundedSearchError::CapacityOverflow("paged vector range"),
@@ -1193,13 +1195,13 @@ impl PagedHnsw {
                 held @ Some(_) => held,
                 None => {
                     let mut cache = self.page_cache.lock();
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     observe_paged_vector(|observer| observer.page_cache_locked());
                     cache.get(page_offset)
                 }
             };
             contextdb_core::find_attribution::note_page_lookup(resident.is_some());
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observe_paged_vector(|observer| observer.page_looked_up(resident.is_some()));
             let page = if let Some(page) = resident {
                 ReadPage::new(page, 0, &mut *release)
@@ -1226,7 +1228,7 @@ impl PagedHnsw {
                     }
                 };
                 contextdb_core::find_attribution::note_page_fill(page.len());
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 observe_paged_vector(|observer| observer.page_filled());
                 let actual = page.capacity();
                 if let Err(error) = acquire(HnswSearchScratchEvent::Reconcile {
@@ -1258,7 +1260,7 @@ impl PagedHnsw {
                 let shared = Arc::new(PageBody(page.into_boxed_slice()));
                 let kept = {
                     let mut cache = self.page_cache.lock();
-                    #[cfg(feature = "test-seams")]
+                    #[cfg(any(test, feature = "test-seams"))]
                     observe_paged_vector(|observer| observer.page_cache_locked());
                     cache.install(page_offset, Arc::clone(&shared))
                 };
@@ -2138,7 +2140,7 @@ impl PagedHnsw {
         admitted.give_back_only(HnswSearchScratchContainer::CandidateHeap, release);
         admitted.give_back_only(HnswSearchScratchContainer::VisitedPoints, release);
         admitted.give_back_only(HnswSearchScratchContainer::ServingPageDirectory, release);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         observe_paged_vector(|observer| observer.walk_compared(work));
         if let Err(error) = walked {
             drop(found);
@@ -2929,7 +2931,7 @@ pub trait HnswQuerySelfScoreObserver: Send + Sync {
 /// locked, how often a page body is faulted in from the snapshot source, how
 /// often a stored vector is decoded, and how often the query's own norm is
 /// recomputed. Production builds have no observer branch.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub trait PagedVectorObserver: Send + Sync {
     /// One acquisition of the serving page cache's lock.
@@ -2972,7 +2974,7 @@ pub struct PagedWalkWork {
 
 /// Install a paged-graph observer for the dynamic extent of one call on this
 /// thread. Nested calls and unwinding restore the previous observer.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn with_paged_vector_observer<R>(
     observer: Arc<dyn PagedVectorObserver>,
@@ -2990,7 +2992,7 @@ pub fn with_paged_vector_observer<R>(
     action()
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn observe_paged_vector(report: impl Fn(&dyn PagedVectorObserver)) {
     let observer = PAGED_VECTOR_OBSERVER.with(|slot| slot.borrow().as_ref().map(Arc::clone));
     if let Some(observer) = observer {
@@ -2998,10 +3000,14 @@ fn observe_paged_vector(report: impl Fn(&dyn PagedVectorObserver)) {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 std::thread_local! {
     static PAGED_VECTOR_OBSERVER: RefCell<Option<Arc<dyn PagedVectorObserver>>> =
         RefCell::new(None);
+}
+
+#[cfg(feature = "test-seams")]
+std::thread_local! {
     static HNSW_CANDIDATE_OBSERVER: RefCell<Option<Arc<dyn HnswCandidateObserver>>> =
         RefCell::new(None);
     static HNSW_COMPLETED_CANDIDATES: Cell<u64> = const { Cell::new(0) };
@@ -8023,7 +8029,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn paged_proof_vector(ordinal: usize, dimension: usize) -> Vec<f32> {
         (0..dimension)
             .map(|coordinate| {

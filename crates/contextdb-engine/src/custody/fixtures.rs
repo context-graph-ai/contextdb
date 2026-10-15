@@ -217,9 +217,9 @@ impl Database {
         let records = self.custody_records()?;
         for r in &records {
             match r {
-            Record::Root{life,submission}=>{if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*life)){return Err(invalid());}},
-            Record::MemberOwner{member,root,submission}=>{if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*root&&m.member_lives.contains(member))){return Err(invalid());}},
-            Record::Terminal{edge:true,record:t}=>{if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==t.submission&&m.seal.digest()==t.seal_digest)){return Err(invalid());}},_=>{} }
+            Record::Root{life,submission} if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*life))=>{return Err(invalid());},
+            Record::MemberOwner{member,root,submission} if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==*submission&&m.root_life==*root&&m.member_lives.contains(member)))=>{return Err(invalid());},
+            Record::Terminal{edge:true,record:t} if !records.iter().any(|r|matches!(r,Record::Manifest(m) if m.id==t.submission&&m.seal.digest()==t.seal_digest))=>{return Err(invalid());},_=>{} }
         }
         serde_json::to_value(records).map_err(|_| invalid())
     }

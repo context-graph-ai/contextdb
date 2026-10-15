@@ -37,6 +37,7 @@ impl MemoryAccountant {
         }
     }
 
+    #[cfg(feature = "test-seams")]
     fn with_budget(limit: usize) -> Self {
         Self {
             limit,
@@ -357,6 +358,7 @@ fn maintain_until_hnsw_ready(
     panic!("finite maintenance did not materialize HNSW for {index:?}");
 }
 
+#[cfg(feature = "test-seams")]
 fn hnsw_final_estimate(entry_count: usize, dimension: usize) -> usize {
     contextdb_vector::hnsw::HnswIndex::estimated_resident_bytes_for_count(
         entry_count,
@@ -365,6 +367,7 @@ fn hnsw_final_estimate(entry_count: usize, dimension: usize) -> usize {
     )
 }
 
+#[cfg(feature = "test-seams")]
 fn hnsw_build_reservation_estimate(entry_count: usize, dimension: usize) -> usize {
     let policy = contextdb_vector::store::VectorIndexLayout::unpartitioned(
         dimension,

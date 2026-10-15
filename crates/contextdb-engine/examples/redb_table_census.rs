@@ -41,7 +41,7 @@ fn main() {
         rows.push((name, entries, stored, metadata, fragmented));
     }
 
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.2));
 
     println!("file_bytes={file_bytes}");
     println!(

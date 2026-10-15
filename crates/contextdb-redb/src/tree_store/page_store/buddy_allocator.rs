@@ -318,7 +318,7 @@ impl BuddyAllocator {
                         let buddy = buddy_page(page);
                         if buddy < allocator.len() {
                             let buddy_allocated = allocator.get(buddy);
-                            assert!(buddy_allocated, "order={order} page={page} buddy={buddy}",);
+                            assert!(buddy_allocated, "order={order} page={page} buddy={buddy}");
                         }
                     }
                 }

@@ -2439,7 +2439,12 @@ fn assert_core_has_no_cfg_or_macro_dependency_bypass(source: &Path, syntax: &syn
         cfg.visit_item(item);
         let sanctioned_lint_only_cfg_attr = source.file_name().is_some_and(|name| {
             name == "direct_file_reader.rs"
-                && matches!(item, Item::Struct(item) if item.ident == "DirectReaderConfig")
+                && matches!(
+                    item,
+                    Item::Struct(item)
+                        if ["DirectReaderConfig", "DirectStoredRow", "DirectStoredEdge", "DirectStoredVector"]
+                            .contains(&item.ident.to_string().as_str())
+                )
         }) && matches!(
             cfg.cfg_attributes.as_slice(),
             [attribute]
