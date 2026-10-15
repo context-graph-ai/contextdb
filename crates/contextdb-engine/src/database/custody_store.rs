@@ -351,6 +351,7 @@ impl Database {
     pub fn __custody_measured_held_for_test() -> Option<usize> {
         MEASURED_READER_FOR_TEST.with(|reader| reader.borrow().as_ref().map(|memory| memory.held()))
     }
+    #[cfg(feature = "test-seams")]
     fn raw_custody_commit_for_test(
         &self,
         key: &str,
