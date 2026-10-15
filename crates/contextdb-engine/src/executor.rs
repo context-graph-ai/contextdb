@@ -12682,9 +12682,11 @@ fn execute_writer_index_scan(
         cursor.seeking_run_with_prefix_len(lower, upper, prefix)
     };
     cursor.source_configure(pick.columns.len());
+    // Entries examined are the index entries the run walks, as on every other
+    // route; the storage touches behind each one are not entries.
     let mut examined = 0u64;
     let mut out = Vec::new();
-    while let Some(row) = db.bounded_ordered_table_row_next(
+    while let Some(row) = db.bounded_ordered_table_row_next_observed(
         read_memory.clone(),
         table,
         &column,
@@ -12692,7 +12694,8 @@ fn execute_writer_index_scan(
         snapshot,
         &mut cursor,
         || Ok::<_, Error>(()),
-        || {
+        || Ok::<_, Error>(()),
+        |_, _| {
             examined = examined.saturating_add(1);
             Ok::<_, Error>(())
         },
