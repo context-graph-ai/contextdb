@@ -774,3 +774,165 @@ fn boolean_pending_seek_uses_the_declared_context_generation_prefix() {
         "doubling rows in other Contexts and generations does not change equality-seek work"
     );
 }
+
+const EVENTS_SCHEMA: &str = "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID NOT NULL, body TEXT NOT NULL) SYNC OFF";
+const EVENTS_INDEX: &str = "CREATE INDEX idx_events_context ON events (context_id, id)";
+const EVENTS_DECLARATION: &str = "ALTER TABLE events SET MAINTAIN COUNT (context_id)";
+const EVENTS_INSERT: &str = "INSERT INTO events (id, context_id, body) VALUES ($id, $context_id, $body)";
+const EVENTS_COUNT: &str = "SELECT COUNT(*) FROM events WHERE context_id = $context_id";
+
+fn event_id(n: u128) -> Value {
+    Value::Uuid(Uuid::from_u128(1_000_000 + n))
+}
+
+/// A store whose events table declares the context count and holds
+/// `committed` events in context 1 and 16 in context 2.
+fn committed_events(path: &std::path::Path, committed: u128) -> Database {
+    let db = open(path);
+    execute(&db, EVENTS_SCHEMA, &HashMap::new());
+    execute(&db, EVENTS_INDEX, &HashMap::new());
+    execute(&db, EVENTS_DECLARATION, &HashMap::new());
+    let rows = (0..committed)
+        .map(|n| (n, 1))
+        .chain((committed..committed + 16).map(|n| (n, 2)))
+        .collect::<Vec<_>>();
+    for batch in rows.chunks(512) {
+        let tx = db.begin().unwrap();
+        for (n, context_id) in batch {
+            db.execute_in_tx(
+                tx,
+                EVENTS_INSERT,
+                &params(&[
+                    ("id", event_id(*n)),
+                    ("context_id", context(*context_id)),
+                    ("body", Value::Text("committed".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.commit(tx).unwrap();
+    }
+    db
+}
+
+/// The writer's own open transaction counts a context through the declared
+/// count: the committed total, less the committed rows the transaction moves
+/// out of the context, plus its own staged rows in the context. The work is
+/// the transaction's, never the context's history.
+#[test]
+fn an_in_transaction_context_count_is_served_from_the_declaration() {
+    let count_columns = vec![("context_id".to_string(), SortDirection::Asc)];
+    let mut examined = Vec::new();
+    for committed in [10_u128, 20_010] {
+        let directory = tempfile::tempdir().unwrap();
+        let db = committed_events(&directory.path().join("in-tx-count.redb"), committed);
+        let tx = db.begin().unwrap();
+        for n in 0..3 {
+            db.execute_in_tx(
+                tx,
+                EVENTS_INSERT,
+                &params(&[
+                    ("id", event_id(5_000_000 + n)),
+                    ("context_id", context(1)),
+                    ("body", Value::Text("staged".into())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.execute_in_tx(
+            tx,
+            EVENTS_INSERT,
+            &params(&[
+                ("id", event_id(6_000_000)),
+                ("context_id", context(2)),
+                ("body", Value::Text("staged elsewhere".into())),
+            ]),
+        )
+        .unwrap();
+        for moved in [0, 1] {
+            db.execute_in_tx(
+                tx,
+                "UPDATE events SET context_id = $to WHERE id = $id",
+                &params(&[("id", event_id(moved)), ("to", context(2))]),
+            )
+            .unwrap();
+        }
+        let answer = db
+            .execute_in_tx(tx, EVENTS_COUNT, &params(&[("context_id", context(1))]))
+            .unwrap();
+        let expected = i64::try_from(committed).unwrap() + 3 - 2;
+        assert_eq!(answer.rows, vec![vec![Value::Int64(expected)]]);
+        println!(
+            "in-tx context count committed={committed} rows_examined={} maintained_count={:?}",
+            answer.trace.rows_examined, answer.trace.maintained_count
+        );
+        assert_eq!(
+            answer.trace.maintained_count.as_deref(),
+            Some(&MaintainedCountDisclosure::Used {
+                table: "events".into(),
+                columns: count_columns.clone(),
+            }),
+            "the declared count answers the writer's in-transaction read"
+        );
+        examined.push(answer.trace.rows_examined);
+        db.rollback(tx).unwrap();
+        db.close().unwrap();
+    }
+    assert_eq!(
+        examined[0], examined[1],
+        "the in-transaction count examines the transaction's work, not the context's history: {examined:?}"
+    );
+}
+
+/// A DELETE stages its WHERE as a value predicate as well as the rows it
+/// matched, and such a predicate cannot say which committed rows it hides
+/// without reading them. The count stays exact, is answered by the ordinary
+/// index range, and says so.
+#[test]
+fn an_in_transaction_count_after_a_value_delete_stays_exact() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = committed_events(&directory.path().join("in-tx-value-delete.redb"), 40);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "DELETE FROM events WHERE context_id = $context_id",
+        &params(&[("context_id", context(2))]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "DELETE FROM events WHERE id = $id",
+        &params(&[("id", event_id(0))]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        EVENTS_INSERT,
+        &params(&[
+            ("id", event_id(7_000_000)),
+            ("context_id", context(1)),
+            ("body", Value::Text("staged".into())),
+        ]),
+    )
+    .unwrap();
+    for (context_id, expected) in [(1, 40), (2, 0)] {
+        let answer = db
+            .execute_in_tx(tx, EVENTS_COUNT, &params(&[("context_id", context(context_id))]))
+            .unwrap();
+        assert_eq!(
+            answer.rows,
+            vec![vec![Value::Int64(expected)]],
+            "context {context_id}"
+        );
+        assert_eq!(
+            answer.trace.maintained_count.as_deref(),
+            Some(&MaintainedCountDisclosure::DeclaredNotServed {
+                table: "events".into(),
+                columns: vec![("context_id".into(), SortDirection::Asc)],
+            }),
+            "a value-predicate delete is counted from the index range, and says so"
+        );
+    }
+    db.rollback(tx).unwrap();
+    db.close().unwrap();
+}
