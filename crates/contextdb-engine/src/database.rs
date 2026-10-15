@@ -23898,8 +23898,7 @@ impl MaintenanceContext {
         // A storage compaction sweep reclaims deferred frees in its own batches while it relocates
         // pages toward the front of the file; extra commits here would allocate behind it. The
         // stage resumes on the first cycle after the sweep completes.
-        if persistence.active_storage_compaction()?.is_some()
-        {
+        if persistence.active_storage_compaction()?.is_some() {
             return Ok(());
         }
         let mut boundary = None;

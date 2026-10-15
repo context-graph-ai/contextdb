@@ -2199,7 +2199,9 @@ fn a_growth_refused_for_quota_retries_at_the_size_the_allocation_needs() {
     {
         let mut table = write.open_table(VALUES).unwrap();
         for key in 0..32u64 {
-            table.insert(key, vec![0x11_u8; 8 * 1024].as_slice()).unwrap();
+            table
+                .insert(key, vec![0x11_u8; 8 * 1024].as_slice())
+                .unwrap();
         }
     }
     write.commit().unwrap();

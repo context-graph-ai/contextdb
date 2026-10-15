@@ -444,10 +444,11 @@ fn setting_of(sql: &str) -> StorageCompactionSetting {
 /// Two storage compaction declarations run through the setter on two
 /// threads while the first is paused after its declaration is durable and
 /// before it is live.
-fn race_declarations(first: &'static str, second: &'static str, before: Option<&str>) -> (
-    Vec<(String, String, String)>,
-    Vec<(String, String, String)>,
-) {
+fn race_declarations(
+    first: &'static str,
+    second: &'static str,
+    before: Option<&str>,
+) -> (Vec<(String, String, String)>, Vec<(String, String, String)>) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("race.redb");
     let db = Arc::new(open(&path));
@@ -540,8 +541,16 @@ fn the_rust_setter_refuses_what_sql_refuses_and_changes_nothing() {
         ..Default::default()
     };
     for ratio in [0.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
-        refused_with(declare(start(ratio)), Issue::StartRatioOutOfRange, &format!("START_RATIO {ratio}"));
-        refused_with(declare(stop(ratio)), Issue::StopRatioOutOfRange, &format!("STOP_RATIO {ratio}"));
+        refused_with(
+            declare(start(ratio)),
+            Issue::StartRatioOutOfRange,
+            &format!("START_RATIO {ratio}"),
+        );
+        refused_with(
+            declare(stop(ratio)),
+            Issue::StopRatioOutOfRange,
+            &format!("STOP_RATIO {ratio}"),
+        );
     }
     refused_with(
         declare(StorageCompactionClauses {
@@ -569,21 +578,50 @@ fn the_rust_setter_refuses_what_sql_refuses_and_changes_nothing() {
         "a valid START_RATIO beside an unrepresentable MIN_INTERVAL",
     );
     for (sql, issue) in [
-        ("SET STORAGE_COMPACTION START_RATIO 0", Issue::StartRatioOutOfRange),
-        ("SET STORAGE_COMPACTION START_RATIO 1.5", Issue::StartRatioOutOfRange),
-        ("SET STORAGE_COMPACTION STOP_RATIO 0", Issue::StopRatioOutOfRange),
-        ("SET STORAGE_COMPACTION MAX_SWEEPS 0", Issue::MaxSweepsNotPositive),
-        ("SET STORAGE_COMPACTION MAX_SWEEPS 4294967296", Issue::MaxSweepsOutOfRange),
-        ("SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS", Issue::MinIntervalNotPositive),
-        ("SET STORAGE_COMPACTION START_RATIO 0.3 START_RATIO 0.6", Issue::DuplicateClause),
+        (
+            "SET STORAGE_COMPACTION START_RATIO 0",
+            Issue::StartRatioOutOfRange,
+        ),
+        (
+            "SET STORAGE_COMPACTION START_RATIO 1.5",
+            Issue::StartRatioOutOfRange,
+        ),
+        (
+            "SET STORAGE_COMPACTION STOP_RATIO 0",
+            Issue::StopRatioOutOfRange,
+        ),
+        (
+            "SET STORAGE_COMPACTION MAX_SWEEPS 0",
+            Issue::MaxSweepsNotPositive,
+        ),
+        (
+            "SET STORAGE_COMPACTION MAX_SWEEPS 4294967296",
+            Issue::MaxSweepsOutOfRange,
+        ),
+        (
+            "SET STORAGE_COMPACTION MIN_INTERVAL 0 SECONDS",
+            Issue::MinIntervalNotPositive,
+        ),
+        (
+            "SET STORAGE_COMPACTION START_RATIO 0.3 START_RATIO 0.6",
+            Issue::DuplicateClause,
+        ),
     ] {
         refused_with(db.execute(sql, &p()), issue, sql);
     }
-    assert_eq!(shown(&db), baseline, "a refused declaration changes nothing live");
+    assert_eq!(
+        shown(&db),
+        baseline,
+        "a refused declaration changes nothing live"
+    );
     db.close().unwrap();
     drop(db);
     let db = open(&path);
-    assert_eq!(shown(&db), baseline, "a refused declaration changes nothing durable");
+    assert_eq!(
+        shown(&db),
+        baseline,
+        "a refused declaration changes nothing durable"
+    );
     // The upper bounds are inclusive.
     db.execute("SET STORAGE_COMPACTION START_RATIO 1 STOP_RATIO 1", &p())
         .unwrap();
@@ -614,16 +652,20 @@ fn the_longest_interval_shows_exactly_and_a_longer_one_is_refused() {
     ] {
         refused_with(db.execute(sql, &p()), Issue::MinIntervalOutOfRange, sql);
     }
-    db.set_storage_compaction(&StorageCompactionSetting::Declare(StorageCompactionClauses {
-        min_interval_ms: Some(i64::MAX as u64),
-        ..Default::default()
-    }))
+    db.set_storage_compaction(&StorageCompactionSetting::Declare(
+        StorageCompactionClauses {
+            min_interval_ms: Some(i64::MAX as u64),
+            ..Default::default()
+        },
+    ))
     .unwrap();
     refused_with(
-        db.set_storage_compaction(&StorageCompactionSetting::Declare(StorageCompactionClauses {
-            min_interval_ms: Some(i64::MAX as u64 + 1),
-            ..Default::default()
-        })),
+        db.set_storage_compaction(&StorageCompactionSetting::Declare(
+            StorageCompactionClauses {
+                min_interval_ms: Some(i64::MAX as u64 + 1),
+                ..Default::default()
+            },
+        )),
         Issue::MinIntervalOutOfRange,
         "one millisecond past the inspectable range",
     );
@@ -632,7 +674,11 @@ fn the_longest_interval_shows_exactly_and_a_longer_one_is_refused() {
     db.close().unwrap();
     drop(db);
     let db = open(&path);
-    assert_eq!(shown(&db)[1], longest, "the longest interval survives reopen exactly");
+    assert_eq!(
+        shown(&db)[1],
+        longest,
+        "the longest interval survives reopen exactly"
+    );
     db.close().unwrap();
 }
 

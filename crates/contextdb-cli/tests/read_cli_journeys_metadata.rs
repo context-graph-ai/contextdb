@@ -344,10 +344,26 @@ fn a_declared_storage_compaction_shows_its_source_through_both_read_routes() {
         create_seeded_table("subject", 2)
     ));
     let declared = vec![
-        ("start_ratio".to_owned(), "0.4".to_owned(), "declared".to_owned()),
-        ("min_interval_ms".to_owned(), "3600000".to_owned(), "default".to_owned()),
-        ("stop_ratio".to_owned(), "0.05".to_owned(), "default".to_owned()),
-        ("max_sweeps".to_owned(), "3".to_owned(), "declared".to_owned()),
+        (
+            "start_ratio".to_owned(),
+            "0.4".to_owned(),
+            "declared".to_owned(),
+        ),
+        (
+            "min_interval_ms".to_owned(),
+            "3600000".to_owned(),
+            "default".to_owned(),
+        ),
+        (
+            "stop_ratio".to_owned(),
+            "0.05".to_owned(),
+            "default".to_owned(),
+        ),
+        (
+            "max_sweeps".to_owned(),
+            "3".to_owned(),
+            "declared".to_owned(),
+        ),
     ];
     let settings = |outcome: &Outcome| -> Vec<(String, String, String)> {
         let docs = outcome.stdout_docs();
@@ -374,7 +390,12 @@ fn a_declared_storage_compaction_shows_its_source_through_both_read_routes() {
 
     let idle = run(&[store.path_str(), "--json"], ".maintenance status\n");
     assert_eq!(idle.code, Some(0), "{}", idle.describe());
-    assert_ne!(route(&idle).as_deref(), Some("owner"), "{}", idle.describe());
+    assert_ne!(
+        route(&idle).as_deref(),
+        Some("owner"),
+        "{}",
+        idle.describe()
+    );
     assert_eq!(
         settings(&idle),
         declared,
@@ -384,7 +405,12 @@ fn a_declared_storage_compaction_shows_its_source_through_both_read_routes() {
     let _owner = live_owner(&store.path, "");
     let owned = run(&[store.path_str(), "--json"], ".maintenance status\n");
     assert_eq!(owned.code, Some(0), "{}", owned.describe());
-    assert_eq!(route(&owned).as_deref(), Some("owner"), "{}", owned.describe());
+    assert_eq!(
+        route(&owned).as_deref(),
+        Some("owner"),
+        "{}",
+        owned.describe()
+    );
     assert_eq!(
         settings(&owned),
         declared,
