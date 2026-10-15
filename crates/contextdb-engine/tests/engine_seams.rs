@@ -230,11 +230,13 @@ mod one_import_commit_larger_than_the_cohort_share_is_absorbed;
 mod opening_a_store_charges_the_reader_the_same_however_long_its_history;
 #[path = "engine_seams/opening_a_store_does_a_bounded_vector_journal_cleanup.rs"]
 mod opening_a_store_does_a_bounded_vector_journal_cleanup;
+#[path = "engine_seams/opening_a_store_holds_a_bounded_window_of_queued_events.rs"]
+mod opening_a_store_holds_a_bounded_window_of_queued_events;
+#[path = "engine_seams/opening_a_store_read_only_does_not_grow_with_history.rs"]
+mod opening_a_store_read_only_does_not_grow_with_history;
 #[path = "engine_seams/reads_and_writes_are_charged_to_their_own_declared_limits.rs"]
 mod reads_and_writes_are_charged_to_their_own_declared_limits;
 #[path = "engine_seams/trigger_audit_history_is_charged_once_to_the_declared_reader.rs"]
 mod trigger_audit_history_is_charged_once_to_the_declared_reader;
-#[path = "engine_seams/opening_a_store_holds_a_bounded_window_of_queued_events.rs"]
-mod opening_a_store_holds_a_bounded_window_of_queued_events;
 #[path = "engine_seams/vector_journal_cleanup_lets_writers_commit_between_steps.rs"]
 mod vector_journal_cleanup_lets_writers_commit_between_steps;
