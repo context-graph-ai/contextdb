@@ -928,10 +928,13 @@ pub fn assert_affected_only(
             continue;
         }
         if table == "__history_root_witness_v1" && event.table == "__redb_user_table_directory" {
-            // The witness table's directory entry moves with its root: at most
-            // once per witness it actually wrote.
+            // Every historical-root hook event opens the witness table: the
+            // check before a relation opens or is deleted, and the write after
+            // it closes. Each witness write therefore carries a few directory
+            // rewrites (measured 1,399 for 600 writes on the largest replay),
+            // all bounded by the witness work the affected tables did.
             assert!(
-                *count <= witness_writes,
+                *count <= 3 * witness_writes,
                 "witness directory rewritten {count} times for {witness_writes} witness writes \
                  {event:?}"
             );

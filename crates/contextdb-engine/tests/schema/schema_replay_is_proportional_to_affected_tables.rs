@@ -884,7 +884,7 @@ fn affected_set_oracle_rejects_missing_dependents_and_unrelated_tables() {
     let mut directory_without_witness = owned.clone();
     directory_without_witness
         .artifact_writes
-        .insert(witness_directory, 3);
+        .insert(witness_directory, 7);
     assert!(
         std::panic::catch_unwind(|| assert_dependency_complete(
             &directory_without_witness,
@@ -893,7 +893,7 @@ fn affected_set_oracle_rejects_missing_dependents_and_unrelated_tables() {
             0
         ))
         .is_err(),
-        "more witness directory rewrites than witness writes are rejected"
+        "witness directory rewrites beyond the witness work are rejected"
     );
 }
 
