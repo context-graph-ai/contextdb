@@ -2331,6 +2331,7 @@ struct PublishedRoot {
     ddl_selector_roots: Option<[[u8; 32]; 2]>,
     content_size_root: Option<[u8; 32]>,
     vector_pages_root: Option<[u8; 32]>,
+    lineage_config_root: Option<[u8; 32]>,
 }
 
 fn empty_published_root(family: LogicalFamily) -> PublishedRoot {
@@ -2342,6 +2343,8 @@ fn empty_published_root(family: LogicalFamily) -> PublishedRoot {
         ddl_selector_roots: (family == LogicalFamily::ChangeAndDdl).then_some([[0; 32]; 2]),
         custody_config_root: (family == LogicalFamily::Configuration)
             .then(|| SetCommitment::empty(CompactIndexSet::CustodyIndex).root()),
+        lineage_config_root: (family == LogicalFamily::Configuration)
+            .then(|| SetCommitment::empty(CompactIndexSet::LineageIndex).root()),
         vector_directory_root: family.carries_vector_directory_projection().then(|| {
             SetCommitment::empty(CompactIndexSet::VectorDirectory).root_with_vector_body_count(0)
         }),
@@ -2382,6 +2385,8 @@ pub(super) enum CompactIndexSet {
     VectorDirectory,
     /// The copied custody policy and delivery records.
     CustodyIndex,
+    /// The copied per-row sync lineage records and purged-life history.
+    LineageIndex,
 }
 
 impl CompactIndexSet {
@@ -2389,6 +2394,7 @@ impl CompactIndexSet {
         match self {
             Self::VectorDirectory => b"contextdb-vector-directory-set-element-v1",
             Self::CustodyIndex => b"contextdb-custody-index-set-element-v1",
+            Self::LineageIndex => b"contextdb-lineage-index-set-element-v1",
         }
     }
 
@@ -2396,6 +2402,7 @@ impl CompactIndexSet {
         match self {
             Self::VectorDirectory => b"contextdb-vector-directory-set-root-v1",
             Self::CustodyIndex => b"contextdb-custody-index-set-root-v1",
+            Self::LineageIndex => b"contextdb-lineage-index-set-root-v1",
         }
     }
 
@@ -2404,6 +2411,7 @@ impl CompactIndexSet {
         match self {
             Self::VectorDirectory => "vector_directory",
             Self::CustodyIndex => "custody_index",
+            Self::LineageIndex => "lineage_index",
         }
     }
 }
@@ -3834,8 +3842,8 @@ fn sort_canonical_from_coalesced(edits: &mut EntryEdits) -> Result<()> {
 }
 
 /// What one encoded family root costs: the buffer `encode_published_root`
-/// reserves. Configuration carries the startup projection and the custody
-/// projection; a vector family carries the membership projection.
+/// reserves. Configuration carries the startup, custody and lineage
+/// projections; a vector family carries the membership projection.
 const ENCODED_ROOT_BYTES: usize = 462;
 
 /// What one proof-reset batch may hold at once: the working set of a family
@@ -3853,6 +3861,7 @@ struct RootTail {
     ddl_selector_roots: Option<[[u8; 32]; 2]>,
     content_size_root: Option<[u8; 32]>,
     vector_pages_root: Option<[u8; 32]>,
+    lineage_config_root: Option<[u8; 32]>,
 }
 
 fn assign_open_projections(
@@ -3861,7 +3870,12 @@ fn assign_open_projections(
     open_config_root: Option<[u8; 32]>,
     custody_config_root: Option<[u8; 32]>,
     vector_directory_root: Option<[u8; 32]>,
+    lineage_config_root: Option<[u8; 32]>,
 ) {
+    if let Some(lineage_config_root) = lineage_config_root {
+        tails[LogicalFamily::Configuration as usize].lineage_config_root =
+            Some(lineage_config_root);
+    }
     if let Some(open_config_root) = open_config_root {
         roots[LogicalFamily::Configuration as usize].open_config_root = Some(open_config_root);
     }
@@ -3904,6 +3918,7 @@ fn persist_changed_family_roots(
             ddl_selector_roots: tails[family as usize].ddl_selector_roots,
             content_size_root: tails[family as usize].content_size_root,
             vector_pages_root: tails[family as usize].vector_pages_root,
+            lineage_config_root: tails[family as usize].lineage_config_root,
         });
         roots_table
             .insert(family as u8, encoded.as_slice())
@@ -3991,6 +4006,9 @@ fn encode_published_root(root: &PublishedRoot) -> Vec<u8> {
     if let Some(root) = root.vector_pages_root {
         encoded.extend_from_slice(&root);
     }
+    if let Some(root) = root.lineage_config_root {
+        encoded.extend_from_slice(&root);
+    }
     if let Some(history) = root.history_open {
         encoded.extend_from_slice(&history.control.encode());
         encoded.extend_from_slice(&history.control_hash);
@@ -4070,6 +4088,9 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
     let vector_pages_root = (family == LogicalFamily::Configuration)
         .then(|| take_root_hash(bytes, &mut cursor, "vector page root"))
         .transpose()?;
+    let lineage_config_root = (family == LogicalFamily::Configuration)
+        .then(|| take_root_hash(bytes, &mut cursor, "lineage config root"))
+        .transpose()?;
     let history_open = if family == LogicalFamily::ChangeAndDdl {
         let control = HistoryOpenControl::decode(take_bytes(
             bytes,
@@ -4118,6 +4139,7 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
         ddl_selector_roots,
         content_size_root,
         vector_pages_root,
+        lineage_config_root,
     })
 }
 
@@ -4891,6 +4913,9 @@ pub(crate) struct ContentIdentityReadVerifier {
     /// Ordered digest of the complete custody copy, read from the Configuration
     /// family-root record when this verifier opened.
     custody_config_root: [u8; 32],
+    /// Set commitment of the complete per-row lineage copy, read from the
+    /// same Configuration family-root record.
+    lineage_config_root: [u8; 32],
     nodes: ReadOnlyTable<&'static [u8], &'static [u8]>,
     verified_records: Mutex<BTreeMap<[u8; 33], VerifiedRecordWitness>>,
     /// The store this verifier authenticates against, so every refusal it
@@ -5143,6 +5168,15 @@ impl ContentIdentityReadVerifier {
         Ok(())
     }
 
+    pub(super) fn verify_lineage_config_projection(&self, digest: [u8; 32]) -> Result<()> {
+        if self.lineage_config_root != digest {
+            return Err(self.corrupt(
+                "lineage configuration projection disagrees with committed Configuration root",
+            ));
+        }
+        Ok(())
+    }
+
     /// Report a proof failure as the existing typed corruption error. An error
     /// that already carries that type passes through unchanged.
     pub(super) fn corrupt(&self, reason: impl std::fmt::Display) -> Error {
@@ -5177,6 +5211,7 @@ impl ContentIdentityReadVerifier {
         let mut roots: [FamilyRoot; 11] =
             std::array::from_fn(|family| empty_root(LogicalFamily::ALL[family]));
         let mut custody_config_root = None;
+        let mut lineage_config_root = None;
         for family in LogicalFamily::ALL {
             let encoded = roots_table
                 .get(family as u8)
@@ -5185,12 +5220,18 @@ impl ContentIdentityReadVerifier {
             let published = decode_published_root(family, encoded.value())?;
             if family == LogicalFamily::Configuration {
                 custody_config_root = published.custody_config_root;
+                lineage_config_root = published.lineage_config_root;
             }
             roots[family as usize] = published.identity;
         }
         let custody_config_root = custody_config_root.ok_or_else(|| {
             Error::Other(
                 "custody configuration projection is absent from the committed root".to_owned(),
+            )
+        })?;
+        let lineage_config_root = lineage_config_root.ok_or_else(|| {
+            Error::Other(
+                "lineage configuration projection is absent from the committed root".to_owned(),
             )
         })?;
         drop(roots_table);
@@ -5204,6 +5245,7 @@ impl ContentIdentityReadVerifier {
         Ok(Self {
             roots,
             custody_config_root,
+            lineage_config_root,
             nodes,
             verified_records: Mutex::new(BTreeMap::new()),
             source: source.display().to_string(),
@@ -7179,6 +7221,7 @@ impl RedbPersistence {
             ddl_selector_roots: None,
             content_size_root: None,
             vector_pages_root: None,
+            lineage_config_root: None,
         });
         for family in LogicalFamily::ALL {
             let encoded = roots_table
@@ -7194,6 +7237,7 @@ impl RedbPersistence {
                 ddl_selector_roots: published.ddl_selector_roots,
                 content_size_root: published.content_size_root,
                 vector_pages_root: published.vector_pages_root,
+                lineage_config_root: published.lineage_config_root,
             };
         }
         drop(roots_table);
@@ -7241,6 +7285,8 @@ impl RedbPersistence {
         );
         let custody_config_root =
             Some(SetCommitment::load_in_write(write_txn, CompactIndexSet::CustodyIndex)?.root());
+        let lineage_config_root =
+            Some(SetCommitment::load_in_write(write_txn, CompactIndexSet::LineageIndex)?.root());
 
         // One durable transaction can stage several physical versions of the
         // same logical record (an UPDATE commonly contributes a remove and a
@@ -7500,6 +7546,7 @@ impl RedbPersistence {
             open_config_root,
             custody_config_root,
             vector_directory_root,
+            lineage_config_root,
         );
         tails[LogicalFamily::Configuration as usize].content_size_root = Some(
             write_txn
@@ -9190,6 +9237,7 @@ pub(crate) mod original_writer {
                 ddl_selector_roots: None,
                 content_size_root: None,
                 vector_pages_root: None,
+                lineage_config_root: None,
             });
             for family in LogicalFamily::ALL {
                 let encoded = roots_table
@@ -9207,6 +9255,7 @@ pub(crate) mod original_writer {
                     ddl_selector_roots: published.ddl_selector_roots,
                     content_size_root: published.content_size_root,
                     vector_pages_root: published.vector_pages_root,
+                    lineage_config_root: published.lineage_config_root,
                 };
             }
             drop(roots_table);
@@ -9253,6 +9302,9 @@ pub(crate) mod original_writer {
                             write_txn,
                         )?,
                     ),
+            );
+            let lineage_config_root = Some(
+                SetCommitment::load_in_write(write_txn, CompactIndexSet::LineageIndex)?.root(),
             );
             let custody_config_root = Some(
                 SetCommitment::load_in_write(write_txn, CompactIndexSet::CustodyIndex)?.root(),
@@ -9519,6 +9571,7 @@ pub(crate) mod original_writer {
                 open_config_root,
                 custody_config_root,
                 vector_directory_root,
+                lineage_config_root,
             );
             tails[LogicalFamily::Configuration as usize].content_size_root = Some(
                 write_txn

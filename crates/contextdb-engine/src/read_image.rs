@@ -365,9 +365,14 @@ fn project_loaded_change_state(
     read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<DirectChangeState> {
     let admit = |bytes: usize| charge.reserve(bytes);
+    let release = |bytes: usize| {
+        charge.release(bytes);
+        Ok(())
+    };
     let projection = crate::database::ChangeProjection {
         checkpoint,
         admit: &admit,
+        release: &release,
         bounded: true,
         ddl: true,
     };
@@ -462,9 +467,14 @@ fn project_loaded_sync_state(
     charge: &Arc<crate::read_image_memory::ImageMemory>,
 ) -> Result<DirectSyncState> {
     let admit = |bytes: usize| charge.reserve(bytes);
+    let release = |bytes: usize| {
+        charge.release(bytes);
+        Ok(())
+    };
     let projection = crate::database::ChangeProjection {
         checkpoint,
         admit: &admit,
+        release: &release,
         bounded: true,
         ddl: false,
     };

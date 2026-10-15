@@ -47030,8 +47030,7 @@ impl Database {
         // request, rather than holding every record from open.
         startup
             .config_source
-            .visit_image_lineage_config(prefix, &mut |key, bytes| {
-                (projection.checkpoint)()?;
+            .visit_image_lineage_config(prefix, projection, &mut |key, bytes| {
                 if projection.bounded {
                     (projection.admit)(
                         std::mem::size_of::<DurableLineageRecord>()
@@ -77939,9 +77938,11 @@ impl Database {
                 )
             };
             let checkpoint = || Ok(());
+            let release = |bytes| output.borrow_mut().try_shrink(bytes);
             let projection = ChangeProjection {
                 checkpoint: &checkpoint,
                 admit: &admit,
+                release: &release,
                 bounded: true,
                 ddl: true,
             };
@@ -77991,9 +77992,11 @@ impl Database {
                     "Reduce the selected changes or raise the declared read memory limit.",
                 )
             };
+            let release = |bytes| selection_credit.borrow_mut().try_shrink(bytes);
             let projection = ChangeProjection {
                 checkpoint: &unbounded_checkpoint,
                 admit: &admit,
+                release: &release,
                 bounded: true,
                 ddl: true,
             };
@@ -89018,6 +89021,8 @@ impl StartupState<'_> {
 pub(crate) struct ChangeProjection<'a> {
     pub(crate) checkpoint: &'a dyn Fn() -> Result<()>,
     pub(crate) admit: &'a dyn Fn(usize) -> Result<()>,
+    /// Return bytes `admit` took for transient scratch the answer does not keep.
+    pub(crate) release: &'a dyn Fn(usize) -> Result<()>,
     pub(crate) bounded: bool,
     /// Whether the answer carries schema history; one that does not never
     /// copies it.
@@ -96554,9 +96559,11 @@ mod currency_version_compaction_tests {
                             "Reduce the selected history.",
                         )
                     };
+                    let release = |bytes| credit.lock().unwrap().try_shrink(bytes);
                     let projection = ChangeProjection {
                         checkpoint: &|| Ok(()),
                         admit: &admit,
+                        release: &release,
                         bounded: true,
                         ddl: false,
                     };

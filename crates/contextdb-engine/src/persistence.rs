@@ -7089,13 +7089,17 @@ impl RetainedReadSource {
     }
 
     /// Visit this image's lineage records whose key starts with `prefix`, in
-    /// key order, read on request from the pinned snapshot. Every record of
-    /// the index is authenticated and the index aggregate is checked against
-    /// its commitment before this returns, so a caller that assembles its
-    /// answer from the visits never returns one built from a damaged index.
+    /// key order, read on request from the pinned snapshot. Before each record
+    /// is copied for authentication, the projection's checkpoint runs and the
+    /// copy's bytes are admitted through it (released once that record is done).
+    /// Every record is authenticated, and the complete set is checked against
+    /// the commitment published on the committed Configuration root before
+    /// this returns, so a dropped, altered or added record refuses the answer
+    /// instead of shortening it.
     pub(crate) fn visit_image_lineage_config(
         &self,
         prefix: &str,
+        projection: &crate::database::ChangeProjection<'_>,
         visit: &mut dyn FnMut(&str, &[u8]) -> Result<()>,
     ) -> Result<()> {
         self.with_read(|read| {
@@ -7108,9 +7112,7 @@ impl RetainedReadSource {
                 .ok_or_else(|| self.content_identity_corruption("lineage config root is absent"))?;
             let root = root.value().to_vec();
             if root.len() != 40 {
-                return Err(
-                    self.content_identity_corruption("lineage config root has invalid size")
-                );
+                return Err(self.content_identity_corruption("lineage config root has invalid size"));
             }
             let metadata = read
                 .open_table(CONTENT_IDENTITY_METADATA_TABLE)
@@ -7128,11 +7130,15 @@ impl RetainedReadSource {
             }
             let mut count = 0_u64;
             let mut xor = [0_u8; 32];
+            let mut set = content_identity::SetCommitment::empty(
+                content_identity::CompactIndexSet::LineageIndex,
+            );
             for entry in table.iter().map_err(RedbPersistence::storage_error)? {
                 let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
                 if key.value() == READ_OPEN_CONFIG_ROOT_KEY {
                     continue;
                 }
+                (projection.checkpoint)()?;
                 if !read_image_lineage_config_key(key.value()) {
                     return Err(self.content_identity_corruption(
                         "lineage config index contains an unrelated key",
@@ -7141,13 +7147,21 @@ impl RetainedReadSource {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(key.value().as_bytes());
                 hasher.update(value.value());
-                for (dst, src) in xor.iter_mut().zip(hasher.finalize().as_bytes()) {
+                let witness = hasher.finalize();
+                for (dst, src) in xor.iter_mut().zip(witness.as_bytes()) {
                     *dst ^= src;
                 }
                 count = count.saturating_add(1);
-                self.authenticate_mutation(
+                set.insert(key.value().as_bytes(), witness.as_bytes())?;
+                // The authentication mutation owns copies of the key and the
+                // value; their bytes are admitted before either is made.
+                let scratch = key.value().len().saturating_add(value.value().len()).saturating_mul(2);
+                (projection.admit)(scratch)?;
+                let authenticated = self.authenticate_mutation(
                     &content_identity::config_mutations(key.value(), Some(value.value()))[0],
-                )?;
+                );
+                (projection.release)(scratch)?;
+                authenticated?;
                 if key.value().starts_with(prefix) {
                     visit(key.value(), value.value())?;
                 }
@@ -7157,6 +7171,8 @@ impl RetainedReadSource {
                     "lineage config index aggregate disagrees with its values",
                 ));
             }
+            self.content_identity
+                .verify_lineage_config_projection(set.root())?;
             Ok(())
         })
     }
@@ -42163,7 +42179,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             write_txn,
             READ_LINEAGE_CONFIG_TABLE,
             READ_LINEAGE_CONFIG_COMMITMENT_KEY,
-            None,
+            Some(content_identity::CompactIndexSet::LineageIndex),
             key,
             value,
         )
@@ -42317,6 +42333,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(Self::storage_error(error)),
         }
+        content_identity::SetCommitment::clear_in_write(
+            write_txn,
+            content_identity::CompactIndexSet::LineageIndex,
+        )?;
         write_txn
             .open_table(READ_LINEAGE_CONFIG_TABLE)
             .map_err(Self::storage_error)?
