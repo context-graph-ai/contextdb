@@ -1024,11 +1024,9 @@ fn an_in_transaction_count_answers_its_own_snapshot_after_another_commit() {
 }
 
 /// A staged row is under a counted key exactly when an index posting for it
-/// would be: the key's total order, in which `-0.0` and `0.0` are different
-/// keys. The transaction's served count is the count the same rows have once
-/// it commits. (The ordinary in-transaction scan applies SQL equality to
-/// staged rows instead, under which `-0.0 = 0.0`; that disagreement with the
-/// index's own keys predates this count and is printed, not asserted.)
+/// would be, and float keys follow PostgreSQL's float8, where `-0.0 = 0.0`.
+/// The transaction's served count, its ordinary count and the count once it
+/// commits all see both rows.
 #[test]
 fn an_in_transaction_count_matches_float_keys_by_index_order() {
     let directory = tempfile::tempdir().unwrap();
@@ -1060,15 +1058,14 @@ fn an_in_transaction_count_matches_float_keys_by_index_order() {
     let ordinary = db
         .execute_in_tx(tx, "SELECT COUNT(id) FROM scores WHERE score = $score", &zero)
         .unwrap();
-    println!(
-        "in-tx float key count: served {:?} ({:?}), ordinary {:?}",
-        served.rows, served.trace.maintained_count, ordinary.rows
-    );
     db.commit(tx).unwrap();
     let committed = execute(&db, "SELECT COUNT(*) FROM scores WHERE score = $score", &zero);
+    let two = vec![vec![Value::Int64(2)]];
+    assert_eq!(served.rows, two, "the served count sees -0.0 as 0.0");
+    assert_eq!(ordinary.rows, two, "the ordinary count sees -0.0 as 0.0");
     assert_eq!(
-        served.rows, committed.rows,
-        "the served count keys staged rows the way the committed index does"
+        committed.rows, two,
+        "the committed count keys -0.0 and 0.0 as one value"
     );
     db.close().unwrap();
 }

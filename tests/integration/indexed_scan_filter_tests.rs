@@ -1866,10 +1866,11 @@ fn nan02_where_equal_nan_returns_zero_rows() {
 }
 
 // ============================================================================
-// NAN03 — parameterized NaN bind returns zero rows.
+// NAN03 — parameterized NaN bind matches the stored NaN row, as PostgreSQL's
+// float8 equality does (NaN = NaN).
 // ============================================================================
 #[test]
-fn nan03_param_nan_bind_returns_zero_rows() {
+fn nan03_param_nan_bind_matches_the_stored_nan() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY, f REAL)", &empty())
         .unwrap();
@@ -1901,15 +1902,15 @@ fn nan03_param_nan_bind_returns_zero_rows() {
         .unwrap();
     assert_eq!(r_pos.trace.physical_plan, "IndexScan");
     assert_eq!(r_pos.rows, vec![vec![Value::Uuid(id_finite)]]);
-    // Negative: NaN-bind short-circuits.
+    // A NaN bind is an ordinary index probe that finds the NaN row.
     let r = db
         .execute(
-            "SELECT f FROM t WHERE f = $p",
+            "SELECT id FROM t WHERE f = $p",
             &params(vec![("p", Value::Float64(f64::NAN))]),
         )
         .unwrap();
     assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r.rows, vec![vec![Value::Uuid(id_nan)]]);
 }
 
 // ============================================================================
