@@ -2674,6 +2674,68 @@ mod received_schema_stage_tests {
             .expect("DDL-only migration does not require a foreign-key component");
     }
 
+    /// A policy-only vector ALTER is its own authored transaction, and the
+    /// outbound builder ships it as its own unit even when the same table's
+    /// vectors were written just before and just after it. The receiver
+    /// therefore applies the policy in place and the vector rows through the
+    /// ordinary path, which keeps every serving graph.
+    #[test]
+    fn dependency_complete_outbound_isolates_a_policy_alter_from_the_same_tables_vectors() {
+        let db = Database::open_memory();
+        let alter = DdlChange::AlterTable {
+            name: "policy_items".to_string(),
+            columns: vec![
+                ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                ("scope".to_string(), "TEXT NOT NULL".to_string()),
+                (
+                    "embedding".to_string(),
+                    "VECTOR(3) PARTITION BY (scope) SEARCH_MODE AUTO".to_string(),
+                ),
+            ],
+            constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
+        };
+        let vector = |row: u64, lsn: u64| VectorChange {
+            index: VectorIndexRef::new("policy_items", "embedding"),
+            row_id: RowId(row),
+            vector: vec![1.0, 0.0, 0.0],
+            lsn: Lsn(lsn),
+        };
+        let changes = ChangeSet {
+            vectors: vec![vector(1, 40), vector(2, 42)],
+            ddl: vec![alter],
+            ddl_lsn: vec![Lsn(41)],
+            ..ChangeSet::default()
+        };
+        let reader = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut copy = contextdb_engine::vector_read_memory::admission(reader.clone());
+
+        let units = db
+            .dependency_complete_outbound_units(changes, Lsn(0), &mut copy, reader.clone())
+            .expect("build the outbound units");
+        let schema_units = units
+            .iter()
+            .filter(|unit| !unit.changes.ddl.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(schema_units.len(), 1, "{units:?}");
+        assert!(schema_units[0].dependency_complete);
+        assert_eq!(schema_units[0].changes.ddl_lsn, vec![Lsn(41)]);
+        assert!(
+            schema_units[0].changes.vectors.is_empty() && schema_units[0].changes.rows.is_empty(),
+            "the policy ALTER travels without the table's vector rows: {units:?}"
+        );
+        let mut shipped = units
+            .iter()
+            .flat_map(|unit| unit.changes.vectors.iter().map(|vector| vector.lsn))
+            .collect::<Vec<_>>();
+        shipped.sort();
+        assert_eq!(shipped, vec![Lsn(40), Lsn(42)], "every vector row still ships");
+    }
+
     #[test]
     fn dependency_complete_outbound_splits_unrelated_data_from_schema_migration() {
         let db = Database::open_memory();
@@ -41698,8 +41760,8 @@ impl Database {
             &live_event_bus,
             &live_trigger,
         );
-        // Lets a test prove its vector rows arrived inside this received
-        // schema unit rather than in a separate data unit.
+        // Lets a test see whether vector rows reached this received schema
+        // unit or arrived in a separate data unit.
         #[cfg(any(test, feature = "test-seams"))]
         record_received_schema_profile_work_for_test(
             "received-unit-vectors",

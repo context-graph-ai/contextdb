@@ -375,14 +375,18 @@ async fn a_synced_hnsw_topology_change_serves_the_old_graph_until_maintenance_re
     synced.stop().await;
 }
 
-/// One received unit carrying a policy-only ALTER and a vector update in the
-/// same table: the ordinary order of "ALTER, then write, then one pull". The
-/// receiver adopts the policy and applies the update without discarding its
-/// graphs: the untouched partition still answers INDEXED with no maintenance,
-/// a snapshot held from before the pull still sees the old vector, and a
-/// changed HNSW topology keeps the old one serving until maintenance.
+/// The ordinary order "ALTER, then write, then one pull": the source changes
+/// only the vector column's policy and then updates a vector in the same
+/// table, and the edge pulls both at once. Each is its own authored
+/// transaction and the sender ships the ALTER as its own unit, so the
+/// received schema stage carries no vector rows and applies the policy in
+/// place; the update takes the ordinary path. The receiver adopts the policy
+/// without discarding its graphs: the untouched partition still answers
+/// INDEXED with no maintenance, a snapshot held from before the pull still
+/// sees the old vector, and a changed HNSW topology keeps the old one serving
+/// until maintenance.
 #[tokio::test]
-async fn a_synced_policy_change_with_rows_in_the_same_unit_keeps_the_receivers_graphs() {
+async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receivers_graphs() {
     for (alter, adopted) in [
         (
             "ALTER TABLE policy_items ALTER COLUMN embedding SET SEARCH_MODE AUTO",
@@ -423,14 +427,14 @@ async fn a_synced_policy_change_with_rows_in_the_same_unit_keeps_the_receivers_g
         }
         let observation = observer
             .observation()
-            .expect("the pull applied a received schema unit");
+            .expect("the one pull applied the ALTER as a received schema unit");
         assert!(
             observation
                 .profile_work
                 .get("received-unit-vectors")
-                .is_some_and(|vectors| *vectors >= 1),
-            "{alter}: the vector update arrived inside the same received unit as the ALTER: \
-             {:?}",
+                .is_some_and(|vectors| *vectors == 0),
+            "{alter}: the sender ships the ALTER apart from the vector update, so the \
+             received schema stage carries no vector rows: {:?}",
             observation.profile_work
         );
         match adopted {
