@@ -538,7 +538,7 @@ fn c7_compaction_rides_the_same_fragmentation_threshold_as_the_currency_path() {
     clock.advance(RETENTION_WINDOW_MILLIS * 2);
 
     // The decision input is the allocator's reclaimable free-page ratio, read
-    // before each cycle prunes (owner ruling, S9). Freshly written rows leave
+    // before each cycle prunes. Freshly written rows leave
     // almost no free pages (0.0281 measured before the first cycle), so the
     // first cycles decide below the threshold; the pages each finite prune
     // releases raise the ratio until a later cycle's decision crosses it.
