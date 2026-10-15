@@ -2141,3 +2141,100 @@ fn allocator_free_total_geometry_costs_the_same_at_one_and_many_regions() {
         "open, trim, relocation and save visit no region for free-total geometry: {visits:?}"
     );
 }
+
+/// A backend whose file may not grow past `limit` bytes (0 = no limit),
+/// refusing like a full disk quota, and which records the length it holds.
+#[derive(Debug)]
+struct QuotaBackend {
+    inner: InMemoryBackend,
+    limit: Arc<std::sync::atomic::AtomicU64>,
+    length: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl StorageBackend for QuotaBackend {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, out)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        let limit = self.limit.load(Ordering::SeqCst);
+        if limit != 0 && len > limit {
+            return Err(io::Error::from(io::ErrorKind::QuotaExceeded));
+        }
+        self.inner.set_len(len)?;
+        self.length.store(len, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+}
+
+/// Growth asks for at least twice the file. When storage refuses that for
+/// quota, the allocation that needed the growth is retried at the size it
+/// needs, so a file under its limit keeps admitting writes that fit instead of
+/// refusing with most of the headroom unused.
+#[test]
+fn a_growth_refused_for_quota_retries_at_the_size_the_allocation_needs() {
+    const VALUES: TableDefinition<u64, &[u8]> = TableDefinition::new("quota_growth");
+    let limit = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let length = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let db = redb::Builder::new()
+        .create_with_backend(QuotaBackend {
+            inner: InMemoryBackend::new(),
+            limit: Arc::clone(&limit),
+            length: Arc::clone(&length),
+        })
+        .unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut table = write.open_table(VALUES).unwrap();
+        for key in 0..32u64 {
+            table.insert(key, vec![0x11_u8; 8 * 1024].as_slice()).unwrap();
+        }
+    }
+    write.commit().unwrap();
+    let before = length.load(Ordering::SeqCst);
+    let headroom = 128 * 1024;
+    assert!(
+        before > 2 * headroom,
+        "fixture: doubling the file must overshoot the headroom ({before})"
+    );
+    limit.store(before + headroom, Ordering::SeqCst);
+
+    let mut admitted = 0;
+    for key in 1_000..1_064u64 {
+        let Ok(write) = db.begin_write() else { break };
+        let inserted = write.open_table(VALUES).and_then(|mut table| {
+            table
+                .insert(key, vec![0x22_u8; 16 * 1024].as_slice())
+                .map(|_| ())
+                .map_err(redb::TableError::from)
+        });
+        if inserted.is_err() || write.commit().is_err() {
+            break;
+        }
+        admitted += 1;
+    }
+    let after = length.load(Ordering::SeqCst);
+    assert!(
+        after <= before + headroom,
+        "growth never passes the limit ({after} > {})",
+        before + headroom
+    );
+    assert!(
+        after > before + headroom / 2,
+        "a refused preferred growth retries at the size the allocation needs: the file stayed \
+         at {after} bytes of {} after {admitted} admitted writes",
+        before + headroom
+    );
+}
