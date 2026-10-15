@@ -7142,6 +7142,13 @@ impl RedbPersistence {
                         mutation.logical_value.as_deref(),
                     )?;
                 }
+                if super::read_image_lineage_config_key(key) {
+                    Self::write_read_lineage_config_entry(
+                        write_txn,
+                        key,
+                        mutation.logical_value.as_deref(),
+                    )?;
+                }
                 if crate::custody::records::owned_key(key) {
                     Self::write_read_custody_config_entry(
                         write_txn,
@@ -9141,6 +9148,13 @@ pub(crate) mod original_writer {
                 if let Ok(key) = std::str::from_utf8(&mutation.logical_key) {
                     if super::super::read_image_open_config_key(key) {
                         Self::write_read_open_config_entry(
+                            write_txn,
+                            key,
+                            mutation.logical_value.as_deref(),
+                        )?;
+                    }
+                    if super::super::read_image_lineage_config_key(key) {
+                        Self::write_read_lineage_config_entry(
                             write_txn,
                             key,
                             mutation.logical_value.as_deref(),

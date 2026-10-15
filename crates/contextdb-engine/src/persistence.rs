@@ -7088,6 +7088,79 @@ impl RetainedReadSource {
         })
     }
 
+    /// Visit this image's lineage records whose key starts with `prefix`, in
+    /// key order, read on request from the pinned snapshot. Every record of
+    /// the index is authenticated and the index aggregate is checked against
+    /// its commitment before this returns, so a caller that assembles its
+    /// answer from the visits never returns one built from a damaged index.
+    pub(crate) fn visit_image_lineage_config(
+        &self,
+        prefix: &str,
+        visit: &mut dyn FnMut(&str, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.with_read(|read| {
+            let table = read
+                .open_table(READ_LINEAGE_CONFIG_TABLE)
+                .map_err(RedbPersistence::storage_error)?;
+            let root = table
+                .get(READ_OPEN_CONFIG_ROOT_KEY)
+                .map_err(RedbPersistence::storage_error)?
+                .ok_or_else(|| self.content_identity_corruption("lineage config root is absent"))?;
+            let root = root.value().to_vec();
+            if root.len() != 40 {
+                return Err(
+                    self.content_identity_corruption("lineage config root has invalid size")
+                );
+            }
+            let metadata = read
+                .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+                .map_err(RedbPersistence::storage_error)?;
+            let commitment = metadata
+                .get(READ_LINEAGE_CONFIG_COMMITMENT_KEY)
+                .map_err(RedbPersistence::storage_error)?
+                .ok_or_else(|| {
+                    self.content_identity_corruption("lineage config commitment is absent")
+                })?;
+            if commitment.value() != blake3::hash(&root).as_bytes() {
+                return Err(self.content_identity_corruption(
+                    "lineage config commitment disagrees with its root",
+                ));
+            }
+            let mut count = 0_u64;
+            let mut xor = [0_u8; 32];
+            for entry in table.iter().map_err(RedbPersistence::storage_error)? {
+                let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+                if key.value() == READ_OPEN_CONFIG_ROOT_KEY {
+                    continue;
+                }
+                if !read_image_lineage_config_key(key.value()) {
+                    return Err(self.content_identity_corruption(
+                        "lineage config index contains an unrelated key",
+                    ));
+                }
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(key.value().as_bytes());
+                hasher.update(value.value());
+                for (dst, src) in xor.iter_mut().zip(hasher.finalize().as_bytes()) {
+                    *dst ^= src;
+                }
+                count = count.saturating_add(1);
+                self.authenticate_mutation(
+                    &content_identity::config_mutations(key.value(), Some(value.value()))[0],
+                )?;
+                if key.value().starts_with(prefix) {
+                    visit(key.value(), value.value())?;
+                }
+            }
+            if root[..8] != count.to_be_bytes() || root[8..] != xor {
+                return Err(self.content_identity_corruption(
+                    "lineage config index aggregate disagrees with its values",
+                ));
+            }
+            Ok(())
+        })
+    }
+
     fn raw_vector_corruption(&self, reason: impl Into<String>) -> Error {
         Error::StoreCorrupted {
             path: self.database_path.display().to_string(),
@@ -13253,13 +13326,17 @@ const READ_IMAGE_OPEN_CONFIG_KEYS: [&str; 16] = [
     "__trigger_including_sync",
 ];
 
-const READ_IMAGE_OPEN_CONFIG_PREFIXES: [&str; 5] = [
+const READ_IMAGE_OPEN_CONFIG_PREFIXES: [&str; 3] = [
     crate::database::event_bus::UNCERTAIN_COUNT_CONFIG_PREFIX,
     crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,
-    crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX,
-    crate::database::Database::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX,
     crate::database::Database::DURABLE_LINEAGE_TABLE_GENERATION_PREFIX,
 ];
+
+/// Per-row lineage keys: one per row life that ever carried sync lineage.
+pub(crate) fn read_image_lineage_config_key(key: &str) -> bool {
+    key.starts_with(crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX)
+        || key.starts_with(crate::database::Database::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX)
+}
 
 /// These keys have already been point-read from the pinned image, including
 /// their absence. A later startup lookup need not revisit the config B-tree.
@@ -19493,6 +19570,11 @@ const READ_OPEN_CONFIG_ROOT_KEY: &str = "";
 const READ_OPEN_CONFIG_COMMITMENT_KEY: &str = "read_open_config_root_v1";
 const READ_CUSTODY_CONFIG_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("read_custody_config");
+/// Per-row lineage records grow with deleted history, so a committed image
+/// reads them on request from this compact index instead of at open.
+const READ_LINEAGE_CONFIG_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("read_lineage_config");
+const READ_LINEAGE_CONFIG_COMMITMENT_KEY: &str = "read_lineage_config_root_v1";
 const READ_CUSTODY_CONFIG_COMMITMENT_KEY: &str = "read_custody_config_root_v1";
 // Derived selectors and their per-primary completion markers share one table.
 // A missing selector must never read a neighboring large configuration payload.
@@ -23601,6 +23683,16 @@ impl RedbPersistence {
         Self::write_open_index_commitment(
             &write_txn,
             READ_CUSTODY_CONFIG_COMMITMENT_KEY,
+            &[0_u8; 40],
+        )?;
+        write_txn
+            .open_table(READ_LINEAGE_CONFIG_TABLE)
+            .map_err(Self::storage_error)?
+            .insert(READ_OPEN_CONFIG_ROOT_KEY, &[0_u8; 40][..])
+            .map_err(Self::storage_error)?;
+        Self::write_open_index_commitment(
+            &write_txn,
+            READ_LINEAGE_CONFIG_COMMITMENT_KEY,
             &[0_u8; 40],
         )?;
         write_txn
@@ -37667,6 +37759,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 "read-custody-config",
                 &mut hasher,
             )?;
+            digest_redb_table(
+                &read_txn,
+                READ_LINEAGE_CONFIG_TABLE,
+                "read-lineage-config",
+                &mut hasher,
+            )?;
             let change_log_entries =
                 digest_redb_table(&read_txn, CHANGE_LOG_TABLE, "change-log", &mut hasher)?;
             let ddl_log_entries =
@@ -42056,6 +42154,21 @@ graph_commit_result }.map_err(Self::storage_error)?;
         custody_pending::rechecked_for_test()
     }
 
+    pub(super) fn write_read_lineage_config_entry(
+        write_txn: &redb::WriteTransaction,
+        key: &str,
+        value: Option<&[u8]>,
+    ) -> Result<()> {
+        Self::write_compact_config_entry(
+            write_txn,
+            READ_LINEAGE_CONFIG_TABLE,
+            READ_LINEAGE_CONFIG_COMMITMENT_KEY,
+            None,
+            key,
+            value,
+        )
+    }
+
     pub(super) fn write_read_custody_config_entry(
         write_txn: &redb::WriteTransaction,
         key: &str,
@@ -42192,6 +42305,42 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let (key, value) = entry.map_err(Self::storage_error)?;
             if read_image_open_config_key(key.value()) {
                 Self::write_read_open_config_entry(write_txn, key.value(), Some(value.value()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn rebuild_read_lineage_config_in_write(
+        write_txn: &redb::WriteTransaction,
+    ) -> Result<()> {
+        match write_txn.delete_table(READ_LINEAGE_CONFIG_TABLE) {
+            Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(Self::storage_error(error)),
+        }
+        write_txn
+            .open_table(READ_LINEAGE_CONFIG_TABLE)
+            .map_err(Self::storage_error)?
+            .insert(READ_OPEN_CONFIG_ROOT_KEY, &[0_u8; 40][..])
+            .map_err(Self::storage_error)?;
+        Self::write_open_index_commitment(
+            write_txn,
+            READ_LINEAGE_CONFIG_COMMITMENT_KEY,
+            &[0_u8; 40],
+        )?;
+        let config = match write_txn.open_table(CONFIG_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        let start = crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX
+            .min(crate::database::Database::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX);
+        for entry in config.range(start..).map_err(Self::storage_error)? {
+            let (key, value) = entry.map_err(Self::storage_error)?;
+            if !key.value().starts_with("sync_lineage.v1.") {
+                break;
+            }
+            if read_image_lineage_config_key(key.value()) {
+                Self::write_read_lineage_config_entry(write_txn, key.value(), Some(value.value()))?;
             }
         }
         Ok(())

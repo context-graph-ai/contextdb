@@ -31818,7 +31818,7 @@ impl Database {
         let stored_commit_last = history_on_request
             .as_ref()
             .and_then(|history| history.commit_index_last);
-        let max_tx = max_tx_across_all(&relational, &graph, &vector, &mut vector_copy_owner)?
+        let max_tx = max_tx_across_all(&relational, &graph)
             .max(commit_index.values().copied().max().unwrap_or(TxId(0)))
             .max(stored_commit_last.map_or(TxId(0), |(_, tx)| tx))
             .max(TxId(read_bounds.identity_tx_floor));
@@ -31839,19 +31839,13 @@ impl Database {
                     .and_then(|history| history.ddl_last_lsn)
                     .unwrap_or(Lsn(0)),
             );
-        let mut lineage_bounds = DurableLineageRecoveryBounds::default();
-        for (key, bytes) in config_values {
-            if key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX)
-                || key.starts_with(Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX)
-            {
-                lineage_bounds.admit(key, bytes)?;
-            }
-        }
-        let max_row_id = max_row_id.max(lineage_bounds.max_row_id);
+        // Every lineage write raises the persisted row-id and LSN floors in
+        // its own transaction (`raise_config_identity_floors_in_write`), the
+        // same floors a writable open trusts; no lineage record is decoded.
+        let max_row_id = max_row_id.max(RowId(read_bounds.external_row_id_floor));
         let max_lsn = max_lsn_across_all(&relational, &graph)
             .max(commit_index_max_lsn)
             .max(ddl_max_lsn)
-            .max(lineage_bounds.purge_frontier_max_lsn)
             .max(Lsn(read_bounds.source_lsn_floor));
         register_loaded_dormant_vector_generations(
             &vector,
@@ -47032,74 +47026,74 @@ impl Database {
         };
         let prefix = Self::DURABLE_LINEAGE_CONFIG_PREFIX;
         let mut pending = Vec::new();
-        for (key, bytes) in startup
-            .config_values
-            .range::<str, _>((
-                std::ops::Bound::Included(prefix),
-                std::ops::Bound::Unbounded,
-            ))
-            .take_while(|(key, _)| key.starts_with(prefix))
-        {
-            (projection.checkpoint)()?;
-            if projection.bounded {
-                (projection.admit)(
-                    std::mem::size_of::<DurableLineageRecord>()
-                        .saturating_add(bytes.len().saturating_mul(3)),
-                )?;
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            let bytes = if PENDING_DELETION_READ_FAULT.with(|fault| fault.replace(false)) {
-                &[0xff_u8, 0xfe, 0xfd, 0xfc][..]
-            } else {
-                bytes.as_slice()
-            };
-            let record = RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)
-                .map_err(|error| Error::StoreCorrupted {
-                    path: self.committed_image_path(),
-                    reason: format!("durable lineage record {key} cannot be read: {error}"),
-                })?;
-            let generation_key = Self::durable_lineage_table_generation_key(&record.table);
-            let generation = startup
-                .config_values
-                .get(&generation_key)
-                .map(|bytes| RedbPersistence::decode_config_value::<u64>(bytes))
-                .transpose()
-                .map_err(|error| Error::StoreCorrupted {
-                    path: self.committed_image_path(),
-                    reason: format!("table generation {generation_key} cannot be read: {error}"),
-                })?
-                .filter(|generation| *generation != 0)
-                .ok_or_else(|| Error::StoreCorrupted {
-                    path: self.committed_image_path(),
-                    reason: format!(
-                        "table {} has lineage but no authoritative generation",
-                        record.table
-                    ),
-                })?;
-            if record.table_generation != generation
-                || record.delete_obligation != DurableDeleteObligation::Pending
-                || record.delete_lsn <= since_lsn.0
-            {
-                continue;
-            }
-            let row = RowChange {
-                table: record.table,
-                natural_key: record.natural_key,
-                values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
-                deleted: true,
-                lsn: Lsn(record.delete_lsn),
-                created_at: None,
-            };
-            if projection.bounded {
-                (projection.admit)(answer_list_entry_bytes::<DurablePendingDelete>(
-                    row.held_bytes(),
-                ))?;
-            }
-            pending.push(DurablePendingDelete {
-                row,
-                local_row_id: record.local_row_id,
-            });
-        }
+        // Lineage grows with deleted history, so the image reads it here, on
+        // request, rather than holding every record from open.
+        startup
+            .config_source
+            .visit_image_lineage_config(prefix, &mut |key, bytes| {
+                (projection.checkpoint)()?;
+                if projection.bounded {
+                    (projection.admit)(
+                        std::mem::size_of::<DurableLineageRecord>()
+                            .saturating_add(bytes.len().saturating_mul(3)),
+                    )?;
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                let bytes = if PENDING_DELETION_READ_FAULT.with(|fault| fault.replace(false)) {
+                    &[0xff_u8, 0xfe, 0xfd, 0xfc][..]
+                } else {
+                    bytes
+                };
+                let record = RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)
+                    .map_err(|error| Error::StoreCorrupted {
+                        path: self.committed_image_path(),
+                        reason: format!("durable lineage record {key} cannot be read: {error}"),
+                    })?;
+                let generation_key = Self::durable_lineage_table_generation_key(&record.table);
+                let generation = startup
+                    .config_values
+                    .get(&generation_key)
+                    .map(|bytes| RedbPersistence::decode_config_value::<u64>(bytes))
+                    .transpose()
+                    .map_err(|error| Error::StoreCorrupted {
+                        path: self.committed_image_path(),
+                        reason: format!(
+                            "table generation {generation_key} cannot be read: {error}"
+                        ),
+                    })?
+                    .filter(|generation| *generation != 0)
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: self.committed_image_path(),
+                        reason: format!(
+                            "table {} has lineage but no authoritative generation",
+                            record.table
+                        ),
+                    })?;
+                if record.table_generation != generation
+                    || record.delete_obligation != DurableDeleteObligation::Pending
+                    || record.delete_lsn <= since_lsn.0
+                {
+                    return Ok(());
+                }
+                let row = RowChange {
+                    table: record.table,
+                    natural_key: record.natural_key,
+                    values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
+                    deleted: true,
+                    lsn: Lsn(record.delete_lsn),
+                    created_at: None,
+                };
+                if projection.bounded {
+                    (projection.admit)(answer_list_entry_bytes::<DurablePendingDelete>(
+                        row.held_bytes(),
+                    ))?;
+                }
+                pending.push(DurablePendingDelete {
+                    row,
+                    local_row_id: record.local_row_id,
+                });
+                Ok(())
+            })?;
         Ok(pending)
     }
 
@@ -92881,12 +92875,7 @@ fn row_is_prunable(
     meta.retained_row_has_expired(&row.values, row.created_at, now)
 }
 
-fn max_tx_across_all(
-    relational: &RelationalStore,
-    graph: &GraphStore,
-    vector: &VectorStore,
-    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-) -> Result<TxId> {
+fn max_tx_across_all(relational: &RelationalStore, graph: &GraphStore) -> TxId {
     let relational_max = relational
         .tables
         .read()
@@ -92903,14 +92892,7 @@ fn max_tx_across_all(
         .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
         .max()
         .unwrap_or(TxId(0));
-    let vector_max = vector
-        .raw_directory_entries(vector_copy_owner)?
-        .into_iter()
-        .flat_map(|(_, entry)| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
-        .max()
-        .unwrap_or(TxId(0));
-
-    Ok(relational_max.max(graph_max).max(vector_max))
+    relational_max.max(graph_max)
 }
 
 /// Vector memberships are written only by commits, and every commit's LSN is
