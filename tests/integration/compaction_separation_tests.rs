@@ -157,11 +157,18 @@ fn compact_now_is_a_no_op_on_an_in_memory_database() {
 fn the_automatic_compaction_path_is_interval_gated_not_per_cycle() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = open_caller_driven(&dir.path().join("interval_gated.db"));
+    // The start decision reads interior free pages, the space only moving
+    // pages can return. This churn leaves about 5% of the file as interior
+    // holes (in-page slack and the trailing free run are not counted), so the
+    // store declares a start ratio below that: the subject here is the
+    // interval gate, not the default ratio.
+    db.execute("SET STORAGE_COMPACTION START_RATIO 0.02", &HashMap::new())
+        .expect("declare the start ratio");
     churn_one_row(&db, 2_000);
 
     // First qualifying cycle: nothing has EVER auto-compacted on this
     // handle, so the interval is trivially satisfied; if fragmentation is at
-    // or above the shared threshold, this cycle compacts.
+    // or above the declared start ratio, this cycle compacts.
     let first = db
         .run_maintenance_cycle()
         .expect("first maintenance cycle must succeed");
