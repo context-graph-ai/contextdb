@@ -374,3 +374,108 @@ async fn a_synced_hnsw_topology_change_serves_the_old_graph_until_maintenance_re
     assert_indexed_answers(&synced.edge, "the new graph serves INDEXED");
     synced.stop().await;
 }
+
+/// One received unit carrying a policy-only ALTER and a vector update in the
+/// same table: the ordinary order of "ALTER, then write, then one pull". The
+/// receiver adopts the policy and applies the update without discarding its
+/// graphs: the untouched partition still answers INDEXED with no maintenance,
+/// a snapshot held from before the pull still sees the old vector, and a
+/// changed HNSW topology keeps the old one serving until maintenance.
+#[tokio::test]
+async fn a_synced_policy_change_with_rows_in_the_same_unit_keeps_the_receivers_graphs() {
+    for (alter, adopted) in [
+        (
+            "ALTER TABLE policy_items ALTER COLUMN embedding SET SEARCH_MODE AUTO",
+            "search_mode",
+        ),
+        (
+            "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT 7",
+            "auto_index_at",
+        ),
+        (
+            "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW \
+             (M = 24, EF_CONSTRUCTION = 300)",
+            "hnsw",
+        ),
+    ] {
+        let synced = Synced::start().await;
+        let (changed_id, changed_scope, old_embedding) = row(0);
+        let new_embedding = vec![0.0, 1.0, 0.0];
+        synced
+            .source
+            .execute(alter, &HashMap::new())
+            .expect("change only the vector column's policy at the source");
+        upsert(
+            &synced.source,
+            changed_id,
+            changed_scope,
+            new_embedding.clone(),
+        );
+        let before = synced.edge.snapshot();
+        let pin = synced
+            .edge
+            .pin_snapshot(before)
+            .expect("hold the pre-pull snapshot");
+        let observer = contextdb_engine::database::ReceivedSchemaApplyObserverForTest::new();
+        {
+            let _scope = synced.edge.observe_received_schema_applies_for_test(&observer);
+            synced.pull().await;
+        }
+        let observation = observer
+            .observation()
+            .expect("the pull applied a received schema unit");
+        assert!(
+            observation
+                .profile_work
+                .get("received-unit-vectors")
+                .is_some_and(|vectors| *vectors >= 1),
+            "{alter}: the vector update arrived inside the same received unit as the ALTER: \
+             {:?}",
+            observation.profile_work
+        );
+        match adopted {
+            "search_mode" => assert_eq!(
+                embedding_column(&synced.edge).search_mode,
+                VectorSearchMode::Auto
+            ),
+            "auto_index_at" => assert_eq!(embedding_column(&synced.edge).auto_index_at, Some(7)),
+            _ => assert!(
+                hnsw_m(&synced.edge)
+                    .iter()
+                    .all(|(desired, _)| *desired == Value::Int64(24)),
+                "{alter}: the receiver adopts the new topology"
+            ),
+        }
+        let (other_id, other_scope, other_embedding) = row(1);
+        assert_eq!(
+            indexed_search(&synced.edge, other_scope, other_embedding).unwrap_or_else(
+                |error| panic!(
+                    "{alter}: the untouched partition keeps its graph through a unit that \
+                     also carries rows: {error}"
+                )
+            ),
+            vec![other_id]
+        );
+        if adopted == "hnsw" {
+            assert!(
+                hnsw_m(&synced.edge)
+                    .iter()
+                    .any(|(desired, serving)| serving != desired),
+                "{alter}: the old topology keeps serving until maintenance"
+            );
+        }
+        assert_eq!(
+            exact_search_at(&synced.edge, before, changed_scope, old_embedding),
+            vec![changed_id],
+            "{alter}: the pre-pull snapshot still sees the old vector"
+        );
+        drop(pin);
+        synced.maintain();
+        assert_eq!(
+            indexed_search(&synced.edge, changed_scope, new_embedding)
+                .expect("the changed partition answers after maintenance"),
+            vec![changed_id]
+        );
+        synced.stop().await;
+    }
+}

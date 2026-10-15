@@ -41698,6 +41698,13 @@ impl Database {
             &live_event_bus,
             &live_trigger,
         );
+        // Lets a test prove its vector rows arrived inside this received
+        // schema unit rather than in a separate data unit.
+        #[cfg(any(test, feature = "test-seams"))]
+        record_received_schema_profile_work_for_test(
+            "received-unit-vectors",
+            changes.vectors.len() as u64,
+        );
         let schema_noop = schema_projection_noop
             && changes.rows.is_empty()
             && changes.edges.is_empty()
