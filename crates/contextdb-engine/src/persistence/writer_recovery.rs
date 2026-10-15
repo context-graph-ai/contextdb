@@ -502,15 +502,20 @@ impl RedbPersistence {
                         // Only its first ordinary insert can establish complete
                         // coverage without scanning old versions.
                         if previous.is_none() {
-                            let counts = write
-                                .open_table(RECOVERY_TABLE)
-                                .map_err(Self::storage_error)?;
-                            let key = format!("row_versions:{table}");
-                            let empty_before = counts
-                                .get(key.as_str())
+                            // Complete coverage holds when every version the
+                            // relation now holds was inserted by this commit:
+                            // its header count equals this commit's inserts.
+                            let physical = Self::rel_table_name(table);
+                            let held = write
+                                .normal_table_len(&physical)
                                 .map_err(Self::storage_error)?
-                                .is_none_or(|value| value.value() == 0u64.to_be_bytes());
-                            if !empty_before {
+                                .unwrap_or(0);
+                            let inserted = ws
+                                .relational_inserts
+                                .iter()
+                                .filter(|(inserted_table, _)| inserted_table == table)
+                                .count() as u64;
+                            if held != inserted {
                                 continue;
                             }
                         }
@@ -619,7 +624,6 @@ impl RedbPersistence {
         Self::write_row_heads_root(write)?;
         #[cfg(any(test, feature = "test-seams"))]
         graph_observation_checkpoint(15)?;
-        Self::write_writer_relational_counts_in_write(write)?;
         #[cfg(any(test, feature = "test-seams"))]
         graph_observation_checkpoint(16)?;
         if let Some(ws) = ws {
@@ -980,85 +984,21 @@ impl RedbPersistence {
         Ok(())
     }
 
-    // A full row cursor has no selected posting to attest a missing body.
-    // Its transaction-coupled cardinality certifies the physical family, even
-    // when a corrupt deletion leaves the iterator empty. No identities or
-    // row payloads are read to maintain or check this metadata.
-    fn write_writer_relational_counts_in_write(write: &redb::WriteTransaction) -> Result<()> {
-        let metadata = write.open_table(META_TABLE).map_err(Self::storage_error)?;
-        let mut counts = write
-            .open_table(RECOVERY_TABLE)
-            .map_err(Self::storage_error)?;
-        for entry in metadata
-            .range("table:".."table;")
-            .map_err(Self::storage_error)?
-        {
-            let (name, _) = entry.map_err(Self::storage_error)?;
-            #[cfg(any(test, feature = "test-seams"))]
-            content_identity::version_manifest::commit_row_work::count_declared_table_visit();
-            let name =
-                name.value()
-                    .strip_prefix("table:")
-                    .ok_or_else(|| Error::StoreCorrupted {
-                        path: "meta".into(),
-                        reason: "invalid table declaration key".into(),
-                    })?;
-            let physical = Self::rel_table_name(name);
-            // An existing relation's count comes from its directory header:
-            // opening it for writing would make every commit open, close and
-            // re-witness every declared table, not just the ones it changed.
-            // A declared relation not yet created is opened once here, which
-            // creates and witnesses it, so readers find its physical root.
-            let count = match write
-                .normal_table_len(&physical)
-                .map_err(Self::storage_error)?
-            {
-                Some(count) => count,
-                None => write
-                    .open_table(TableDefinition::<&[u8], &[u8]>::new(&physical))
-                    .map_err(Self::storage_error)?
-                    .len()
-                    .map_err(Self::storage_error)?,
-            };
-            let key = format!("row_versions:{name}");
-            let value = count.to_be_bytes();
-            if counts
-                .get(key.as_str())
-                .map_err(Self::storage_error)?
-                .is_some_and(|existing| existing.value() == value)
-            {
-                continue;
-            }
-            counts
-                .insert(key.as_str(), value.as_slice())
-                .map_err(Self::storage_error)?;
-        }
-        Ok(())
-    }
-
+    // A full row cursor has no selected posting to attest a missing body. The
+    // relation's committed cardinality certifies the physical family, even
+    // when a corrupt deletion leaves the iterator empty. That cardinality is
+    // the one the relation's producer witness captured with its root when it
+    // last closed, so maintaining it costs a commit nothing beyond the
+    // relations it actually touched. No identities or row payloads are read.
     pub(super) fn verify_writer_relational_count_in_read(
         read: &redb::ReadTransaction,
         table: &str,
         actual: u64,
     ) -> Result<()> {
-        let counts = read
-            .open_table(RECOVERY_TABLE)
-            .map_err(Self::storage_error)?;
-        let key = format!("row_versions:{table}");
-        let value = counts
-            .get(key.as_str())
-            .map_err(Self::storage_error)?
+        let expected = Self::witnessed_row_count_in_read(read, &Self::rel_table_name(table))?
             .ok_or_else(|| Error::StoreCorrupted {
                 path: table.to_owned(),
                 reason: "missing saved row cardinality".into(),
-            })?;
-        let expected = value
-            .value()
-            .try_into()
-            .map(u64::from_be_bytes)
-            .map_err(|_| Error::StoreCorrupted {
-                path: table.to_owned(),
-                reason: "invalid saved row cardinality".into(),
             })?;
         if expected != actual {
             return Err(Error::StoreCorrupted {

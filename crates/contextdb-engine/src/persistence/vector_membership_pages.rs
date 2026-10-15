@@ -190,13 +190,26 @@ pub(super) fn is_empty_partitioned_route_in_write(
     Ok(true)
 }
 
-/// A vector declaration owns its empty unpartitioned route from this commit.
+/// A declared table owns its relation, and a vector declaration its empty
+/// unpartitioned route, from this commit. Creating the relation here, in the
+/// declaring transaction, lets its producer witness record it; readers then
+/// find a physical root without any later commit having to visit it.
 pub(super) fn ensure_declared_routes(
     write: &redb::WriteTransaction,
     table: &str,
     meta: &TableMeta,
     accountant: Option<crate::memory_accounting::AccountantHandle>,
 ) -> Result<()> {
+    let relation = RedbPersistence::rel_table_name(table);
+    if write
+        .normal_table_len(&relation)
+        .map_err(RedbPersistence::storage_error)?
+        .is_none()
+    {
+        write
+            .open_table(TableDefinition::<&[u8], &[u8]>::new(&relation))
+            .map_err(RedbPersistence::storage_error)?;
+    }
     for column in &meta.columns {
         if matches!(column.column_type, ColumnType::Vector(_))
             && column

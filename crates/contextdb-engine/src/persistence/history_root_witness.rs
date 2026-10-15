@@ -28,6 +28,20 @@ fn record(root: Option<[u8; 32]>, incarnation: [u8; 16]) -> [u8; RECORD_BYTES] {
     }
     bytes
 }
+/// The entry count a witness record captured with its root: the root header's
+/// trailing little-endian length, or zero for an empty relation.
+fn witnessed_length(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != RECORD_BYTES || bytes[0] != 1 {
+        return None;
+    }
+    if bytes[1] == 0 {
+        return Some(0);
+    }
+    bytes[RECORD_BYTES - 8..]
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
+}
 fn matches(bytes: &[u8], root: Option<[u8; 32]>) -> bool {
     bytes.len() == RECORD_BYTES
         && bytes[0] == 1
@@ -106,6 +120,40 @@ impl RedbPersistence {
             }
         }
         Ok(())
+    }
+    /// A relation's committed row count, as its producer witness captured it
+    /// when the relation last closed: one witness lookup, nothing enumerated.
+    /// `None` when the relation has never been witnessed.
+    pub(super) fn witnessed_row_count_in_read(
+        read: &redb::ReadTransaction,
+        name: &str,
+    ) -> Result<Option<u64>> {
+        let witnesses = read.open_table(WITNESSES).map_err(|error| match error {
+            redb::TableError::TableDoesNotExist(_) => {
+                corruption(WITNESSES.name(), "metadata is absent")
+            }
+            other => Self::storage_error(other),
+        })?;
+        let Some(record) = witnesses.get(name).map_err(Self::storage_error)? else {
+            return Ok(None);
+        };
+        witnessed_length(record.value())
+            .map(Some)
+            .ok_or_else(|| corruption(name, "record is malformed"))
+    }
+    /// [`Self::witnessed_row_count_in_read`] inside a write transaction: the
+    /// count as of the relation's last close in this transaction or before.
+    pub(super) fn witnessed_row_count_in_write(
+        write: &redb::WriteTransaction,
+        name: &str,
+    ) -> Result<Option<u64>> {
+        let witnesses = write.open_table(WITNESSES).map_err(Self::storage_error)?;
+        let Some(record) = witnesses.get(name).map_err(Self::storage_error)? else {
+            return Ok(None);
+        };
+        witnessed_length(record.value())
+            .map(Some)
+            .ok_or_else(|| corruption(name, "record is malformed"))
     }
     pub(super) fn initialize_history_witnesses(write: &redb::WriteTransaction) -> Result<()> {
         write.open_table(WITNESSES).map_err(Self::storage_error)?;

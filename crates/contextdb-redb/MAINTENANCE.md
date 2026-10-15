@@ -568,10 +568,11 @@ headroom instead of stopping at the first preferred growth. The engine's
 
 `WriteTransaction::normal_table_len` (contextdb-internal, doc-hidden) returns a normal table's
 entry count from its directory header, or `None` when the table is absent. It is the same
-`length` that `Table::len()` reads, but it does not open the table. The engine's per-commit
-saved row cardinality reads every declared relation's count this way. Opening each relation for
-writing made every commit open, close and re-witness every declared table: the contextdb
-historical-root hook fires on each open and close. Its proof is the engine test
-`a_one_table_commit_leaves_every_other_tables_relation_untouched`.
+`length` that `Table::len()` reads, but it does not open the table. The engine uses it to ask
+whether a declared relation exists before creating it at declaration time, and to compare a
+relation's current entry count with one commit's inserts for the retention-clock first-insert
+check. Opening a relation to ask either question would fire the contextdb historical-root hook,
+which re-witnesses that table. The proof that a one-table commit touches no other relation is the
+engine test `a_one_table_commit_leaves_every_other_tables_relation_untouched`.
 
 Only the `src/transactions.rs` section of the patch was regenerated.
