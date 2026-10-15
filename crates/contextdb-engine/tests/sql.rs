@@ -1,5 +1,7 @@
 #[path = "sql/a_local_create_table_never_replaces_an_existing_table.rs"]
 mod a_local_create_table_never_replaces_an_existing_table;
+#[path = "sql/a_write_bound_through_a_full_index_prefix_examines_only_its_rows.rs"]
+mod a_write_bound_through_a_full_index_prefix_examines_only_its_rows;
 #[path = "sql/composite_index_elides_a_descending_sort.rs"]
 mod composite_index_elides_a_descending_sort;
 #[path = "sql/composite_index_elides_a_still_needed_sort_over_whole_key.rs"]
