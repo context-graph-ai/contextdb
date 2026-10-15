@@ -3082,8 +3082,14 @@ fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
 
     // The held unit lands once there is room, and the later one is no longer
     // waiting for anything.
-    let retry_limit =
-        held.receiver.accountant().usage().used + measured_held_retry_room(true, false, false);
+    // The control that measured this room is a separate database, and the proof
+    // this retry maintains is page granular: across runs the same retry has
+    // needed exactly one 4096-byte proof page more than its control measured
+    // (58144 requested against 54048 available), so the limit carries that page.
+    const ONE_PROOF_PAGE: usize = 4096;
+    let retry_limit = held.receiver.accountant().usage().used
+        + measured_held_retry_room(true, false, false)
+        + ONE_PROOF_PAGE;
     held.receiver
         .set_memory_limit(Some(retry_limit))
         .expect("raise the limit above what the held unit and the one behind it need");
