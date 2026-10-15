@@ -9847,6 +9847,8 @@ fn capped_index_range_entries(
         let (lower, upper, prefix) = bounded::declared_index_run(&pick, direction, false);
         cursor.seeking_run_with_prefix_len(lower, upper, prefix)
     };
+    // Only how many entries the range holds is asked: membership decides it.
+    cursor.select_identities_only();
     cursor.source_configure(pick.columns.len());
     let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
     let mut entries = 0;
