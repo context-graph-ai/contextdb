@@ -11580,21 +11580,18 @@ fn in_transaction_prefix_count(
     }
     // The overlay's own controls are charged by the credit it carries.
     let under_prefix = |row: &VersionedRow| {
-        columns
-            .iter()
-            .zip(prefix.iter())
-            .all(|((column, _), key)| {
-                let wanted = match key {
-                    DirectedValue::Asc(TotalOrdAsc(value)) => value,
-                    DirectedValue::Desc(TotalOrdDesc(value)) => value,
-                };
-                // Index-key equality, not `==`: a staged row is under the key
-                // exactly when its posting would be.
-                contextdb_core::index_key_value_eq(
-                    row.values.get(column).unwrap_or(&Value::Null),
-                    wanted,
-                )
-            })
+        columns.iter().zip(prefix.iter()).all(|((column, _), key)| {
+            let wanted = match key {
+                DirectedValue::Asc(TotalOrdAsc(value)) => value,
+                DirectedValue::Desc(TotalOrdDesc(value)) => value,
+            };
+            // Index-key equality, not `==`: a staged row is under the key
+            // exactly when its posting would be.
+            contextdb_core::index_key_value_eq(
+                row.values.get(column).unwrap_or(&Value::Null),
+                wanted,
+            )
+        })
     };
     // Every committed row the transaction may hide, once: deleted by identity,
     // or restaged under the same identity by an update. The identities are
