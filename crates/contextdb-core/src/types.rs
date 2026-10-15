@@ -792,6 +792,13 @@ impl PartialOrd for DirectedValue {
     }
 }
 
+/// Whether two values are the same index key: equal under the total order
+/// every index posting and maintained count is keyed by. Unlike `==`, `-0.0`
+/// and `0.0` are different keys and `NaN` is one key.
+pub fn index_key_value_eq(a: &Value, b: &Value) -> bool {
+    value_total_cmp(a, b).is_eq()
+}
+
 /// Total ordering over `Value`. Stub uses a simple discriminant tiebreak +
 /// `f64::total_cmp` for Float64 + NULL-LAST-ASC semantics. Works uniformly
 /// for every value type; impl may replace this with a more specialized lookup

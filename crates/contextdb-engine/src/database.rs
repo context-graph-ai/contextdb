@@ -62764,8 +62764,9 @@ impl Database {
             return Ok(None);
         };
         // The record is the root's; it answers only a read at the root's own
-        // snapshot. A transaction reads at its begin snapshot, which is the
-        // root's while nothing else has committed since.
+        // snapshot. An ordinary statement, inside a transaction or not, reads
+        // at the current root's snapshot; a statement whose snapshot was
+        // overridden (a historical read) falls back to the index range.
         if snapshot != root.snapshot {
             return Ok(None);
         }

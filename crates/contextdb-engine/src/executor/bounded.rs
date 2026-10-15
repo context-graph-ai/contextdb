@@ -11578,7 +11578,7 @@ fn in_transaction_prefix_count(
     {
         return Ok(None);
     }
-    context.reserve(BoundedWorkSource::IndexRange, overlay.bytes)?;
+    // The overlay's own controls are charged by the credit it carries.
     let under_prefix = |row: &VersionedRow| {
         columns
             .iter()
@@ -11588,7 +11588,12 @@ fn in_transaction_prefix_count(
                     DirectedValue::Asc(TotalOrdAsc(value)) => value,
                     DirectedValue::Desc(TotalOrdDesc(value)) => value,
                 };
-                row.values.get(column).unwrap_or(&Value::Null) == wanted
+                // Index-key equality, not `==`: a staged row is under the key
+                // exactly when its posting would be.
+                contextdb_core::index_key_value_eq(
+                    row.values.get(column).unwrap_or(&Value::Null),
+                    wanted,
+                )
             })
     };
     // Every committed row the transaction may hide, once: deleted by identity,
@@ -11641,7 +11646,6 @@ fn in_transaction_prefix_count(
             }
         }
     }
-    context.release(overlay.bytes)?;
     drop(overlay);
     let count = u64::try_from(count).map_err(|_| {
         BoundedExecutionError::from(Error::Other(
