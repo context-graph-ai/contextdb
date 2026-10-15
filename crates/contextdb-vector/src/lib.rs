@@ -28,7 +28,8 @@ pub use store::VectorPartitionSourceMaintenanceMetadata;
 pub use store::{
     OwnedPartitionedVectorEntries, PartitionedVectorDelete, PartitionedVectorEntry,
     PartitionedVectorMove, PreparedLoadedVectorReplacement, PreparedPartitionedVectorBatch,
-    PreparedVectorPublication, PreparedVectorTablePublication, VectorIndexInfo, VectorIndexLayout,
+    PreparedVectorPolicyLayout, PreparedVectorPublication, PreparedVectorTablePublication,
+    VectorIndexInfo, VectorIndexLayout,
     VectorIndexLayoutInfo, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
     VectorMaintenanceNeed, VectorMaintenanceReport, VectorMembershipProvenance,
     VectorPartitionInfo, VectorPartitionRef, VectorRouteQuarantineReason, VectorStore,

@@ -9312,6 +9312,16 @@ impl Drop for IndexState {
     }
 }
 
+/// A policy-only layout change admitted by
+/// [`VectorStore::prepare_policy_layout_update`] and not yet published.
+/// Dropping it unpublished returns its admitted growth.
+pub struct PreparedVectorPolicyLayout {
+    index: VectorIndexRef,
+    column: Arc<VectorColumnState>,
+    layout: VectorIndexLayout,
+    growth: Option<RetainedMemoryCharge>,
+}
+
 /// Complete in-memory declaration for one vector column. Partition columns
 /// remain in declaration order; the cap is `None` only for an unpartitioned
 /// column and is the already-resolved effective cap otherwise.
@@ -14492,6 +14502,104 @@ impl VectorStore {
             }
             Ok(())
         })
+    }
+
+    /// Admit a policy-only layout change for a registered index: the same
+    /// dimension, quantization and partition key, with any change to search
+    /// mode, `AUTO_INDEX_AT`, `MAX_PARTITIONS`, HNSW or consolidation. Like
+    /// `register_index_with_layout` for such a change, it keeps every
+    /// partition and every graph. Everything that can fail happens here; a
+    /// caller that must publish after durability applies the result with
+    /// [`Self::publish_policy_layout_update`], which cannot fail. `None` means
+    /// the index already has this layout.
+    pub fn prepare_policy_layout_update(
+        &self,
+        index: &VectorIndexRef,
+        layout: VectorIndexLayout,
+    ) -> Result<Option<PreparedVectorPolicyLayout>> {
+        Self::validate_layout(index, &layout)?;
+        let column = self
+            .try_column(index)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        let current = column.layout.read().clone();
+        if current == layout {
+            return Ok(None);
+        }
+        if !current.has_same_storage_shape(&layout) {
+            return Err(Error::Other(format!(
+                "vector index {}.{} changes its storage shape, not only its policy",
+                index.table, index.column
+            )));
+        }
+        if let Some(max_partitions) = layout.max_partitions
+            && column.live_or_retained_partition_count() > max_partitions as usize
+        {
+            return Err(Error::VectorPartitionLimitExceeded {
+                index: index.clone(),
+                max_partitions,
+            });
+        }
+        let growth = layout
+            .estimated_bytes()
+            .saturating_sub(current.estimated_bytes());
+        let growth = if growth == 0 {
+            None
+        } else {
+            let accountant = column.directory_accounting.lock().accountant.clone();
+            accountant.try_allocate_for(
+                growth,
+                "vector_index",
+                "register_vector_directory",
+                "Reduce vector declaration metadata or raise MEMORY_LIMIT before updating the index.",
+            )?;
+            Some(RetainedMemoryCharge {
+                bytes: growth,
+                accountant,
+            })
+        };
+        Ok(Some(PreparedVectorPolicyLayout {
+            index: index.clone(),
+            column,
+            layout,
+            growth,
+        }))
+    }
+
+    /// Apply a prepared policy-only layout change. The column keeps its
+    /// partitions and graphs; only its declared policy changes. If the index
+    /// was replaced since preparation, the prepared change is dropped and
+    /// its admitted growth returned.
+    pub fn publish_policy_layout_update(&self, prepared: PreparedVectorPolicyLayout) {
+        self.with_bulk_maintenance(|| {
+            let PreparedVectorPolicyLayout {
+                index,
+                column,
+                layout,
+                mut growth,
+            } = prepared;
+            let still_current = self
+                .registry
+                .read()
+                .get(&index)
+                .is_some_and(|live| Arc::ptr_eq(live, &column));
+            if !still_current {
+                return;
+            }
+            let old_bytes = column.layout.read().estimated_bytes();
+            let new_bytes = layout.estimated_bytes();
+            *column.layout.write() = layout;
+            let mut retained = column.directory_accounting.lock();
+            if let Some(growth) = growth.as_mut() {
+                // The admitted growth now belongs to the column's directory.
+                retained.bytes += growth.bytes;
+                growth.bytes = 0;
+            } else if old_bytes > new_bytes {
+                retained.accountant.release(old_bytes - new_bytes);
+                retained.bytes -= old_bytes - new_bytes;
+            }
+        });
     }
 
     fn validate_layout(index: &VectorIndexRef, layout: &VectorIndexLayout) -> Result<()> {

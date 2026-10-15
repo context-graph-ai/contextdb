@@ -9301,6 +9301,9 @@ pub(crate) struct ReceivedSchemaStage {
     dag_edge_types: Option<PreparedDagEdgeTypes>,
     rank_formulas: Option<HashMap<(String, String), Arc<RankFormula>>>,
     vector: Option<contextdb_vector::PreparedVectorTablePublication>,
+    /// Policy-only layout changes to live vector columns this unit does not
+    /// replace, admitted before durability and applied in place after it.
+    vector_policy_layouts: Vec<contextdb_vector::PreparedVectorPolicyLayout>,
     event_bus: Option<event_bus::PreparedEventBusPublication>,
     /// Acquired while the received-schema unit is still being prepared and
     /// retained through its matching durable config transaction plus queue
@@ -41805,6 +41808,7 @@ impl Database {
                 dag_edge_types: None,
                 rank_formulas: None,
                 vector: None,
+                vector_policy_layouts: Vec::new(),
                 event_bus: None,
                 queue_mutation_lease: None,
                 trigger: None,
@@ -41880,12 +41884,33 @@ impl Database {
                 .iter()
                 .map(|index| index.table.clone()),
         );
+        // A layout change that keeps the vectors' storage shape (dimension,
+        // quantization and partition key) is policy only: search mode,
+        // AUTO_INDEX_AT, MAX_PARTITIONS, HNSW or consolidation. A local ALTER
+        // applies it to the live column in place and keeps every partition
+        // and graph, so the received ALTER does the same: it neither seeds a
+        // vector replacement nor makes this unit copy the vectors.
+        let mut policy_only_vector_layouts = HashMap::new();
         for index in live_vector_layouts
             .keys()
             .chain(projected_vector_layouts.keys())
         {
-            if live_vector_layouts.get(index) != projected_vector_layouts.get(index) {
-                additional_seeds.insert(index.table.clone());
+            match (
+                live_vector_layouts.get(index),
+                projected_vector_layouts.get(index),
+            ) {
+                (Some(live), Some(projected))
+                    if live != projected
+                        && same_vector_storage_shape(live, projected)
+                        && !changed_vector_routes.contains(index)
+                        && !replaced_vector_refs.contains(index) =>
+                {
+                    policy_only_vector_layouts.insert(index.clone(), projected.clone());
+                }
+                (live, projected) if live != projected => {
+                    additional_seeds.insert(index.table.clone());
+                }
+                _ => {}
             }
         }
         let vector_schema_changed = !additional_seeds.is_empty();
@@ -41951,9 +41976,22 @@ impl Database {
                 .into_iter()
                 .collect::<HashMap<_, _>>()
             };
+            // Only a storage-shape difference needs the vectors copied; a
+            // policy-only one is applied in place after publication.
+            let selected_shapes = |tables: &HashMap<String, TableMeta>| {
+                selected_layouts(tables)
+                    .into_iter()
+                    .map(|(index, layout)| {
+                        (
+                            index,
+                            (layout.dimension, layout.quantization, layout.partition_key_columns),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
             let copy_vectors = vector_schema_changed
                 || !changes.vectors.is_empty()
-                || selected_layouts(&live_tables) != selected_layouts(&side_semantic.tables);
+                || selected_shapes(&live_tables) != selected_shapes(&side_semantic.tables);
             let dag_types = |tables: &HashMap<String, TableMeta>| {
                 tables
                     .iter()
@@ -42437,6 +42475,19 @@ impl Database {
                 deleted_tx: placed.membership.deleted_tx,
             });
         }
+        // A unit that copies vectors replaces these columns with the arriving
+        // layout; otherwise the live columns take only the new policy.
+        let mut vector_policy_layouts = Vec::new();
+        if !copy_vectors {
+            for (index, layout) in policy_only_vector_layouts.drain() {
+                if let Some(prepared) = self
+                    .vector_store
+                    .prepare_policy_layout_update(&index, layout)?
+                {
+                    vector_policy_layouts.push(prepared);
+                }
+            }
+        }
         let vector = copy_vectors
             .then(|| {
                 self.vector_store
@@ -42755,6 +42806,7 @@ impl Database {
             dag_edge_types: Some(dag_edge_types),
             rank_formulas: Some(rank_formulas),
             vector,
+            vector_policy_layouts,
             event_bus,
             queue_mutation_lease: Some(queue_mutation_lease),
             trigger,
@@ -43031,6 +43083,13 @@ impl Database {
                 vector,
                 Arc::clone(&self.finalization.vector_accountant),
             );
+        }
+        let vector_policy_changed = !stage.vector_policy_layouts.is_empty();
+        for prepared in std::mem::take(&mut stage.vector_policy_layouts) {
+            self.vector_store.publish_policy_layout_update(prepared);
+        }
+        if vector_policy_changed {
+            self.reconcile_maintenance_thread();
         }
         // The replacement registry has retired the old in-process builders.
         // Only successfully committed cancellation receipts release their holds;
@@ -88528,6 +88587,14 @@ pub(crate) fn vector_index_layout_from_column(column: &ColumnDef) -> Option<Vect
         )
         .with_consolidation_disabled(column.consolidation_disabled),
     )
+}
+
+/// Two layouts store their vectors alike: the same dimension, quantization
+/// and partition key. Any other difference is policy.
+fn same_vector_storage_shape(left: &VectorIndexLayout, right: &VectorIndexLayout) -> bool {
+    left.dimension == right.dimension
+        && left.quantization == right.quantization
+        && left.partition_key_columns == right.partition_key_columns
 }
 
 fn vector_layouts_from_meta(
