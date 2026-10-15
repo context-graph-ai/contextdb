@@ -43548,7 +43548,19 @@ impl Database {
         }
         let vector_policy_changed = !stage.vector_policy_layouts.is_empty();
         for prepared in std::mem::take(&mut stage.vector_policy_layouts) {
-            self.vector_store.publish_policy_layout_update(prepared);
+            let Some(published) = self.vector_store.publish_policy_layout_update(prepared) else {
+                continue;
+            };
+            // A local ALTER clears each recorded maintenance failure its new
+            // policy no longer needs, and so does the synced one. The mark is
+            // inspection-only and this unit is already durable: a refused
+            // recheck leaves the mark until the next maintenance pass.
+            if let Ok(read_memory) = self.declared_reader_memory() {
+                let mut owner = crate::vector_read_memory::admission(read_memory);
+                let _ = self
+                    .vector_store
+                    .recheck_policy_maintenance_failures(&published, &mut owner);
+            }
         }
         if vector_policy_changed {
             self.reconcile_maintenance_thread();

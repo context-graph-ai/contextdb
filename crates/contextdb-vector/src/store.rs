@@ -9322,6 +9322,13 @@ pub struct PreparedVectorPolicyLayout {
     growth: Option<RetainedMemoryCharge>,
 }
 
+/// A policy-only layout change [`VectorStore::publish_policy_layout_update`]
+/// has published, kept for the follow-up maintenance-failure recheck.
+pub struct PublishedVectorPolicyLayout {
+    index: VectorIndexRef,
+    column: Arc<VectorColumnState>,
+}
+
 /// Complete in-memory declaration for one vector column. Partition columns
 /// remain in declaration order; the cap is `None` only for an unpartitioned
 /// column and is the already-resolved effective cap otherwise.
@@ -14475,16 +14482,30 @@ impl VectorStore {
         let Some(changed_column) = changed_column else {
             return Ok(());
         };
+        self.recheck_maintenance_failures_for_layout(&index, &changed_column, &layout, owner)
+    }
+
+    /// After a policy-only layout change is visible, clear each recorded
+    /// partition maintenance failure the new layout no longer needs. Only the
+    /// few partitions carrying a failure need a directory-derived recheck, and
+    /// a concurrent retry cannot have its newer mark cleared by this one.
+    fn recheck_maintenance_failures_for_layout(
+        &self,
+        index: &VectorIndexRef,
+        changed_column: &Arc<VectorColumnState>,
+        layout: &VectorIndexLayout,
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<()> {
         self.with_bulk_read(|| {
-            let still_current = self.registry.read().get(&index).is_some_and(|column| {
-                Arc::ptr_eq(column, &changed_column) && *column.layout.read() == layout
+            let still_current = self.registry.read().get(index).is_some_and(|column| {
+                Arc::ptr_eq(column, changed_column) && *column.layout.read() == *layout
             });
             if !still_current {
                 return Ok(());
             }
             for (partition_key, state) in changed_column.admitted_partition_snapshots(owner)? {
                 if state.is_historical_only() { continue; }
-                self.with_partition_maintenance(&index, &partition_key, || -> Result<()> {
+                self.with_partition_maintenance(index, &partition_key, || -> Result<()> {
                     let Some(failure) = state.maintenance_failure_details() else {
                         return Ok(());
                     };
@@ -14493,7 +14514,7 @@ impl VectorStore {
                             .with(|held| held.borrow().contains(&self.id)),
                         "declaration failure recheck cannot inspect raw vector directories under the store-wide write gate"
                     );
-                    let info = Self::partition_info_snapshot(&index, &partition_key, &state, &layout, owner)?;
+                    let info = Self::partition_info_snapshot(index, &partition_key, &state, layout, owner)?;
                     if layout.maintenance_need(&info).is_none() {
                         state.clear_maintenance_failure_if(failure);
                     }
@@ -14582,7 +14603,10 @@ impl VectorStore {
     /// partitions and graphs; only its declared policy changes. If the index
     /// was replaced since preparation, the prepared change is dropped and
     /// its admitted growth returned.
-    pub fn publish_policy_layout_update(&self, prepared: PreparedVectorPolicyLayout) {
+    pub fn publish_policy_layout_update(
+        &self,
+        prepared: PreparedVectorPolicyLayout,
+    ) -> Option<PublishedVectorPolicyLayout> {
         self.with_bulk_maintenance(|| {
             let PreparedVectorPolicyLayout {
                 index,
@@ -14596,7 +14620,7 @@ impl VectorStore {
                 .get(&index)
                 .is_some_and(|live| Arc::ptr_eq(live, &column));
             if !still_current {
-                return;
+                return None;
             }
             let old_bytes = column.layout.read().estimated_bytes();
             let new_bytes = layout.estimated_bytes();
@@ -14610,7 +14634,32 @@ impl VectorStore {
                 retained.accountant.release(old_bytes - new_bytes);
                 retained.bytes -= old_bytes - new_bytes;
             }
-        });
+            drop(retained);
+            Some(PublishedVectorPolicyLayout { index, column })
+        })
+    }
+
+    /// The local ALTER's follow-up for a published policy-only change: clear
+    /// each recorded partition maintenance failure the new layout no longer
+    /// needs. The failure mark is inspection-only, so a caller that cannot
+    /// fail after durability may ignore a refusal here; the mark then stays
+    /// until the next maintenance pass touches the partition.
+    pub fn recheck_policy_maintenance_failures(
+        &self,
+        published: &PublishedVectorPolicyLayout,
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<()> {
+        let layout = {
+            let current = published.column.layout.read();
+            owner.reserve(current.estimated_bytes())?;
+            current.clone()
+        };
+        self.recheck_maintenance_failures_for_layout(
+            &published.index,
+            &published.column,
+            &layout,
+            owner,
+        )
     }
 
     fn validate_layout(index: &VectorIndexRef, layout: &VectorIndexLayout) -> Result<()> {

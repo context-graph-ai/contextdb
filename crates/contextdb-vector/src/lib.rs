@@ -29,6 +29,7 @@ pub use store::{
     OwnedPartitionedVectorEntries, PartitionedVectorDelete, PartitionedVectorEntry,
     PartitionedVectorMove, PreparedLoadedVectorReplacement, PreparedPartitionedVectorBatch,
     PreparedVectorPolicyLayout, PreparedVectorPublication, PreparedVectorTablePublication,
+    PublishedVectorPolicyLayout,
     VectorIndexInfo, VectorIndexLayout, VectorIndexLayoutInfo, VectorMaintenanceFailure,
     VectorMaintenanceFailureDetails, VectorMaintenanceNeed, VectorMaintenanceReport,
     VectorMembershipProvenance, VectorPartitionInfo, VectorPartitionRef,
