@@ -140,14 +140,32 @@ fn receiver(path: &std::path::Path) -> Arc<Database> {
     db
 }
 
+// The resident table (about 30 MB of vectors) is larger than the default
+// reader memory ceiling, and one statement answering all of it is refused by
+// the result-serving contract. Read it in primary-key windows instead; the
+// rows compared are the same.
 fn resident_rows(db: &Database) -> Vec<Vec<Value>> {
-    let rows = db
-        .execute(
-            "SELECT id, embedding FROM resident_vectors ORDER BY id",
-            &empty(),
-        )
-        .expect("resident data remains readable")
-        .rows;
+    const WINDOW: i64 = 500;
+    let mut rows = Vec::with_capacity(10_000);
+    let mut start = 0;
+    loop {
+        let window = db
+            .execute(
+                "SELECT id, embedding FROM resident_vectors \
+                 WHERE id >= $start AND id < $end ORDER BY id",
+                &HashMap::from([
+                    ("start".to_string(), Value::Int64(start)),
+                    ("end".to_string(), Value::Int64(start + WINDOW)),
+                ]),
+            )
+            .expect("resident data remains readable")
+            .rows;
+        if window.is_empty() {
+            break;
+        }
+        rows.extend(window);
+        start += WINDOW;
+    }
     assert_eq!(
         rows.len(),
         10_000,
