@@ -182,3 +182,25 @@ fn the_same_where_in_a_select_examines_only_its_rows() {
         "the SELECT's entries examined grew with the table: {examined:?}"
     );
 }
+
+/// The entries examined are entries on every route: the same WHERE reports the
+/// same count whether it selects, updates or deletes the session's rows.
+#[test]
+fn the_same_where_examines_the_same_entries_on_every_route() {
+    let (_root, db) = passages(200);
+    let select = db
+        .execute(&format!("SELECT id FROM p {WHERE}"), &params())
+        .expect("select one session")
+        .trace
+        .rows_examined;
+    let (update, _) = run(
+        &db,
+        &format!("UPDATE p SET is_searchable = $searchable {WHERE}"),
+    );
+    let (delete, _) = run(&db, &format!("DELETE FROM p {WHERE}"));
+    assert_eq!(
+        (update, delete),
+        (select, select),
+        "UPDATE and DELETE count entries examined as SELECT does (select={select})"
+    );
+}
