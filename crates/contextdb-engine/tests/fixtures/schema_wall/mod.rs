@@ -843,6 +843,17 @@ pub fn assert_affected_only(
         // Each relation a commit opens records its new historical root, keyed
         // by the physical table name. Only an affected relation may be
         // witnessed; an unrelated one means the commit touched it.
+        if table == "__history_root_witness_v1" && event.table == "__redb_user_table_directory" {
+            // The witness table's directory entry moves with its root.
+            assert!(
+                observation.artifact_writes.iter().any(|(write, _)| {
+                    write.table == "__history_root_witness_v1"
+                        && write.operation == TableWriteOperationForTest::Insert
+                }),
+                "witness directory rewrite without a witness write {event:?}"
+            );
+            continue;
+        }
         if event.table == "__history_root_witness_v1" {
             let physical = std::str::from_utf8(&event.key).expect("witness keys are table names");
             if let Some(owner) = physical.strip_prefix("rel_") {
