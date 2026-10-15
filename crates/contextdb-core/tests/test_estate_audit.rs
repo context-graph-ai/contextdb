@@ -559,7 +559,9 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     //  - S9b (+9): an in-transaction COUNT is served from the declared MAINTAIN COUNT (9c8552ca, 5);
     //    FLOAT equality and order follow PostgreSQL float8 on every route (80648934, 4).
     // S9's 2 + 11 compaction proofs (ef0615d3, 8ba5e2ea) were already in the 4516 entry.
-    ("contextdb-engine", 4681, RSN_TEST_COUNT),
+    // 2026-10-15, S9b (+1): a draining owner keeps its exact channel until admitted work
+    // leaves, the read contract's close order (Vigil store/shutdown).
+    ("contextdb-engine", 4682, RSN_TEST_COUNT),
     ("contextdb-server", 421, RSN_TEST_COUNT),
     ("contextdb-cli", 271, RSN_TEST_COUNT),
 ];
