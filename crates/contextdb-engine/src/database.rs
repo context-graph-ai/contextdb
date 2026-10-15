@@ -9304,6 +9304,9 @@ pub(crate) struct ReceivedSchemaStage {
     /// Policy-only layout changes to live vector columns this unit does not
     /// replace, admitted before durability and applied in place after it.
     vector_policy_layouts: Vec<contextdb_vector::PreparedVectorPolicyLayout>,
+    /// Tables whose only vector change in this unit was policy: their
+    /// vectors were not replaced, so they await no received vector image.
+    vector_policy_tables: HashSet<String>,
     event_bus: Option<event_bus::PreparedEventBusPublication>,
     /// Acquired while the received-schema unit is still being prepared and
     /// retained through its matching durable config transaction plus queue
@@ -41809,6 +41812,7 @@ impl Database {
                 rank_formulas: None,
                 vector: None,
                 vector_policy_layouts: Vec::new(),
+                vector_policy_tables: HashSet::new(),
                 event_bus: None,
                 queue_mutation_lease: None,
                 trigger: None,
@@ -41890,27 +41894,50 @@ impl Database {
         // applies it to the live column in place and keeps every partition
         // and graph, so the received ALTER does the same: it neither seeds a
         // vector replacement nor makes this unit copy the vectors.
-        let mut policy_only_vector_layouts = HashMap::new();
-        for index in live_vector_layouts
-            .keys()
-            .chain(projected_vector_layouts.keys())
-        {
+        let policy_only = |index: &VectorIndexRef| {
             match (
                 live_vector_layouts.get(index),
                 projected_vector_layouts.get(index),
             ) {
-                (Some(live), Some(projected))
-                    if live != projected
+                (Some(live), Some(projected)) => {
+                    live != projected
                         && same_vector_storage_shape(live, projected)
                         && !changed_vector_routes.contains(index)
-                        && !replaced_vector_refs.contains(index) =>
-                {
-                    policy_only_vector_layouts.insert(index.clone(), projected.clone());
+                        && !replaced_vector_refs.contains(index)
                 }
-                (live, projected) if live != projected => {
-                    additional_seeds.insert(index.table.clone());
-                }
-                _ => {}
+                _ => false,
+            }
+        };
+        // Admit the copied declarations, names and map before building it.
+        let (policy_only_count, policy_only_bytes) = live_vector_layouts
+            .keys()
+            .filter(|index| policy_only(index))
+            .fold((0usize, 0usize), |(count, bytes), index| {
+                (
+                    count + 1,
+                    bytes
+                        .saturating_add(index.table.len())
+                        .saturating_add(index.column.len())
+                        .saturating_add(projected_vector_layouts[index].estimated_bytes()),
+                )
+            });
+        vector_copy_owner.reserve(
+            policy_only_bytes.saturating_add(policy_only_count.saturating_mul(
+                2 * std::mem::size_of::<(VectorIndexRef, VectorIndexLayout)>() + 1,
+            )),
+        )?;
+        let mut policy_only_vector_layouts = HashMap::with_capacity(policy_only_count);
+        for index in live_vector_layouts.keys() {
+            if policy_only(index) {
+                policy_only_vector_layouts
+                    .insert(index.clone(), projected_vector_layouts[index].clone());
+            } else if live_vector_layouts.get(index) != projected_vector_layouts.get(index) {
+                additional_seeds.insert(index.table.clone());
+            }
+        }
+        for index in projected_vector_layouts.keys() {
+            if !live_vector_layouts.contains_key(index) {
+                additional_seeds.insert(index.table.clone());
             }
         }
         let vector_schema_changed = !additional_seeds.is_empty();
@@ -42482,14 +42509,26 @@ impl Database {
         // A unit that copies vectors replaces these columns with the arriving
         // layout; otherwise the live columns take only the new policy.
         let mut vector_policy_layouts = Vec::new();
-        if !copy_vectors {
+        let mut vector_policy_tables = HashSet::new();
+        if !copy_vectors && !policy_only_vector_layouts.is_empty() {
+            vector_copy_owner.reserve(
+                policy_only_vector_layouts.len().saturating_mul(
+                    std::mem::size_of::<contextdb_vector::PreparedVectorPolicyLayout>()
+                        + 2 * std::mem::size_of::<String>()
+                        + 1,
+                ),
+            )?;
+            vector_policy_layouts.reserve_exact(policy_only_vector_layouts.len());
+            vector_policy_tables.reserve(policy_only_vector_layouts.len());
             for (index, layout) in policy_only_vector_layouts.drain() {
-                if let Some(prepared) = self
-                    .vector_store
-                    .prepare_policy_layout_update(&index, layout)?
-                {
+                if let Some(prepared) = self.vector_store.prepare_policy_layout_update(
+                    &index,
+                    layout,
+                    vector_copy_owner,
+                )? {
                     vector_policy_layouts.push(prepared);
                 }
+                vector_policy_tables.insert(index.table);
             }
         }
         let vector = copy_vectors
@@ -42811,6 +42850,7 @@ impl Database {
             rank_formulas: Some(rank_formulas),
             vector,
             vector_policy_layouts,
+            vector_policy_tables,
             event_bus,
             queue_mutation_lease: Some(queue_mutation_lease),
             trigger,
@@ -43048,7 +43088,14 @@ impl Database {
         take_received_unit_unwind_fault_for_test(
             ReceivedUnitFaultPoint::BetweenPublicationComponents,
         );
-        let awaits_vector_image = stage.affected_tables.iter().any(|table| {
+        // A table whose only vector change was policy kept its vectors and
+        // graphs: it awaits no replacement image, and the flag keeps its
+        // prior state.
+        let awaits_vector_image = stage
+            .affected_tables
+            .iter()
+            .filter(|table| !stage.vector_policy_tables.contains(*table))
+            .any(|table| {
             self.relational_store.table_meta(table).is_some_and(|meta| {
                 meta.columns
                     .iter()
