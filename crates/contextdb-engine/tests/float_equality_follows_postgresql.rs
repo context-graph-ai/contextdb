@@ -148,3 +148,183 @@ fn float_equality_and_order_follow_postgresql_on_every_route() {
     assert_all("reopened NaN", equal_counts(&db, None, f64::NAN), 3);
     db.close().unwrap();
 }
+
+/// Rows from the writer, from inside a transaction, from the closed store's
+/// read-only file route, and from the reopened writer.
+fn rows_on_every_route(
+    path: &std::path::Path,
+    sql: &str,
+    bound: &HashMap<String, Value>,
+) -> Vec<(&'static str, Vec<Vec<Value>>)> {
+    let db = open(path);
+    let committed = db.execute(sql, bound).unwrap().rows;
+    let tx = db.begin().unwrap();
+    let in_transaction = db.execute_in_tx(tx, sql, bound).unwrap().rows;
+    db.rollback(tx).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let reader = contextdb_engine::ReadSession::open(path).expect("read-only open");
+    let file_route = reader.execute(sql, bound).unwrap().rows;
+    drop(reader);
+    let db = open(path);
+    let reopened = db.execute(sql, bound).unwrap().rows;
+    db.close().unwrap();
+    vec![
+        ("committed", committed),
+        ("in-transaction", in_transaction),
+        ("file route", file_route),
+        ("reopened", reopened),
+    ]
+}
+
+#[test]
+fn distinct_keeps_one_row_per_float8_value() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("float8-distinct.redb");
+    let db = open(&path);
+    schema(&db);
+    for (n, score) in [0.0, -0.0, f64::NAN, -f64::NAN, 1.0].into_iter().enumerate() {
+        insert(&db, None, n as u128 + 1, score);
+    }
+    db.close().unwrap();
+    drop(db);
+
+    let none = HashMap::new();
+    for (route, rows) in rows_on_every_route(&path, "SELECT DISTINCT score FROM plain", &none) {
+        assert_eq!(
+            rows.len(),
+            3,
+            "{route}: DISTINCT over {{0, -0, NaN, -NaN, 1}} is {{0, NaN, 1}}: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn an_indexed_float_range_with_one_bound_answers_like_a_scan() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("float8-range.redb");
+    let db = open(&path);
+    for statement in [
+        "CREATE TABLE grouped (id UUID PRIMARY KEY, grp INTEGER NOT NULL, score FLOAT NOT NULL) SYNC OFF",
+        "CREATE INDEX idx_grouped_grp_score ON grouped (grp, score)",
+        "CREATE TABLE loose (id UUID PRIMARY KEY, grp INTEGER NOT NULL, score FLOAT NOT NULL) SYNC OFF",
+    ] {
+        db.execute(statement, &HashMap::new()).unwrap();
+    }
+    for (n, score) in [0.0, -0.0, f64::NAN, -f64::NAN, 1.0, f64::NEG_INFINITY]
+        .into_iter()
+        .enumerate()
+    {
+        for table in ["grouped", "loose"] {
+            for grp in [1_i64, 2] {
+                db.execute(
+                    &format!("INSERT INTO {table} (id, grp, score) VALUES ($id, $grp, $score)"),
+                    &params(&[
+                        ("id", id(n as u128 + 1 + 100 * grp as u128)),
+                        ("grp", Value::Int64(grp)),
+                        ("score", Value::Float64(score)),
+                    ]),
+                )
+                .unwrap();
+            }
+        }
+    }
+    db.close().unwrap();
+    drop(db);
+
+    // Under float8 order: -inf < -0 = 0 < 1 < NaN = -NaN. The open edge of a
+    // one-bound range after the `grp` prefix is the column's least value.
+    for (operator, expected) in [("<=", 4), ("<", 3), (">=", 3), (">", 2)] {
+        let bound = params(&[("grp", Value::Int64(1)), ("score", Value::Float64(1.0))]);
+        for table in ["grouped", "loose"] {
+            let sql = format!("SELECT id FROM {table} WHERE grp = $grp AND score {operator} $score");
+            for (route, rows) in rows_on_every_route(&path, &sql, &bound) {
+                assert_eq!(
+                    rows.len(),
+                    expected,
+                    "{route}: {table} WHERE grp = 1 AND score {operator} 1.0 answered {} rows",
+                    rows.len()
+                );
+            }
+        }
+    }
+    let db = open(&path);
+    let plan = db
+        .execute(
+            "SELECT id FROM grouped WHERE grp = $grp AND score <= $score",
+            &params(&[("grp", Value::Int64(1)), ("score", Value::Float64(1.0))]),
+        )
+        .unwrap()
+        .trace
+        .physical_plan;
+    assert_eq!(plan, "IndexScan", "the one-bound range reads the index");
+    db.close().unwrap();
+}
+
+#[test]
+fn a_rank_policy_joins_float_keys_by_float8_equality() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("float8-rank.redb");
+    let db = open(&path);
+    for statement in [
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, bucket REAL, weight REAL) SYNC OFF",
+        "CREATE INDEX outcomes_bucket_idx ON outcomes (bucket)",
+        "CREATE TABLE decisions (
+            id UUID PRIMARY KEY,
+            bucket REAL,
+            embedding VECTOR(2) RANK_POLICY (
+                JOIN outcomes ON bucket,
+                FORMULA 'coalesce({weight}, 0.0)',
+                SORT_KEY effective
+            )
+        ) SYNC OFF",
+    ] {
+        db.execute(statement, &HashMap::new()).unwrap();
+    }
+    // Each decision's bucket is float8-equal, but not bit-equal, to exactly
+    // one outcome's: -NaN to NaN and -0.0 to 0.0. 5.0 is a bit-equal control.
+    for (n, bucket, embedding) in [
+        (1, -f64::NAN, vec![0.6_f32, 0.8]),
+        (2, -0.0, vec![0.8, 0.6]),
+        (3, 5.0, vec![0.5, 0.866_025_4]),
+    ] {
+        db.execute(
+            "INSERT INTO decisions (id, bucket, embedding) VALUES ($id, $bucket, $embedding)",
+            &params(&[
+                ("id", id(n)),
+                ("bucket", Value::Float64(bucket)),
+                ("embedding", Value::Vector(embedding)),
+            ]),
+        )
+        .unwrap();
+    }
+    for (n, bucket, weight) in [(11, f64::NAN, 10.0), (12, 0.0, 5.0), (13, 5.0, 20.0)] {
+        db.execute(
+            "INSERT INTO outcomes (id, bucket, weight) VALUES ($id, $bucket, $weight)",
+            &params(&[
+                ("id", id(n)),
+                ("bucket", Value::Float64(bucket)),
+                ("weight", Value::Float64(weight)),
+            ]),
+        )
+        .unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+
+    // Joined weights 20, 10, 5 order the decisions 3, 1, 2. Had only the
+    // bit-equal control joined, the order would be 3, 2, 1; had nothing
+    // joined, similarity alone would give 2, 1, 3.
+    let query = params(&[("q", Value::Vector(vec![1.0, 0.0]))]);
+    for (route, rows) in rows_on_every_route(
+        &path,
+        "SELECT id FROM decisions ORDER BY embedding <=> $q USE RANK effective LIMIT 3",
+        &query,
+    ) {
+        assert_eq!(
+            rows,
+            vec![vec![id(3)], vec![id(1)], vec![id(2)]],
+            "{route}: every decision joins the outcome whose bucket it equals"
+        );
+    }
+}
