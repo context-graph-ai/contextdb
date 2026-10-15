@@ -163,10 +163,16 @@ thread_local! {
 static VECTOR_DURABLE_PURGE_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
 #[cfg(any(test, feature = "test-seams"))]
 static VECTOR_DURABLE_PURGE_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+/// The vector store whose next durable compaction fails, by address; 0 when
+/// unarmed. Scoped to the arming database so another test's maintenance
+/// cycle in the same process never consumes it.
 #[cfg(any(test, feature = "test-seams"))]
-static VECTOR_DURABLE_COMPACTION_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
+static VECTOR_DURABLE_COMPACTION_FAILURE_ARMED_FOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// The vector store that consumed the injected compaction failure, by address.
 #[cfg(any(test, feature = "test-seams"))]
-static VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+static VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED_BY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(any(test, feature = "test-seams"))]
 fn crash_at_purge_publication_boundary_for_test(boundary: &str) {
@@ -26419,10 +26425,17 @@ impl MaintenanceContext {
                         #[cfg(any(test, feature = "test-seams"))]
                         self.vector.maybe_pause_memory_workspace_for_test();
                         #[cfg(any(test, feature = "test-seams"))]
-                        if take_vector_memory_fault(
-                            &VECTOR_DURABLE_COMPACTION_FAILURE_ARMED,
-                            &VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED,
-                        ) {
+                        if VECTOR_DURABLE_COMPACTION_FAILURE_ARMED_FOR
+                            .compare_exchange(
+                                Arc::as_ptr(&self.vector) as usize,
+                                0,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
+                            .is_ok()
+                        {
+                            VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED_BY
+                                .store(Arc::as_ptr(&self.vector) as usize, Ordering::SeqCst);
                             return Err(Error::Other(
                                 "injected vector compaction prepublication failure".to_string(),
                             ));
@@ -69380,16 +69393,21 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn arm_vector_durable_compaction_failure_for_test(&self) {
-        arm_vector_memory_fault(
-            &VECTOR_DURABLE_COMPACTION_FAILURE_ARMED,
-            &VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED,
+        let store = Arc::as_ptr(&self.vector_store) as usize;
+        let _ = VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED_BY.compare_exchange(
+            store,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         );
+        VECTOR_DURABLE_COMPACTION_FAILURE_ARMED_FOR.store(store, Ordering::SeqCst);
     }
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn vector_durable_compaction_failure_consumed_for_test(&self) -> bool {
-        VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED.load(Ordering::SeqCst)
+        VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED_BY.load(Ordering::SeqCst)
+            == Arc::as_ptr(&self.vector_store) as usize
     }
 
     pub(crate) fn register_vector_index_for_column(
