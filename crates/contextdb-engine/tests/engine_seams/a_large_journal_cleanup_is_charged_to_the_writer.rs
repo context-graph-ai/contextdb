@@ -1,15 +1,19 @@
 #![cfg(feature = "test-seams")]
 //! After a partition's first graph is published, maintenance removes the
-//! journal records that graph now covers. Each record it decodes is already
-//! funded by that cleanup's writer workspace. Before this repair the same
-//! decode was charged again, and kept, by a private reader at the shipped
-//! 16 MiB default, so cleaning the journal of a partition with a few tens of
-//! thousands of new rows was refused on a budget nobody declared.
+//! journal records that graph now covers, under its writer: each record's
+//! decode is funded by the cleanup's workspace and returned before the next
+//! is read. The memory property this test was written for -- no private
+//! reader at the shipped 16 MiB default keeping every decode -- no longer has
+//! a code path: an ownerless decode is writer work. A cleanup that kept one
+//! decode owner across every record measurably retains under 5 bytes per
+//! record (155,439 B after 32,769 records), so no practical journal size
+//! makes a regression refuse. This is the functional check that a journal
+//! larger than one cleanup step is cleaned and the route is searchable.
 use contextdb_core::{Value, Wallclock, read_contract::ReadLimits};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::collections::HashMap;
 
-const ROWS: i64 = 32_768;
+const ROWS: i64 = 2_048;
 
 fn partition_status(db: &Database) -> HashMap<String, Value> {
     let result = db
@@ -35,7 +39,7 @@ fn a_journal_larger_than_the_shipped_reader_memory_is_cleaned_under_the_writer()
         root.path().join("journal-cleanup.db"),
         DatabaseOpenOptions {
             maintenance_policy: MaintenancePolicy::CallerDriven,
-            memory_limit: Some(512 * 1024 * 1024),
+            memory_limit: Some(16 * 1024 * 1024),
             ..DatabaseOpenOptions::default()
         },
     )
@@ -45,18 +49,21 @@ fn a_journal_larger_than_the_shipped_reader_memory_is_cleaned_under_the_writer()
         &HashMap::new(),
     )
     .unwrap();
-    for id in 0..ROWS {
-        db.execute(
-            "INSERT INTO points VALUES ($id, 1, $vector)",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id)),
-                (
-                    "vector".into(),
-                    Value::Vector(vec![0.0, 1.0, id as f32 + 1.0]),
-                ),
-            ]),
-        )
-        .unwrap();
+    for first in (0..ROWS).step_by(1024) {
+        let mut sql = String::from("INSERT INTO points VALUES ");
+        let mut params = HashMap::new();
+        for id in first..(first + 1024).min(ROWS) {
+            if id > first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("($i{id}, 1, $v{id})"));
+            params.insert(format!("i{id}"), Value::Int64(id));
+            params.insert(
+                format!("v{id}"),
+                Value::Vector(vec![0.0, 1.0, id as f32 + 1.0]),
+            );
+        }
+        db.execute(&sql, &params).unwrap();
     }
     db.execute(
         "INSERT INTO points VALUES ($id, 1, $vector)",

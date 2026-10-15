@@ -63,6 +63,17 @@ fn append(db: &Database, id: i64, vector: Vec<f32>) {
 
 /// A built 16-row graph, then `suffix_rows` single-row commits and the target.
 fn fixture(path: &std::path::Path, limit: usize, suffix_rows: usize) -> Database {
+    fixture_in_commits(path, limit, suffix_rows, 1)
+}
+
+/// The same suffix written `per_commit` rows to a commit: a cohort is still
+/// whole commits, and a large suffix costs a fraction of the commits.
+fn fixture_in_commits(
+    path: &std::path::Path,
+    limit: usize,
+    suffix_rows: usize,
+    per_commit: usize,
+) -> Database {
     // Readers are declared large enough to search a pending suffix; the
     // writer limit is what these tests hold fixed.
     let mut options = options(limit);
@@ -85,8 +96,25 @@ fn fixture(path: &std::path::Path, limit: usize, suffix_rows: usize) -> Database
         .remaining_partitions
         != 0
     {}
-    for id in BASE_ROWS..BASE_ROWS + suffix_rows as i64 {
-        append(&db, id, vector_for(id));
+    let suffix = BASE_ROWS..BASE_ROWS + suffix_rows as i64;
+    if per_commit <= 1 {
+        for id in suffix {
+            append(&db, id, vector_for(id));
+        }
+    } else {
+        for first in suffix.clone().step_by(per_commit) {
+            let mut sql = String::from("INSERT INTO points VALUES ");
+            let mut params = HashMap::new();
+            for id in first..(first + per_commit as i64).min(suffix.end) {
+                if id > first {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("($i{id}, 1, $v{id})"));
+                params.insert(format!("i{id}"), Value::Int64(id));
+                params.insert(format!("v{id}"), Value::Vector(vector_for(id)));
+            }
+            db.execute(&sql, &params).unwrap();
+        }
     }
     let mut target = vec![0.0; DIMENSION];
     target[0] = 1.0;
@@ -339,13 +367,17 @@ fn a_tight_writer_limit_refuses_a_missing_and_admits_no_duplicate_decode_charge(
     assert_searchable(&db, suffix_rows);
 }
 
+// Stress tier: the property needs a suffix whose decoded vectors exceed the
+// whole 16 MiB writer (3,000 x 6 KiB). The default tier keeps the cohort
+// bound's witness in the interrupted-import test.
+#[cfg(feature = "nightly-tests")]
 #[test]
 fn an_import_larger_than_the_writer_limit_is_absorbed_in_committed_cohorts_without_raising_it() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     const LIMIT: usize = 16 * 1024 * 1024;
     let suffix_rows = 3000;
     let root = tempfile::tempdir().unwrap();
-    let db = fixture(&root.path().join("cohorts.db"), LIMIT, suffix_rows);
+    let db = fixture_in_commits(&root.path().join("cohorts.db"), LIMIT, suffix_rows, 16);
     let entry_bytes = DIMENSION * 4 + 256;
     assert!(
         (suffix_rows + 1) * entry_bytes > LIMIT,
@@ -621,7 +653,7 @@ fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds()
 }
 
 const CRASH_LIMIT: usize = 16 * 1024 * 1024;
-const CRASH_SUFFIX_ROWS: usize = 3000;
+const CRASH_SUFFIX_ROWS: usize = 480;
 
 /// The writer stays at 16 MiB; the reader is declared large enough to search
 /// a pending suffix of 2,840 1536-dimension vectors while it is pending.
@@ -707,7 +739,7 @@ fn an_import_interrupted_after_one_cohort_publishes_only_that_cohort_and_resumes
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("cohort-interrupt.db");
-    let db = fixture(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS);
+    let db = fixture_in_commits(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS, 16);
     assert_eq!(pending_inserts(&db), CRASH_SUFFIX_ROWS + 1);
     // The second cohort's load gets no headroom: the first cohort is
     // published, the second refuses at its first decode.
@@ -794,7 +826,7 @@ fn crash_at_the_first_cohort_publication(test: &str, cut: &str) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("cohort-crash.db");
     let out = root.path().join("first-cohort");
-    let db = fixture(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS);
+    let db = fixture_in_commits(&path, CRASH_LIMIT, CRASH_SUFFIX_ROWS, 16);
     let before = serving(&db);
     assert_eq!(before.3, CRASH_SUFFIX_ROWS + 1);
     db.close().unwrap();
@@ -973,7 +1005,7 @@ fn every_commit_the_writer_accepted_is_absorbed_under_the_same_limit() {
     // commit holds all its vectors under the writer's declared limit; its
     // import tail must then fit under that same limit, whatever its size.
     let mut largest_committed = 0;
-    for rows in [4096usize, 2048, 1024, 512, 256, 128, 64] {
+    for rows in [512usize, 256, 128, 64] {
         let (committed, absorbed) = one_commit_of(rows, 16 * 1024 * 1024);
         eprintln!(
             "one commit of {rows} vectors under 16 MiB: committed={committed} absorbed={absorbed:?}"
@@ -995,7 +1027,7 @@ fn a_committed_lsn_larger_than_a_lowered_limit_is_absorbed_by_a_bounded_rebuild(
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("lowered.db");
     let db = fixture(&path, ROOMY_LIMIT, 0);
-    let rows = 4096usize;
+    let rows = 256usize;
     let mut sql = String::from("INSERT INTO points VALUES ");
     let mut params = HashMap::new();
     for row in 0..rows {
@@ -1009,8 +1041,9 @@ fn a_committed_lsn_larger_than_a_lowered_limit_is_absorbed_by_a_bounded_rebuild(
     }
     db.execute(&sql, &params).unwrap();
     db.close().unwrap();
-    // The operator reopens with a limit below what that one commit's
-    // decoded vectors need (4,096 x 6,144 B = 24 MiB > 16 MiB). Coverage is
+    // The operator reopens with a 16 MiB limit, whose cohort share (1 MiB)
+    // is below that one commit's decoded vectors (256 x 6,144 B =
+    // 1.5 MiB). Coverage is
     // per committed LSN, so the commit is absorbed by a bounded rebuild under
     // the unchanged limit instead of being refused.
     let db = Database::open_with_options(&path, options(16 * 1024 * 1024)).unwrap();

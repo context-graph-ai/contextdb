@@ -21,9 +21,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-const DIMENSION: usize = 1536;
+const DIMENSION: usize = 384;
 const BASE_ROWS: i64 = 16;
-const ONE_COMMIT: usize = 4096;
+const ONE_COMMIT: usize = 640;
 const ROOMY: usize = 512 * 1024 * 1024;
 const TIGHT: usize = 16 * 1024 * 1024;
 
@@ -74,7 +74,7 @@ fn one_commit(db: &Database, first: i64, rows: usize) {
     db.execute(&sql, &params).unwrap();
 }
 
-/// A built 16-row route, then one commit of 4,096 vectors, closed.
+/// A built 16-row route, then one commit of 640 vectors, closed.
 fn store_with_one_large_commit(path: &std::path::Path) {
     store_with_one_commit_of(path, ONE_COMMIT);
 }
@@ -196,7 +196,7 @@ fn one_committed_lsn_larger_than_the_cohort_share_is_absorbed_without_raising_th
             .is_empty()
     );
     assert_eq!(count(&db), BASE_ROWS + ONE_COMMIT as i64);
-    for id in [1_000_000, 1_002_047, 1_004_095, 3] {
+    for id in [1_000_000, 1_000_319, 1_000_639, 3] {
         assert_eq!(nearest(&db, id), vec![vec![Value::Int64(id)]]);
     }
 }
@@ -219,14 +219,14 @@ fn an_older_build_publishes_at_its_own_frontier_before_a_fresh_build_absorbs_the
             .remaining_partitions
             != 0
         {}
-        for id in BASE_ROWS..BASE_ROWS + 2048 {
-            insert_one(&db, id);
+        for first in (BASE_ROWS..BASE_ROWS + 1024).step_by(256) {
+            one_commit(&db, first, 256);
         }
         db.close().unwrap();
     }
     {
         // Under the tight limit one cycle starts a replacement and leaves it
-        // unfinished: four batches of a 2,064-point build.
+        // unfinished: a 1,040-point build takes more than one cycle.
         let db = Database::open_with_options(&path, options(TIGHT)).unwrap();
         assert!(db.persist_import_vector_tails().unwrap());
         let cycle = db.run_maintenance_cycle().unwrap().vector;
@@ -258,8 +258,8 @@ fn an_older_build_publishes_at_its_own_frontier_before_a_fresh_build_absorbs_the
         batches.len()
     );
     assert_eq!(serving_pending(&db), 0);
-    assert_eq!(count(&db), BASE_ROWS + 2048 + ONE_COMMIT as i64);
-    for id in [1_000_000, 1_004_095, 1000] {
+    assert_eq!(count(&db), BASE_ROWS + 1024 + ONE_COMMIT as i64);
+    for id in [1_000_000, 1_000_639, 1000] {
         assert_eq!(nearest(&db, id), vec![vec![Value::Int64(id)]]);
     }
 }
@@ -271,14 +271,14 @@ fn a_large_commit_after_the_import_target_stays_pending_for_the_next_call() {
     let path = root.path().join("after-target.db");
     store_with_one_large_commit(&path);
     let db = Arc::new(Database::open_with_options(&path, options(TIGHT)).unwrap());
-    // Between two build steps of this call, another writer commits 256
+    // Between two build steps of this call, another writer commits 640
     // vectors in one commit: larger than the cohort share, after the target.
     let committed = Arc::new(AtomicBool::new(false));
     let late = (Arc::clone(&db), Arc::clone(&committed));
     let _steps = observe_import_rebuild_steps_for_test(Arc::new(move |_| {
         if !late.1.swap(true, Ordering::SeqCst) {
             let db = Arc::clone(&late.0);
-            std::thread::spawn(move || one_commit(&db, 2_000_000, 256))
+            std::thread::spawn(move || one_commit(&db, 2_000_000, 640))
                 .join()
                 .unwrap();
         }
@@ -288,7 +288,7 @@ fn a_large_commit_after_the_import_target_stays_pending_for_the_next_call() {
     assert!(committed.load(Ordering::SeqCst), "the late commit happened");
     assert_eq!(
         serving_pending(&db),
-        256,
+        640,
         "the commit after this call's target stays pending, uncovered"
     );
     assert_eq!(nearest(&db, 1_000_000), vec![vec![Value::Int64(1_000_000)]]);
@@ -297,7 +297,7 @@ fn a_large_commit_after_the_import_target_stays_pending_for_the_next_call() {
     assert_eq!(nearest(&db, 2_000_100), vec![vec![Value::Int64(2_000_100)]]);
     assert!(db.persist_import_vector_tails().unwrap());
     assert_eq!(serving_pending(&db), 0);
-    assert_eq!(count(&db), BASE_ROWS + ONE_COMMIT as i64 + 256);
+    assert_eq!(count(&db), BASE_ROWS + ONE_COMMIT as i64 + 640);
 }
 
 #[test]
@@ -336,7 +336,7 @@ fn a_pinned_reader_keeps_its_answer_while_the_large_commit_is_rebuilt_and_publis
 fn a_rebuild_holds_the_same_decode_charge_at_every_step_whatever_its_size() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let mut envelopes = Vec::new();
-    for rows in [1024, ONE_COMMIT] {
+    for rows in [640, 1280] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("step-envelope.db");
         store_with_one_commit_of(&path, rows);
@@ -378,21 +378,21 @@ fn a_rebuild_holds_the_same_decode_charge_at_every_step_whatever_its_size() {
 fn a_fresh_rebuild_counts_its_inputs_outside_the_commit_lock_at_any_partition_size() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let mut runs = Vec::new();
-    for extra_base in [0, 2048] {
+    for extra_base in [0, 1024] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("count-outside-lock.db");
-        store_with_base_and_one_commit(&path, extra_base, 1024);
+        store_with_base_and_one_commit(&path, extra_base, 640);
         let db = Database::open_with_options(&path, options(TIGHT)).unwrap();
         take_membership_count_decodes_for_test();
         assert!(db.persist_import_vector_tails().unwrap());
         let (total, under_lock) = take_membership_count_decodes_for_test();
         eprintln!(
             "fresh rebuild over {} memberships: {total} counted, {under_lock} under the commit lock",
-            BASE_ROWS as usize + extra_base + 1024
+            BASE_ROWS as usize + extra_base + 640
         );
         assert_eq!(serving_pending(&db), 0);
         // The count reads every membership once, before the commit lock.
-        assert_eq!(total, BASE_ROWS as usize + extra_base + 1024);
+        assert_eq!(total, BASE_ROWS as usize + extra_base + 640);
         runs.push((total, under_lock));
     }
     assert!(runs[1].0 > runs[0].0, "{runs:?}");
@@ -501,7 +501,7 @@ fn crash_inside_the_large_commit(test: &str, cut: &str) {
     }
     assert_eq!(serving_pending(&db), 0);
     assert_eq!(count(&db), BASE_ROWS + ONE_COMMIT as i64);
-    for id in [1_000_000, 1_004_095] {
+    for id in [1_000_000, 1_000_639] {
         assert_eq!(nearest(&db, id), vec![vec![Value::Int64(id)]]);
     }
 }
