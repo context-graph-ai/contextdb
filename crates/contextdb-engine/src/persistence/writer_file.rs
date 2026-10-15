@@ -301,6 +301,22 @@ impl LockedWriterFile {
         .unwrap_or_else(|_| PathBuf::from("database file"))
     }
 
+    /// macOS has no /proc; the kernel reports the open file's path through
+    /// `F_GETPATH`.
+    #[cfg(target_os = "macos")]
+    fn file_path(&self) -> PathBuf {
+        let mut path = PathBuf::new();
+        match nix::fcntl::fcntl(&self.file, nix::fcntl::FcntlArg::F_GETPATH(&mut path)) {
+            Ok(_) => path,
+            Err(_) => PathBuf::from("database file"),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn file_path(&self) -> PathBuf {
+        PathBuf::from("database file")
+    }
+
     fn recognized_reader_snapshot(&self, snapshot: &super::RegisteredReaderSnapshot) -> bool {
         snapshot.database_identity == self.reader_database_identity.get().copied().flatten()
             || self
