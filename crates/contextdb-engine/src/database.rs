@@ -2741,7 +2741,11 @@ mod received_schema_stage_tests {
             .flat_map(|unit| unit.changes.vectors.iter().map(|vector| vector.lsn))
             .collect::<Vec<_>>();
         shipped.sort();
-        assert_eq!(shipped, vec![Lsn(40), Lsn(42)], "every vector row still ships");
+        assert_eq!(
+            shipped,
+            vec![Lsn(40), Lsn(42)],
+            "every vector row still ships"
+        );
     }
 
     #[test]

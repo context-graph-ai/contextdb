@@ -422,7 +422,9 @@ async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receive
             .expect("hold the pre-pull snapshot");
         let observer = contextdb_engine::database::ReceivedSchemaApplyObserverForTest::new();
         {
-            let _scope = synced.edge.observe_received_schema_applies_for_test(&observer);
+            let _scope = synced
+                .edge
+                .observe_received_schema_applies_for_test(&observer);
             synced.pull().await;
         }
         let observation = observer
@@ -527,7 +529,10 @@ async fn a_synced_policy_change_clears_a_failure_the_new_policy_no_longer_needs(
     synced
         .alter("ALTER TABLE policy_items ALTER COLUMN embedding SET SEARCH_MODE AUTO")
         .await;
-    assert_eq!(embedding_column(&synced.edge).search_mode, VectorSearchMode::Auto);
+    assert_eq!(
+        embedding_column(&synced.edge).search_mode,
+        VectorSearchMode::Auto
+    );
     assert_eq!(
         failure(),
         None,
