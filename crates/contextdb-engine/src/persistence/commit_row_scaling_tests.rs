@@ -452,11 +452,11 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
 }
 
 /// A commit writing one row into one table opens, closes and witnesses only
-/// that table's relation, however many other tables the store declares. The
-/// saved row cardinality of every other table is unchanged by the commit and
-/// must not be refreshed by opening each of them for writing, which made every
-/// commit's protected-root work, and a received schema unit's durable
-/// writes, grow with the number of declared tables.
+/// that table's relation, and looks at no other table's declaration, header
+/// or saved count, however many other tables the store declares. Refreshing
+/// every declared table's row-count bookkeeping on every commit made each
+/// commit's work, and a received schema unit's durable writes, grow with the
+/// number of declared tables.
 #[test]
 fn a_one_table_commit_leaves_every_other_tables_relation_untouched() {
     let mut events_by_tables = Vec::new();
@@ -481,6 +481,7 @@ fn a_one_table_commit_leaves_every_other_tables_relation_untouched() {
             .expect("give the table a committed row");
         }
         commit_row_work::take_protected_root_events();
+        commit_row_work::take_declared_table_visits();
         db.execute(
             "INSERT INTO other_0000 VALUES ($id, 'the measured row')",
             &HashMap::from([(
@@ -490,15 +491,21 @@ fn a_one_table_commit_leaves_every_other_tables_relation_untouched() {
         )
         .expect("commit one row into one table");
         let events = commit_row_work::take_protected_root_events();
-        eprintln!("one_table_commit tables={count} protected_root_events={events}");
-        events_by_tables.push((count, events));
+        let visits = commit_row_work::take_declared_table_visits();
+        eprintln!(
+            "one_table_commit tables={count} protected_root_events={events} \
+             declared_table_visits={visits}"
+        );
+        events_by_tables.push((count, events, visits));
         db.close().expect("close the store");
     }
-    let (_, first) = events_by_tables[0];
+    let (_, first_events, first_visits) = events_by_tables[0];
     assert!(
-        events_by_tables.iter().all(|(_, events)| *events == first),
-        "a one-row, one-table commit's protected root events grew with the declared \
-         tables: {events_by_tables:?}"
+        events_by_tables
+            .iter()
+            .all(|(_, events, visits)| *events == first_events && *visits == first_visits),
+        "a one-row, one-table commit's protected root events or declared-table visits grew \
+         with the declared tables (tables, events, visits): {events_by_tables:?}"
     );
 }
 

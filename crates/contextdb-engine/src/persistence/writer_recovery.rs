@@ -994,6 +994,8 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?
         {
             let (name, _) = entry.map_err(Self::storage_error)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            content_identity::version_manifest::commit_row_work::count_declared_table_visit();
             let name =
                 name.value()
                     .strip_prefix("table:")
