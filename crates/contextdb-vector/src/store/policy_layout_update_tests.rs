@@ -294,9 +294,17 @@ fn publish_and_recheck(
     FAILURE_RECHECK_VISITS.with(|visits| visits.get())
 }
 
-/// A second policy change after `policy_only`.
+/// A policy under which a partition needs no maintenance at all: exact search
+/// builds no graph, so a recheck can clear any recorded failure.
+fn exact_policy(layout: &VectorIndexLayout) -> VectorIndexLayout {
+    let mut changed = layout.clone();
+    changed.search_mode = VectorSearchMode::Exact;
+    changed
+}
+
+/// A second policy change after `exact_policy`.
 fn policy_again(layout: &VectorIndexLayout) -> VectorIndexLayout {
-    let mut changed = policy_only(layout);
+    let mut changed = exact_policy(layout);
     changed.auto_index_at = Some(9);
     changed
 }
@@ -335,7 +343,7 @@ fn a_policy_recheck_looks_only_at_the_failed_partition() {
             .expect("record one partition's failure");
         let mut owner = VectorCopyAdmission::new(Budget::with_limit(usize::MAX));
         assert_eq!(
-            publish_and_recheck(&store, policy_only(&layout), &mut owner),
+            publish_and_recheck(&store, exact_policy(&layout), &mut owner),
             1,
             "only the failed partition of {partitions} is looked at"
         );
@@ -366,7 +374,7 @@ fn a_failure_the_column_cannot_index_is_still_rechecked() {
     column_owner.refuse.store(false, Ordering::SeqCst);
     let mut owner = VectorCopyAdmission::new(Budget::with_limit(usize::MAX));
     assert_eq!(
-        publish_and_recheck(&store, policy_only(&layout), &mut owner),
+        publish_and_recheck(&store, exact_policy(&layout), &mut owner),
         16,
         "an incomplete index makes the recheck look at every partition once"
     );
