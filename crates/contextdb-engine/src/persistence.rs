@@ -39254,11 +39254,24 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .iter()
                 .cloned()
                 .map(|part| match part {
-                    DirectedValue::Asc(TotalOrdAsc(value)) => (false, value),
-                    DirectedValue::Desc(TotalOrdDesc(value)) => (true, value),
+                    DirectedValue::Asc(TotalOrdAsc(value)) => {
+                        (false, Self::count_key_value(value))
+                    }
+                    DirectedValue::Desc(TotalOrdDesc(value)) => {
+                        (true, Self::count_key_value(value))
+                    }
                 })
                 .collect(),
         })
+    }
+
+    /// A count is kept per index key, and float keys follow PostgreSQL's
+    /// float8 equality, so `-0.0` and `0.0`, and every NaN, share one record.
+    fn count_key_value(value: Value) -> Value {
+        match value {
+            Value::Float64(value) => Value::Float64(contextdb_core::float8_canonical(value)),
+            value => value,
+        }
     }
 
     /// The stored-key prefix shared by every maintained count of one column
@@ -39285,7 +39298,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 DirectedValue::Asc(TotalOrdAsc(value)) => (false, value),
                 DirectedValue::Desc(TotalOrdDesc(value)) => (true, value),
             };
-            encoded.extend_from_slice(&Self::encode(&(descending, value))?);
+            encoded.extend_from_slice(&Self::encode(&(
+                descending,
+                Self::count_key_value(value.clone()),
+            ))?);
         }
         let mut full = prefix.to_vec();
         full.extend(

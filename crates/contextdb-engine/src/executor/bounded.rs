@@ -5858,17 +5858,17 @@ fn borrowed_scalar_cmp(
     match (left, right) {
         (BorrowedScalar::Int64(left), BorrowedScalar::Int64(right)) => Some(left.cmp(&right)),
         (BorrowedScalar::Float64(left), BorrowedScalar::Float64(right)) => {
-            Some(left.total_cmp(&right))
+            Some(contextdb_core::float8_cmp(left, right))
         }
         (BorrowedScalar::Text(left), BorrowedScalar::Text(right)) => Some(left.cmp(right)),
         (BorrowedScalar::Timestamp(left), BorrowedScalar::Timestamp(right)) => {
             Some(left.cmp(&right))
         }
         (BorrowedScalar::Int64(left), BorrowedScalar::Float64(right)) => {
-            Some((left as f64).total_cmp(&right))
+            Some(contextdb_core::float8_cmp(left as f64, right))
         }
         (BorrowedScalar::Float64(left), BorrowedScalar::Int64(right)) => {
-            Some(left.total_cmp(&(right as f64)))
+            Some(contextdb_core::float8_cmp(left, right as f64))
         }
         (BorrowedScalar::Timestamp(left), BorrowedScalar::Int64(right)) => Some(left.cmp(&right)),
         (BorrowedScalar::Int64(left), BorrowedScalar::Timestamp(right)) => Some(left.cmp(&right)),
@@ -14003,7 +14003,7 @@ fn select_vector_candidate_identity_source(
                 })
         })
     }
-    // SQL comparisons that need coercion, NULL/NaN exclusion or residual
+    // SQL comparisons that need coercion, NULL exclusion or residual
     // expression evaluation retain their charged row reads.
     fn covered(expr: &Expr, state: &ScanState, pick: &IndexPick) -> bool {
         if let Expr::BinaryOp {
@@ -14054,8 +14054,9 @@ fn select_vector_candidate_identity_source(
             ..
         } = expr
         {
-            // The total index order includes NULL and NaN, which SQL ordered
-            // comparisons exclude. NULL is the physical tail in ascending
+            // The total index order includes NULL, which SQL ordered
+            // comparisons exclude, and a REAL range stays on the row-checking
+            // route. NULL is the physical tail in ascending
             // order and the physical head in descending order, so a lower
             // SQL bound (`>` / `>=`) reaches it in either direction. Keep
             // nullable lower-bound ranges on the row-checking route.
@@ -15580,12 +15581,11 @@ fn build_scan(
     let filter_analysis =
         filter.map(|filter| analyze_filter_for_index(table, &meta, filter, &params));
     // A predicate that can match nothing -- contradictory equalities on the
-    // same column, a NULL or NaN bound where a value is required, a literal
+    // same column, a NULL bound where a value is required, a literal
     // that cannot even be read as the column's type -- answers zero rows
     // having read none. The executor decides this before it touches the store
     // (`executor.rs:6912`); a read that instead drops the unusable pick walks
-    // the whole table, charges the reader for every row of it, and for NaN
-    // hands back a row the other door never returns.
+    // the whole table and charges the reader for every row of it.
     let coerced_filter_pick = filter_analysis
         .as_ref()
         .and_then(|analysis| analysis.pick.clone())

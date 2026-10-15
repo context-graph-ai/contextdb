@@ -793,16 +793,32 @@ impl PartialOrd for DirectedValue {
 }
 
 /// Whether two values are the same index key: equal under the total order
-/// every index posting and maintained count is keyed by. Unlike `==`, `-0.0`
-/// and `0.0` are different keys and `NaN` is one key.
+/// every index posting and maintained count is keyed by. Floats follow
+/// PostgreSQL's float8: `-0.0` and `0.0` are one key, and every NaN is one key.
 pub fn index_key_value_eq(a: &Value, b: &Value) -> bool {
     value_total_cmp(a, b).is_eq()
 }
 
-/// Total ordering over `Value`. Stub uses a simple discriminant tiebreak +
-/// `f64::total_cmp` for Float64 + NULL-LAST-ASC semantics. Works uniformly
-/// for every value type; impl may replace this with a more specialized lookup
-/// in its own pass.
+/// The one representative of a float's PostgreSQL float8 equality class:
+/// `-0.0` becomes `0.0` and every NaN becomes the one positive quiet NaN.
+/// Anything keyed by a float's bytes (a maintained count, a hash) keys this.
+pub fn float8_canonical(value: f64) -> f64 {
+    if value.is_nan() {
+        f64::NAN
+    } else if value == 0.0 {
+        0.0
+    } else {
+        value
+    }
+}
+
+/// PostgreSQL's float8 order: a total order in which `-0.0 = 0.0`, every NaN
+/// equals every other NaN, and NaN sorts above every number.
+pub fn float8_cmp(left: f64, right: f64) -> std::cmp::Ordering {
+    float8_canonical(left).total_cmp(&float8_canonical(right))
+}
+
+/// Total ordering over `Value`, NULLS LAST ascending, floats by `float8_cmp`.
 fn value_total_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     // NULL > any finite under ASC per shp_05 (NULLS LAST ASC).
@@ -814,7 +830,7 @@ fn value_total_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
     match (a, b) {
         (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Float64(x), Value::Float64(y)) => x.total_cmp(y),
+        (Value::Float64(x), Value::Float64(y)) => float8_cmp(*x, *y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),

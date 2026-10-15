@@ -9451,7 +9451,7 @@ pub(crate) struct IndexPick {
     /// Physical bounds on the first range after the finite prefix.
     trailing_range: Option<(std::ops::Bound<IndexKey>, std::ops::Bound<IndexKey>)>,
     /// The prefix is provably empty before touching the index tree
-    /// (contradictory suffix constants, NULL/NaN suffix binds, or an
+    /// (contradictory suffix constants, NULL suffix binds, or an
     /// incoercible leading equality/range value).
     prefix_empty: bool,
     /// Every finite probe value already has the declared column type and each
@@ -9988,7 +9988,7 @@ fn coerce_pick_shape_to_column_type(
 }
 
 fn usable_index_probe_value(value: &Value) -> bool {
-    !value.is_null() && !matches!(value, Value::Float64(number) if number.is_nan())
+    !value.is_null()
 }
 
 fn coerce_index_probe_value(
@@ -10438,7 +10438,7 @@ fn analyze_filter_for_index_with_capability(
 
 /// A row-value `IN` over plain columns with bindable values, coerced to the
 /// columns' declared types. A listed row holding a value no stored key can
-/// equal (NULL, NaN, or a value the column type cannot hold) can never make
+/// equal (NULL, or a value the column type cannot hold) can never make
 /// the comparison true, so it names no key and is dropped.
 struct RowValueList {
     columns: Vec<String>,
@@ -12117,12 +12117,12 @@ fn execute_index_scan(
     // > end) or degenerately empty (start == end with both ends excluded).
     // A normal query never constructs an inverted pair, but a NaN bound does:
     // the index's total order (`DirectedValue`/`value_total_cmp`, built on
-    // `f64::total_cmp`) sorts the canonical NaN constant AFTER every other
+    // PostgreSQL float8 order, `float8_cmp`) sorts every NaN AFTER every other
     // value, so `NaN` as a lower bound can sort above a perfectly ordinary
     // upper bound. Rather than special-case NaN, guard the whole class: if
     // the bound pair can't form a non-empty range under this order, the
-    // answer is the empty set (matching a non-indexed scan's IEEE-754
-    // behavior, where every comparison against NaN is false), not a panic.
+    // answer is the empty set (matching a non-indexed scan under the same
+    // order, where nothing lies between such bounds), not a panic.
     let range_is_empty = |lower: &Bound<Vec<DirectedValue>>, upper: &Bound<Vec<DirectedValue>>| {
         let (lower_key, lower_excluded) = match lower {
             Bound::Included(v) => (Some(v), false),
@@ -12834,13 +12834,12 @@ fn run_index_scan_with_order(
 /// Whether this predicate can match no row at all, so the answer is zero rows
 /// having read none.
 ///
-/// `col = NaN` never matches -- NaN equals nothing, itself included -- and
-/// `col = NULL` is UNKNOWN rather than true, so neither reaches the store.
-/// Both doors ask this one function; a read that decides it for itself returns
-/// a row the other door excludes.
+/// `col = NULL` is UNKNOWN rather than true, so it never reaches the store.
+/// (`col = NaN` is an ordinary probe: floats follow PostgreSQL's float8, where
+/// every NaN equals every other NaN.) Both doors ask this one function; a read
+/// that decides it for itself returns a row the other door excludes.
 pub(crate) fn pick_matches_nothing(pick: &IndexPick) -> bool {
     match &pick.shape {
-        IndexPredicateShape::Equality(Value::Float64(f)) if f.is_nan() => true,
         IndexPredicateShape::Equality(Value::Null) => true,
         _ => pick.prefix_empty,
     }
@@ -14356,11 +14355,17 @@ fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
 
     match (a, b) {
         (Value::Int64(left), Value::Int64(right)) => Some(left.cmp(right)),
-        (Value::Float64(left), Value::Float64(right)) => Some(left.total_cmp(right)),
+        (Value::Float64(left), Value::Float64(right)) => {
+            Some(contextdb_core::float8_cmp(*left, *right))
+        }
         (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
         (Value::Timestamp(left), Value::Timestamp(right)) => Some(left.cmp(right)),
-        (Value::Int64(left), Value::Float64(right)) => Some((*left as f64).total_cmp(right)),
-        (Value::Float64(left), Value::Int64(right)) => Some(left.total_cmp(&(*right as f64))),
+        (Value::Int64(left), Value::Float64(right)) => {
+            Some(contextdb_core::float8_cmp(*left as f64, *right))
+        }
+        (Value::Float64(left), Value::Int64(right)) => {
+            Some(contextdb_core::float8_cmp(*left, *right as f64))
+        }
         (Value::Timestamp(left), Value::Int64(right)) => Some(left.cmp(right)),
         (Value::Int64(left), Value::Timestamp(right)) => Some(left.cmp(right)),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),

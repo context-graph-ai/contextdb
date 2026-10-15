@@ -2037,7 +2037,7 @@ fn borrowed_directed_order(
         (V::Int64(left), V::Int64(right)) | (V::Timestamp(left), V::Timestamp(right)) => {
             left.cmp(&right)
         }
-        (V::Float64(left), V::Float64(right)) => left.total_cmp(&right),
+        (V::Float64(left), V::Float64(right)) => contextdb_core::float8_cmp(left, right),
         (V::Text(left), V::Text(right)) => left.cmp(right),
         (V::Uuid(left), V::Uuid(right)) => left.cmp(&right),
         (V::TxId(left), V::TxId(right)) => left.0.cmp(&right.0),

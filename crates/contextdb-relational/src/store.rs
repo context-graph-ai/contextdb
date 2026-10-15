@@ -244,7 +244,7 @@ fn hash_value(value: &Value, hasher: &mut impl Hasher) -> Option<()> {
         }
         Value::Float64(value) => {
             3_u8.hash(hasher);
-            value.to_bits().hash(hasher);
+            contextdb_core::float8_canonical(*value).to_bits().hash(hasher);
         }
         Value::Text(value) => {
             4_u8.hash(hasher);
@@ -1342,7 +1342,7 @@ impl RelationalStore {
         }
 
         fn safe_value(value: &Value) -> bool {
-            !value.is_null() && !matches!(value, Value::Float64(number) if number.is_nan())
+            !value.is_null()
         }
 
         fn matches_index_column_type(value: &Value, column_type: &ColumnType) -> bool {
