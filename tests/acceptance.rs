@@ -86,8 +86,6 @@ mod graph_adjacency_routing;
 mod handle_scope_constraint;
 #[path = "acceptance/infra_failures.rs"]
 mod infra_failures;
-#[path = "acceptance/long_running.rs"]
-mod long_running;
 #[path = "acceptance/memory_accounting.rs"]
 mod memory_accounting;
 #[path = "acceptance/multi_edge.rs"]
@@ -118,8 +116,6 @@ mod state_machine_concurrent_legal_transition;
 mod state_machine_self_edge_check;
 #[path = "acceptance/storage_scale_hardening.rs"]
 mod storage_scale_hardening;
-#[path = "acceptance/sync.rs"]
-mod sync;
 #[path = "acceptance/test_alloc_counter.rs"]
 pub mod test_alloc_counter;
 #[path = "acceptance/trigger.rs"]

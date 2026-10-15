@@ -2,99 +2,418 @@ name: CI
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'crates/**'
-      - 'scripts/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/**'
-      - 'rust-toolchain.toml'
-      - 'Dockerfile'
+    branches: [dev, main]
   pull_request:
-    branches: [main]
+    branches: [dev, main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
 env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  RUSTFLAGS: ""
   CARGO_INCREMENTAL: 0
+  CI_GATE_MODE: normal
+  NORMAL_CLEANUP_MIN_FREE_BYTES: "85899345920"
 
 jobs:
-  lint:
-    if: "!startsWith(github.event.head_commit.message, 'release:')"
+  impact:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      integration_required: ${{ steps.classify.outputs.integration_required }}
+      impact_reason: ${{ steps.classify.outputs.impact_reason }}
+      path_classes: ${{ steps.classify.outputs.path_classes }}
+      performance_qualification: ${{ steps.classify.outputs.performance_qualification }}
+      integration_matrix: ${{ steps.plan.outputs.matrix }}
+      combined_matrix: ${{ steps.plan.outputs.combined_matrix }}
+      bundle_matrix: ${{ steps.plan.outputs.bundle_matrix }}
+      enabled: ${{ steps.plan.outputs.enabled }}
+      run_default: ${{ steps.plan.outputs.run_default }}
+      gate_mode: ${{ steps.plan.outputs.gate_mode }}
+      dedup_sha: ${{ steps.plan.outputs.dedup_sha }}
+      dedup_reason: ${{ steps.plan.outputs.dedup_reason }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      source_fingerprint: ${{ steps.plan.outputs.source_fingerprint }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check
-      - run: cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Require complete workspace test inventory
+        run: python3 scripts/ci-inventory.py
+      - id: classify
+        run: python3 scripts/ci-impact.py
+      - id: plan
+        env:
+          CI_INTEGRATION_ENABLED: ${{ steps.classify.outputs.integration_required }}
+          CI_INTEGRATION_DEFAULT: "false"
+          IMPACT_REASON: ${{ steps.classify.outputs.impact_reason }}
+          PATH_CLASSES: ${{ steps.classify.outputs.path_classes }}
+          PERFORMANCE_QUALIFICATION: ${{ steps.classify.outputs.performance_qualification }}
+        run: python3 -B scripts/ci-integration.py plan
 
-  test:
-    needs: lint
+  integration:
+    needs: [impact, test-bundles]
+    if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      - run: cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
-      - run: cargo build --release
-      # The packaged engine builds alone with default features, where feature-gated transport
-      # and test-support code is unused; its dead-code warnings are not errors in this step.
-      - env:
-          RUSTFLAGS: ""
-        run: bash scripts/verify-packaged-engine.sh
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate published normal plan and execution
+        env:
+          CI_INTEGRATION_ENABLED: ${{ needs.impact.outputs.enabled }}
+          CI_INTEGRATION_DEFAULT: ${{ needs.impact.outputs.run_default }}
+          CI_INTEGRATION_NEEDS: ${{ toJSON(needs) }}
+          CI_COMBINED_MATRIX: ${{ needs.impact.outputs.combined_matrix }}
+          CI_BUNDLE_MATRIX: ${{ needs.impact.outputs.bundle_matrix }}
+          DEDUP_SHA: ${{ needs.impact.outputs.dedup_sha }}
+          DEDUP_REASON: ${{ needs.impact.outputs.dedup_reason }}
+          SOURCE_SHA: ${{ needs.impact.outputs.source_sha }}
+          SOURCE_FINGERPRINT: ${{ needs.impact.outputs.source_fingerprint }}
+          GATE_MODE: ${{ needs.impact.outputs.gate_mode }}
+          RUN_DEFAULT: ${{ needs.impact.outputs.run_default }}
+        run: python3 -B scripts/ci-integration.py normal-required
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install lint script tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Offline CI script controls
+        run: |
+          python3 -B scripts/ci-build-tests.py
+          python3 -B scripts/ci-required-tests.py
+          python3 -B scripts/ci-inventory-tests.py
+          python3 -B scripts/ci-acceptance-partition-tests.py
+          python3 -B scripts/ci-integration-tests.py
+          python3 -B scripts/ci-routing-tests.py
+          python3 -B scripts/ci-routing-tests.py --dedup-only
+          python3 -B scripts/ci-routing-tests.py --plan-only
+          python3 -B scripts/ci-cache-post-cleanup-tests.py
+          bash scripts/ci-free-disk-tests.sh
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: lint-debug0-jobs2
+      - run: bash scripts/verify pr lint
+
+  test-bundles:
+    name: test / ${{ matrix.name }}
+    needs: impact
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.impact.outputs.bundle_matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: always() && !cancelled() && matrix.slot1 != null
+        with:
+          key: ${{ matrix.slot1.cache_key }}
+          add-job-id-key: false
+          workspaces: |
+            . -> target
+            crates/contextdb-redb -> ../../target/redb
+      - name: Install test tools for constituent 1
+        if: always() && !cancelled() && matrix.slot1.kind == 'pr'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - id: slot1_pr
+        name: Run constituent 1 / ${{ matrix.slot1.name }}
+        if: always() && !cancelled() && matrix.slot1.kind == 'pr'
+        continue-on-error: true
+        env:
+          CI_BUNDLE: ${{ matrix.slot1.pr.constituents && matrix.slot1.pr.shard || '' }}
+          CI_CRATE: ${{ matrix.slot1.pr.crate }}
+          CI_FEATURES: ${{ matrix.slot1.pr.features }}
+          CI_SHARD: ${{ matrix.slot1.pr.shard }}
+        run: bash scripts/verify pr shard
+      - id: slot1_integration
+        name: Run constituent 1 / ${{ matrix.slot1.name }}
+        if: always() && !cancelled() && matrix.slot1.kind == 'integration'
+        continue-on-error: true
+        env:
+          CI_INTEGRATION_ENABLED: ${{ needs.impact.outputs.enabled }}
+          CI_INTEGRATION_DEFAULT: "false"
+          CI_INTEGRATION_SLICE: ${{ matrix.slot1.integration.id }}
+          CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot1.integration) }}
+        run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
+      - name: Upload constituent 1 shard receipt
+        if: always() && !cancelled() && matrix.slot1.kind == 'pr'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-${{ matrix.slot1.pr.shard }}-${{ github.run_attempt }}
+          path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload constituent 1 integration receipt
+        if: always() && !cancelled() && matrix.slot1.kind == 'integration'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extended-integration-${{ matrix.slot1.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-integration-out/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: always() && !cancelled() && matrix.slot2 != null
+        with:
+          key: ${{ matrix.slot2.cache_key }}
+          add-job-id-key: false
+          workspaces: |
+            . -> target
+            crates/contextdb-redb -> ../../target/redb
+      - name: Install test tools for constituent 2
+        if: always() && !cancelled() && matrix.slot2.kind == 'pr'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - id: slot2_pr
+        name: Run constituent 2 / ${{ matrix.slot2.name }}
+        if: always() && !cancelled() && matrix.slot2.kind == 'pr'
+        continue-on-error: true
+        env:
+          CI_BUNDLE: ${{ matrix.slot2.pr.constituents && matrix.slot2.pr.shard || '' }}
+          CI_CRATE: ${{ matrix.slot2.pr.crate }}
+          CI_FEATURES: ${{ matrix.slot2.pr.features }}
+          CI_SHARD: ${{ matrix.slot2.pr.shard }}
+        run: bash scripts/verify pr shard
+      - id: slot2_integration
+        name: Run constituent 2 / ${{ matrix.slot2.name }}
+        if: always() && !cancelled() && matrix.slot2.kind == 'integration'
+        continue-on-error: true
+        env:
+          CI_INTEGRATION_ENABLED: ${{ needs.impact.outputs.enabled }}
+          CI_INTEGRATION_DEFAULT: "false"
+          CI_INTEGRATION_SLICE: ${{ matrix.slot2.integration.id }}
+          CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot2.integration) }}
+        run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
+      - name: Upload constituent 2 shard receipt
+        if: always() && !cancelled() && matrix.slot2.kind == 'pr'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-${{ matrix.slot2.pr.shard }}-${{ github.run_attempt }}
+          path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload constituent 2 integration receipt
+        if: always() && !cancelled() && matrix.slot2.kind == 'integration'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extended-integration-${{ matrix.slot2.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-integration-out/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: always() && !cancelled() && matrix.slot3 != null
+        with:
+          key: ${{ matrix.slot3.cache_key }}
+          add-job-id-key: false
+          workspaces: |
+            . -> target
+            crates/contextdb-redb -> ../../target/redb
+      - name: Install test tools for constituent 3
+        if: always() && !cancelled() && matrix.slot3.kind == 'pr'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - id: slot3_pr
+        name: Run constituent 3 / ${{ matrix.slot3.name }}
+        if: always() && !cancelled() && matrix.slot3.kind == 'pr'
+        continue-on-error: true
+        env:
+          CI_BUNDLE: ${{ matrix.slot3.pr.constituents && matrix.slot3.pr.shard || '' }}
+          CI_CRATE: ${{ matrix.slot3.pr.crate }}
+          CI_FEATURES: ${{ matrix.slot3.pr.features }}
+          CI_SHARD: ${{ matrix.slot3.pr.shard }}
+        run: bash scripts/verify pr shard
+      - id: slot3_integration
+        name: Run constituent 3 / ${{ matrix.slot3.name }}
+        if: always() && !cancelled() && matrix.slot3.kind == 'integration'
+        continue-on-error: true
+        env:
+          CI_INTEGRATION_ENABLED: ${{ needs.impact.outputs.enabled }}
+          CI_INTEGRATION_DEFAULT: "false"
+          CI_INTEGRATION_SLICE: ${{ matrix.slot3.integration.id }}
+          CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot3.integration) }}
+        run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
+      - name: Upload constituent 3 shard receipt
+        if: always() && !cancelled() && matrix.slot3.kind == 'pr'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-${{ matrix.slot3.pr.shard }}-${{ github.run_attempt }}
+          path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload constituent 3 integration receipt
+        if: always() && !cancelled() && matrix.slot3.kind == 'integration'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extended-integration-${{ matrix.slot3.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-integration-out/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Require every bundled constituent to succeed
+        if: always()
+        env:
+          SLOT1_KIND: ${{ matrix.slot1.kind }}
+          SLOT1_PR: ${{ steps.slot1_pr.outcome }}
+          SLOT1_INTEGRATION: ${{ steps.slot1_integration.outcome }}
+          SLOT2_KIND: ${{ matrix.slot2.kind }}
+          SLOT2_PR: ${{ steps.slot2_pr.outcome }}
+          SLOT2_INTEGRATION: ${{ steps.slot2_integration.outcome }}
+          SLOT3_KIND: ${{ matrix.slot3.kind }}
+          SLOT3_PR: ${{ steps.slot3_pr.outcome }}
+          SLOT3_INTEGRATION: ${{ steps.slot3_integration.outcome }}
+        run: |
+          status=0
+          check_slot() {
+            local kind="$1" pr="$2" integration="$3"
+            if [[ -z "$kind" ]]; then
+              [[ "$pr" == skipped && "$integration" == skipped ]] || status=1
+            elif [[ "$kind" == pr ]]; then
+              [[ "$pr" == success && "$integration" == skipped ]] || status=1
+            elif [[ "$kind" == integration ]]; then
+              [[ "$pr" == skipped && "$integration" == success ]] || status=1
+            else
+              status=1
+            fi
+          }
+          check_slot "$SLOT1_KIND" "$SLOT1_PR" "$SLOT1_INTEGRATION"
+          check_slot "$SLOT2_KIND" "$SLOT2_PR" "$SLOT2_INTEGRATION"
+          check_slot "$SLOT3_KIND" "$SLOT3_PR" "$SLOT3_INTEGRATION"
+          exit "$status"
+      - name: Remove disposable cache test scratch
+        if: always() && !cancelled()
+        run: bash scripts/ci-cache-post-cleanup.sh
+  build:
+    needs: features
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-debug0-jobs2
+      - run: bash scripts/verify pr build
+
+  features:
+    needs: lint
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: features-debug0-jobs2
+      - run: bash scripts/verify pr features
 
   installed-smoke:
-    needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-      - name: Install release binaries into an isolated root
-        run: |
-          install_root="$RUNNER_TEMP/contextdb-installed"
-          cargo install --locked --path crates/contextdb-cli --root "$install_root"
-          cargo install --locked --path crates/contextdb-server --root "$install_root" \
-            --features production-smoke-driver --bins
-      - name: Run installed release durability smoke
-        run: |
-          install_root="$RUNNER_TEMP/contextdb-installed"
-          CONTEXTDB_CLI="$install_root/bin/contextdb" \
-          CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" \
-          CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
-            scripts/installed-release-durable-sync-smoke.sh
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: installed-debug0-jobs2
+      - name: Install and run release durability smoke
+        env:
+          CI_INSTALL_ROOT: ${{ runner.temp }}/contextdb-installed
+        run: bash scripts/verify pr installed
 
   cross-compile:
-    needs: lint
+    needs: build
+    if: always() && !cancelled()
     strategy:
       matrix:
         include:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
+          # macOS targets set aside until CDB-153 (engine uses Linux-only pipe2/SOCK_CLOEXEC) is fixed
+    timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: ${{ matrix.target }}
+          key: cross-${{ matrix.target }}-debug0-jobs2
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-      - run: cargo build --release --target ${{ matrix.target }} -p contextdb-cli -p contextdb-server
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - run: bash scripts/verify pr cross
+        env:
+          CI_TARGET: ${{ matrix.target }}
+
+  required:
+    name: PR checks
+    if: always()
+    needs: [lint, test-bundles, build, features, installed-smoke, cross-compile, impact, integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require every check to succeed
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-required.py
+
+  development-binaries:
+    needs: [required]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev' && github.repository == 'context-graph-ai/contextdb'
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: write
+      actions: read

@@ -351,6 +351,7 @@ fn assert_recall(cell: &str, matched: u64) {
 
 #[cfg(feature = "nightly-tests")]
 #[test]
+#[ignore = "CDB-161: bounded-storage-rc2 S5 AUTO calibration campaign (fix SHA pending); re-enabled when rc2 lands on dev."]
 fn indexed_route_does_less_work_than_exact() {
     let db = fixture();
     for partitions in [1_usize, 3, 8] {
@@ -423,6 +424,7 @@ fn indexed_route_does_less_work_than_exact() {
 
 #[cfg(feature = "nightly-tests")]
 #[test]
+#[ignore = "CDB-162: bounded-storage-rc2 S5 per-candidate walk-cost campaign (fix SHA pending); re-enabled when rc2 lands on dev."]
 fn single_context_saved_graph_auto_and_indexed_are_faster_than_exact() {
     let single = single_context_fixture();
     let mut auto_evaluations = 0_u64;

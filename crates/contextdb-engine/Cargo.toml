@@ -115,14 +115,17 @@ name = "acceptance"
 path = "../../tests/acceptance.rs"
 
 [[test]]
+name = "acceptance_long_running"
+path = "../../tests/acceptance_long_running.rs"
+
+[[test]]
+name = "acceptance_sync"
+path = "../../tests/acceptance_sync.rs"
+
+[[test]]
 name = "bounded"
 path = "tests/bounded.rs"
 required-features = ["test-seams"]
-
-[[test]]
-name = "custody"
-path = "tests/custody.rs"
-required-features = ["test-seams", "iroh"]
 
 [[test]]
 name = "durable_public_api"
@@ -172,8 +175,8 @@ path = "tests/sync.rs"
 required-features = ["test-seams"]
 
 [[test]]
-name = "vector"
-path = "tests/vector.rs"
+name = "sync_schema_transactions"
+path = "tests/sync_schema_transactions.rs"
 required-features = ["test-seams"]
 
 [[test]]
@@ -379,3 +382,338 @@ required-features = ["iroh"]
 [[example]]
 name = "custody_scale"
 required-features = ["iroh", "test-seams"]
+
+[[test]]
+name = "custody_custody_inspection"
+path = "tests/custody_custody_inspection.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_custody_protocol"
+path = "tests/custody_custody_protocol.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_custody_purge_and_discard"
+path = "tests/custody_custody_purge_and_discard.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_delivery_manifest"
+path = "tests/custody_delivery_manifest.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_delivery_outcome"
+path = "tests/custody_delivery_outcome.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_schema_replay_bounded_contract"
+path = "tests/custody_schema_replay_bounded_contract.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_schema_replay_is_proportional_to_affected_tables"
+path = "tests/custody_schema_replay_is_proportional_to_affected_tables.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_schema_replay_identical_schema_does_no_artifact_work"
+path = "tests/custody_schema_replay_identical_schema_does_no_artifact_work.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_schema_replay_work_limited_to_affected_tables"
+path = "tests/custody_schema_replay_work_limited_to_affected_tables.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_server_resource_policy_contract_tests"
+path = "tests/custody_server_resource_policy_contract_tests.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_tenant_table_policy"
+path = "tests/custody_tenant_table_policy.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_the_whole_startup_schema_installs_in_one_transaction"
+path = "tests/custody_the_whole_startup_schema_installs_in_one_transaction.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "vector_declared_budget"
+path = "tests/vector_declared_budget.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_filtered_scope_is_charged_for_its_candidates"
+path = "tests/vector_a_filtered_scope_is_charged_for_its_candidates.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn"
+path = "tests/vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_find_decodes_only_the_rows_it_returns"
+path = "tests/vector_a_find_decodes_only_the_rows_it_returns.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_find_locks_its_serving_cache_once_per_page"
+path = "tests/vector_a_find_locks_its_serving_cache_once_per_page.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_find_names_only_the_pairs_it_asks_for"
+path = "tests/vector_a_find_names_only_the_pairs_it_asks_for.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_find_over_many_contexts_spends_one_search_budget"
+path = "tests/vector_a_find_over_many_contexts_spends_one_search_budget.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_graph_search_stays_inside_its_serving_cache"
+path = "tests/vector_a_graph_search_stays_inside_its_serving_cache.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_replaced_vector_cannot_end_a_tied_frontier"
+path = "tests/vector_a_replaced_vector_cannot_end_a_tied_frontier.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_serving_pages"
+path = "tests/vector_serving_pages.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_saved_graph_search_reports_its_distance_work"
+path = "tests/vector_a_saved_graph_search_reports_its_distance_work.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_a_tied_frontier_cannot_hide_a_smaller_row"
+path = "tests/vector_a_tied_frontier_cannot_hide_a_smaller_row.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_an_exact_search_authenticates_pages_not_every_vector"
+path = "tests/vector_an_exact_search_authenticates_pages_not_every_vector.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_an_exhaustive_find_streams_bodies_it_cannot_hold"
+path = "tests/vector_an_exhaustive_find_streams_bodies_it_cannot_hold.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_auto_chooses_the_cheaper_route_for_each_partition"
+path = "tests/vector_auto_chooses_the_cheaper_route_for_each_partition.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_auto_decides_the_route_once_for_the_whole_scope"
+path = "tests/vector_auto_decides_the_route_once_for_the_whole_scope.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_auto_pays_what_indexed_pays"
+path = "tests/vector_auto_pays_what_indexed_pays.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_equal_distance_rows_keep_canonical_order_across_contexts"
+path = "tests/vector_equal_distance_rows_keep_canonical_order_across_contexts.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph"
+path = "tests/vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_graph_build_distance_evaluations_stay_under_the_ratchet"
+path = "tests/vector_graph_build_distance_evaluations_stay_under_the_ratchet.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_graph_route_profile_quality"
+path = "tests/vector_graph_route_profile_quality.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_indexed_route_does_less_work_than_exact"
+path = "tests/vector_indexed_route_does_less_work_than_exact.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_multi_partition_union_recovers_nearest_rows"
+path = "tests/vector_multi_partition_union_recovers_nearest_rows.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_named_vector_planner_tests"
+path = "tests/vector_named_vector_planner_tests.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_one_search_covers_every_layer_on_both_routes"
+path = "tests/vector_one_search_covers_every_layer_on_both_routes.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_quantized"
+path = "tests/vector_quantized.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_retained_indexed_rows"
+path = "tests/vector_retained_indexed_rows.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_row_delete_and_guards_honor_vector_columns"
+path = "tests/vector_row_delete_and_guards_honor_vector_columns.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_the_owner_doors_run_one_search_over_every_layer"
+path = "tests/vector_the_owner_doors_run_one_search_over_every_layer.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_delete_only_journal_progress_contract"
+path = "tests/vector_delete_only_journal_progress_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_exclusion_persistence_tests"
+path = "tests/vector_exclusion_persistence_tests.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_generation"
+path = "tests/vector_generation.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_held_out_native_reference"
+path = "tests/vector_held_out_native_reference.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_inspection_explain_truth_contract"
+path = "tests/vector_inspection_explain_truth_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_lazy"
+path = "tests/vector_lazy.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_maintained_lifecycle_contract"
+path = "tests/vector_maintained_lifecycle_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_memory_ownership_reconciliation_contract"
+path = "tests/vector_memory_ownership_reconciliation_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_operation_observations"
+path = "tests/vector_operation_observations.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_partition"
+path = "tests/vector_partition.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_policy"
+path = "tests/vector_policy.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_rank_policy_exact_audits_the_whole_table"
+path = "tests/vector_rank_policy_exact_audits_the_whole_table.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_received_generation_invalidation_contract"
+path = "tests/vector_received_generation_invalidation_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_resource_maintenance_contract"
+path = "tests/vector_resource_maintenance_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_schema"
+path = "tests/vector_schema.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_search_mode_bounded_contract"
+path = "tests/vector_search_mode_bounded_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_serving_merge_contract"
+path = "tests/vector_serving_merge_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_snapshot_frontier_completeness_contract"
+path = "tests/vector_snapshot_frontier_completeness_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_tail_transaction_contract"
+path = "tests/vector_tail_transaction_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_transaction_filter_snapshot_truth_contract"
+path = "tests/vector_transaction_filter_snapshot_truth_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_where_one_partition_spends_its_find"
+path = "tests/vector_where_one_partition_spends_its_find.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_writer_residency_attribution"
+path = "tests/vector_writer_residency_attribution.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_graph_recall_5000_anisotropic_per_context"
+path = "tests/vector_graph_recall_5000_anisotropic_per_context.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_graph_recall_5001_topic_clusters_per_context"
+path = "tests/vector_graph_recall_5001_topic_clusters_per_context.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_graph_recall_50000_isotropic_per_context"
+path = "tests/vector_graph_recall_50000_isotropic_per_context.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "vector_graph_recall_50001_anisotropic_per_context"
+path = "tests/vector_graph_recall_50001_anisotropic_per_context.rs"
+required-features = ["test-seams"]

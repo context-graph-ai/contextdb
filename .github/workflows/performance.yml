@@ -1,0 +1,44 @@
+name: Performance measurement (manual guide)
+
+# Performance measurement is MANUAL today. This workflow runs no benchmark,
+# checks out no source, executes no repository code and uploads no artifact.
+# It exists so the performance path keeps a permanent, findable name and points
+# to the single home for the manual journey: docs/performance/README.md.
+#
+# TODO (owner-only, not implemented): a dedicated self-hosted runner on an
+# exclusive machine, registered by the owner, with dispatch restricted to the
+# owner, running one exact reviewed commit under one exclusive target directory
+# and resource envelope, with publication of a public summary kept as a separate
+# explicit step. Not an existing capability: `scripts/verify performance run`
+# refuses whenever CI or GITHUB_ACTIONS is set, so runner admission, resource
+# isolation and security controls are still to be built. Until the owner
+# authorizes and builds that, do not add a self-hosted runner, secrets, write
+# permissions, fork execution or a schedule here, and do not make this a
+# required check.
+#
+# DORMANT PLACEHOLDER: this workflow cannot run today. Its only active trigger
+# is a push filter that ignores every branch and every tag, so no push, tag,
+# pull request, schedule or dispatch ever starts it and it never reports a
+# status. Enabling it later is owner-controlled and needs the actual runner
+# admission, resource isolation, security controls and measurement steps
+# described above; changing `runs-on` alone is not enough.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches-ignore: ['**']
+    tags-ignore: ['**']
+  # TODO (owner-controlled future enablement): uncomment only once the
+  # admission, isolation, security and execution work above exists.
+  # workflow_dispatch:
+
+jobs:
+  manual-performance-guide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Link the manual performance journey (no measurement)
+        run: |
+          echo 'No measurement ran and this is not a performance pass; the manual journey is in docs/performance/README.md.' | tee -a "$GITHUB_STEP_SUMMARY"

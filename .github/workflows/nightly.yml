@@ -1,27 +1,19 @@
 name: Nightly
 
-# Nightly test tier. Stress/journey tests re-tiered out of the default gate are marked
-# `#[cfg(feature = "nightly-tests")]` and build/run only here. This deliberately does
-# NOT use `--include-ignored`: the tree carries `#[ignore]` tests that must stay skipped
-# everywhere (known-failing quarantined, platform- and corpus-gated).
+# One full-suite producer per schedule/manual trigger. PRs call only additional
+# nightly feature fixtures on their own SHA; default PR shards stay in ci.yml.
 on:
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-  CARGO_INCREMENTAL: 0
+permissions:
+  contents: read
 
 jobs:
   full-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      - run: cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
-      - run: cargo test -p contextdb-engine --features nightly-tests
-      - run: cargo test -p contextdb-engine --features nightly-tests --release --test acceptance
+    uses: ./.github/workflows/integration.yml
+    with:
+      enabled: true
+      run_default: true
+      gate_mode: full

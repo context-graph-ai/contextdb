@@ -40,16 +40,150 @@ fn owner_options(runtime_dir: PathBuf, test_hooks: OwnerReadTestHooks) -> Databa
     }
 }
 
-fn owner_thread_count() -> usize {
-    std::fs::read_dir("/proc/self/task")
+fn task_file(path: &Path) -> Option<String> {
+    task_file_result(std::fs::read_to_string(path), path)
+}
+
+fn task_file_result(result: std::io::Result<String>, path: &Path) -> Option<String> {
+    match result {
+        Ok(contents) => Some(contents),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            None
+        }
+        Err(error) => panic!("read Linux task file {}: {error}", path.display()),
+    }
+}
+
+fn task_is_exiting(stat: &str) -> bool {
+    // proc_pid_stat(5) field 9 is the kernel flags, after the parenthesized comm.
+    // Linux v6.17 include/linux/sched.h defines PF_EXITING as 0x00000004.
+    // A joined thread can remain visible during kernel exit; it is no longer live work.
+    let (_, fields) = stat
+        .rsplit_once(')')
+        .expect("Linux task stat has a closing comm parenthesis");
+    let flags = fields
+        .split_whitespace()
+        .nth(6)
+        .expect("Linux task stat has field 9 flags")
+        .parse::<u64>()
+        .expect("Linux task stat flags are an unsigned decimal integer");
+    flags & 0x00000004 != 0
+}
+
+fn owner_thread_count_in(tasks: &Path) -> usize {
+    std::fs::read_dir(tasks)
         .expect("read this process's Linux thread directory")
-        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.expect("read a Linux task directory entry"))
         .filter(|entry| {
-            std::fs::read_to_string(entry.path().join("comm"))
-                .ok()
+            let path = entry.path();
+            task_file(&path.join("comm"))
                 .is_some_and(|comm| comm.trim().starts_with("contextdb-owner"))
+                && task_file(&path.join("stat")).is_some_and(|stat| !task_is_exiting(&stat))
         })
         .count()
+}
+
+fn owner_thread_count() -> usize {
+    owner_thread_count_in(Path::new("/proc/self/task"))
+}
+
+#[test]
+fn census_counts_a_live_named_owner_thread() {
+    let baseline = owner_thread_count();
+    let (ready, started) = mpsc::channel();
+    let (release, wait) = mpsc::channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name("contextdb-owner-census".to_owned())
+        .spawn(move || {
+            ready.send(()).expect("announce live owner thread");
+            let _ = wait.recv();
+        })
+        .expect("spawn a task-scoped live owner thread");
+    started
+        .recv_timeout(EXIT_WAIT)
+        .expect("owner thread is live");
+    let live_count = owner_thread_count();
+    drop(release);
+    thread.join().expect("join the task-scoped owner thread");
+    assert_eq!(live_count, baseline + 1);
+}
+
+#[test]
+fn census_distinguishes_kernel_exit_and_rejects_malformed_flags() {
+    let tasks = tempfile::tempdir().expect("task-scoped synthetic proc directory");
+    let task = tasks.path().join("1");
+    std::fs::create_dir(&task).unwrap();
+    std::fs::write(task.join("comm"), "contextdb-owner\n").unwrap();
+    for (state, flags, expected) in [("R", "4194380", 0), ("R", "4194376", 1), ("Z", "0", 1)] {
+        std::fs::write(
+            task.join("stat"),
+            format!("1 (contextdb-owner (with spaces)) {state} 2 3 4 0 -1 {flags} 0\n"),
+        )
+        .unwrap();
+        assert_eq!(owner_thread_count_in(tasks.path()), expected);
+    }
+    for malformed in [
+        "1 (contextdb-owner) R 2 3 4 0 -1 invalid 0",
+        "1 (contextdb-owner) R 2 3 4 0 -1 -4 0",
+        "1 (contextdb-owner) R 2 3 4 0 -1 18446744073709551616 0",
+        "1 (contextdb-owner) R 2 3",
+        "1 contextdb-owner R 2 3 4 0 -1 4",
+    ] {
+        std::fs::write(task.join("stat"), malformed).unwrap();
+        assert!(std::panic::catch_unwind(|| owner_thread_count_in(tasks.path())).is_err());
+    }
+}
+
+#[test]
+fn census_allows_disappeared_tasks_but_rejects_other_io_errors() {
+    let tasks = tempfile::tempdir().expect("task-scoped synthetic proc directory");
+    let task = tasks.path().join("1");
+    std::fs::create_dir(&task).unwrap();
+    assert_eq!(owner_thread_count_in(tasks.path()), 0);
+    std::fs::write(task.join("comm"), "contextdb-owner\n").unwrap();
+    assert_eq!(owner_thread_count_in(tasks.path()), 0);
+    std::fs::create_dir(task.join("stat")).unwrap();
+    assert!(std::panic::catch_unwind(|| owner_thread_count_in(tasks.path())).is_err());
+    std::fs::remove_file(task.join("comm")).unwrap();
+    std::fs::create_dir(task.join("comm")).unwrap();
+    assert!(std::panic::catch_unwind(|| owner_thread_count_in(tasks.path())).is_err());
+}
+
+#[test]
+fn census_accepts_enoent_and_esrch_but_panics_on_other_read_errors() {
+    let path = Path::new("/proc/self/task/vanished/comm");
+    assert_eq!(
+        task_file_result(Ok("contextdb-owner\n".to_owned()), path),
+        Some("contextdb-owner\n".to_owned())
+    );
+    for code in [libc::ENOENT, libc::ESRCH] {
+        assert_eq!(
+            task_file_result(Err(std::io::Error::from_raw_os_error(code)), path),
+            None
+        );
+    }
+    for code in [libc::EISDIR, libc::EACCES, libc::EIO, libc::EINVAL] {
+        let panic = std::panic::catch_unwind(|| {
+            task_file_result(Err(std::io::Error::from_raw_os_error(code)), path)
+        })
+        .expect_err("non-vanished task read errors must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("task read panic has path context");
+        assert!(message.contains(&path.display().to_string()));
+    }
+    assert!(
+        std::panic::catch_unwind(|| {
+            task_file_result(
+                Err(std::io::Error::other("unexpected task read error")),
+                path,
+            )
+        })
+        .is_err()
+    );
 }
 
 fn resident_kib() -> u64 {

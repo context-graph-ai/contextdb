@@ -114,6 +114,12 @@ pass before any commit, release, or "done" claim. Read the disk and single-build
 `cargo test --workspace`. Narrower suites while iterating:
 `cargo test -p contextdb-engine --test acceptance`, `--test integration`, `--test sql_surface`.
 
+How CI is organised — its paths, each PR check, and the local `bash scripts/verify` command
+behind each check — is in [`.github/CI.md`](.github/CI.md). If you edit anything under
+`.github/` or a CI script (`scripts/verify`, `scripts/ci-*`), also read
+[`.github/AGENTS.md`](.github/AGENTS.md); its rules cover those scripts even though they live
+outside `.github/`.
+
 ### Where a change lives
 
 Describe the capability, then go to the crate that owns it — do not go looking by filename.

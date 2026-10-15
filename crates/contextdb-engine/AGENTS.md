@@ -155,7 +155,7 @@ Paths below are relative to this crate unless they start with `crates/` or `../.
 ```bash
 cargo test -p contextdb-engine --lib
 cargo test -p contextdb-engine --features test-seams --test sql_surface
-cargo test -p contextdb-engine --features test-seams,iroh --test sync
+cargo test -p contextdb-engine --features test-seams,iroh --test sync --test sync_schema_transactions
 ```
 
 Tests group under `tests/*.rs`; targets using private observation hooks need `test-seams`.

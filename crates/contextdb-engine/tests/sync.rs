@@ -1,20 +1,7 @@
-/// `--exact` expects a module-qualified name without the integration-test
-/// crate prefix printed by `module_path!()`.
-#[cfg(unix)]
-pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
-    match module_path.split_once("::") {
-        Some((_, rest)) => format!("{rest}::{fn_name}"),
-        None => fn_name.to_string(),
-    }
-}
-
 #[path = "sync/a_received_drop_of_an_edge_table_takes_its_links.rs"]
 mod a_received_drop_of_an_edge_table_takes_its_links;
 #[path = "sync/a_received_drop_retires_its_change_log_identity.rs"]
 mod a_received_drop_retires_its_change_log_identity;
-#[cfg(unix)]
-#[path = "sync/a_received_schema_transaction_never_publishes_a_prefix.rs"]
-mod a_received_schema_transaction_never_publishes_a_prefix;
 #[path = "sync/policy_refusal_outcome_and_replay.rs"]
 mod policy_refusal_outcome_and_replay;
 #[path = "sync/pull_page_filters_hub_bookkeeping.rs"]

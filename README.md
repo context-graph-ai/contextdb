@@ -9,7 +9,7 @@
 
 # contextdb
 
-An embedded database for agentic memory systems. Relational storage, graph traversal, and vector similarity search under unified MVCC transactions — in a single file, in a single process. Every agent, device, or service runs its own contextdb. They sync bidirectionally through a central server by dial-by-key — reaching it through its own cryptographic identity, no broker to install — knowledge learned by one becomes available to all, with per-table conflict resolution. No port forwarding, no VPN — a node behind NAT dials outbound, and machines on one LAN sync with zero external infrastructure.
+An embedded database for agentic memory systems. Relational storage, graph traversal, and vector similarity search under unified MVCC transactions — in a single file, in a single process. Every agent, device, or service runs its own contextdb, and each one works standalone. Instances sync bidirectionally with per-table conflict resolution, so knowledge learned by one becomes available to all: machines on one LAN sync over [iroh](https://www.iroh.com/) with no server setup, and how you wire production (including an optional SyncServer) is your choice. No port forwarding, no VPN — a node behind NAT dials outbound.
 
 If you're building agent memory today, you're probably stitching together SQLite for state, a vector database for embeddings, and application code for graph traversal. contextdb replaces all three — and adds **enforceable policy constraints** (state machines, DAG enforcement, cascading propagation) that the database guarantees, not application code.
 
@@ -28,7 +28,9 @@ SQL, `<=>`, and `GRAPH_TABLE ... MATCH` follow existing conventions — the comp
 
 **Language support:** contextdb is a Rust library and CLI today. Python and TypeScript bindings are on the roadmap — contributions welcome.
 
-**Website:** [contextdb.tech](https://contextdb.tech) · **Docs:** [contextdb.tech/docs](https://contextdb.tech/docs/)
+**Website:** [contextdb.tech](https://contextdb.tech) · **Docs:** [contextdb.tech/docs](https://contextdb.tech/docs/) · **How it works:** [contextdb.tech/how-it-works](https://contextdb.tech/how-it-works)
+
+The website's `/docs/` opens the development documentation, `/docs/dev/` selects development explicitly, and `/docs/releases/<version>/` selects a release.
 
 See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or jump to [Getting Started](docs/getting-started.md) to try it in 2 minutes.
 
@@ -183,6 +185,11 @@ serde_json = "1"
 
 ## Install
 
+For packaged binaries and the current development-download status, see
+[Downloads](docs/download.md). The permanent
+[latest development download](https://github.com/context-graph-ai/contextdb/releases/tag/dev-latest)
+uses stable filenames; availability and required verification are in that guide.
+
 ```bash
 # Install the CLI
 cargo install contextdb-cli
@@ -274,7 +281,7 @@ per-column storage footprint; omitted quantization defaults to `F32`.
 
 **Enforceable policy constraints** — `IMMUTABLE` tables, `STATE MACHINE` column transitions, `DAG` cycle prevention, single-column and composite foreign keys, `RETAIN` with TTL expiry, `PROPAGATE` for cascading state changes along edges and foreign keys. Enforced by the database — no application code can bypass them.
 
-**Collaborative sync** — Every contextdb instance is a full read-write database. Each runs a SyncClient that syncs bidirectionally with a central SyncServer by dial-by-key: the server is reached through its own cryptographic identity (its enrollment ticket), not a broker address — nothing to install or expose. Machines on one LAN sync with zero external infrastructure and no internet, over direct connections; the default configuration contacts no third-party service. Crossing networks, the operator either self-hosts a small stateless relay or opts into the free public relays — connectivity is never a paid feature. Offline-first: each database works independently, syncing changesets when connected. Conflict policy and travel direction are declared on the table; see [`docs/query-language.md`](docs/query-language.md#table-options) and the recipe in [`skills/sync`](skills/sync/SKILL.md#7-a-delete-that-stays-deleted--across-sync-and-restart). The server runs the same contextdb engine — self-host it, or point your databases at a hosted server.
+**Collaborative sync** — Every contextdb instance is a full read-write database. Each works standalone, and instances sync bidirectionally by dial-by-key: a peer is reached through its own cryptographic identity (its enrollment ticket), not a broker address — nothing to install or expose. Machines on one LAN sync over iroh with no server setup, no external infrastructure and no internet, over direct connections; the default configuration contacts no third-party service. Crossing networks, the operator either self-hosts a small stateless relay or opts into the free public relays — connectivity is never a paid feature. Offline-first: each database works independently, syncing changesets when connected. Conflict policy and travel direction are declared on the table; see [`docs/query-language.md`](docs/query-language.md#table-options) and the recipe in [`skills/sync`](skills/sync/SKILL.md#7-a-delete-that-stays-deleted--across-sync-and-restart). For production, topology is your choice: an optional SyncServer (the same contextdb engine) can act as a central hub — self-host it, or point your databases at a hosted server — but it is never a prerequisite.
 
 **Persistence** — Single-file storage via redb. Crash-safe. Compute/storage separated via the `WriteSetApplicator` trait (local redb for open source, object store for enterprise).
 

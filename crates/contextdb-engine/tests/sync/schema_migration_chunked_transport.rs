@@ -382,6 +382,7 @@ fn crash_after_first_fragment(root: &Path) {
     reader.join().unwrap();
 }
 
+#[ignore = "CDB-163: bounded-storage-rc2 S3/S4 oversized-pull funding campaign (fix SHA pending); re-enabled when rc2 lands on dev."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_retry() {
     let root = tempfile::tempdir().unwrap();

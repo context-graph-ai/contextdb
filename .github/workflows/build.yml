@@ -1,0 +1,104 @@
+name: Build development binaries
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact current dev SHA with successful same-repository push CI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BUILD_SHA: ${{ github.sha }}
+  WORKFLOW_SHA: ${{ github.workflow_sha }}
+
+jobs:
+  qualify:
+    if: >-
+      github.repository == 'context-graph-ai/contextdb' &&
+      github.ref == 'refs/heads/dev' && github.workflow_sha == github.sha &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Require exact current dev source, successful push CI and aggregate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-build-control.py guard
+      - name: Offline development delivery controls
+        run: python3 scripts/ci-build-tests.py
+
+  build:
+    needs: [qualify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.BUILD_SHA }}
+          persist-credentials: false
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ''
+          target: x86_64-unknown-linux-gnu
+      - name: Build, package and smoke unpacked native binaries
+        env:
+          BUILD_ASSETS: ${{ runner.temp }}/development-assets
+        run: bash scripts/ci-build-package.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: contextdb-development-linux-x86_64
+          path: ${{ runner.temp }}/development-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [qualify, build]
+    # Only qualified, successfully built deliveries enter the publication queue.
+    concurrency:
+      group: contextdb-dev-binaries-publish
+      cancel-in-progress: false
+      queue: max
+    if: >-
+      github.repository == 'context-graph-ai/contextdb' &&
+      github.ref == 'refs/heads/dev' && github.workflow_sha == github.sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: contextdb-development-linux-x86_64
+          path: ${{ runner.temp }}/development-assets
+      - name: Validate assets and source again, then replace rolling prerelease assets
+        env:
+          BUILD_ASSETS: ${{ runner.temp }}/development-assets
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-build-control.py publish

@@ -480,6 +480,7 @@ pub struct Background {
     child: Child,
     stdin: Option<ChildStdin>,
     transcript: Arc<(Mutex<String>, Condvar)>,
+    output_readers: Vec<std::thread::JoinHandle<()>>,
     pub path: PathBuf,
 }
 
@@ -495,6 +496,7 @@ pub fn background(args: &[&str]) -> Background {
 
     let stdin = child.stdin.take().expect("background stdin");
     let transcript = Arc::new((Mutex::new(String::new()), Condvar::new()));
+    let mut output_readers = Vec::new();
     for stream in [
         child.stdout.take().map(StreamHandle::Out),
         child.stderr.take().map(StreamHandle::Err),
@@ -503,7 +505,7 @@ pub fn background(args: &[&str]) -> Background {
     .flatten()
     {
         let sink = Arc::clone(&transcript);
-        std::thread::spawn(move || {
+        output_readers.push(std::thread::spawn(move || {
             let mut reader: Box<dyn Read + Send> = match stream {
                 StreamHandle::Out(out) => Box::new(out),
                 StreamHandle::Err(err) => Box::new(err),
@@ -523,13 +525,14 @@ pub fn background(args: &[&str]) -> Background {
             }
             let (_, signal) = &*sink;
             signal.notify_all();
-        });
+        }));
     }
 
     Background {
         child,
         stdin: Some(stdin),
         transcript,
+        output_readers,
         path: PathBuf::new(),
     }
 }
@@ -600,6 +603,11 @@ impl Background {
     pub fn finish(mut self) -> (Option<i32>, String) {
         self.stdin.take();
         let status = self.child.wait().expect("wait for the background session");
+        // Process exit closes its pipes, but the reader threads may still be
+        // draining them. Collect both streams before asserting on the output.
+        for reader in self.output_readers.drain(..) {
+            reader.join().expect("collect background session output");
+        }
         (status.code(), self.transcript())
     }
 
