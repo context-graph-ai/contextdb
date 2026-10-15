@@ -3944,7 +3944,7 @@ impl Database {
         }
         let mut count = ByteCount(0);
         bincode::serde::encode_into_std_write(
-            &next_action_id,
+            next_action_id,
             &mut count,
             bincode::config::standard(),
         )
@@ -3958,7 +3958,7 @@ impl Database {
         // original admission. Neither key nor value exists before admission.
         let mut encoded = Vec::with_capacity(count.0);
         bincode::serde::encode_into_std_write(
-            &next_action_id,
+            next_action_id,
             &mut encoded,
             bincode::config::standard(),
         )
@@ -4760,7 +4760,7 @@ impl OwnedEventStageRegistration {
 impl Drop for OwnedEventStageRegistration {
     fn drop(&mut self) {
         if self.armed {
-            let retired = self.storage.take_owned_registered_stage(&self);
+            let retired = self.storage.take_owned_registered_stage(self);
             drop(retired);
         }
     }
@@ -4801,6 +4801,10 @@ impl Clone for OwnedDiscardAppendHandle {
         }
     }
 }
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing the ordinary publication would allocate outside its admission"
+)]
 pub(super) enum OwnedAppendCustody {
     Ordinary(OwnedSinkQueuePublication),
     Discard(OwnedDiscardAppendHandle),
@@ -4835,12 +4839,12 @@ fn cancel_owned_slots_locked(map: &mut OwnedQueueMap, slots: &mut [OwnedQueueApp
 }
 impl Drop for OwnedSinkQueuePublication {
     fn drop(&mut self) {
-        if self.state == OwnedEscrowState::Active {
-            if let Some(storage) = self.storage.upgrade() {
-                let mut queues = storage.data().queues.lock();
-                cancel_owned_slots_locked(&mut queues, &mut self.slots);
-                drop(queues);
-            }
+        if self.state == OwnedEscrowState::Active
+            && let Some(storage) = self.storage.upgrade()
+        {
+            let mut queues = storage.data().queues.lock();
+            cancel_owned_slots_locked(&mut queues, &mut self.slots);
+            drop(queues);
         }
         // Fields destroy retired bodies before their invoices; drop lease only
         // after cancellation releases the queue lock.
@@ -5073,12 +5077,12 @@ impl OwnedEventBusHandle {
             }
             for plan in &mut plans.body {
                 if let Some(queue) = queues.values.get_mut(&plan.sink) {
-                    if let Some(replacement) = &mut plan.replacement {
-                        if replacement.0.capacity() > queue.entries.capacity() {
-                            replacement.0.append(&mut queue.entries);
-                            std::mem::swap(&mut queue.entries, &mut replacement.0);
-                            std::mem::swap(&mut queue.buffer, &mut replacement.1);
-                        }
+                    if let Some(replacement) = &mut plan.replacement
+                        && replacement.0.capacity() > queue.entries.capacity()
+                    {
+                        replacement.0.append(&mut queue.entries);
+                        std::mem::swap(&mut queue.entries, &mut replacement.0);
+                        std::mem::swap(&mut queue.buffer, &mut replacement.1);
                     }
                     queue.pending += plan.count;
                     queue.reservations += 1;
@@ -5234,10 +5238,10 @@ struct OwnedPurgeAppendTransfer {
 impl Drop for OwnedPurgeAppendTransfer {
     fn drop(&mut self) {
         let mut token = self.handle.control.get().token.lock();
-        if let Some(append) = token.as_mut() {
-            if append.state == OwnedEscrowState::Frozen {
-                append.state = OwnedEscrowState::Suspended;
-            }
+        if let Some(append) = token.as_mut()
+            && append.state == OwnedEscrowState::Frozen
+        {
+            append.state = OwnedEscrowState::Suspended;
         }
         // A published Active token keeps its transferred lease and identity.
     }
@@ -5461,13 +5465,11 @@ impl OwnedEventBusHandle {
         &self,
         mut publication: OwnedPurgeQueuePublication,
     ) {
-        let retired = {
+        {
             let mut queues = self.data().queues.lock();
             std::mem::swap(&mut *queues, &mut publication.queues);
             // The old paid map is now owned by publication, outside the guard.
-            ()
-        };
-        let _ = retired;
+        }
         if let Some(transfer) = &publication.transfer {
             let mut append = transfer
                 .handle
@@ -6058,18 +6060,16 @@ fn owned_context_scope_allows(
     gate: &EventGateSnapshot,
     values: &HashMap<String, Value>,
 ) -> bool {
-    if let (Some(contexts), Some(column)) = (&access.contexts, &gate.context_column) {
-        if !matches!(values.get(column), Some(Value::Uuid(context)) if contexts.contains(&ContextId::new(*context)))
-        {
-            return false;
-        }
+    if let (Some(contexts), Some(column)) = (&access.contexts, &gate.context_column)
+        && !matches!(values.get(column), Some(Value::Uuid(context)) if contexts.contains(&ContextId::new(*context)))
+    {
+        return false;
     }
-    if let (Some(labels), Some(scope)) = (&access.scope_labels, &gate.scope_read) {
-        if !matches!(values.get(&scope.column), Some(Value::Text(label))
+    if let (Some(labels), Some(scope)) = (&access.scope_labels, &gate.scope_read)
+        && !matches!(values.get(&scope.column), Some(Value::Text(label))
             if scope.read_labels.iter().any(|read| read == label) && labels.iter().any(|allowed| allowed.0 == *label))
-        {
-            return false;
-        }
+    {
+        return false;
     }
     true
 }
@@ -6264,6 +6264,10 @@ impl OwnedNativeQueueFailure {
             None => Ok(value),
         }
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "the failure carries its own funded reservations; boxing it would allocate outside them"
+    )]
     fn finish<T>(mut self, result: Result<T>) -> std::result::Result<T, Self> {
         match result {
             Err(error) => {
@@ -6651,12 +6655,12 @@ impl OwnedEventBusHandle {
             retired.body = state.checked_out.take(&lookup.key);
             if retired.body.is_some() {
                 let mut allocation = self.data().checkout_allocation.lock();
-                if let Some(allocation) = &mut *allocation {
-                    if let Some(index) = allocation.keys.iter().position(|credit| {
+                if let Some(allocation) = &mut *allocation
+                    && let Some(index) = allocation.keys.iter().position(|credit| {
                         credit.id == lookup.key.1 && credit.name.body == lookup.key.0
-                    }) {
-                        retired.credit = Some(allocation.keys.swap_remove(index));
-                    }
+                    })
+                {
+                    retired.credit = Some(allocation.keys.swap_remove(index));
                 }
             }
         }
@@ -6683,6 +6687,10 @@ impl OwnedEventBusHandle {
         state.retried += retried;
         state.uncertain += uncertain;
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "the failure carries its own funded reservations; boxing it would allocate outside them"
+    )]
     pub(super) fn transition_owned_sink_attempt<P: OwnedSinkQueuePersistence>(
         &self,
         persistence: &P,
@@ -6836,6 +6844,10 @@ impl OwnedEventBusHandle {
         });
         failure.finish(result)
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "the failure carries its own funded reservations; boxing it would allocate outside them"
+    )]
     pub(super) fn ack_owned_front_entries<P: OwnedSinkQueuePersistence>(
         &self,
         persistence: &P,
@@ -7680,7 +7692,9 @@ impl OwnedEventBusHandle {
             } else {
                 let (key, credit) = copy_owned_native_string(original, name)?;
                 let key = OwnedEventBody { body: key, credit };
-                let (depth, newest_id) = extent.expect("read image extent");
+                let Some((depth, newest_id)) = extent else {
+                    unreachable!("read image extent")
+                };
                 image.next_action_id = image.next_action_id.max(newest_id.saturating_add(1));
                 image.unloaded.insert(key.body, depth);
                 image.unloaded_credit.keys.push(key.credit);
