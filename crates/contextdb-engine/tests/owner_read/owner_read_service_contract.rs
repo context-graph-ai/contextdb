@@ -3702,8 +3702,10 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         assert_simple_refusal(&closed_cursor_request, ReadFailureKind::OwnerNotServing);
         assert_eq!(harness.service.resources(), while_ignoring);
     }
+    // A drain that missed its deadline keeps the channel owned, admitting
+    // nothing, until a later close finishes it.
     #[cfg(unix)]
-    assert!(!harness.service.channel_path().exists());
+    assert!(harness.service.channel_path().exists());
 
     harness
         .database
@@ -3720,7 +3722,7 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
     #[cfg(unix)]
     {
         assert!(harness.service.channel_is_bound_for_test());
-        assert!(!harness.service.channel_path().exists());
+        assert!(harness.service.channel_path().exists());
     }
 
     handler.release();
@@ -3737,6 +3739,9 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         .service
         .shutdown_and_drain()
         .expect("retry succeeds after cancellation-ignoring handler releases");
+    // Admitted work has left, so the retried close removes the channel.
+    #[cfg(unix)]
+    assert!(!harness.service.channel_path().exists());
     assert_resources(&harness.service, baseline);
     harness
         .database

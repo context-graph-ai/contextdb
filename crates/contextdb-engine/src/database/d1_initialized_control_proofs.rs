@@ -649,7 +649,7 @@ pub(crate) fn mapped_rows_for_test() {
             drop(database);
             assert_eq!(
                 phase_seen.recv().unwrap(),
-                QuiescentStopPhase::ChannelWithdrawn
+                QuiescentStopPhase::AdmissionStopped
             );
             assert!(
                 matches!(service_gone.try_recv(), Err(mpsc::TryRecvError::Empty)),

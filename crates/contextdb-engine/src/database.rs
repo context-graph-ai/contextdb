@@ -98393,8 +98393,8 @@ pub(crate) fn returned_loader_rows_for_test() {
         let closer = if owner_drop {
             drop(database);
             assert_eq!(
-                phase_seen.recv().expect("owner drop withdraws channel"),
-                QuiescentStopPhase::ChannelWithdrawn
+                phase_seen.recv().expect("owner drop stops admission"),
+                QuiescentStopPhase::AdmissionStopped
             );
             assert!(
                 matches!(service_gone.try_recv(), Err(mpsc::TryRecvError::Empty)),
@@ -98411,7 +98411,7 @@ pub(crate) fn returned_loader_rows_for_test() {
             for expected in [
                 QuiescentStopPhase::WritesStopped,
                 QuiescentStopPhase::Published,
-                QuiescentStopPhase::ChannelWithdrawn,
+                QuiescentStopPhase::AdmissionStopped,
             ] {
                 assert_eq!(phase_seen.recv().expect("stop phase"), expected);
                 assert!(
@@ -98432,6 +98432,12 @@ pub(crate) fn returned_loader_rows_for_test() {
             b"held"
         );
         if let Some(closer) = closer {
+            // The channel comes down only after the admitted work has left.
+            assert_eq!(
+                phase_seen.recv().expect("channel removed after drain"),
+                QuiescentStopPhase::ChannelWithdrawn
+            );
+            resume_sent.send(()).expect("resume after channel removal");
             assert_eq!(
                 phase_seen.recv().expect("accepted read drained"),
                 QuiescentStopPhase::AcceptedDrained

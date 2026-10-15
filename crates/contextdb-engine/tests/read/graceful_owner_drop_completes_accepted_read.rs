@@ -113,7 +113,7 @@ fn graceful_close_publishes_quiescence_before_withdrawing_the_channel() {
     for expected in [
         QuiescentStopPhase::WritesStopped,
         QuiescentStopPhase::Published,
-        QuiescentStopPhase::ChannelWithdrawn,
+        QuiescentStopPhase::AdmissionStopped,
     ] {
         assert_eq!(phase_seen.recv().expect("stop phase"), expected);
         if expected == QuiescentStopPhase::WritesStopped {
@@ -155,6 +155,12 @@ fn graceful_close_publishes_quiescence_before_withdrawing_the_channel() {
             .expect("accepted read succeeds"),
         b"held"
     );
+    // The channel comes down only after the admitted work has left.
+    assert_eq!(
+        phase_seen.recv().expect("channel phase"),
+        QuiescentStopPhase::ChannelWithdrawn
+    );
+    resume_sent.send(()).expect("resume after channel removal");
     assert_eq!(
         phase_seen.recv().expect("drained phase"),
         QuiescentStopPhase::AcceptedDrained
