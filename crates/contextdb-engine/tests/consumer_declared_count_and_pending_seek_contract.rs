@@ -1022,3 +1022,53 @@ fn an_in_transaction_count_answers_its_own_snapshot_after_another_commit() {
     db.rollback(tx_a).unwrap();
     db.close().unwrap();
 }
+
+/// A staged row is under a counted key exactly when an index posting for it
+/// would be: the key's total order, in which `-0.0` and `0.0` are different
+/// keys. The transaction's served count is the count the same rows have once
+/// it commits. (The ordinary in-transaction scan applies SQL equality to
+/// staged rows instead, under which `-0.0 = 0.0`; that disagreement with the
+/// index's own keys predates this count and is printed, not asserted.)
+#[test]
+fn an_in_transaction_count_matches_float_keys_by_index_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("in-tx-float-key.redb"));
+    for statement in [
+        "CREATE TABLE scores (id UUID PRIMARY KEY, score FLOAT NOT NULL) SYNC OFF",
+        "CREATE INDEX idx_scores_score ON scores (score, id)",
+        "ALTER TABLE scores SET MAINTAIN COUNT (score)",
+    ] {
+        execute(&db, statement, &HashMap::new());
+    }
+    let insert = "INSERT INTO scores (id, score) VALUES ($id, $score)";
+    execute(
+        &db,
+        insert,
+        &params(&[("id", event_id(1)), ("score", Value::Float64(0.0))]),
+    );
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        insert,
+        &params(&[("id", event_id(2)), ("score", Value::Float64(-0.0))]),
+    )
+    .unwrap();
+    let zero = params(&[("score", Value::Float64(0.0))]);
+    let served = db
+        .execute_in_tx(tx, "SELECT COUNT(*) FROM scores WHERE score = $score", &zero)
+        .unwrap();
+    let ordinary = db
+        .execute_in_tx(tx, "SELECT COUNT(id) FROM scores WHERE score = $score", &zero)
+        .unwrap();
+    println!(
+        "in-tx float key count: served {:?} ({:?}), ordinary {:?}",
+        served.rows, served.trace.maintained_count, ordinary.rows
+    );
+    db.commit(tx).unwrap();
+    let committed = execute(&db, "SELECT COUNT(*) FROM scores WHERE score = $score", &zero);
+    assert_eq!(
+        served.rows, committed.rows,
+        "the served count keys staged rows the way the committed index does"
+    );
+    db.close().unwrap();
+}
