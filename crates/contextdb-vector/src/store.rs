@@ -10348,6 +10348,15 @@ type PreparedPruningColumn = (
     Vec<Option<RawVectorMembershipSummary>>,
 );
 
+/// See [`VectorColumnState::failed_partitions`].
+#[derive(Default)]
+struct FailedPartitions {
+    keys: std::collections::BTreeSet<VectorPartitionKey>,
+    /// A charge was refused, or the column is a replacement image: some
+    /// failing partition may be missing from `keys`.
+    incomplete: bool,
+}
+
 struct VectorColumnState {
     layout: RwLock<VectorIndexLayout>,
     partitions: RwLock<BTreeMap<VectorPartitionKey, Arc<IndexState>>>,
@@ -10369,6 +10378,10 @@ struct VectorColumnState {
     /// the live column it replaces) recounts instead and goes live when it
     /// is installed.
     derived: AtomicBool,
+    /// The partitions that have recorded a maintenance failure since they were
+    /// last rechecked: a superset of the ones failing now, so a policy recheck
+    /// visits only them. Its entries are charged to `directory_accounting`.
+    failed_partitions: Mutex<FailedPartitions>,
     /// Registration declares the owner of every resident registry/directory
     /// image, including memory stores. Preparation admits its retained bytes;
     /// DROP COLUMN/TABLE returns them once, independent of cache state.
@@ -10398,6 +10411,7 @@ impl VectorColumnState {
             limit_ledger: Arc::new(PartitionLimitLedger::default()),
             directory_tally: Arc::new(DirectoryTally::default()),
             derived: AtomicBool::new(true),
+            failed_partitions: Mutex::new(FailedPartitions::default()),
             registry_copy_bytes: AtomicUsize::new(0),
             directory_accounting: Mutex::new(RetainedMemoryCharge {
                 bytes: 0,
@@ -10420,6 +10434,9 @@ impl VectorColumnState {
         }
         column.derived.store(false, Ordering::SeqCst);
         *column.directory_tally.figures.lock() = DirectoryFigures::default();
+        // A replacement image can hold states that carry failures recorded
+        // on the column it replaces; its first recheck looks at every one.
+        column.failed_partitions.lock().incomplete = true;
         column
     }
 
@@ -10584,6 +10601,113 @@ impl VectorColumnState {
                 .iter()
                 .map(|(key, state)| (key.clone(), state.clone())),
         );
+        Ok(snapshots)
+    }
+
+    /// Charged size of one failed-partition entry.
+    fn failed_partition_entry_bytes(key: &VectorPartitionKey) -> usize {
+        key.estimated_bytes()
+            .saturating_add(std::mem::size_of::<VectorPartitionKey>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
+    }
+
+    /// Note that `key`'s partition recorded a maintenance failure. A charge the
+    /// column's owner refuses leaves the set incomplete, so the next recheck
+    /// looks at every partition instead of trusting it.
+    fn note_failed_partition(&self, key: &VectorPartitionKey) {
+        let mut failed = self.failed_partitions.lock();
+        if failed.incomplete || failed.keys.contains(key) {
+            return;
+        }
+        let bytes = Self::failed_partition_entry_bytes(key);
+        let mut retained = self.directory_accounting.lock();
+        if retained
+            .accountant
+            .try_allocate_for(
+                bytes,
+                "vector_index",
+                "record_partition_failure",
+                "Raise MEMORY_LIMIT to keep this partition's maintenance failure indexed.",
+            )
+            .is_err()
+        {
+            failed.incomplete = true;
+            return;
+        }
+        retained.bytes += bytes;
+        failed.keys.insert(key.clone());
+    }
+
+    /// Whether a recheck can find anything: some partition was noted as
+    /// failed, or the set is incomplete.
+    fn may_have_failed_partitions(&self) -> bool {
+        let failed = self.failed_partitions.lock();
+        failed.incomplete || !failed.keys.is_empty()
+    }
+
+    /// Drop `key` from the failed-partition set and return its charge.
+    fn forget_failed_partition(&self, key: &VectorPartitionKey) {
+        let mut failed = self.failed_partitions.lock();
+        if !failed.keys.remove(key) {
+            return;
+        }
+        let bytes = Self::failed_partition_entry_bytes(key);
+        let mut retained = self.directory_accounting.lock();
+        retained.accountant.release(bytes);
+        retained.bytes -= bytes;
+    }
+
+    /// The partitions a policy recheck must look at, under the caller's
+    /// admission: only the noted failed ones, or, when that set is
+    /// incomplete, every partition (the set restarts empty and the recheck
+    /// notes each failure it still finds). Noted keys whose partition is gone
+    /// are dropped here.
+    fn failure_recheck_snapshots(
+        &self,
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<Vec<(VectorPartitionKey, Arc<IndexState>)>> {
+        let keys = {
+            let mut failed = self.failed_partitions.lock();
+            if failed.incomplete {
+                let charged = failed
+                    .keys
+                    .iter()
+                    .map(Self::failed_partition_entry_bytes)
+                    .sum::<usize>();
+                failed.keys.clear();
+                failed.incomplete = false;
+                drop(failed);
+                if charged != 0 {
+                    let mut retained = self.directory_accounting.lock();
+                    retained.accountant.release(charged);
+                    retained.bytes -= charged;
+                }
+                return self.admitted_partition_snapshots(owner);
+            }
+            if failed.keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            let bytes = failed.keys.iter().fold(0usize, |bytes, key| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(VectorPartitionKey, Arc<IndexState>)>())
+                    .saturating_add(key.estimated_bytes())
+            });
+            owner.reserve(bytes)?;
+            failed.keys.iter().cloned().collect::<Vec<_>>()
+        };
+        let partitions = self.partitions.read();
+        let mut snapshots = Vec::with_capacity(keys.len());
+        let mut gone = Vec::new();
+        for key in keys {
+            match partitions.get(&key) {
+                Some(state) => snapshots.push((key, state.clone())),
+                None => gone.push(key),
+            }
+        }
+        drop(partitions);
+        for key in &gone {
+            self.forget_failed_partition(key);
+        }
         Ok(snapshots)
     }
 
@@ -13947,6 +14071,7 @@ impl VectorStore {
                             Err(error) => {
                                 let details = VectorMaintenanceFailureDetails::from_error(&error);
                                 state.record_maintenance_failure(details);
+                                column.note_failed_partition(&key);
                                 first_failure_details.get_or_insert(details);
                                 continue;
                             }
@@ -14024,6 +14149,7 @@ impl VectorStore {
                         self.try_partition_state(&partition.index, &partition.partition_key)
                     {
                         state.record_maintenance_failure(details);
+                        self.note_failed_partition(&partition.index, &partition.partition_key);
                     }
                     first_failure_details.get_or_insert(details);
                     continue;
@@ -14495,6 +14621,14 @@ impl VectorStore {
     /// partition maintenance failure the new layout no longer needs. Only the
     /// few partitions carrying a failure need a directory-derived recheck, and
     /// a concurrent retry cannot have its newer mark cleared by this one.
+    /// Note a recorded partition failure on the column that owns it now.
+    fn note_failed_partition(&self, index: &VectorIndexRef, key: &VectorPartitionKey) {
+        let column = self.registry.read().get(index).cloned();
+        if let Some(column) = column {
+            column.note_failed_partition(key);
+        }
+    }
+
     fn recheck_maintenance_failures_for_layout(
         &self,
         index: &VectorIndexRef,
@@ -14509,25 +14643,39 @@ impl VectorStore {
             if !still_current {
                 return Ok(());
             }
-            for (partition_key, state) in changed_column.admitted_partition_snapshots(owner)? {
+            for (partition_key, state) in changed_column.failure_recheck_snapshots(owner)? {
                 #[cfg(test)]
                 FAILURE_RECHECK_VISITS.with(|visits| visits.set(visits.get() + 1));
-                if state.is_historical_only() { continue; }
+                if state.is_historical_only() {
+                    if state.maintenance_failure_details().is_some() {
+                        changed_column.note_failed_partition(&partition_key);
+                    }
+                    continue;
+                }
                 self.with_partition_maintenance(index, &partition_key, || -> Result<()> {
-                    let Some(failure) = state.maintenance_failure_details() else {
-                        return Ok(());
-                    };
-                    debug_assert!(
-                        !HELD_BULK_WRITE_LOCKS
-                            .with(|held| held.borrow().contains(&self.id)),
-                        "declaration failure recheck cannot inspect raw vector directories under the store-wide write gate"
-                    );
-                    let info = Self::partition_info_snapshot(index, &partition_key, &state, layout, owner)?;
-                    if layout.maintenance_need(&info).is_none() {
-                        state.clear_maintenance_failure_if(failure);
+                    if let Some(failure) = state.maintenance_failure_details() {
+                        debug_assert!(
+                            !HELD_BULK_WRITE_LOCKS
+                                .with(|held| held.borrow().contains(&self.id)),
+                            "declaration failure recheck cannot inspect raw vector directories under the store-wide write gate"
+                        );
+                        let info = Self::partition_info_snapshot(index, &partition_key, &state, layout, owner)?;
+                        if layout.maintenance_need(&info).is_none() {
+                            state.clear_maintenance_failure_if(failure);
+                        }
                     }
                     Ok(())
                 })?;
+                // A failure recorded after the check above is noted again by
+                // its recorder, or here, so the set never loses one.
+                if state.maintenance_failure_details().is_some() {
+                    changed_column.note_failed_partition(&partition_key);
+                } else {
+                    changed_column.forget_failed_partition(&partition_key);
+                    if state.maintenance_failure_details().is_some() {
+                        changed_column.note_failed_partition(&partition_key);
+                    }
+                }
             }
             Ok(())
         })
@@ -14657,6 +14805,9 @@ impl VectorStore {
         published: &PublishedVectorPolicyLayout,
         owner: &mut VectorCopyAdmission,
     ) -> Result<()> {
+        if !published.column.may_have_failed_partitions() {
+            return Ok(());
+        }
         let layout = {
             let current = published.column.layout.read();
             owner.reserve(current.estimated_bytes())?;
@@ -16945,14 +17096,19 @@ impl VectorStore {
                 return false;
             }
             let partitions = column.partitions.read();
-            if !partitions
-                .values()
-                .any(|current| Arc::ptr_eq(current, expected_state))
-            {
+            let Some(expected_key) = partitions
+                .iter()
+                .find(|(_, current)| Arc::ptr_eq(current, expected_state))
+                .map(|(key, _)| key.clone())
+            else {
                 return false;
-            }
+            };
             if let Some(failure) = failure {
                 expected_state.record_maintenance_failure(failure);
+            }
+            drop(partitions);
+            if failure.is_some() {
+                column.note_failed_partition(&expected_key);
             }
             if let Some(quarantine) = quarantine {
                 expected_state.set_route_quarantine(quarantine);
@@ -21231,6 +21387,7 @@ impl VectorStore {
                 return Ok(());
             };
             state.record_maintenance_failure(details);
+            self.note_failed_partition(&partition.index, &partition.partition_key);
             Ok(())
         })
     }
