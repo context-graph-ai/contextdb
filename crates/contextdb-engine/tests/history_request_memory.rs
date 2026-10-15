@@ -2020,3 +2020,78 @@ fn lineage_authentication_scratch_is_admitted_before_copy() {
         ),
     }
 }
+
+/// The lineage authentication copy is reserved before it is made: when that
+/// one reservation is refused, the request fails typed at it and allocates no
+/// copy of the record; every other reservation is admitted normally.
+#[test]
+fn a_refused_lineage_scratch_reservation_copies_nothing() {
+    const KEY_BYTES: usize = 256 * 1024;
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    {
+        let database = Database::open(&path).expect("open the wide-key fixture");
+        database
+            .execute(
+                "CREATE TABLE wide (id TEXT PRIMARY KEY, body TEXT)",
+                &HashMap::new(),
+            )
+            .expect("declare a synced wide-key table");
+        let params = HashMap::from([(
+            "id".to_owned(),
+            contextdb_core::Value::Text("k".repeat(KEY_BYTES)),
+        )]);
+        database
+            .execute("INSERT INTO wide (id, body) VALUES ($id, 'body')", &params)
+            .expect("insert the wide-key row");
+        database
+            .execute("DELETE FROM wide WHERE id = $id", &params)
+            .expect("delete the wide-key row");
+        database.close().expect("close the wide-key fixture");
+    }
+    let largest_copied_record = {
+        use redb::{ReadableDatabase, ReadableTable};
+        let raw = redb::Database::open(&path).expect("open the wide-key fixture");
+        let read = raw.begin_read().unwrap();
+        let copy = read.open_table(LINEAGE_COPY).unwrap();
+        copy.iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                key.value().len() + value.value().len()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    assert!(largest_copied_record > KEY_BYTES);
+    let (reader, _) = fallback_reader(&path, None);
+    change_response(&reader).expect("warm the reader's history");
+    contextdb_engine::persistence::refuse_next_lineage_scratch_admission_for_test();
+    let (refused, peak) = measure(|| change_response(&reader));
+    match refused {
+        Err(DirectFileReaderError::MemoryBudget {
+            subsystem,
+            operation,
+            requested_bytes,
+            ..
+        }) => {
+            assert_eq!(
+                (subsystem.as_str(), operation.as_str(), requested_bytes),
+                ("lineage_config", "authenticate", 2 * largest_copied_record),
+                "the refused reservation is the record's authentication copy"
+            );
+        }
+        other => panic!(
+            "a refused authentication reservation fails the request: {:?}",
+            other.map(|response| answer_rows(&response))
+        ),
+    }
+    assert!(
+        peak < largest_copied_record,
+        "nothing record-sized was copied before the refusal: peak={peak} record={largest_copied_record}"
+    );
+    assert_eq!(
+        answer_rows(&change_response(&reader).expect("the next request answers")).1,
+        1
+    );
+}
