@@ -451,6 +451,57 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
     db.close().expect("close the refused store");
 }
 
+/// A commit writing one row into one table opens, closes and witnesses only
+/// that table's relation, however many other tables the store declares. The
+/// saved row cardinality of every other table is unchanged by the commit and
+/// must not be refreshed by opening each of them for writing, which made every
+/// commit's protected-root work, and a received schema unit's durable
+/// writes, grow with the number of declared tables.
+#[test]
+fn a_one_table_commit_leaves_every_other_tables_relation_untouched() {
+    let mut events_by_tables = Vec::new();
+    for count in [64usize, 128, 256] {
+        let root = tempfile::tempdir().expect("fixture directory");
+        let db = Database::open(root.path().join("one-table.db")).expect("open the database");
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        for n in 0..count {
+            let table = format!("other_{n:04}");
+            db.execute(
+                &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, payload TEXT NOT NULL)"),
+                &HashMap::new(),
+            )
+            .expect("declare one table");
+            db.execute(
+                &format!("INSERT INTO {table} VALUES ($id, 'one row')"),
+                &HashMap::from([(
+                    "id".into(),
+                    Value::Uuid(uuid::Uuid::from_u128(0x07e5 << 112 | n as u128)),
+                )]),
+            )
+            .expect("give the table a committed row");
+        }
+        commit_row_work::take_protected_root_events();
+        db.execute(
+            "INSERT INTO other_0000 VALUES ($id, 'the measured row')",
+            &HashMap::from([(
+                "id".into(),
+                Value::Uuid(uuid::Uuid::from_u128(0x07e5_ffff << 96)),
+            )]),
+        )
+        .expect("commit one row into one table");
+        let events = commit_row_work::take_protected_root_events();
+        eprintln!("one_table_commit tables={count} protected_root_events={events}");
+        events_by_tables.push((count, events));
+        db.close().expect("close the store");
+    }
+    let (_, first) = events_by_tables[0];
+    assert!(
+        events_by_tables.iter().all(|(_, events)| *events == first),
+        "a one-row, one-table commit's protected root events grew with the declared \
+         tables: {events_by_tables:?}"
+    );
+}
+
 /// One transaction writing one row into each of T tables, staged in
 /// descending name order. Both row-head reconciliation passes must first use
 /// the tables in that order, open each exactly once, and do held-relation
