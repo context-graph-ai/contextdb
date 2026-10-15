@@ -42044,6 +42044,24 @@ graph_commit_result }.map_err(Self::storage_error)?;
         defer_pending: bool,
         verification: &custody_pending::Owner,
     ) -> Result<()> {
+        // A write that restates the stored bytes (the authority certificate
+        // every delivery restates) changes no group membership, no pending
+        // verdict and no commitment: skip all three. Without this, every
+        // restated certificate re-verified every current local root.
+        {
+            let table = write_txn
+                .open_table(READ_CUSTODY_CONFIG_TABLE)
+                .map_err(Self::storage_error)?;
+            let stored = table.get(key).map_err(Self::storage_error)?;
+            let unchanged = match (&stored, value) {
+                (Some(stored), Some(value)) => stored.value() == value,
+                (None, None) => true,
+                _ => false,
+            };
+            if unchanged {
+                return Ok(());
+            }
+        }
         custody_groups::maintain(write_txn, key, value, funding)?;
         custody_pending::maintain(write_txn, key, value, defer_pending, verification)?;
         Self::write_compact_config_entry(
