@@ -624,6 +624,10 @@ impl RedbPersistence {
         Self::write_row_heads_root(write)?;
         #[cfg(any(test, feature = "test-seams"))]
         graph_observation_checkpoint(15)?;
+        // Every committed writer image has a declaration table, even before
+        // its first declaration: opening it here creates it once, and costs a
+        // commit one fixed open, never a visit per declared table.
+        write.open_table(META_TABLE).map_err(Self::storage_error)?;
         #[cfg(any(test, feature = "test-seams"))]
         graph_observation_checkpoint(16)?;
         if let Some(ws) = ws {
