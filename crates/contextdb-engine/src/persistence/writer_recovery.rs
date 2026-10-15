@@ -1002,13 +1002,22 @@ impl RedbPersistence {
                         reason: "invalid table declaration key".into(),
                     })?;
             let physical = Self::rel_table_name(name);
-            // Read the count from the table's directory header. Opening the
-            // relation for writing would make every commit open, close and
+            // An existing relation's count comes from its directory header:
+            // opening it for writing would make every commit open, close and
             // re-witness every declared table, not just the ones it changed.
-            let count = write
+            // A declared relation not yet created is opened once here, which
+            // creates and witnesses it, so readers find its physical root.
+            let count = match write
                 .normal_table_len(&physical)
                 .map_err(Self::storage_error)?
-                .unwrap_or(0);
+            {
+                Some(count) => count,
+                None => write
+                    .open_table(TableDefinition::<&[u8], &[u8]>::new(&physical))
+                    .map_err(Self::storage_error)?
+                    .len()
+                    .map_err(Self::storage_error)?,
+            };
             let key = format!("row_versions:{name}");
             let value = count.to_be_bytes();
             if counts
