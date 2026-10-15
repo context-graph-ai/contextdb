@@ -464,6 +464,12 @@ impl MaintenanceProgressPauseSlot {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Partitions a failure recheck on this thread looked at.
+    static FAILURE_RECHECK_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 thread_local! {
     static HELD_MAINTENANCE_LOCKS: RefCell<Vec<(StoreId, VectorIndexRef, VectorPartitionKey)>> = const { RefCell::new(Vec::new()) };
     static HELD_BULK_READ_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
@@ -14504,6 +14510,8 @@ impl VectorStore {
                 return Ok(());
             }
             for (partition_key, state) in changed_column.admitted_partition_snapshots(owner)? {
+                #[cfg(test)]
+                FAILURE_RECHECK_VISITS.with(|visits| visits.set(visits.get() + 1));
                 if state.is_historical_only() { continue; }
                 self.with_partition_maintenance(index, &partition_key, || -> Result<()> {
                     let Some(failure) = state.maintenance_failure_details() else {

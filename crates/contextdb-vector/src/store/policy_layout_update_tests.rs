@@ -187,3 +187,197 @@ fn a_published_policy_update_changes_only_the_policy() {
         "a storage-shape change is not a policy update"
     );
 }
+
+/// A refusable owner for a column's own directory charges.
+#[derive(Debug, Default)]
+struct Refusable {
+    used: AtomicUsize,
+    refuse: AtomicBool,
+}
+
+impl MemoryBudget for Refusable {
+    fn try_allocate_for(
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<()> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(Error::MemoryBudgetExceeded {
+                subsystem: subsystem.into(),
+                operation: operation.into(),
+                requested_bytes: bytes,
+                available_bytes: 0,
+                budget_limit_bytes: self.used.load(Ordering::SeqCst),
+                hint: hint.into(),
+            });
+        }
+        self.used.fetch_add(bytes, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::SeqCst);
+    }
+}
+
+fn scoped_index() -> VectorIndexRef {
+    VectorIndexRef::new("scoped", "embedding")
+}
+
+fn scope(n: usize) -> VectorPartitionKey {
+    VectorPartitionKey::from_components(vec![contextdb_core::VectorPartitionComponent::Integer(
+        n as i64,
+    )])
+}
+
+/// A store with `partitions` healthy partitions of one vector each.
+fn partitioned_store(partitions: usize, owner: Arc<Refusable>) -> (VectorStore, VectorIndexLayout) {
+    let store = VectorStore::default();
+    let layout = VectorIndexLayout::new(
+        2,
+        VectorQuantization::F32,
+        vec!["scope".to_owned()],
+        Some(partitions as u32),
+        VectorSearchMode::Indexed,
+    );
+    let mut admission = VectorCopyAdmission::new(owner.clone());
+    store
+        .register_index_with_layout(
+            scoped_index(),
+            layout.clone(),
+            owner.clone(),
+            &mut admission,
+        )
+        .expect("register the scoped index");
+    for n in 0..partitions {
+        store
+            .insert_loaded_partitioned_vector(
+                PartitionedVectorEntry::new(
+                    scope(n),
+                    VectorEntry {
+                        index: scoped_index(),
+                        row_id: RowId(n as u64 + 1),
+                        vector: vec![1.0, n as f32],
+                        created_tx: TxId(1),
+                        deleted_tx: None,
+                        lsn: Lsn(1),
+                    },
+                ),
+                &mut admission,
+            )
+            .expect("load one vector into its own partition");
+    }
+    (store, layout)
+}
+
+/// Publish `target` as a policy-only change and run the follow-up recheck
+/// under `recheck_owner`; returns the partitions the recheck looked at.
+fn publish_and_recheck(
+    store: &VectorStore,
+    target: VectorIndexLayout,
+    recheck_owner: &mut VectorCopyAdmission,
+) -> usize {
+    let mut prepare_owner = VectorCopyAdmission::new(Budget::with_limit(usize::MAX));
+    let prepared = store
+        .prepare_policy_layout_update(&scoped_index(), target, &mut prepare_owner)
+        .expect("admit the policy change")
+        .expect("the policy changed");
+    let published = store
+        .publish_policy_layout_update(prepared)
+        .expect("the column is still current");
+    FAILURE_RECHECK_VISITS.with(|visits| visits.set(0));
+    store
+        .recheck_policy_maintenance_failures(&published, recheck_owner)
+        .expect("the recheck is admitted");
+    FAILURE_RECHECK_VISITS.with(|visits| visits.get())
+}
+
+/// A second policy change after `policy_only`.
+fn policy_again(layout: &VectorIndexLayout) -> VectorIndexLayout {
+    let mut changed = policy_only(layout);
+    changed.auto_index_at = Some(9);
+    changed
+}
+
+fn failure_of(store: &VectorStore, n: usize) -> Option<VectorMaintenanceFailure> {
+    let mut owner = VectorCopyAdmission::new(Budget::with_limit(usize::MAX));
+    store
+        .partition_info(&scoped_index(), &scope(n), &mut owner)
+        .expect("inspect one partition")
+        .and_then(|info| info.maintenance_failure)
+}
+
+#[test]
+fn a_policy_recheck_with_no_failures_looks_at_no_partition() {
+    for partitions in [4, 16, 64] {
+        let (store, layout) = partitioned_store(partitions, Arc::new(Refusable::default()));
+        // A recheck budget too small to copy any partition is enough.
+        let mut owner = VectorCopyAdmission::new(Budget::with_limit(0));
+        assert_eq!(
+            publish_and_recheck(&store, policy_only(&layout), &mut owner),
+            0,
+            "{partitions} healthy partitions are neither copied nor locked"
+        );
+    }
+}
+
+#[test]
+fn a_policy_recheck_looks_only_at_the_failed_partition() {
+    for partitions in [4, 16, 64] {
+        let (store, layout) = partitioned_store(partitions, Arc::new(Refusable::default()));
+        store
+            .record_partition_maintenance_failure(
+                &VectorPartitionRef::new(scoped_index(), scope(1)),
+                VectorMaintenanceFailure::MemoryLimit,
+            )
+            .expect("record one partition's failure");
+        let mut owner = VectorCopyAdmission::new(Budget::with_limit(usize::MAX));
+        assert_eq!(
+            publish_and_recheck(&store, policy_only(&layout), &mut owner),
+            1,
+            "only the failed partition of {partitions} is looked at"
+        );
+        assert_eq!(
+            failure_of(&store, 1),
+            None,
+            "the new policy needs no work there, so its failure is cleared"
+        );
+        assert_eq!(
+            publish_and_recheck(&store, policy_again(&layout), &mut owner),
+            0,
+            "a cleared failure is not looked at again"
+        );
+    }
+}
+
+#[test]
+fn a_failure_the_column_cannot_index_is_still_rechecked() {
+    let column_owner = Arc::new(Refusable::default());
+    let (store, layout) = partitioned_store(16, column_owner.clone());
+    column_owner.refuse.store(true, Ordering::SeqCst);
+    store
+        .record_partition_maintenance_failure(
+            &VectorPartitionRef::new(scoped_index(), scope(3)),
+            VectorMaintenanceFailure::MemoryLimit,
+        )
+        .expect("record a failure whose index entry is refused");
+    column_owner.refuse.store(false, Ordering::SeqCst);
+    let mut owner = VectorCopyAdmission::new(Budget::with_limit(usize::MAX));
+    assert_eq!(
+        publish_and_recheck(&store, policy_only(&layout), &mut owner),
+        16,
+        "an incomplete index makes the recheck look at every partition once"
+    );
+    assert_eq!(
+        failure_of(&store, 3),
+        None,
+        "the unindexed failure is cleared"
+    );
+    assert_eq!(
+        publish_and_recheck(&store, policy_again(&layout), &mut owner),
+        0,
+        "the rebuilt index is trusted again"
+    );
+}
