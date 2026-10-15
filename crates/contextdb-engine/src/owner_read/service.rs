@@ -3680,9 +3680,9 @@ impl OwnerReadService {
         // registration. The latter includes in-process owner requests, which
         // intentionally consume no admission slot but still retain owner
         // resources until their handler returns.
-        // Crossing the deadline keeps every retained resource owned. The
-        // listener has already been withdrawn after quiescence publication;
-        // a later close or final drop can finish the accepted work.
+        // Crossing the deadline keeps every retained resource owned, the
+        // channel included, still refusing new work; a later close or final
+        // drop can finish the accepted work.
         let mut stop_error = None;
         let operation: LocalDeadlineOperation<'_> = Box::pin(std::future::poll_fn(|context| {
             if self.poll_requests_drained(context).is_pending() {
@@ -3713,13 +3713,24 @@ impl OwnerReadService {
         if let Some(error) = stop_error {
             return Err(error);
         }
-        // The pathname was withdrawn at admission stop; this final removal
-        // is idempotent and covers a service stopped outside the owning handle.
+        // Admitted work has left: remove the channel this run created. A
+        // drain that missed its deadline keeps the channel owned, admitting
+        // nothing, until a later close finishes it.
         if drained.is_ok() {
             self.stop_serving()?;
             #[cfg(unix)]
             self.join_accept_worker();
             self.remove_own_channel();
+            #[cfg(any(test, feature = "test-seams"))]
+            if let Some(observer) = self
+                .spec
+                .config
+                .test_hooks
+                .as_ref()
+                .and_then(|hooks| hooks.quiescent_stop.as_ref())
+            {
+                observer(crate::read_session::QuiescentStopPhase::ChannelWithdrawn);
+            }
         }
         drained
     }
@@ -3800,16 +3811,17 @@ impl OwnerReadService {
         if matches!(*state, ServiceState::Serving) {
             *state = ServiceState::DrainingGracefully;
             self.admission.close_to_new_work()?;
-            // Quiescence was published by the owning database before this
-            // transition. Remove the listener now so an arriving reader
-            // discovers the committed file instead of a stopping channel.
-            self.remove_own_channel();
+            // The channel stays published while admitted work drains: a
+            // reader that dials it is refused new work and told the owner is
+            // draining, and with quiescence already published it reads the
+            // committed file instead. Close removes the channel only after
+            // the drain, and a drain that times out keeps it owned.
             drop(state);
             #[cfg(any(test, feature = "test-seams"))]
             if let Some(hooks) = &self.spec.config.test_hooks {
                 let _ = hooks.drain_started.send(());
                 if let Some(observer) = &hooks.quiescent_stop {
-                    observer(crate::read_session::QuiescentStopPhase::ChannelWithdrawn);
+                    observer(crate::read_session::QuiescentStopPhase::AdmissionStopped);
                 }
             }
         }

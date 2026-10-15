@@ -5552,6 +5552,10 @@ pub struct OwnerReadTestHooks {
 pub enum QuiescentStopPhase {
     WritesStopped,
     Published,
+    /// The owner refuses new work; its channel stays published while the
+    /// work it already admitted drains.
+    AdmissionStopped,
+    /// The drained owner removed the channel it created.
     ChannelWithdrawn,
     AcceptedDrained,
 }
