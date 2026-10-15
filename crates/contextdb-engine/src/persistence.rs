@@ -33209,6 +33209,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
             if complete || removed == 0 {
                 return Ok(complete);
             }
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::database::maybe_pause_between_vector_journal_cleanup_steps_for_test();
             checkpoint()?;
         }
     }

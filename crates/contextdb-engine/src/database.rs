@@ -17309,6 +17309,22 @@ fn query_trace_rows_examined_capture_pause_for_test() -> Arc<ApplyPhasePause> {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+static VECTOR_JOURNAL_CLEANUP_STEP_GAP_PAUSE: OnceLock<Arc<ApplyPhasePause>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-seams"))]
+fn vector_journal_cleanup_step_gap_pause_for_test() -> Arc<ApplyPhasePause> {
+    VECTOR_JOURNAL_CLEANUP_STEP_GAP_PAUSE
+        .get_or_init(|| Arc::new(ApplyPhasePause::new()))
+        .clone()
+}
+
+/// Pause between two committed steps of a vector journal cleanup.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn maybe_pause_between_vector_journal_cleanup_steps_for_test() {
+    vector_journal_cleanup_step_gap_pause_for_test().maybe_pause();
+}
+
+#[cfg(any(test, feature = "test-seams"))]
 fn vector_journal_cleanup_pause_for_test() -> Arc<ApplyPhasePause> {
     VECTOR_JOURNAL_CLEANUP_PAUSE
         .get_or_init(|| Arc::new(ApplyPhasePause::new()))
@@ -78844,6 +78860,19 @@ impl Database {
         let _operation = self.assert_open_operation();
         self.vector_store
             .arm_journal_truncation_fault_for_test(partition, phase)
+    }
+
+    /// Pause between two committed steps of a vector journal cleanup, after
+    /// the earlier step has committed and before the next one starts.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_one_shot_vector_journal_cleanup_step_gap_pause_for_test(
+        &self,
+    ) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
+        let inner = vector_journal_cleanup_step_gap_pause_for_test();
+        let generation = inner.arm();
+        ApplyPhasePauseGuard { inner, generation }
     }
 
     /// Pause after cleanup owns and charges its physical journal-key copies,
