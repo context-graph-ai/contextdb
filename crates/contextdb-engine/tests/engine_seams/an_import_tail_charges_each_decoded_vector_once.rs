@@ -1021,13 +1021,18 @@ fn every_commit_the_writer_accepted_is_absorbed_under_the_same_limit() {
     );
 }
 
+// Stress tier: one committed LSN whose decoded vectors exceed the reopened
+// writer's whole 16 MiB limit (4,096 x 6 KiB). The default tier keeps
+// absorption above the cohort share in the commit sweep and the
+// one-import-commit suite.
+#[cfg(feature = "nightly-tests")]
 #[test]
 fn a_committed_lsn_larger_than_a_lowered_limit_is_absorbed_by_a_bounded_rebuild() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("lowered.db");
     let db = fixture(&path, ROOMY_LIMIT, 0);
-    let rows = 256usize;
+    let rows = 4096usize;
     let mut sql = String::from("INSERT INTO points VALUES ");
     let mut params = HashMap::new();
     for row in 0..rows {
@@ -1041,9 +1046,8 @@ fn a_committed_lsn_larger_than_a_lowered_limit_is_absorbed_by_a_bounded_rebuild(
     }
     db.execute(&sql, &params).unwrap();
     db.close().unwrap();
-    // The operator reopens with a 16 MiB limit, whose cohort share (1 MiB)
-    // is below that one commit's decoded vectors (256 x 6,144 B =
-    // 1.5 MiB). Coverage is
+    // The operator reopens with a limit below what that one commit's
+    // decoded vectors need (4,096 x 6,144 B = 24 MiB > 16 MiB). Coverage is
     // per committed LSN, so the commit is absorbed by a bounded rebuild under
     // the unchanged limit instead of being refused.
     let db = Database::open_with_options(&path, options(16 * 1024 * 1024)).unwrap();
