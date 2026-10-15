@@ -14516,6 +14516,7 @@ impl VectorStore {
         &self,
         index: &VectorIndexRef,
         layout: VectorIndexLayout,
+        owner: &mut VectorCopyAdmission,
     ) -> Result<Option<PreparedVectorPolicyLayout>> {
         Self::validate_layout(index, &layout)?;
         let column = self
@@ -14523,11 +14524,20 @@ impl VectorStore {
             .ok_or_else(|| Error::UnknownVectorIndex {
                 index: index.clone(),
             })?;
-        let current = column.layout.read().clone();
-        if current == layout {
+        // Compared in place: copying the current declaration would be an
+        // unadmitted allocation as wide as its partition key.
+        let (unchanged, same_shape, current_bytes) = {
+            let current = column.layout.read();
+            (
+                *current == layout,
+                current.has_same_storage_shape(&layout),
+                current.estimated_bytes(),
+            )
+        };
+        if unchanged {
             return Ok(None);
         }
-        if !current.has_same_storage_shape(&layout) {
+        if !same_shape {
             return Err(Error::Other(format!(
                 "vector index {}.{} changes its storage shape, not only its policy",
                 index.table, index.column
@@ -14541,9 +14551,10 @@ impl VectorStore {
                 max_partitions,
             });
         }
-        let growth = layout
-            .estimated_bytes()
-            .saturating_sub(current.estimated_bytes());
+        // The prepared change keeps its own copy of the index name until it
+        // is published; the caller's copy owner funds it until then.
+        owner.reserve(index.table.len().saturating_add(index.column.len()))?;
+        let growth = layout.estimated_bytes().saturating_sub(current_bytes);
         let growth = if growth == 0 {
             None
         } else {
@@ -26066,6 +26077,10 @@ mod received_publication_accounting_tests;
 #[cfg(test)]
 #[path = "store/detached_copy_payload_tests.rs"]
 mod detached_copy_payload_tests;
+
+#[cfg(test)]
+#[path = "store/policy_layout_update_tests.rs"]
+mod policy_layout_update_tests;
 
 #[cfg(test)]
 #[path = "store/generation_selection_tests.rs"]
