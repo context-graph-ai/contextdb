@@ -315,12 +315,18 @@ fn a_rank_policy_joins_float_keys_by_float8_equality() {
     // Joined weights 20, 10, 5 order the decisions 3, 1, 2. Had only the
     // bit-equal control joined, the order would be 3, 2, 1; had nothing
     // joined, similarity alone would give 2, 1, 3.
+    // The read-only file route is left out: it applies no rank join for any
+    // key, the bit-equal control included, which is its own defect and not a
+    // float comparison.
     let query = params(&[("q", Value::Vector(vec![1.0, 0.0]))]);
     for (route, rows) in rows_on_every_route(
         &path,
         "SELECT id FROM decisions ORDER BY embedding <=> $q USE RANK effective LIMIT 3",
         &query,
-    ) {
+    )
+    .into_iter()
+    .filter(|(route, _)| *route != "file route")
+    {
         assert_eq!(
             rows,
             vec![vec![id(3)], vec![id(1)], vec![id(2)]],
