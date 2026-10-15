@@ -483,3 +483,55 @@ async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receive
         synced.stop().await;
     }
 }
+
+/// A synced policy change rechecks a recorded maintenance failure exactly as a
+/// local ALTER does: when the partition's healthy route needs no work under
+/// the new policy, inspection stops reporting the old refusal.
+#[tokio::test]
+async fn a_synced_policy_change_clears_a_failure_the_new_policy_no_longer_needs() {
+    let synced = Synced::start().await;
+    let (_, scope, _) = row(0);
+    let index = contextdb_core::VectorIndexRef::new("policy_items", "embedding");
+    let partition = contextdb_vector::VectorPartitionRef::new(
+        index.clone(),
+        contextdb_core::VectorPartitionKey::from_values(&[Value::Uuid(scope)])
+            .expect("one UUID partition key"),
+    );
+    let failure = || {
+        let mut owner = contextdb_engine::vector_read_memory::admission(
+            synced
+                .edge
+                .declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+        synced
+            .edge
+            .vector_store_for_test()
+            .partition_info(&index, &partition.partition_key, &mut owner)
+            .expect("inspect the receiver's partition")
+            .and_then(|info| info.maintenance_failure)
+    };
+    synced
+        .edge
+        .vector_store_for_test()
+        .record_partition_maintenance_failure(
+            &partition,
+            contextdb_vector::VectorMaintenanceFailure::MemoryLimit,
+        )
+        .expect("record a maintenance refusal on the receiver's healthy partition");
+    assert_eq!(
+        failure(),
+        Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
+    );
+
+    synced
+        .alter("ALTER TABLE policy_items ALTER COLUMN embedding SET SEARCH_MODE AUTO")
+        .await;
+    assert_eq!(embedding_column(&synced.edge).search_mode, VectorSearchMode::Auto);
+    assert_eq!(
+        failure(),
+        None,
+        "the healthy route needs no work under the synced policy, so the old refusal is gone"
+    );
+    synced.stop().await;
+}
