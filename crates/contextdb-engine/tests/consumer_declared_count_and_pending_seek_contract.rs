@@ -936,3 +936,89 @@ fn an_in_transaction_count_after_a_value_delete_stays_exact() {
     db.rollback(tx).unwrap();
     db.close().unwrap();
 }
+
+/// A transaction that began before another transaction committed counts the
+/// store as its own snapshot sees it plus what it staged: moving a row into
+/// the context, restaging another twice, and inserting. The declared count
+/// answers it only while its snapshot is the writer root's; either way the
+/// answer equals the ordinary count of the same rows.
+#[test]
+fn an_in_transaction_count_answers_its_own_snapshot_after_another_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = committed_events(&directory.path().join("in-tx-snapshot.redb"), 30);
+    let tx_a = db.begin().unwrap();
+    // A row of context 2 moves into context 1; a context-1 row is restaged
+    // twice and stays; one row is staged in context 1.
+    db.execute_in_tx(
+        tx_a,
+        "UPDATE events SET context_id = $to WHERE id = $id",
+        &params(&[("id", event_id(30)), ("to", context(1))]),
+    )
+    .unwrap();
+    for body in ["first restage", "second restage"] {
+        db.execute_in_tx(
+            tx_a,
+            "UPDATE events SET body = $body WHERE id = $id",
+            &params(&[("id", event_id(5)), ("body", Value::Text(body.into()))]),
+        )
+        .unwrap();
+    }
+    db.execute_in_tx(
+        tx_a,
+        EVENTS_INSERT,
+        &params(&[
+            ("id", event_id(8_000_000)),
+            ("context_id", context(1)),
+            ("body", Value::Text("staged".into())),
+        ]),
+    )
+    .unwrap();
+    let before_other = db
+        .execute_in_tx(tx_a, EVENTS_COUNT, &params(&[("context_id", context(1))]))
+        .unwrap();
+    assert_eq!(before_other.rows, vec![vec![Value::Int64(32)]]);
+    // Another transaction commits two more context-1 rows.
+    let tx_b = db.begin().unwrap();
+    for n in 0..2 {
+        db.execute_in_tx(
+            tx_b,
+            EVENTS_INSERT,
+            &params(&[
+                ("id", event_id(9_000_000 + n)),
+                ("context_id", context(1)),
+                ("body", Value::Text("other".into())),
+            ]),
+        )
+        .unwrap();
+    }
+    db.commit(tx_b).unwrap();
+    let served = db
+        .execute_in_tx(tx_a, EVENTS_COUNT, &params(&[("context_id", context(1))]))
+        .unwrap();
+    let ordinary = db
+        .execute_in_tx(
+            tx_a,
+            "SELECT COUNT(id) FROM events WHERE context_id = $context_id",
+            &params(&[("context_id", context(1))]),
+        )
+        .unwrap();
+    println!(
+        "in-tx count after another commit: served {:?} ({:?}), ordinary {:?}",
+        served.rows, served.trace.maintained_count, ordinary.rows
+    );
+    assert_eq!(
+        served.rows, ordinary.rows,
+        "the declared count and the ordinary count agree on the transaction's view"
+    );
+    assert!(
+        matches!(
+            served.trace.maintained_count.as_deref(),
+            Some(MaintainedCountDisclosure::Used { .. })
+                | Some(MaintainedCountDisclosure::DeclaredNotServed { .. })
+        ),
+        "the read discloses which route answered: {:?}",
+        served.trace.maintained_count
+    );
+    db.rollback(tx_a).unwrap();
+    db.close().unwrap();
+}

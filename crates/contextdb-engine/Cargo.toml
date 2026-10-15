@@ -428,3 +428,8 @@ required-features = ["test-seams"]
 name = "native_backing_allocator"
 path = "tests/native_backing_allocator.rs"
 required-features = ["test-seams"]
+
+[[test]]
+name = "in_transaction_count_stays_inside_its_memory"
+path = "tests/in_transaction_count_stays_inside_its_memory.rs"
+required-features = ["test-seams"]
