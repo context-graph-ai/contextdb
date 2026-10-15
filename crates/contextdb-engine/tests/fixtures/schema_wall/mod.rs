@@ -41,13 +41,37 @@ pub fn initialize_fixture_callbacks(db: &Database) {
 pub fn assert_dependency_complete(
     observation: &ReceivedSchemaApplyObservationForTest,
     affected: &BTreeSet<String>,
+    indexes: &BTreeSet<String>,
     contact_exchanges: u64,
 ) {
     assert_eq!(
         &observation.staged_table_names, affected,
         "every FK/propagation/trigger dependent is staged, and no unrelated table is staged"
     );
-    assert_affected_only(observation, affected, contact_exchanges);
+    assert_affected_only(observation, affected, indexes, contact_exchanges);
+}
+
+/// The physical index tables `tables` own in `db`'s current schema, by the
+/// engine's naming rule: one per declared index, and its `_current` companion.
+/// A caller passes the union of the schema before and after the apply it
+/// observes, so a dropped or added index is still owned.
+pub fn physical_index_tables(db: &Database, tables: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for table in tables {
+        let Some(meta) = db.table_meta(table) else {
+            continue;
+        };
+        for index in &meta.indexes {
+            let mut hash = blake3::Hasher::new();
+            hash.update(table.as_bytes());
+            hash.update(&[0]);
+            hash.update(index.name.as_bytes());
+            let base = format!("__rel_index_{}", hash.finalize().to_hex());
+            names.insert(format!("{base}_current"));
+            names.insert(base);
+        }
+    }
+    names
 }
 
 pub fn declare(db: &Database, ddls: &[&str]) {
@@ -596,6 +620,7 @@ pub fn assert_zero_images(observation: &ReceivedSchemaApplyObservationForTest) {
 pub fn assert_affected_only(
     observation: &ReceivedSchemaApplyObservationForTest,
     affected: &BTreeSet<String>,
+    indexes: &BTreeSet<String>,
     contact_exchanges: u64,
 ) {
     assert!(observation.durable_observer_attached);
@@ -664,9 +689,16 @@ pub fn assert_affected_only(
         .iter()
         .filter(|(event, _)| {
             event.table.starts_with("__rel_index_")
-                || (event.table == "__redb_user_table_directory"
+                || ((event.table == "__redb_user_table_directory"
+                    || event.table == "__history_root_witness_v1")
                     && event.key.starts_with(b"__rel_index_"))
         })
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    let witness_writes = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| event.table == "__history_root_witness_v1")
         .map(|(_, count)| *count)
         .sum::<u64>();
     assert!(
@@ -755,32 +787,23 @@ pub fn assert_affected_only(
         if table == "writer_recovery" {
             if event.table == "__redb_user_table_directory" {
                 assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
-                // Each of the three fixed controls, and the saved row counts of
-                // the tables a commit changed, open and update the table root.
+                // Each of the three fixed controls opens and updates the table root.
                 assert!(
-                    *count <= 4 * (1 + contact_exchanges),
+                    *count <= 3 * (1 + contact_exchanges),
                     "writer recovery root rewritten {count} times {event:?}"
                 );
             } else {
                 assert_eq!(event.operation, TableWriteOperationForTest::Insert);
-                if let Some(owner) = event.key.strip_prefix(b"row_versions:") {
-                    let owner = std::str::from_utf8(owner).expect("row count keys name tables");
-                    assert!(
-                        affected.contains(owner) || owner == "work_node_contacts",
-                        "unrelated saved row count {event:?}"
-                    );
-                } else {
-                    assert!(
-                        matches!(
-                            event.key.as_slice(),
-                            b"bounds" | b"commit_directory_root" | b"row_heads_root"
-                        ),
-                        "unexpected recovery control coordinate {event:?}"
-                    );
-                }
+                assert!(
+                    matches!(
+                        event.key.as_slice(),
+                        b"bounds" | b"commit_directory_root" | b"row_heads_root"
+                    ),
+                    "unexpected recovery control coordinate {event:?}"
+                );
                 assert!(
                     *count <= 1 + contact_exchanges,
-                    "recovery record written {count} times {event:?}"
+                    "recovery control written {count} times {event:?}"
                 );
             }
             continue;
@@ -905,13 +928,12 @@ pub fn assert_affected_only(
             continue;
         }
         if table == "__history_root_witness_v1" && event.table == "__redb_user_table_directory" {
-            // The witness table's directory entry moves with its root.
+            // The witness table's directory entry moves with its root: at most
+            // once per witness it actually wrote.
             assert!(
-                observation.artifact_writes.iter().any(|(write, _)| {
-                    write.table == "__history_root_witness_v1"
-                        && write.operation == TableWriteOperationForTest::Insert
-                }),
-                "witness directory rewrite without a witness write {event:?}"
+                *count <= witness_writes,
+                "witness directory rewritten {count} times for {witness_writes} witness writes \
+                 {event:?}"
             );
             continue;
         }
@@ -924,8 +946,8 @@ pub fn assert_affected_only(
                 );
             } else {
                 assert!(
-                    physical.starts_with("__rel_index_"),
-                    "unexpected historical root witness: {event:?}"
+                    indexes.contains(physical),
+                    "historical root witness of an index no affected table owns: {event:?}"
                 );
             }
             continue;
