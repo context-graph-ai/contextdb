@@ -38,7 +38,22 @@ pub(crate) fn refund_open_residue(bytes: usize) {
     aggregate_refund(bytes);
 }
 
+#[cfg(test)]
+thread_local! {
+    // Bytes this thread has returned to the process aggregate. It lets a test
+    // assert on the refund its own drop makes, which the shared aggregate
+    // cannot show exactly while other tests charge and refund writers.
+    static REFUNDED_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn refunded_on_this_thread_for_test() -> usize {
+    REFUNDED_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 fn aggregate_refund(bytes: usize) {
+    #[cfg(test)]
+    REFUNDED_ON_THIS_THREAD.with(|refunded| refunded.set(refunded.get() + bytes));
     if bytes != 0 {
         PROCESS_WRITER_AGGREGATE
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {

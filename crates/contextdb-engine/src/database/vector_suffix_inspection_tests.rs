@@ -462,7 +462,7 @@ fn seeded_suffix_writer_final_owner_refunds_without_injected_failure() {
 }
 
 fn assert_final_writer_refund(writer: crate::memory_accounting::AccountantHandle) {
-    use crate::memory_accounting::process_aggregate_snapshot;
+    use crate::memory_accounting::refunded_on_this_thread_for_test;
     // The diagnostic owns the engine-created accountant, limit, and writer
     // counter. Their private seam reports the live identities and typed
     // layouts; it is not an allocator measurement.
@@ -481,11 +481,13 @@ fn assert_final_writer_refund(writer: crate::memory_accounting::AccountantHandle
         "all store payloads and controls refund before the diagnostic accountant is freed"
     );
     assert_eq!(writer.underflow_count_for_test(), 0);
-    let before = process_aggregate_snapshot().0;
+    // The process aggregate is shared with every test running in this process,
+    // so the exact refund is read from the refunds this thread made.
+    let before = refunded_on_this_thread_for_test();
     drop(writer);
     assert_eq!(
-        process_aggregate_snapshot().0,
-        before - backing,
+        refunded_on_this_thread_for_test() - before,
+        backing,
         "final counter destruction refunds the executing process aggregate exactly"
     );
 }
