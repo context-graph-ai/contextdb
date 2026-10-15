@@ -101,7 +101,11 @@ fn answer(
 #[test]
 fn a_pending_member_before_at_or_after_a_stored_one_answers_by_order() {
     let (_root, database) = store(&[10, 20, 30, 40]);
-    assert_eq!(answer(&database, &[], 11, false), Some(20), "the stored member");
+    assert_eq!(
+        answer(&database, &[], 11, false),
+        Some(20),
+        "the stored member"
+    );
     assert_eq!(
         answer(&database, &[(15, true)], 11, false),
         Some(15),
@@ -145,7 +149,12 @@ fn the_latest_pending_delta_decides_whether_a_member_exists() {
         "consecutive removed stored members are all skipped"
     );
     assert_eq!(
-        answer(&database, &[(20, false), (30, false), (35, true)], 11, false),
+        answer(
+            &database,
+            &[(20, false), (30, false), (35, true)],
+            11,
+            false
+        ),
         Some(35),
         "a pending member past removed stored members answers"
     );
@@ -169,8 +178,16 @@ fn the_latest_pending_delta_decides_whether_a_member_exists() {
 #[test]
 fn inclusive_and_exclusive_bounds_hold_for_stored_and_pending_members() {
     let (_root, database) = store(&[10, 20, 30, 40]);
-    assert_eq!(answer(&database, &[], 20, false), Some(20), "inclusive keeps the bound");
-    assert_eq!(answer(&database, &[], 20, true), Some(30), "exclusive passes the bound");
+    assert_eq!(
+        answer(&database, &[], 20, false),
+        Some(20),
+        "inclusive keeps the bound"
+    );
+    assert_eq!(
+        answer(&database, &[], 20, true),
+        Some(30),
+        "exclusive passes the bound"
+    );
     assert_eq!(answer(&database, &[(25, true)], 20, true), Some(25));
     assert_eq!(
         answer(&database, &[(20, true)], 20, true),

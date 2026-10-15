@@ -29,11 +29,10 @@ pub use store::{
     OwnedPartitionedVectorEntries, PartitionedVectorDelete, PartitionedVectorEntry,
     PartitionedVectorMove, PreparedLoadedVectorReplacement, PreparedPartitionedVectorBatch,
     PreparedVectorPolicyLayout, PreparedVectorPublication, PreparedVectorTablePublication,
-    VectorIndexInfo, VectorIndexLayout,
-    VectorIndexLayoutInfo, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
-    VectorMaintenanceNeed, VectorMaintenanceReport, VectorMembershipProvenance,
-    VectorPartitionInfo, VectorPartitionRef, VectorRouteQuarantineReason, VectorStore,
-    VectorTeardownReceipt, VectorVersionIdentity,
+    VectorIndexInfo, VectorIndexLayout, VectorIndexLayoutInfo, VectorMaintenanceFailure,
+    VectorMaintenanceFailureDetails, VectorMaintenanceNeed, VectorMaintenanceReport,
+    VectorMembershipProvenance, VectorPartitionInfo, VectorPartitionRef,
+    VectorRouteQuarantineReason, VectorStore, VectorTeardownReceipt, VectorVersionIdentity,
 };
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]

@@ -41984,7 +41984,11 @@ impl Database {
                     .map(|(index, layout)| {
                         (
                             index,
-                            (layout.dimension, layout.quantization, layout.partition_key_columns),
+                            (
+                                layout.dimension,
+                                layout.quantization,
+                                layout.partition_key_columns,
+                            ),
                         )
                     })
                     .collect::<HashMap<_, _>>()

@@ -47,7 +47,11 @@ fn ids(result: &QueryResult) -> Vec<Uuid> {
         .collect()
 }
 
-fn indexed_search(db: &Database, scope: Uuid, query: Vec<f32>) -> contextdb_core::Result<Vec<Uuid>> {
+fn indexed_search(
+    db: &Database,
+    scope: Uuid,
+    query: Vec<f32>,
+) -> contextdb_core::Result<Vec<Uuid>> {
     db.execute(
         "SELECT id FROM policy_items WHERE scope_id = $scope \
          ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
@@ -88,8 +92,16 @@ async fn receiver_after_synced(alter: &str) -> (Arc<Database>, [(Uuid, Uuid, Vec
     let source = Arc::new(Database::open_memory());
     let edge = Arc::new(Database::open_memory());
     let rows = [
-        (Uuid::from_u128(0xA101), Uuid::from_u128(0xA1), vec![1.0, 0.0, 0.0]),
-        (Uuid::from_u128(0xA102), Uuid::from_u128(0xA2), vec![0.0, 0.0, 1.0]),
+        (
+            Uuid::from_u128(0xA101),
+            Uuid::from_u128(0xA1),
+            vec![1.0, 0.0, 0.0],
+        ),
+        (
+            Uuid::from_u128(0xA102),
+            Uuid::from_u128(0xA2),
+            vec![0.0, 0.0, 1.0],
+        ),
     ];
     source
         .execute(SCHEMA, &HashMap::new())
@@ -124,7 +136,10 @@ async fn receiver_after_synced(alter: &str) -> (Arc<Database>, [(Uuid, Uuid, Vec
     )
     .expect("construct the authenticated sync client");
 
-    client.pull_default().await.expect("first pull installs the table");
+    client
+        .pull_default()
+        .await
+        .expect("first pull installs the table");
     edge.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     for _ in 0..MAX_MAINTENANCE_CYCLES {
         edge.run_maintenance_cycle()
@@ -177,9 +192,10 @@ async fn a_synced_search_mode_change_keeps_indexed_answering_without_maintenance
 
 #[tokio::test]
 async fn a_synced_auto_index_at_change_keeps_indexed_answering_without_maintenance() {
-    let (edge, rows) =
-        receiver_after_synced("ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT 7")
-            .await;
+    let (edge, rows) = receiver_after_synced(
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT 7",
+    )
+    .await;
     assert_eq!(
         embedding_column(&edge).auto_index_at,
         Some(7),
