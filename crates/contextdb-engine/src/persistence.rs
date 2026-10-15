@@ -7193,6 +7193,18 @@ impl RetainedReadSource {
                 // The authentication mutation owns copies of the key and the
                 // value; their bytes are admitted before either is made.
                 let scratch = key.value().len().saturating_add(value.value().len()).saturating_mul(2);
+                #[cfg(any(test, feature = "test-seams"))]
+                if LINEAGE_SCRATCH_REFUSAL.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(Error::MemoryBudgetExceeded {
+                        subsystem: "lineage_config".into(),
+                        operation: "authenticate".into(),
+                        requested_bytes: scratch,
+                        available_bytes: 0,
+                        budget_limit_bytes: 0,
+                        hint: "Raise the reader's memory limit to authenticate this lineage record."
+                            .into(),
+                    });
+                }
                 (projection.admit)(scratch)?;
                 let authenticated = self.authenticate_mutation(
                     &content_identity::config_mutations(key.value(), Some(value.value()))[0],
@@ -13384,6 +13396,18 @@ const READ_IMAGE_OPEN_CONFIG_PREFIXES: [&str; 3] = [
     crate::database::event_bus::UNCONFIRMED_COUNT_CONFIG_PREFIX,
     crate::database::Database::DURABLE_LINEAGE_TABLE_GENERATION_PREFIX,
 ];
+
+#[cfg(any(test, feature = "test-seams"))]
+static LINEAGE_SCRATCH_REFUSAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse the next lineage-record authentication-copy admission, exactly as
+/// an exhausted reader would, and admit every other reservation normally.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn refuse_next_lineage_scratch_admission_for_test() {
+    LINEAGE_SCRATCH_REFUSAL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// Per-row lineage keys: one per row life that ever carried sync lineage.
 pub(crate) fn read_image_lineage_config_key(key: &str) -> bool {
