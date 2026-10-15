@@ -5757,9 +5757,12 @@ fn encoded_row_key(
     size: usize,
 ) -> std::result::Result<Vec<u8>, BoundedExecutionError> {
     let mut key = vec![0u8; size];
-    let written =
-        bincode::serde::encode_into_slice(row, key.as_mut_slice(), bincode::config::standard())
-            .map_err(|_| Error::Other("bounded row-key encoding failed".to_string()))?;
+    let written = bincode::serde::encode_into_slice(
+        contextdb_core::SqlEqualityKey(row),
+        key.as_mut_slice(),
+        bincode::config::standard(),
+    )
+    .map_err(|_| Error::Other("bounded row-key encoding failed".to_string()))?;
     if written != size {
         return Err(
             Error::Other("bounded row-key size changed during encoding".to_string()).into(),
@@ -5838,7 +5841,9 @@ fn borrowed_scalar_exact_eq(left: BorrowedScalar<'_>, right: BorrowedScalar<'_>)
         (BorrowedScalar::Null, BorrowedScalar::Null) => true,
         (BorrowedScalar::Bool(left), BorrowedScalar::Bool(right)) => left == right,
         (BorrowedScalar::Int64(left), BorrowedScalar::Int64(right)) => left == right,
-        (BorrowedScalar::Float64(left), BorrowedScalar::Float64(right)) => left == right,
+        (BorrowedScalar::Float64(left), BorrowedScalar::Float64(right)) => {
+            contextdb_core::float8_cmp(left, right).is_eq()
+        }
         (BorrowedScalar::Text(left), BorrowedScalar::Text(right)) => left == right,
         (BorrowedScalar::Uuid(left), BorrowedScalar::Uuid(right)) => left == right,
         (BorrowedScalar::Timestamp(left), BorrowedScalar::Timestamp(right)) => left == right,
@@ -10875,7 +10880,7 @@ impl DistinctState {
                 return Ok(None);
             };
             context.charge_operator(BoundedWorkSource::UnindexedSort)?;
-            let encoded_bytes = serialized_size(&row.values)?;
+            let encoded_bytes = serialized_size(&contextdb_core::SqlEqualityKey(&row.values))?;
             let retained = checked_size_add(
                 encoded_bytes,
                 checked_size_add(
@@ -11136,7 +11141,7 @@ impl UnionState {
                 .pending
                 .as_ref()
                 .ok_or_else(|| Error::Other("bounded UNION lost its pending row".to_string()))?;
-            let encoded_bytes = serialized_size(&row.values)?;
+            let encoded_bytes = serialized_size(&contextdb_core::SqlEqualityKey(&row.values))?;
             let retained = checked_size_add(
                 encoded_bytes,
                 checked_size_add(

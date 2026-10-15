@@ -10579,7 +10579,8 @@ fn index_column_minimum(meta: &TableMeta, column: &str) -> Option<Value> {
             .column_type
         {
             ColumnType::Integer => Value::Int64(i64::MIN),
-            ColumnType::Real => Value::Float64(f64::from_bits(0xffff_ffff_ffff_ffff)),
+            // The least value of PostgreSQL's float8 order; NaN is its greatest.
+            ColumnType::Real => Value::Float64(f64::NEG_INFINITY),
             ColumnType::Text => Value::Text(String::new()),
             ColumnType::Boolean => Value::Bool(false),
             ColumnType::Uuid => Value::Uuid(uuid::Uuid::nil()),
@@ -15495,7 +15496,10 @@ fn right_table_name(plan: &PhysicalPlan) -> String {
 }
 
 fn distinct_row_key(row: &[Value]) -> Vec<u8> {
-    bincode::serde::encode_to_vec(row, bincode::config::standard())
+    bincode::serde::encode_to_vec(
+        contextdb_core::SqlEqualityKey(row),
+        bincode::config::standard(),
+    )
         .expect("query rows should serialize for DISTINCT")
 }
 

@@ -283,7 +283,7 @@ impl AtomicLsn {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -297,6 +297,50 @@ pub enum Value {
     Json(#[serde(with = "json_as_string")] serde_json::Value),
     Vector(Vec<f32>),
     TxId(TxId),
+}
+
+/// SQL value equality: floats compare as PostgreSQL's float8 (`float8_cmp`),
+/// so `-0.0 == 0.0` and every NaN equals every other NaN. Code that needs a
+/// stored float's exact bits compares `to_bits()` instead.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::Int64(left), Value::Int64(right)) => left == right,
+            (Value::Float64(left), Value::Float64(right)) => float8_cmp(*left, *right).is_eq(),
+            (Value::Text(left), Value::Text(right)) => left == right,
+            (Value::Uuid(left), Value::Uuid(right)) => left == right,
+            (Value::Timestamp(left), Value::Timestamp(right)) => left == right,
+            (Value::Json(left), Value::Json(right)) => left == right,
+            (Value::Vector(left), Value::Vector(right)) => left == right,
+            (Value::TxId(left), Value::TxId(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+/// A row encoded as a key under SQL equality: bincode of the row with every
+/// float replaced by its `float8_canonical` representative, so rows SQL calls
+/// equal (`-0.0` and `0.0`, any two NaNs) encode to the same bytes. The
+/// encoded length equals the row's own, since a float always encodes in eight
+/// bytes. Borrows the row; nothing is copied.
+pub struct SqlEqualityKey<'a>(pub &'a [Value]);
+
+impl Serialize for SqlEqualityKey<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut row = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 {
+            match value {
+                Value::Float64(float) => {
+                    row.serialize_element(&Value::Float64(float8_canonical(*float)))?
+                }
+                value => row.serialize_element(value)?,
+            }
+        }
+        row.end()
+    }
 }
 
 mod json_as_string {
@@ -802,6 +846,7 @@ pub fn index_key_value_eq(a: &Value, b: &Value) -> bool {
 /// The one representative of a float's PostgreSQL float8 equality class:
 /// `-0.0` becomes `0.0` and every NaN becomes the one positive quiet NaN.
 /// Anything keyed by a float's bytes (a maintained count, a hash) keys this.
+#[inline]
 pub fn float8_canonical(value: f64) -> f64 {
     if value.is_nan() {
         f64::NAN
@@ -814,6 +859,7 @@ pub fn float8_canonical(value: f64) -> f64 {
 
 /// PostgreSQL's float8 order: a total order in which `-0.0 = 0.0`, every NaN
 /// equals every other NaN, and NaN sorts above every number.
+#[inline]
 pub fn float8_cmp(left: f64, right: f64) -> std::cmp::Ordering {
     float8_canonical(left).total_cmp(&float8_canonical(right))
 }
