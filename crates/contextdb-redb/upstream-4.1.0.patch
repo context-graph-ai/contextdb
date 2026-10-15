@@ -3832,7 +3832,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +1143,111 @@
+@@ -864,9 +1143,129 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -3878,6 +3878,24 @@
 +            .map(|table| match table {
 +                InternalTableDefinition::Normal { table_root, .. } => {
 +                    table_root.map(BtreeHeader::to_le_bytes)
++                }
++                InternalTableDefinition::Multimap { .. } => unreachable!(),
++            }))
++    }
++
++    /// Entry count of one normal table from its directory header, without
++    /// opening it: `None` when the table is absent.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn normal_table_len(&self, name: &str) -> Result<Option<u64>, TableError> {
++        let mut tables = self.tables.lock().unwrap();
++        tables.table_tree.flush_table_root_updates()?;
++        Ok(tables
++            .table_tree
++            .get_table_untyped(name, TableType::Normal)?
++            .map(|table| match table {
++                InternalTableDefinition::Normal { table_root, .. } => {
++                    table_root.map_or(0, |header| header.length)
 +                }
 +                InternalTableDefinition::Multimap { .. } => unreachable!(),
 +            }))
@@ -3944,7 +3962,7 @@
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1273,29 @@
+@@ -892,6 +1291,29 @@
              return Ok(true);
          }
  
@@ -3974,7 +3992,7 @@
          Ok(false)
      }
  
-@@ -1349,7 +1753,225 @@
+@@ -1349,7 +1771,225 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -4200,7 +4218,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +1995,13 @@
+@@ -1373,6 +2013,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -4214,7 +4232,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +2013,21 @@
+@@ -1384,10 +2031,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -4237,7 +4255,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +2052,29 @@
+@@ -1412,7 +2070,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -4268,7 +4286,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +2120,39 @@
+@@ -1458,9 +2138,39 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -4308,7 +4326,7 @@
      }
  
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +2161,45 @@
+@@ -1469,11 +2179,45 @@
              self.two_phase_commit = true;
          }
  
@@ -4356,7 +4374,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +2210,102 @@
+@@ -1484,6 +2228,102 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -4459,7 +4477,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,18 +2449,39 @@
+@@ -1627,18 +2467,39 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -4503,7 +4521,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2523,17 @@
+@@ -1680,7 +2541,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -4522,7 +4540,7 @@
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2541,11 @@
+@@ -1688,6 +2559,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -4534,7 +4552,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2556,146 @@
+@@ -1698,6 +2574,146 @@
              self.mem.free(page, &mut PageTrackerPolicy::Ignore);
          }
  
@@ -4681,7 +4699,7 @@
          Ok(())
      }
  
-@@ -1766,6 +2764,9 @@
+@@ -1766,6 +2782,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -4691,7 +4709,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2824,384 @@
+@@ -1823,46 +2842,384 @@
          Ok(progress)
      }
  
@@ -5106,7 +5124,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +3376,18 @@
+@@ -2037,6 +3394,18 @@
          })
      }
  
@@ -5125,7 +5143,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +3458,148 @@
+@@ -2107,18 +3476,148 @@
      tree: TableTree,
  }
  
@@ -5275,7 +5293,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3616,69 @@
+@@ -2135,12 +3634,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -5346,7 +5364,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +3699,7 @@
+@@ -2161,7 +3717,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -5355,7 +5373,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +3727,7 @@
+@@ -2189,7 +3745,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -5364,7 +5382,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +3755,7 @@
+@@ -2217,7 +3773,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -5373,7 +5391,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +3801,15 @@
+@@ -2263,7 +3819,15 @@
  
  #[cfg(test)]
  mod test {
@@ -5390,7 +5408,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3830,919 @@
+@@ -2284,4 +3848,919 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }

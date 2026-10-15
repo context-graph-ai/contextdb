@@ -1002,11 +1002,13 @@ impl RedbPersistence {
                         reason: "invalid table declaration key".into(),
                     })?;
             let physical = Self::rel_table_name(name);
-            let count = match write.open_table(TableDefinition::<&[u8], &[u8]>::new(&physical)) {
-                Ok(rows) => rows.len().map_err(Self::storage_error)?,
-                Err(redb::TableError::TableDoesNotExist(_)) => 0,
-                Err(error) => return Err(Self::storage_error(error)),
-            };
+            // Read the count from the table's directory header. Opening the
+            // relation for writing would make every commit open, close and
+            // re-witness every declared table, not just the ones it changed.
+            let count = write
+                .normal_table_len(&physical)
+                .map_err(Self::storage_error)?
+                .unwrap_or(0);
             let key = format!("row_versions:{name}");
             let value = count.to_be_bytes();
             if counts

@@ -563,3 +563,15 @@ Test: `a_growth_refused_for_quota_retries_at_the_size_the_allocation_needs` in
 `tests/allocator_residency_contract.rs` caps a store's growth and checks that later writes use the
 headroom instead of stopping at the first preferred growth. The engine's
 `disk_04_insert_rejected_when_over_disk_budget` covers the same promise through `DISK_LIMIT`.
+
+## Normal-table entry count without opening (S8)
+
+`WriteTransaction::normal_table_len` (contextdb-internal, doc-hidden) returns a normal table's
+entry count from its directory header, or `None` when the table is absent. It is the same
+`length` that `Table::len()` reads, but it does not open the table. The engine's per-commit
+saved row cardinality reads every declared relation's count this way. Opening each relation for
+writing made every commit open, close and re-witness every declared table: the contextdb
+historical-root hook fires on each open and close. Its proof is the engine test
+`a_one_table_commit_leaves_every_other_tables_relation_untouched`.
+
+Only the `src/transactions.rs` section of the patch was regenerated.

@@ -1190,6 +1190,24 @@ impl WriteTransaction {
             }))
     }
 
+    /// Entry count of one normal table from its directory header, without
+    /// opening it: `None` when the table is absent.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn normal_table_len(&self, name: &str) -> Result<Option<u64>, TableError> {
+        let mut tables = self.tables.lock().unwrap();
+        tables.table_tree.flush_table_root_updates()?;
+        Ok(tables
+            .table_tree
+            .get_table_untyped(name, TableType::Normal)?
+            .map(|table| match table {
+                InternalTableDefinition::Normal { table_root, .. } => {
+                    table_root.map_or(0, |header| header.length)
+                }
+                InternalTableDefinition::Multimap { .. } => unreachable!(),
+            }))
+    }
+
     #[cfg(feature = "test-seams")]
     pub(crate) fn record_table_write_for_test(
         &self,
