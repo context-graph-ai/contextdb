@@ -489,19 +489,77 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
 // and engine publication/restart proofs are all counted in the default tier.
 // No tests or clock/sleep allowances are removed or changed.
 const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
-    ("contextdb-core", 86, RSN_TEST_COUNT),
+    // Reconciled 2026-10-15 with the audit's own count at rc2 e4cdfcc5: three native
+    // custody source-selection proofs landed in the reviewed base commit 8cc2247a.
+    ("contextdb-core", 89, RSN_TEST_COUNT),
     ("contextdb-tx", 19, RSN_TEST_COUNT),
     ("contextdb-relational", 10, RSN_TEST_COUNT),
     ("contextdb-graph", 10, RSN_TEST_COUNT),
     ("contextdb-hnsw", 21, RSN_TEST_COUNT),
-    ("contextdb-vector", 199, RSN_TEST_COUNT),
+    // Reconciled 2026-10-15 (rc2 e4cdfcc5, +5): the declared index cap funds each selected
+    // partition (908e09ef) and keeps opening and expansion inside the original cap
+    // (9ea05b99), one proof each, S5; the policy layout update admits, refunds and publishes
+    // only the policy, three proofs (a6ab7690, S8).
+    ("contextdb-vector", 204, RSN_TEST_COUNT),
     ("contextdb-parser", 137, RSN_TEST_COUNT),
     ("contextdb-planner", 10, RSN_TEST_COUNT),
     // Approved continued-growth proofs: unique-key predicate writes match current-entry reads;
     // a maintenance cycle that prunes nothing walks no storage statistics as the store grows;
     // automatic compaction starts on reclaimable free pages and not on in-page slack;
     // storage compaction is declarable and unmeasured fragmentation reads unknown (5 proofs).
-    ("contextdb-engine", 4516, RSN_TEST_COUNT),
+    // Reconciled 2026-10-15 at rc2 e4cdfcc5 (4516 -> 4681, +165), measured with this audit at
+    // each landing; each group's tests prove the criterion named. The entry's 4503 was last
+    // matched by the audit at e18a38f6;
+    //  - e18a38f6 -> f565dff7 (4503 -> 4521, +18): tests already in the reviewed base source
+    //    that became countable when the base first built (not campaign additions), by the
+    //    audit's own name list: database/snapshot_pin_pool_tests.rs
+    //    overflow_pins_spend_reader_memory_and_refuse_without_changing_committed_state;
+    //    database/vector_suffix_inspection_tests.rs local_current_identity_admission_refuses_the_complete_transaction_before_durability,
+    //    sync_current_identity_admission_refuses_rows_vectors_and_the_authenticated_receipt,
+    //    captured_suffix_inspection_uses_actual_reader_and_root_without_resident_tail,
+    //    seeded_suffix_writer_final_owner_refunds_without_injected_failure;
+    //    persistence/proof_allocation_oracle_tests.rs general_checkpoint_preserves_original_native_ownership;
+    //    persistence/relational_posting_prune.rs borrowed_terminal_keys_preserve_the_canonical_scalar_codec,
+    //    expired_last_indexed_version_stays_absent_from_later_historical_reads,
+    //    reclaimed_intervals_split_postings_reanchor_current_and_preserve_old_roots;
+    //    persistence/vector_current_identity.rs repeated_current_probes_release_transient_decode_before_the_next_row,
+    //    current_identity_probe_work_is_independent_of_retained_history,
+    //    signed_duplicates_are_counted_atomically_and_do_not_change_old_captures,
+    //    current_moves_replay_and_refusals_preserve_exact_owner_and_captured_roots,
+    //    missing_and_mismatched_current_witnesses_refuse_without_reconstruction,
+    //    cancelled_current_identity_refuses_before_probes_and_refunds_its_owner;
+    //    tests/engine_seams/edge_property_write_contract.rs
+    //    replacing_a_small_property_preserves_and_funds_the_large_existing_payload,
+    //    deleting_then_reinserting_an_edge_does_not_merge_retired_properties;
+    //    tests/native_backing_allocator.rs
+    //    non_test_engine_native_controls_match_actual_allocator_requests_and_final_frees;
+    //    renames in the same span (cdb120_partition_insert_cost, paged_generation_load_pricing_contract,
+    //    vector_tail_transaction_contract) change no count;
+    //  - native delivery served beside the legacy handler (ed0b081c, S4, 7), the custody
+    //    history residency check (39dae99c, 1), the delivery journal read through the durable
+    //    group index (0d123de5, 1), an import whose vectors exceed the default read memory
+    //    (e7e6d616, S7, 1): +10 to 33c92dce;
+    //  - S8 (+26): commit cost scales with the transaction, not the store: open table handles
+    //    charged to the writer budget, pending version deltas indexed by position, bulk deletes
+    //    and alternating tables reopen each table once (39b1e99b, 14); held relations charge
+    //    their funded memory through real commits (f1044aae, 2); a synced policy-only vector
+    //    ALTER keeps the receiver's graphs, manifest seeks over pending deltas, and the sender
+    //    ships a policy ALTER apart from vector rows (a97f5e05, 10);
+    //  - S10 (+38 net): open-time journal record validation and open charge flat as history
+    //    grows (4f2f3111, 13); sink queue windows (c9fba2c4, 10; 5e11785f, 7); a covered journal
+    //    cleanup holds the commit lock one step at a time (4f4464b9, 1); two legacy
+    //    policy-hold upgrade tests removed (c257a312, -2); read-only open stays flat as history
+    //    grows (a8270561, 7); a row pays for its partition key once and a refused lineage
+    //    scratch reservation copies nothing (e4cdfcc5, 2);
+    //  - S7 (+39 net): import-tail decodes charged once to the writer, exact-length decode,
+    //    reads and writes charged to their own limits (043ae199, 41); two full-size stress cases
+    //    moved to the nightly tier (fb7367d4, -2);
+    //  - S3 (+25, a259e9f1): bounded custody storage, durable custody reads, validation,
+    //    pending delivery and retirement admission with their regression controls;
+    //  - S9b (+9): an in-transaction COUNT is served from the declared MAINTAIN COUNT (9c8552ca, 5);
+    //    FLOAT equality and order follow PostgreSQL float8 on every route (80648934, 4).
+    // S9's 2 + 11 compaction proofs (ef0615d3, 8ba5e2ea) were already in the 4516 entry.
+    ("contextdb-engine", 4681, RSN_TEST_COUNT),
     ("contextdb-server", 421, RSN_TEST_COUNT),
     ("contextdb-cli", 271, RSN_TEST_COUNT),
 ];
