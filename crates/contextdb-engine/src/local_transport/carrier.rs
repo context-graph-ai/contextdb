@@ -788,51 +788,63 @@ enum ConnectWait {
 }
 
 /// Close-on-exec and non-blocking at creation where the kernel offers it.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
 ))]
 fn new_socket_flags() -> nix::sys::socket::SockFlag {
     nix::sys::socket::SockFlag::SOCK_CLOEXEC | nix::sys::socket::SockFlag::SOCK_NONBLOCK
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
 ))]
 fn configure_new_socket(_socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
     Ok(())
 }
 
 /// Without SOCK_CLOEXEC / SOCK_NONBLOCK (macOS) both are set right after creation.
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
-)))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
 fn new_socket_flags() -> nix::sys::socket::SockFlag {
     nix::sys::socket::SockFlag::empty()
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
-)))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
 fn configure_new_socket(socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
     use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
     fcntl(socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
