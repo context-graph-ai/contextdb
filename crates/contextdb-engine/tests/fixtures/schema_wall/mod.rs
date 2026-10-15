@@ -840,6 +840,24 @@ pub fn assert_affected_only(
         if table.starts_with("__content_identity_") || table.starts_with("__rel_index_") {
             continue;
         }
+        // Each relation a commit opens records its new historical root, keyed
+        // by the physical table name. Only an affected relation may be
+        // witnessed; an unrelated one means the commit touched it.
+        if event.table == "__history_root_witness_v1" {
+            let physical = std::str::from_utf8(&event.key).expect("witness keys are table names");
+            if let Some(owner) = physical.strip_prefix("rel_") {
+                assert!(
+                    affected.contains(owner),
+                    "unrelated relation witnessed by an affected-set commit: {event:?}"
+                );
+            } else {
+                assert!(
+                    physical.starts_with("__rel_index_"),
+                    "unexpected historical root witness: {event:?}"
+                );
+            }
+            continue;
+        }
         if let Some(owner) = table.strip_prefix("rel_") {
             assert!(
                 affected.contains(owner),
