@@ -157,8 +157,13 @@ fn a_delete_bound_through_a_full_index_prefix_examines_only_its_rows() {
     assert_flat(&format!("DELETE FROM p {WHERE}"));
 }
 
+/// Two indexes bind all four equality columns of this WHERE. Every row shares
+/// one connector, so `p_connector_idx` holds the whole context under the bound
+/// prefix and `p_session_idx` holds ten rows. The planner chooses by which
+/// bound range is smaller, never by which index was declared first.
 #[test]
 fn the_same_where_in_a_select_examines_only_its_rows() {
+    let mut examined = Vec::new();
     for rows in [200, 2_000] {
         let (_root, db) = passages(rows);
         let result = db
@@ -170,5 +175,10 @@ fn the_same_where_in_a_select_examines_only_its_rows() {
         );
         assert_eq!(result.rows.len(), ROWS_PER_SESSION as usize);
         assert_eq!(result.trace.index_used.as_deref(), Some("p_session_idx"));
+        examined.push((rows, result.trace.rows_examined));
     }
+    assert_eq!(
+        examined[0].1, examined[1].1,
+        "the SELECT's entries examined grew with the table: {examined:?}"
+    );
 }
