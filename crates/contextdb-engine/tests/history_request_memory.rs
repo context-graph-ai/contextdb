@@ -1708,3 +1708,315 @@ fn cancellation_stops_a_schema_history_reconstruction() {
          peak {cancelled_peak} of {complete_peak}"
     );
 }
+
+/// The on-demand copy of per-row lineage a committed image reads its pending
+/// deletions from.
+const LINEAGE_COPY: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("read_lineage_config");
+const IDENTITY_METADATA: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("__content_identity_metadata");
+const LINEAGE_COPY_COMMITMENT: &str = "read_lineage_config_root_v1";
+
+/// Edit the lineage copy in place, then recompute its own count/XOR root and
+/// the metadata commitment over that root, so only a binding to the committed
+/// Configuration identity can tell the copy was changed.
+fn rewrite_lineage_copy(
+    path: &std::path::Path,
+    edit: impl FnOnce(&mut redb::Table<&str, &[u8]>),
+) {
+    use redb::ReadableTable;
+    let raw = redb::Database::open(path).expect("open the sealed lineage fixture");
+    let write = raw.begin_write().expect("begin a copy-only lineage edit");
+    let mut root = [0_u8; 40];
+    {
+        let mut copy = write.open_table(LINEAGE_COPY).expect("copied lineage index");
+        edit(&mut copy);
+        let mut count = 0_u64;
+        let mut xor = [0_u8; 32];
+        for entry in copy.iter().expect("scan the remaining lineage copy") {
+            let (key, value) = entry.expect("read a copied lineage record");
+            if key.value().is_empty() {
+                continue;
+            }
+            count += 1;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(key.value().as_bytes());
+            hasher.update(value.value());
+            for (dst, src) in xor.iter_mut().zip(hasher.finalize().as_bytes()) {
+                *dst ^= src;
+            }
+        }
+        root[..8].copy_from_slice(&count.to_be_bytes());
+        root[8..].copy_from_slice(&xor);
+        copy.insert("", root.as_slice())
+            .expect("rebuild the copy's own aggregate");
+    }
+    write
+        .open_table(IDENTITY_METADATA)
+        .unwrap()
+        .insert(
+            LINEAGE_COPY_COMMITMENT,
+            blake3::hash(&root).as_bytes().as_slice(),
+        )
+        .expect("rebuild the copy's metadata checksum");
+    write.commit().expect("persist the copy-only lineage edit");
+    drop(raw);
+}
+
+fn first_pending_record_key(copy: &redb::Table<&str, &[u8]>) -> String {
+    use redb::ReadableTable;
+    copy.iter()
+        .unwrap()
+        .filter_map(|entry| {
+            let (key, _) = entry.unwrap();
+            key.value()
+                .starts_with("sync_lineage.v1.record.")
+                .then(|| key.value().to_owned())
+        })
+        .next()
+        .expect("at least one pending deletion is copied")
+}
+
+fn assert_lineage_copy_refused(path: &std::path::Path, what: &str) {
+    let (fallback, _) = fallback_reader(path, None);
+    match change_response(&fallback) {
+        Err(DirectFileReaderError::CorruptStore(..)) => {}
+        other => panic!(
+            "{what}: a lineage copy that disagrees with the committed image is a corrupt store, \
+             not an answer: {:?}",
+            other.map(|response| answer_rows(&response))
+        ),
+    }
+}
+
+/// A lineage copy missing one pending deletion, with its own checksums
+/// recomputed, is refused instead of answering one deletion fewer.
+#[test]
+fn self_consistent_lineage_index_omission_is_refused() {
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    seed_pending_deletions(&path, 2, 8);
+    let (healthy, _) = fallback_reader(&path, None);
+    assert_eq!(
+        answer_rows(&change_response(&healthy).expect("the healthy copy answers")),
+        (2, 8, 0)
+    );
+    drop(healthy);
+    rewrite_lineage_copy(&path, |copy| {
+        let omitted = first_pending_record_key(copy);
+        copy.remove(omitted.as_str())
+            .expect("omit one pending deletion from the copy");
+    });
+    assert_lineage_copy_refused(&path, "omitted record");
+}
+
+/// A lineage copy whose record was rewritten, with its own checksums
+/// recomputed, is refused.
+#[test]
+fn a_rewritten_lineage_index_record_is_refused() {
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    seed_pending_deletions(&path, 2, 8);
+    rewrite_lineage_copy(&path, |copy| {
+        let key = first_pending_record_key(copy);
+        let mut value = {
+            use redb::ReadableTable;
+            copy.get(key.as_str()).unwrap().unwrap().value().to_vec()
+        };
+        let last = value.len() - 1;
+        value[last] ^= 0x01;
+        copy.insert(key.as_str(), value.as_slice())
+            .expect("rewrite one copied record");
+    });
+    assert_lineage_copy_refused(&path, "rewritten record");
+}
+
+/// A committed image lists every pending deletion of every table from the
+/// on-demand lineage copy, after the writer has closed.
+#[test]
+fn image_pending_deletes_survive_lineage_index_split() {
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    seed_pending_deletions(&path, 3, 7);
+    {
+        let database = Database::open(&path).expect("reopen to add a second table");
+        database
+            .execute(
+                "CREATE TABLE q (id UUID PRIMARY KEY, body TEXT)",
+                &HashMap::new(),
+            )
+            .expect("declare a second synced table");
+        for row in 0..5u128 {
+            let params = HashMap::from([(
+                "id".to_owned(),
+                contextdb_core::Value::Uuid(uuid::Uuid::from_u128(0x6000_0000 + row)),
+            )]);
+            database
+                .execute("INSERT INTO q (id, body) VALUES ($id, 'body')", &params)
+                .expect("insert a second-table row");
+            database
+                .execute("DELETE FROM q WHERE id = $id", &params)
+                .expect("delete a second-table row");
+        }
+        database.close().expect("close the two-table fixture");
+    }
+    let (fallback, _) = fallback_reader(&path, None);
+    assert_eq!(
+        answer_rows(&change_response(&fallback).expect("the image answers")),
+        (3, 12, 0),
+        "every pending deletion of both tables is listed once"
+    );
+}
+
+/// Purged lives displaced into the lineage history are read and checked on
+/// request too; a cancellation during that scan stops it.
+#[test]
+fn purged_lineage_scan_honors_cancellation() {
+    use contextdb_engine::direct_file_reader::test_seams::force_history_log_gap_for_test;
+    const LIVES: usize = 600;
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    seed_pending_deletions(&path, 1, 1);
+    {
+        let database = Database::open(&path).expect("reopen to purge repeated lives");
+        database
+            .execute(
+                "CREATE TABLE purged (id UUID PRIMARY KEY, batch TEXT NOT NULL) SYNC OFF",
+                &HashMap::new(),
+            )
+            .expect("declare the purged table");
+        let params = HashMap::from([(
+            "id".to_owned(),
+            contextdb_core::Value::Uuid(uuid::Uuid::from_u128(0x7000_0000)),
+        )]);
+        for _ in 0..LIVES {
+            database
+                .execute("INSERT INTO purged (id, batch) VALUES ($id, 'a')", &params)
+                .expect("a new life at the purged key");
+            database
+                .execute("PURGE FROM purged WHERE batch = 'a'", &HashMap::new())
+                .expect("purge that life");
+        }
+        database.close().expect("close the purged-history fixture");
+    }
+    let run = |cancel_at: Option<usize>| {
+        let cancellation = DirectCancellation::new();
+        let clock = Arc::new(SteppingClock {
+            armed: false.into(),
+            reads: 0.into(),
+            cancel_at: std::sync::Mutex::new(cancel_at.map(|at| (at, cancellation.clone()))),
+        });
+        let mut config = config(None);
+        config.limits.active_ms = u64::MAX / 4;
+        config.clock = clock.clone();
+        let reader = open_for_test(&path, config).expect("open the checkpoint reader");
+        force_history_log_gap_for_test(&reader);
+        clock.armed.store(true, Ordering::SeqCst);
+        let answer = metadata_with_cancellation_for_test(
+            &reader,
+            DirectMetadataRequest::ImageState {
+                kind: DirectImageMetadataKind::ChangeLog,
+            },
+            &cancellation,
+        );
+        (
+            answer.map(|response| answer_rows(&response)),
+            clock.reads.load(Ordering::SeqCst),
+        )
+    };
+    let (complete, steps) = run(None);
+    assert_eq!(complete.expect("an uncancelled request answers").1, 1);
+    assert!(
+        steps > LIVES,
+        "the purged-history scan checks for cancellation per record: {steps} steps for {LIVES} lives"
+    );
+    let (cancelled, _) = run(Some(steps / 2));
+    assert!(
+        matches!(cancelled, Err(DirectFileReaderError::Cancelled)),
+        "a request cancelled during the purged-history scan is cancelled: {cancelled:?}"
+    );
+}
+
+/// A large lineage record is never copied past the reader's room: a reader
+/// without room for it is refused, typed, and allocates no more than that
+/// room (plus storage read slack) before the refusal.
+#[test]
+fn lineage_authentication_scratch_is_admitted_before_copy() {
+    // Room enough for the request's history load, not for one record's
+    // authentication copy.
+    const KEY_BYTES: usize = 512 * 1024;
+    const ROOM: usize = 4 * 1024 * 1024 + 512 * 1024;
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    {
+        let database = Database::open(&path).expect("open the wide-key fixture");
+        database
+            .execute(
+                "CREATE TABLE wide (id TEXT PRIMARY KEY, body TEXT)",
+                &HashMap::new(),
+            )
+            .expect("declare a synced wide-key table");
+        let params = HashMap::from([(
+            "id".to_owned(),
+            contextdb_core::Value::Text("k".repeat(KEY_BYTES)),
+        )]);
+        database
+            .execute("INSERT INTO wide (id, body) VALUES ($id, 'body')", &params)
+            .expect("insert the wide-key row");
+        database
+            .execute("DELETE FROM wide WHERE id = $id", &params)
+            .expect("delete the wide-key row");
+        database.close().expect("close the wide-key fixture");
+    }
+    let largest_copied_record = {
+        use redb::{ReadableDatabase, ReadableTable};
+        let raw = redb::Database::open(&path).expect("open the wide-key fixture");
+        let read = raw.begin_read().unwrap();
+        let copy = read.open_table(LINEAGE_COPY).unwrap();
+        copy.iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                key.value().len() + value.value().len()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let (roomy, cached) = fallback_reader(&path, None);
+    assert_eq!(
+        answer_rows(&change_response(&roomy).expect("with room, the deletion answers")).1,
+        1
+    );
+    drop(roomy);
+    // Loading history on request needs transient room it returns before the
+    // answer; hold competing admitted work afterwards, leaving less room than
+    // one record's authentication copy.
+    let (tight, _) = fallback_reader(&path, Some(cached + 64 * largest_copied_record));
+    let _competing_work =
+        contextdb_engine::direct_file_reader::test_seams::hold_reader_memory_leaving_for_test(
+            &tight,
+            ROOM,
+        )
+        .expect("hold competing admitted work");
+    let (refused, refused_peak) = measure(|| change_response(&tight));
+    assert!(
+        refused_peak <= ROOM + STORAGE_READ_SLACK_BYTES,
+        "the refused request copied past what it could admit: peak={refused_peak} room={ROOM}"
+    );
+    match refused {
+        Err(DirectFileReaderError::MemoryBudget {
+            requested_bytes,
+            available_bytes,
+            ..
+        }) => {
+            assert!(
+                requested_bytes > available_bytes,
+                "the refusal is typed at the reservation that did not fit"
+            );
+        }
+        other => panic!(
+            "a reader without room for the authentication copy is refused before it: {:?}",
+            other.map(|response| answer_rows(&response))
+        ),
+    }
+}
