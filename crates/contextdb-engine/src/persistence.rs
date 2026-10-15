@@ -33215,6 +33215,26 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
     }
 
+    /// One bounded step of T2 in its own committed transaction: returns
+    /// whether the covered prefix is gone and how many records it removed.
+    /// A caller that holds the commit lock takes it for one step at a time.
+    pub(crate) fn truncate_vector_partition_journal_step_with_checkpoint(
+        &self,
+        expected_catalog: &VectorPartitionGenerationCatalogRecord,
+        workspace: &mut VectorWorkspaceReservation,
+        checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<(bool, usize)> {
+        let mut removed = 0usize;
+        let complete = self.truncate_vector_partition_journal_in_steps(
+            expected_catalog,
+            workspace,
+            checkpoint,
+            VECTOR_JOURNAL_CLEANUP_STEP_RECORDS,
+            &mut removed,
+        )?;
+        Ok((complete, removed))
+    }
+
     /// The reopen retry of T2: one bounded step. It reads at most
     /// `VECTOR_JOURNAL_CLEANUP_STEP_RECORDS` journal records, removes the
     /// covered ones among them in one committed transaction and leaves the

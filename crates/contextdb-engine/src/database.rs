@@ -23795,6 +23795,36 @@ impl MaintenanceContext {
     fn publish_direct_metadata<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
         publish_direct_metadata(&self.tx_mgr, write)
     }
+
+    /// T2 for maintenance: the covered journal prefix is removed one bounded
+    /// committed step at a time, each under its own commit-lock hold, so a
+    /// write admitted while a backlog remains commits between steps instead
+    /// of waiting for the whole cleanup. `decode` installs the decode owner a
+    /// step runs under, if the caller has one.
+    fn truncate_vector_journal_in_published_steps(
+        &self,
+        persistence: &RedbPersistence,
+        catalog: &VectorPartitionGenerationCatalogRecord,
+        workspace: &mut contextdb_vector::VectorWorkspaceReservation,
+        mut decode: impl FnMut() -> Result<Option<crate::read_image_memory::ImageMemoryScope>>,
+    ) -> Result<bool> {
+        loop {
+            let (complete, removed) = self.publish_direct_metadata(|| {
+                let _decode = decode()?;
+                persistence.truncate_vector_partition_journal_step_with_checkpoint(
+                    catalog,
+                    workspace,
+                    || self.build_checkpoint(),
+                )
+            })?;
+            if complete || removed == 0 {
+                return Ok(complete);
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            maybe_pause_between_vector_journal_cleanup_steps_for_test();
+            self.build_checkpoint()?;
+        }
+    }
     fn retain_published_vector_cleanup_failure(
         &self,
         partition: &VectorPartitionRef,
@@ -23947,13 +23977,12 @@ impl MaintenanceContext {
         cleanup_workspace: &mut contextdb_vector::VectorWorkspaceReservation,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
-        match self.publish_direct_metadata(|| {
-            persistence.truncate_vector_partition_journal_through_catalog_with_checkpoint(
-                catalog,
-                cleanup_workspace,
-                || self.build_checkpoint(),
-            )
-        }) {
+        match self.truncate_vector_journal_in_published_steps(
+            persistence,
+            catalog,
+            cleanup_workspace,
+            || Ok(None),
+        ) {
             Ok(_) => {}
             Err(Error::StoreCorrupted { .. }) => {
                 self.vector.quarantine_partition_route(
@@ -26593,14 +26622,12 @@ impl MaintenanceContext {
                         vector_journal_cleanup_cancellation_tests::before_published_cleanup_for_test(
                             &published_catalog,
                         );
-                            let truncated = match self.publish_direct_metadata(|| {
-                                persistence
-                                .truncate_vector_partition_journal_through_catalog_with_checkpoint(
-                                    &published_catalog,
-                                    &mut workspace,
-                                    || self.build_checkpoint(),
-                                )
-                            }) {
+                            let truncated = match self.truncate_vector_journal_in_published_steps(
+                                persistence,
+                                &published_catalog,
+                                &mut workspace,
+                                || Ok(None),
+                            ) {
                                 Ok(truncated) => truncated,
                                 Err(
                                     error @ (Error::ReadCancelled | Error::PublicationInterrupted),

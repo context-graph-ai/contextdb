@@ -1447,22 +1447,24 @@ impl MaintenanceContext {
             "truncate_vector_partition_journal",
             "Raise MEMORY_LIMIT before cleaning this maintained route.",
         )?;
-        let truncated = match self.publish_direct_metadata(|| {
-            // Each covered record the cleanup decodes is admitted in its
-            // writer workspace and dropped before the next is read; its
-            // decode is charged to this writer for that one record, not
-            // kept by a private reader at the shipped default.
-            let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
-                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                0,
-            )?;
-            let _decode = decode.enter();
-            persistence.truncate_vector_partition_journal_through_catalog_with_checkpoint(
-                &published_catalog,
-                &mut workspace,
-                || self.build_checkpoint(),
-            )
-        }) {
+        let truncated = match self.truncate_vector_journal_in_published_steps(
+            persistence,
+            &published_catalog,
+            &mut workspace,
+            || {
+                // Each covered record the cleanup decodes is admitted in its
+                // writer workspace and dropped before the next is read; its
+                // decode is charged to this writer for that one record, not
+                // kept by a private reader at the shipped default.
+                let decode = crate::read_image_memory::ImageMemory::operation_writer_per_call(
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
+                    0,
+                )?;
+                Ok(Some(decode.enter()))
+            },
+        ) {
             Ok(truncated) => truncated,
             Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
                 return Err(error);
