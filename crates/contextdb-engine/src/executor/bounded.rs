@@ -313,6 +313,9 @@ struct RequestContext {
     live_source_pages: Arc<std::sync::atomic::AtomicUsize>,
     /// The caller-supplied budget retained by this executing request.
     reader_budget: Arc<dyn ReadMemoryBudget>,
+    /// Bound-range sizes of tied index candidates, probed once per request so
+    /// preflight, ordering and build choose the same index.
+    index_ranges: crate::executor::IndexRangeMemo,
     #[cfg(any(test, feature = "test-seams"))]
     probe: Mutex<Option<Arc<dyn BoundedExecutionProbe>>>,
 }
@@ -456,6 +459,7 @@ impl RequestContext {
         Self::check_effective_limits(&limits)?;
         let started_ms = clock.now_ms();
         let context = Arc::new_cyclic(|context| Self {
+            index_ranges: Default::default(),
             vector_read_capture: Mutex::new(None),
             vector_copies: Mutex::new(crate::vector_read_memory::admission(Arc::new(
                 WeakSourceDecodeBudget(context.clone()),
@@ -1227,6 +1231,35 @@ impl RequestContext {
         });
         let _decode = decode.as_ref().map(|decode| decode.enter());
         operation(&mut owner)
+    }
+
+    /// This request's sizer for index candidates that tie on their declaration.
+    fn index_range_sizes<'a>(
+        &'a self,
+        db: &'a dyn ReadExecutionTarget,
+        snapshot: SnapshotId,
+    ) -> crate::executor::IndexRangeSizes<'a> {
+        crate::executor::IndexRangeSizes::new(
+            db,
+            snapshot,
+            self.reader_budget.clone(),
+            &self.index_ranges,
+        )
+    }
+
+    /// Count the index entries this request's range probes read as examined.
+    fn note_index_range_probes(&self) -> std::result::Result<(), BoundedExecutionError> {
+        let entries = self.index_ranges.take_entries_read();
+        if entries != 0 {
+            let mut state = self.state();
+            state.completed_rows_examined = state
+                .completed_rows_examined
+                .checked_add(entries)
+                .ok_or_else(|| {
+                    Error::Other("bounded rows-examined counter overflow".to_string())
+                })?;
+        }
+        Ok(())
     }
 
     fn state(&self) -> MutexGuard<'_, RequestState> {
@@ -11427,17 +11460,24 @@ fn preflight_plan_indexes(
     match plan {
         PhysicalPlan::Limit { count: 0, .. } => Ok(()),
         PhysicalPlan::Scan { table, filter, .. } => {
+            let ranges = context.index_range_sizes(db, snapshot);
             if let Some(filter) = filter.as_ref()
                 && let Some(meta) = db.table_meta(table)
-                && let Some(pick) = analyze_filter_for_index(table, &meta, filter, params).pick
+                && let Some(pick) =
+                    analyze_filter_for_index(table, &meta, filter, params, Some(&ranges)).pick
             {
+                context.note_index_range_probes()?;
                 preflight(table, &pick.name)?;
             }
+            context.note_index_range_probes()?;
             Ok(())
         }
         PhysicalPlan::IndexScan { table, index, .. } => preflight(table, index),
         PhysicalPlan::Sort { input, keys } => {
-            if let Some((table, _, ordered)) = ordered_scan(db, input, keys, params) {
+            let ranges = context.index_range_sizes(db, snapshot);
+            let ordered = ordered_scan(db, input, keys, params, Some(&ranges));
+            context.note_index_range_probes()?;
+            if let Some((table, _, ordered)) = ordered {
                 preflight(table, &ordered.index)?;
             }
             preflight_plan_indexes(db, input, params, snapshot, context)
@@ -11705,7 +11745,14 @@ fn build_authenticated_index_count(
     let Some(meta) = db.table_meta(table) else {
         return Err(Error::TableNotFound(table.clone()).into());
     };
-    let analysis = analyze_filter_for_index(table, &meta, filter, params);
+    let analysis = analyze_filter_for_index(
+        table,
+        &meta,
+        filter,
+        params,
+        Some(&context.index_range_sizes(db, snapshot)),
+    );
+    context.note_index_range_probes()?;
     let Some(pick) = analysis.pick else {
         return Ok(None);
     };
@@ -12605,7 +12652,10 @@ fn build_ranked_prefix(
         if let PhysicalPlan::Scan { filter, .. } = &mut group_scan {
             *filter = Some(group_filter);
         }
-        let Some((_, filter, ordered)) = ordered_scan(db, &group_scan, &keys, &params) else {
+        let ranges = context.index_range_sizes(db, snapshot);
+        let ordered = ordered_scan(db, &group_scan, &keys, &params, Some(&ranges));
+        context.note_index_range_probes()?;
+        let Some((_, filter, ordered)) = ordered else {
             return Ok(None);
         };
         if ordered.reverse {
@@ -13258,7 +13308,10 @@ fn build_kernel_with_ctes<'plan>(
             // Asked once, so the two places below cannot disagree about
             // whether a transaction is open.
             let inside_transaction = context.transaction().is_some();
-            if let Some((table, filter, ordered)) = ordered_scan(db, input, keys, &params) {
+            let ranges = context.index_range_sizes(db, snapshot);
+            let ordered = ordered_scan(db, input, keys, &params, Some(&ranges));
+            context.note_index_range_probes()?;
+            if let Some((table, filter, ordered)) = ordered {
                 return build_scan(
                     db,
                     table,
@@ -15583,8 +15636,10 @@ fn build_scan(
     // query first turns `a IN (SELECT ...)` into a list of literals, and a
     // shape the writer never wrote then looks indexable -- so the two doors
     // disagree about whether the statement uses an index at all.
+    let ranges = context.index_range_sizes(db, snapshot);
     let filter_analysis =
-        filter.map(|filter| analyze_filter_for_index(table, &meta, filter, &params));
+        filter.map(|filter| analyze_filter_for_index(table, &meta, filter, &params, Some(&ranges)));
+    context.note_index_range_probes()?;
     // A predicate that can match nothing -- contradictory equalities on the
     // same column, a NULL bound where a value is required, a literal
     // that cannot even be read as the column's type -- answers zero rows
@@ -16259,6 +16314,7 @@ fn ordered_scan<'a>(
     input: &'a PhysicalPlan,
     keys: &'a [SortKey],
     params: &HashMap<String, Value>,
+    ranges: Option<&crate::executor::IndexRangeSizes<'_>>,
 ) -> Option<(&'a str, Option<&'a Expr>, OrderedIndexScan)> {
     let PhysicalPlan::Scan { table, filter, .. } = input else {
         return None;
@@ -16280,6 +16336,7 @@ fn ordered_scan<'a>(
             Some(keys),
             true,
             automatic_ordered,
+            ranges,
         )
         .pick?;
         meta.indexes
@@ -16328,6 +16385,7 @@ fn ordered_scan<'a>(
             Some(keys),
             true,
             automatic_ordered,
+            ranges,
         ))
     });
     let predicate_pick = sort_analysis

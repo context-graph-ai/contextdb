@@ -33827,8 +33827,15 @@ impl Database {
         // query that can never run reads as a green light for it.
         validate_plan_columns(self, &plan)?;
         let vector_shape = vector_search_shape_from_plan(&plan);
+        let range_memo = crate::executor::IndexRangeMemo::default();
+        let ranges = crate::executor::IndexRangeSizes::new(
+            self,
+            self.snapshot_for_read(),
+            read_memory.clone(),
+            &range_memo,
+        );
         let relational_route = if vector_shape.is_none() {
-            analyze_passive_relational_route(self, &plan, params)
+            analyze_passive_relational_route(self, &plan, params, &ranges)
         } else {
             None
         };

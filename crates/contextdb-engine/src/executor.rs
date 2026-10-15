@@ -5715,6 +5715,8 @@ fn execute_plan_once(
             // Analyze the PRE-resolve filter so `a IN (SELECT …)` disqualifies
             // the outer IndexScan even after the subquery has been executed.
             let meta_for_indexes = db.table_meta(table);
+            let range_memo = IndexRangeMemo::default();
+            let ranges = IndexRangeSizes::new(db, snapshot, read_memory.clone(), &range_memo);
             let analysis = filter
                 .as_ref()
                 .filter(|_| {
@@ -5735,9 +5737,11 @@ fn execute_plan_once(
                             params,
                             pending_sort_keys,
                             false,
+                            Some(&ranges),
                         )
                     })
                 });
+            db.__bump_rows_examined(range_memo.take_entries_read());
 
             if let Some(a) = analysis {
                 if let Some(pick) = a.pick {
@@ -7690,10 +7694,13 @@ fn exec_delete(
     // Keep the residual predicate and access checks on the selected rows;
     // returning every unrelated row would charge a full-table output copy.
     let rows = if let Some(where_clause) = resolved_where.as_ref() {
-        let indexed = db
-            .table_meta(&p.table)
-            .as_ref()
-            .and_then(|meta| analyze_filter_for_index(&p.table, meta, where_clause, params).pick)
+        let range_memo = IndexRangeMemo::default();
+        let ranges = IndexRangeSizes::new(db, snapshot, read_memory.clone(), &range_memo);
+        let pick = db.table_meta(&p.table).as_ref().and_then(|meta| {
+            analyze_filter_for_index(&p.table, meta, where_clause, params, Some(&ranges)).pick
+        });
+        db.__bump_rows_examined(range_memo.take_entries_read());
+        let indexed = pick
             .map(|pick| {
                 execute_index_scan(
                     db,
@@ -8015,9 +8022,13 @@ fn exec_update(
     let rows = if let Some(rows) = direct_rows {
         rows
     } else if let Some(where_clause) = resolved_where.as_ref() {
-        let indexed_rows = table_meta
-            .as_ref()
-            .and_then(|meta| analyze_filter_for_index(&p.table, meta, where_clause, params).pick)
+        let range_memo = IndexRangeMemo::default();
+        let ranges = IndexRangeSizes::new(db, snapshot, read_memory.clone(), &range_memo);
+        let pick = table_meta.as_ref().and_then(|meta| {
+            analyze_filter_for_index(&p.table, meta, where_clause, params, Some(&ranges)).pick
+        });
+        db.__bump_rows_examined(range_memo.take_entries_read());
+        let indexed_rows = pick
             .map(|pick| {
                 execute_index_scan(
                     db,
@@ -9726,7 +9737,153 @@ struct IndexAnalysis {
     considered: Vec<crate::database::IndexCandidate>,
 }
 
-/// The relational route a plan would take, derived without touching rows.
+/// Entries a probe reads from one tied candidate's bound range before it
+/// stops. Two ranges that both reach it are left to the remaining tie-breaks.
+pub(crate) const TIED_INDEX_RANGE_PROBE_CAP: usize = 64;
+
+/// One statement's probed bound-range sizes. Every analysis of the same pick
+/// in the statement (preflight, build, EXPLAIN) gets the same size back, so
+/// they choose the same index.
+#[derive(Default)]
+pub(crate) struct IndexRangeMemo {
+    sizes: parking_lot::Mutex<HashMap<String, usize>>,
+    entries_read: std::sync::atomic::AtomicU64,
+}
+
+impl IndexRangeMemo {
+    /// Index entries the statement's probes read, for its examined count.
+    pub(crate) fn take_entries_read(&self) -> u64 {
+        self.entries_read
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// How an index analysis sizes candidates that tie on everything the
+/// declaration says: equally many bound equality columns at the same
+/// selectivity. Industry-standard planners choose among such indexes by how
+/// many entries each one's bound range holds, never by declaration order; with
+/// no statistics this reads each tied range through the route's own ordered
+/// cursor, up to [`TIED_INDEX_RANGE_PROBE_CAP`] entries, and the smaller wins.
+pub(crate) struct IndexRangeSizes<'a> {
+    target: &'a dyn ReadExecutionTarget,
+    snapshot: SnapshotId,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memo: &'a IndexRangeMemo,
+}
+
+impl<'a> IndexRangeSizes<'a> {
+    pub(crate) fn new(
+        target: &'a dyn ReadExecutionTarget,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memo: &'a IndexRangeMemo,
+    ) -> Self {
+        Self {
+            target,
+            snapshot,
+            read_memory,
+            memo,
+        }
+    }
+
+    /// The entries in `pick`'s bound range, capped. A probe this route cannot
+    /// complete reports the cap: no information, so the tie stays with the
+    /// remaining tie-breaks.
+    fn size(&self, table: &str, pick: &IndexPick) -> usize {
+        let key = format!("{table}\u{0}{pick:?}");
+        if let Some(size) = self.memo.sizes.lock().get(&key) {
+            return *size;
+        }
+        let size = capped_index_range_entries(
+            self.target,
+            table,
+            pick,
+            self.snapshot,
+            self.read_memory.clone(),
+        )
+        .unwrap_or(TIED_INDEX_RANGE_PROBE_CAP);
+        self.memo
+            .entries_read
+            .fetch_add(size as u64, std::sync::atomic::Ordering::SeqCst);
+        self.memo.sizes.lock().insert(key, size);
+        size
+    }
+}
+
+/// Read `pick`'s bound range through the same ordered cursor every route
+/// serves that index with, stopping at [`TIED_INDEX_RANGE_PROBE_CAP`] entries.
+fn capped_index_range_entries(
+    target: &dyn ReadExecutionTarget,
+    table: &str,
+    pick: &IndexPick,
+    snapshot: SnapshotId,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let pick = target.coerce_pick_shape_to_column_type(table, pick)?;
+    if pick_matches_nothing(&pick) {
+        return Ok(0);
+    }
+    let meta = target
+        .table_meta(table)
+        .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+    if !meta.indexes.iter().any(|decl| decl.name == pick.name) {
+        return Ok(TIED_INDEX_RANGE_PROBE_CAP);
+    }
+    let (column, direction) = pick
+        .columns
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Other("index has no leading column".into()))?;
+    let cursor =
+        contextdb_relational::mem::BoundedOrderedRowCursor::for_index(pick.name.clone(), false);
+    let mut cursor = if matches!(
+        pick.shape,
+        IndexPredicateShape::Equality(_)
+            | IndexPredicateShape::InList(_)
+            | IndexPredicateShape::IsNull
+    ) {
+        cursor.seeking_runs(expanded_index_runs(&pick)?)
+    } else {
+        let (lower, upper, prefix) = bounded::declared_index_run(&pick, direction, false);
+        cursor.seeking_run_with_prefix_len(lower, upper, prefix)
+    };
+    cursor.source_configure(pick.columns.len());
+    let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+    let mut entries = 0;
+    while entries < TIED_INDEX_RANGE_PROBE_CAP {
+        let row = target.bounded_ordered_table_row_next_observed(
+            read_memory.clone(),
+            table,
+            &column,
+            direction,
+            snapshot,
+            &mut cursor,
+            &mut || Ok(()),
+            &mut || Ok(()),
+            &mut |_, _| Ok(()),
+            &mut |bytes| {
+                bytes
+                    .retain_into(
+                        &mut credit,
+                        "query",
+                        "index_range_probe",
+                        "Raise MEMORY_LIMIT to compare the tied indexes' ranges.",
+                    )
+                    .map_err(Into::into)
+            },
+        )?;
+        if row.is_none() {
+            break;
+        }
+        entries += 1;
+    }
+    Ok(entries)
+}
+
+/// The relational route a plan would take, derived without executing it.
+/// Its one storage read is the bounded probe that tells tied index candidates
+/// apart (at most [`TIED_INDEX_RANGE_PROBE_CAP`] entries each), the same one
+/// execution makes, so the two cannot name different indexes.
 ///
 /// This is deliberately distinct from [`QueryTrace`]: it is planning
 /// metadata, not a receipt for work that happened. The analysis below reuses
@@ -9752,8 +9909,9 @@ pub(crate) fn analyze_passive_relational_route(
     db: &Database,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
+    ranges: &IndexRangeSizes<'_>,
 ) -> Option<PassiveRelationalRoute> {
-    analyze_passive_relational_route_with_sort(db, plan, params, None)
+    analyze_passive_relational_route_with_sort(db, plan, params, None, ranges)
 }
 
 fn analyze_passive_relational_route_with_sort(
@@ -9761,6 +9919,7 @@ fn analyze_passive_relational_route_with_sort(
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
+    ranges: &IndexRangeSizes<'_>,
 ) -> Option<PassiveRelationalRoute> {
     match plan {
         PhysicalPlan::Scan { table, filter, .. } => {
@@ -9782,6 +9941,7 @@ fn analyze_passive_relational_route_with_sort(
                             params,
                             pending_sort_keys,
                             true,
+                            Some(ranges),
                         )
                     })
                 });
@@ -9827,7 +9987,7 @@ fn analyze_passive_relational_route_with_sort(
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::MaterializeCte { input, .. } => {
-            analyze_passive_relational_route_with_sort(db, input, params, pending_sort_keys)
+            analyze_passive_relational_route_with_sort(db, input, params, pending_sort_keys, ranges)
         }
         PhysicalPlan::Sort { input, keys } => {
             // Runtime sort path A walks a matching index directly when the
@@ -9852,6 +10012,7 @@ fn analyze_passive_relational_route_with_sort(
                 input,
                 params,
                 Some(keys.as_slice()),
+                ranges,
             )?;
             // Runtime sort path B keeps an already-selected index when its
             // order satisfies the requested key prefix. Either direction:
@@ -10114,8 +10275,9 @@ fn analyze_filter_for_index(
     meta: &TableMeta,
     filter: &Expr,
     params: &HashMap<String, Value>,
+    ranges: Option<&IndexRangeSizes<'_>>,
 ) -> IndexAnalysis {
-    analyze_filter_for_index_with_sort(table, meta, filter, params, None, false)
+    analyze_filter_for_index_with_sort(table, meta, filter, params, None, false, ranges)
 }
 
 /// [`analyze_filter_for_index`], plus a still-needed `ORDER BY` the winner
@@ -10135,6 +10297,7 @@ fn analyze_filter_for_index_with_sort(
     params: &HashMap<String, Value>,
     sort_keys: Option<&[contextdb_planner::SortKey]>,
     allow_reverse: bool,
+    ranges: Option<&IndexRangeSizes<'_>>,
 ) -> IndexAnalysis {
     analyze_filter_for_index_with_capability(
         table,
@@ -10144,6 +10307,7 @@ fn analyze_filter_for_index_with_sort(
         sort_keys,
         allow_reverse,
         false,
+        ranges,
     )
 }
 
@@ -10159,6 +10323,7 @@ fn analyze_filter_for_index_with_capability(
     sort_keys: Option<&[contextdb_planner::SortKey]>,
     allow_reverse: bool,
     automatic_ordered: bool,
+    ranges: Option<&IndexRangeSizes<'_>>,
 ) -> IndexAnalysis {
     #[cfg(any(test, feature = "test-seams"))]
     let _finite_planner_observation = FinitePlannerObservationScope::enter();
@@ -10347,15 +10512,37 @@ fn analyze_filter_for_index_with_capability(
     // regardless of how many candidates there are or what order they were
     // declared in.
     let order_by_pending = sort_keys.is_some_and(|keys| !keys.is_empty());
+    // A fully bound, non-NULL unique equality matches at most one row; prefer it
+    // over any prefix that is not one, however many more columns that prefix binds.
+    let lead = |c: &IndexCandidatePlan| {
+        (
+            !(c.whole_key && c.unique && c.single_row_probe),
+            std::cmp::Reverse(c.match_count),
+            c.tier,
+        )
+    };
+    // Candidates that tie on all of that are told apart by how many entries
+    // their bound ranges hold; only those are probed.
+    let range_sizes: HashMap<String, usize> = match (ranges, candidates.iter().map(lead).min()) {
+        (Some(ranges), Some(best)) if candidates.iter().filter(|c| lead(c) == best).count() > 1 => {
+            candidates
+                .iter()
+                .filter(|c| lead(c) == best)
+                .map(|c| (c.pick.name.clone(), ranges.size(table, &c.pick)))
+                .collect()
+        }
+        _ => HashMap::new(),
+    };
+    let range_of = |c: &IndexCandidatePlan| range_sizes.get(&c.pick.name).copied().unwrap_or(0);
     let winner = candidates
         .iter()
         .min_by_key(|c| {
+            let (unique_point, match_count, tier) = lead(c);
             (
-                // A fully bound, non-NULL unique equality matches at most one row; prefer it
-                // over any prefix that is not one, however many more columns that prefix binds.
-                !(c.whole_key && c.unique && c.single_row_probe),
-                std::cmp::Reverse(c.match_count),
-                c.tier,
+                unique_point,
+                match_count,
+                tier,
+                range_of(c),
                 candidate_placement_rank(c, order_by_pending),
                 c.column_count,
                 c.creation_index,
@@ -10389,6 +10576,8 @@ fn analyze_filter_for_index_with_capability(
                 "fewer predicate columns matched than chosen index"
             } else if candidate.tier > winner.tier {
                 "lower selectivity than chosen index"
+            } else if range_of(candidate) > range_of(winner) {
+                "larger bound range than chosen index"
             } else if winner_implies_one_row && !candidate_implies_one_row {
                 "chosen index is UNIQUE and reads at most one row, so no sort is needed"
             } else if winner.sort_elides && !candidate.sort_elides {
@@ -14163,7 +14352,9 @@ pub(crate) fn vector_candidate_plan_has_complete_relational_route(
             let Some(meta) = db.table_meta(table) else {
                 return Ok(false);
             };
-            let Some(_) = analyze_filter_for_index(table, &meta, filter, params).pick else {
+            // Only whether some index serves the filter matters here, which a
+            // tie between candidates cannot change, so nothing is probed.
+            let Some(_) = analyze_filter_for_index(table, &meta, filter, params, None).pick else {
                 return Ok(false);
             };
             // The scan kernel coerces this same pick when it opens the index
@@ -15759,7 +15950,11 @@ where
             continue;
         }
 
-        let analysis = analyze_filter_for_index(&table_name, &meta, &start_filter, params);
+        let range_memo = IndexRangeMemo::default();
+        let ranges = IndexRangeSizes::new(db, snapshot, read_memory.clone(), &range_memo);
+        let analysis =
+            analyze_filter_for_index(&table_name, &meta, &start_filter, params, Some(&ranges));
+        examined = examined.saturating_add(range_memo.take_entries_read());
         let (ids, scanned) = read(&table_name, analysis.pick.as_ref())?;
         examined = examined.saturating_add(scanned);
         candidate_ids.extend(ids);
