@@ -500,7 +500,9 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // partition (908e09ef) and keeps opening and expansion inside the original cap
     // (9ea05b99), one proof each, S5; the policy layout update admits, refunds and publishes
     // only the policy, three proofs (a6ab7690, S8).
-    ("contextdb-vector", 204, RSN_TEST_COUNT),
+    // Raised 2026-10-15 (204 -> 207, +3, S8): a policy recheck looks at no partition without
+    // failures, only the failed one with one, and every one once when its index is incomplete.
+    ("contextdb-vector", 207, RSN_TEST_COUNT),
     ("contextdb-parser", 137, RSN_TEST_COUNT),
     ("contextdb-planner", 10, RSN_TEST_COUNT),
     // Approved continued-growth proofs: unique-key predicate writes match current-entry reads;
@@ -561,7 +563,12 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // S9's 2 + 11 compaction proofs (ef0615d3, 8ba5e2ea) were already in the 4516 entry.
     // 2026-10-15, S9b (+1): a draining owner keeps its exact channel until admitted work
     // leaves, the read contract's close order (Vigil store/shutdown).
-    ("contextdb-engine", 4682, RSN_TEST_COUNT),
+    // Raised 2026-10-15 (4682 -> 4688, +6, S8): a one-table commit visits no other table's
+    // declaration or saved row count (1); a synced policy change clears a failure its new
+    // policy no longer needs (1); an UPDATE or DELETE bound through a full index prefix, and the
+    // same WHERE as a SELECT, examine only their rows, tied indexes chosen by range (3); every
+    // route counts the same entries examined (1).
+    ("contextdb-engine", 4688, RSN_TEST_COUNT),
     ("contextdb-server", 421, RSN_TEST_COUNT),
     ("contextdb-cli", 271, RSN_TEST_COUNT),
 ];
