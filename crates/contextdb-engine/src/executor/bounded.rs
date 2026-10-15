@@ -11542,6 +11542,116 @@ fn build_kernel(
     build_kernel_with_ctes(db, plan, params, snapshot, &HashMap::new(), context).map(|node| *node)
 }
 
+/// The writer transaction's view of one maintained prefix count: the committed
+/// total, less the committed rows this transaction hides (deletes by identity,
+/// or restages) whose committed values are under the prefix, plus its own
+/// staged rows under the prefix.
+///
+/// The work is one bounded committed-row read per staged row and per staged
+/// deletion of this table, and one touch per staged row: what the transaction
+/// itself staged, never the table's history. A deletion staged by VALUE cannot
+/// say which committed rows it hides without reading them, so that shape
+/// returns `None` and the caller counts the index range exactly instead.
+#[allow(clippy::too_many_arguments)]
+fn in_transaction_prefix_count(
+    db: &dyn ReadExecutionTarget,
+    tx: TxId,
+    table: &str,
+    columns: &[(String, contextdb_core::SortDirection)],
+    prefix: &IndexKey,
+    committed: u64,
+    snapshot: SnapshotId,
+    context: &Arc<RequestContext>,
+) -> std::result::Result<Option<u64>, BoundedExecutionError> {
+    let overlay = db.transaction_table_overlay(
+        tx,
+        table,
+        context.source_read_memory(BoundedWorkSource::IndexRange),
+    )?;
+    if overlay.is_empty() {
+        return Ok(Some(committed));
+    }
+    if overlay
+        .delete_predicates
+        .iter()
+        .any(|predicate| predicate.table == table)
+    {
+        return Ok(None);
+    }
+    context.reserve(BoundedWorkSource::IndexRange, overlay.bytes)?;
+    let under_prefix = |row: &VersionedRow| {
+        columns
+            .iter()
+            .zip(prefix.iter())
+            .all(|((column, _), key)| {
+                let wanted = match key {
+                    DirectedValue::Asc(TotalOrdAsc(value)) => value,
+                    DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                };
+                row.values.get(column).unwrap_or(&Value::Null) == wanted
+            })
+    };
+    // Every committed row the transaction may hide, once: deleted by identity,
+    // or restaged under the same identity by an update.
+    let mut hidden: Vec<RowId> = overlay.deleted.iter().copied().collect();
+    if let Some(staged) = overlay.staged_rows.as_ref() {
+        hidden.extend(
+            staged
+                .rows()
+                .map(|row| row.row_id)
+                .filter(|row_id| !overlay.deleted.contains(row_id)),
+        );
+    }
+    let mut count = i128::from(committed);
+    for row_id in hidden {
+        let probe = Cell::new(0_usize);
+        let original = context.with_source_page_admission(BoundedWorkSource::IndexRange, || {
+            db.bounded_row_by_identity(
+                context.source_read_memory(BoundedWorkSource::IndexRange),
+                None,
+                table,
+                row_id,
+                snapshot,
+                &mut || {
+                    context.charge(
+                        BoundedWorkSource::IndexRange,
+                        BoundedSourceTouch::IndexEntry,
+                    )
+                },
+                &mut |bytes| {
+                    let bytes = context.admit_source_row(BoundedWorkSource::IndexRange, bytes)?;
+                    probe.set(bytes);
+                    Ok(())
+                },
+            )
+        })?;
+        if original.as_ref().is_some_and(&under_prefix) {
+            count -= 1;
+        }
+        drop(original);
+        context.release(probe.get())?;
+    }
+    if let Some(staged) = overlay.staged_rows.as_ref() {
+        for row in staged.rows() {
+            context.charge(
+                BoundedWorkSource::IndexRange,
+                BoundedSourceTouch::IndexEntry,
+            )?;
+            if under_prefix(row) {
+                count += 1;
+            }
+        }
+    }
+    context.release(overlay.bytes)?;
+    drop(overlay);
+    let count = u64::try_from(count).map_err(|_| {
+        BoundedExecutionError::from(Error::Other(
+            "transaction count fell below zero".to_string(),
+        ))
+    })?;
+    Ok(Some(count))
+}
+
 /// Serve a `COUNT(*)` over an exact index prefix from the maintained count,
 /// when the table declares one over exactly those columns.
 ///
@@ -11551,15 +11661,20 @@ fn build_kernel(
 /// ordinary index-range aggregate the caller builds next is what carries the
 /// disclosure. Both answers are exact; only their cost differs, and this is
 /// what lets a consumer see which one it got.
+///
+/// Inside the writer's own transaction the stored count is the committed
+/// total, so the answer is that total adjusted by what the transaction staged
+/// in this table: [`in_transaction_prefix_count`].
 fn build_authenticated_index_count(
     db: &dyn ReadExecutionTarget,
     input: &PhysicalPlan,
     columns: &[ProjectColumn],
     params: &HashMap<String, Value>,
+    snapshot: SnapshotId,
     context: &Arc<RequestContext>,
     disclosure: &mut Option<crate::maintained_counts::MaintainedCountDisclosure>,
 ) -> std::result::Result<Option<Box<PullNode>>, BoundedExecutionError> {
-    if context.transaction().is_some() || columns.len() != 1 {
+    if columns.len() != 1 {
         return Ok(None);
     }
     let Expr::FunctionCall { name, args } = &columns[0].expr else {
@@ -11664,13 +11779,27 @@ fn build_authenticated_index_count(
         );
         return Ok(None);
     }
-    let Some(count) = db.authenticated_relational_index_prefix_count(
+    let committed = db.authenticated_relational_index_prefix_count(
         table,
         &pick.columns[..prefix.len()],
         &prefix,
+        snapshot,
         context.source_read_memory(BoundedWorkSource::IndexRange),
-    )?
-    else {
+    )?;
+    let served = match (committed, context.transaction()) {
+        (Some(committed), Some(tx)) => in_transaction_prefix_count(
+            db,
+            tx,
+            table,
+            &pick.columns[..prefix.len()],
+            &prefix,
+            committed,
+            snapshot,
+            context,
+        )?,
+        (committed, _) => committed,
+    };
+    let Some(count) = served else {
         // The shape was eligible and the answer is still exact — the ordinary
         // index-range aggregate the caller builds next opens the same exact
         // prefix range and counts live postings.
@@ -13026,6 +13155,7 @@ fn build_kernel_with_ctes<'plan>(
                 input,
                 columns,
                 &params,
+                snapshot,
                 context,
                 &mut maintained_count,
             )? {

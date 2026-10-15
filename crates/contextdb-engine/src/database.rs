@@ -62713,6 +62713,7 @@ impl Database {
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &contextdb_core::IndexKey,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
         if let Some(source) = &self.retained_relational_source {
@@ -62762,7 +62763,10 @@ impl Database {
         let Some(root) = self.scoped_writer_root() else {
             return Ok(None);
         };
-        if self.snapshot_for_read() != root.snapshot {
+        // The record is the root's; it answers only a read at the root's own
+        // snapshot. A transaction reads at its begin snapshot, which is the
+        // root's while nothing else has committed since.
+        if snapshot != root.snapshot {
             return Ok(None);
         }
         let mut count = 0;

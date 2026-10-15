@@ -613,14 +613,17 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// reuses those pages or re-proves after they are evicted.
     fn release_statement_proof_reuse(&self) {}
 
+    /// The maintained count for one exact prefix as of `snapshot`, or `None`
+    /// when this target cannot serve it at that snapshot.
     fn authenticated_relational_index_prefix_count(
         &self,
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
-        let _ = (table, columns, prefix, read_memory);
+        let _ = (table, columns, prefix, snapshot, read_memory);
         Ok(None)
     }
 
@@ -1761,6 +1764,7 @@ impl ReadExecutionTarget for Database {
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
         Database::authenticated_relational_index_prefix_count(
@@ -1768,6 +1772,7 @@ impl ReadExecutionTarget for Database {
             table,
             columns,
             prefix,
+            snapshot,
             read_memory,
         )
     }
@@ -20624,10 +20629,16 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
+        snapshot: SnapshotId,
         read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<u64>> {
-        self.store
-            .authenticated_relational_index_prefix_count(table, columns, prefix, read_memory)
+        self.store.authenticated_relational_index_prefix_count(
+            table,
+            columns,
+            prefix,
+            snapshot,
+            read_memory,
+        )
     }
 
     fn bounded_read_snapshot_registration(
