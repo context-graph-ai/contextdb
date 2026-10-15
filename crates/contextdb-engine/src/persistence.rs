@@ -39254,9 +39254,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .iter()
                 .cloned()
                 .map(|part| match part {
-                    DirectedValue::Asc(TotalOrdAsc(value)) => {
-                        (false, Self::count_key_value(value))
-                    }
+                    DirectedValue::Asc(TotalOrdAsc(value)) => (false, Self::count_key_value(value)),
                     DirectedValue::Desc(TotalOrdDesc(value)) => {
                         (true, Self::count_key_value(value))
                     }

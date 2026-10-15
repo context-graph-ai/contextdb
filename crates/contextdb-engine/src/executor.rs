@@ -15500,7 +15500,7 @@ fn distinct_row_key(row: &[Value]) -> Vec<u8> {
         contextdb_core::SqlEqualityKey(row),
         bincode::config::standard(),
     )
-        .expect("query rows should serialize for DISTINCT")
+    .expect("query rows should serialize for DISTINCT")
 }
 
 fn resolve_uuid(expr: &Expr, params: &HashMap<String, Value>) -> Result<uuid::Uuid> {

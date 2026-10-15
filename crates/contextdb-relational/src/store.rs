@@ -244,7 +244,9 @@ fn hash_value(value: &Value, hasher: &mut impl Hasher) -> Option<()> {
         }
         Value::Float64(value) => {
             3_u8.hash(hasher);
-            contextdb_core::float8_canonical(*value).to_bits().hash(hasher);
+            contextdb_core::float8_canonical(*value)
+                .to_bits()
+                .hash(hasher);
         }
         Value::Text(value) => {
             4_u8.hash(hasher);

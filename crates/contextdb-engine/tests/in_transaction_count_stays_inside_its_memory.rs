@@ -95,7 +95,9 @@ fn an_in_transaction_count_holds_no_memory_per_staged_row() {
         &params(&[("context_id", uuid(1))]),
     );
     let peak_growth = PEAK_BYTES.load(Ordering::Relaxed) - before;
-    println!("in-tx count over {STAGED} staged rows: peak growth {peak_growth} B, answer {answer:?}");
+    println!(
+        "in-tx count over {STAGED} staged rows: peak growth {peak_growth} B, answer {answer:?}"
+    );
     match answer {
         Ok(answer) => assert_eq!(answer.rows, vec![vec![Value::Int64(10)]]),
         Err(error) => assert!(

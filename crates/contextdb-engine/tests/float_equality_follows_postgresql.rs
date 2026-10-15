@@ -137,7 +137,11 @@ fn float_equality_and_order_follow_postgresql_on_every_route() {
     insert(&db, Some(tx), 6, -0.0);
     insert(&db, Some(tx), 7, f64::NAN);
     assert_all("in-transaction 0.0", equal_counts(&db, Some(tx), 0.0), 3);
-    assert_all("in-transaction NaN", equal_counts(&db, Some(tx), f64::NAN), 3);
+    assert_all(
+        "in-transaction NaN",
+        equal_counts(&db, Some(tx), f64::NAN),
+        3,
+    );
     db.commit(tx).unwrap();
     assert_all("post-commit 0.0", equal_counts(&db, None, 0.0), 3);
     assert_all("post-commit NaN", equal_counts(&db, None, f64::NAN), 3);
@@ -183,7 +187,10 @@ fn distinct_keeps_one_row_per_float8_value() {
     let path = directory.path().join("float8-distinct.redb");
     let db = open(&path);
     schema(&db);
-    for (n, score) in [0.0, -0.0, f64::NAN, -f64::NAN, 1.0].into_iter().enumerate() {
+    for (n, score) in [0.0, -0.0, f64::NAN, -f64::NAN, 1.0]
+        .into_iter()
+        .enumerate()
+    {
         insert(&db, None, n as u128 + 1, score);
     }
     db.close().unwrap();
@@ -237,7 +244,8 @@ fn an_indexed_float_range_with_one_bound_answers_like_a_scan() {
     for (operator, expected) in [("<=", 4), ("<", 3), (">=", 3), (">", 2)] {
         let bound = params(&[("grp", Value::Int64(1)), ("score", Value::Float64(1.0))]);
         for table in ["grouped", "loose"] {
-            let sql = format!("SELECT id FROM {table} WHERE grp = $grp AND score {operator} $score");
+            let sql =
+                format!("SELECT id FROM {table} WHERE grp = $grp AND score {operator} $score");
             for (route, rows) in rows_on_every_route(&path, &sql, &bound) {
                 assert_eq!(
                     rows.len(),

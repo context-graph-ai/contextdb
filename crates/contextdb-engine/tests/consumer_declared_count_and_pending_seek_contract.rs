@@ -778,7 +778,8 @@ fn boolean_pending_seek_uses_the_declared_context_generation_prefix() {
 const EVENTS_SCHEMA: &str = "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID NOT NULL, body TEXT NOT NULL) SYNC OFF";
 const EVENTS_INDEX: &str = "CREATE INDEX idx_events_context ON events (context_id, id)";
 const EVENTS_DECLARATION: &str = "ALTER TABLE events SET MAINTAIN COUNT (context_id)";
-const EVENTS_INSERT: &str = "INSERT INTO events (id, context_id, body) VALUES ($id, $context_id, $body)";
+const EVENTS_INSERT: &str =
+    "INSERT INTO events (id, context_id, body) VALUES ($id, $context_id, $body)";
 const EVENTS_COUNT: &str = "SELECT COUNT(*) FROM events WHERE context_id = $context_id";
 
 fn event_id(n: u128) -> Value {
@@ -917,7 +918,11 @@ fn an_in_transaction_count_after_a_value_delete_stays_exact() {
     .unwrap();
     for (context_id, expected) in [(1, 40), (2, 0)] {
         let answer = db
-            .execute_in_tx(tx, EVENTS_COUNT, &params(&[("context_id", context(context_id))]))
+            .execute_in_tx(
+                tx,
+                EVENTS_COUNT,
+                &params(&[("context_id", context(context_id))]),
+            )
             .unwrap();
         assert_eq!(
             answer.rows,
@@ -1053,13 +1058,25 @@ fn an_in_transaction_count_matches_float_keys_by_index_order() {
     .unwrap();
     let zero = params(&[("score", Value::Float64(0.0))]);
     let served = db
-        .execute_in_tx(tx, "SELECT COUNT(*) FROM scores WHERE score = $score", &zero)
+        .execute_in_tx(
+            tx,
+            "SELECT COUNT(*) FROM scores WHERE score = $score",
+            &zero,
+        )
         .unwrap();
     let ordinary = db
-        .execute_in_tx(tx, "SELECT COUNT(id) FROM scores WHERE score = $score", &zero)
+        .execute_in_tx(
+            tx,
+            "SELECT COUNT(id) FROM scores WHERE score = $score",
+            &zero,
+        )
         .unwrap();
     db.commit(tx).unwrap();
-    let committed = execute(&db, "SELECT COUNT(*) FROM scores WHERE score = $score", &zero);
+    let committed = execute(
+        &db,
+        "SELECT COUNT(*) FROM scores WHERE score = $score",
+        &zero,
+    );
     let two = vec![vec![Value::Int64(2)]];
     assert_eq!(served.rows, two, "the served count sees -0.0 as 0.0");
     assert_eq!(ordinary.rows, two, "the ordinary count sees -0.0 as 0.0");
