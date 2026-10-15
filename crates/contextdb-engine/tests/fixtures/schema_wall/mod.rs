@@ -843,6 +843,35 @@ pub fn assert_affected_only(
         // Each relation a commit opens records its new historical root, keyed
         // by the physical table name. Only an affected relation may be
         // witnessed; an unrelated one means the commit touched it.
+        // Current-row sizes (`table \0 row id`) and per-table content totals
+        // (`table`) move with the affected rows; an unrelated owner is a leak.
+        if matches!(table, "content_size_row_live" | "content_size_totals") {
+            if event.table == "__redb_user_table_directory" {
+                assert!(
+                    observation
+                        .artifact_writes
+                        .iter()
+                        .any(|(write, _)| write.table == table
+                            && write.operation != TableWriteOperationForTest::DirectoryInsert),
+                    "content-size directory rewrite without a content-size write {event:?}"
+                );
+            } else {
+                let owner_bytes = match table {
+                    "content_size_row_live" => event
+                        .key
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .expect("a row size key names its table"),
+                    _ => event.key.as_slice(),
+                };
+                let owner = std::str::from_utf8(owner_bytes).expect("content-size owners are names");
+                assert!(
+                    affected.contains(owner),
+                    "unrelated content-size write {event:?}"
+                );
+            }
+            continue;
+        }
         if table == "__history_root_witness_v1" && event.table == "__redb_user_table_directory" {
             // The witness table's directory entry moves with its root.
             assert!(
