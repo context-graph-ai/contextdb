@@ -843,6 +843,22 @@ pub fn assert_affected_only(
         // Each relation a commit opens records its new historical root, keyed
         // by the physical table name. Only an affected relation may be
         // witnessed; an unrelated one means the commit touched it.
+        // Declaration occurrence bookkeeping is keyed by (LSN, ordinal): one
+        // entry per received declaration, and every declaration names an
+        // affected table, so its writes are bounded by the affected set.
+        if table == "ddl_eligible_occurrences" {
+            let writes = observation
+                .artifact_writes
+                .iter()
+                .filter(|(write, _)| write.table == table)
+                .map(|(_, count)| *count)
+                .sum::<u64>();
+            assert!(
+                writes != 0 && writes <= affected.len() as u64,
+                "declaration occurrence writes exceed the affected declarations {event:?}: {writes}"
+            );
+            continue;
+        }
         // Current-row sizes (`table \0 row id`) and per-table content totals
         // (`table`) move with the affected rows; an unrelated owner is a leak.
         if matches!(table, "content_size_row_live" | "content_size_totals") {
