@@ -24402,7 +24402,9 @@ impl MaintenanceContext {
     /// check that found the file below the threshold. The threshold is
     /// measured on the allocator's reclaimable free-page ratio -- interior
     /// free pages, which only a whole-page relocation gives back, not in-page
-    /// slack and not the trailing growth headroom any trim returns -- which
+    /// slack and not the trailing free run, which the file reuses before it
+    /// grows and which compaction's final trim returns (an ordinary commit
+    /// trims it only once it reaches half of the last region) -- which
     /// costs the same at any store size; untrusted totals take no decision. It runs outside
     /// the commit lock, since
     /// this is called from `run_cycle` after both `run_pruning` and
