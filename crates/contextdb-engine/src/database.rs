@@ -89042,6 +89042,7 @@ impl ChangeProjection<'static> {
         Self {
             checkpoint: &unbounded_checkpoint,
             admit: &unbounded_admission,
+            release: &unbounded_admission,
             bounded: false,
             ddl: true,
         }
