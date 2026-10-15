@@ -15950,9 +15950,50 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1107,13 +1856,20 @@
+@@ -1093,27 +1842,50 @@
+                 layout.usable_bytes() + required_growth * 2,
+             )
+         };
+-        let new_layout = DatabaseLayout::calculate(
+-            next_desired_size,
+-            state.header.layout().full_region_layout().num_pages(),
+-            state
+-                .header
+-                .layout()
+-                .full_region_layout()
+-                .get_header_pages(),
+-            self.page_size,
+-        );
++        let calculate = |desired_size| {
++            DatabaseLayout::calculate(
++                desired_size,
++                state.header.layout().full_region_layout().num_pages(),
++                state
++                    .header
++                    .layout()
++                    .full_region_layout()
++                    .get_header_pages(),
++                self.page_size,
++            )
++        };
++        let mut new_layout = calculate(next_desired_size);
+         assert!(new_layout.len() >= layout.len());
  
-         let result = self.storage.resize(new_layout.len());
+-        let result = self.storage.resize(new_layout.len());
++        let mut result = self.storage.resize(new_layout.len());
++        // Storage refused the preferred growth for quota: retry once at the
++        // smallest growth that still guarantees this allocation's block.
++        let minimal_layout = calculate(layout.usable_bytes() + required_growth * 2);
++        if minimal_layout.len() < new_layout.len()
++            && matches!(
++                &result,
++                Err(StorageError::Io(error))
++                    if error.kind() == std::io::ErrorKind::QuotaExceeded
++            )
++        {
++            new_layout = minimal_layout;
++            result = self.storage.resize(new_layout.len());
++        }
          if result.is_err() {
 +            if matches!(
 +                &result,
@@ -15972,7 +16013,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1123,7 +1879,12 @@
+@@ -1123,7 +1895,12 @@
          allocation_size: usize,
          allocated: &mut PageTrackerPolicy,
      ) -> Result<PageMut<'txn>> {
@@ -15986,7 +16027,7 @@
          if let Ok(ref page) = result {
              allocated.insert(page.get_page_number());
          }
-@@ -1135,7 +1896,7 @@
+@@ -1135,7 +1912,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -15995,7 +16036,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +1906,7 @@
+@@ -1145,7 +1922,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -16004,7 +16045,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +1919,41 @@
+@@ -1158,8 +1935,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -16047,7 +16088,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +2022,433 @@
+@@ -1228,4 +2038,433 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }

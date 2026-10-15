@@ -1842,19 +1842,35 @@ impl TransactionalMemory {
                 layout.usable_bytes() + required_growth * 2,
             )
         };
-        let new_layout = DatabaseLayout::calculate(
-            next_desired_size,
-            state.header.layout().full_region_layout().num_pages(),
-            state
-                .header
-                .layout()
-                .full_region_layout()
-                .get_header_pages(),
-            self.page_size,
-        );
+        let calculate = |desired_size| {
+            DatabaseLayout::calculate(
+                desired_size,
+                state.header.layout().full_region_layout().num_pages(),
+                state
+                    .header
+                    .layout()
+                    .full_region_layout()
+                    .get_header_pages(),
+                self.page_size,
+            )
+        };
+        let mut new_layout = calculate(next_desired_size);
         assert!(new_layout.len() >= layout.len());
 
-        let result = self.storage.resize(new_layout.len());
+        let mut result = self.storage.resize(new_layout.len());
+        // Storage refused the preferred growth for quota: retry once at the
+        // smallest growth that still guarantees this allocation's block.
+        let minimal_layout = calculate(layout.usable_bytes() + required_growth * 2);
+        if minimal_layout.len() < new_layout.len()
+            && matches!(
+                &result,
+                Err(StorageError::Io(error))
+                    if error.kind() == std::io::ErrorKind::QuotaExceeded
+            )
+        {
+            new_layout = minimal_layout;
+            result = self.storage.resize(new_layout.len());
+        }
         if result.is_err() {
             if matches!(
                 &result,

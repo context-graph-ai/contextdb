@@ -69,6 +69,7 @@ The engine owns the table names, membership encoding and admission policy.
 | `src/open_with_backend_region_override_tests.rs` (added) | Verify existing-storage backend open ignores a creation-only region-size override. |
 | `src/table_registry.rs` (added), `src/transactions.rs`, `src/table.rs`, `src/lib.rs`, `Cargo.toml` | The write transaction's open-table registry stays std's hash table and randomly seeded `RandomState` (the `hashbrown` crate std wraps, with `allocator-api2`), and gains an allocator a caller can fund: a fallible reserve refused with no credit reports the exact `Layout` it would allocate without changing the registry, a reserve paid with exactly that credit performs it, an empty replacement array can be prepared ahead and installed later without allocating, and a monitor counts any array allocation made outside a funded reserve. Keys and a table handle's name are `Box<str>`. The hidden `contextdb-internal` methods are `open_table_registry_{len,bytes,cost_to_reserve,reserve,cost_to_hold,prepare,install,monitor}`; `tests/open_table_registry_allocations.rs` witnesses every registry allocation by address against a counting global allocator. The engine owns the funding policy. |
 | `src/tree_store/table_tree.rs` | Restage an already staged table root in place instead of allocating a key the map drops again; expose `pending_table_update_contains` (internal) and its size (test seam). |
+| `src/tree_store/page_store/page_manager.rs` | When storage refuses `grow`'s preferred size with `QuotaExceeded`, retry once at upstream's own minimum for the allocation (`usable + 2 × required`, which guarantees its aligned block), and refuse only if that is refused too; a quota refusal still leaves the layout and recovery state unchanged. |
 
 The allocator metadata seam is compiled only under `test-seams`; it delegates to the production resident-byte count. A nested, thread-local `observe_allocator_region_loads_for_test` counter counts region views materialized during its scope. Writable startup uses lazy saved-word lookup, so that counter does not imply a whole-table load. The read-only `allocator_regions_for_test` accessor reads the current scalar region count under the state mutex; `Builder::set_region_size` remains a `test-seams` fixture constructor.
 `Database::native_read_transaction_count_for_test` exposes that existing ownership count only under `test-seams`; reader lifetime tests release other holders of that transaction before checking zero, while the writer retains its successor root.
@@ -151,6 +152,11 @@ ContextDB still owns the companion lock and data-descriptor downgrade policy.
 Propose the scoped read-admission and backend-read observation hooks separately with nested-guard
 and error-path tests. Keep ContextDB policy out of those proposals. None of these proposals has been
 submitted upstream.
+Propose the quota-refused growth retry upstream on its own: any backend that refuses a resize for
+quota (a disk-limited file, a fixed-size device) otherwise refuses an allocation that would fit,
+because the preferred growth at least doubles the file. The change is one retry inside `grow` and
+the test `a_growth_refused_for_quota_retries_at_the_size_the_allocation_needs`. Not submitted
+upstream.
 
 The commit-work counters answer how much of a write's cost is the storage engine copying pages on
 the way to a durable commit: the lengths of the two allocation-extent lists a commit writes, a per-page tag the
@@ -541,3 +547,19 @@ The test-seams accessors are:
 
 The patch sections for the changed files were regenerated in place; the fork's other
 sections are unchanged. Compiler and runtime results are recorded in the S9 handover, not here.
+
+## Quota-refused growth retries at the allocation's size
+
+`grow` asks storage for at least twice the file (`max(2 × usable, usable + 2 × required)`), or a
+whole region once regions are full. A backend that enforces a size limit refuses that with
+`QuotaExceeded` even when the allocation itself would fit: ContextDB's writer file refuses any
+resize past `DISK_LIMIT`, so a store more than 100 KiB under its limit refused a 16 KiB insert.
+`grow` now retries once at `usable + 2 × required`, upstream's own lower bound, which keeps an
+aligned block of the requested order available after growth. If that retry is refused too, the
+error returns as before: the layout and the recovery state are unchanged, and the writer can
+continue once capacity is released. Without a quota refusal, growth is exactly upstream's.
+
+Test: `a_growth_refused_for_quota_retries_at_the_size_the_allocation_needs` in
+`tests/allocator_residency_contract.rs` caps a store's growth and checks that later writes use the
+headroom instead of stopping at the first preferred growth. The engine's
+`disk_04_insert_rejected_when_over_disk_budget` covers the same promise through `DISK_LIMIT`.
