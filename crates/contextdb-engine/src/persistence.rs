@@ -1207,7 +1207,44 @@ impl WakePipe {
         use std::os::fd::FromRawFd as _;
 
         let mut ends = [0_i32; 2];
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
         let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        // Without pipe2 (macOS) the flags are set on each end right after creation.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        )))]
+        let made = {
+            let made = unsafe { libc::pipe(ends.as_mut_ptr()) };
+            if made == 0 {
+                for end in ends {
+                    let flags = unsafe { libc::fcntl(end, libc::F_GETFL) };
+                    let marked =
+                        unsafe { libc::fcntl(end, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                    let closed = unsafe { libc::fcntl(end, libc::F_SETFD, libc::FD_CLOEXEC) };
+                    if flags < 0 || marked < 0 || closed < 0 {
+                        let error = std::io::Error::last_os_error();
+                        unsafe {
+                            libc::close(ends[0]);
+                            libc::close(ends[1]);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            made
+        };
         if made != 0 {
             return Err(std::io::Error::last_os_error());
         }

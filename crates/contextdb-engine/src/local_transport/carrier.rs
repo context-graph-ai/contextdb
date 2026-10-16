@@ -641,11 +641,76 @@ enum ConnectWait {
     BacklogCapacity,
 }
 
+/// Close-on-exec and non-blocking at creation where the kernel offers it.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+fn new_socket_flags() -> nix::sys::socket::SockFlag {
+    nix::sys::socket::SockFlag::SOCK_CLOEXEC | nix::sys::socket::SockFlag::SOCK_NONBLOCK
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+fn configure_new_socket(_socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
+    Ok(())
+}
+
+/// Without SOCK_CLOEXEC / SOCK_NONBLOCK (macOS) both are set right after creation.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn new_socket_flags() -> nix::sys::socket::SockFlag {
+    nix::sys::socket::SockFlag::empty()
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn configure_new_socket(socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    fcntl(socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    fcntl(socket, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn connect_readiness(
     path: &std::path::Path,
 ) -> Result<UnixReadiness<ConnectAttempt>, LocalTransportError> {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use nix::sys::socket::{AddressFamily, SockType, UnixAddr, connect, socket};
     use std::os::fd::AsRawFd;
 
     // Same address rule as the bind: what the kernel is shown may be the
@@ -656,10 +721,12 @@ fn connect_readiness(
     let socket = socket(
         AddressFamily::Unix,
         SockType::Stream,
-        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        new_socket_flags(),
         None,
     )
     .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+    configure_new_socket(&socket)
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
     let stream = std::os::unix::net::UnixStream::from(socket);
     let wait = match connect(stream.as_raw_fd(), &address) {
         Ok(()) | Err(nix::errno::Errno::EISCONN) => {

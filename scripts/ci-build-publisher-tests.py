@@ -69,13 +69,40 @@ class Remote:
         if args[:2] != ['gh', 'api'] and args[:2] != ['gh', 'release']:
             raise AssertionError('publisher executed non-control command: ' + repr(args))
         if args[:2] == ['gh', 'api']:
-            path = next(a for a in args[2:] if a.startswith(('repos/', '/repos/'))).lstrip('/')
+            path = next(a for a in args[2:] if a.startswith(('repos/', '/repos/', 'https://uploads.github.com/'))).removeprefix('https://uploads.github.com/').lstrip('/')
             method = args[args.index('--method') + 1] if '--method' in args else 'GET'
             fields = {}
             for i, arg in enumerate(args):
                 if arg in ('-f', '-F', '--field', '--raw-field'):
                     key, value = args[i + 1].split('=', 1)
                     fields[key] = value
+            if path == f'repos/{c.REPO}/releases' and method == 'POST':
+                self.record('create', target=fields['target_commitish'], draft=fields['draft'] == 'true')
+                self.interrupt()
+                release = dict(id=17, tag_name=fields['tag_name'], prerelease=fields['prerelease'] == 'true',
+                               draft=fields['draft'] == 'true', target_commitish=fields['target_commitish'])
+                self.releases.append(release)
+                return json.dumps(release)
+            if re.fullmatch(r'repos/[^/]+/[^/]+/releases/[0-9]+', path):
+                assert path.endswith('/17'), 'must use authoritative release ID'
+                if method == 'GET':
+                    return json.dumps(self.releases[0])
+                if method == 'PATCH':
+                    if 'target_commitish' in fields:
+                        raise ValueError('release edit must preserve the channel tag target')
+                    Remote.command(self, ['gh', 'release', 'edit', 'dev-latest', '--draft=false',
+                                  '--notes', fields['body']])
+                    return json.dumps(self.releases[0])
+            if '/assets?name=' in path and method == 'POST':
+                assert '/releases/17/' in path
+                source = args[args.index('--input') + 1]
+                Remote.command(self, ['gh', 'release', 'upload', 'dev-latest', '--repo', c.REPO, source])
+                return '{}'
+            if '/releases/assets/' in path and method == 'GET':
+                asset_id = int(path.rsplit('/', 1)[-1])
+                name = next(a['name'] for a in self.metadata() if a['id'] == asset_id)
+                self.record('verify', names=[name])
+                return self.assets[name] + (b'corrupt-download' if self.download_corrupt else b'')
             if '/git/refs' in path and method != 'GET':
                 self.record('tag-write', method=method, fields=fields)
                 return '{}'
@@ -100,7 +127,8 @@ class Remote:
             if '/assets/' in path and method == 'DELETE':
                 asset_id = int(path.rsplit('/', 1)[-1])
                 name = next(a['name'] for a in self.metadata() if a['id'] == asset_id)
-                self.record('delete', name=name)
+                if name not in c.ASSETS:
+                    self.record('delete', name=name)
                 del self.assets[name]
                 self.interrupt()
                 return '{}'
@@ -187,6 +215,78 @@ class SettledPublisherControls(unittest.TestCase):
                 self.assertEqual(len(created), 1)
                 self.assertEqual(created[0]['target'], expected)
                 self.assertTrue(created[0]['draft'])
+
+    def test_create_response_survives_invisible_post_create_listing(self):
+        original = self.remote.command
+        def command(args, **kw):
+            if args[:2] == ['gh', 'release']:
+                raise AssertionError('publisher must use release/asset IDs, not tag lookup')
+            if any('/releases?' in arg for arg in args) and self.remote.releases:
+                raise AssertionError('must not list after successful create')
+            return original(args, **kw)
+        self.remote.command = command
+        self.invoke()
+        self.assertFalse(self.remote.releases[0]['draft'])
+        self.assertEqual(len([e for e in self.remote.events if e['kind'] == 'create']), 1)
+
+    def test_failed_create_and_empty_fresh_lookup_refuse_without_second_create(self):
+        original = self.remote.command
+        creates = []
+        def command(args, **kw):
+            if '--method' in args and args[args.index('--method') + 1] == 'POST' and args[2].endswith('/releases'):
+                creates.append(args)
+                raise subprocess.CalledProcessError(1, args, stderr='HTTP 403')
+            return original(args, **kw)
+        self.remote.command = command
+        with self.assertRaisesRegex(ValueError, 'release POST failed.*fresh authenticated'):
+            self.invoke()
+        self.assertEqual(len(creates), 1)
+        self.assertFalse(self.remote.assets)
+
+    def test_binary_command_preserves_all_download_bytes(self):
+        payload = b'\n\x00\xffpayload \n'
+        with patch.object(c.subprocess, 'check_output', return_value=payload) as output:
+            self.assertEqual(c.command(['gh', 'api', 'synthetic'], binary=True), payload)
+        self.assertFalse(output.call_args.kwargs['text'])
+
+    def test_invalid_create_object_fails_before_upload_or_publication(self):
+        original = self.remote.command
+        for change in ({'id': '../bad'}, {'id': True}, {'tag_name': 'v1'},
+                       {'draft': False}, {'prerelease': False}, {'immutable': True},
+                       {'target_commitish': 'f' * 40}):
+            with self.subTest(change=change):
+                self.remote = Remote(self.root)
+                original = self.remote.command
+                def command(args, **kw):
+                    result = original(args, **kw)
+                    if '--method' in args and args[args.index('--method') + 1] == 'POST' and args[2].endswith('/releases'):
+                        return json.dumps(dict(json.loads(result), **change))
+                    return result
+                self.remote.command = command
+                with self.assertRaises(ValueError):
+                    self.invoke()
+                self.assertFalse(any(e['kind'] in ('upload', 'edit', 'delete') for e in self.remote.events))
+
+    def test_stale_initial_list_recovers_existing_draft_after_single_create_conflict(self):
+        self.existing(draft=True)
+        original = self.remote.command
+        listings = []
+        creates = []
+        def command(args, **kw):
+            if any('/releases?' in arg for arg in args):
+                listings.append(args)
+                if len(listings) == 1:
+                    return '[[]]'
+            if '--method' in args and args[args.index('--method') + 1] == 'POST' and args[2].endswith('/releases'):
+                creates.append(args)
+                raise subprocess.CalledProcessError(1, args, stderr='HTTP 422 already exists')
+            return original(args, **kw)
+        self.remote.command = command
+        self.invoke()
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(listings), 2)
+        self.assertEqual(len(self.remote.releases), 1)
+        self.assertFalse(self.remote.releases[0]['draft'])
 
     def test_channel_tag_is_never_moved_and_receipt_keeps_built_source(self):
         self.existing()

@@ -113,8 +113,8 @@ class FinalDeliveryControls(unittest.TestCase):
 
     def test_reviewer_release_edit_target_mutant_is_rejected_by_existing_fake(self):
         mutant = self.mutant(
-            "command(['gh', 'release', 'edit', 'dev-latest', '--repo', REPO, '--draft=false',",
-            "command(['gh', 'release', 'edit', 'dev-latest', '--repo', REPO, '--target', sha, '--draft=false',")
+            "make_latest='false', name=f'Development {sha}', body=",
+            "target_commitish=sha, make_latest='false', name=f'Development {sha}', body=")
         fixture = self.fixture()
         with patch.object(p, 'c', mutant):
             with self.assertRaises((ValueError, AssertionError)):

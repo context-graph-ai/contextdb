@@ -562,6 +562,12 @@ impl Background {
         self.send(&format!("{line}\n"));
     }
 
+    pub fn try_send_line(&mut self, line: &str) -> std::io::Result<()> {
+        let stdin = self.stdin.as_mut().expect("background stdin");
+        stdin.write_all(format!("{line}\n").as_bytes())?;
+        stdin.flush()
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }

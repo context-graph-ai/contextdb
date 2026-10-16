@@ -291,6 +291,36 @@ impl LockedWriterFile {
         .unwrap_or_else(|_| PathBuf::from("database file"))
     }
 
+    /// macOS has no /proc; the kernel reports the open file's path through
+    /// `F_GETPATH`, as raw bytes that need not be UTF-8.
+    #[cfg(target_os = "macos")]
+    fn file_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut buffer = [0_u8; libc::PATH_MAX as usize];
+        let made = unsafe {
+            libc::fcntl(
+                self.file.as_raw_fd(),
+                libc::F_GETPATH,
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+            )
+        };
+        if made < 0 {
+            return PathBuf::from("database file");
+        }
+        let length = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..length]))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn file_path(&self) -> PathBuf {
+        PathBuf::from("database file")
+    }
+
     fn recognized_reader_snapshot(&self, snapshot: &super::RegisteredReaderSnapshot) -> bool {
         snapshot.database_identity == self.reader_database_identity.get().copied().flatten()
             || self

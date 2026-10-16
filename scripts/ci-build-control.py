@@ -27,7 +27,9 @@ def require(ok, message):
 
 
 def command(args, **kw):
-    return subprocess.check_output(args, text=True, timeout=kw.pop("timeout", 120), **kw).strip()
+    binary = kw.pop("binary", False)
+    output = subprocess.check_output(args, text=not binary, timeout=kw.pop("timeout", 120), **kw)
+    return output if binary else output.strip()
 
 
 def api(path, **fields):
@@ -238,7 +240,8 @@ def current_tip(sha):
 
 def release_listing():
     data = json.loads(command(['gh', 'api', '--paginate', '--slurp',
-                               f'repos/{REPO}/releases?per_page=100']))
+                               f'repos/{REPO}/releases?per_page=100',
+                               '-H', 'Cache-Control: no-cache']))
     matches = [r for page in data for r in page if r['tag_name'] == 'dev-latest']
     require(len(matches) <= 1, 'duplicate rolling release')
     return matches
@@ -246,25 +249,47 @@ def release_listing():
 
 def remote_assets(release_id):
     data = json.loads(command(['gh', 'api', '--paginate', '--slurp',
-                               f'repos/{REPO}/releases/{release_id}/assets?per_page=100']))
+                               f'repos/{REPO}/releases/{release_id}/assets?per_page=100',
+                               '-H', 'Cache-Control: no-cache']))
     assets = [a for page in data for a in page]
     require(len({a['name'] for a in assets}) == len(assets), 'duplicate remote asset')
     return assets
 
 
-def remote_bytes(names):
-    # Read actual asset bytes as data; never execute or unpack remote content.
-    with tempfile.TemporaryDirectory() as tmp:
-        args = ['gh', 'release', 'download', 'dev-latest', '--repo', REPO, '--dir', tmp]
-        for name in names:
-            args += ['--pattern', name]
-        command(args)
-        require({p.name for p in Path(tmp).iterdir()} == set(names), 'remote inventory mismatch')
-        return {n: Path(tmp, n).read_bytes() for n in names}
+def release_guard(release):
+    require(type(release.get('id')) is int and release['id'] > 0
+            and release.get('tag_name') == 'dev-latest'
+            and release.get('prerelease') is True
+            and type(release.get('draft')) is bool
+            and not release.get('immutable', False),
+            'invalid rolling release ID/object; expected mutable dev-latest prerelease')
+    return release
 
 
-def verify_remote(files):
-    data = remote_bytes(files)
+def upload(release_id, path, clobber=False):
+    from urllib.parse import quote
+    if clobber:
+        for asset in remote_assets(release_id):
+            if asset['name'] == path.name:
+                current_tip(os.environ['BUILD_SHA'])
+                command(['gh', 'api', f"repos/{REPO}/releases/assets/{asset['id']}",
+                         '--method', 'DELETE'])
+    current_tip(os.environ['BUILD_SHA'])
+    command(['gh', 'api',
+             f'https://uploads.github.com/repos/{REPO}/releases/{release_id}/assets?name={quote(path.name, safe="")}',
+             '--method', 'POST', '-H', 'Content-Type: application/octet-stream', '--input', str(path)])
+
+
+def remote_bytes(names, release_id):
+    # Read actual asset bytes by ID as data; never execute or unpack remote content.
+    assets = {a['name']: a for a in remote_assets(release_id)}
+    require(set(names) <= assets.keys(), 'remote inventory mismatch')
+    return {n: command(['gh', 'api', f"repos/{REPO}/releases/assets/{assets[n]['id']}",
+                        '-H', 'Accept: application/octet-stream'], binary=True) for n in names}
+
+
+def verify_remote(files, release_id):
+    data = remote_bytes(files, release_id)
     require(all(hashlib.sha256(data[n]).hexdigest() == digest(p) for n, p in files.items()),
             'remote upload mismatch')
 
@@ -286,14 +311,41 @@ def publish():
         bootstrap = api(f'repos/{REPO}/commits/{quote(branch, safe="")}')['sha']
         require(re.fullmatch('[0-9a-f]{40}', bootstrap), 'invalid bootstrap SHA')
         current_tip(sha)
-        command(['gh', 'release', 'create', 'dev-latest', '--repo', REPO, '--draft', '--prerelease',
-                 '--latest=false', '--target', bootstrap, '--title', 'Development upload pending',
-                 '--notes', 'Upload pending; channel tag is stationary.'])
-        matches = release_listing()
-        require(len(matches) == 1, 'created release not found')
-    release = matches[0]
-    require(release['prerelease'] and not release.get('immutable', False),
-            'rolling release must be mutable prerelease')
+        # POST returns the authoritative object; a successful create must never be
+        # followed by a cached listing or a second create to rediscover its ID.
+        try:
+            release = json.loads(command(['gh', 'api', f'repos/{REPO}/releases', '--method', 'POST',
+                        '-f', 'tag_name=dev-latest', '-f', f'target_commitish={bootstrap}',
+                        '-F', 'draft=true', '-F', 'prerelease=true', '-f', 'make_latest=false',
+                        '-f', 'name=Development upload pending',
+                        '-f', 'body=Upload pending; channel tag is stationary.']))
+        except subprocess.CalledProcessError as error:
+            # A stale initial list or an interrupted POST may hide an existing draft.
+            # One fresh lookup can recover it; never issue a second create.
+            matches = release_listing()
+            require(len(matches) == 1,
+                    f'release POST failed (exit {error.returncode}); fresh authenticated '
+                    'listing found no unique dev-latest; inspect gh HTTP error above')
+            release_guard(matches[0])
+            release = api(f"repos/{REPO}/releases/{matches[0]['id']}")
+            require(release.get('id') == matches[0]['id'], 'release identity changed')
+            release_guard(release)
+            # Recovery keeps the existing stationary bootstrap, even if default advanced.
+            return publish_existing(release, root, sha, env)
+        release_guard(release)
+        require(release['draft'] and release.get('target_commitish') == bootstrap,
+                'created release must be hidden at bootstrap SHA')
+    else:
+        # Resolve the discovered ID directly, avoiding tag-based draft lookup.
+        release_guard(matches[0])
+        release = api(f"repos/{REPO}/releases/{matches[0]['id']}")
+        require(release.get('id') == matches[0]['id'], 'release identity changed')
+    release_guard(release)
+    publish_existing(release, root, sha, env)
+
+
+def publish_existing(release, root, sha, env):
+    print(f"Using validated dev-latest release {release['id']} (draft={release['draft']})")
     release_id = release['id']
     assets = remote_assets(release_id)
     order = [BASE + suffix for suffix in ('.tar.gz', '.tar.gz.sha256', '.json')]
@@ -310,19 +362,19 @@ def publish():
         require(not (set(copies) & existing), 'write-once run group already exists')
         for path in copies.values():
             current_tip(sha)
-            command(['gh', 'release', 'upload', 'dev-latest', '--repo', REPO, str(path)])
-        verify_remote(copies)  # Whole run group must verify before ANY stable mutation.
+            upload(release_id, path)
+        verify_remote(copies, release_id)  # Whole run group must verify before ANY stable mutation.
         for name in order:
             current_tip(sha)  # Immediately before EVERY stable-name mutation.
-            command(['gh', 'release', 'upload', 'dev-latest', '--repo', REPO, str(root / name), '--clobber'])
-        verify_remote({name: root / name for name in order})
+            upload(release_id, root / name, clobber=True)
+        verify_remote({name: root / name for name in order}, release_id)
         retention_assets = remote_assets(release_id)
         current_tip(sha)
-        command(['gh', 'release', 'edit', 'dev-latest', '--repo', REPO, '--draft=false',
-                 '--prerelease', '--latest=false', '--title', f'Development {sha}', '--notes',
-                 f'Unstable development binaries. Source: {sha}. The dev-latest tag is the stationary '
-                 'bootstrap point, not the binary source. Verify checksum AND receipt digest. '
-                 'Run copies (rename to stable names before verification): ' + ', '.join(copies)])
+        api(f'repos/{REPO}/releases/{release_id}', draft=False, prerelease=True,
+            make_latest='false', name=f'Development {sha}', body=
+            f'Unstable development binaries. Source: {sha}. The dev-latest tag is the stationary '
+            'bootstrap point, not the binary source. Verify checksum AND receipt digest. '
+            'Run copies (rename to stable names before verification): ' + ', '.join(copies))
     # Only successful verified metadata publication admits retention. Ignore stable names,
     # unrelated assets and incomplete groups. Group age is its last member creation time.
     groups = {}
@@ -337,11 +389,11 @@ def publish():
     complete.sort(key=lambda items: (max(a['created_at'] for a in items), items[0]['name']), reverse=True)
     # Protect every group whose actual receipt equals the current stable receipt,
     # even when timestamps place it outside the newest three publications.
-    stable_receipt = remote_bytes([BASE + '.json'])[BASE + '.json']
+    stable_receipt = remote_bytes([BASE + '.json'], release_id)[BASE + '.json']
     require(stable_receipt == (root / (BASE + '.json')).read_bytes(), 'stable receipt changed')
     for items in complete[3:]:
         receipt_name = next(a['name'] for a in items if a['name'].endswith('.json'))
-        if remote_bytes([receipt_name])[receipt_name] == stable_receipt:
+        if remote_bytes([receipt_name], release_id)[receipt_name] == stable_receipt:
             continue
         for asset in items:
             current_tip(sha)

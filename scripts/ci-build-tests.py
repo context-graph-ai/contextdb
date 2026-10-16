@@ -415,11 +415,11 @@ class AssetControls(unittest.TestCase):
                     original = remote.command
                     uploads = []
                     def command(args, **kwargs):
-                        if args[1:3] == ['release', 'upload']:
+                        if args[:2] == ['gh', 'api'] and any('/assets?name=' in a for a in args):
                             if mode == 'failure' and len(uploads) == count:
                                 raise subprocess.CalledProcessError(1, args)
                             result = original(args, **kwargs)
-                            uploads.append(Path(args[6]).name)
+                            uploads.append(Path(args[args.index('--input') + 1]).name)
                             if mode == 'tip' and len(uploads) >= count:
                                 remote.tip = OTHER
                             return result
@@ -429,16 +429,19 @@ class AssetControls(unittest.TestCase):
                         self.invoke_remote(remote)
                     self.assertEqual(uploads, order[:count])
                     changed_stable = set(order[:count]) & set(stable)
-                    self.assertEqual({n: remote.assets[n] for n in stable},
-                                     {n: new[n] if n in changed_stable else old[n] for n in stable})
+                    missing = {order[count]} if mode == 'failure' and 3 <= count < 6 else set()
+                    self.assertEqual({n: remote.assets.get(n) for n in stable},
+                                     {n: None if n in missing else new[n] if n in changed_stable else old[n]
+                                      for n in stable})
                     self.assertFalse([e for e in remote.events if e['kind'] in ('edit', 'delete', 'tag-write')],
                                      'metadata/tag must remain old on interruption')
                     with tempfile.TemporaryDirectory() as download:
                         for name in stable:
-                            Path(download, name).write_bytes(remote.assets[name])
+                            if name in remote.assets:
+                                Path(download, name).write_bytes(remote.assets[name])
                         result = subprocess.run(['bash', '-c', checks], cwd=download,
                                                 text=True, capture_output=True)
-                    self.assertEqual(result.returncode == 0, count <= 3 or count == 6,
+                    self.assertEqual(result.returncode == 0, not missing and (count <= 3 or count == 6),
                                      'interrupted mixed sets must fail the actual download checks')
 
     def test_download_recipe_rejects_mixed_sidecars_before_unpacking(self):

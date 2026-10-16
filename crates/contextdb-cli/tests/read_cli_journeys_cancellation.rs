@@ -185,9 +185,18 @@ fn a_non_interactive_session_keeps_process_termination() {
     session.wait_for("statement_progress");
 
     session.interrupt();
-    session.send_line("SELECT id FROM paged ORDER BY id LIMIT 1;");
+    // Termination may close stdin before this write, or the write may win the race.
+    let next_statement = session.try_send_line("SELECT id FROM paged ORDER BY id LIMIT 1;");
 
     let (code, transcript) = session.finish();
+    if let Err(error) = next_statement {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "unexpected post-interrupt write error: {error}; exit code: {code:?}\n\
+             transcript:\n{transcript}"
+        );
+    }
     assert_ne!(
         code,
         Some(0),
