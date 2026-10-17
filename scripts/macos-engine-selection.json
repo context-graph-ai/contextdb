@@ -1,9 +1,9 @@
 {
   "schema": "macos-engine-selection-v1",
-  "parent": "bc9cce955eb85fb1488f5304426eedeb6d97e905",
-  "approval_receipt_sha256": "7cc5a0567451821944c3668773faf568cb1538513557cf22e6da27e6ac15dc70",
+  "parent": "8972d4c918dd1e72e88195d9357c957311ec7869",
+  "approval_receipt_sha256": "913cd82ab247eb2dcff5fa79846ab4b824fa2f71be228a0e2e132c5744da6939",
   "source_sha256": {
-    "crates/contextdb-engine/src/local_transport/runtime.rs": "242a990302c1a01ad8f9aa4df22edf86717f9c54915cd2d10d3f4f970a70172e",
+    "crates/contextdb-engine/src/local_transport/runtime.rs": "b50c07cde63c59d685c62061523345ab6f2f6357e9aff5e06246bf4f5413c9a0",
     "crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs": "49d248839ff7ab3cab233787f4eab3b245325b4cfd3317b07011e541227b6f2e"
   },
   "internal_ids": [

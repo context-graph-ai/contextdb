@@ -36,7 +36,8 @@ def candidate(config, verifier):
 
 
 def selection(data):
-    require(data['schema'] == 'macos-engine-selection-v1' and data['parent'] == BASE,
+    require(data.get('schema') == 'macos-engine-selection-v1' and
+            isinstance(data.get('parent'), str) and re.fullmatch('[0-9a-f]{40}', data['parent']),
             'unexpected selection schema/parent')
     require(re.fullmatch('[0-9a-f]{64}', data['approval_receipt_sha256']), 'receipt provenance required')
     internal, external = data['internal_ids'], data['external_ids']
@@ -163,6 +164,7 @@ def main():
         sha = candidate(json.loads((root/'scripts/macos-reader-proof.json').read_text()), verifier)
         selected = json.loads((root/'scripts/macos-engine-selection.json').read_text())
         internal, external = selection(selected)
+        require(sha != selected['parent'], 'candidate must differ from immediate parent')
         expected = selected['source_sha256']
         files = ['.github/workflows/macos-engine-proof.yml', 'scripts/ci-macos-engine-proof.py',
                  'scripts/macos-engine-selection.json', 'scripts/macos-reader-proof.json']
@@ -187,6 +189,10 @@ def main():
             'source-fetch', cwd=objects, env=dict(os.environ, GIT_TERMINAL_PROMPT='0'))
         require(run(['git', 'rev-parse', 'FETCH_HEAD'], 'source-head', cwd=objects).stdout.decode().strip() == sha,
                 'fetched H mismatch')
+        commit_raw = run(['git', 'cat-file', '-p', sha], 'source-commit', cwd=objects).stdout.decode()
+        parents = [l.split()[1] for l in commit_raw.splitlines() if l.startswith('parent ')]
+        require(parents == [selected['parent']], 'candidate parent mismatch; expected ' + selected['parent'])
+        receipt['candidate_parent'] = selected['parent']
         run(['git', '-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', str(tree), sha],
             'source-checkout', cwd=objects)
         receipt['source_tree'] = run(['git', 'rev-parse', 'HEAD^{tree}'], 'source-tree', cwd=tree).stdout.decode().strip()
