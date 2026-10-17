@@ -11,9 +11,9 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
-BASE = '6a0d4b42222f3f3063e74d16d780a3e94a87163e'
-PATCH_SHA = 'd3504372be4722ebe6d386480a987aee68385351e3dc4ce5dc7cadf67756d35e'
-CASE = 'persistence::macos_reader_registry_tests::macos_reader_registry_authenticates_process_and_descriptor'
+BASE = 'bc9cce955eb85fb1488f5304426eedeb6d97e905'
+PATCH_SHA = '2d43d59483513f3637901533f104c923105aac6b80d58e797d3334c7646cab63'
+CASE = 'database::macos_locator_tests::default_locator_serves_separate_processes'
 FILTER = 'test(=' + CASE + ')'
 
 
@@ -35,10 +35,9 @@ def outcome(xml, code, baseline):
     failure = case.find('failure')
     if baseline:
         text = ET.tostring(case, encoding='unicode')
-        diagnostic = ('ordinary self pin: ordinary owner pin admits the live '
-                      'registration into a complete registry:')
-        if code != 100 or failure is None or diagnostic not in text or 'authenticated reader snapshot registry is indeterminate' not in text:
-            raise RuntimeError('baseline did not fail at the known admission assertion')
+        diagnostic = 'MACLOCATOR_DEFAULT_SERVICE_REQUIRED short=false normal=false'
+        if code != 100 or failure is None or diagnostic not in text or text.count('MACLOCATOR_EXPECTED_PATH_TOO_LONG') != 2:
+            raise RuntimeError('baseline did not fail at the typed default locator service assertion')
     elif code != 0 or failure is not None:
         raise RuntimeError('fixed case must pass all assertions')
 

@@ -1,0 +1,21 @@
+{
+  "schema": "macos-engine-selection-v1",
+  "parent": "bc9cce955eb85fb1488f5304426eedeb6d97e905",
+  "approval_receipt_sha256": "7cc5a0567451821944c3668773faf568cb1538513557cf22e6da27e6ac15dc70",
+  "source_sha256": {
+    "crates/contextdb-engine/src/local_transport/runtime.rs": "242a990302c1a01ad8f9aa4df22edf86717f9c54915cd2d10d3f4f970a70172e",
+    "crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs": "49d248839ff7ab3cab233787f4eab3b245325b4cfd3317b07011e541227b6f2e"
+  },
+  "internal_ids": [
+    "local_transport::runtime::macos_locator_tests::macos_system_temporary_container_validates_shape_sticky_and_owner",
+    "local_transport::runtime::macos_locator_tests::macos_default_descriptor_preparer_creates_and_cleans_exclusive_owned_nonce_leaf",
+    "local_transport::runtime::macos_locator_tests::macos_default_descriptor_preparer_refuses_symlink_regular_file_and_insecure_mode"
+  ],
+  "external_ids": [
+    "local_transport_runtime::local_channel_derives_the_macos_direct_default_channel",
+    "local_transport_runtime::macos_default_channel_full_u64_uid_boundaries",
+    "local_transport_runtime::macos_default_channel_path_length_bound_b13_accept_b14_refuse",
+    "local_transport_runtime::macos_default_channel_canonicalizes_alias_before_symlink_inspection",
+    "local_transport_runtime::process_environment_resolves_the_native_macos_direct_default_channel"
+  ]
+}
