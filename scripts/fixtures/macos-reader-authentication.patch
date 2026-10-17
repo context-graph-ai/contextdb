@@ -1,0 +1,562 @@
+diff --git a/crates/contextdb-engine/src/persistence.rs b/crates/contextdb-engine/src/persistence.rs
+index 587a0cf..137b3e3 100644
+--- a/crates/contextdb-engine/src/persistence.rs
++++ b/crates/contextdb-engine/src/persistence.rs
+@@ -35479,6 +35479,9 @@ mod coordination_error_tests;
+ #[cfg(all(test, target_os = "linux"))]
+ mod owner_cursor_admission_tests;
+ 
++#[cfg(all(test, target_os = "macos"))]
++mod macos_reader_registry_tests;
++
+ #[cfg(test)]
+ mod purge_error_typing_tests;
+ 
+diff --git a/crates/contextdb-engine/src/persistence/macos_reader_registry_tests.rs b/crates/contextdb-engine/src/persistence/macos_reader_registry_tests.rs
+new file mode 100644
+index 0000000..5ede72d
+--- /dev/null
++++ b/crates/contextdb-engine/src/persistence/macos_reader_registry_tests.rs
+@@ -0,0 +1,542 @@
++//! macOS process and descriptor authentication for the existing reader registry.
++//!
++//! `owner_cursor_admission_tests` is compiled only on Linux, so it cannot observe
++//! native authentication on this platform. The rows below call the existing
++//! registration, scan, and owner-pin functions. A live registration is admitted
++//! only with a nonzero process start and the database descriptor's device and
++//! inode. A locked failure stays indeterminate and keeps its file. An unlocked
++//! record is removed. No new helper, receipt, or seam is introduced.
++
++use super::*;
++use std::io::Write as _;
++use std::os::fd::{AsRawFd as _, FromRawFd as _};
++use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
++use std::process::{Command, Stdio};
++
++const CHILD_ENV: &str = "CONTEXTDB_MACOS_READER_REGISTRY_CHILD";
++const DATABASE_ENV: &str = "CONTEXTDB_MACOS_READER_REGISTRY_DATABASE";
++const RUNTIME_ENV: &str = "CONTEXTDB_MACOS_READER_REGISTRY_RUNTIME";
++const READY_ENV: &str = "CONTEXTDB_MACOS_READER_REGISTRY_READY";
++
++#[derive(Clone, Copy)]
++enum Row {
++    OrdinarySelfPin,
++    ExternalProcess,
++    ForgedZeroStart,
++    ForgedNonzeroStart,
++    WrongRegularDescriptor,
++    PipeDescriptor,
++    ReplacedPhysicalFile,
++    UnlockedStaleDebris,
++    ClosedDescriptor,
++}
++
++impl Row {
++    fn name(self) -> &'static str {
++        match self {
++            Self::OrdinarySelfPin => "ordinary self pin",
++            Self::ExternalProcess => "external process",
++            Self::ForgedZeroStart => "forged zero start",
++            Self::ForgedNonzeroStart => "forged nonzero start",
++            Self::WrongRegularDescriptor => "wrong regular descriptor",
++            Self::PipeDescriptor => "pipe descriptor",
++            Self::ReplacedPhysicalFile => "replaced physical file",
++            Self::UnlockedStaleDebris => "unlocked stale debris",
++            Self::ClosedDescriptor => "closed descriptor",
++        }
++    }
++}
++
++fn store() -> (tempfile::TempDir, RedbPersistence, std::path::PathBuf) {
++    let directory = tempfile::tempdir().expect("task-scoped store directory");
++    let path = directory.path().join("reader-registry.db");
++    let database = crate::Database::open(&path).expect("create a durable store");
++    database.close().expect("close the seed writer");
++    let runtime = directory.path().join("runtime");
++    std::fs::create_dir(&runtime).expect("task-scoped runtime");
++    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
++        .expect("owner-only runtime");
++    let persistence =
++        RedbPersistence::open_with_cache_in_runtime_dir(&path, REDB_CACHE_BYTES, Some(&runtime))
++            .expect("open the writer with a task-scoped registry");
++    (directory, persistence, runtime)
++}
++
++fn publish_live_registration(persistence: &RedbPersistence) -> ReadSnapshotRegistrationGuard {
++    let published =
++        published_writer_identity(persistence.path()).expect("published writer identity");
++    let physical_identity = persistence.physical_identity().expect("physical identity");
++    let storage_snapshot = {
++        let db = persistence.db.read().expect("persistence handle");
++        let db = db.as_ref().expect("database is open");
++        db.begin_read()
++            .expect("storage snapshot")
++            .storage_snapshot_identity()
++    };
++    ReadSnapshotRegistrationGuard::from_owner(
++        persistence.path(),
++        published.0,
++        published.1,
++        physical_identity,
++        storage_snapshot,
++        persistence.runtime_dir.as_deref(),
++    )
++    .expect("publish the live reader registration")
++}
++
++fn registration_paths(guard: &ReadSnapshotRegistrationGuard) -> Vec<std::path::PathBuf> {
++    guard
++        .registration
++        .iter()
++        .chain(guard.other_registrations.iter())
++        .map(|registration| registration.path.clone())
++        .collect()
++}
++
++fn scan(persistence: &RedbPersistence) -> ReaderSnapshotRegistry {
++    capture_reader_snapshot_registry(
++        persistence.physical_identity().expect("physical identity"),
++        persistence.runtime_dir.as_deref(),
++    )
++}
++
++fn rewrite_locked_snapshot(
++    guard: &ReadSnapshotRegistrationGuard,
++    snapshot: &RegisteredReaderSnapshot,
++) -> Vec<std::path::PathBuf> {
++    let bytes = encode_reader_snapshot(snapshot).expect("encode the registration");
++    let decoded =
++        decode_reader_snapshot(&bytes).expect("forged registration keeps a valid checksum");
++    assert_eq!(decoded.owner_user, snapshot.owner_user);
++    assert_eq!(decoded.physical_identity, snapshot.physical_identity);
++    assert_eq!(decoded.storage_snapshot, snapshot.storage_snapshot);
++    assert_eq!(
++        decoded.process.process_start,
++        snapshot.process.process_start
++    );
++    assert_eq!(decoded.descriptor_number, snapshot.descriptor_number);
++    let paths = registration_paths(guard);
++    assert!(!paths.is_empty(), "publication created a snapshot file");
++    for path in &paths {
++        std::fs::write(path, &bytes).expect("rewrite the locked registration");
++        let on_disk =
++            decode_reader_snapshot(&std::fs::read(path).expect("reread the registration"))
++                .expect("rewritten registration keeps a valid checksum");
++        assert_eq!(
++            on_disk.process.process_start,
++            snapshot.process.process_start
++        );
++        assert_eq!(on_disk.descriptor_number, snapshot.descriptor_number);
++        assert_eq!(on_disk.owner_user, guard.snapshot.owner_user);
++        assert_eq!(on_disk.physical_identity, guard.snapshot.physical_identity);
++    }
++    paths
++}
++
++fn assert_admitted(
++    label: &str,
++    scanned: ReaderSnapshotRegistry,
++    descriptor: &std::fs::File,
++    process_id: u32,
++) {
++    let metadata = descriptor.metadata().expect("database descriptor metadata");
++    let identity = (metadata.dev(), metadata.ino());
++    let ReaderSnapshotRegistry::Complete(snapshots) = scanned else {
++        panic!("{label}: the live registration scans as a complete registry: {scanned:?}");
++    };
++    let matched: Vec<_> = snapshots
++        .iter()
++        .filter(|snapshot| snapshot.process.process_id == process_id)
++        .collect();
++    assert!(
++        !matched.is_empty(),
++        "{label}: complete registry contains process {process_id} at device/inode {identity:?}: {snapshots:?}"
++    );
++    for snapshot in matched {
++        assert_ne!(
++            snapshot.process.process_start.0, 0,
++            "{label}: an admitted registration has a nonzero process start"
++        );
++        assert_eq!(
++            snapshot.physical_identity, identity,
++            "{label}: admitted device and inode are the held database descriptor"
++        );
++    }
++}
++
++fn assert_locked_refusal(
++    label: &str,
++    scanned: ReaderSnapshotRegistry,
++    paths: &[std::path::PathBuf],
++) {
++    assert!(
++        matches!(scanned, ReaderSnapshotRegistry::Indeterminate(_)),
++        "{label}: the locked registration stays indeterminate and is not admitted: {scanned:?}"
++    );
++    for path in paths {
++        assert!(
++            path.is_file(),
++            "{label}: the locked registration remains {}",
++            path.display()
++        );
++    }
++}
++
++fn exact_filter() -> String {
++    let module_path = module_path!();
++    let relative = module_path
++        .split_once("::")
++        .map(|(_, rest)| rest)
++        .unwrap_or(module_path);
++    format!("{relative}::macos_reader_registry_authenticates_process_and_descriptor")
++}
++
++struct ExternalHolder {
++    child: std::process::Child,
++    finished: bool,
++}
++
++impl ExternalHolder {
++    fn finish(&mut self) {
++        drop(self.child.stdin.take());
++        let status = self
++            .child
++            .wait()
++            .expect("wait for the external registration");
++        self.finished = true;
++        assert!(
++            status.success(),
++            "external registration process failed: {status}"
++        );
++    }
++}
++
++impl Drop for ExternalHolder {
++    fn drop(&mut self) {
++        if !self.finished {
++            let _ = self.child.kill();
++            let _ = self.child.wait();
++        }
++    }
++}
++
++fn spawn_external(database: &std::path::Path, runtime: &std::path::Path) -> ExternalHolder {
++    let mut ends = [0i32; 2];
++    // The pipe is this test's ready signal. Its write end is inherited by the child.
++    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "ready pipe");
++    let read_fd = ends[0];
++    let write_fd = ends[1];
++    let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFD) };
++    assert!(flags >= 0, "ready-pipe flags");
++    assert_eq!(
++        unsafe { libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
++        0,
++        "keep the ready pipe across exec"
++    );
++    let filter = exact_filter();
++    let child = Command::new(std::env::current_exe().expect("current test binary"))
++        .args(["--exact", &filter, "--nocapture"])
++        .env(CHILD_ENV, "1")
++        .env(DATABASE_ENV, database)
++        .env(RUNTIME_ENV, runtime)
++        .env(READY_ENV, write_fd.to_string())
++        .stdin(Stdio::piped())
++        .stderr(Stdio::inherit())
++        .spawn();
++    let mut child = match child {
++        Ok(child) => child,
++        Err(error) => {
++            unsafe {
++                libc::close(read_fd);
++                libc::close(write_fd);
++            }
++            panic!("spawn the external registration process: {error}");
++        }
++    };
++    unsafe { libc::close(write_fd) };
++    let mut ready = unsafe { std::fs::File::from_raw_fd(read_fd) };
++    let mut byte = [0u8; 1];
++    let count = std::io::Read::read(&mut ready, &mut byte).expect("read the ready pipe");
++    assert_eq!(
++        (count, byte[0]),
++        (1, b'R'),
++        "external process exited before holding its registration"
++    );
++    ExternalHolder {
++        child,
++        finished: false,
++    }
++}
++
++fn hold_external_registration() {
++    let database = std::path::PathBuf::from(std::env::var(DATABASE_ENV).expect("database path"));
++    let runtime = std::path::PathBuf::from(std::env::var(RUNTIME_ENV).expect("runtime path"));
++    let ready_fd: i32 = std::env::var(READY_ENV)
++        .expect("ready descriptor")
++        .parse()
++        .expect("ready descriptor number");
++    let created = crate::Database::open(&database).expect("create a durable store");
++    created.close().expect("close the seed writer");
++    let persistence = RedbPersistence::open_with_cache_in_runtime_dir(
++        &database,
++        REDB_CACHE_BYTES,
++        Some(&runtime),
++    )
++    .expect("open the external writer");
++    let guard = publish_live_registration(&persistence);
++    {
++        // This process inherited the parent's ready-pipe write end.
++        let mut ready = unsafe { std::fs::File::from_raw_fd(ready_fd) };
++        std::io::Write::write_all(&mut ready, b"R").expect("signal the held registration");
++        std::io::Write::flush(&mut ready).expect("flush the held registration");
++    }
++    let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
++    drop(guard);
++    drop(persistence);
++}
++
++fn closed_descriptor_number() -> u32 {
++    let mut limit = libc::rlimit {
++        rlim_cur: 0,
++        rlim_max: 0,
++    };
++    assert_eq!(
++        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
++        0,
++        "read the process descriptor limit"
++    );
++    let start = i32::try_from(limit.rlim_cur)
++        .unwrap_or(i32::MAX)
++        .saturating_sub(1);
++    let source = std::fs::File::open("/dev/null").expect("descriptor source");
++    let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, start) };
++    assert!(
++        fd >= start,
++        "duplicate a descriptor at the top of the table, got {fd}"
++    );
++    let closed = u32::try_from(fd).expect("descriptor number fits the registration");
++    assert_eq!(
++        unsafe { libc::close(fd) },
++        0,
++        "close the duplicated descriptor"
++    );
++    closed
++}
++
++fn plant_unlocked_debris(
++    runtime: &std::path::Path,
++    identity: (u64, u64),
++    bytes: &[u8],
++) -> std::path::PathBuf {
++    let root = reader_breadcrumb_root(runtime);
++    create_reader_breadcrumb_directory(&root).expect("registry root");
++    let directory = reader_snapshot_directory(runtime, identity);
++    create_reader_breadcrumb_directory(&directory).expect("registry directory");
++    let path = directory.join("stale-unlocked.snapshot");
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(&path)
++        .expect("unlocked debris");
++    file.write_all(bytes).expect("write unlocked debris");
++    file.set_permissions(std::fs::Permissions::from_mode(0o600))
++        .expect("owner-only debris");
++    drop(file);
++    path
++}
++
++fn run_external(label: &str) {
++    let directory = tempfile::tempdir().expect("task-scoped store directory");
++    let database = directory.path().join("reader-registry.db");
++    let runtime = directory.path().join("runtime");
++    std::fs::create_dir(&runtime).expect("task-scoped runtime");
++    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
++        .expect("owner-only runtime");
++    let mut holder = spawn_external(&database, &runtime);
++    let descriptor = std::fs::File::open(&database).expect("open the held database");
++    let metadata = descriptor.metadata().expect("database metadata");
++    let scanned =
++        capture_reader_snapshot_registry((metadata.dev(), metadata.ino()), Some(&runtime));
++    assert_ne!(holder.child.id(), std::process::id());
++    assert_admitted(label, scanned, &descriptor, holder.child.id());
++    holder.finish();
++}
++
++fn run_row(row: Row) {
++    let label = row.name();
++    if matches!(row, Row::ExternalProcess) {
++        run_external(label);
++        return;
++    }
++    let (directory, persistence, runtime) = store();
++    match row {
++        Row::OrdinarySelfPin => {
++            let pin = match persistence.owner_cursor_pin() {
++                Ok(pin) => pin,
++                Err(error) => panic!(
++                    "{label}: ordinary owner pin admits the live registration into a complete registry: {error:?}"
++                ),
++            };
++            assert_admitted(
++                label,
++                scan(&persistence),
++                pin._registration.descriptor.as_ref(),
++                std::process::id(),
++            );
++        }
++        Row::ForgedZeroStart | Row::ForgedNonzeroStart => {
++            let guard = publish_live_registration(&persistence);
++            let mut forged = guard.snapshot.clone();
++            let start = if matches!(row, Row::ForgedZeroStart) {
++                0
++            } else {
++                match forged.process.process_start.0.wrapping_add(1) {
++                    0 => 1,
++                    value => value,
++                }
++            };
++            if matches!(row, Row::ForgedNonzeroStart) {
++                assert_ne!(start, 0);
++                assert_ne!(start, forged.process.process_start.0);
++            }
++            forged.process.process_start =
++                contextdb_core::read_contract::ProcessStartIdentity(start);
++            let paths = rewrite_locked_snapshot(&guard, &forged);
++            assert_locked_refusal(label, scan(&persistence), &paths);
++        }
++        Row::WrongRegularDescriptor => {
++            let guard = publish_live_registration(&persistence);
++            let other = directory.path().join("other-regular");
++            let other = std::fs::OpenOptions::new()
++                .read(true)
++                .write(true)
++                .create(true)
++                .truncate(true)
++                .open(other)
++                .expect("other regular file");
++            let mut forged = guard.snapshot.clone();
++            forged.descriptor_number =
++                u32::try_from(other.as_raw_fd()).expect("descriptor number fits");
++            assert_ne!(forged.descriptor_number, guard.snapshot.descriptor_number);
++            let paths = rewrite_locked_snapshot(&guard, &forged);
++            assert_locked_refusal(label, scan(&persistence), &paths);
++            drop(other);
++        }
++        Row::PipeDescriptor => {
++            let guard = publish_live_registration(&persistence);
++            let mut ends = [0i32; 2];
++            assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "pipe");
++            let read_end = unsafe { std::fs::File::from_raw_fd(ends[0]) };
++            let write_end = unsafe { std::fs::File::from_raw_fd(ends[1]) };
++            let mut forged = guard.snapshot.clone();
++            forged.descriptor_number =
++                u32::try_from(read_end.as_raw_fd()).expect("descriptor number fits");
++            let paths = rewrite_locked_snapshot(&guard, &forged);
++            assert_locked_refusal(label, scan(&persistence), &paths);
++            drop(read_end);
++            drop(write_end);
++        }
++        Row::ReplacedPhysicalFile => {
++            let guard = publish_live_registration(&persistence);
++            let paths = registration_paths(&guard);
++            let original = {
++                let metadata = guard.descriptor.metadata().expect("registered descriptor");
++                (metadata.dev(), metadata.ino())
++            };
++            let replacement = std::fs::OpenOptions::new()
++                .read(true)
++                .write(true)
++                .create(true)
++                .truncate(true)
++                .open(directory.path().join("replaced-database"))
++                .expect("replacement file");
++            let target = guard.descriptor.as_raw_fd();
++            // Replace the registered database descriptor with the new file's inode.
++            let duplicated = unsafe { libc::dup2(replacement.as_raw_fd(), target) };
++            assert_eq!(
++                duplicated, target,
++                "replace the registered database descriptor"
++            );
++            let replaced = {
++                let metadata = guard.descriptor.metadata().expect("replaced descriptor");
++                (metadata.dev(), metadata.ino())
++            };
++            assert_ne!(
++                replaced, original,
++                "the descriptor names the replacement file"
++            );
++            for path in &paths {
++                let decoded = decode_reader_snapshot(
++                    &std::fs::read(path).expect("read the untouched registration"),
++                )
++                .expect("the published checksum still decodes");
++                assert_eq!(decoded.physical_identity, original);
++                assert_eq!(decoded.owner_user, guard.snapshot.owner_user);
++                assert_eq!(decoded.descriptor_number, guard.snapshot.descriptor_number);
++            }
++            assert_locked_refusal(label, scan(&persistence), &paths);
++            drop(replacement);
++        }
++        Row::UnlockedStaleDebris => {
++            let identity = persistence.physical_identity().expect("physical identity");
++            let guard = publish_live_registration(&persistence);
++            let source = registration_paths(&guard)
++                .into_iter()
++                .next()
++                .expect("published registration");
++            let bytes = std::fs::read(&source).expect("read the live registration");
++            let decoded = decode_reader_snapshot(&bytes).expect("live registration checksum");
++            drop(guard);
++            let debris = plant_unlocked_debris(&runtime, identity, &bytes);
++            assert!(debris.is_file(), "{label}: planted unlocked debris");
++            let scanned = scan(&persistence);
++            match scanned {
++                ReaderSnapshotRegistry::Complete(snapshots) => {
++                    assert!(
++                        snapshots
++                            .iter()
++                            .all(|snapshot| snapshot.handle_identity != decoded.handle_identity),
++                        "{label}: unlocked debris is not an admitted registration: {snapshots:?}"
++                    );
++                }
++                other => panic!(
++                    "{label}: unlocked registration is removed and the registry is complete: {other:?}"
++                ),
++            }
++            assert!(!debris.exists(), "{label}: unlocked debris is unlinked");
++        }
++        Row::ClosedDescriptor => {
++            let guard = publish_live_registration(&persistence);
++            let closed = closed_descriptor_number();
++            let mut forged = guard.snapshot.clone();
++            forged.descriptor_number = closed;
++            let paths = rewrite_locked_snapshot(&guard, &forged);
++            assert_locked_refusal(label, scan(&persistence), &paths);
++        }
++        Row::ExternalProcess => unreachable!("external process has its own holder"),
++    }
++}
++
++#[test]
++fn macos_reader_registry_authenticates_process_and_descriptor() {
++    // One mapped test. The child entry exists only because admission of another
++    // process cannot be observed inside this process.
++    if std::env::var_os(CHILD_ENV).is_some() {
++        hold_external_registration();
++        return;
++    }
++    for row in [
++        Row::OrdinarySelfPin,
++        Row::ExternalProcess,
++        Row::ForgedZeroStart,
++        Row::ForgedNonzeroStart,
++        Row::WrongRegularDescriptor,
++        Row::PipeDescriptor,
++        Row::ReplacedPhysicalFile,
++        Row::UnlockedStaleDebris,
++        Row::ClosedDescriptor,
++    ] {
++        run_row(row);
++    }
++}

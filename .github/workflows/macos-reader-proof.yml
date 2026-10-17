@@ -1,0 +1,48 @@
+name: macOS reader authentication proof
+on:
+  push:
+    branches: [ci-macos-reader-auth-proof]
+permissions:
+  contents: read
+concurrency:
+  group: macos-reader-proof-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  reader-authentication:
+    if: github.repository == 'context-graph-ai/contextdb' && github.ref == 'refs/heads/ci-macos-reader-auth-proof' && github.event_name == 'push'
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUSTUP_TOOLCHAIN: '1.94.1'
+      RUSTFLAGS: ''
+      VERIFIER_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: context-graph-ai/contextdb
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: '1.94.1'
+          cache: false
+          rustflags: ''
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-nextest@0.9.140
+      - name: Execute baseline and fixed reader authentication
+        run: python3 scripts/ci-macos-reader-proof.py
+      - name: Upload focused native evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-reader-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/macos-reader-proof/
+          retention-days: 14
+          if-no-files-found: error
