@@ -729,7 +729,7 @@ fn prepare_macos_default_runtime_directory(
         ));
     }
 
-    let mode = Mode::from_bits_truncate(OWNER_ONLY_MODE);
+    let mode = Mode::S_IRWXU;
     match mkdirat(&parent_fd, leaf_name, mode) {
         Ok(()) => {}
         Err(nix::errno::Errno::EEXIST) => {}
