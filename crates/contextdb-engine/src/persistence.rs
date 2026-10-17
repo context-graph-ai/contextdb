@@ -2741,7 +2741,21 @@ fn current_reader_registration_process() -> std::io::Result<ReaderBreadcrumb> {
             process_start: linux_process_start(std::process::id())?,
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let process_name = std::env::current_exe()?
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| safe_reader_process_display_name(name))
+            .unwrap_or("contextdb-reader")
+            .to_owned();
+        Ok(ReaderBreadcrumb {
+            process_id: std::process::id(),
+            process_name,
+            process_start: macos_process_start(std::process::id())?,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let process_name = std::env::current_exe()?
             .file_name()
@@ -2783,6 +2797,57 @@ fn linux_process_start(
         .parse::<u64>()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(contextdb_core::read_contract::ProcessStartIdentity(value))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start(
+    process_id: u32,
+) -> std::io::Result<contextdb_core::read_contract::ProcessStartIdentity> {
+    let pid = libc::c_int::try_from(process_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a process id of 0 has no reader start identity",
+        ));
+    }
+    // SAFETY: `proc_bsdinfo` is a plain integer record. All-zero is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == 136);
+    // SAFETY: `info` is a live `proc_bsdinfo` and `size` is its byte length.
+    // `PROC_PIDTBSDINFO` with arg 0 returns that record and does not select a zombie.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return Err(std::io::Error::last_os_error());
+    }
+    if info.pbi_pid != process_id || info.pbi_start_tvusec >= 1_000_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS process start identity was rejected",
+        ));
+    }
+    let packed = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .filter(|packed| *packed != 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "macOS process start identity was rejected",
+            )
+        })?;
+    Ok(contextdb_core::read_contract::ProcessStartIdentity(packed))
 }
 
 fn next_reader_breadcrumb_path(
@@ -4494,9 +4559,93 @@ fn reader_snapshot_owns_descriptor(snapshot: &RegisteredReaderSnapshot) -> bool 
         .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == snapshot.physical_identity)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn reader_snapshot_owns_descriptor(snapshot: &RegisteredReaderSnapshot) -> bool {
+    let stored = snapshot.process.process_start;
+    if stored == contextdb_core::read_contract::ProcessStartIdentity(0) {
+        return false;
+    }
+    if macos_process_start(snapshot.process.process_id).ok() != Some(stored) {
+        return false;
+    }
+    if macos_descriptor_identity(snapshot.process.process_id, snapshot.descriptor_number).ok()
+        != Some(snapshot.physical_identity)
+    {
+        return false;
+    }
+    macos_process_start(snapshot.process.process_id).ok() == Some(stored)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reader_snapshot_owns_descriptor(_snapshot: &RegisteredReaderSnapshot) -> bool {
     false
+}
+
+#[cfg(target_os = "macos")]
+fn macos_descriptor_identity(process_id: u32, descriptor: u32) -> std::io::Result<(u64, u64)> {
+    // libc 0.2.182 declares `vnode_info` and not `vnode_fdinfo`. Flavor 1 is
+    // `proc_fileinfo` plus `vnode_info`. Flavor 2 also applies a path check.
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+    #[repr(C)]
+    struct VnodeFdInfo {
+        pfi: ProcFileInfo,
+        pvi: libc::vnode_info,
+    }
+    const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+    // `enum vtype`: `VNON` is 0 and `VREG` is 1.
+    const VREG: libc::c_int = 1;
+    const _: () = assert!(std::mem::size_of::<ProcFileInfo>() == 24);
+    const _: () = assert!(std::mem::size_of::<libc::vinfo_stat>() == 136);
+    const _: () = assert!(std::mem::size_of::<libc::vnode_info>() == 152);
+    const _: () = assert!(std::mem::size_of::<VnodeFdInfo>() == 176);
+
+    let pid = libc::c_int::try_from(process_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a process id of 0 has no reader descriptor",
+        ));
+    }
+    let fd = libc::c_int::try_from(descriptor)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: the record is plain integers. All-zero is a valid value.
+    let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfo>())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `info` is a live flavor-1 record and `size` is its byte length.
+    let written = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            fd,
+            PROC_PIDFDVNODEINFO,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return Err(std::io::Error::last_os_error());
+    }
+    if info.pfi.fi_type != libc::PROX_FDTYPE_VNODE
+        || info.pvi.vi_type != VREG
+        || (info.pvi.vi_stat.vst_mode & libc::S_IFMT) != libc::S_IFREG
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "reader descriptor is not the registered regular file",
+        ));
+    }
+    // `MetadataExt::dev` casts Apple `dev_t` (`i32`) with `as u64`, which
+    // sign-extends. `vst_dev` holds those same bits in a `u32`.
+    let device = (info.pvi.vi_stat.vst_dev as i32) as u64;
+    Ok((device, info.pvi.vi_stat.vst_ino))
 }
 
 #[cfg(unix)]
