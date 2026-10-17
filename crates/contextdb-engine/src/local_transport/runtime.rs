@@ -50,6 +50,15 @@ impl RuntimeDirectory {
         }
     }
 
+    /// A macOS platform default directory whose root and directory are the same.
+    #[cfg(target_os = "macos")]
+    fn direct(directory: &Path) -> Self {
+        Self {
+            root: directory.to_path_buf(),
+            directory: directory.to_path_buf(),
+        }
+    }
+
     /// The runtime root: the directory whose ownership and permissions this
     /// process requires but never creates.
     pub fn root(&self) -> &Path {
@@ -315,6 +324,58 @@ fn validate_runtime_container_root(
     validate_runtime_root_shape(facts, current_user)
 }
 
+/// The macOS system temporary container (`/tmp` -> `/private/tmp`) must be an
+/// absolute, local, non-symlink directory owned by root (UID 0) and writable,
+/// with the sticky mode bit set. The owner-only channel directory is created
+/// directly inside it.
+#[cfg(target_os = "macos")]
+fn validate_macos_system_temporary_container(
+    facts: &RuntimeDirectoryFacts,
+    full_mode: u32,
+) -> Result<(), LocalTransportError> {
+    if !facts.available {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::Unavailable,
+        ));
+    }
+    if !facts.is_absolute {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::Relative,
+        ));
+    }
+    if !facts.is_local {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::NonLocal,
+        ));
+    }
+    if facts.is_symbolic_link {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::SymbolicLink,
+        ));
+    }
+    if !facts.is_directory {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::NotDirectory,
+        ));
+    }
+    if facts.owner != LocalUserIdentity(0) {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::WrongOwner,
+        ));
+    }
+    if !facts.writable {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::NotWritable,
+        ));
+    }
+    if (full_mode & 0o1000) == 0 {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::InsecureMode,
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_channel_path(
     facts: &ChannelPathFacts,
     current_user: LocalUserIdentity,
@@ -455,10 +516,30 @@ fn resolve_runtime_layout_with_environment(
         }
         #[cfg(target_os = "macos")]
         {
-            (
-                environment.macos_user_temporary_directory()?,
-                RuntimeDirectorySource::MacosTemporary,
-            )
+            use std::os::unix::fs::MetadataExt;
+
+            let _ = environment;
+            let alias_facts = inspector.inspect(Path::new("/tmp"))?;
+            if !alias_facts.available {
+                return Err(LocalTransportError::RuntimeRoot(
+                    RuntimeRootViolation::Unavailable,
+                ));
+            }
+            let canonical_parent = alias_facts.resolved_root;
+            let facts = inspector.inspect(&canonical_parent)?;
+            let full_mode = std::fs::symlink_metadata(&canonical_parent)
+                .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?
+                .mode();
+            validate_macos_system_temporary_container(&facts, full_mode)?;
+            let leaf = format!("cdb{:016x}", request.current_user.0);
+            let direct_dir = canonical_parent.join(leaf);
+            let runtime = RuntimeDirectory::direct(&direct_dir);
+            validate_channel_addressability(
+                &runtime
+                    .path()
+                    .join("0000000000000000000000000000000000000000000000000000000000000000.sock"),
+            )?;
+            return Ok((runtime, RuntimeDirectorySource::MacosTemporary));
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -564,6 +645,11 @@ fn prepare_runtime_layout_with_environment(
 ) -> Result<(RuntimeDirectory, RuntimeDirectorySource), LocalTransportError> {
     let (runtime, source) =
         resolve_runtime_layout_with_environment(request, inspector, environment)?;
+    #[cfg(target_os = "macos")]
+    if source == RuntimeDirectorySource::MacosTemporary {
+        prepare_macos_default_runtime_directory(runtime.path(), request.current_user)?;
+        return Ok((runtime, source));
+    }
     match inspector.inspect(runtime.path()) {
         Ok(facts) if facts.available => validate_runtime_root(&facts, request.current_user)?,
         Ok(_) | Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::Unavailable)) => {
@@ -574,6 +660,137 @@ fn prepare_runtime_layout_with_environment(
         Err(error) => return Err(error),
     }
     Ok((runtime, source))
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_macos_default_runtime_directory(
+    path: &Path,
+    expected_user: LocalUserIdentity,
+) -> Result<(), LocalTransportError> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::{Mode, SFlag, fstat, mkdirat};
+    use nix::sys::statfs::fstatfs;
+
+    let parent = path.parent().ok_or_else(|| {
+        LocalTransportError::FilesystemInspection("runtime path has no parent directory".to_owned())
+    })?;
+    let leaf_name = path.file_name().ok_or_else(|| {
+        LocalTransportError::FilesystemInspection("runtime path has no leaf name".to_owned())
+    })?;
+
+    let parent_fd = open(
+        parent,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        nix::errno::Errno::ENOENT => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::Unavailable)
+        }
+        nix::errno::Errno::ELOOP => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::SymbolicLink)
+        }
+        nix::errno::Errno::ENOTDIR => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory)
+        }
+        nix::errno::Errno::EACCES => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode)
+        }
+        other => LocalTransportError::FilesystemInspection(other.to_string()),
+    })?;
+
+    let parent_stat = fstat(&parent_fd)
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+
+    let parent_file_type = SFlag::from_bits_truncate(parent_stat.st_mode) & SFlag::S_IFMT;
+    if parent_file_type != SFlag::S_IFDIR {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::NotDirectory,
+        ));
+    }
+
+    if parent_stat.st_uid != 0 {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::WrongOwner,
+        ));
+    }
+
+    if (parent_stat.st_mode as u32 & 0o1000) == 0 {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::InsecureMode,
+        ));
+    }
+
+    let parent_fs = fstatfs(&parent_fd)
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+    if !parent_fs.flags().contains(nix::mount::MntFlags::MNT_LOCAL) {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::NonLocal,
+        ));
+    }
+
+    let mode = Mode::from_bits_truncate(OWNER_ONLY_MODE);
+    match mkdirat(&parent_fd, leaf_name, mode) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EEXIST) => {}
+        Err(error) => {
+            return Err(LocalTransportError::FilesystemInspection(error.to_string()));
+        }
+    }
+
+    let child_fd = openat(
+        &parent_fd,
+        leaf_name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        nix::errno::Errno::ENOENT => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::Unavailable)
+        }
+        nix::errno::Errno::ELOOP => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::SymbolicLink)
+        }
+        nix::errno::Errno::ENOTDIR => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory)
+        }
+        nix::errno::Errno::EACCES => {
+            LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode)
+        }
+        other => LocalTransportError::FilesystemInspection(other.to_string()),
+    })?;
+
+    let stat = fstat(&child_fd)
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+
+    let file_type = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+    if file_type != SFlag::S_IFDIR {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::NotDirectory,
+        ));
+    }
+
+    if LocalUserIdentity(stat.st_uid as u64) != expected_user {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::WrongOwner,
+        ));
+    }
+
+    if (stat.st_mode as u32 & 0o777) != OWNER_ONLY_MODE {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::InsecureMode,
+        ));
+    }
+
+    let fs = fstatfs(&child_fd)
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+    if !fs.flags().contains(nix::mount::MntFlags::MNT_LOCAL) {
+        return Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::NonLocal,
+        ));
+    }
+
+    Ok(())
 }
 
 fn create_owner_only_runtime_child(path: &Path) -> Result<(), LocalTransportError> {
@@ -733,4 +950,204 @@ fn filesystem_is_local(path: &Path) -> Result<bool, LocalTransportError> {
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn filesystem_is_local(_path: &Path) -> Result<bool, LocalTransportError> {
     Err(LocalTransportError::PlatformUnsupported)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_locator_tests {
+    use super::*;
+
+    #[test]
+    fn macos_system_temporary_container_validates_shape_sticky_and_owner() {
+        let parent = PathBuf::from("/private/tmp");
+        let valid_facts = RuntimeDirectoryFacts {
+            requested_root: parent.clone(),
+            resolved_root: parent,
+            is_absolute: true,
+            is_local: true,
+            is_directory: true,
+            is_symbolic_link: false,
+            owner: LocalUserIdentity(0),
+            mode: 0o1777,
+            writable: true,
+            available: true,
+        };
+        let valid_mode = 0o1777;
+
+        // Valid parent with S_ISVTX (0o1000) passes
+        assert!(validate_macos_system_temporary_container(&valid_facts, valid_mode).is_ok());
+
+        // Unavailable
+        let mut f = valid_facts.clone();
+        f.available = false;
+        assert_eq!(
+            validate_macos_system_temporary_container(&f, valid_mode),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::Unavailable))
+        );
+
+        // Relative
+        let mut f = valid_facts.clone();
+        f.is_absolute = false;
+        assert_eq!(
+            validate_macos_system_temporary_container(&f, valid_mode),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::Relative))
+        );
+
+        // NonLocal
+        let mut f = valid_facts.clone();
+        f.is_local = false;
+        assert_eq!(
+            validate_macos_system_temporary_container(&f, valid_mode),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NonLocal))
+        );
+
+        // SymbolicLink
+        let mut f = valid_facts.clone();
+        f.is_symbolic_link = true;
+        assert_eq!(
+            validate_macos_system_temporary_container(&f, valid_mode),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::SymbolicLink))
+        );
+
+        // NotDirectory
+        let mut f = valid_facts.clone();
+        f.is_directory = false;
+        assert_eq!(
+            validate_macos_system_temporary_container(&f, valid_mode),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory))
+        );
+
+        // WrongOwner (non-root UID)
+        let mut f = valid_facts.clone();
+        f.owner = LocalUserIdentity(501);
+        assert_eq!(
+            validate_macos_system_temporary_container(&f, valid_mode),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::WrongOwner))
+        );
+
+        // NotWritable
+        let mut f = valid_facts.clone();
+        f.writable = false;
+        assert_eq!(
+            validate_macos_system_temporary_container(&f, valid_mode),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotWritable))
+        );
+
+        // InsecureMode (missing S_ISVTX sticky bit 0o1000 in full_mode)
+        assert_eq!(
+            validate_macos_system_temporary_container(&valid_facts, 0o777),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode))
+        );
+        assert_eq!(
+            validate_macos_system_temporary_container(&valid_facts, 0o755),
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode))
+        );
+    }
+
+    #[test]
+    fn macos_default_descriptor_preparer_creates_and_cleans_exclusive_owned_nonce_leaf() {
+        use std::os::unix::fs::MetadataExt;
+
+        let canonical_tmp = std::fs::canonicalize("/tmp")
+            .expect("canonicalize /tmp must succeed on native Darwin");
+        let current_uid = LocalUserIdentity(nix::unistd::geteuid().as_raw() as u64);
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let nonce_leaf = format!("cdb_test_{pid}_{nonce:016x}");
+        let test_leaf_path = canonical_tmp.join(&nonce_leaf);
+
+        // Ensure we never delete a pre-existing path
+        assert!(!test_leaf_path.exists(), "test nonce collision: path already exists");
+
+        // Positive case: prepare descriptor-relative runtime child
+        let prepared = prepare_macos_default_runtime_directory(&test_leaf_path, current_uid);
+        assert!(prepared.is_ok(), "prepare descriptor on owned nonce leaf must succeed");
+
+        // Identity check: verify created leaf metadata dev and ino
+        let metadata = std::fs::symlink_metadata(&test_leaf_path).expect("leaf metadata");
+        assert_eq!(metadata.uid(), current_uid.0 as u32);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+
+        let created_dev = metadata.dev();
+        let created_ino = metadata.ino();
+
+        // Idempotent re-run: EEXIST tolerated, reopened via descriptor
+        let prepared_again = prepare_macos_default_runtime_directory(&test_leaf_path, current_uid);
+        assert!(prepared_again.is_ok(), "idempotent re-prepare must succeed");
+
+        // Verify inode identity has not changed before cleanup
+        let pre_cleanup_meta = std::fs::symlink_metadata(&test_leaf_path)
+            .expect("re-read leaf metadata before cleanup");
+        assert_eq!(pre_cleanup_meta.dev(), created_dev, "device changed before cleanup");
+        assert_eq!(pre_cleanup_meta.ino(), created_ino, "inode changed before cleanup");
+
+        // Cleanup only our test inode
+        std::fs::remove_dir(&test_leaf_path).expect("exclusive test leaf cleanup must succeed");
+        assert!(!test_leaf_path.exists(), "test leaf must be removed");
+    }
+
+    #[test]
+    fn macos_default_descriptor_preparer_refuses_symlink_regular_file_and_insecure_mode() {
+        let canonical_tmp = std::fs::canonicalize("/tmp")
+            .expect("canonicalize /tmp must succeed on native Darwin");
+        let current_uid = LocalUserIdentity(nix::unistd::geteuid().as_raw() as u64);
+        let pid = std::process::id();
+        let base_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+
+        // Negative 1: Symlink leaf refused via O_NOFOLLOW
+        let symlink_name = format!("cdb_test_symlink_{pid}_{base_nonce:016x}");
+        let symlink_path = canonical_tmp.join(&symlink_name);
+        assert!(!symlink_path.exists());
+        std::os::unix::fs::symlink(&canonical_tmp, &symlink_path)
+            .expect("create test symlink leaf");
+        let symlink_res = prepare_macos_default_runtime_directory(&symlink_path, current_uid);
+        // Darwin openat(O_NOFOLLOW | O_DIRECTORY) on a symlink returns ELOOP (mapped to SymbolicLink)
+        // or ENOTDIR (mapped to NotDirectory) if O_DIRECTORY is checked first.
+        assert!(
+            matches!(
+                symlink_res,
+                Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::SymbolicLink))
+                    | Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory))
+            ),
+            "symlink leaf must be refused via O_NOFOLLOW with SymbolicLink or NotDirectory: got {:?}",
+            symlink_res
+        );
+        std::fs::remove_file(&symlink_path).expect("cleanup test symlink");
+
+        // Negative 2: Regular file leaf refused
+        let file_name = format!("cdb_test_file_{pid}_{base_nonce:016x}");
+        let file_path = canonical_tmp.join(&file_name);
+        assert!(!file_path.exists());
+        std::fs::write(&file_path, b"not-a-directory").expect("write test regular file");
+        let file_res = prepare_macos_default_runtime_directory(&file_path, current_uid);
+        assert_eq!(
+            file_res,
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory)),
+            "regular file leaf must be refused with NotDirectory"
+        );
+        std::fs::remove_file(&file_path).expect("cleanup test file");
+
+        // Negative 3: Insecure mode 0755 leaf refused
+        let insecure_name = format!("cdb_test_insecure_{pid}_{base_nonce:016x}");
+        let insecure_path = canonical_tmp.join(&insecure_name);
+        assert!(!insecure_path.exists());
+        let mut builder = std::fs::DirBuilder::new();
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o755);
+        builder.create(&insecure_path).expect("create test 0755 directory");
+        let insecure_res = prepare_macos_default_runtime_directory(&insecure_path, current_uid);
+        assert_eq!(
+            insecure_res,
+            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode)),
+            "insecurely moded 0755 leaf must be refused with InsecureMode"
+        );
+        std::fs::remove_dir(&insecure_path).expect("cleanup test 0755 directory");
+    }
 }
