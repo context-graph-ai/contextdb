@@ -142,7 +142,8 @@ def main():
                 run(['git', 'apply', str(patch)], cwd=tree, name=label+'-patch')
                 run(['git', 'diff', '--stat'], cwd=tree, name=label+'-diff')
                 config = Path(temporary) / (label+'.toml')
-                config.write_text('[profile.reader-proof]\nretries = 0\n[profile.reader-proof.junit]\npath = "junit.xml"\nstore-success-output = true\nstore-failure-output = true\n')
+                junit = Path(temporary) / (label+'-junit.xml')
+                config.write_text('[profile.reader-proof]\nretries = 0\n[profile.reader-proof.junit]\npath = ' + json.dumps(str(junit)) + '\nstore-success-output = true\nstore-failure-output = true\n')
                 env = dict(os.environ, CARGO_TARGET_DIR=str(Path(temporary)/('target-'+label)))
                 common = ['-p', 'contextdb-engine', '--lib', '--locked', '-E', FILTER]
                 listing = run(['cargo', 'nextest', 'list', *common, '--message-format', 'json'],
@@ -152,9 +153,8 @@ def main():
                                  '--config-file', str(config), '--no-fail-fast',
                                  '--success-output', 'immediate', '--failure-output', 'immediate'],
                                 cwd=tree, name=label+'-run', env=env, required=False)
-                junit = Path(env['CARGO_TARGET_DIR']) / 'nextest/reader-proof/junit.xml'
-                xml = junit.read_text()
-                (out / (label+'-junit.xml')).write_text(xml)
+                xml = junit.read_bytes()
+                (out / (label+'-junit.xml')).write_bytes(xml)
                 outcome(xml, execution.returncode, label == 'baseline')
                 results[label] = 'expected assertion failure' if label == 'baseline' else 'passed'
             except Exception as error:
