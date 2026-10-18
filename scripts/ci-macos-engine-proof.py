@@ -14,7 +14,16 @@ import time
 PUBLIC = 'https://github.com/context-graph-ai/contextdb.git'
 BRANCH = 'refs/heads/ci-macos-reader-auth-proof'
 BASE = 'bc9cce955eb85fb1488f5304426eedeb6d97e905'
+PARENT_H = '800cb2b1c2dd0067d2ea2db670104fa4793b56b4'
 PREFIX = 'local_transport::runtime::macos_locator_tests::'
+
+# Authoritative trusted engine source files and accepted post-repair hashes (BS 395/396 acceptance).
+# Any modification to compiled engine module paths or unexpected source files is rejected.
+TRUSTED_ENGINE_FILES = {
+    'crates/contextdb-engine/src/local_transport/runtime.rs': 'b50c07cde63c59d685c62061523345ab6f2f6357e9aff5e06246bf4f5413c9a0',
+    'crates/contextdb-engine/tests/local_transport/local_transport_refusal_taxonomy.rs': '9ebdb6f9008876f6954cd341c94f16485b72eafa8efbe6f3563fd8769459b0e3',
+    'crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs': '49d248839ff7ab3cab233787f4eab3b245325b4cfd3317b07011e541227b6f2e',
+}
 
 
 def require(ok, message):
@@ -26,30 +35,35 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def candidate(config, verifier):
-    require(set(config) == {'repository_url', 'candidate_sha'} and
-            config['repository_url'] == PUBLIC, 'unexpected source repository/config')
-    sha = config['candidate_sha']
-    require(isinstance(sha, str) and re.fullmatch('[0-9a-f]{40}', sha) and
-            sha not in (verifier, BASE), 'approved public H required, distinct from T and baseline')
+def candidate(selected, verifier):
+    # Engine candidate identity is explicitly bound in macos-engine-selection.json;
+    # do NOT fallback to shared reader config (macos-reader-proof.json) or environment variables.
+    require(isinstance(selected, dict), 'engine selection config required')
+    sha = selected.get('candidate_sha')
+    require(isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha),
+            'approved public engine candidate H required in engine selection (null template cannot build)')
+    parent = selected.get('parent')
+    require(sha not in (verifier, BASE, parent, PARENT_H),
+            'approved public engine H required, distinct from T, baseline, and parent')
     return sha
 
 
 def selection(data):
     require(data.get('schema') == 'macos-engine-selection-v1' and
-            isinstance(data.get('parent'), str) and re.fullmatch('[0-9a-f]{40}', data['parent']),
-            'unexpected selection schema/parent')
-    require(re.fullmatch('[0-9a-f]{64}', data['approval_receipt_sha256']), 'receipt provenance required')
-    internal, external = data['internal_ids'], data['external_ids']
+            data.get('parent') == PARENT_H,
+            'unexpected selection schema/parent; expected ' + PARENT_H)
+    receipt_sha = data.get('approval_receipt_sha256')
+    require(isinstance(receipt_sha, str) and re.fullmatch(r'[0-9a-f]{64}', receipt_sha),
+            'receipt provenance required (null template cannot build)')
+    internal, external = data.get('internal_ids', []), data.get('external_ids', [])
     require(len(internal) == 3 and len(external) == 5 and
             len(set(internal + external)) == 8, 'exact unique 3+5 selection required')
     require(all(x.startswith(PREFIX) for x in internal) and
             all(x.startswith('local_transport_runtime::') for x in external), 'full module IDs required')
-    require(set(data['source_sha256']) == {
-        'crates/contextdb-engine/src/local_transport/runtime.rs',
-        'crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs'}, 'exact source map required')
-    require(all(re.fullmatch('[0-9a-f]{64}', x) for x in data['source_sha256'].values()),
-            'full source hashes required')
+    require(set(data.get('source_sha256', {})) == set(TRUSTED_ENGINE_FILES),
+            'exact 3 trusted engine source paths required')
+    require(data['source_sha256'] == TRUSTED_ENGINE_FILES,
+            'trusted engine source mapping mismatch')
     return internal, external
 
 
@@ -151,7 +165,7 @@ def main():
     try:
         require(platform.system() == 'Darwin', 'native Darwin required before any build')
         verifier = os.environ.get('VERIFIER_SHA', '')
-        require(re.fullmatch('[0-9a-f]{40}', verifier), 'full verifier SHA required')
+        require(re.fullmatch(r'[0-9a-f]{40}', verifier), 'full verifier SHA required')
         require(os.environ.get('GITHUB_EVENT_NAME') == 'push' and
                 os.environ.get('GITHUB_REF') == BRANCH and
                 os.environ.get('GITHUB_REPOSITORY') == 'context-graph-ai/contextdb' and
@@ -161,10 +175,9 @@ def main():
                 'verifier checkout mismatch')
         require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'verifier-status').stdout.strip(),
                 'dirty verifier checkout')
-        sha = candidate(json.loads((root/'scripts/macos-reader-proof.json').read_text()), verifier)
         selected = json.loads((root/'scripts/macos-engine-selection.json').read_text())
+        sha = candidate(selected, verifier)
         internal, external = selection(selected)
-        require(sha != selected['parent'], 'candidate must differ from immediate parent')
         expected = selected['source_sha256']
         files = ['.github/workflows/macos-engine-proof.yml', 'scripts/ci-macos-engine-proof.py',
                  'scripts/macos-engine-selection.json', 'scripts/macos-reader-proof.json']
