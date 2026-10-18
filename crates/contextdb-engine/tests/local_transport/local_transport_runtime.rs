@@ -306,7 +306,7 @@ fn linux_filesystem_locality_is_an_allowlist_and_unknown_types_are_refused() {
 #[test]
 #[cfg(target_os = "macos")]
 fn local_channel_derives_the_macos_direct_default_channel() {
-    let owner = LocalUserIdentity(7_102); // 0x1bc2
+    let owner = LocalUserIdentity(7_106); // 0x1bc2
     let canonical_parent = PathBuf::from("/private/tmp");
     let request = RuntimeDirectoryRequest {
         explicit_root: None,
