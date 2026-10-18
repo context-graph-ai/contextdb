@@ -4546,11 +4546,30 @@ fn assert_production_readers_are_named_where_the_writer_scans(runtime_directory:
     first
         .release()
         .expect("the first production read session finishes and releases its read lock");
+    match probe_writer(&path, runtime_directory) {
+        WriterProbeResult::HeldByReaders {
+            attempts,
+            observed_direct_readers,
+            verified_readers,
+            message,
+        } => {
+            assert_eq!(attempts, 1);
+            assert_eq!(observed_direct_readers, 1);
+            assert_eq!(verified_readers, vec![second_breadcrumb.clone()]);
+            assert!(message.contains(&second_breadcrumb.process_name));
+            assert!(message.contains(&format!("process {}", second_breadcrumb.process_id)));
+        }
+        other => panic!("the remaining production reader must still refuse the writer: {other:?}"),
+    }
     second
         .release()
         .expect("the second production read session finishes and releases its read lock");
     assert!(!first_breadcrumb_path.exists());
     assert!(!second_breadcrumb_path.exists());
+    assert!(matches!(
+        probe_writer(&path, runtime_directory),
+        WriterProbeResult::Acquired { attempts: 1 }
+    ));
 }
 
 /// A runtime root short enough that a local channel pathname below it still
