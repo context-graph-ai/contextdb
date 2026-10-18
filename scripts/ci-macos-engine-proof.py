@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify the fixed public engine revision using eight exact native tests."""
+"""Qualify the fixed public engine revision running 5 integration cases and binding 3 carried library passes."""
 import hashlib
 import json
 import os
@@ -14,15 +14,23 @@ import time
 PUBLIC = 'https://github.com/context-graph-ai/contextdb.git'
 BRANCH = 'refs/heads/ci-macos-reader-auth-proof'
 BASE = 'bc9cce955eb85fb1488f5304426eedeb6d97e905'
-PARENT_H = '800cb2b1c2dd0067d2ea2db670104fa4793b56b4'
+PARENT_H = '897eff2849d0e800ca3a5e4a9e9837fbda6e6cbb'
 PREFIX = 'local_transport::runtime::macos_locator_tests::'
 
-# Authoritative trusted engine source files and accepted post-repair hashes (BS 395/396 acceptance).
+# Authoritative trusted engine source files and accepted post-repair hashes (BS 415/416 acceptance).
 # Any modification to compiled engine module paths or unexpected source files is rejected.
 TRUSTED_ENGINE_FILES = {
     'crates/contextdb-engine/src/local_transport/runtime.rs': 'b50c07cde63c59d685c62061523345ab6f2f6357e9aff5e06246bf4f5413c9a0',
     'crates/contextdb-engine/tests/local_transport/local_transport_refusal_taxonomy.rs': '9ebdb6f9008876f6954cd341c94f16485b72eafa8efbe6f3563fd8769459b0e3',
-    'crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs': '49d248839ff7ab3cab233787f4eab3b245325b4cfd3317b07011e541227b6f2e',
+    'crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs': 'dc0bd03e0386a6518f592c0d0da70b39c128dcbd94c99d3db7fccf06d14a7bdc',
+}
+
+EXPECTED_CARRY = {
+    'old_engine_candidate_sha': '897eff2849d0e800ca3a5e4a9e9837fbda6e6cbb',
+    'old_verifier_sha': '8081aaba063becc0b9b960fd2a5af44453c63d4b',
+    'old_native_run_id': '39087115042',
+    'old_receipt_sha256': '927e061e8fe5505b19299c0edc969716456fd25db3314690cd417039e493800a',
+    'old_passed_lib_binary_sha256': '8008a17a21c205d24aba6f0ce3149e9e087620721908f76bfc3385e853411cdf',
 }
 
 
@@ -55,9 +63,19 @@ def selection(data):
     receipt_sha = data.get('approval_receipt_sha256')
     require(isinstance(receipt_sha, str) and re.fullmatch(r'[0-9a-f]{64}', receipt_sha),
             'receipt provenance required (null template cannot build)')
+    carry_receipt_sha = data.get('carry_receipt_sha256')
+    require(isinstance(carry_receipt_sha, str) and re.fullmatch(r'[0-9a-f]{64}', carry_receipt_sha),
+            'carry receipt provenance required (null template cannot build)')
+
+    carry = data.get('carry_authority', {})
+    require(isinstance(carry, dict), 'carry_authority object required')
+    for k, v in EXPECTED_CARRY.items():
+        require(carry.get(k) == v, f'carry authority mismatch for {k}')
+
     internal, external = data.get('internal_ids', []), data.get('external_ids', [])
     require(len(internal) == 3 and len(external) == 5 and
             len(set(internal + external)) == 8, 'exact unique 3+5 selection required')
+    require(carry.get('carried_internal_ids') == internal, 'carried_internal_ids mismatch in carry_authority')
     require(all(x.startswith(PREFIX) for x in internal) and
             all(x.startswith('local_transport_runtime::') for x in external), 'full module IDs required')
     require(set(data.get('source_sha256', {})) == set(TRUSTED_ENGINE_FILES),
@@ -137,8 +155,19 @@ def main():
     root = Path(__file__).resolve().parents[1]
     out = root/'target/macos-engine-proof'
     out.mkdir(parents=True, exist_ok=False)
-    receipt = {'verdict': 'FAIL', 'native': 'UNQUALIFIED', 'commands': [], 'runs': [],
-               'cleanup': {'created': False, 'success': False}}
+    receipt = {
+        'verdict': 'FAIL',
+        'native': 'UNQUALIFIED',
+        'native_current_result': 'UNQUALIFIED',
+        'combined_status': 'PENDING_BS_CARRY',
+        'commands': [],
+        'runs': [],
+        'cleanup': {'created': False, 'success': False},
+        'current_actual_required': 5,
+        'carried_required': 3,
+        'selected_total': 8,
+        'carried_library_status': 'EXTERNAL_CARRY_PENDING_VALIDATION',
+    }
     temporary = None
     tree = None
     expected = None
@@ -181,12 +210,25 @@ def main():
         expected = selected['source_sha256']
         files = ['.github/workflows/macos-engine-proof.yml', 'scripts/ci-macos-engine-proof.py',
                  'scripts/macos-engine-selection.json', 'scripts/macos-reader-proof.json']
-        receipt.update(verifier_sha=verifier, candidate_sha=sha, repository=PUBLIC,
-                       workflow_sha=os.environ['GITHUB_WORKFLOW_SHA'], ref=BRANCH, event='push',
-                       workflow_ref=os.environ.get('GITHUB_WORKFLOW_REF'),
-                       run_id=os.environ.get('GITHUB_RUN_ID'), run_attempt=os.environ.get('GITHUB_RUN_ATTEMPT'),
-                       selection=selected, tooling_sha256={f: digest(root/f) for f in files},
-                       features='default', jobs=1, test_threads=1, platform=platform.platform())
+        receipt.update(
+            verifier_sha=verifier,
+            candidate_sha=sha,
+            repository=PUBLIC,
+            workflow_sha=os.environ['GITHUB_WORKFLOW_SHA'],
+            ref=BRANCH,
+            event='push',
+            workflow_ref=os.environ.get('GITHUB_WORKFLOW_REF'),
+            run_id=os.environ.get('GITHUB_RUN_ID'),
+            run_attempt=os.environ.get('GITHUB_RUN_ATTEMPT'),
+            selection=selected,
+            tooling_sha256={f: digest(root/f) for f in files},
+            features='default',
+            jobs=1,
+            test_threads=1,
+            platform=platform.platform(),
+            carried_internal_ids=internal,
+            carry_authority=selected.get('carry_authority'),
+        )
         for name, command in [('macos', ['sw_vers']), ('uname', ['uname', '-a']),
                               ('rustc', ['rustc', '-Vv']), ('cargo', ['cargo', '-V'])]:
             receipt[name] = run(command, name).stdout.decode()
@@ -223,6 +265,7 @@ def main():
         receipt['target_dir'] = str(target_dir)
         receipt['inventories'] = {}
         binaries = {}
+        # Darwin compile + list BOTH targets with unchanged lib default command and integration --features test-seams
         for label, selector, ids in [('lib', ['--lib'], internal),
                                       ('integration', ['--features', 'test-seams', '--test', 'local_transport'], external)]:
             build = run(['cargo', 'test', '--locked', '-p', 'contextdb-engine', *selector,
@@ -233,18 +276,21 @@ def main():
             receipt['inventories'][label] = inventory(listed.stdout.decode(), ids, label == 'lib')
         receipt['binaries'] = binaries
         save()
-        for label, ids in [('lib', internal), ('integration', external)]:
-            for full_id in ids:
-                require(full_id not in [x['id'] for x in receipt['runs']], 'duplicate invocation')
-                execution = run([binaries[label]['path'], '--exact', full_id, '--nocapture', '--test-threads', '1'],
-                                'case-'+str(len(receipt['runs'])+1), cwd=tree, env=env, required=False)
-                record = {'id': full_id, 'binary': label, 'exit': execution.returncode, 'passed': False}
-                receipt['runs'].append(record)
-                save()
-                outcome(execution.stdout.decode(), execution.returncode, full_id)
-                record['passed'] = True
-                save()
-        require(len(receipt['runs']) == 8 and all(x['passed'] for x in receipt['runs']), 'eight actual passes required')
+
+        # DO NOT execute library3 again. Run ONLY 5 integration FULLIDs, exactly 1 pass 0 fail 0 ignore each.
+        for full_id in external:
+            require(full_id not in [x['id'] for x in receipt['runs']], 'duplicate invocation')
+            execution = run([binaries['integration']['path'], '--exact', full_id, '--nocapture', '--test-threads', '1'],
+                            'case-'+str(len(receipt['runs'])+1), cwd=tree, env=env, required=False)
+            record = {'id': full_id, 'binary': 'integration', 'exit': execution.returncode, 'passed': False}
+            receipt['runs'].append(record)
+            save()
+            outcome(execution.stdout.decode(), execution.returncode, full_id)
+            record['passed'] = True
+            save()
+
+        require(len(receipt['runs']) == 5 and all(x['passed'] for x in receipt['runs']),
+                'five actual integration passes required')
         receipt['verdict'] = 'PASS'
     except Exception as error:
         receipt['error'] = str(error)
@@ -267,7 +313,15 @@ def main():
                 receipt['cleanup']['error'] = str(error)
         else:
             receipt['cleanup'] = {'created': False, 'success': True, 'reason': 'no temporary checkout created'}
-        receipt['native'] = 'QUALIFIED' if receipt['verdict'] == 'PASS' else 'UNQUALIFIED'
+
+        if receipt['verdict'] == 'PASS':
+            receipt['native'] = 'PASS/PENDING_BS_CARRY'
+            receipt['native_current_result'] = 'integration5 current PASS/PENDING_BS_CARRY'
+            receipt['combined_status'] = 'PENDING_BS_CARRY'
+        else:
+            receipt['native'] = 'UNQUALIFIED'
+            receipt['native_current_result'] = 'UNQUALIFIED'
+            receipt['combined_status'] = 'UNQUALIFIED'
         save()
     require(receipt['verdict'] == 'PASS', 'engine qualification failed; see receipt and raw logs')
 

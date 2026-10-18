@@ -1,12 +1,13 @@
 {
   "schema": "macos-engine-selection-v1",
-  "candidate_sha": "897eff2849d0e800ca3a5e4a9e9837fbda6e6cbb",
-  "parent": "800cb2b1c2dd0067d2ea2db670104fa4793b56b4",
-  "approval_receipt_sha256": "99a53776cbb1a33ba2b078dd576c9456f4699f6f52b1a888d3d1d8e62be69a84",
+  "candidate_sha": "db9d067f291c0add0922713936a63f51f24e9f1c",
+  "parent": "897eff2849d0e800ca3a5e4a9e9837fbda6e6cbb",
+  "approval_receipt_sha256": "909162af4302913e111c8253ae2e7ec6505adb59dcd7107e6d19ca40a8355fa8",
+  "carry_receipt_sha256": "f55ed2520c34bf508082a820c872a7c7c9cd2144707dcc8b84fc1a9b94a7811f",
   "source_sha256": {
     "crates/contextdb-engine/src/local_transport/runtime.rs": "b50c07cde63c59d685c62061523345ab6f2f6357e9aff5e06246bf4f5413c9a0",
     "crates/contextdb-engine/tests/local_transport/local_transport_refusal_taxonomy.rs": "9ebdb6f9008876f6954cd341c94f16485b72eafa8efbe6f3563fd8769459b0e3",
-    "crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs": "49d248839ff7ab3cab233787f4eab3b245325b4cfd3317b07011e541227b6f2e"
+    "crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs": "dc0bd03e0386a6518f592c0d0da70b39c128dcbd94c99d3db7fccf06d14a7bdc"
   },
   "internal_ids": [
     "local_transport::runtime::macos_locator_tests::macos_system_temporary_container_validates_shape_sticky_and_owner",
@@ -19,5 +20,17 @@
     "local_transport_runtime::macos_default_channel_path_length_bound_b13_accept_b14_refuse",
     "local_transport_runtime::macos_default_channel_canonicalizes_alias_before_symlink_inspection",
     "local_transport_runtime::process_environment_resolves_the_native_macos_direct_default_channel"
-  ]
+  ],
+  "carry_authority": {
+    "old_engine_candidate_sha": "897eff2849d0e800ca3a5e4a9e9837fbda6e6cbb",
+    "old_verifier_sha": "8081aaba063becc0b9b960fd2a5af44453c63d4b",
+    "old_native_run_id": "39087115042",
+    "old_receipt_sha256": "927e061e8fe5505b19299c0edc969716456fd25db3314690cd417039e493800a",
+    "old_passed_lib_binary_sha256": "8008a17a21c205d24aba6f0ce3149e9e087620721908f76bfc3385e853411cdf",
+    "carried_internal_ids": [
+      "local_transport::runtime::macos_locator_tests::macos_system_temporary_container_validates_shape_sticky_and_owner",
+      "local_transport::runtime::macos_locator_tests::macos_default_descriptor_preparer_creates_and_cleans_exclusive_owned_nonce_leaf",
+      "local_transport::runtime::macos_locator_tests::macos_default_descriptor_preparer_refuses_symlink_regular_file_and_insecure_mode"
+    ]
+  }
 }
