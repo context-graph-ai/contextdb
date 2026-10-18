@@ -39,9 +39,10 @@ def publication_binding(dispatch_path, checkout, d):
         return result
     before,after=tree(o.BASE),tree(d['tooling_sha'])
     additions=set(m.REVIEWED_PATHS)|{m.ACTIVATION_PATH}
-    o.require(not additions.intersection(before), 'diagnostic additions overlap fixed base')
-    o.require(set(after)==set(before)|additions and all(after[p]==v for p,v in before.items()),
-              'actual T changes inherited source or has missing/extra additions')
+    expected_base={'.github/workflows/macos-diagnostics.yml': {'blob': 'c73c8e22e1ba889b8376701c8b084ae8974c7bc4', 'mode': '100644'}, 'scripts/ci-macos-diagnostics.py': {'blob': 'ee6ba21ea8504f2527e43ce219579e86b44dda63', 'mode': '100644'}, 'scripts/diagnostic-assets/CG_trace.patch': {'blob': '23f50e3bfef4cfac03b79f05b50a501501406be0', 'mode': '100644'}, 'scripts/diagnostic-assets/activation.json': {'blob': 'dac666c2ae6159810edcd140ee76784efeb00e36', 'mode': '100644'}, 'scripts/diagnostic-assets/engine_trace.patch': {'blob': 'eb1da2f006c1fc9216ef5ff21fc2ecd05d78cb9b', 'mode': '100644'}, 'scripts/diagnostic-assets/frozen.json': {'blob': '78cf1f10f44c1330be0377c12d9f7d705739e158', 'mode': '100644'}, 'scripts/diagnostic-assets/nomic.rs': {'blob': 'd25ac48b943d36851ee4fba6b876a62c85b67c53', 'mode': '100644'}, 'scripts/dispatch-macos-diagnostics.py': {'blob': '19ed029b5435e50dce3697c144095601c423cdf9', 'mode': '100644'}, 'scripts/macos-diagnostic-selection.json': {'blob': 'c90959c112bd964bd1b1bdec144bdf8ebb45f634', 'mode': '100644'}, 'scripts/macos-diagnostic-selection.schema.json': {'blob': '9e94c45e4867ae578e931caad4e58d9fe85bac2c', 'mode': '100644'}, 'scripts/observe-macos-diagnostics.py': {'blob': '1256ee386dbf787c3922b47ea41c4fda61ffd796', 'mode': '100644'}}
+    o.require({p:before.get(p) for p in additions}==expected_base, 'diagnostic parent content mismatch')
+    o.require(set(after)==set(before) and all(after[p]==v for p,v in before.items() if p not in additions),
+              'actual T changes inherited source or has missing/extra diagnostic paths')
     for path in additions:
         o.require(after[path]['mode']=='100644', 'published file mode mismatch')
         raw=subprocess.check_output(['git','-C',str(checkout),'show',d['tooling_sha']+':'+path])

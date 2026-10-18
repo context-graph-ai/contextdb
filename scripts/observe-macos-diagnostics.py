@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 
 REPO='context-graph-ai/contextdb'
 BRANCH='ci-macos-diagnostic-295'
-BASE='ef16fe66365bb3d1b39c96d22403187610ab8958'
+BASE='2358c71db6ceedea174d7e9ceb5a1eec0bbe836f'
 FROZEN='f5066c842195aeba87fb0943fb4eebbb00093fb2d0fde692f641482339b44f53'
 CASE='subscriptions::subscription_filter_context_ids_routes_msp_subscriber_across_authorized_contexts_with_single_sink_count'
 BINARY='context-graph::acceptance'
@@ -74,7 +74,7 @@ def unzip(raw,destination):
                 target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(z.read(info))
 
 
-def receipt_check(capture,final,d):
+def receipt_identity(capture,final,d):
     require(capture['actual_tooling_sha']==d['tooling_sha'] and final['actual_tooling_sha']==d['tooling_sha'] and
             final['actual_tooling_tree']==d['tooling_tree'] and final['phase']==d['phase'] and
             str(final['run_id'])==str(d['run_id']) and int(final['run_attempt'])==1 and final['event']=='push' and
@@ -84,6 +84,11 @@ def receipt_check(capture,final,d):
     require(final['source_post_verified'] is True and final['cleanup']['success'] is True and
             final['cleanup']['source_captured_before_cleanup'] is True and final['process_cleanup']['success'] is True,'cleanup/source evidence incomplete')
     require({r:s['commit'] for r,s in final['sources'].items()}==d['sources'],'fetched source mismatch')
+    require(final['product_qualification']=='UNQUALIFIED','diagnostics cannot grant PR qualification')
+
+
+def receipt_check(capture,final,d):
+    receipt_identity(capture,final,d)
     require(final['generated_lock_sha256'] and final['metadata_sha256'] and final['default_graph']['package_ids'] and
             final['binary']['sha256'] and final['inventory'],'compile/lock/inventory proof missing')
     rows=final['runs'];require(len(rows)==1 and final['unrun']==0,'partial execution receipt')
@@ -97,12 +102,11 @@ def receipt_check(capture,final,d):
     return r
 
 
-def verify_raw_evidence(directory, receipt, dispatch):
+def verify_graph_evidence(directory, receipt, dispatch):
     runner=Path(__file__).with_name('ci-macos-diagnostics.py')
     spec=importlib.util.spec_from_file_location('diagnostic_validator',runner)
     m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
     frozen=m.load_frozen(runner.parents[1])
-    verify_case_transport(directory,receipt,dispatch,m,frozen)
     expected=m.expected_maps(frozen,[frozen['patches'][x] for x in m.PHASES['subscription_trace']])
     lock=(directory/'generated-Cargo.lock').read_text()
     m.approve_lock((directory/'cg-original-Cargo.lock').read_text(),lock)
@@ -125,7 +129,22 @@ def verify_raw_evidence(directory, receipt, dispatch):
         require(c['argv']==m.CARGO+receipt['metadata_flags']+extra and c['cwd']==str(Path(receipt['owned_root'])/'cg') and c['complete'] is True and c['exit']==0,'metadata command flags/source mismatch')
     require(metadata_commands[0]<metadata_commands[1],'baseline must precede overlay metadata')
     graph=m.compare_metadata(baseline,metadata,Path(receipt['owned_root'])/'engine',frozen,(directory/'cg-original-Cargo.lock').read_text(),lock)
+    require(sha((directory/'engine-original-Cargo.lock').read_bytes())==frozen['sources']['engine']['files']['Cargo.lock'],'original engine lock mismatch')
+    require(sha((directory/'cg-original-Cargo.lock').read_bytes())==frozen['sources']['cg']['files']['Cargo.lock'],'original CG lock mismatch')
+    if receipt.get('default_graph') is None:
+        require(receipt.get('capture_complete') is False, 'complete capture missing graph')
+        return m,frozen,graph,metadata
     require(graph==receipt['default_graph'],'raw metadata graph differs')
+    return m,frozen,graph,metadata
+
+
+def verify_raw_evidence(directory, receipt, dispatch):
+    m,frozen,graph,metadata=verify_graph_evidence(directory,receipt,dispatch)
+    verify_case_transport(directory,receipt,dispatch,m,frozen)
+    verify_compiled_evidence(directory,receipt,m,frozen,graph,metadata)
+
+
+def verify_compiled_evidence(directory,receipt,m,frozen,graph,metadata):
     packages=[p for p in metadata['packages'] if p['name']=='context-graph' and p['manifest_path']==str(Path(receipt['owned_root'])/'cg/crates/context-graph/Cargo.toml')]
     require(len(packages)==1,'actual CG package missing')
     events=[json.loads(line) for line in (directory/'compile.stdout').read_text().splitlines() if line.strip()]
@@ -138,6 +157,143 @@ def verify_raw_evidence(directory, receipt, dispatch):
     require(listed==receipt['inventory'],'raw inventory differs from receipt')
     require(sha((directory/'engine-original-Cargo.lock').read_bytes())==frozen['sources']['engine']['files']['Cargo.lock'],'original engine lock mismatch')
     require(sha((directory/'cg-original-Cargo.lock').read_bytes())==frozen['sources']['cg']['files']['Cargo.lock'],'original CG lock mismatch')
+
+
+def verify_command_outputs(directory,receipt):
+    commands=receipt['commands']
+    require(isinstance(commands,list) and commands and len({c['name'] for c in commands})==len(commands),
+            'missing/duplicate command timeline')
+    for c in commands:
+        require(c['complete'] is True and type(c['exit']) is int, 'partial command receipt')
+        for stream in ('stdout','stderr'):
+            if c['name'].endswith('-archive') and stream=='stdout':continue
+            path=directory/(c['name']+'.'+stream)
+            require(path.is_file() and sha(path.read_bytes())==c[stream+'_sha256'],'raw command digest mismatch')
+
+
+def verify_incomplete_identity(directory,receipt,d):
+    runner=Path(__file__).with_name('ci-macos-diagnostics.py')
+    spec=importlib.util.spec_from_file_location('incomplete_identity_validator',runner)
+    m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+    frozen=m.load_frozen(runner.parents[1])
+    manifest=m.reviewed_manifest(runner.parents[1])
+    require(m.sha(m.canonical(manifest))==d.get('reviewed_content_manifest_sha256'),
+            'incomplete reviewed content/dispatch mismatch')
+    raw={}
+    for name in ('activation','selection'):
+        path=directory/('raw-'+name+'.json')
+        require(path.is_file() and not path.is_symlink(),
+                'UNVERIFIED identity gap: missing retained raw '+name+' bytes')
+        raw[name]=path.read_bytes()
+    require(sha(raw['activation'])==d.get('activation_receipt_sha256'),
+            'retained activation bytes digest mismatch')
+    authority=json.loads(raw['activation'])
+    require(isinstance(authority,dict),'activation object required')
+    m.activation_binding(authority,manifest,frozen)
+    require(authority==receipt.get('activation'),'retained activation/decoded receipt mismatch')
+    require(authority['diagnostic_publication_approval_receipt_sha256']==
+            d.get('diagnostic_publication_approval_receipt_sha256'), 'activation source approval/dispatch mismatch')
+    require(sha(raw['selection'])==d.get('selection_sha256')==receipt.get('selection_sha256'),
+            'retained selection bytes digest mismatch')
+    config=json.loads(raw['selection'])
+    require(isinstance(config,dict),'selection object required')
+    m.selection(config,frozen)
+    require(config==receipt.get('selection') and config['activation_receipt_sha256']==sha(raw['activation']),
+            'retained selection/activation/decoded receipt mismatch')
+    require(m.content_entry(m.SELECTION_PATH,raw['selection'],'100644')==manifest['files'][m.SELECTION_PATH],
+            'retained selection reviewed content mismatch')
+    sources=receipt.get('sources')
+    require(isinstance(sources,dict) and set(sources)==set(frozen['sources']), 'incomplete source tuple missing')
+    commands=receipt.get('commands',[])
+    identity={}
+    for repo,source in frozen['sources'].items():
+        require(isinstance(sources[repo],dict) and sources[repo].get('commit')==source['commit'] and sources[repo].get('tree')==source['tree'],
+                'fetched source commit/tree mismatch: '+repo)
+        identity[repo]={}
+        for suffix,expected,argv in (('head',source['commit'],['git','rev-parse','FETCH_HEAD']),
+                                     ('tree',source['tree'],['git','rev-parse',source['commit']+'^{tree}'])):
+            name=repo+'-'+suffix
+            rows=[c for c in commands if c.get('name')==name]
+            if not rows:
+                identity[repo][suffix]='UNRUN_UNVERIFIED'
+                continue
+            require(len(rows)==1 and rows[0].get('argv')==argv and rows[0].get('complete') is True and
+                    rows[0].get('exit')==0 and not rows[0].get('timeout',False), 'fetched source identity command mismatch: '+name)
+            path=directory/(name+'.stdout')
+            require(path.is_file() and path.read_bytes().decode().strip()==expected,
+                    'fetched source identity output mismatch: '+name)
+            identity[repo][suffix]='VERIFIED'
+    return {'activation':'VERIFIED','selection':'VERIFIED','sources':identity}
+
+
+def verify_incomplete(directory,capture,final,d,job):
+    identity=verify_incomplete_identity(directory,final,d)
+    receipt_identity(capture,final,d)
+    require(final.get('capture_complete') is False and capture.get('capture_complete') is False and
+            isinstance(final.get('error'),str) and final['error'].strip() and
+            capture.get('error')==final['error'] and final.get('verdict') in ('FAIL','TEST_FAIL'),
+            'incomplete capture requires original failure')
+    require(job.get('conclusion')=='failure' and any(s.get('conclusion')=='failure' and
+            'capture' in s.get('name','').lower() for s in job.get('steps',[])),
+            'incomplete capture requires failed job/capture step')
+    require(capture==dict(final,cleanup=capture['cleanup']), 'capture/final receipt drift outside cleanup')
+    verify_command_outputs(directory,final)
+    require(all(status=='VERIFIED' for source in identity['sources'].values() for status in source.values()),
+            'UNVERIFIED identity gap: metadata-stage capture missing fetched source command')
+    m,frozen,graph,metadata=verify_graph_evidence(directory,final,d)
+    names=[c['name'] for c in final['commands']]
+    case_commands=[c for c in final['commands'] if c['name']=='case-1']
+    missing=[name for name in ('feature-graph-default','compile','real-model-proofs',
+                             'inventory-all','inventory-selected','case-1') if name not in names]
+    result={'result':'INCOMPLETE_HARNESS_FAILURE','capture_complete':False,'selected':1,
+            'passed':0,'product_qualification':'UNQUALIFIED','primary_error':final['error'],'identity':identity,
+            'missing_stages':missing,'trace_capture':final.get('trace_capture'),
+            'actual_runs':final['runs'],'case_exit':None,'junit_present':(directory/'junit.xml').is_file()}
+    if not case_commands:
+        # Only the observed pre-compilation graph failure has a defined zero-case timeline.
+        require(final['error'].startswith('ValueError: resolved baseline/overlay graph differs:') and
+                final['verdict']=='FAIL' and final['runs']==[] and final['unrun']==1 and
+                final.get('default_graph') is None and final.get('binary') is None and
+                final.get('inventory') is None and final.get('trace_capture') is None and
+                not any(n in names for n in ('feature-graph-default','compile','model-seed',
+                    'real-model-proofs','inventory-all','inventory-selected')) and
+                not any((directory/n).exists() for n in ('case-1.stdout','case-1.stderr','junit.xml',
+                    'compile.stdout','inventory-all.stdout','inventory-selected.stdout')),
+                'inconsistent zero-case metadata failure timeline')
+        require(names[-1]=='disk-after' and names[-2]=='metadata-generate' and
+                all(not c['name'].startswith(('case-','inventory-')) for c in final['commands']),
+                'zero-case timeline extends beyond metadata failure')
+        require(all(c['exit']==0 and not c.get('timeout',False) for c in final['commands']),
+                'metadata failure timeline contains another command failure')
+        result.update(case_status='UNRUN',unrun=1,executed=0,failed=0)
+    else:
+        # Executed/partial case evidence is never relabelled UNRUN or granted a test PASS.
+        require(len(case_commands)==1 and all(n in names for n in ('compile','inventory-all','inventory-selected')),
+                'case command without prerequisites')
+        require(final.get('default_graph') and final.get('binary',{}).get('sha256') and final.get('inventory'), 'partial case missing graph/binary/inventory proof')
+        verify_compiled_evidence(directory,final,m,frozen,graph,metadata)
+        ordered=[names.index(n) for n in ('compile','inventory-all','inventory-selected','case-1')]
+        require(ordered==sorted(ordered), 'case prerequisite timeline out of order')
+        c=case_commands[0];row=frozen['cases']['A'][0]
+        require(c['argv']==row['run_argv'] and c['cwd']==str(Path(final['owned_root'])/'cg') and
+                c.get('environment')==m.CASE_ENV, 'partial case command identity mismatch')
+        for command in final['commands']:
+            if command['name']!='case-1':require(not any(k in command.get('environment',{}) for k in m.CASE_ENV),'case environment leaked to prerequisite')
+        trace=m.trace_presence((directory/'case-1.stdout').read_bytes(),(directory/'case-1.stderr').read_bytes())
+        require(final.get('trace_capture')==trace, 'partial trace receipt differs')
+        if result['junit_present']:
+            try:
+                actual=m.junit_result((directory/'junit.xml').read_bytes(),row,c['exit'])
+            except (ValueError,ET.ParseError) as error:
+                result['junit_error']=type(error).__name__+': '+str(error)
+                require(final['runs']==[], 'invalid JUnit has fabricated run accounting')
+            else:
+                require(final['runs']==[actual], 'partial JUnit/receipt accounting differs')
+                result['actual_junit_result']=actual
+        else:require(final['runs']==[], 'missing JUnit has fabricated run accounting')
+        result.update(case_status='EXECUTED_CAPTURE_INCOMPLETE',unrun=None,executed=1,
+                      failed=None,case_exit=c['exit'],trace_capture=trace)
+    return result
 
 
 def verify_case_transport(directory, receipt, dispatch, m, frozen):
@@ -246,14 +402,23 @@ def observe(d,out,api=None,notify=None,clock=time.time,pause=time.sleep):
             kind=a['name'].rsplit('-',1)[1];dest=out/kind;unzip(raw,dest);extracted[kind]=dest
         capture=json.loads((extracted['capture']/'receipt.json').read_text())
         final=json.loads((extracted['cleanup']/'receipt.json').read_text())
+        if final.get('capture_complete') is False:
+            # Retain actual case commands/bytes even if validation later rejects partial evidence.
+            case_commands=[c for c in final.get('commands',[]) if c.get('name')=='case-1']
+            partial_raw={name:{'present':(extracted['capture']/name).is_file(),
+                              'sha256':sha((extracted['capture']/name).read_bytes()) if (extracted['capture']/name).is_file() else None}
+                         for name in ('case-1.stdout','case-1.stderr','junit.xml')}
+            save(out/'partial-evidence.json',{'primary_error':final.get('error'),'identity_status':'UNVERIFIED',
+                'case_commands':case_commands,'runs':final.get('runs'),'raw':partial_raw,
+                'case_status':'EXECUTED_CAPTURE_INCOMPLETE' if case_commands else 'UNRUN_UNVERIFIED',
+                'missing_stages':[name for name in ('compile','inventory-all','inventory-selected','case-1')
+                                  if not any(c.get('name')==name for c in final.get('commands',[]))]})
+            partial=verify_incomplete(extracted['capture'],capture,final,bound,jobs['jobs'][0])
+            state.update(partial,status='COLLECTED_INCOMPLETE',collector_status='COLLECTED_INCOMPLETE',finished=clock())
+            save(state_path,state);return state
         r=receipt_check(capture,final,bound)
         verify_raw_evidence(extracted['capture'],final,bound)
-        for c in final['commands']:
-            require(c['complete'] is True and c['exit'] is not None,'partial command receipt')
-            for stream in ('stdout','stderr'):
-                if c['name'].endswith('-archive') and stream=='stdout':continue
-                path=extracted['capture']/(c['name']+'.'+stream)
-                require(path.is_file() and sha(path.read_bytes())==c[stream+'_sha256'],'raw command digest mismatch')
+        verify_command_outputs(extracted['capture'],final)
         cases=list(ET.parse(extracted['capture']/'junit.xml').getroot().iter('testcase'))
         require(len(cases)==1 and cases[0].get('name')==CASE and cases[0].get('classname')==BINARY and cases[0].find('skipped') is None,'raw JUnit accounting mismatch')
         failed_xml=cases[0].find('failure') is not None or cases[0].find('error') is not None
@@ -264,6 +429,19 @@ def observe(d,out,api=None,notify=None,clock=time.time,pause=time.sleep):
     raise TimeoutError(state['error'])
 
 
+def final_callback(out,d,state):
+    # Local callback receives inert evidence text, including the original root failure when retained.
+    primary=state.get('primary_error')
+    if primary is None and (out/'capture/receipt.json').is_file():
+        primary=json.loads((out/'capture/receipt.json').read_text()).get('error')
+    message='HOSTED_MAC_FINAL '+json.dumps({'evidence':str(out),'primary_error':primary,
+        'collector_status':state.get('collector_status',state.get('status')),
+        'collector_error':state.get('collector_error'),'result':state.get('result')},sort_keys=True)
+    p=subprocess.run([*callback_config(d['callback']),message],shell=False,capture_output=True,timeout=30)
+    save(out/'final-callback.json',{'message':message,'exit':p.returncode})
+    require(p.returncode==0,'final collector callback failed')
+
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('action',choices=['prepare','observe']);p.add_argument('--dispatch',type=Path,required=True);p.add_argument('--out',type=Path,required=True)
     a=p.parse_args();d=json.loads(a.dispatch.read_text())
@@ -272,11 +450,17 @@ def main():
         dispatch_binding(d);a.out.mkdir(parents=True,exist_ok=False)
         save(a.out/'ready.json',{'status':'PREPARED','dispatch_sha256':sha(json.dumps(d,sort_keys=True).encode()),'observer_sha256':sha(Path(__file__).read_bytes()),'live_process_started':False,'activation_issued':False})
     else:
-        try: observe(d,a.out)
+        try:
+            state=observe(d,a.out)
+            final_callback(a.out,d,state)
         except BaseException as error:
             state_path=a.out/'state.json'
             if state_path.exists():
                 state=json.loads(state_path.read_text());state.update(status='EVIDENCE_FAIL',error=type(error).__name__+': '+str(error),finished=time.time());save(state_path,state)
+            try:
+                final_callback(a.out,d,dict(state if state_path.exists() else {},collector_status='EVIDENCE_FAIL',collector_error=type(error).__name__+': '+str(error)))
+            except Exception:
+                pass  # The saved original error remains authoritative when final delivery also fails.
             raise
 
 

@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 
 REPO = 'context-graph-ai/contextdb'
 BRANCH = 'ci-macos-diagnostic-295'
-BASE = 'ef16fe66365bb3d1b39c96d22403187610ab8958'
+BASE = '2358c71db6ceedea174d7e9ceb5a1eec0bbe836f'
 FROZEN_SHA = 'f5066c842195aeba87fb0943fb4eebbb00093fb2d0fde692f641482339b44f53'
 CARGO = ['rustup', 'run', '1.94.1', 'cargo']
 NAMES = {'contextdb-'+n for n in ('core','engine','graph','hnsw','parser','planner','redb','relational','server','tx','vector')}
@@ -276,33 +276,53 @@ def metadata_closure(metadata, engine, frozen):
 
 def canonical_graph(metadata, replacements):
     # IDs are opaque. Only the explicit package mapping may replace them.
+    require(isinstance(metadata,dict) and set(metadata)<=
+            {'packages','workspace_members','workspace_default_members','resolve','target_directory',
+             'build_directory','version','workspace_root','metadata'}, 'unsupported metadata field')
+    require(type(metadata.get('version',1)) is int and metadata.get('version',1)==1, 'unsupported metadata version')
+    require(isinstance(metadata['resolve'],dict) and set(metadata['resolve'])=={'nodes','root'}, 'unsupported resolve fields')
+    require(isinstance(metadata['packages'],list) and metadata['packages'], 'invalid packages')
+    package_fields={'name','version','id','license','license_file','description','source','dependencies',
+        'targets','features','manifest_path','metadata','publish','authors','categories','default_run',
+        'rust_version','keywords','readme','repository','homepage','documentation','edition','links','hints'}
+    for p in metadata['packages']:
+        require(isinstance(p,dict) and set(p)<=package_fields and
+                all(isinstance(p[k],str) and p[k] for k in ('id','name','version','manifest_path')) and
+                (p['source'] is None or isinstance(p['source'],str)), 'unsupported/invalid package metadata')
     packages={p['id']:p for p in metadata['packages']}
+    require(len(packages)==len(metadata['packages']), 'duplicate package identities')
     rows=metadata['resolve']['nodes']
+    require(isinstance(rows,list) and rows and all(isinstance(n,dict) and set(n)=={'id','dependencies','deps','features'} for n in rows), 'unsupported resolved node fields')
     require(rows and len({n['id'] for n in rows})==len(rows) and
             {n['id'] for n in rows}==set(packages), 'empty/missing/duplicate resolved nodes')
     def ident(value):
-        require(value in packages, 'unknown resolved identity')
+        require(isinstance(value,str) and value in packages, 'unknown resolved identity')
         return replacements.get(value,value)
     result={}; edge_count=0
     for n in rows:
         deps=[]
-        require(isinstance(n['features'],list) and len(set(n['features']))==len(n['features']), 'invalid resolved features')
+        require(isinstance(n['features'],list) and all(isinstance(x,str) for x in n['features']) and len(set(n['features']))==len(n['features']), 'invalid resolved features')
+        require(isinstance(n['dependencies'],list) and all(isinstance(x,str) for x in n['dependencies']) and len(set(n['dependencies']))==len(n['dependencies']) and isinstance(n['deps'],list), 'invalid resolved dependencies')
+        require(all(isinstance(d,dict) and set(d)=={'name','pkg','dep_kinds'} for d in n['deps']), 'unsupported resolved edge fields')
         require(set(n['dependencies'])=={d['pkg'] for d in n['deps']}, 'resolved dependency representations differ')
         for d in n['deps']:
-            require(d['name'] and d['dep_kinds'], 'missing dependency alias/kind')
-            kinds=[]
+            require(isinstance(d['name'],str) and d['name'] and isinstance(d['dep_kinds'],list) and d['dep_kinds'], 'missing dependency alias/kind')
+            kinds={}
             for k in d['dep_kinds']:
-                require(set(k)=={'kind','target'} and k['kind'] in (None,'dev','build') and
+                require(isinstance(k,dict) and set(k)=={'kind','target'} and k['kind'] in (None,'dev','build') and
                         (k['target'] is None or isinstance(k['target'],str)), 'invalid dependency kind/target')
-                kinds.append(k)
+                # Complete records only: repeated declaration evidence adds no graph identity.
+                kinds[json.dumps(k,sort_keys=True)]=k
             deps.append({'name':d['name'],'pkg':ident(d['pkg']),
-                         'dep_kinds':sorted(kinds,key=lambda x:json.dumps(x,sort_keys=True))})
+                         'dep_kinds':sorted(kinds.values(),key=lambda x:json.dumps(x,sort_keys=True))})
         edge_count+=len(deps)
         require(len({json.dumps(d,sort_keys=True) for d in deps})==len(deps), 'duplicate resolved edge')
         result[ident(n['id'])]={'features':sorted(n['features']),
             'dependencies':sorted(ident(x) for x in n['dependencies']),
             'deps':sorted(deps,key=lambda x:json.dumps(x,sort_keys=True))}
     require(edge_count>0, 'empty resolved dependency graph')
+    for key in ('workspace_members','workspace_default_members'):
+        require(isinstance(metadata[key],list) and all(isinstance(x,str) for x in metadata[key]) and len(set(metadata[key]))==len(metadata[key]), 'invalid workspace members')
     return {'nodes':result,'root':ident(metadata['resolve']['root']) if metadata['resolve']['root'] else None,
             'workspace_members':sorted(ident(x) for x in metadata['workspace_members']),
             'workspace_default_members':sorted(ident(x) for x in metadata['workspace_default_members'])}
@@ -330,11 +350,26 @@ def compare_metadata(baseline, derived, engine, frozen, before_lock, after_lock,
     for i,p in old.items():
         q=new[mapping.get(i,i)]
         require((p['name'],p['version'])==(q['name'],q['version']), 'package name/version changed')
+        require(p.get('hints')==q.get('hints'), 'package hints changed')
         if i not in mapping:
             require(p['source']==q['source'] and p['manifest_path']==q['manifest_path'], 'unapproved source/path replacement')
     expected=canonical_graph(baseline,mapping); actual=canonical_graph(derived,{})
     if evidence_dir is not None:
         import difflib
+        # Raw API multiplicity remains evidence, independently of relation equality.
+        raw_graphs={label:{'resolve':data['resolve'],'workspace_members':data['workspace_members'],
+                           'workspace_default_members':data['workspace_default_members']}
+                    for label,data in (('baseline',baseline),('overlay',derived))}
+        for label,data in raw_graphs.items():write_json(evidence_dir/('graph-'+label+'-raw.json'),data)
+        (evidence_dir/'graph-raw.diff').write_text(''.join(difflib.unified_diff(
+            json.dumps(raw_graphs['baseline'],sort_keys=True,indent=2).splitlines(True),
+            json.dumps(raw_graphs['overlay'],sort_keys=True,indent=2).splitlines(True),
+            fromfile='baseline-raw',tofile='overlay-raw')))
+        write_json(evidence_dir/'graph-kind-multiplicity.json',{
+            label:[{'node':n['id'],'alias':e['name'],'pkg':e['pkg'],'raw_count':len(e['dep_kinds']),
+                    'distinct_count':len({json.dumps(k,sort_keys=True) for k in e['dep_kinds']})}
+                   for n in data['resolve']['nodes'] for e in n['deps']]
+            for label,data in (('baseline',baseline),('overlay',derived))})
         write_json(evidence_dir/'graph-baseline-normalized.json',expected)
         write_json(evidence_dir/'graph-overlay-normalized.json',actual)
         (evidence_dir/'graph.diff').write_text(''.join(difflib.unified_diff(json.dumps(expected,sort_keys=True,indent=2).splitlines(True),json.dumps(actual,sort_keys=True,indent=2).splitlines(True),fromfile='baseline-normalized',tofile='overlay-normalized')))
@@ -495,7 +530,9 @@ def capture(root):
     cmd.save()
     try:
         frozen=load_frozen(root)
-        config=json.loads((root/'scripts/macos-diagnostic-selection.json').read_text())
+        selection_raw=(root/SELECTION_PATH).read_bytes()
+        (out/'raw-selection.json').write_bytes(selection_raw)
+        config=json.loads(selection_raw)
         patches=selection(config,frozen)
         require(platform.system()=='Darwin', 'Darwin required')
         T=os.environ.get('GITHUB_SHA','')
@@ -507,11 +544,13 @@ def capture(root):
         require(cmd.run(['git','rev-parse','HEAD^'],'tooling-parent',root).stdout.decode().strip()==BASE,'tooling must be single ordinary commit over fixed base')
         # Activation is a content-bound manager receipt; exact resulting T is separately bound by local observer.
         activation=root/'scripts/diagnostic-assets/activation.json'
-        require(digest(activation)==config['activation_receipt_sha256'],'activation receipt mismatch')
-        authority=json.loads(activation.read_text())
+        activation_raw=activation.read_bytes()
+        (out/'raw-activation.json').write_bytes(activation_raw)
+        require(sha(activation_raw)==config['activation_receipt_sha256'],'activation receipt mismatch')
+        authority=json.loads(activation_raw)
         activation_binding(authority, reviewed_manifest(root), frozen)
         receipt.update(actual_tooling_sha=T,actual_tooling_tree=cmd.run(['git','rev-parse','HEAD^{tree}'],'tooling-tree',root).stdout.decode().strip(),
-                       phase='subscription_trace',selection=config,selection_sha256=digest(root/'scripts/macos-diagnostic-selection.json'),activation=authority,platform=platform.platform(),
+                       phase='subscription_trace',selection=config,selection_sha256=sha(selection_raw),activation=authority,platform=platform.platform(),
                        arch=platform.machine(),run_id=os.environ['GITHUB_RUN_ID'],run_attempt=os.environ['GITHUB_RUN_ATTEMPT'],event='push',ref='refs/heads/'+BRANCH)
         for name,args in [('sw-vers',['sw_vers']),('uname',['uname','-a']),('cpu',['sysctl','-n','hw.ncpu']),
                           ('memory',['sysctl','-n','hw.memsize']),('disk',['df','-k','.']),('python',['python3','--version']),

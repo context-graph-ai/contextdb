@@ -1,9 +1,9 @@
 {
   "schema": "mac-diagnostic-selection-v1",
   "phase": "subscription_trace",
-  "tooling_base": "ef16fe66365bb3d1b39c96d22403187610ab8958",
+  "tooling_base": "2358c71db6ceedea174d7e9ceb5a1eec0bbe836f",
   "frozen_sha256": "f5066c842195aeba87fb0943fb4eebbb00093fb2d0fde692f641482339b44f53",
-  "activation_receipt_sha256": "4705d6943980480606ca77ab95d4bfd61760568b69bbcc9eb921cd7724adbf00",
+  "activation_receipt_sha256": "8699312dda8343498634eb6bdef4f297fab3f75fc21bce57f44f334910efbb18",
   "reader_adoption_receipt_sha256": null,
   "actual_tooling_sha": null,
   "actual_tooling_tree": null,
