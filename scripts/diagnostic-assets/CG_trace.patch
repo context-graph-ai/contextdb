@@ -1,0 +1,323 @@
+--- a/crates/context-graph/src/store/subscriptions.rs
++++ b/crates/context-graph/src/store/subscriptions.rs
+@@ -1,5 +1,94 @@
+ use std::collections::{BTreeMap, BTreeSet, HashMap};
+ use std::sync::{Arc, Weak};
++
++
++// Disposable external diagnostic only; remove this module with the patch.
++mod external_trace {
++    use std::fmt::{self, Write as _};
++    use std::io::Write as _;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    const LIMIT: usize = 48;
++    const STREAM: &str = "cg";
++    static NEXT: AtomicUsize = AtomicUsize::new(0);
++
++    pub(super) fn enabled() -> bool {
++        std::env::var_os("SUBSCRIPTION_EXTERNAL_TRACE").as_deref()
++            == Some(std::ffi::OsStr::new("external-472-v1"))
++    }
++
++    fn sink_id(sink: &str) -> Option<&str> {
++        let id = sink.strip_prefix("cg_subscription_new_decision_")?;
++        (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
++    }
++
++    // Slots are reservation order within this stream, not cross-crate causal order.
++    pub(super) fn emit(sink: &str, fields: impl FnOnce(&mut Line)) {
++        if !enabled() {
++            return;
++        }
++        let Some(sink) = sink_id(sink) else { return };
++        let Ok(slot) = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++            (n < LIMIT).then_some(n + 1)
++        }) else { return };
++        let mut line = Line { bytes: [0; 2048], len: 0, clipped: false };
++        let epoch_ns = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_nanos()).unwrap_or(0);
++        let _ = write!(line, "EXTSUB1 stream={} pid={} seq={} epoch_ns={} sink={} ",
++            STREAM, std::process::id(), slot + 1, epoch_ns, sink);
++        if slot + 1 == LIMIT {
++            let _ = write!(line, "event=truncated limit={}", LIMIT);
++        } else {
++            fields(&mut line);
++        }
++        // Reserve space for an explicit clipping marker and the final newline.
++        if line.clipped {
++            let suffix = b" record_clipped=1";
++            let end = line.len + suffix.len();
++            line.bytes[line.len..end].copy_from_slice(suffix);
++            line.len = end;
++        }
++        line.bytes[line.len] = b'\n';
++        line.len += 1;
++        // Trace failure never changes delivery, persistence or the test result.
++        let _ = std::io::stderr().lock().write_all(&line.bytes[..line.len]);
++    }
++
++    pub(super) struct Line {
++        bytes: [u8; 2048],
++        len: usize,
++        clipped: bool,
++    }
++
++    impl fmt::Write for Line {
++        fn write_str(&mut self, text: &str) -> fmt::Result {
++            let available = (self.bytes.len() - 32).saturating_sub(self.len);
++            let n = available.min(text.len());
++            self.bytes[self.len..self.len + n].copy_from_slice(&text.as_bytes()[..n]);
++            self.len += n;
++            self.clipped |= n != text.len();
++            Ok(())
++        }
++    }
++
++    #[allow(dead_code)] // Only the engine stream needs bounded ID prefixes.
++    pub(super) fn ids(out: &mut Line, key: &str, ids: impl Iterator<Item = u64>) {
++        let _ = write!(out, " {}=", key);
++        for (i, id) in ids.take(8).enumerate() {
++            let _ = write!(out, "{}{}", if i == 0 { "" } else { "," }, id);
++        }
++    }
++}
++
++macro_rules! external_trace {
++    ($sink:expr, $($fields:tt)*) => {
++        external_trace::emit($sink, |out| {
++            use std::fmt::Write as _;
++            let _ = write!(out, $($fields)*);
++        })
++    };
++}
+ 
+ use contextdb_core::{Lsn, Value};
+ use contextdb_engine::sync_types::DdlChange;
+@@ -244,25 +333,38 @@
+         let filter_for_callback = filter.clone();
+         let sink_name = subscription_id.sink_name().to_string();
+         let deliver = move |event: &SinkEvent| {
++            external_trace!(&sink_name, "event=adapter_entry action={} lsn={}", event.action_id, event.at_lsn.0);
+             let Some(store) = callback_store.to_store() else {
++                external_trace!(&sink_name, "event=adapter_return action={} outcome=transient phase=closed", event.action_id);
+                 return Err(SinkError::Transient(
+                     "context graph store is closed".to_string(),
+                 ));
+             };
+             if has_subscription_receipt(&store.db, &sink_name, event.action_id)? {
++                external_trace!(&sink_name, "event=adapter_return action={} outcome=ok phase=receipt_hit", event.action_id);
+                 return Ok(());
+             }
+             let payload = build_payload(&store, event)
++                .inspect_err(|_| external_trace!(&sink_name, "event=adapter_return action={} outcome=permanent phase=build_payload", event.action_id))
+                 .map_err(|err| SinkError::Permanent(err.to_string()))?;
+             if !payload
+                 .matches_filter(&store, &filter_for_callback)
++                .inspect_err(|_| external_trace!(&sink_name, "event=adapter_return action={} outcome=permanent phase=filter", event.action_id))
+                 .map_err(|err| SinkError::Permanent(err.to_string()))?
+             {
++                external_trace!(&sink_name, "event=filter_miss action={}", event.action_id);
+                 return record_subscription_receipt(&store.db, &sink_name, event.action_id);
+             }
+             deliver_with_receipt(&store.db, &sink_name, event.action_id, || {
+                 handler(&payload).map_err(subscription_error_to_sink_error)
+             })
++            .inspect(|_| external_trace!(&sink_name, "event=adapter_return action={} outcome=ok phase=delivery", event.action_id))
++            .inspect_err(|error| external_trace!(&sink_name, "event=adapter_return action={} outcome={} phase=delivery", event.action_id,
++                match error {
++                    SinkError::Transient(_) => "transient",
++                    SinkError::Permanent(_) => "permanent",
++                    SinkError::OutcomeUncertain(_) => "uncertain",
++                }))
+         };
+         match &effective_contexts {
+             Some(contexts) if Some(contexts) != self.store.authorized_contexts.as_ref() => {
+@@ -750,7 +852,15 @@
+     if has_subscription_receipt(db, sink_name, action_id)? {
+         return Ok(());
+     }
+-    effect()?;
++    external_trace!(sink_name, "event=handler_entry action={}", action_id);
++    effect()
++        .inspect(|_| external_trace!(sink_name, "event=handler_return action={} outcome=ok", action_id))
++        .inspect_err(|error| external_trace!(sink_name, "event=handler_return action={} outcome={}", action_id,
++            match error {
++                SinkError::Transient(_) => "transient",
++                SinkError::Permanent(_) => "permanent",
++                SinkError::OutcomeUncertain(_) => "uncertain",
++            }))?;
+     record_subscription_receipt(db, sink_name, action_id)
+ }
+ 
+@@ -764,6 +874,8 @@
+         &receipt_params(sink_name, action_id),
+     )
+     .map(|result| !result.rows.is_empty())
++    .inspect(|hit| external_trace!(sink_name, "event=receipt_lookup action={} outcome={}", action_id, if *hit { "hit" } else { "miss" }))
++    .inspect_err(|_| external_trace!(sink_name, "event=receipt_lookup action={} outcome=error return=transient", action_id))
+     .map_err(|error| SinkError::Transient(error.to_string()))
+ }
+ 
+@@ -772,7 +884,8 @@
+     sink_name: &str,
+     action_id: u64,
+ ) -> std::result::Result<(), SinkError> {
+-    let tx = db.begin().map_err(|error| {
++    external_trace!(sink_name, "event=receipt_begin action={}", action_id);
++    let tx = db.begin().inspect_err(|_| external_trace!(sink_name, "event=receipt_return action={} outcome=uncertain phase=begin", action_id)).map_err(|error| {
+         SinkError::OutcomeUncertain(format!(
+             "action {action_id} may have taken effect; its receipt could not start: {error}"
+         ))
+@@ -784,12 +897,16 @@
+         "INSERT INTO cg_subscription_receipts (sink_name, action_id, recorded_at) VALUES ($sink_name, $action_id, $recorded_at)",
+         &params,
+     ) {
++        external_trace!(sink_name, "event=receipt_return action={} outcome=uncertain phase=insert", action_id);
+         let _ = db.rollback(tx);
+         return Err(SinkError::OutcomeUncertain(format!(
+             "action {action_id} may have taken effect; its receipt was refused: {error}"
+         )));
+     }
+-    db.commit(tx).map_err(|error| {
++    db.commit(tx)
++        .inspect(|_| external_trace!(sink_name, "event=receipt_commit action={} outcome=ok", action_id))
++        .inspect_err(|_| external_trace!(sink_name, "event=receipt_commit action={} outcome=uncertain", action_id))
++        .map_err(|error| {
+         SinkError::OutcomeUncertain(format!(
+             "action {action_id} may have taken effect; its receipt did not commit: {error}"
+         ))
+--- a/crates/context-graph/tests/acceptance/subscriptions.rs
++++ b/crates/context-graph/tests/acceptance/subscriptions.rs
+@@ -2,6 +2,95 @@
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Barrier, Mutex};
+ use std::time::{Duration, Instant};
++
++
++// Disposable external diagnostic only; remove this module with the patch.
++mod external_trace {
++    use std::fmt::{self, Write as _};
++    use std::io::Write as _;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    const LIMIT: usize = 16;
++    const STREAM: &str = "test";
++    static NEXT: AtomicUsize = AtomicUsize::new(0);
++
++    pub(super) fn enabled() -> bool {
++        std::env::var_os("SUBSCRIPTION_EXTERNAL_TRACE").as_deref()
++            == Some(std::ffi::OsStr::new("external-472-v1"))
++    }
++
++    fn sink_id(sink: &str) -> Option<&str> {
++        let id = sink.strip_prefix("cg_subscription_new_decision_")?;
++        (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
++    }
++
++    // Slots are reservation order within this stream, not cross-crate causal order.
++    pub(super) fn emit(sink: &str, fields: impl FnOnce(&mut Line)) {
++        if !enabled() {
++            return;
++        }
++        let Some(sink) = sink_id(sink) else { return };
++        let Ok(slot) = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++            (n < LIMIT).then_some(n + 1)
++        }) else { return };
++        let mut line = Line { bytes: [0; 2048], len: 0, clipped: false };
++        let epoch_ns = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_nanos()).unwrap_or(0);
++        let _ = write!(line, "EXTSUB1 stream={} pid={} seq={} epoch_ns={} sink={} ",
++            STREAM, std::process::id(), slot + 1, epoch_ns, sink);
++        if slot + 1 == LIMIT {
++            let _ = write!(line, "event=truncated limit={}", LIMIT);
++        } else {
++            fields(&mut line);
++        }
++        // Reserve space for an explicit clipping marker and the final newline.
++        if line.clipped {
++            let suffix = b" record_clipped=1";
++            let end = line.len + suffix.len();
++            line.bytes[line.len..end].copy_from_slice(suffix);
++            line.len = end;
++        }
++        line.bytes[line.len] = b'\n';
++        line.len += 1;
++        // Trace failure never changes delivery, persistence or the test result.
++        let _ = std::io::stderr().lock().write_all(&line.bytes[..line.len]);
++    }
++
++    pub(super) struct Line {
++        bytes: [u8; 2048],
++        len: usize,
++        clipped: bool,
++    }
++
++    impl fmt::Write for Line {
++        fn write_str(&mut self, text: &str) -> fmt::Result {
++            let available = (self.bytes.len() - 32).saturating_sub(self.len);
++            let n = available.min(text.len());
++            self.bytes[self.len..self.len + n].copy_from_slice(&text.as_bytes()[..n]);
++            self.len += n;
++            self.clipped |= n != text.len();
++            Ok(())
++        }
++    }
++
++    #[allow(dead_code)] // Only the engine stream needs bounded ID prefixes.
++    pub(super) fn ids(out: &mut Line, key: &str, ids: impl Iterator<Item = u64>) {
++        let _ = write!(out, " {}=", key);
++        for (i, id) in ids.take(8).enumerate() {
++            let _ = write!(out, "{}{}", if i == 0 { "" } else { "," }, id);
++        }
++    }
++}
++
++macro_rules! external_trace {
++    ($sink:expr, $($fields:tt)*) => {
++        external_trace::emit($sink, |out| {
++            use std::fmt::Write as _;
++            let _ = write!(out, $($fields)*);
++        })
++    };
++}
+ 
+ use chrono::Utc;
+ use context_graph::*;
+@@ -1285,6 +1374,34 @@
+     assert!(!contexts.contains(&ctx_c));
+     drop(captured);
+     let metrics = wait_for_metrics(&scoped, &sub, |metrics| metrics.delivered == 2);
++    if external_trace::enabled() {
++        // Copy only fixed-size metadata under the existing collector mutex;
++        // release it before formatting or stderr I/O. Do not clone payloads.
++        let (count, snapshot) = {
++            let mut snapshot = [None; 8];
++            match payloads.lock() {
++                Ok(captured) => {
++                    for (slot, payload) in snapshot.iter_mut().zip(captured.iter()) {
++                        *slot = Some((payload.action_id, payload.decision.context_id, payload.at_lsn.0));
++                    }
++                    (Some(captured.len()), snapshot)
++                }
++                Err(_) => (None, snapshot),
++            }
++        };
++        let observed_count = count.unwrap_or(0);
++        external_trace!(sub.sink_name(), "event=final_snapshot available={} count={} copied={} delivered={} queued={} retried={} uncertain={} permanent={} ctx_a={} ctx_b={} ctx_c={} ctx_d={}",
++            count.is_some(), observed_count, observed_count.min(8), metrics.delivered, metrics.queued, metrics.retried, metrics.uncertain, metrics.permanent_failures,
++            ctx_a, ctx_b, ctx_c, ctx_d);
++        for (position, item) in snapshot.into_iter().enumerate() {
++            if let Some((action, context, lsn)) = item {
++                external_trace!(sub.sink_name(), "event=final_payload position={} action={} context={} lsn={}", position, action, context, lsn);
++            }
++        }
++        if observed_count > 8 {
++            external_trace!(sub.sink_name(), "event=snapshot_truncated count={} copied=8", observed_count);
++        }
++    }
+     assert_eq!(metrics.delivered, 2);
+     assert_eq!(metrics.permanent_failures, 0);
+     drop(dir);

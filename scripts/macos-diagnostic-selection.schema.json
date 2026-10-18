@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Single-image hosted Mac diagnostic selection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "phase",
+    "tooling_base",
+    "frozen_sha256",
+    "activation_receipt_sha256",
+    "reader_adoption_receipt_sha256",
+    "actual_tooling_sha",
+    "actual_tooling_tree",
+    "actual_generated_lock_sha256",
+    "actual_metadata_sha256",
+    "actual_source_post"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mac-diagnostic-selection-v1"
+    },
+    "phase": {
+      "const": "subscription_trace"
+    },
+    "tooling_base": {
+      "const": "ef16fe66365bb3d1b39c96d22403187610ab8958"
+    },
+    "frozen_sha256": {
+      "const": "f5066c842195aeba87fb0943fb4eebbb00093fb2d0fde692f641482339b44f53"
+    },
+    "activation_receipt_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Null template fails execution admission; only a concrete manager receipt may activate."
+    },
+    "reader_adoption_receipt_sha256": {
+      "const": null
+    },
+    "actual_tooling_sha": {
+      "const": null
+    },
+    "actual_tooling_tree": {
+      "const": null
+    },
+    "actual_generated_lock_sha256": {
+      "const": null
+    },
+    "actual_metadata_sha256": {
+      "const": null
+    },
+    "actual_source_post": {
+      "const": null
+    }
+  }
+}

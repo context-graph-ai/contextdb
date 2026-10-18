@@ -1,0 +1,293 @@
+--- a/crates/contextdb-engine/src/database/event_bus.rs
++++ b/crates/contextdb-engine/src/database/event_bus.rs
+@@ -1,5 +1,94 @@
+ use super::*;
+ use std::cell::Cell;
++
++
++// Disposable external diagnostic only; remove this module with the patch.
++mod external_trace {
++    use std::fmt::{self, Write as _};
++    use std::io::Write as _;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    const LIMIT: usize = 192;
++    const STREAM: &str = "engine";
++    static NEXT: AtomicUsize = AtomicUsize::new(0);
++
++    pub(super) fn enabled() -> bool {
++        std::env::var_os("SUBSCRIPTION_EXTERNAL_TRACE").as_deref()
++            == Some(std::ffi::OsStr::new("external-472-v1"))
++    }
++
++    fn sink_id(sink: &str) -> Option<&str> {
++        let id = sink.strip_prefix("cg_subscription_new_decision_")?;
++        (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
++    }
++
++    // Slots are reservation order within this stream, not cross-crate causal order.
++    pub(super) fn emit(sink: &str, fields: impl FnOnce(&mut Line)) {
++        if !enabled() {
++            return;
++        }
++        let Some(sink) = sink_id(sink) else { return };
++        let Ok(slot) = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++            (n < LIMIT).then_some(n + 1)
++        }) else { return };
++        let mut line = Line { bytes: [0; 2048], len: 0, clipped: false };
++        let epoch_ns = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_nanos()).unwrap_or(0);
++        let _ = write!(line, "EXTSUB1 stream={} pid={} seq={} epoch_ns={} sink={} ",
++            STREAM, std::process::id(), slot + 1, epoch_ns, sink);
++        if slot + 1 == LIMIT {
++            let _ = write!(line, "event=truncated limit={}", LIMIT);
++        } else {
++            fields(&mut line);
++        }
++        // Reserve space for an explicit clipping marker and the final newline.
++        if line.clipped {
++            let suffix = b" record_clipped=1";
++            let end = line.len + suffix.len();
++            line.bytes[line.len..end].copy_from_slice(suffix);
++            line.len = end;
++        }
++        line.bytes[line.len] = b'\n';
++        line.len += 1;
++        // Trace failure never changes delivery, persistence or the test result.
++        let _ = std::io::stderr().lock().write_all(&line.bytes[..line.len]);
++    }
++
++    pub(super) struct Line {
++        bytes: [u8; 2048],
++        len: usize,
++        clipped: bool,
++    }
++
++    impl fmt::Write for Line {
++        fn write_str(&mut self, text: &str) -> fmt::Result {
++            let available = (self.bytes.len() - 32).saturating_sub(self.len);
++            let n = available.min(text.len());
++            self.bytes[self.len..self.len + n].copy_from_slice(&text.as_bytes()[..n]);
++            self.len += n;
++            self.clipped |= n != text.len();
++            Ok(())
++        }
++    }
++
++    #[allow(dead_code)] // Only the engine stream needs bounded ID prefixes.
++    pub(super) fn ids(out: &mut Line, key: &str, ids: impl Iterator<Item = u64>) {
++        let _ = write!(out, " {}=", key);
++        for (i, id) in ids.take(8).enumerate() {
++            let _ = write!(out, "{}{}", if i == 0 { "" } else { "," }, id);
++        }
++    }
++}
++
++macro_rules! external_trace {
++    ($sink:expr, $($fields:tt)*) => {
++        external_trace::emit($sink, |out| {
++            use std::fmt::Write as _;
++            let _ = write!(out, $($fields)*);
++        })
++    };
++}
+ 
+ const EVENT_TYPES_CONFIG_KEY: &str = "__event_bus_event_types";
+ const SINKS_CONFIG_KEY: &str = "__event_bus_sinks";
+@@ -2019,6 +2108,10 @@
+         }
+         let mut queues = self.event_bus.queues.lock();
+         for (sink, entry) in events {
++            external_trace!(&sink, "event=enqueue action={} event_action={} row={} lsn={} attempts={} context_gate={} scope_gate={} acl_gate={} context={}",
++                entry.id, entry.event.action_id, entry.row_id.0, entry.event.at_lsn.0, entry.attempts,
++                entry.gate.context_column.is_some(), entry.gate.scope_read.is_some(), entry.gate.acl.is_some(),
++                match entry.event.row_values.get("context_id") { Some(Value::Uuid(id)) => *id, _ => Default::default() });
+             let queue = queues.entry(sink).or_default();
+             assert!(
+                 queue.len() < MAX_SINK_QUEUE_DEPTH,
+@@ -2363,6 +2456,13 @@
+                     self.wait(&shutdown, Duration::from_millis(250));
+                     continue;
+                 };
++                external_trace!(&self.sink, "event=queue_front action={} row={} lsn={} attempts={} queue_len={} visible={} context_gate={} context_allowed={}",
++                    front.id, front.row_id.0, front.event.at_lsn.0, front.attempts, queue.len(),
++                    event_visible_for_access(&registration.access, &front), front.gate.context_column.is_some(),
++                    registration.access.contexts.as_ref().map(|contexts| {
++                        front.gate.context_column.as_ref().and_then(|column| front.event.row_values.get(column))
++                            .is_some_and(|value| matches!(value, Value::Uuid(id) if contexts.contains(&ContextId::new(*id))))
++                    }).unwrap_or(true));
+                 if !event_visible_for_access(&registration.access, &front) {
+                     if let Some(entry) = queue.pop_front() {
+                         queue.push_back(entry);
+@@ -2387,6 +2487,11 @@
+                     .insert((self.sink.clone(), entry.id));
+             }
+             drop(queue_mutation);
++            external_trace::emit(&self.sink, |out| {
++                use std::fmt::Write as _;
++                let _ = write!(out, "event=checkout count={}", entries.len());
++                external_trace::ids(out, "actions", entries.iter().map(|entry| entry.id));
++            });
+ 
+             if entries.is_empty() {
+                 self.wait(&shutdown, Duration::from_millis(250));
+@@ -2398,6 +2503,8 @@
+             let mut permanent_failure_count = 0u64;
+             let mut examined_count = 0u64;
+             for (entry_position, entry) in entries.iter().cloned().enumerate() {
++                external_trace!(&self.sink, "event=checkout_entry action={} row={} lsn={} attempts={} batch_position={} batch_len={}",
++                    entry.id, entry.row_id.0, entry.event.at_lsn.0, entry.attempts, entry_position, entries.len());
+                 if shutdown.load(Ordering::SeqCst) {
+                     for pending in entries.iter().skip(entry_position) {
+                         self.event_bus
+@@ -2407,6 +2514,8 @@
+                 }
+                 if entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
+                     if let Err(error) = self.transition_attempt(entry.id, false, true) {
++                        external_trace!(&self.sink, "event=batch_abandoned phase=reconcile action={} pending_delivered={} pending_permanent={} pending_examined={} pending_acked={}",
++                            entry.id, delivered_count, permanent_failure_count, examined_count, acked.len());
+                         tracing::warn!(sink = %self.sink, action_id = entry.id, %error,
+                             "cannot durably reconcile an unconfirmed sink attempt");
+                         for pending in entries.iter().skip(entry_position) {
+@@ -2426,6 +2535,8 @@
+                 let attempts = match self.transition_attempt(entry.id, true, false) {
+                     Ok(attempts) => attempts,
+                     Err(error) => {
++                        external_trace!(&self.sink, "event=batch_abandoned phase=attempt action={} pending_delivered={} pending_permanent={} pending_examined={} pending_acked={}",
++                            entry.id, delivered_count, permanent_failure_count, examined_count, acked.len());
+                         tracing::warn!(sink = %self.sink, action_id = entry.id, %error,
+                             "cannot durably record sink attempt before delivery");
+                         for pending in entries.iter().skip(entry_position) {
+@@ -2443,11 +2554,21 @@
+                 if event.action_id == 0 {
+                     event.action_id = entry.id;
+                 }
++                external_trace!(&self.sink, "event=callback_entry action={} row={} lsn={} attempts={}",
++                    event.action_id, entry.row_id.0, event.at_lsn.0, attempts);
+                 let result = {
+                     let _callback = EventBusCallbackGuard::enter(&self.event_bus);
+                     catch_unwind(AssertUnwindSafe(|| callback(&event)))
+                 };
+                 self.add_in_flight(-1);
++                external_trace!(&self.sink, "event=callback_return action={} outcome={}", event.action_id,
++                    match &result {
++                        Ok(Ok(())) => "ok",
++                        Ok(Err(SinkError::Transient(_))) => "transient",
++                        Ok(Err(SinkError::Permanent(_))) => "permanent",
++                        Ok(Err(SinkError::OutcomeUncertain(_))) => "uncertain",
++                        Err(_) => "panic_uncertain",
++                    });
+                 let result = match result {
+                     Ok(outcome) => outcome,
+                     Err(payload) => {
+@@ -2583,12 +2704,11 @@
+         if count == 0 {
+             return;
+         }
+-        self.event_bus
+-            .metrics
+-            .lock()
+-            .entry(self.sink.clone())
+-            .or_default()
+-            .examined += count;
++        let mut metrics = self.event_bus.metrics.lock();
++        let state = metrics.entry(self.sink.clone()).or_default();
++        state.examined += count;
++        external_trace!(&self.sink, "event=denied_publish delta_examined={} delivered={} permanent={} examined={} retried={} uncertain={} unconfirmed={} in_flight={}",
++            count, state.delivered, state.permanent_failures, state.examined, state.retried, state.uncertain, state.unconfirmed, state.in_flight);
+     }
+ 
+     /// One post-batch metrics write: delivered + permanent failures + examined
+@@ -2619,19 +2739,26 @@
+         state.examined += examined;
+         state.retried += retried;
+         state.uncertain += uncertain;
++        external_trace!(&self.sink, "event=batch_publish delta_delivered={} delta_permanent={} delta_examined={} delta_retried={} delta_uncertain={} delivered={} permanent={} examined={} retried={} uncertain={} unconfirmed={} in_flight={}",
++            delivered, permanent_failures, examined, retried, uncertain,
++            state.delivered, state.permanent_failures, state.examined, state.retried, state.uncertain, state.unconfirmed, state.in_flight);
+     }
+ 
+     fn transition_attempt(&self, entry_id: u64, start: bool, uncertain: bool) -> Result<u32> {
+-        let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
++        external_trace!(&self.sink, "event=attempt_request action={} start={} uncertain={}", entry_id, start, uncertain);
++        let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()
++            .inspect_err(|_| external_trace!(&self.sink, "event=attempt_refused action={} phase=mutation_guard start={} uncertain={}", entry_id, start, uncertain))?;
+         let mut queues = self.event_bus.queues.lock();
+         let entry = queues
+             .get_mut(&self.sink)
+             .and_then(|queue| queue.iter_mut().find(|entry| entry.id == entry_id))
+-            .ok_or_else(|| Error::Other(format!("pending sink action disappeared: {entry_id}")))?;
++            .ok_or_else(|| Error::Other(format!("pending sink action disappeared: {entry_id}")))
++            .inspect_err(|_| external_trace!(&self.sink, "event=attempt_refused action={} phase=missing_entry start={} uncertain={}", entry_id, start, uncertain))?;
+         let mut updated = entry.clone();
+         let attempts = updated.attempts & ATTEMPT_COUNT_MASK;
+         updated.attempts = if start {
+             if updated.attempts & UNCONFIRMED_ATTEMPT != 0 {
++                external_trace!(&self.sink, "event=attempt_refused action={} phase=unresolved start={} uncertain={}", entry_id, start, uncertain);
+                 return Err(Error::Other(format!(
+                     "sink action has an unresolved attempt: {entry_id}"
+                 )));
+@@ -2655,7 +2782,10 @@
+             Some(&updated),
+             uncertain,
+             unconfirmed_delta,
+-        )?;
++        )
++        .inspect(|_| external_trace!(&self.sink, "event=attempt_durable action={} start={} uncertain={} before={} after={} persistence={}",
++            entry_id, start, uncertain, entry.attempts, updated.attempts, self.persistence.is_some()))
++        .inspect_err(|_| external_trace!(&self.sink, "event=attempt_refused action={} phase=persist start={} uncertain={}", entry_id, start, uncertain))?;
+         entry.attempts = updated.attempts;
+         if start {
+             self.event_bus
+@@ -2676,6 +2806,11 @@
+         if entry_ids.is_empty() {
+             return Ok(());
+         }
++        external_trace::emit(&self.sink, |out| {
++            use std::fmt::Write as _;
++            let _ = write!(out, "event=ack_request requested_count={}", entry_ids.len());
++            external_trace::ids(out, "requested", entry_ids.iter().copied());
++        });
+         let result = (|| -> Result<()> {
+             let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
+             let mut queues = self.event_bus.queues.lock();
+@@ -2687,6 +2822,13 @@
+                     .take_while(|(id, entry)| *id == entry.id)
+                     .map(|(id, _)| id)
+                     .collect::<Vec<_>>();
++                external_trace::emit(&self.sink, |out| {
++                    use std::fmt::Write as _;
++                    let _ = write!(out, "event=ack_prefix requested_count={} removable_count={} queued_before={}", entry_ids.len(), removable.len(), queue.len());
++                    external_trace::ids(out, "requested", entry_ids.iter().copied());
++                    external_trace::ids(out, "front", queue.iter().map(|entry| entry.id));
++                    external_trace::ids(out, "removable", removable.iter().copied());
++                });
+                 if !removable.is_empty() {
+                     let unconfirmed = queue
+                         .iter()
+@@ -2698,7 +2840,9 @@
+                         &self.sink,
+                         &removable,
+                         unconfirmed,
+-                    )?;
++                    )
++                    .inspect(|_| external_trace!(&self.sink, "event=ack_durable outcome=ok removable_count={} persistence={}", removable.len(), self.persistence.is_some()))
++                    .inspect_err(|_| external_trace!(&self.sink, "event=ack_durable outcome=error removable_count={} persistence={}", removable.len(), self.persistence.is_some()))?;
+                     for _ in 0..removable.len() {
+                         queue.pop_front();
+                     }
+@@ -2706,9 +2850,13 @@
+                     let state = metrics.entry(self.sink.clone()).or_default();
+                     state.unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
+                 }
++                external_trace!(&self.sink, "event=ack_queue_after queued={} removable_count={}", queue.len(), removable.len());
++            } else {
++                external_trace!(&self.sink, "event=ack_queue_absent");
+             }
+             Ok(())
+         })();
++        external_trace!(&self.sink, "event=ack_return outcome={} requested_count={}", if result.is_ok() { "ok" } else { "error" }, entry_ids.len());
+         for entry_id in entry_ids {
+             self.event_bus
+                 .finish_checked_out_entry(&self.sink, *entry_id);

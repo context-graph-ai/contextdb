@@ -1,0 +1,82 @@
+name: Mac diagnostics (not PR qualification)
+on:
+  push:
+    branches: [ci-macos-diagnostic-295]
+permissions:
+  contents: read
+concurrency:
+  group: mac-diagnostics-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  subscription-trace:
+    name: Subscription trace (single isolated image)
+    if: github.repository == 'context-graph-ai/contextdb' && github.ref == 'refs/heads/ci-macos-diagnostic-295' && github.event_name == 'push'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_OPT_LEVEL: '1'
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_DEV_OVERFLOW_CHECKS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      CARGO_TERM_COLOR: never
+      RUSTUP_TOOLCHAIN: '1.94.1'
+      RUSTFLAGS: ''
+    steps:
+      - name: Set shared model cache path
+        run: echo "CG_MODEL_CACHE_ROOT=$RUNNER_TEMP/cg-model-cache" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: context-graph-ai/contextdb
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          toolchain: '1.94.1'
+          cache: false
+          rustflags: ''
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8
+        with:
+          tool: cargo-nextest@0.9.140
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: nomic-model-cache
+        with:
+          path: ${{ env.CG_MODEL_CACHE_ROOT }}
+          key: cg-nomic-${{ runner.os }}-${{ hashFiles('scripts/diagnostic-assets/nomic.rs') }}
+      - name: Capture exactly one original subscription case
+        env:
+          MODEL_CACHE_HIT: ${{ steps.nomic-model-cache.outputs.cache-hit }}
+        run: python3 scripts/ci-macos-diagnostics.py capture
+      - name: Upload evidence before owned source cleanup
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mac-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-capture
+          path: |
+            target/macos-diagnostics/*.json
+            target/macos-diagnostics/*.stdout
+            target/macos-diagnostics/*.stderr
+            target/macos-diagnostics/*.lock
+            target/macos-diagnostics/*.diff
+            target/macos-diagnostics/*.toml
+            target/macos-diagnostics/*.xml
+            target/macos-diagnostics/fingerprints/**/*.json
+          retention-days: 14
+          if-no-files-found: error
+      - name: Delete only owned source target and data directories
+        if: always()
+        run: python3 scripts/ci-macos-diagnostics.py cleanup
+      - name: Upload final cleanup receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mac-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-cleanup
+          path: target/macos-diagnostics/receipt.json
+          retention-days: 14
+          if-no-files-found: error

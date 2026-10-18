@@ -1,0 +1,14 @@
+{
+  "tooling_base": "ef16fe66365bb3d1b39c96d22403187610ab8958",
+  "phase": "subscription_trace",
+  "frozen_sha256": "f5066c842195aeba87fb0943fb4eebbb00093fb2d0fde692f641482339b44f53",
+  "sources": {
+    "cg": "db6d20cfc32a8bdf6a0753f3b629bbf94ab2f8af",
+    "engine": "db9d067f291c0add0922713936a63f51f24e9f1c"
+  },
+  "schema": "mac-diagnostic-activation-v2",
+  "reviewed_content_manifest_sha256": "b46ab4bbf16554de93475ab55cd15d826ad2260f06500c61f369381ac57a6c96",
+  "diagnostic_publication_approval_receipt_sha256": "944551358d6948bdeb28c7fe1a93f213a7b538f0e1e5c7d41a92c413a4e5c996",
+  "publication_approved": true,
+  "native_execution_approved": true
+}
