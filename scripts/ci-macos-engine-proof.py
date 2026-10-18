@@ -211,7 +211,7 @@ def main():
         receipt['inventories'] = {}
         binaries = {}
         for label, selector, ids in [('lib', ['--lib'], internal),
-                                      ('integration', ['--test', 'local_transport'], external)]:
+                                      ('integration', ['--features', 'test-seams', '--test', 'local_transport'], external)]:
             build = run(['cargo', 'test', '--locked', '-p', 'contextdb-engine', *selector,
                          '--no-run', '--message-format=json'], label+'-build', cwd=tree, env=env)
             binary = executable(build.stdout.decode(), package_id, targets[label], target_dir)
