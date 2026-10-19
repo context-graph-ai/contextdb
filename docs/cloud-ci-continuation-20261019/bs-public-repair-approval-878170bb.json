@@ -1,0 +1,9 @@
+{
+  "schema": "bs-public-repair-approval-v1",
+  "issuer": "BS",
+  "repository": "context-graph-ai/contextdb",
+  "approval_status": "approved",
+  "review_status": "reviewed",
+  "public_status": "public",
+  "approved_public_sha": "878170bb142790f43ad73ff644ab8ae9eec1039f"
+}
