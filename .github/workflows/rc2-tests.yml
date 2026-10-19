@@ -2,7 +2,9 @@ name: rc2-tests
 
 on:
   push:
-    branches: [dev, 'bounded-storage-*']
+    branches: [main, dev, 'bounded-storage-*', linux-bounded-storage-candidate-20261019]
+  pull_request:
+    branches: [main, dev]
   workflow_dispatch:
 
 concurrency:
@@ -29,6 +31,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: lint
+      - run: python3 -m pip install PyYAML==6.0.3
+      - run: python3 scripts/ci-continuity.py check
+      - run: python3 scripts/ci-continuity-tests.py
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check
@@ -47,7 +52,7 @@ jobs:
           - { shard: contextdb-tx, crate: contextdb-tx, features: "" }
           - { shard: contextdb-tx-test-seams, crate: contextdb-tx, features: "test-seams" }
           - { shard: contextdb-engine, crate: contextdb-engine, features: "" }
-          - { shard: contextdb-engine-test-seams, crate: contextdb-engine, features: "test-seams" }
+          - { shard: contextdb-engine-test-seams, crate: contextdb-engine, features: "test-seams,iroh" }
           - { shard: contextdb-server, crate: contextdb-server, features: "" }
           - { shard: contextdb-server-test-seams, crate: contextdb-server, features: "test-seams" }
           - { shard: contextdb-cli, crate: contextdb-cli, features: "" }
@@ -59,7 +64,7 @@ jobs:
           - { shard: contextdb-planner, crate: contextdb-planner, features: "" }
           - { shard: contextdb-relational, crate: contextdb-relational, features: "" }
           # contextdb-redb is excluded from the workspace, so it is addressed by manifest path.
-          - { shard: contextdb-redb, crate: contextdb-redb, features: "", standalone: "true" }
+          - { shard: contextdb-redb, crate: contextdb-redb, features: "contextdb-internal,test-seams", standalone: "true" }
     steps:
       - name: Free disk space
         run: |
@@ -122,11 +127,17 @@ jobs:
           if-no-files-found: warn
 
   summary:
-    needs: test
+    needs: [lint, test]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Require every correctness job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-continuity.py aggregate lint test
       - uses: actions/download-artifact@v4
+        if: always()
         with:
           pattern: shard-*
           path: shards

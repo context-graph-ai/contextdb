@@ -1,0 +1,5336 @@
+{
+  "base": "65a2ccf8066de7a4b6ec5381d5bf0e75775152d6",
+  "branch": "linux-bounded-storage-candidate-20261019",
+  "features": [
+    {
+      "crate": "contextdb-cli",
+      "declaration": [],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-core",
+      "declaration": [],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-engine",
+      "declaration": [],
+      "feature": "in-process-test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-engine",
+      "declaration": [
+        "in-process-test-seams",
+        "redb/test-seams",
+        "redb/cache_metrics",
+        "contextdb-vector/test-seams",
+        "contextdb-core/test-seams",
+        "contextdb-tx/test-seams",
+        "contextdb-relational/test-seams"
+      ],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-engine",
+      "declaration": [
+        "iroh"
+      ],
+      "feature": "production-smoke-driver",
+      "jobs": [
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-engine",
+      "declaration": [
+        "dep:tokio"
+      ],
+      "feature": "sync-orchestration",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test",
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-engine",
+      "declaration": [
+        "sync-orchestration",
+        "dep:iroh",
+        "dep:iroh-blobs",
+        "dep:bao-tree",
+        "dep:bytes",
+        "dep:futures-util",
+        "dep:irpc",
+        "dep:iroh-tickets",
+        "dep:range-collections",
+        "dep:url",
+        "dep:rustls-pki-types"
+      ],
+      "feature": "iroh",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test",
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-engine",
+      "declaration": [
+        "iroh",
+        "dep:iroh-mdns-address-lookup"
+      ],
+      "feature": "mdns",
+      "jobs": [],
+      "status": "not selected by existing command families; no coverage claimed",
+      "tiers": []
+    },
+    {
+      "crate": "contextdb-engine",
+      "declaration": [],
+      "feature": "nightly-tests",
+      "jobs": [
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly"
+      ]
+    },
+    {
+      "crate": "contextdb-hnsw",
+      "declaration": [],
+      "feature": "default",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-hnsw",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test",
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-hnsw",
+      "declaration": [
+        "anndists/stdsimd"
+      ],
+      "feature": "stdsimd",
+      "jobs": [],
+      "status": "not selected by existing command families; no coverage claimed",
+      "tiers": []
+    },
+    {
+      "crate": "contextdb-redb",
+      "declaration": [
+        "dep:log"
+      ],
+      "feature": "logging",
+      "jobs": [],
+      "status": "not selected by existing command families; no coverage claimed",
+      "tiers": []
+    },
+    {
+      "crate": "contextdb-redb",
+      "declaration": [],
+      "feature": "cache_metrics",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-redb",
+      "declaration": [],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "contextdb-redb",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-redb",
+      "declaration": [],
+      "feature": "contextdb-internal",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "contextdb-redb",
+        "nightly/full-test",
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-relational",
+      "declaration": [],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-server",
+      "declaration": [
+        "iroh"
+      ],
+      "feature": "default",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test",
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-server",
+      "declaration": [
+        "contextdb-engine/iroh",
+        "dep:iroh",
+        "dep:iroh-tickets",
+        "dep:blake3",
+        "dep:rustls-pki-types",
+        "dep:url",
+        "iroh/metrics"
+      ],
+      "feature": "iroh",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test",
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-server",
+      "declaration": [
+        "iroh",
+        "contextdb-engine/mdns"
+      ],
+      "feature": "mdns",
+      "jobs": [],
+      "status": "not selected by existing command families; no coverage claimed",
+      "tiers": []
+    },
+    {
+      "crate": "contextdb-server",
+      "declaration": [
+        "contextdb-engine/in-process-test-seams"
+      ],
+      "feature": "in-process-test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-server",
+      "declaration": [
+        "in-process-test-seams",
+        "contextdb-engine/test-seams"
+      ],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-server",
+      "declaration": [
+        "iroh",
+        "contextdb-engine/production-smoke-driver"
+      ],
+      "feature": "production-smoke-driver",
+      "jobs": [
+        "ci/installed-smoke"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-tx",
+      "declaration": [],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    },
+    {
+      "crate": "contextdb-vector",
+      "declaration": [],
+      "feature": "test-seams",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams",
+        "contextdb-tx",
+        "contextdb-tx-test-seams",
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "contextdb-cli",
+        "contextdb-vector",
+        "contextdb-vector-test-seams",
+        "contextdb-graph",
+        "contextdb-parser",
+        "contextdb-planner",
+        "contextdb-relational",
+        "nightly/full-test"
+      ],
+      "status": "selected; not executed by this audit",
+      "tiers": [
+        "nightly",
+        "normal"
+      ]
+    }
+  ],
+  "ignore_declarations": [
+    {
+      "declaration": "/// a feature in `OUTSIDE_DEFAULT_TIER_FEATURES` or `#[ignore]`. A macro that expands one",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 482,
+      "path": "crates/contextdb-core/tests/test_estate_audit.rs"
+    },
+    {
+      "declaration": "gated_outside_default_tier(attribute) || attribute.starts_with(\"#[ignore\")",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 800,
+      "path": "crates/contextdb-core/tests/test_estate_audit.rs"
+    },
+    {
+      "declaration": "#[ignore = \"requires the DEBRIS_LEDGER_CORPUS debris file\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 102939,
+      "path": "crates/contextdb-engine/src/database.rs"
+    },
+    {
+      "declaration": "#[ignore = \"measurement: builds two 20,010-event streams\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 123,
+      "path": "crates/contextdb-engine/tests/engine_seams/a_declared_count_is_the_only_count_an_append_writes.rs"
+    },
+    {
+      "declaration": "#[ignore = \"child process of the declaration-crash tests\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 597,
+      "path": "crates/contextdb-engine/tests/engine_seams/declaring_a_count_on_a_table_with_rows_is_atomic_and_charged.rs"
+    },
+    {
+      "declaration": "/// them are `#[ignore]`d and run on demand.",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 32,
+      "path": "crates/contextdb-engine/tests/engine_seams/one_event_append_cost_by_stream_depth.rs"
+    },
+    {
+      "declaration": "#[ignore = \"builds stores of up to 20,010 events; run with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 506,
+      "path": "crates/contextdb-engine/tests/engine_seams/one_event_append_cost_by_stream_depth.rs"
+    },
+    {
+      "declaration": "#[ignore = \"the fix this test pins is not implemented yet, and it builds stores \\",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 592,
+      "path": "crates/contextdb-engine/tests/engine_seams/one_event_append_cost_by_stream_depth.rs"
+    },
+    {
+      "declaration": "#[ignore = \"builds a 5,010-event store; run with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 24,
+      "path": "crates/contextdb-engine/tests/engine_seams/where_an_appends_chunk_rewrites_sit_in_the_proof_tree.rs"
+    },
+    {
+      "declaration": "#[ignore = \"requires the seeded 1,250-row, 768-dimension store built by an_exact_search_authenticates_pages_not_every_vector; fixture creation takes minutes and hundreds of megabytes\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 130,
+      "path": "crates/contextdb-engine/tests/vector/a_find_locks_its_serving_cache_once_per_page.rs"
+    },
+    {
+      "declaration": "#[ignore = \"seeds a 1,250 x 768 store, which is minutes and hundreds of megabytes -- too slow \\",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 61,
+      "path": "crates/contextdb-engine/tests/vector/a_graph_search_stays_inside_its_serving_cache.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 27,
+      "path": "crates/contextdb-engine/tests/vector/a_replaced_vector_tied_frontier_walk_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 13,
+      "path": "crates/contextdb-engine/tests/vector/a_tied_frontier_walk_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 106,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 181,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 219,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 39,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_is_admitted_at_what_its_loads_hold.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 80,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_is_admitted_at_what_its_loads_hold.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 51,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_keeps_its_entry_pages_warm.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 159,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_keeps_its_entry_pages_warm.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 224,
+      "path": "crates/contextdb-engine/tests/vector/a_wide_find_keeps_its_entry_pages_warm.rs"
+    },
+    {
+      "declaration": "#[ignore = \"large exact-search diagnostic; run explicitly when measuring body and proof work\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 149,
+      "path": "crates/contextdb-engine/tests/vector/an_exact_search_authenticates_pages_not_every_vector.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 282,
+      "path": "crates/contextdb-engine/tests/vector/each_layer_a_wide_find_loads_keeps_its_share.rs"
+    },
+    {
+      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 314,
+      "path": "crates/contextdb-engine/tests/vector/each_layer_a_wide_find_loads_keeps_its_share.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 78,
+      "path": "crates/contextdb-engine/tests/vector/flat_route_crossover_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 97,
+      "path": "crates/contextdb-engine/tests/vector/multi_context_auto_route_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 210,
+      "path": "crates/contextdb-engine/tests/vector/multi_context_auto_route_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 306,
+      "path": "crates/contextdb-engine/tests/vector/multi_context_auto_route_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 199,
+      "path": "crates/contextdb-engine/tests/vector/multi_partition_union_recall_beam_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 118,
+      "path": "crates/contextdb-engine/tests/vector/single_context_search_radius_work_diagnostic.rs"
+    },
+    {
+      "declaration": "#[ignore = \"measurement for the owner, not a bar, and it cannot run in the default suite: it \\",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 227,
+      "path": "crates/contextdb-engine/tests/vector/what_a_declared_search_breadth_buys.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic measurement: it seeds a 12,500 x 768 store (about \\",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 227,
+      "path": "crates/contextdb-engine/tests/vector/what_the_approved_budget_does_to_one_large_context.rs"
+    },
+    {
+      "declaration": "#[ignore = \"attribution, not a bar: it seeds a 10,000 x 768 store (about ten minutes) and \\",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 85,
+      "path": "crates/contextdb-engine/tests/vector/where_one_partition_spends_its_find.rs"
+    },
+    {
+      "declaration": "#[ignore = \"attribution, not a bar: it seeds a 10,000 x 768 store (about ten minutes) and \\",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 118,
+      "path": "crates/contextdb-engine/tests/vector/where_one_partition_spends_its_find.rs"
+    },
+    {
+      "declaration": "/// (`a_graph_search_stays_inside_its_serving_cache`) is `#[ignore]`d because",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 9240,
+      "path": "crates/contextdb-vector/src/hnsw.rs"
+    },
+    {
+      "declaration": "#[ignore = \"diagnostic\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 109,
+      "path": "crates/contextdb-vector/tests/graph_reachability_diagnostic.rs"
+    },
+    {
+      "declaration": "line.contains(\"#[ignore = \\\"\") && !line.contains(\"#[ignore = \\\"\\\"]\"),",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 27,
+      "path": "tests/acceptance/contributing.rs"
+    },
+    {
+      "declaration": "if trimmed.starts_with(\"#[ignore\") {",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 57,
+      "path": "tests/acceptance/contributing.rs"
+    },
+    {
+      "declaration": "#[ignore = \"server has no health endpoint yet\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 61,
+      "path": "tests/acceptance/deployment.rs"
+    },
+    {
+      "declaration": "#[ignore = \"requires ARM64 cross compile\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 23,
+      "path": "tests/integration/cross_cutting_acceptance_tests.rs"
+    },
+    {
+      "declaration": "#[ignore = \"requires ARM64 cross-compile CI gate\"]",
+      "execution": "not selected (--include-ignored absent)",
+      "line": 2813,
+      "path": "tests/integration/gate_a_primitives.rs"
+    }
+  ],
+  "nightly_cfg": [
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 13,
+      "path": "crates/contextdb-engine/tests/custody.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 373,
+      "path": "crates/contextdb-engine/tests/engine_seams/an_import_tail_charges_each_decoded_vector_once.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 1028,
+      "path": "crates/contextdb-engine/tests/engine_seams/an_import_tail_charges_each_decoded_vector_once.rs"
+    },
+    {
+      "declaration": "#![cfg(all(target_os = \"linux\", feature = \"nightly-tests\"))]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 1,
+      "path": "crates/contextdb-engine/tests/owner_read/writable_open_drop_cycles_return_threads_and_memory.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 367,
+      "path": "crates/contextdb-engine/tests/schema/find_show_status_stay_fast_while_schema_replays.rs"
+    },
+    {
+      "declaration": "#![cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 6,
+      "path": "crates/contextdb-engine/tests/seed_commit_memory.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 185,
+      "path": "crates/contextdb-engine/tests/vector/continuous_writers_hold_throughput_and_reader_latency.rs"
+    },
+    {
+      "declaration": "#![cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 1,
+      "path": "crates/contextdb-engine/tests/vector/graph_build_distance_evaluations_stay_under_the_ratchet.rs"
+    },
+    {
+      "declaration": "#![cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 1,
+      "path": "crates/contextdb-engine/tests/vector/graph_route_profile_quality.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 359,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 364,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 373,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 380,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 385,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 403,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 409,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 475,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 488,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 587,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 675,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 723,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 768,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 846,
+      "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 70,
+      "path": "crates/contextdb-engine/tests/vector.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 285,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 697,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 755,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 2726,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 2971,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 2980,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 2991,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 3121,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 3907,
+      "path": "tests/acceptance/trigger_same_db_progress.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 943,
+      "path": "tests/integration/gate_a_primitives.rs"
+    },
+    {
+      "declaration": "#[cfg(feature = \"nightly-tests\")]",
+      "execution": "not executed by this audit",
+      "job": "nightly/full-test",
+      "line": 4426,
+      "path": "tests/integration/gate_b_workflows.rs"
+    }
+  ],
+  "shard_runner": "mkdir -p shard-out\nstart=$(date +%s)\nargs=()\nif [[ \"${{ matrix.standalone }}\" == \"true\" ]]; then\n  args+=(--manifest-path crates/contextdb-redb/Cargo.toml)\nelse\n  args+=(-p \"${{ matrix.crate }}\")\nfi\nif [[ -n \"${{ matrix.features }}\" ]]; then\n  args+=(--features \"${{ matrix.features }}\")\nfi\nset +e\n# Test-harness targets get the one-thread flag. Benches are run\n# separately without it: a `harness = false` (criterion) bench\n# rejects libtest arguments such as `--test-threads`.\ncargo test --locked \"${args[@]}\" --lib --bins --tests --examples -- --test-threads=1 2>&1 | tee \"shard-out/${{ matrix.shard }}.log\"\nstatus=${PIPESTATUS[0]}\ncargo test --locked \"${args[@]}\" --benches 2>&1 | tee -a \"shard-out/${{ matrix.shard }}.log\"\nbench_status=${PIPESTATUS[0]}\nif [[ \"$status\" -eq 0 ]]; then status=$bench_status; fi\nset -e\nend=$(date +%s)\necho \"${{ matrix.shard }} $((end - start))s exit=$status\" > \"shard-out/${{ matrix.shard }}.time\"\ndf -h / | tee -a \"shard-out/${{ matrix.shard }}.time\"\nexit \"$status\"\n",
+  "shards": [
+    {
+      "crate": "contextdb-core",
+      "features": "",
+      "shard": "contextdb-core"
+    },
+    {
+      "crate": "contextdb-core",
+      "features": "test-seams",
+      "shard": "contextdb-core-test-seams"
+    },
+    {
+      "crate": "contextdb-tx",
+      "features": "",
+      "shard": "contextdb-tx"
+    },
+    {
+      "crate": "contextdb-tx",
+      "features": "test-seams",
+      "shard": "contextdb-tx-test-seams"
+    },
+    {
+      "crate": "contextdb-engine",
+      "features": "",
+      "shard": "contextdb-engine"
+    },
+    {
+      "crate": "contextdb-engine",
+      "features": "test-seams,iroh",
+      "shard": "contextdb-engine-test-seams"
+    },
+    {
+      "crate": "contextdb-server",
+      "features": "",
+      "shard": "contextdb-server"
+    },
+    {
+      "crate": "contextdb-server",
+      "features": "test-seams",
+      "shard": "contextdb-server-test-seams"
+    },
+    {
+      "crate": "contextdb-cli",
+      "features": "",
+      "shard": "contextdb-cli"
+    },
+    {
+      "crate": "contextdb-vector",
+      "features": "",
+      "shard": "contextdb-vector"
+    },
+    {
+      "crate": "contextdb-vector",
+      "features": "test-seams",
+      "shard": "contextdb-vector-test-seams"
+    },
+    {
+      "crate": "contextdb-hnsw",
+      "features": "",
+      "shard": "contextdb-hnsw"
+    },
+    {
+      "crate": "contextdb-graph",
+      "features": "",
+      "shard": "contextdb-graph"
+    },
+    {
+      "crate": "contextdb-parser",
+      "features": "",
+      "shard": "contextdb-parser"
+    },
+    {
+      "crate": "contextdb-planner",
+      "features": "",
+      "shard": "contextdb-planner"
+    },
+    {
+      "crate": "contextdb-relational",
+      "features": "",
+      "shard": "contextdb-relational"
+    },
+    {
+      "crate": "contextdb-redb",
+      "features": "contextdb-internal,test-seams",
+      "shard": "contextdb-redb",
+      "standalone": "true"
+    }
+  ],
+  "targets": [
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "lib",
+      "name": "contextdb_cli",
+      "path": "crates/contextdb-cli/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "bin",
+      "name": "contextdb",
+      "path": "crates/contextdb-cli/src/main.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "cli_immutable_column_tests",
+      "path": "crates/contextdb-cli/tests/cli_immutable_column_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "comment_remainder_tests",
+      "path": "crates/contextdb-cli/tests/comment_remainder_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "corrupt_store_open_tests",
+      "path": "crates/contextdb-cli/tests/corrupt_store_open_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "declared_sync_surface_tests",
+      "path": "crates/contextdb-cli/tests/declared_sync_surface_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "docs_exit_code_table",
+      "path": "crates/contextdb-cli/tests/docs_exit_code_table.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "exit_code_contract",
+      "path": "crates/contextdb-cli/tests/exit_code_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "explain_non_execution_tests",
+      "path": "crates/contextdb-cli/tests/explain_non_execution_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "interactive_type_ahead",
+      "path": "crates/contextdb-cli/tests/interactive_type_ahead.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "json_and_row_cap",
+      "path": "crates/contextdb-cli/tests/json_and_row_cap.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "json_meta_commands",
+      "path": "crates/contextdb-cli/tests/json_meta_commands.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "json_schema_sync_vocabulary_tests",
+      "path": "crates/contextdb-cli/tests/json_schema_sync_vocabulary_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "json_startup_error_envelope_tests",
+      "path": "crates/contextdb-cli/tests/json_startup_error_envelope_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "json_stderr_purity_tests",
+      "path": "crates/contextdb-cli/tests/json_stderr_purity_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "multiline_statement_tests",
+      "path": "crates/contextdb-cli/tests/multiline_statement_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "oversized_exit_push_tests",
+      "path": "crates/contextdb-cli/tests/oversized_exit_push_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "purge_cli_verb_tests",
+      "path": "crates/contextdb-cli/tests/purge_cli_verb_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_classification_staged",
+      "path": "crates/contextdb-cli/tests/read_classification_staged.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_cancellation",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_cancellation.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_cursor",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_cursor.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_invocation",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_invocation.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_live_owner",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_live_owner.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_machine_surface",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_machine_surface.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_metadata",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_metadata.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_ordinary_results",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_ordinary_results.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_runtime_root",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_runtime_root.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_script_continuation",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_script_continuation.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_session_shape",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_session_shape.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "read_cli_journeys_unserved_owner",
+      "path": "crates/contextdb-cli/tests/read_cli_journeys_unserved_owner.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "removed_spellings_are_refused_by_name",
+      "path": "crates/contextdb-cli/tests/removed_spellings_are_refused_by_name.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "reset_live_owner_tests",
+      "path": "crates/contextdb-cli/tests/reset_live_owner_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "reset_repair_tests",
+      "path": "crates/contextdb-cli/tests/reset_repair_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "statement_framing_seam_tests",
+      "path": "crates/contextdb-cli/tests/statement_framing_seam_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "sync_pull_liveness_tests",
+      "path": "crates/contextdb-cli/tests/sync_pull_liveness_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "sync_pull_progress_counter_tests",
+      "path": "crates/contextdb-cli/tests/sync_pull_progress_counter_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "sync_status_vocabulary_tests",
+      "path": "crates/contextdb-cli/tests/sync_status_vocabulary_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "tombstone_exit_push_false_failure_tests",
+      "path": "crates/contextdb-cli/tests/tombstone_exit_push_false_failure_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "usage_error_no_side_effects_tests",
+      "path": "crates/contextdb-cli/tests/usage_error_no_side_effects_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "vector_partition_show_cursor_contract",
+      "path": "crates/contextdb-cli/tests/vector_partition_show_cursor_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-cli",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-cli"
+      ],
+      "kind": "test",
+      "name": "write_session_transaction_reads_are_bounded",
+      "path": "crates/contextdb-cli/tests/write_session_transaction_reads_are_bounded.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "lib",
+      "name": "contextdb_core",
+      "path": "crates/contextdb-core/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "atomic_wrapper_audit",
+      "path": "crates/contextdb-core/tests/atomic_wrapper_audit.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "bincode_serde_path_audit",
+      "path": "crates/contextdb-core/tests/bincode_serde_path_audit.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "docs_audit",
+      "path": "crates/contextdb-core/tests/docs_audit.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "error_non_exhaustive_tests",
+      "path": "crates/contextdb-core/tests/error_non_exhaustive_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "history_policy_tail_decode_tests",
+      "path": "crates/contextdb-core/tests/history_policy_tail_decode_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "hnsw_fork_patch_matches_its_sources",
+      "path": "crates/contextdb-core/tests/hnsw_fork_patch_matches_its_sources.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "memory_safety_tests",
+      "path": "crates/contextdb-core/tests/memory_safety_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "operator_guidance_contract",
+      "path": "crates/contextdb-core/tests/operator_guidance_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "purge_authority_error_contract_tests",
+      "path": "crates/contextdb-core/tests/purge_authority_error_contract_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "read_contract_compile",
+      "path": "crates/contextdb-core/tests/read_contract_compile.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "read_contract_types",
+      "path": "crates/contextdb-core/tests/read_contract_types.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "read_failure_wording",
+      "path": "crates/contextdb-core/tests/read_failure_wording.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "redb_fork_patch_matches_its_sources",
+      "path": "crates/contextdb-core/tests/redb_fork_patch_matches_its_sources.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "store_companion_path_appends_lock_to_the_full_store_name",
+      "path": "crates/contextdb-core/tests/store_companion_path_appends_lock_to_the_full_store_name.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "tenant_id_newtype_tests",
+      "path": "crates/contextdb-core/tests/tenant_id_newtype_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "test_estate_audit",
+      "path": "crates/contextdb-core/tests/test_estate_audit.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "timestamp_audit",
+      "path": "crates/contextdb-core/tests/timestamp_audit.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "txid_newtype_tests",
+      "path": "crates/contextdb-core/tests/txid_newtype_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-core",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-core",
+        "contextdb-core-test-seams"
+      ],
+      "kind": "test",
+      "name": "type_spread_audit",
+      "path": "crates/contextdb-core/tests/type_spread_audit.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "lib",
+      "name": "contextdb_engine",
+      "path": "crates/contextdb-engine/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "a_row_pays_for_its_partition_key_once",
+      "path": "crates/contextdb-engine/tests/a_row_pays_for_its_partition_key_once.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "acceptance",
+      "path": "crates/contextdb-engine/../../tests/acceptance.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "bounded",
+      "path": "crates/contextdb-engine/tests/bounded.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "bounded_in_subquery_stays_inside_the_read_limits",
+      "path": "crates/contextdb-engine/tests/bounded_in_subquery_stays_inside_the_read_limits.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "bounded_metadata_start_lookup_stays_inside_the_read_limits",
+      "path": "crates/contextdb-engine/tests/bounded_metadata_start_lookup_stays_inside_the_read_limits.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "bounded_read_of_staged_graph_work_stays_within_its_limits",
+      "path": "crates/contextdb-engine/tests/bounded_read_of_staged_graph_work_stays_within_its_limits.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "cdb120_partition_insert_cost",
+      "path": "crates/contextdb-engine/tests/cdb120_partition_insert_cost.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "custody",
+      "path": "crates/contextdb-engine/tests/custody.rs",
+      "required_features": [
+        "test-seams",
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "declared_memory_limit_bounds_a_writer",
+      "path": "crates/contextdb-engine/tests/declared_memory_limit_bounds_a_writer.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "direct_file_image_memory_lifetime",
+      "path": "crates/contextdb-engine/tests/direct_file_image_memory_lifetime.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "durable_public_api",
+      "path": "crates/contextdb-engine/tests/durable_public_api.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "engine",
+      "path": "crates/contextdb-engine/tests/engine.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "engine_seams",
+      "path": "crates/contextdb-engine/tests/engine_seams.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "float_equality_follows_postgresql",
+      "path": "crates/contextdb-engine/tests/float_equality_follows_postgresql.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "graph_property_memory_charge_measurement",
+      "path": "crates/contextdb-engine/tests/graph_property_memory_charge_measurement.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "history_request_memory",
+      "path": "crates/contextdb-engine/tests/history_request_memory.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "in_transaction_count_stays_inside_its_memory",
+      "path": "crates/contextdb-engine/tests/in_transaction_count_stays_inside_its_memory.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "indexed_row_memory_charge_measurement",
+      "path": "crates/contextdb-engine/tests/indexed_row_memory_charge_measurement.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "integration",
+      "path": "crates/contextdb-engine/../../tests/integration.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "local_transport",
+      "path": "crates/contextdb-engine/tests/local_transport.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "memory_limit_admission_holds_for_vectors",
+      "path": "crates/contextdb-engine/tests/memory_limit_admission_holds_for_vectors.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "native_backing_allocator",
+      "path": "crates/contextdb-engine/tests/native_backing_allocator.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "native_terminal_allocations",
+      "path": "crates/contextdb-engine/tests/native_terminal_allocations.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "owner_read",
+      "path": "crates/contextdb-engine/tests/owner_read.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "read",
+      "path": "crates/contextdb-engine/tests/read.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "reader_release",
+      "path": "crates/contextdb-engine/tests/reader_release.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "received_schema_metadata_peak",
+      "path": "crates/contextdb-engine/tests/received_schema_metadata_peak.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "seed_commit_memory",
+      "path": "crates/contextdb-engine/tests/seed_commit_memory.rs",
+      "required_features": [
+        "test-seams",
+        "nightly-tests"
+      ],
+      "tier": "nightly"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "sql",
+      "path": "crates/contextdb-engine/tests/sql.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "sql_surface",
+      "path": "crates/contextdb-engine/tests/sql_surface.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "staged_predecode_row",
+      "path": "crates/contextdb-engine/tests/staged_predecode_row.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "sync",
+      "path": "crates/contextdb-engine/tests/sync.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "text_memory_charge_measurement",
+      "path": "crates/contextdb-engine/tests/text_memory_charge_measurement.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "tied_index_probes_stay_inside_the_read_limits",
+      "path": "crates/contextdb-engine/tests/tied_index_probes_stay_inside_the_read_limits.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "vector",
+      "path": "crates/contextdb-engine/tests/vector.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "writecost_cycle_bound",
+      "path": "crates/contextdb-engine/tests/writecost_cycle_bound.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "writecost_planner",
+      "path": "crates/contextdb-engine/tests/writecost_planner.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "writecost_planner_reversed",
+      "path": "crates/contextdb-engine/tests/writecost_planner_reversed.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "test",
+      "name": "writecost_reclaim",
+      "path": "crates/contextdb-engine/tests/writecost_reclaim.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "acceptance_three_paradigm_query",
+      "path": "crates/contextdb-engine/../../benches/acceptance_three_paradigm_query.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "commit_write_volume_scaling",
+      "path": "crates/contextdb-engine/../../benches/commit_write_volume_scaling.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "composite_index_routing",
+      "path": "crates/contextdb-engine/../../benches/composite_index_routing.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "engine_full_throughput",
+      "path": "crates/contextdb-engine/../../benches/engine_full_throughput.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "engine_throughput",
+      "path": "crates/contextdb-engine/../../benches/engine_throughput.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "graph_adjacency_probe",
+      "path": "crates/contextdb-engine/../../benches/graph_adjacency_probe.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "indexed_scan_filter_entity_list",
+      "path": "crates/contextdb-engine/../../benches/indexed_scan_filter_entity_list.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "indexed_scan_filter_file_backed_open",
+      "path": "crates/contextdb-engine/../../benches/indexed_scan_filter_file_backed_open.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "indexed_scan_filter_in_memory_pk_inserts",
+      "path": "crates/contextdb-engine/../../benches/indexed_scan_filter_in_memory_pk_inserts.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "indexed_scan_filter_non_id_pk_inserts",
+      "path": "crates/contextdb-engine/../../benches/indexed_scan_filter_non_id_pk_inserts.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "indexed_scan_filter_pk_inserts",
+      "path": "crates/contextdb-engine/../../benches/indexed_scan_filter_pk_inserts.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "mixed_workflows_pr",
+      "path": "crates/contextdb-engine/../../benches/mixed_workflows_pr.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "rank_policy_recall",
+      "path": "crates/contextdb-engine/../../benches/rank_policy_recall.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "sigterm_drain_in_flight_persistence",
+      "path": "crates/contextdb-engine/../../benches/sigterm_drain_in_flight_persistence.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "sql_surface_distinct",
+      "path": "crates/contextdb-engine/../../benches/sql_surface_distinct.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "storage_scale_hardening",
+      "path": "crates/contextdb-engine/../../benches/storage_scale_hardening.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "subscriptions_pr",
+      "path": "crates/contextdb-engine/../../benches/subscriptions_pr.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier1_acl_overhead",
+      "path": "crates/contextdb-engine/../../benches/tier1_acl_overhead.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier1_atomic_visibility_under_contention",
+      "path": "crates/contextdb-engine/../../benches/tier1_atomic_visibility_under_contention.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier1_context_guard_overhead",
+      "path": "crates/contextdb-engine/../../benches/tier1_context_guard_overhead.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier1_event_bus_throughput",
+      "path": "crates/contextdb-engine/../../benches/tier1_event_bus_throughput.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier1_scope_label_overhead",
+      "path": "crates/contextdb-engine/../../benches/tier1_scope_label_overhead.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier2_commit_validate_overhead",
+      "path": "crates/contextdb-engine/../../benches/tier2_commit_validate_overhead.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier2_fk_revalidation_overhead",
+      "path": "crates/contextdb-engine/../../benches/tier2_fk_revalidation_overhead.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "tier2_state_machine_overhead",
+      "path": "crates/contextdb-engine/../../benches/tier2_state_machine_overhead.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "trigger_throughput",
+      "path": "crates/contextdb-engine/../../benches/trigger_throughput.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams"
+      ],
+      "kind": "bench",
+      "name": "version_cleanup_scaling",
+      "path": "crates/contextdb-engine/../../benches/version_cleanup_scaling.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "example",
+      "name": "custody_scale",
+      "path": "crates/contextdb-engine/examples/custody_scale.rs",
+      "required_features": [
+        "iroh",
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "example",
+      "name": "event_custody",
+      "path": "crates/contextdb-engine/examples/event_custody.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "example",
+      "name": "peak_rss_harness",
+      "path": "crates/contextdb-engine/examples/peak_rss_harness.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-engine",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-engine",
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "kind": "example",
+      "name": "redb_table_census",
+      "path": "crates/contextdb-engine/examples/redb_table_census.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-graph",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-graph"
+      ],
+      "kind": "lib",
+      "name": "contextdb_graph",
+      "path": "crates/contextdb-graph/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-graph",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-graph"
+      ],
+      "kind": "test",
+      "name": "bounded_traversal_survives_adjacency_compaction",
+      "path": "crates/contextdb-graph/tests/bounded_traversal_survives_adjacency_compaction.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-graph",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-graph"
+      ],
+      "kind": "test",
+      "name": "graph_tests",
+      "path": "crates/contextdb-graph/tests/graph_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-graph",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-graph"
+      ],
+      "kind": "test",
+      "name": "long_traversal_queue_drops_iteratively",
+      "path": "crates/contextdb-graph/tests/long_traversal_queue_drops_iteratively.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-graph",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-graph"
+      ],
+      "kind": "test",
+      "name": "row_owned_edges",
+      "path": "crates/contextdb-graph/tests/row_owned_edges.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-hnsw",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-hnsw"
+      ],
+      "kind": "lib",
+      "name": "hnsw_rs",
+      "path": "crates/contextdb-hnsw/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "lib",
+      "name": "contextdb_parser",
+      "path": "crates/contextdb-parser/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "bare_join_keyword_contract",
+      "path": "crates/contextdb-parser/tests/bare_join_keyword_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "legacy_conflict_policy_ddl_tests",
+      "path": "crates/contextdb-parser/tests/legacy_conflict_policy_ddl_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "maintained_count_syntax_contract",
+      "path": "crates/contextdb-parser/tests/maintained_count_syntax_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "parser_immutable_tests",
+      "path": "crates/contextdb-parser/tests/parser_immutable_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "parser_tests",
+      "path": "crates/contextdb-parser/tests/parser_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "purge_parser_contract_tests",
+      "path": "crates/contextdb-parser/tests/purge_parser_contract_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "row_value_in_predicate_contract",
+      "path": "crates/contextdb-parser/tests/row_value_in_predicate_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "scope_label_write_keyword_word_boundary_tests",
+      "path": "crates/contextdb-parser/tests/scope_label_write_keyword_word_boundary_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "statement_effect_contract",
+      "path": "crates/contextdb-parser/tests/statement_effect_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "utf8_multibyte_boundary_tests",
+      "path": "crates/contextdb-parser/tests/utf8_multibyte_boundary_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "test",
+      "name": "vector_partition_syntax_contract",
+      "path": "crates/contextdb-parser/tests/vector_partition_syntax_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-parser",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-parser"
+      ],
+      "kind": "bench",
+      "name": "parser_throughput",
+      "path": "crates/contextdb-parser/../../benches/parser_throughput.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-planner",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-planner"
+      ],
+      "kind": "lib",
+      "name": "contextdb_planner",
+      "path": "crates/contextdb-planner/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-planner",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-planner"
+      ],
+      "kind": "test",
+      "name": "planner_tests",
+      "path": "crates/contextdb-planner/tests/planner_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-planner",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-planner"
+      ],
+      "kind": "test",
+      "name": "purge_planner_contract_tests",
+      "path": "crates/contextdb-planner/tests/purge_planner_contract_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-planner",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-planner"
+      ],
+      "kind": "test",
+      "name": "vector_explain_redaction_contract",
+      "path": "crates/contextdb-planner/tests/vector_explain_redaction_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "lib",
+      "name": "redb",
+      "path": "crates/contextdb-redb/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "admission_reads_are_bounded_by_the_format",
+      "path": "crates/contextdb-redb/tests/admission_reads_are_bounded_by_the_format.rs",
+      "required_features": [
+        "contextdb-internal",
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "allocator_residency_contract",
+      "path": "crates/contextdb-redb/tests/allocator_residency_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "backward_compatibility",
+      "path": "crates/contextdb-redb/tests/backward_compatibility.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "basic_tests",
+      "path": "crates/contextdb-redb/tests/basic_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "growth_after_compaction_contract",
+      "path": "crates/contextdb-redb/tests/growth_after_compaction_contract.rs",
+      "required_features": [
+        "contextdb-internal"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "integration_tests",
+      "path": "crates/contextdb-redb/tests/integration_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "multimap_tests",
+      "path": "crates/contextdb-redb/tests/multimap_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "multithreading_tests",
+      "path": "crates/contextdb-redb/tests/multithreading_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "named_root_capture_contract",
+      "path": "crates/contextdb-redb/tests/named_root_capture_contract.rs",
+      "required_features": [
+        "contextdb-internal",
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "open_table_registry_allocations",
+      "path": "crates/contextdb-redb/tests/open_table_registry_allocations.rs",
+      "required_features": [
+        "contextdb-internal",
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "open_with_backend_contract",
+      "path": "crates/contextdb-redb/tests/open_with_backend_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-redb",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-redb"
+      ],
+      "kind": "test",
+      "name": "reclaim_step_contract",
+      "path": "crates/contextdb-redb/tests/reclaim_step_contract.rs",
+      "required_features": [
+        "contextdb-internal",
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-relational",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-relational"
+      ],
+      "kind": "lib",
+      "name": "contextdb_relational",
+      "path": "crates/contextdb-relational/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-relational",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-relational"
+      ],
+      "kind": "test",
+      "name": "relational_tests",
+      "path": "crates/contextdb-relational/tests/relational_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "lib",
+      "name": "contextdb_server",
+      "path": "crates/contextdb-server/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams",
+        "ci/installed-smoke"
+      ],
+      "kind": "bin",
+      "name": "contextdb-server",
+      "path": "crates/contextdb-server/src/main.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "ci/installed-smoke"
+      ],
+      "kind": "bin",
+      "name": "contextdb-smoke-driver",
+      "path": "crates/contextdb-server/src/smoke_driver.rs",
+      "required_features": [
+        "production-smoke-driver"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "accepted_delete_suppression_cursor_tests",
+      "path": "crates/contextdb-server/tests/accepted_delete_suppression_cursor_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authenticated_sync_contract_tests",
+      "path": "crates/contextdb-server/tests/authenticated_sync_contract_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authoritative_purge_blob_atomicity_tests",
+      "path": "crates/contextdb-server/tests/authoritative_purge_blob_atomicity_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authoritative_purge_delivery_tests",
+      "path": "crates/contextdb-server/tests/authoritative_purge_delivery_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authoritative_purge_direction_delivery_tests",
+      "path": "crates/contextdb-server/tests/authoritative_purge_direction_delivery_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authoritative_purge_fresh_same_key_lineage_tests",
+      "path": "crates/contextdb-server/tests/authoritative_purge_fresh_same_key_lineage_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authoritative_purge_pull_only_delivery_tests",
+      "path": "crates/contextdb-server/tests/authoritative_purge_pull_only_delivery_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authoritative_purge_stale_descendant_refusal_tests",
+      "path": "crates/contextdb-server/tests/authoritative_purge_stale_descendant_refusal_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "authoritative_purge_sync_off_delivery_tests",
+      "path": "crates/contextdb-server/tests/authoritative_purge_sync_off_delivery_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "binary_exit_code_contract",
+      "path": "crates/contextdb-server/tests/binary_exit_code_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "bounded_tables_sync_tests",
+      "path": "crates/contextdb-server/tests/bounded_tables_sync_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "builtin_schema_reconcile_tests",
+      "path": "crates/contextdb-server/tests/builtin_schema_reconcile_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "composite_key_memory_limit_apply_tests",
+      "path": "crates/contextdb-server/tests/composite_key_memory_limit_apply_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "composite_key_sync_tests",
+      "path": "crates/contextdb-server/tests/composite_key_sync_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "composite_key_vector_apply_tests",
+      "path": "crates/contextdb-server/tests/composite_key_vector_apply_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "composite_key_wire_roundtrip_tests",
+      "path": "crates/contextdb-server/tests/composite_key_wire_roundtrip_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "conflict_policy_honored_tests",
+      "path": "crates/contextdb-server/tests/conflict_policy_honored_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "cross_sender_latest_wins_arbitration_tests",
+      "path": "crates/contextdb-server/tests/cross_sender_latest_wins_arbitration_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "dependency_complete_sync_tests",
+      "path": "crates/contextdb-server/tests/dependency_complete_sync_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "dependency_unit_refusal_tests",
+      "path": "crates/contextdb-server/tests/dependency_unit_refusal_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "destination_ancestry_reupload_tests",
+      "path": "crates/contextdb-server/tests/destination_ancestry_reupload_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "destination_reupload_safety_tests",
+      "path": "crates/contextdb-server/tests/destination_reupload_safety_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "distributed_blob_job_worker_tests",
+      "path": "crates/contextdb-server/tests/distributed_blob_job_worker_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "durable_deletion_and_purge_tests",
+      "path": "crates/contextdb-server/tests/durable_deletion_and_purge_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "established_owner_vector_update_sync_tests",
+      "path": "crates/contextdb-server/tests/established_owner_vector_update_sync_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "file_backed_identity_selection_tests",
+      "path": "crates/contextdb-server/tests/file_backed_identity_selection_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "hub_ordered_sync_mutation_arbitration_tests",
+      "path": "crates/contextdb-server/tests/hub_ordered_sync_mutation_arbitration_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "in_memory_sync_lineage_tests",
+      "path": "crates/contextdb-server/tests/in_memory_sync_lineage_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "installed_work_ledger_claim_race_tests",
+      "path": "crates/contextdb-server/tests/installed_work_ledger_claim_race_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "iroh_transport_tests",
+      "path": "crates/contextdb-server/tests/iroh_transport_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "json_ticket_output",
+      "path": "crates/contextdb-server/tests/json_ticket_output.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "keep_latest_identity_collision_tests",
+      "path": "crates/contextdb-server/tests/keep_latest_identity_collision_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "keep_latest_pull_adopts_hub_order_tests",
+      "path": "crates/contextdb-server/tests/keep_latest_pull_adopts_hub_order_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "keyless_sync_eligibility_tests",
+      "path": "crates/contextdb-server/tests/keyless_sync_eligibility_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "media_transfer_containment",
+      "path": "crates/contextdb-server/tests/media_transfer_containment.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "media_transfer_fetch_retention",
+      "path": "crates/contextdb-server/tests/media_transfer_fetch_retention.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "media_transfer_memory",
+      "path": "crates/contextdb-server/tests/media_transfer_memory.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "media_transfer_reclaim_driver",
+      "path": "crates/contextdb-server/tests/media_transfer_reclaim_driver.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "media_transfer_tests",
+      "path": "crates/contextdb-server/tests/media_transfer_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "movable_destination_tests",
+      "path": "crates/contextdb-server/tests/movable_destination_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "no_broker_surface",
+      "path": "crates/contextdb-server/tests/no_broker_surface.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "outbound_vector_owner_row_tests",
+      "path": "crates/contextdb-server/tests/outbound_vector_owner_row_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "oversized_dependency_unit_reopened_tests",
+      "path": "crates/contextdb-server/tests/oversized_dependency_unit_reopened_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "oversized_dependency_unit_tests",
+      "path": "crates/contextdb-server/tests/oversized_dependency_unit_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "pending_push_change_count_tests",
+      "path": "crates/contextdb-server/tests/pending_push_change_count_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "per_edge_receipt_confirmation_tests",
+      "path": "crates/contextdb-server/tests/per_edge_receipt_confirmation_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "post_refusal_page_apply_tests",
+      "path": "crates/contextdb-server/tests/post_refusal_page_apply_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "pre_existing_table_policy_adoption_tests",
+      "path": "crates/contextdb-server/tests/pre_existing_table_policy_adoption_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "preflight_policy_projection_tests",
+      "path": "crates/contextdb-server/tests/preflight_policy_projection_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "protocol_future_bump_rule_tests",
+      "path": "crates/contextdb-server/tests/protocol_future_bump_rule_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "protocol_newtype_roundtrip",
+      "path": "crates/contextdb-server/tests/protocol_newtype_roundtrip.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "protocol_version_bump_tests",
+      "path": "crates/contextdb-server/tests/protocol_version_bump_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "protocol_wire_format_freeze_tests",
+      "path": "crates/contextdb-server/tests/protocol_wire_format_freeze_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "pull_cursor_source_identity_tests",
+      "path": "crates/contextdb-server/tests/pull_cursor_source_identity_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "pull_only_overwrite_tests",
+      "path": "crates/contextdb-server/tests/pull_only_overwrite_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "purge_wire_layout_tests",
+      "path": "crates/contextdb-server/tests/purge_wire_layout_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "push_only_terminal_refusal_tests",
+      "path": "crates/contextdb-server/tests/push_only_terminal_refusal_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "received_direction_projection_tests",
+      "path": "crates/contextdb-server/tests/received_direction_projection_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "received_table_keeps_declared_arbitration_tests",
+      "path": "crates/contextdb-server/tests/received_table_keeps_declared_arbitration_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "refused_pusher_receives_the_winner_tests",
+      "path": "crates/contextdb-server/tests/refused_pusher_receives_the_winner_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "restated_row_outbound_group_tests",
+      "path": "crates/contextdb-server/tests/restated_row_outbound_group_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "retained_expires_column_readback_tests",
+      "path": "crates/contextdb-server/tests/retained_expires_column_readback_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "retained_history_readback_tests",
+      "path": "crates/contextdb-server/tests/retained_history_readback_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "schema_provenance_wire_contract",
+      "path": "crates/contextdb-server/tests/schema_provenance_wire_contract.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "self_echo_pull_after_push_tests",
+      "path": "crates/contextdb-server/tests/self_echo_pull_after_push_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "server_behavior_alias_contract_tests",
+      "path": "crates/contextdb-server/tests/server_behavior_alias_contract_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "server_resource_policy_contract_tests",
+      "path": "crates/contextdb-server/tests/server_resource_policy_contract_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "stale_restore_tests",
+      "path": "crates/contextdb-server/tests/stale_restore_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "sync_direction_honored_tests",
+      "path": "crates/contextdb-server/tests/sync_direction_honored_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "sync_integration",
+      "path": "crates/contextdb-server/tests/sync_integration.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "sync_off_drop_outbound_tests",
+      "path": "crates/contextdb-server/tests/sync_off_drop_outbound_tests.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "sync_pull_in_progress_tests",
+      "path": "crates/contextdb-server/tests/sync_pull_in_progress_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "transport_boundary_regression_tests",
+      "path": "crates/contextdb-server/tests/transport_boundary_regression_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "transport_boundary_tests",
+      "path": "crates/contextdb-server/tests/transport_boundary_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "usage_error_no_side_effects_tests",
+      "path": "crates/contextdb-server/tests/usage_error_no_side_effects_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "vector_owner_delete_group_tests",
+      "path": "crates/contextdb-server/tests/vector_owner_delete_group_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "wiped_edge_convergence_tests",
+      "path": "crates/contextdb-server/tests/wiped_edge_convergence_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "work_ledger_tests",
+      "path": "crates/contextdb-server/tests/work_ledger_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "work_node_contacts_ddl_drift_tests",
+      "path": "crates/contextdb-server/tests/work_node_contacts_ddl_drift_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "test",
+      "name": "worker_defers_own_submission_tests",
+      "path": "crates/contextdb-server/tests/worker_defers_own_submission_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "bench",
+      "name": "blob_transfer",
+      "path": "crates/contextdb-server/benches/blob_transfer.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "bench",
+      "name": "server_sync_system",
+      "path": "crates/contextdb-server/../../benches/server_sync_system.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "bench",
+      "name": "server_throughput",
+      "path": "crates/contextdb-server/../../benches/server_throughput.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "bench",
+      "name": "sync_pr",
+      "path": "crates/contextdb-server/../../benches/sync_pr.rs",
+      "required_features": [
+        "iroh"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "example",
+      "name": "bounded_tables_smoke",
+      "path": "crates/contextdb-server/examples/bounded_tables_smoke.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "example",
+      "name": "media_transfer_fabric_demo",
+      "path": "crates/contextdb-server/examples/media_transfer_fabric_demo.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server",
+        "contextdb-server-test-seams"
+      ],
+      "kind": "example",
+      "name": "work_fabric_demo",
+      "path": "crates/contextdb-server/examples/work_fabric_demo.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-server",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-server-test-seams"
+      ],
+      "kind": "example",
+      "name": "work_fabric_two_nodes",
+      "path": "crates/contextdb-server/examples/work_fabric_two_nodes.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-tx",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-tx",
+        "contextdb-tx-test-seams"
+      ],
+      "kind": "lib",
+      "name": "contextdb_tx",
+      "path": "crates/contextdb-tx/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-tx",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-tx",
+        "contextdb-tx-test-seams"
+      ],
+      "kind": "test",
+      "name": "native_conditional_undo",
+      "path": "crates/contextdb-tx/tests/native_conditional_undo.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-tx",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-tx",
+        "contextdb-tx-test-seams"
+      ],
+      "kind": "test",
+      "name": "row_owned_edge_staging_tests",
+      "path": "crates/contextdb-tx/tests/row_owned_edge_staging_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-tx",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-tx",
+        "contextdb-tx-test-seams"
+      ],
+      "kind": "test",
+      "name": "tx_safety_tests",
+      "path": "crates/contextdb-tx/tests/tx_safety_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-tx",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-tx",
+        "contextdb-tx-test-seams"
+      ],
+      "kind": "test",
+      "name": "tx_tests",
+      "path": "crates/contextdb-tx/tests/tx_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "lib",
+      "name": "contextdb_vector",
+      "path": "crates/contextdb-vector/src/lib.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "a_borrowed_serving_page_keeps_its_charge_through_a_give_back",
+      "path": "crates/contextdb-vector/tests/a_borrowed_serving_page_keeps_its_charge_through_a_give_back.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "a_completed_search_keeps_live_scratch_charged",
+      "path": "crates/contextdb-vector/tests/a_completed_search_keeps_live_scratch_charged.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "a_saved_graph_serving_cache_keeps_its_lookup_table_charged",
+      "path": "crates/contextdb-vector/tests/a_saved_graph_serving_cache_keeps_its_lookup_table_charged.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "a_serving_page_a_search_still_reads_stays_charged",
+      "path": "crates/contextdb-vector/tests/a_serving_page_a_search_still_reads_stays_charged.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "borrowed_route_metadata_adapter",
+      "path": "crates/contextdb-vector/tests/borrowed_route_metadata_adapter.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "concurrent_searches_stay_inside_their_serving_cache",
+      "path": "crates/contextdb-vector/tests/concurrent_searches_stay_inside_their_serving_cache.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "graph_identity_rows_share_one_point",
+      "path": "crates/contextdb-vector/tests/graph_identity_rows_share_one_point.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "graph_reachability_diagnostic",
+      "path": "crates/contextdb-vector/tests/graph_reachability_diagnostic.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "roaring_treemap_growth_stays_within_its_bound",
+      "path": "crates/contextdb-vector/tests/roaring_treemap_growth_stays_within_its_bound.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "vector_store_identity_survives_address_reuse",
+      "path": "crates/contextdb-vector/tests/vector_store_identity_survives_address_reuse.rs",
+      "required_features": [],
+      "tier": "normal"
+    },
+    {
+      "crate": "contextdb-vector",
+      "execution": "not executed by this audit; existing ignore attributes still apply",
+      "jobs": [
+        "contextdb-vector",
+        "contextdb-vector-test-seams"
+      ],
+      "kind": "test",
+      "name": "vector_tests",
+      "path": "crates/contextdb-vector/tests/vector_tests.rs",
+      "required_features": [],
+      "tier": "normal"
+    }
+  ],
+  "workflow_structure": {
+    "ci": {
+      "env": {
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TERM_COLOR": "always",
+        "RUSTFLAGS": "-D warnings"
+      },
+      "jobs": {
+        "cross-compile": {
+          "needs": "lint",
+          "runs-on": "${{ matrix.os }}",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "uses": "actions-rust-lang/setup-rust-toolchain@v1",
+              "with": {
+                "target": "${{ matrix.target }}"
+              }
+            },
+            {
+              "uses": "Swatinem/rust-cache@v2",
+              "with": {
+                "key": "${{ matrix.target }}"
+              }
+            },
+            {
+              "if": "matrix.target == 'aarch64-unknown-linux-gnu'",
+              "name": "Install cross-compilation tools",
+              "run": "sudo apt-get update\nsudo apt-get install -y gcc-aarch64-linux-gnu\necho \"CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc\" >> \"$GITHUB_ENV\"\n"
+            },
+            {
+              "run": "cargo build --release --target ${{ matrix.target }} -p contextdb-cli -p contextdb-server"
+            }
+          ],
+          "strategy": {
+            "matrix": {
+              "include": [
+                {
+                  "os": "ubuntu-latest",
+                  "target": "aarch64-unknown-linux-gnu"
+                }
+              ]
+            }
+          }
+        },
+        "installed-smoke": {
+          "needs": "lint",
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "uses": "actions-rust-lang/setup-rust-toolchain@v1"
+            },
+            {
+              "uses": "Swatinem/rust-cache@v2"
+            },
+            {
+              "name": "Install release binaries into an isolated root",
+              "run": "install_root=\"$RUNNER_TEMP/contextdb-installed\"\ncargo install --locked --path crates/contextdb-cli --root \"$install_root\"\ncargo install --locked --path crates/contextdb-server --root \"$install_root\" \\\n  --features production-smoke-driver --bins\n"
+            },
+            {
+              "name": "Run installed release durability smoke",
+              "run": "install_root=\"$RUNNER_TEMP/contextdb-installed\"\nCONTEXTDB_CLI=\"$install_root/bin/contextdb\" \\\nCONTEXTDB_SMOKE_DRIVER=\"$install_root/bin/contextdb-smoke-driver\" \\\nCONTEXTDB_SERVER=\"$install_root/bin/contextdb-server\" \\\n  scripts/installed-release-durable-sync-smoke.sh\n"
+            }
+          ]
+        },
+        "lint": {
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "uses": "actions-rust-lang/setup-rust-toolchain@v1"
+            },
+            {
+              "uses": "Swatinem/rust-cache@v2"
+            },
+            {
+              "run": "python3 -m pip install PyYAML==6.0.3"
+            },
+            {
+              "run": "python3 scripts/ci-continuity.py check"
+            },
+            {
+              "run": "python3 scripts/ci-continuity-tests.py"
+            },
+            {
+              "run": "cargo fmt --all --check"
+            },
+            {
+              "run": "cargo clippy --workspace --all-targets -- -D warnings"
+            },
+            {
+              "run": "cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check"
+            },
+            {
+              "run": "cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings"
+            }
+          ]
+        },
+        "required": {
+          "if": "always()",
+          "needs": [
+            "lint",
+            "test",
+            "installed-smoke",
+            "cross-compile"
+          ],
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "env": {
+                "NEEDS_JSON": "${{ toJSON(needs) }}"
+              },
+              "name": "Require every correctness job to succeed",
+              "run": "python3 scripts/ci-continuity.py aggregate lint test installed-smoke cross-compile"
+            }
+          ]
+        },
+        "test": {
+          "needs": "lint",
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "uses": "actions-rust-lang/setup-rust-toolchain@v1"
+            },
+            {
+              "uses": "Swatinem/rust-cache@v2"
+            },
+            {
+              "run": "cargo test --workspace"
+            },
+            {
+              "run": "cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked"
+            },
+            {
+              "run": "cargo build --release"
+            },
+            {
+              "env": {
+                "RUSTFLAGS": ""
+              },
+              "run": "bash scripts/verify-packaged-engine.sh"
+            }
+          ]
+        }
+      },
+      "name": "CI",
+      "on": {
+        "pull_request": {
+          "branches": [
+            "main",
+            "dev"
+          ]
+        },
+        "push": {
+          "branches": [
+            "main",
+            "dev",
+            "linux-bounded-storage-candidate-20261019"
+          ],
+          "paths": [
+            "crates/**",
+            "scripts/**",
+            "tests/**",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".github/workflows/**",
+            "rust-toolchain.toml",
+            "Dockerfile"
+          ]
+        },
+        "workflow_dispatch": ""
+      },
+      "permissions": {
+        "contents": "read"
+      }
+    },
+    "nightly": {
+      "env": {
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TERM_COLOR": "always",
+        "RUSTFLAGS": "-D warnings"
+      },
+      "jobs": {
+        "full-test": {
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "uses": "actions-rust-lang/setup-rust-toolchain@v1"
+            },
+            {
+              "uses": "Swatinem/rust-cache@v2"
+            },
+            {
+              "run": "cargo test --workspace"
+            },
+            {
+              "run": "cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked"
+            },
+            {
+              "run": "cargo test -p contextdb-engine --features test-seams,iroh,nightly-tests"
+            },
+            {
+              "run": "cargo test -p contextdb-engine --features test-seams,nightly-tests --release --test acceptance"
+            }
+          ]
+        }
+      },
+      "name": "Nightly",
+      "on": {
+        "schedule": [
+          {
+            "cron": "0 3 * * *"
+          }
+        ],
+        "workflow_dispatch": ""
+      }
+    },
+    "rc2-tests": {
+      "concurrency": {
+        "cancel-in-progress": "true",
+        "group": "rc2-tests-${{ github.ref }}"
+      },
+      "env": {
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_TERM_COLOR": "always"
+      },
+      "jobs": {
+        "lint": {
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "uses": "actions-rust-lang/setup-rust-toolchain@v1",
+              "with": {
+                "cache": "false"
+              }
+            },
+            {
+              "uses": "Swatinem/rust-cache@v2",
+              "with": {
+                "key": "lint"
+              }
+            },
+            {
+              "run": "python3 -m pip install PyYAML==6.0.3"
+            },
+            {
+              "run": "python3 scripts/ci-continuity.py check"
+            },
+            {
+              "run": "python3 scripts/ci-continuity-tests.py"
+            },
+            {
+              "run": "cargo fmt --all --check"
+            },
+            {
+              "run": "cargo clippy --workspace --all-targets -- -D warnings"
+            },
+            {
+              "run": "cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check"
+            },
+            {
+              "run": "cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings"
+            }
+          ]
+        },
+        "summary": {
+          "if": "always()",
+          "needs": [
+            "lint",
+            "test"
+          ],
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "env": {
+                "NEEDS_JSON": "${{ toJSON(needs) }}"
+              },
+              "name": "Require every correctness job to succeed",
+              "run": "python3 scripts/ci-continuity.py aggregate lint test"
+            },
+            {
+              "if": "always()",
+              "uses": "actions/download-artifact@v4",
+              "with": {
+                "path": "shards",
+                "pattern": "shard-*"
+              }
+            },
+            {
+              "name": "Disk and per-shard wall clock",
+              "run": "df -h\necho \"== per-shard wall clock ==\"\nfor f in shards/*/*.time; do head -n 1 \"$f\"; done | sort\n"
+            }
+          ]
+        },
+        "test": {
+          "name": "test (${{ matrix.shard }})",
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "name": "Free disk space",
+              "run": "df -h /\nsudo docker image prune -a -f || true\nsudo docker system prune -a -f --volumes || true\nsudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/az /opt/ghc \\\n  /usr/local/lib/android /usr/share/dotnet /usr/local/share/boost\ndf -h /\n# The CLI's staged classification proof needs `rg` (and `jq`, preinstalled).\nsudo apt-get update -qq\nsudo apt-get install -y -qq ripgrep\nrg --version\njq --version\n"
+            },
+            {
+              "uses": "actions/checkout@v4"
+            },
+            {
+              "uses": "actions-rust-lang/setup-rust-toolchain@v1",
+              "with": {
+                "cache": "false",
+                "rustflags": ""
+              }
+            },
+            {
+              "uses": "Swatinem/rust-cache@v2",
+              "with": {
+                "key": "rc2-${{ matrix.shard }}",
+                "workspaces": ". -> target\ncrates/contextdb-redb -> target\n"
+              }
+            },
+            {
+              "id": "run",
+              "name": "Run shard (one test process per test binary, one test thread)",
+              "run": "mkdir -p shard-out\nstart=$(date +%s)\nargs=()\nif [[ \"${{ matrix.standalone }}\" == \"true\" ]]; then\n  args+=(--manifest-path crates/contextdb-redb/Cargo.toml)\nelse\n  args+=(-p \"${{ matrix.crate }}\")\nfi\nif [[ -n \"${{ matrix.features }}\" ]]; then\n  args+=(--features \"${{ matrix.features }}\")\nfi\nset +e\n# Test-harness targets get the one-thread flag. Benches are run\n# separately without it: a `harness = false` (criterion) bench\n# rejects libtest arguments such as `--test-threads`.\ncargo test --locked \"${args[@]}\" --lib --bins --tests --examples -- --test-threads=1 2>&1 | tee \"shard-out/${{ matrix.shard }}.log\"\nstatus=${PIPESTATUS[0]}\ncargo test --locked \"${args[@]}\" --benches 2>&1 | tee -a \"shard-out/${{ matrix.shard }}.log\"\nbench_status=${PIPESTATUS[0]}\nif [[ \"$status\" -eq 0 ]]; then status=$bench_status; fi\nset -e\nend=$(date +%s)\necho \"${{ matrix.shard }} $((end - start))s exit=$status\" > \"shard-out/${{ matrix.shard }}.time\"\ndf -h / | tee -a \"shard-out/${{ matrix.shard }}.time\"\nexit \"$status\"\n"
+            },
+            {
+              "if": "always()",
+              "name": "Upload shard log",
+              "uses": "actions/upload-artifact@v4",
+              "with": {
+                "if-no-files-found": "warn",
+                "name": "shard-${{ matrix.shard }}",
+                "path": "shard-out/"
+              }
+            }
+          ],
+          "strategy": {
+            "fail-fast": "false",
+            "matrix": {
+              "include": [
+                {
+                  "crate": "contextdb-core",
+                  "features": "",
+                  "shard": "contextdb-core"
+                },
+                {
+                  "crate": "contextdb-core",
+                  "features": "test-seams",
+                  "shard": "contextdb-core-test-seams"
+                },
+                {
+                  "crate": "contextdb-tx",
+                  "features": "",
+                  "shard": "contextdb-tx"
+                },
+                {
+                  "crate": "contextdb-tx",
+                  "features": "test-seams",
+                  "shard": "contextdb-tx-test-seams"
+                },
+                {
+                  "crate": "contextdb-engine",
+                  "features": "",
+                  "shard": "contextdb-engine"
+                },
+                {
+                  "crate": "contextdb-engine",
+                  "features": "test-seams,iroh",
+                  "shard": "contextdb-engine-test-seams"
+                },
+                {
+                  "crate": "contextdb-server",
+                  "features": "",
+                  "shard": "contextdb-server"
+                },
+                {
+                  "crate": "contextdb-server",
+                  "features": "test-seams",
+                  "shard": "contextdb-server-test-seams"
+                },
+                {
+                  "crate": "contextdb-cli",
+                  "features": "",
+                  "shard": "contextdb-cli"
+                },
+                {
+                  "crate": "contextdb-vector",
+                  "features": "",
+                  "shard": "contextdb-vector"
+                },
+                {
+                  "crate": "contextdb-vector",
+                  "features": "test-seams",
+                  "shard": "contextdb-vector-test-seams"
+                },
+                {
+                  "crate": "contextdb-hnsw",
+                  "features": "",
+                  "shard": "contextdb-hnsw"
+                },
+                {
+                  "crate": "contextdb-graph",
+                  "features": "",
+                  "shard": "contextdb-graph"
+                },
+                {
+                  "crate": "contextdb-parser",
+                  "features": "",
+                  "shard": "contextdb-parser"
+                },
+                {
+                  "crate": "contextdb-planner",
+                  "features": "",
+                  "shard": "contextdb-planner"
+                },
+                {
+                  "crate": "contextdb-relational",
+                  "features": "",
+                  "shard": "contextdb-relational"
+                },
+                {
+                  "crate": "contextdb-redb",
+                  "features": "contextdb-internal,test-seams",
+                  "shard": "contextdb-redb",
+                  "standalone": "true"
+                }
+              ]
+            }
+          },
+          "timeout-minutes": "330"
+        }
+      },
+      "name": "rc2-tests",
+      "on": {
+        "pull_request": {
+          "branches": [
+            "main",
+            "dev"
+          ]
+        },
+        "push": {
+          "branches": [
+            "main",
+            "dev",
+            "bounded-storage-*",
+            "linux-bounded-storage-candidate-20261019"
+          ]
+        },
+        "workflow_dispatch": ""
+      },
+      "permissions": {
+        "contents": "read"
+      }
+    }
+  }
+}
