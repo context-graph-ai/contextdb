@@ -1,0 +1,107 @@
+{
+  "run_id": 39243713367,
+  "head_sha": "35962ff149c1e145263627f83b286fc93f398755",
+  "branch": "linux-bounded-storage-candidate-20261019",
+  "scope": "Eight completed failed Linux test jobs from the observer snapshot; excludes lint and the then-in-progress job.",
+  "primary_step": "cargo test --locked \"${args[@]}\" --lib --bins --tests --examples -- --test-threads=1; then cargo test --locked \"${args[@]}\" --benches",
+  "jobs": [
+    {
+      "id": 118030560972,
+      "name": "test (contextdb-server-test-seams)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030560972",
+      "exit_code": 101,
+      "classification": "runtime assertion and benchmark timeout",
+      "failures": [
+        {"selector": "dependency_complete_sync_preserves_final_state_and_refuses_partial_units_after_reopen", "source": "crates/contextdb-server/tests/dependency_complete_sync_tests.rs:215", "diagnostic": "connected final state expected one hub acceptance position; observed 2", "summary": "0 passed, 1 failed"},
+        {"selector": "blob_transfer/536870912 benchmark", "source": "crates/contextdb-server/benches/blob_transfer.rs:204", "diagnostic": "bench resolve must succeed: FetchTimedOut { after_ms: 120000 }", "summary": "benchmark process exit 101"}
+      ],
+      "raw_log_sha256": "29058515e8a84d1ee479d172d2c6d3bc27c45ba183c2e7451a4521f8df87b980"
+    },
+    {
+      "id": 118030561049,
+      "name": "test (contextdb-core-test-seams)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030561049",
+      "exit_code": 101,
+      "classification": "runtime assertion",
+      "failures": [
+        {"selector": "the_hnsw_fork_patch_produces_the_sources_it_names", "source": "crates/contextdb-core/tests/hnsw_fork_patch_matches_its_sources.rs:73", "diagnostic": "crates/contextdb-hnsw/upstream-0.3.4.patch disagrees with src/hnswio.rs at line 1901; patch yields a sealed-layout decoder comment while source has a serving point decoder comment", "summary": "0 passed, 1 failed"}
+      ],
+      "raw_log_sha256": "48021480a8bc248668cfa31c4bb5b876bbeca9dd2a5b79434b4bff771b348f66"
+    },
+    {
+      "id": 118030561157,
+      "name": "test (contextdb-cli)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030561157",
+      "exit_code": 101,
+      "classification": "runtime assertion; repeated on two test invocations",
+      "failures": [
+        {"selector": "json_output::tests::maintenance_json_retains_the_failed_budget_and_real_recovery_command", "source": "crates/contextdb-cli/src/json_output.rs:1296", "diagnostic": "unwrap failed: MemoryBudgetExceeded { subsystem: writer, operation: adapter_control, requested_bytes: 64, available_bytes: 0, budget_limit_bytes: 74934 }", "summary": "34 passed, 1 failed on each of two invocations"}
+      ],
+      "raw_log_sha256": "d5e4d0911e4cd06cdf53e8d9cdf4b161f3d4e448b68d75b30e9b823af9ddeb93"
+    },
+    {
+      "id": 118030561221,
+      "name": "test (contextdb-server)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030561221",
+      "exit_code": 101,
+      "classification": "runtime assertion and benchmark timeout",
+      "failures": [
+        {"selector": "dependency_complete_sync_preserves_final_state_and_refuses_partial_units_after_reopen", "source": "crates/contextdb-server/tests/dependency_complete_sync_tests.rs:215", "diagnostic": "connected final state expected one hub acceptance position; observed 2", "summary": "0 passed, 1 failed"},
+        {"selector": "blob_transfer/536870912 benchmark", "source": "crates/contextdb-server/benches/blob_transfer.rs:204", "diagnostic": "bench resolve must succeed: FetchTimedOut { after_ms: 120000 }", "summary": "benchmark process exit 101"}
+      ],
+      "raw_log_sha256": "ed347072b93ca55ae368f4e8eccf7790bc1ffabb7bd3d20dd41a5f93c8e44a83"
+    },
+    {
+      "id": 118030561234,
+      "name": "test (contextdb-core)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030561234",
+      "exit_code": 101,
+      "classification": "runtime assertion",
+      "failures": [
+        {"selector": "the_hnsw_fork_patch_produces_the_sources_it_names", "source": "crates/contextdb-core/tests/hnsw_fork_patch_matches_its_sources.rs:73", "diagnostic": "crates/contextdb-hnsw/upstream-0.3.4.patch disagrees with src/hnswio.rs at line 1901; patch output does not match the source", "summary": "0 passed, 1 failed"}
+      ],
+      "raw_log_sha256": "6359c26a28336bbeeeadf1eecf357cf13ef06511dea1176dbd46d1d809250e96"
+    },
+    {
+      "id": 118030561294,
+      "name": "test (contextdb-vector)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030561294",
+      "exit_code": 101,
+      "classification": "runtime assertion; repeated on two test invocations",
+      "failures": [
+        {"selector": "memory_budget::tests::resizing_workspace_moves_one_charge_between_ownership_phases", "source": "crates/contextdb-vector/src/memory_budget.rs:623,645", "diagnostic": "routing control unwind followed by accounting mismatch: left 58, right 18", "summary": "159 passed, 1 failed on each of two invocations"}
+      ],
+      "raw_log_sha256": "320d15eddf8ba0ce3e08164ca8b09ab905fafb7edd1d3a4dbc47cd7fb0a7a871"
+    },
+    {
+      "id": 118030561308,
+      "name": "test (contextdb-engine)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030561308",
+      "exit_code": 101,
+      "classification": "compile failure; no test runtime result",
+      "failures": [
+        {"selector": null, "source": "crates/contextdb-engine/src/persistence/owner_cursor_admission_tests.rs:623", "diagnostic": "unresolved import pause_reader_registration_lock_for_test; provider is gated behind the test-seams feature", "summary": "could not compile contextdb-engine lib test; repeated for test and bench cargo invocations"}
+      ],
+      "raw_log_sha256": "3c69573a00b1192f6d8fc7e329d00f59e93726d8c9b974289daf6e2bf54f160f"
+    },
+    {
+      "id": 118030561353,
+      "name": "test (contextdb-vector-test-seams)",
+      "url": "https://github.com/context-graph-ai/contextdb/actions/runs/39243713367/job/118030561353",
+      "exit_code": 101,
+      "classification": "runtime assertion; repeated on two test invocations",
+      "failures": [
+        {"selector": "memory_budget::tests::resizing_workspace_moves_one_charge_between_ownership_phases", "source": "crates/contextdb-vector/src/memory_budget.rs:623,645", "diagnostic": "routing control unwind followed by accounting mismatch: left 58, right 18", "summary": "167 passed, 1 failed on each of two invocations"}
+      ],
+      "raw_log_sha256": "334a17cb40cddfc6519ccf888fcc7c7bd40b5f5ebf4f0ea3301e4df068b7c477"
+    }
+  ],
+  "distinct_roots": [
+    "contextdb-engine test-seams compile failure due to an unavailable feature-gated helper",
+    "contextdb-hnsw fork patch does not match the source, failing in contextdb-core and its test-seams shard",
+    "contextdb-server dependency-complete sync assertion observes two acceptance positions instead of one",
+    "contextdb-server blob transfer benchmark fetch times out after 120 seconds",
+    "contextdb-vector workspace resize memory-budget unwind leaves mismatched accounting, repeated in standard and test-seams shards",
+    "contextdb-cli maintenance JSON test cannot allocate 64 bytes for writer adapter control despite 74,934-byte budget, repeated twice"
+  ]
+}

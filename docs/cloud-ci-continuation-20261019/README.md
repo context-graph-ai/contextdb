@@ -18,6 +18,10 @@ The two observed lint jobs on ContextDB head `35962ff` both passed continuity ch
 
 The three source branches preserve existing history. On the bounded-storage candidate, retain the original history assertion RED as evidence; the only oracle change is the already-included owner-authorized single-file history expectation correction. The other 14 frozen files and all assertions outside that correction remain byte-for-byte unchanged. The combined source patch (467) is based on `7048a52c` and already includes the manual `OwnerKind` Clone repair (461), two transaction expectation repairs, and the single owner-authorized history expectation correction (822). Do not double-apply these components or rewrite the frozen test oracle. The original RED remains evidence; publication does not qualify the new history-test GREEN, its mutation checks, or the full 63/20 suites.
 
+## Latest Linux shard snapshot
+
+The latest observer snapshot for [run 39243713367](https://github.com/context-graph-ai/contextdb/actions/runs/39243713367) recorded 8 test jobs passed, 8 failed, and 1 still running; lint failed. This is not a completed all-scope qualification. Eight completed failed jobs represent six distinct failure roots; the engine test-seams job was still pending at audit close. See the [Linux shard failure summary](linux-shard-failures-35962ff1.md) and its [sanitized portable facts](linux-shard-failures-35962ff1.json) for job links, selectors, and evidence.
+
 ## Patch files
 
 Each patch is a review/reference artifact with repository-relative file names. SHA-256 values below bind the exact bytes in this packet.
