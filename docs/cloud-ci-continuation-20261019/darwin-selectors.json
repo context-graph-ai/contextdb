@@ -1,0 +1,64 @@
+{
+  "features": "default; no test-seams/private feature enabled",
+  "targets": [
+    "aarch64-apple-darwin on native public CI",
+    "x86_64-unknown-linux-gnu on native public CI"
+  ],
+  "selectors": [
+    "persistence::reader_coordination_wait_tests::queued_cancellation_after_check_and_arm_returns_before_reader_release",
+    "persistence::reader_coordination_wait_tests::public_reader_wait_cancellation_preserves_reader_and_writer_ownership",
+    "persistence::reader_coordination_wait_tests::public_reader_wait_release_without_cancellation_cleans_up_and_reacquires"
+  ],
+  "expected_count_new_rows_per_OS": 3,
+  "control_selectors": [
+    "persistence::reader_breadcrumb_location_proofs::a_stopped_wait_answers_without_waiting",
+    "persistence::reader_breadcrumb_location_proofs::a_store_nobody_holds_is_released_at_once",
+    "persistence::reader_breadcrumb_location_proofs::a_writer_reads_the_breadcrumbs_of_a_supplied_runtime_root",
+    "persistence::recorded_owner_state_proofs::a_record_nobody_is_holding_refuses_nobody"
+  ],
+  "expected_control_count_per_OS": 4,
+  "commands_proposed_not_executed": {
+    "compile": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "contextdb-engine",
+      "--lib",
+      "--no-run"
+    ],
+    "list": [
+      "cargo",
+      "nextest",
+      "list",
+      "--locked",
+      "-p",
+      "contextdb-engine",
+      "--lib",
+      "-E",
+      "test(=persistence::reader_coordination_wait_tests::queued_cancellation_after_check_and_arm_returns_before_reader_release) | test(=persistence::reader_coordination_wait_tests::public_reader_wait_cancellation_preserves_reader_and_writer_ownership) | test(=persistence::reader_coordination_wait_tests::public_reader_wait_release_without_cancellation_cleans_up_and_reacquires)"
+    ],
+    "run": [
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "contextdb-engine",
+      "--lib",
+      "-E",
+      "test(=persistence::reader_coordination_wait_tests::queued_cancellation_after_check_and_arm_returns_before_reader_release) | test(=persistence::reader_coordination_wait_tests::public_reader_wait_cancellation_preserves_reader_and_writer_ownership) | test(=persistence::reader_coordination_wait_tests::public_reader_wait_release_without_cancellation_cleans_up_and_reacquires)"
+    ],
+    "parity_controls": [
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "contextdb-engine",
+      "--lib",
+      "-E",
+      "test(=persistence::reader_breadcrumb_location_proofs::a_stopped_wait_answers_without_waiting) | test(=persistence::reader_breadcrumb_location_proofs::a_store_nobody_holds_is_released_at_once) | test(=persistence::reader_breadcrumb_location_proofs::a_writer_reads_the_breadcrumbs_of_a_supplied_runtime_root) | test(=persistence::recorded_owner_state_proofs::a_record_nobody_is_holding_refuses_nobody)"
+    ]
+  }
+}

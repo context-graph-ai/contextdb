@@ -1,0 +1,26 @@
+diff --git a/crates/contextdb-core/src/read_memory.rs b/crates/contextdb-core/src/read_memory.rs
+index bfcdae2..9f27bd7 100644
+--- a/crates/contextdb-core/src/read_memory.rs
++++ b/crates/contextdb-core/src/read_memory.rs
+@@ -220,12 +220,20 @@ pub trait ReadMemoryBudget: Debug + Send + Sync {
+ #[doc(hidden)]
+ pub struct ReadMemoryOwner(OwnerKind);
+ 
+-#[derive(Clone)]
+ enum OwnerKind {
+     Legacy(Arc<dyn ReadMemoryBudget>, Option<ReadShared<ReadCredit>>),
+     Native(NativeOwner),
+ }
+ 
++impl Clone for OwnerKind {
++    fn clone(&self) -> Self {
++        match self {
++            Self::Legacy(reader, invoice) => Self::Legacy(reader.clone(), invoice.clone()),
++            Self::Native(owner) => Self::Native(owner.clone()),
++        }
++    }
++}
++
+ impl Debug for OwnerKind {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {

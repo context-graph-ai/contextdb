@@ -1,0 +1,132 @@
+diff --git a/crates/contextdb-core/src/read_memory.rs b/crates/contextdb-core/src/read_memory.rs
+index bfcdae27593551f0518226e6b17a88af50e6a003..9f27bd7700719ccd19abed877cf1824fd5c61b1c 100644
+--- a/crates/contextdb-core/src/read_memory.rs
++++ b/crates/contextdb-core/src/read_memory.rs
+@@ -220,12 +220,20 @@ pub trait ReadMemoryBudget: Debug + Send + Sync {
+ #[doc(hidden)]
+ pub struct ReadMemoryOwner(OwnerKind);
+ 
+-#[derive(Clone)]
+ enum OwnerKind {
+     Legacy(Arc<dyn ReadMemoryBudget>, Option<ReadShared<ReadCredit>>),
+     Native(NativeOwner),
+ }
+ 
++impl Clone for OwnerKind {
++    fn clone(&self) -> Self {
++        match self {
++            Self::Legacy(reader, invoice) => Self::Legacy(reader.clone(), invoice.clone()),
++            Self::Native(owner) => Self::Native(owner.clone()),
++        }
++    }
++}
++
+ impl Debug for OwnerKind {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+diff --git a/crates/contextdb-engine/tests/engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs b/crates/contextdb-engine/tests/engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs
+index 627a5dca060faf4acb10b63a6970644e56c07bb2..6ef3aad7d7e00b53661e5d24812d318307ba67de 100644
+--- a/crates/contextdb-engine/tests/engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs
++++ b/crates/contextdb-engine/tests/engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs
+@@ -53,7 +53,24 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
+         let log_entries = db.change_log_since(Lsn(0)).unwrap();
+         let log = canonical(&log_entries);
+         let commits = db.commit_index_for_test();
+-        let changes = canonical(&db.changes_since(Lsn(0)).expect("read the declared changes"));
++        let mut fixed_export = db.changes_since(Lsn(0)).expect("read the declared changes");
++        let changes = canonical(&fixed_export);
++        let fixed_suffix = checkpoints[n - 1].0;
++        // Independent pre-close export: filter every family strictly after the cursor.
++        // Keep order and equal-LSN siblings; validate DDL pairing before zipping.
++        fixed_export.rows.retain(|row| row.lsn > fixed_suffix);
++        fixed_export.edges.retain(|edge| edge.lsn > fixed_suffix);
++        fixed_export
++            .vectors
++            .retain(|vector| vector.lsn > fixed_suffix);
++        fixed_export.validate_ddl_lsn_cardinality().unwrap();
++        (fixed_export.ddl_lsn, fixed_export.ddl) = fixed_export
++            .ddl_lsn
++            .into_iter()
++            .zip(fixed_export.ddl)
++            .filter(|(lsn, _)| *lsn > fixed_suffix)
++            .unzip();
++        let fixed_export_oracle = canonical(&fixed_export);
+         let suffix = checkpoints[n / 2].0;
+         let suffix_oracle =
+             canonical(&db.changes_since(suffix).expect("read the declared changes"));
+@@ -96,24 +113,36 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
+             suffix_oracle,
+             "resumed export suffix"
+         );
+-        let fixed_suffix = checkpoints[n - 1].0;
+-        let fixed_oracle = canonical(
++        let fixed_log_oracle = canonical(
+             &log_entries
+                 .iter()
+                 .filter(|entry| entry.lsn() > fixed_suffix)
+                 .cloned()
+                 .collect::<Vec<_>>(),
+         );
++        let (fixed_log, fixed_log_work) = observe(|| db.change_log_since(fixed_suffix).unwrap());
++        assert_eq!(
++            canonical(&fixed_log),
++            fixed_log_oracle,
++            "exact fixed log occurrence order including equal-LSN siblings"
++        );
++        assert!(
++            fixed_log_work.log_keys_examined > 0 && fixed_log_work.log_keys_examined <= 16,
++            "fixed log suffix must seek the saved position: {fixed_log_work:?}"
++        );
+         let (exported_suffix, export_work) = observe(|| {
+             db.changes_since(fixed_suffix)
+                 .expect("read the declared changes")
+         });
+         assert_eq!(
+             canonical(&exported_suffix),
+-            fixed_oracle,
++            fixed_export_oracle,
+             "resumed export suffix"
+         );
+-        sync_work.push(export_work.log_keys_examined);
++        sync_work.push((
++            fixed_log_work.log_keys_examined,
++            export_work.log_keys_examined,
++        ));
+         assert!(
+             export_work.log_keys_examined > 0 && export_work.log_keys_examined <= 16,
+             "fixed export suffix must seek the saved position: {export_work:?}"
+@@ -208,7 +237,7 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
+     }
+     assert_eq!(
+         sync_work[0], sync_work[1],
+-        "fixed resumed export work ignores doubled completed log"
++        "fixed resumed log and export work ignore doubled completed log"
+     );
+     assert_eq!(
+         append_work[0], append_work[1],
+diff --git a/crates/contextdb-tx/src/manager.rs b/crates/contextdb-tx/src/manager.rs
+index ccb2f5bcdcffe2e834f20d3f17e567bf366ad3bd..65772a69b9235fff6a16e1e01091427276de363d 100644
+--- a/crates/contextdb-tx/src/manager.rs
++++ b/crates/contextdb-tx/src/manager.rs
+@@ -363,6 +363,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
+         }
+     }
+ 
++    #[expect(
++        clippy::too_many_arguments,
++        reason = "Engine construction keeps authenticated allocator, committed frontier, capture custody, and commit release inputs distinct."
++    )]
+     fn new_with_engine_parts(
+         store: S,
+         next_tx: TxId,
+@@ -853,6 +857,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
+     /// and the published read frontier. Preparation must stamp every data member
+     /// with its private transport position before the one durable apply.
+     #[doc(hidden)]
++    #[expect(
++        clippy::too_many_arguments,
++        reason = "Private interval commit keeps reservation, admission, active preparation, canonical preparation, and after-apply callbacks in distinct phases."
++    )]
+     pub fn commit_with_private_lsn_interval_active_prepare_and_applied_mut<F, G>(
+         &self,
+         tx: TxId,

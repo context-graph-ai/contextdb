@@ -1,0 +1,3797 @@
+{
+  "run": 462,
+  "summary": {
+    "raw_source_warnings": 380,
+    "unique_diagnostics": 377,
+    "strict_gate": "FAILED in prior run 461; remains required",
+    "diagnostic_run_qualifies": false
+  },
+  "classification_counts": {
+    "FLAG_MANAGER_JUDGMENT": 265,
+    "SUGGESTION": 112
+  },
+  "diagnostics": [
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3944,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3945,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3946,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3947,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3948,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3949,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3950,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 4719,
+      "column": 13,
+      "lint": "unused_variables",
+      "message": "unused variable: `snapshot_tx`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 16701,
+      "column": 17,
+      "lint": "unused_variables",
+      "message": "unused variable: `column`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 17995,
+      "column": 51,
+      "lint": "unused_variables",
+      "message": "unused variable: `state`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/hnsw/union.rs",
+      "line": 1890,
+      "column": 15,
+      "lint": "dead_code",
+      "message": "function `merge_layer_searches_with_custody` is never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/memory_budget.rs",
+      "line": 94,
+      "column": 5,
+      "lint": "dead_code",
+      "message": "field `control_invoice` is never read",
+      "occurrences": 2,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 5497,
+      "column": 19,
+      "lint": "dead_code",
+      "message": "method `bounded_hnsw_eligibility` is never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 3326,
+      "column": 5,
+      "lint": "clippy::too_many_arguments",
+      "message": "this function has too many arguments (8/7)",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 5266,
+      "column": 53,
+      "lint": "clippy::manual_saturating_arithmetic",
+      "message": "manual saturating arithmetic",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 6669,
+      "column": 25,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 6672,
+      "column": 29,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 6775,
+      "column": 25,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 6780,
+      "column": 25,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 7010,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/mem.rs",
+      "line": 7111,
+      "column": 32,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::VectorQueryState`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3250,
+      "column": 1,
+      "lint": "clippy::len_without_is_empty",
+      "message": "trait `PagedVectorCatalog` has a `len` method but no (possibly inherited) `is_empty` method",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3254,
+      "column": 16,
+      "lint": "clippy::type_complexity",
+      "message": "very complex type used. Consider factoring parts into `type` definitions",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3260,
+      "column": 16,
+      "lint": "clippy::type_complexity",
+      "message": "very complex type used. Consider factoring parts into `type` definitions",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3313,
+      "column": 5,
+      "lint": "clippy::len_without_is_empty",
+      "message": "struct `PagedVectorSourceSelection` has a public `len` method, but no `is_empty` method",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3770,
+      "column": 41,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::DormantRawVectorLoader>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3806,
+      "column": 41,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::DormantRawVectorLoader>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3829,
+      "column": 50,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::membership::RawVectorMembershipSource>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 3836,
+      "column": 41,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::DormantRawVectorLoader>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 7563,
+      "column": 9,
+      "lint": "clippy::drop_non_drop",
+      "message": "call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 15740,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 15895,
+      "column": 5,
+      "lint": "clippy::too_many_arguments",
+      "message": "this function has too many arguments (8/7)",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 20061,
+      "column": 64,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::membership::RawVectorReverseMembershipSource>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 20085,
+      "column": 62,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::DurableRawPartitionFactory>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 20238,
+      "column": 60,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::membership::RawVectorReverseMembershipSource>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/store.rs",
+      "line": 20239,
+      "column": 58,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `store::NativeSourceArc<dyn store::DurableRawPartitionFactory>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-vector/src/test_seam.rs",
+      "line": 39,
+      "column": 38,
+      "lint": "clippy::type_complexity",
+      "message": "very complex type used. Consider factoring parts into `type` definitions",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-graph/src/mem.rs",
+      "line": 2726,
+      "column": 5,
+      "lint": "clippy::too_many_arguments",
+      "message": "this function has too many arguments (8/7)",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-relational/src/schema_generation.rs",
+      "line": 345,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/writer_read.rs",
+      "line": 3750,
+      "column": 17,
+      "lint": "unused_imports",
+      "message": "unused import: `contextdb_relational::source::RelationalReadSource`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8633,
+      "column": 41,
+      "lint": "clippy::multiple_bound_locations",
+      "message": "bound is defined in more than one place",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 2063,
+      "column": 5,
+      "lint": "clippy::empty_line_after_doc_comments",
+      "message": "empty lines after doc comment",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 18,
+      "column": 71,
+      "lint": "unused_imports",
+      "message": "unused import: `split_canonical_result`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 27,
+      "column": 56,
+      "lint": "unused_imports",
+      "message": "unused import: `encode_query_result`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/content_identity.rs",
+      "line": 14786,
+      "column": 41,
+      "lint": "unused_imports",
+      "message": "unused import: `WriterSnapshotHandle`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_observations.rs",
+      "line": 433,
+      "column": 83,
+      "lint": "unused_imports",
+      "message": "unused import: `PhysicalVectorDiscovery`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/vector_physical_observation.rs",
+      "line": 10,
+      "column": 5,
+      "lint": "unused_imports",
+      "message": "unused import: `redb::TableHandle`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/blob_repository/native_purge.rs",
+      "line": 233,
+      "column": 9,
+      "lint": "unused_variables",
+      "message": "variable `any` is assigned to, but never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/blob_repository/native_purge.rs",
+      "line": 282,
+      "column": 13,
+      "lint": "unused_assignments",
+      "message": "value assigned to `any` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/discard.rs",
+      "line": 1116,
+      "column": 62,
+      "lint": "unused_assignments",
+      "message": "value assigned to `holder` is never read",
+      "occurrences": 2,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/discard.rs",
+      "line": 1117,
+      "column": 68,
+      "lint": "unused_assignments",
+      "message": "value assigned to `preparation_slot` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/connected_replay.rs",
+      "line": 2108,
+      "column": 65,
+      "lint": "unused_variables",
+      "message": "unused variable: `tx`",
+      "occurrences": 2,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 24379,
+      "column": 17,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 24379,
+      "column": 28,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 45109,
+      "column": 17,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 45430,
+      "column": 44,
+      "lint": "unused_variables",
+      "message": "unused variable: `received_edge_input_count`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 89518,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 107537,
+      "column": 13,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 108398,
+      "column": 13,
+      "lint": "unused_variables",
+      "message": "unused variable: `discard_fence_memory`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/vector_membership_source.rs",
+      "line": 3573,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/schema_projection.rs",
+      "line": 255,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/schema_projection.rs",
+      "line": 275,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working_graph.rs",
+      "line": 575,
+      "column": 17,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor.rs",
+      "line": 19897,
+      "column": 15,
+      "lint": "dead_code",
+      "message": "function `append_composite_fk_auto_indexes` is never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor.rs",
+      "line": 19900,
+      "column": 4,
+      "lint": "dead_code",
+      "message": "function `append_auto_phase` is never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 280,
+      "column": 5,
+      "lint": "dead_code",
+      "message": "field `1` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 344,
+      "column": 5,
+      "lint": "dead_code",
+      "message": "field `native_budget_control` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 20347,
+      "column": 8,
+      "lint": "dead_code",
+      "message": "struct `NativeControlCell` is never constructed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 20358,
+      "column": 8,
+      "lint": "dead_code",
+      "message": "struct `NativeControlStrong` is never constructed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 20362,
+      "column": 8,
+      "lint": "dead_code",
+      "message": "struct `NativeControlWeak` is never constructed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 20370,
+      "column": 8,
+      "lint": "dead_code",
+      "message": "associated items `try_new_with_native` and `downgrade` are never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 20481,
+      "column": 8,
+      "lint": "dead_code",
+      "message": "method `upgrade` is never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded/control_memory.rs",
+      "line": 54,
+      "column": 19,
+      "lint": "dead_code",
+      "message": "associated function `try_new_cyclic` is never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/local_transport/framing.rs",
+      "line": 1841,
+      "column": 5,
+      "lint": "dead_code",
+      "message": "variant `Disconnected` is never constructed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/read_image_memory.rs",
+      "line": 95,
+      "column": 19,
+      "lint": "dead_code",
+      "message": "associated items `preparation_original` and `charging_reader_per_call` are never used",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_read_memory.rs",
+      "line": 12,
+      "column": 5,
+      "lint": "dead_code",
+      "message": "field `1` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_observations.rs",
+      "line": 463,
+      "column": 12,
+      "lint": "dead_code",
+      "message": "fields `expected`, `snapshot`, `lsn`, and `fenced` are never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_observations.rs",
+      "line": 465,
+      "column": 9,
+      "lint": "dead_code",
+      "message": "field `0` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_observations.rs",
+      "line": 466,
+      "column": 18,
+      "lint": "dead_code",
+      "message": "field `0` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_observations.rs",
+      "line": 467,
+      "column": 21,
+      "lint": "dead_code",
+      "message": "fields `index`, `partition`, and `owner` are never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_observations.rs",
+      "line": 470,
+      "column": 19,
+      "lint": "dead_code",
+      "message": "fields `index`, `partition`, and `record` are never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_observations.rs",
+      "line": 473,
+      "column": 17,
+      "lint": "dead_code",
+      "message": "field `0` is never read",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/blob_repository/native_purge.rs",
+      "line": 191,
+      "column": 17,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/blob_repository/native_purge.rs",
+      "line": 275,
+      "column": 12,
+      "lint": "clippy::nonminimal_bool",
+      "message": "this boolean expression can be simplified",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/blob_repository/native_purge.rs",
+      "line": 260,
+      "column": 30,
+      "lint": "clippy::op_ref",
+      "message": "taken reference of right operand",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/graph_cursor_claims.rs",
+      "line": 70,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/row_graph.rs",
+      "line": 573,
+      "column": 60,
+      "lint": "clippy::unnecessary_mut_passed",
+      "message": "the method `next_edge_with` doesn't need a mutable reference",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/writer_read.rs",
+      "line": 3053,
+      "column": 64,
+      "lint": "clippy::unnecessary_mut_passed",
+      "message": "the method `next_edge_with` doesn't need a mutable reference",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/writer_read.rs",
+      "line": 3088,
+      "column": 56,
+      "lint": "clippy::unnecessary_mut_passed",
+      "message": "the method `next_edge_with` doesn't need a mutable reference",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/writer_read.rs",
+      "line": 3134,
+      "column": 60,
+      "lint": "clippy::unnecessary_mut_passed",
+      "message": "the method `next_edge_with` doesn't need a mutable reference",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/discard.rs",
+      "line": 495,
+      "column": 22,
+      "lint": "clippy::redundant_closure_call",
+      "message": "try not to call a closure in the expression where it is declared",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/connected_replay.rs",
+      "line": 40,
+      "column": 13,
+      "lint": "clippy::map_entry",
+      "message": "usage of `contains_key` followed by `insert` on a `BTreeMap`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/connected_replay.rs",
+      "line": 386,
+      "column": 25,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/connected_replay.rs",
+      "line": 436,
+      "column": 29,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/connected_replay.rs",
+      "line": 747,
+      "column": 13,
+      "lint": "clippy::map_entry",
+      "message": "usage of `contains_key` followed by `insert` on a `BTreeMap`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/connected_replay.rs",
+      "line": 1483,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/connected_replay.rs",
+      "line": 1487,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 5950,
+      "column": 6,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 6595,
+      "column": 47,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 7152,
+      "column": 13,
+      "lint": "clippy::drop_non_drop",
+      "message": "call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 7337,
+      "column": 13,
+      "lint": "clippy::drop_non_drop",
+      "message": "call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 7385,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 7400,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 7873,
+      "column": 17,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8098,
+      "column": 83,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8161,
+      "column": 6,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8189,
+      "column": 64,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8191,
+      "column": 13,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8297,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8302,
+      "column": 67,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8325,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8369,
+      "column": 85,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8461,
+      "column": 6,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8487,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8489,
+      "column": 13,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8564,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8566,
+      "column": 13,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8572,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8628,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8630,
+      "column": 13,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/event_bus.rs",
+      "line": 8631,
+      "column": 13,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/gate.rs",
+      "line": 2057,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/gate.rs",
+      "line": 4217,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/gate.rs",
+      "line": 4886,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 14317,
+      "column": 1,
+      "lint": "clippy::large_enum_variant",
+      "message": "large size difference between variants",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 14808,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 15154,
+      "column": 21,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 17465,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 23943,
+      "column": 9,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 34558,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 43959,
+      "column": 84,
+      "lint": "clippy::redundant_closure",
+      "message": "redundant closure",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 44079,
+      "column": 28,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::vec::Vec<f32>`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 46001,
+      "column": 21,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 46292,
+      "column": 17,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 48878,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 48887,
+      "column": 17,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 48910,
+      "column": 17,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 58647,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 63841,
+      "column": 9,
+      "lint": "clippy::drop_non_drop",
+      "message": "call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 67775,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database.rs",
+      "line": 108472,
+      "column": 17,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor/bounded.rs",
+      "line": 5760,
+      "column": 59,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `&str`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/executor.rs",
+      "line": 19790,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/local_transport/query_funding.rs",
+      "line": 207,
+      "column": 13,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/memory_accounting.rs",
+      "line": 3054,
+      "column": 9,
+      "lint": "clippy::wrong_self_convention",
+      "message": "methods called `into_*` usually take `self` by value",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4444,
+      "column": 33,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4445,
+      "column": 33,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4446,
+      "column": 33,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4449,
+      "column": 50,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4459,
+      "column": 25,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4460,
+      "column": 25,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4461,
+      "column": 25,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4466,
+      "column": 42,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4476,
+      "column": 25,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4477,
+      "column": 25,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4478,
+      "column": 25,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4481,
+      "column": 42,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4535,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4536,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4537,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4540,
+      "column": 54,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4561,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4562,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4563,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4566,
+      "column": 54,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4578,
+      "column": 41,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4579,
+      "column": 41,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4580,
+      "column": 41,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4582,
+      "column": 41,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4610,
+      "column": 29,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4611,
+      "column": 29,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4612,
+      "column": 29,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4617,
+      "column": 46,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4639,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4640,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4641,
+      "column": 37,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4644,
+      "column": 54,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4655,
+      "column": 42,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4661,
+      "column": 42,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4676,
+      "column": 48,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4689,
+      "column": 46,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4693,
+      "column": 48,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4693,
+      "column": 58,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4693,
+      "column": 79,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4694,
+      "column": 88,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4717,
+      "column": 21,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4718,
+      "column": 21,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4719,
+      "column": 21,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4721,
+      "column": 21,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4727,
+      "column": 21,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4728,
+      "column": 21,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4729,
+      "column": 21,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service.rs",
+      "line": 4732,
+      "column": 38,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/content_identity.rs",
+      "line": 967,
+      "column": 16,
+      "lint": "clippy::map_identity",
+      "message": "unnecessary map of the identity function",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/vector_membership_source.rs",
+      "line": 1624,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/vector_membership_source.rs",
+      "line": 2374,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/vector_paged.rs",
+      "line": 1410,
+      "column": 57,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/vector_paged.rs",
+      "line": 1418,
+      "column": 63,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_wait_helper.rs",
+      "line": 833,
+      "column": 22,
+      "lint": "clippy::redundant_closure",
+      "message": "redundant closure",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_wait_helper.rs",
+      "line": 837,
+      "column": 18,
+      "lint": "clippy::redundant_closure",
+      "message": "redundant closure",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_wait_helper.rs",
+      "line": 852,
+      "column": 18,
+      "lint": "clippy::redundant_closure",
+      "message": "redundant closure",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_wait_helper.rs",
+      "line": 859,
+      "column": 18,
+      "lint": "clippy::redundant_closure",
+      "message": "redundant closure",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_wait_helper.rs",
+      "line": 867,
+      "column": 22,
+      "lint": "clippy::redundant_closure",
+      "message": "redundant closure",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_wait_helper.rs",
+      "line": 875,
+      "column": 18,
+      "lint": "clippy::redundant_closure",
+      "message": "redundant closure",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/history_root_witness.rs",
+      "line": 78,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/native_storage_admission.rs",
+      "line": 320,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/native_storage_admission.rs",
+      "line": 672,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/native_storage_admission.rs",
+      "line": 736,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/schema_projection.rs",
+      "line": 1087,
+      "column": 43,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/schema_projection.rs",
+      "line": 1165,
+      "column": 17,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/discard_history.rs",
+      "line": 20,
+      "column": 1,
+      "lint": "clippy::large_enum_variant",
+      "message": "large size difference between variants",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working.rs",
+      "line": 38,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working.rs",
+      "line": 40,
+      "column": 86,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working.rs",
+      "line": 40,
+      "column": 129,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working.rs",
+      "line": 52,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working.rs",
+      "line": 53,
+      "column": 47,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working.rs",
+      "line": 55,
+      "column": 90,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working.rs",
+      "line": 543,
+      "column": 54,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working_vector.rs",
+      "line": 1163,
+      "column": 1,
+      "lint": "clippy::large_enum_variant",
+      "message": "large size difference between variants",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/received_working_vector.rs",
+      "line": 2072,
+      "column": 51,
+      "lint": "clippy::needless_borrow",
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_source.rs",
+      "line": 570,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_source.rs",
+      "line": 628,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_source.rs",
+      "line": 635,
+      "column": 28,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_source.rs",
+      "line": 654,
+      "column": 17,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_source.rs",
+      "line": 671,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_source.rs",
+      "line": 672,
+      "column": 69,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/writer_source.rs",
+      "line": 675,
+      "column": 106,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 40049,
+      "column": 21,
+      "lint": "clippy::needless_question_mark",
+      "message": "enclosing `Ok` and `?` operator are unneeded",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 47654,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 47661,
+      "column": 81,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 47673,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 47679,
+      "column": 57,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 47684,
+      "column": 13,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 47684,
+      "column": 53,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 47691,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 56810,
+      "column": 24,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 56821,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 56943,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 56978,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 56993,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57073,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57082,
+      "column": 91,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57082,
+      "column": 131,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57094,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57095,
+      "column": 48,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57228,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57397,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 57400,
+      "column": 13,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58132,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58137,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58372,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58376,
+      "column": 31,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58387,
+      "column": 22,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58440,
+      "column": 56,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58529,
+      "column": 10,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this function is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58533,
+      "column": 31,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence.rs",
+      "line": 58553,
+      "column": 56,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistent_store.rs",
+      "line": 1420,
+      "column": 77,
+      "lint": "clippy::result_large_err",
+      "message": "the `Err`-variant returned from this closure is very large",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/read_image_memory.rs",
+      "line": 1304,
+      "column": 23,
+      "lint": "clippy::type_complexity",
+      "message": "very complex type used. Consider factoring parts into `type` definitions",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_read_memory.rs",
+      "line": 56,
+      "column": 17,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_read_memory.rs",
+      "line": 570,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/vector_read_memory.rs",
+      "line": 583,
+      "column": 9,
+      "lint": "clippy::collapsible_if",
+      "message": "this `if` statement can be collapsed",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 833,
+      "column": 72,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 857,
+      "column": 64,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 917,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 921,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 925,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 941,
+      "column": 64,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 972,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 976,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 980,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 1000,
+      "column": 64,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 1031,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 1035,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 1039,
+      "column": 47,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 1060,
+      "column": 64,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 1153,
+      "column": 27,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 3440,
+      "column": 40,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 3447,
+      "column": 48,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/sync_server.rs",
+      "line": 3460,
+      "column": 44,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/in_process.rs",
+      "line": 148,
+      "column": 43,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 2554,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 3306,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 3332,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 3427,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 3458,
+      "column": 29,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 3899,
+      "column": 43,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4155,
+      "column": 33,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4167,
+      "column": 37,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4193,
+      "column": 55,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4207,
+      "column": 37,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4222,
+      "column": 37,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4258,
+      "column": 33,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4278,
+      "column": 33,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4284,
+      "column": 37,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 4450,
+      "column": 25,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5019,
+      "column": 33,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5030,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5101,
+      "column": 25,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5649,
+      "column": 48,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5654,
+      "column": 31,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5685,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5875,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5897,
+      "column": 37,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 5935,
+      "column": 9,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 6129,
+      "column": 31,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 6144,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/iroh.rs",
+      "line": 6149,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 49,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 54,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 59,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 143,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 150,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 156,
+      "column": 35,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 172,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 177,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 191,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 201,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 230,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 286,
+      "column": 25,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 293,
+      "column": 25,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 300,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 306,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 311,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 318,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 568,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 689,
+      "column": 25,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 697,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 707,
+      "column": 29,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 715,
+      "column": 25,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 739,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 749,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 823,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 858,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 863,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 873,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 880,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 890,
+      "column": 43,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 899,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 909,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 914,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 1371,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2258,
+      "column": 31,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2268,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2291,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2338,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2369,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2406,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2415,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2426,
+      "column": 27,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2521,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2593,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2647,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2675,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2681,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2686,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 2703,
+      "column": 21,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 3101,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 3215,
+      "column": 39,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 3257,
+      "column": 13,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/large_request_staging.rs",
+      "line": 3261,
+      "column": 35,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/transport/mod.rs",
+      "line": 1057,
+      "column": 17,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `std::string::String`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/read_content_test_adapter.rs",
+      "line": 752,
+      "column": 52,
+      "lint": "clippy::unnecessary_mut_passed",
+      "message": "the method `next_edge_with` doesn't need a mutable reference",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/staged_graph_order_tests.rs",
+      "line": 196,
+      "column": 9,
+      "lint": "unused_mut",
+      "message": "variable does not need to be mutable",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/composite_store.rs",
+      "line": 2102,
+      "column": 13,
+      "lint": "clippy::field_reassign_with_default",
+      "message": "field assignment outside of initializer for an instance created with Default::default()",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/writer_read.rs",
+      "line": 3631,
+      "column": 1,
+      "lint": "clippy::items_after_test_module",
+      "message": "items after a test module",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/pull_page_contract_tests.rs",
+      "line": 1789,
+      "column": 9,
+      "lint": "clippy::single_match",
+      "message": "you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/received_schema_atomic_retry_tests.rs",
+      "line": 984,
+      "column": 33,
+      "lint": "clippy::needless_borrows_for_generic_args",
+      "message": "the borrowed expression implements the required traits",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/owner_read/service/inbound.rs",
+      "line": 562,
+      "column": 45,
+      "lint": "clippy::useless_conversion",
+      "message": "useless conversion to the same type: `owner_read::OwnerReadScaffoldError`",
+      "occurrences": 1,
+      "classification": "SUGGESTION",
+      "needed_facts": "Remove the compiler-identified redundant .into() at this expression only; confirm inference remains unchanged."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/proof_allocation_oracle_tests.rs",
+      "line": 2714,
+      "column": 18,
+      "lint": "clippy::needless_range_loop",
+      "message": "the loop variable `i` is used to index `free`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/proof_allocation_oracle_tests.rs",
+      "line": 2855,
+      "column": 13,
+      "lint": "clippy::double_ended_iterator_last",
+      "message": "called `Iterator::last` on a `DoubleEndedIterator`; this will needlessly iterate the entire iterator",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/src/persistence/history_root_witness.rs",
+      "line": 919,
+      "column": 9,
+      "lint": "clippy::bool_assert_comparison",
+      "message": "used `assert_eq!` with a literal bool",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/tests/local_transport/local_transport_runtime.rs",
+      "line": 12,
+      "column": 49,
+      "lint": "unused_imports",
+      "message": "unused import: `resolve_runtime_directory`",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/tests/vector/a_row_checked_find_keeps_recall_and_refusals.rs",
+      "line": 421,
+      "column": 5,
+      "lint": "clippy::assertions_on_constants",
+      "message": "this assertion has a constant value",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/tests/vector/a_row_checked_find_keeps_recall_and_refusals.rs",
+      "line": 422,
+      "column": 5,
+      "lint": "clippy::assertions_on_constants",
+      "message": "this assertion has a constant value",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/tests/vector/a_row_checked_find_keeps_recall_and_refusals.rs",
+      "line": 423,
+      "column": 5,
+      "lint": "clippy::assertions_on_constants",
+      "message": "this assertion has a constant value",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    },
+    {
+      "path": "crates/contextdb-engine/tests/vector/a_row_checked_find_keeps_recall_and_refusals.rs",
+      "line": 424,
+      "column": 5,
+      "lint": "clippy::assertions_on_constants",
+      "message": "this assertion has a constant value",
+      "occurrences": 1,
+      "classification": "FLAG_MANAGER_JUDGMENT",
+      "needed_facts": "No edit proposed; inspect semantics and intended contract before deciding."
+    }
+  ],
+  "separate_strict_test_compile_warning": {
+    "path": "crates/contextdb-redb/src/transaction_tracker.rs",
+    "line": 159,
+    "symbol": "ReaderRegistry::get",
+    "needed_facts": "Private method returns self.map.get(id); consider only the authorized three-line deletion after local reference inspection."
+  },
+  "authorized_narrow_followup": {
+    "path": "crates/contextdb-vector/src/memory_budget.rs",
+    "lines": "85-106",
+    "field": "control_invoice",
+    "permitted_change": "Rename to _control_invoice only; preserve field order, type, constructor behavior, and drop behavior."
+  }
+}

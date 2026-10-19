@@ -1,0 +1,79 @@
+diff --git a/crates/cg-cli/tests/event_forget_terminal.rs b/crates/cg-cli/tests/event_forget_terminal.rs
+index 120270d03b65fd9ce04d87e1eb2f9e4e7f84cc4a..8b436b19c42f28d263723ed84d37cda7375bf0cd 100644
+--- a/crates/cg-cli/tests/event_forget_terminal.rs
++++ b/crates/cg-cli/tests/event_forget_terminal.rs
+@@ -133,8 +133,11 @@ fn forget_keeps_the_reader_coordination_condition_when_erasure_is_refused() {
+ 
+     let machine = Machine::without_model();
+     let project = machine.project("coordination");
+-    let runtime = machine.root.join("runtime");
+-    fs::create_dir(&runtime).expect("create isolated coordination root");
++    let runtime_root = tempfile::Builder::new()
++        .prefix("cgr")
++        .tempdir_in("/tmp")
++        .expect("a runtime root short enough for local channel addresses");
++    let runtime = runtime_root.path().to_path_buf();
+     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+         .expect("make coordination root private");
+     write_session(
+diff --git a/crates/cg-node-fs/src/lib.rs b/crates/cg-node-fs/src/lib.rs
+index 90f0dc774c9803ba3d8464e7be579b01f71c3f04..daa622aed66f5b677c901e9bb6afd24ebaec4384 100644
+--- a/crates/cg-node-fs/src/lib.rs
++++ b/crates/cg-node-fs/src/lib.rs
+@@ -175,7 +175,8 @@ pub fn load_text_if_present(path: &Path) -> std::io::Result<Option<String>> {
+ /// a container gets killed instead of refused.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+ pub struct MachineMemory {
+-    /// Installed memory, from `/proc/meminfo`. `None` where the platform does not publish it.
++    /// Installed memory, from `/proc/meminfo` or macOS `hw.memsize`.
++    /// `None` where the platform does not publish it.
+     pub total_bytes: Option<u64>,
+     /// The control group's own memory ceiling, when the kernel enforces a finite one.
+     pub cgroup_limit_bytes: Option<u64>,
+@@ -185,15 +186,44 @@ pub struct MachineMemory {
+ ///
+ /// Every read is best-effort: a platform that publishes neither number answers `None` for both and
+ /// the caller falls back to its own floor rather than failing. Nothing here dereferences a source
+-/// reference or reaches the network — these are the kernel's own published files.
++/// reference or reaches the network — these are the kernel's own published memory facts.
+ pub fn machine_memory() -> MachineMemory {
+     MachineMemory {
+-        total_bytes: read_proc_meminfo_total(),
++        total_bytes: {
++            #[cfg(target_os = "macos")]
++            {
++                read_macos_memsize()
++            }
++            #[cfg(not(target_os = "macos"))]
++            {
++                read_proc_meminfo_total()
++            }
++        },
+         cgroup_limit_bytes: read_cgroup_memory_limit(),
+     }
+ }
+ 
++/// Darwin publishes installed physical memory in bytes as `hw.memsize`.
++#[cfg(target_os = "macos")]
++fn read_macos_memsize() -> Option<u64> {
++    // Use the system utility directly, independent of the caller's PATH and without a shell.
++    let output = std::process::Command::new("/usr/sbin/sysctl")
++        .args(["-n", "hw.memsize"])
++        .output()
++        .ok()?;
++    if !output.status.success() {
++        return None;
++    }
++    let bytes = std::str::from_utf8(&output.stdout)
++        .ok()?
++        .trim()
++        .parse::<u64>()
++        .ok()?;
++    (bytes > 0).then_some(bytes)
++}
++
+ /// `MemTotal:` from `/proc/meminfo`, in bytes. The file publishes kibibytes.
++#[cfg(not(target_os = "macos"))]
+ fn read_proc_meminfo_total() -> Option<u64> {
+     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+     let kibibytes = text
