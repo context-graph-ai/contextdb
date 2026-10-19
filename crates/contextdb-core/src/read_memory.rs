@@ -220,10 +220,18 @@ pub trait ReadMemoryBudget: Debug + Send + Sync {
 #[doc(hidden)]
 pub struct ReadMemoryOwner(OwnerKind);
 
-#[derive(Clone)]
 enum OwnerKind {
     Legacy(Arc<dyn ReadMemoryBudget>, Option<ReadShared<ReadCredit>>),
     Native(NativeOwner),
+}
+
+impl Clone for OwnerKind {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Legacy(reader, invoice) => Self::Legacy(reader.clone(), invoice.clone()),
+            Self::Native(owner) => Self::Native(owner.clone()),
+        }
+    }
 }
 
 impl Debug for OwnerKind {

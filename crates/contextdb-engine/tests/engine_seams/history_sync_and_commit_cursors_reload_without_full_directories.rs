@@ -53,7 +53,24 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
         let log_entries = db.change_log_since(Lsn(0)).unwrap();
         let log = canonical(&log_entries);
         let commits = db.commit_index_for_test();
-        let changes = canonical(&db.changes_since(Lsn(0)).expect("read the declared changes"));
+        let mut fixed_export = db.changes_since(Lsn(0)).expect("read the declared changes");
+        let changes = canonical(&fixed_export);
+        let fixed_suffix = checkpoints[n - 1].0;
+        // Independent pre-close export: filter every family strictly after the cursor.
+        // Keep order and equal-LSN siblings; validate DDL pairing before zipping.
+        fixed_export.rows.retain(|row| row.lsn > fixed_suffix);
+        fixed_export.edges.retain(|edge| edge.lsn > fixed_suffix);
+        fixed_export
+            .vectors
+            .retain(|vector| vector.lsn > fixed_suffix);
+        fixed_export.validate_ddl_lsn_cardinality().unwrap();
+        (fixed_export.ddl_lsn, fixed_export.ddl) = fixed_export
+            .ddl_lsn
+            .into_iter()
+            .zip(fixed_export.ddl)
+            .filter(|(lsn, _)| *lsn > fixed_suffix)
+            .unzip();
+        let fixed_export_oracle = canonical(&fixed_export);
         let suffix = checkpoints[n / 2].0;
         let suffix_oracle =
             canonical(&db.changes_since(suffix).expect("read the declared changes"));
@@ -96,13 +113,22 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
             suffix_oracle,
             "resumed export suffix"
         );
-        let fixed_suffix = checkpoints[n - 1].0;
-        let fixed_oracle = canonical(
+        let fixed_log_oracle = canonical(
             &log_entries
                 .iter()
                 .filter(|entry| entry.lsn() > fixed_suffix)
                 .cloned()
                 .collect::<Vec<_>>(),
+        );
+        let (fixed_log, fixed_log_work) = observe(|| db.change_log_since(fixed_suffix).unwrap());
+        assert_eq!(
+            canonical(&fixed_log),
+            fixed_log_oracle,
+            "exact fixed log occurrence order including equal-LSN siblings"
+        );
+        assert!(
+            fixed_log_work.log_keys_examined > 0 && fixed_log_work.log_keys_examined <= 16,
+            "fixed log suffix must seek the saved position: {fixed_log_work:?}"
         );
         let (exported_suffix, export_work) = observe(|| {
             db.changes_since(fixed_suffix)
@@ -110,10 +136,13 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
         });
         assert_eq!(
             canonical(&exported_suffix),
-            fixed_oracle,
+            fixed_export_oracle,
             "resumed export suffix"
         );
-        sync_work.push(export_work.log_keys_examined);
+        sync_work.push((
+            fixed_log_work.log_keys_examined,
+            export_work.log_keys_examined,
+        ));
         assert!(
             export_work.log_keys_examined > 0 && export_work.log_keys_examined <= 16,
             "fixed export suffix must seek the saved position: {export_work:?}"
@@ -208,7 +237,7 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
     }
     assert_eq!(
         sync_work[0], sync_work[1],
-        "fixed resumed export work ignores doubled completed log"
+        "fixed resumed log and export work ignore doubled completed log"
     );
     assert_eq!(
         append_work[0], append_work[1],

@@ -363,6 +363,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Engine construction keeps authenticated allocator, committed frontier, capture custody, and commit release inputs distinct."
+    )]
     fn new_with_engine_parts(
         store: S,
         next_tx: TxId,
@@ -853,6 +857,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     /// and the published read frontier. Preparation must stamp every data member
     /// with its private transport position before the one durable apply.
     #[doc(hidden)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Private interval commit keeps reservation, admission, active preparation, canonical preparation, and after-apply callbacks in distinct phases."
+    )]
     pub fn commit_with_private_lsn_interval_active_prepare_and_applied_mut<F, G>(
         &self,
         tx: TxId,
