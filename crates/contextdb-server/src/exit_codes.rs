@@ -93,7 +93,7 @@ mod tests {
         );
 
         let definitive = [
-            Error::SyncError("hub refused the changeset".to_string()),
+            Error::SyncError("hub refused the changeset".to_string().into()),
             Error::ParseError("unexpected token".to_string()),
             Error::TableNotFound("decisions".to_string()),
             Error::UniqueViolation {
@@ -109,12 +109,12 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/held.db"),
             },
             Error::MemoryBudgetExceeded {
-                subsystem: "vector".to_string(),
-                operation: "build".to_string(),
+                subsystem: "vector".to_string().into(),
+                operation: "build".to_string().into(),
                 requested_bytes: 2,
                 available_bytes: 1,
                 budget_limit_bytes: 1,
-                hint: "raise the budget".to_string(),
+                hint: "raise the budget".to_string().into(),
             },
         ];
         for error in &definitive {

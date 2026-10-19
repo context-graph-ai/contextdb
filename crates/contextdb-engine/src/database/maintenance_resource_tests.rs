@@ -154,6 +154,135 @@ fn a_retained_raw_body_has_decode_scratch_even_without_live_graph_points() {
 
 #[test]
 fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
+    // A complete native build must commit its final publication batch under
+    // the existing outer maintenance boundary, then become an indexed route.
+    // The registered gate nextest configuration bounds the pre-fix self-wait;
+    // this row asserts published state and answers, never elapsed time.
+    {
+        use contextdb_vector::VectorCopyAdmission;
+        use contextdb_vector::hnsw::paged_builder::PagedVectorPhase;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("native-publication.db")).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute(
+            "CREATE TABLE publication_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 2, EF_CONSTRUCTION = 4))",
+            &HashMap::new(),
+        ).unwrap();
+        for (id, sql) in [
+            (1, "INSERT INTO publication_items VALUES ($id, '[1,0,0]')"),
+            (2, "INSERT INTO publication_items VALUES ($id, '[0,1,0]')"),
+        ] {
+            db.execute(sql, &HashMap::from([("id".into(), Value::Int64(id))]))
+                .unwrap();
+        }
+        let route = VectorPartitionRef::new(
+            VectorIndexRef::new("publication_items", "v"),
+            VectorPartitionKey::unpartitioned(),
+        );
+        let persistence = db.persistence.as_ref().unwrap().clone();
+        vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
+        let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
+        let context = db.maintenance_context();
+        let record = context
+            .start_paged_vector_build(&route, &persistence, &mut owner, true)
+            .unwrap()
+            .unwrap();
+        let plan = vector_paged_build::paged_batch_plan(&record.declaration).unwrap();
+        for _ in 0..4 {
+            if db
+                .vector_store
+                .partition_paged_build_progress(&route)
+                .unwrap()
+                .phase
+                == PagedVectorPhase::Complete
+            {
+                break;
+            }
+            assert!(
+                db.vector_store
+                    .step_partition_paged_build_with_plan(&route, plan, &mut || Ok(()),)
+                    .unwrap()
+            );
+        }
+        let complete = persistence
+            .load_paged_build_record(&route)
+            .unwrap()
+            .unwrap()
+            .progress()
+            .unwrap();
+        assert_eq!(
+            (
+                complete.phase,
+                complete.graph.points,
+                complete.encoded_points
+            ),
+            (
+                PagedVectorPhase::Complete,
+                complete.total_points,
+                complete.total_points
+            ),
+        );
+        let published = context
+            .publish_paged_vector_build(
+                &route,
+                &persistence,
+                &record,
+                &complete,
+                plan,
+                db.declared_reader_memory().unwrap(),
+            )
+            .unwrap();
+        assert!(published.published && published.cleanup_failure.is_none());
+        let catalog = persistence
+            .load_vector_partition_generation_catalog_for(&route.index, &route.partition_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (catalog.base.generation_id, catalog.change.is_none()),
+            (complete.generation_id, true),
+        );
+        assert!(
+            persistence
+                .load_paged_build_record(&route)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.vector_store
+                .partition_paged_build_progress(&route)
+                .is_none()
+        );
+        let shown = db
+            .execute(
+                "SHOW VECTOR_PARTITIONS FOR publication_items.v",
+                &HashMap::new(),
+            )
+            .unwrap();
+        let state = |column| {
+            let position = shown
+                .columns
+                .iter()
+                .position(|name| name == column)
+                .unwrap();
+            shown.rows[0][position].clone()
+        };
+        assert_eq!(
+            (
+                shown.rows.len(),
+                state("query_state"),
+                state("maintenance_state")
+            ),
+            (1, Value::Text("ready".into()), Value::Text("idle".into())),
+        );
+        let answer = db.execute(
+            "SELECT id FROM publication_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2",
+            &HashMap::new(),
+        ).unwrap();
+        assert_eq!(
+            answer.rows,
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("state-digest.db")).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -181,12 +310,45 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
         VectorIndexRef::new("items", "v"),
         VectorPartitionKey::unpartitioned(),
     );
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+    let vector_fixture_count_1 = db
+        .vector_store_for_test()
+        .partition_generation_entry_counts(
+            &partition.index,
+            &partition.partition_key,
+            before_updates,
+            None,
+            &mut vector_fixture_copy_1,
+        )
+        .expect("count the real selected generation")
+        .0;
+    let vector_fixture_workspace_1 = db
+        .vector_store_for_test()
+        .reserve_workspace(
+            vector_fixture_copy_1.accountant_for_test().clone(),
+            db.vector_store_for_test()
+                .generation_copy_bytes_for_test(
+                    &partition.index,
+                    &partition.partition_key,
+                    vector_fixture_count_1,
+                )
+                .expect("price the retained generation"),
+            "fixture_generation_copy",
+            "Use the exact selected fixture generation.",
+        )
+        .expect("admit the actual generation workspace");
+
     let past_entries = db
         .vector_store_for_test()
         .entries_for_partition_at_snapshot(
             &partition.index,
             &partition.partition_key,
             before_updates,
+            &vector_fixture_workspace_1,
         )
         .unwrap();
     assert_eq!(past_entries.len(), 16);
@@ -197,9 +359,46 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
     );
     drop(past_entries);
     let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
+    let vector_fixture_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_2 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+    let vector_fixture_count_2 = db
+        .vector_store_for_test()
+        .partition_generation_entry_counts(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            None,
+            &mut vector_fixture_copy_2,
+        )
+        .expect("count the real selected generation")
+        .0;
+    let vector_fixture_workspace_2 = db
+        .vector_store_for_test()
+        .reserve_workspace(
+            vector_fixture_copy_2.accountant_for_test().clone(),
+            db.vector_store_for_test()
+                .generation_copy_bytes_for_test(
+                    &partition.index,
+                    &partition.partition_key,
+                    vector_fixture_count_2,
+                )
+                .expect("price the retained generation"),
+            "fixture_generation_copy",
+            "Use the exact selected fixture generation.",
+        )
+        .expect("admit the actual generation workspace");
+
     let entries = db
         .vector_store_for_test()
-        .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+        .entries_for_partition_at_snapshot(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            &vector_fixture_workspace_2,
+        )
         .unwrap();
     let mut live = entries
         .iter()
@@ -230,6 +429,278 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
 
 #[test]
 fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_catalog() {
+    // Currency cleanup must use the caller's native reader child. A smaller
+    // reader refuses without changing committed state; the original declared
+    // reader succeeds with the same writer and the same durable fixture.
+    {
+        use crate::persistence::content_identity::proof_allocation_oracle_tests::MaintenanceReaderSpy;
+        use crate::read_image_memory::ImageMemory;
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open_with_options(
+            directory.path().join("currency-reader.db"),
+            DatabaseOpenOptions {
+                memory_limit: Some(1_610_612_736),
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..DatabaseOpenOptions::default()
+            },
+        )
+        .unwrap();
+        db.execute("CREATE TABLE funded_items (id INT PRIMARY KEY, v VECTOR(3)) HISTORY CURRENT ONLY SYNC OFF", &HashMap::new()).unwrap();
+        for id in 0..4 {
+            db.execute(
+                "INSERT INTO funded_items VALUES ($id, '[1,0,0]')",
+                &HashMap::from([("id".into(), Value::Int64(id))]),
+            )
+            .unwrap();
+        }
+        db.execute("UPDATE funded_items SET v = '[0,1,0]'", &HashMap::new())
+            .unwrap();
+        let parent =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824);
+        let child = parent.child().unwrap();
+        let child_control = parent.retained_bytes_for_test();
+        let observer = crate::vector_read_memory::declared_child_observer(&child).unwrap();
+        let spy = MaintenanceReaderSpy::new(child.clone(), db.__accountant_handle_for_test());
+        let probe =
+            ImageMemory::operation_reader(db.__accountant_handle_for_test(), spy.clone()).unwrap();
+        assert!(Arc::ptr_eq(
+            &probe.reader_budget().unwrap(),
+            &(spy.clone() as Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>)
+        ));
+        let operation_control = probe.held();
+        drop(probe);
+        let persistence = db.persistence.as_ref().unwrap();
+        let before_rows = persistence.load_all_tables().unwrap();
+        let before_vectors = persistence.load_vectors().unwrap();
+        let before_memberships = persistence.load_vector_partition_memberships().unwrap();
+        let before_changes = persistence.load_change_log().unwrap();
+        let before_commit_index = persistence.load_commit_index().unwrap();
+        let writer_before = db.accountant().usage().used;
+        let small_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            child_control + operation_control as u64 - 1,
+        );
+        let small_child = small_parent.child().unwrap();
+        let error = db
+            .maintenance_context()
+            .run_currency(CurrencyGate::Always, small_child.clone())
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "reader" && operation == "decode_owner"),
+            "{error:?}"
+        );
+        assert_eq!(persistence.load_all_tables().unwrap(), before_rows);
+        assert_eq!(persistence.load_vectors().unwrap(), before_vectors);
+        assert_eq!(
+            persistence.load_vector_partition_memberships().unwrap(),
+            before_memberships
+        );
+        assert_eq!(persistence.load_change_log().unwrap(), before_changes);
+        assert_eq!(
+            persistence.load_commit_index().unwrap(),
+            before_commit_index
+        );
+        assert_eq!(db.accountant().usage().used, writer_before);
+        drop(small_child);
+        assert_eq!(small_parent.retained_bytes_for_test(), 0);
+        let report = db
+            .maintenance_context()
+            .run_currency(CurrencyGate::Always, spy.clone())
+            .unwrap();
+        assert_eq!(report.pruned_versions, 4);
+        assert_eq!(report.vector_keys_rewritten, 4);
+        assert!(
+            spy.decode_requests.load(Ordering::SeqCst) > 0,
+            "currency's persistence decodes invoice the supplied child, never the standalone fallback"
+        );
+        assert_eq!(spy.wrong_funder.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.sample().charged_bytes, 0);
+        assert_eq!(parent.retained_bytes_for_test(), child_control);
+        assert_eq!(
+            persistence
+                .load_vector_partition_memberships()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            db.execute("SELECT id FROM funded_items ORDER BY id", &HashMap::new())
+                .unwrap()
+                .rows,
+            (0..4).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
+        );
+        drop(spy);
+        drop(child);
+        assert_eq!(parent.retained_bytes_for_test(), 0);
+        db.close().unwrap();
+    }
+    // Cancellation is observed during actual ownership audit before any
+    // destructive commit (maintenance intent line 41; root policy 22).
+    {
+        use contextdb_vector::VectorCopyAdmission;
+        use contextdb_vector::hnsw::paged_builder::PagedVectorPhase;
+        use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(directory.path().join("audit-cancel.db")).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute("CREATE TABLE orphan_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 2, EF_CONSTRUCTION = 4))", &HashMap::new()).unwrap();
+        db.execute(
+            "INSERT INTO orphan_items VALUES (1, '[1,0,0]'), (2, '[0,1,0]')",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let route = VectorPartitionRef::new(
+            VectorIndexRef::new("orphan_items", "v"),
+            VectorPartitionKey::unpartitioned(),
+        );
+        let persistence = db.persistence.as_ref().unwrap().clone();
+        vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
+        let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
+        let context = db.maintenance_context();
+        let record = context
+            .start_paged_vector_build(&route, &persistence, &mut owner, true)
+            .unwrap()
+            .unwrap();
+        let plan = vector_paged_build::paged_batch_plan(&record.declaration).unwrap();
+        for _ in 0..4 {
+            if db
+                .vector_store
+                .partition_paged_build_progress(&route)
+                .unwrap()
+                .phase
+                == PagedVectorPhase::Complete
+            {
+                break;
+            }
+            db.vector_store
+                .step_partition_paged_build_with_plan(&route, plan, &mut || Ok(()))
+                .unwrap();
+        }
+        let complete = persistence
+            .load_paged_build_record(&route)
+            .unwrap()
+            .unwrap()
+            .progress()
+            .unwrap();
+        context
+            .publish_paged_vector_build(
+                &route,
+                &persistence,
+                &record,
+                &complete,
+                plan,
+                db.declared_reader_memory().unwrap(),
+            )
+            .unwrap();
+
+        let pages = TableDefinition::<&[u8], &[u8]>::new("vector_paged_generation_pages");
+        let cleanup = TableDefinition::<u64, &[u8]>::new("vector_paged_cleanup");
+        db.tx_mgr
+            .with_maintenance_publication(|publication| {
+                publication.reserve()?;
+                persistence.with_db(|storage| {
+                    let write = storage.begin_write().unwrap();
+                    for definition in [
+                        TableDefinition::<&[u8], &[u8]>::new("vector_partition_generation_catalog"),
+                        TableDefinition::<&[u8], &[u8]>::new("vector_partition_base_generations"),
+                    ] {
+                        let mut table = write.open_table(definition).unwrap();
+                        let keys = table
+                            .iter()
+                            .unwrap()
+                            .map(|r| r.unwrap().0.value().to_vec())
+                            .collect::<Vec<_>>();
+                        for key in keys {
+                            table.remove(key.as_slice()).unwrap();
+                        }
+                    }
+                    write
+                        .open_table(cleanup)
+                        .unwrap()
+                        .insert(0, b"damaged-fence".as_slice())
+                        .unwrap();
+                    write.commit().unwrap();
+                    Ok(())
+                })?;
+                publication.complete();
+                Ok(())
+            })
+            .unwrap();
+        let durable = || {
+            persistence
+                .with_db(|storage| {
+                    let read = storage.begin_read().unwrap();
+                    let p = read.open_table(pages).unwrap();
+                    let c = read.open_table(cleanup).unwrap();
+                    let page_rows = p
+                        .iter()
+                        .unwrap()
+                        .map(|r| {
+                            let (k, v) = r.unwrap();
+                            (k.value().to_vec(), v.value().to_vec())
+                        })
+                        .collect::<Vec<_>>();
+                    let cleanup_rows = c
+                        .iter()
+                        .unwrap()
+                        .map(|r| {
+                            let (k, v) = r.unwrap();
+                            (k.value(), v.value().to_vec())
+                        })
+                        .collect::<Vec<_>>();
+                    Ok((page_rows, cleanup_rows))
+                })
+                .unwrap()
+        };
+        let before = durable();
+        assert!(!before.0.is_empty() && before.1.iter().any(|(key, _)| *key == 0));
+        drop(owner);
+        let baseline = db.accountant.usage().used;
+        let stop = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = Arc::new(AtomicBool::new(false));
+        let observer = {
+            let stop = stop.clone();
+            let calls = calls.clone();
+            let held = held.clone();
+            let vector = db.vector_store.clone();
+            Arc::new(move || {
+                // Entry, admitted outer workspace, locked audit entry, audit
+                // reader entry, then its first scan-loop cancellation check.
+                if calls.fetch_add(1, Ordering::SeqCst) + 1 == 5 {
+                    held.store(
+                        vector
+                            .memory_ownership_snapshot_for_test()
+                            .temporary_workspace
+                            > 0,
+                        Ordering::SeqCst,
+                    );
+                    stop.store(true, Ordering::SeqCst);
+                }
+            })
+        };
+        let mut context = db.maintenance_context();
+        context.worker_stop = Some(stop);
+        let interrupted = resident_history_test_seams::with_checkpoint_observer(observer, || {
+            context.reclaim_paged_vector_storage()
+        });
+        let observed = (
+            matches!(interrupted, Err(Error::ReadCancelled)),
+            calls.load(Ordering::SeqCst) >= 5 && held.load(Ordering::SeqCst),
+            durable(),
+            db.accountant.usage().used,
+        );
+        assert_eq!(
+            observed,
+            (true, true, before, baseline),
+            "mid-audit interruption must leave every page/fence/queue byte unchanged and release cursor/workspace"
+        );
+        assert_eq!(
+            db.vector_memory_ownership_receipt_for_test()
+                .temporary_workspace,
+            0
+        );
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("cancel.db")).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -270,7 +741,14 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
     let stop = Arc::new(AtomicBool::new(false));
     let mut context = db.maintenance_context();
     context.worker_stop = Some(stop.clone());
-    let worker = std::thread::spawn(move || context.run_cycle(CurrencyGate::Always));
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let worker = std::thread::spawn(move || {
+        context.run_cycle(CurrencyGate::Always, fixture_operation_reader_1.clone())
+    });
     let reached = pause.wait_until_reached(Duration::from_secs(10));
     let workspace = db
         .vector_memory_ownership_receipt_for_test()
@@ -365,7 +843,14 @@ fn cancellation_after_durable_repair_publication_preserves_repair_and_skips_cycl
     let stop = Arc::new(AtomicBool::new(false));
     let mut context = db.maintenance_context();
     context.worker_stop = Some(stop.clone());
-    let worker = std::thread::spawn(move || context.run_cycle(CurrencyGate::Always));
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let worker = std::thread::spawn(move || {
+        context.run_cycle(CurrencyGate::Always, fixture_operation_reader_2.clone())
+    });
     assert!(
         pause.wait_until_reached(Duration::from_secs(10)),
         "repair reaches the post-publication snapshot-sample boundary"
@@ -445,6 +930,170 @@ fn cancellation_after_durable_repair_publication_preserves_repair_and_skips_cycl
 
 #[test]
 fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_removals_together() {
+    // Repair survives process exit after retirement and build registration,
+    // before any insertion batch (maintenance intent line 41; policy 22).
+    {
+        use contextdb_vector::hnsw::{HnswBuildObserver, with_hnsw_build_observer};
+        use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
+        const REPAIR_CHILD: &str = "CONTEXTDB_REPAIR_RETIRED_NATIVE_PATH";
+        const RETIRED_EXIT: i32 = 86;
+        let route = VectorPartitionRef::new(
+            VectorIndexRef::new("t", "v"),
+            VectorPartitionKey::unpartitioned(),
+        );
+        if let Ok(path) = std::env::var(REPAIR_CHILD) {
+            let db = Database::open(&path).unwrap();
+            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+            db.execute(
+                "SELECT id FROM t ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1",
+                &HashMap::new(),
+            )
+            .expect_err("the selected saved graph is actually corrupt");
+            assert!(db.vector_store.partition_route_quarantine(&route).is_some());
+            let baseline = db.accountant.usage().used;
+            db.accountant
+                .set_budget(Some(baseline + 512 * 1024))
+                .unwrap();
+            // Implement only the existing observer's required method. It is
+            // a fixture adapter, not an additional test or product seam.
+            struct RetirementCut {
+                persistence: Arc<RedbPersistence>,
+                route: VectorPartitionRef,
+            }
+            impl HnswBuildObserver for RetirementCut {
+                fn before_hnsw_build(&self) {
+                    assert!(
+                        self.persistence
+                            .load_vector_partition_generation_catalog_for(
+                                &self.route.index,
+                                &self.route.partition_key
+                            )
+                            .unwrap()
+                            .is_none(),
+                        "the damaged catalog retired before the first native insertion batch"
+                    );
+                    let record = self
+                        .persistence
+                        .load_paged_build_record(&self.route)
+                        .unwrap()
+                        .expect("restart record is durable before the first batch");
+                    let progress = record.progress().unwrap();
+                    assert_eq!(
+                        (
+                            progress.graph.points,
+                            progress.encoded_points,
+                            progress.total_points
+                        ),
+                        (0, 0, 1)
+                    );
+                    self.persistence
+                        .with_db(|storage| {
+                            let read = storage.begin_read().unwrap();
+                            let cleanup = read
+                                .open_table(TableDefinition::<u64, &[u8]>::new(
+                                    "vector_paged_cleanup",
+                                ))
+                                .unwrap();
+                            assert!(cleanup.get(0).unwrap().is_some());
+                            Ok(())
+                        })
+                        .unwrap();
+                    // Real child-process exit skips all Database/redb drops.
+                    std::process::exit(RETIRED_EXIT);
+                }
+            }
+            let observer = Arc::new(RetirementCut {
+                persistence: db.persistence.as_ref().unwrap().clone(),
+                route: route.clone(),
+            });
+            with_hnsw_build_observer(observer, || {
+                db.maintenance_context()
+                    .persist_built_vector_partition(&route, db.declared_reader_memory().unwrap())
+            })
+            .expect("a fitting finite repair reaches its existing pre-batch observer");
+            panic!("repair did not reach the registered pre-first-batch cut");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retired-before-first-batch.db");
+        {
+            let db = Database::open(&path).unwrap();
+            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, v VECTOR(1) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 2, EF_CONSTRUCTION = 2))", &HashMap::new()).unwrap();
+            db.execute("INSERT INTO t VALUES (1, '[1]')", &HashMap::new())
+                .unwrap();
+            for _ in 0..8 {
+                db.run_maintenance_cycle().unwrap();
+            }
+            db.close().unwrap();
+        }
+        RedbPersistence::corrupt_vector_partition_base_record_for_test(&path, &route).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "database::maintenance_resource_tests::retention_cleanup_commits_generation_catalog_and_eligible_commit_index_removals_together", "--nocapture"])
+            .env(REPAIR_CHILD, &path).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(RETIRED_EXIT),
+            "retirement child reaches its exact durable cut: {output:?}"
+        );
+        let db = Database::open(&path).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let persistence = db.persistence.as_ref().unwrap();
+        let record = persistence
+            .load_paged_build_record(&route)
+            .unwrap()
+            .expect("reopen restores the zero-point restart record");
+        assert_eq!(record.progress().unwrap().graph.points, 0);
+        persistence
+            .with_db(|storage| {
+                let read = storage.begin_read().unwrap();
+                let cleanup = read
+                    .open_table(TableDefinition::<u64, &[u8]>::new("vector_paged_cleanup"))
+                    .unwrap();
+                assert!(cleanup.get(0).unwrap().is_some());
+                let parents = read
+                    .open_table(TableDefinition::<&[u8], &[u8]>::new(
+                        "vector_partition_base_generations",
+                    ))
+                    .unwrap();
+                assert!(
+                    parents.len().unwrap() > 0,
+                    "damaged parent evidence survives the crash"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let exact = db
+            .execute(
+                "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR EXACT LIMIT 1",
+                &HashMap::new(),
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(exact.len(), 1);
+        let context = db.maintenance_context();
+        for _ in 0..16 {
+            context
+                .persist_built_vector_partition(&route, db.declared_reader_memory().unwrap())
+                .unwrap();
+            if persistence
+                .load_vector_partition_generation_catalog_for(&route.index, &route.partition_key)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(db.vector_store.partition_has_paged_storage(&route));
+        assert_eq!(
+            db.execute(
+                "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1",
+                &HashMap::new()
+            )
+            .unwrap()
+            .rows,
+            exact
+        );
+    }
     use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
     const CHILD: &str = "CONTEXTDB_RETENTION_GENERATION_ATOMIC_PATH";
     const CASE: &str = "CONTEXTDB_RETENTION_GENERATION_ATOMIC_CASE";
@@ -549,9 +1198,19 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
 }
 
 fn assert_stopped_maintenance_is_pending(db: &Database, partition: &VectorPartitionRef) {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let info = db
         .vector_store_for_test()
-        .partition_info(&partition.index, &partition.partition_key)
+        .partition_info(
+            &partition.index,
+            &partition.partition_key,
+            &mut partition_observation_owner_1,
+        )
+        .unwrap()
         .unwrap();
     assert_eq!(info.maintenance_failure, None);
     assert!(info.maintenance_progress.is_none());
@@ -575,6 +1234,277 @@ fn assert_stopped_maintenance_is_pending(db: &Database, partition: &VectorPartit
 
 #[test]
 fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
+    // Inspection samples committed progress while an actual native write batch
+    // owns the maintenance commit gate. The existing insertion callback pauses
+    // inside that batch; it does not publish speculative progress.
+    {
+        use crate::persistence::vector_paged::NativePagedGeneration;
+        use contextdb_vector::VectorCopyAdmission;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("inspection-batch.db")).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute(
+            "CREATE TABLE inspection_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 2, EF_CONSTRUCTION = 4))",
+            &HashMap::new(),
+        ).unwrap();
+        for id in 0..33 {
+            db.execute(
+                "INSERT INTO inspection_items VALUES ($id, '[1,0,0]')",
+                &HashMap::from([("id".into(), Value::Int64(id))]),
+            )
+            .unwrap();
+        }
+        let route = VectorPartitionRef::new(
+            VectorIndexRef::new("inspection_items", "v"),
+            VectorPartitionKey::unpartitioned(),
+        );
+        let persistence = db.persistence.as_ref().unwrap().clone();
+        vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
+        let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
+        let context = db.maintenance_context();
+        let record = context
+            .start_paged_vector_build(&route, &persistence, &mut owner, true)
+            .unwrap()
+            .unwrap();
+        db.vector_store.forget_partition_paged_build(&route);
+        let mut hooks = vector_paged_build::paged_build_hooks(
+            &db.vector_store,
+            &db.tx_mgr,
+            &db.resource_closed,
+            &db.publication_interrupted,
+            &route,
+            &record,
+        )
+        .unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let callback_armed = armed.clone();
+        let (reached, reach_seen) = std::sync::mpsc::sync_channel(1);
+        let callback_reached = reached.clone();
+        let (release, release_seen) = std::sync::mpsc::sync_channel(1);
+        let release_seen = std::sync::Mutex::new(release_seen);
+        hooks.inserted = Arc::new(move |_| {
+            if callback_armed.swap(false, Ordering::SeqCst) {
+                callback_reached.send(true).unwrap();
+                release_seen.lock().unwrap().recv().unwrap();
+            }
+        });
+        let native = Arc::new(NativePagedGeneration::new(
+            persistence.clone(),
+            route.clone(),
+            &record,
+            hooks,
+        ));
+        let plan = vector_paged_build::paged_batch_plan(&record.declaration).unwrap();
+        db.vector_store
+            .register_partition_paged_builder(
+                &route,
+                record.progress().unwrap(),
+                native,
+                plan,
+                db.accountant.vector_budget().unwrap(),
+                &mut owner,
+            )
+            .unwrap();
+        assert!(
+            db.vector_store
+                .step_partition_paged_build_with_plan(&route, plan, &mut || Ok(()),)
+                .unwrap()
+        );
+        let before = persistence
+            .load_paged_build_record(&route)
+            .unwrap()
+            .unwrap()
+            .progress()
+            .unwrap();
+        assert!(before.graph.points > 0 && before.graph.points < before.total_points);
+        db.vector_store.report_partition_paged_build_progress(
+            &route,
+            "building",
+            record.reason.as_str(),
+            before.total_points,
+            before.graph.points,
+            before.frontier_tx,
+        );
+        let failure = VectorMaintenanceFailure::BuildFailure;
+        db.vector_store
+            .record_partition_maintenance_failure(&route, failure)
+            .unwrap();
+        let inspection_reader = db
+            .read_session(contextdb_core::read_contract::ReadLimits::default())
+            .unwrap();
+        let inspect = || {
+            let mut observations = Vec::new();
+            for (sql, columns) in [
+                (
+                    "SHOW VECTOR_INDEXES",
+                    &[
+                        "maintenance_state",
+                        "maintenance_vectors_total",
+                        "maintenance_vectors_done",
+                        "maintenance_vectors_remaining",
+                        "stalled_partitions",
+                        "broad_route_reason",
+                    ][..],
+                ),
+                (
+                    "SHOW VECTOR_PARTITIONS FOR inspection_items.v",
+                    &[
+                        "maintenance_state",
+                        "maintenance_vectors_total",
+                        "maintenance_vectors_done",
+                        "maintenance_vectors_remaining",
+                        "maintenance_reason",
+                        "maintenance_checkpoint_tx",
+                        "recovery_action",
+                    ][..],
+                ),
+            ] {
+                // Public inspection keeps its ordinary default active limit.
+                // Retain a refusal as an observation so the batch is always
+                // released before the assertion on the pre-fix tree.
+                observations.push(
+                    inspection_reader
+                        .execute(sql, &HashMap::new())
+                        .map_err(|error| format!("{error:?}"))
+                        .map(|shown| {
+                            if shown.rows.len() != 1 {
+                                return Err(format!(
+                                    "unexpected inspection rows: {:?}",
+                                    shown.rows
+                                ));
+                            }
+                            columns
+                                .iter()
+                                .map(|column| {
+                                    let position = shown
+                                        .columns
+                                        .iter()
+                                        .position(|name| name.as_str() == *column)
+                                        .ok_or_else(|| {
+                                            format!("missing inspection column {column}")
+                                        })?;
+                                    Ok(shown.rows[0][position].clone())
+                                })
+                                .collect::<std::result::Result<Vec<_>, String>>()
+                        })
+                        .and_then(|row| row),
+                );
+            }
+            observations
+        };
+        armed.store(true, Ordering::SeqCst);
+        let (paused, observed, advanced) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    db.vector_store
+                        .step_partition_paged_build_with_plan(&route, plan, &mut || Ok(()))
+                }));
+                let _ = reached.send(false);
+                result
+            });
+            let paused = reach_seen.recv().unwrap();
+            let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let gate_held = db
+                    .tx_mgr
+                    .try_with_commit_lock_for(Duration::ZERO, || ())
+                    .is_none();
+                let stalled = inspect();
+                let clear = db.vector_store.clear_partition_maintenance_failure(&route);
+                let building = inspect();
+                let restore = db
+                    .vector_store
+                    .record_partition_maintenance_failure(&route, failure);
+                (gate_held, stalled, clear, building, restore)
+            }));
+            if paused {
+                release.send(()).unwrap();
+            }
+            (paused, observed, worker.join().unwrap())
+        });
+        let (gate_held, stalled, clear, building, restore) = observed.unwrap();
+        assert!(
+            paused && gate_held,
+            "native batch owns the maintenance commit gate"
+        );
+        clear.unwrap();
+        restore.unwrap();
+        assert!(advanced.unwrap().unwrap());
+        let after = persistence
+            .load_paged_build_record(&route)
+            .unwrap()
+            .unwrap()
+            .progress()
+            .unwrap();
+        assert!(
+            after.graph.points > before.graph.points && after.graph.points < after.total_points
+        );
+        db.vector_store.report_partition_paged_build_progress(
+            &route,
+            "building",
+            record.reason.as_str(),
+            after.total_points,
+            after.graph.points,
+            after.frontier_tx,
+        );
+        // This fixture explicitly controls the recorded mark. It does not
+        // change the production rule for clearing failures on publication.
+        db.vector_store
+            .clear_partition_maintenance_failure(&route)
+            .unwrap();
+        let resumed = inspect();
+        let expected = |progress: &contextdb_vector::hnsw::paged_builder::PagedVectorProgress,
+                        failed| {
+            let state = if failed { "stalled" } else { "building" };
+            let common = vec![
+                Value::Text(state.into()),
+                Value::Int64(progress.total_points as i64),
+                Value::Int64(progress.graph.points as i64),
+                Value::Int64((progress.total_points - progress.graph.points) as i64),
+            ];
+            let mut index = common.clone();
+            index.extend([
+                Value::Int64(i64::from(failed)),
+                Value::Text(
+                    if failed {
+                        failure.reason()
+                    } else {
+                        record.reason.as_str()
+                    }
+                    .into(),
+                ),
+            ]);
+            let mut partition = common;
+            partition.extend([
+                Value::Text(
+                    if failed {
+                        failure.reason()
+                    } else {
+                        record.reason.as_str()
+                    }
+                    .into(),
+                ),
+                Value::Int64(progress.frontier_tx.0 as i64),
+                Value::Text(
+                    if failed {
+                        failure.recovery_action()
+                    } else {
+                        "run_maintenance_cycle"
+                    }
+                    .into(),
+                ),
+            ]);
+            vec![Ok(index), Ok(partition)]
+        };
+        assert_eq!(
+            [stalled, building, resumed],
+            [
+                expected(&before, true),
+                expected(&before, false),
+                expected(&after, false)
+            ],
+            "both inspection statements sample state, failure and committed count without waiting for the native gate",
+        );
+    }
     for durable in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = if durable {
@@ -668,8 +1598,454 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
 }
 
 #[test]
+#[allow(clippy::needless_borrows_for_generic_args)] // Preserve the existing test expression and assertion contract.
 fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
+    // A corrupt neighbour cannot stop a fenced route's maintenance or healthy
+    // serving (maintenance intent line 41; root policy 22).
+    {
+        use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("two-damaged-partitions.db");
+        let route = |scope| {
+            VectorPartitionRef::new(
+                VectorIndexRef::new("repair_items", "v"),
+                VectorPartitionKey::from_values(&[Value::Int64(scope)]).unwrap(),
+            )
+        };
+        let a = route(0);
+        let b = route(1);
+        let old_a;
+        {
+            let db = Database::open(&path).unwrap();
+            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+            db.execute("CREATE TABLE repair_items (id INT PRIMARY KEY, scope_id INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 2, EF_CONSTRUCTION = 4))", &HashMap::new()).unwrap();
+            for scope in 0..3 {
+                for ordinal in 0..2 {
+                    db.execute(
+                        "INSERT INTO repair_items VALUES ($id, $scope, '[1,0,0]')",
+                        &HashMap::from([
+                            ("id".into(), Value::Int64(scope * 100 + ordinal)),
+                            ("scope".into(), Value::Int64(scope)),
+                        ]),
+                    )
+                    .unwrap();
+                }
+            }
+            for _ in 0..8 {
+                db.run_maintenance_cycle().unwrap();
+            }
+            let persistence = db.persistence.as_ref().unwrap();
+            old_a = persistence
+                .load_vector_partition_generation_catalog_for(&a.index, &a.partition_key)
+                .unwrap()
+                .unwrap()
+                .base
+                .generation_id;
+            let definitions = (
+                TableDefinition::<&[u8], &[u8]>::new("vector_partition_generation_catalog"),
+                TableDefinition::<u64, &[u8]>::new("vector_paged_cleanup"),
+            );
+            let keys = persistence
+                .with_db(|storage| {
+                    let read = storage.begin_read().unwrap();
+                    let table = read.open_table(definitions.0).unwrap();
+                    let mut selected = (None, None);
+                    for row in table.iter().unwrap() {
+                        let (key, value) = row.unwrap();
+                        let catalog = persistence
+                            .decode_maintenance_vector_catalog(value.value())
+                            .unwrap();
+                        if catalog.index == a.index && catalog.partition_key == a.partition_key {
+                            selected.0 = Some(key.value().to_vec());
+                        }
+                        if catalog.index == b.index && catalog.partition_key == b.partition_key {
+                            selected.1 = Some(key.value().to_vec());
+                        }
+                    }
+                    Ok((selected.0.unwrap(), selected.1.unwrap()))
+                })
+                .unwrap();
+            // Reconstruct the durable retirement cut for A identically on
+            // both trees. B retains an independently damaged catalog.
+            // The preceding child-process row proves real retirement creates
+            // this cut; here only cross-partition scheduling is under test.
+            persistence
+                .with_db(|storage| {
+                    let write = storage.begin_write().unwrap();
+                    {
+                        let mut table = write.open_table(definitions.0).unwrap();
+                        table.remove(keys.0.as_slice()).unwrap();
+                        let mut bytes = table
+                            .get(keys.1.as_slice())
+                            .unwrap()
+                            .unwrap()
+                            .value()
+                            .to_vec();
+                        *bytes.last_mut().unwrap() ^= 0xff;
+                        table.insert(keys.1.as_slice(), bytes.as_slice()).unwrap();
+                    }
+                    // Retirement keeps authenticated membership history but
+                    // resets its serving frontier in the same transaction.
+                    {
+                        let definition =
+                            TableDefinition::<&[u8], &[u8]>::new("vector_membership_summary_pages");
+                        let mut summaries = write.open_table(definition).unwrap();
+                        let bytes = summaries
+                            .get(keys.0.as_slice())
+                            .unwrap()
+                            .unwrap()
+                            .value()
+                            .to_vec();
+                        let end = bytes.len() - 32;
+                        let mut authenticated = blake3::Hasher::new();
+                        authenticated.update(&keys.0);
+                        authenticated.update(&bytes[..end]);
+                        if !bytes.starts_with(b"CDBVMS01")
+                            || authenticated.finalize().as_bytes().as_slice() != &bytes[end..]
+                        {
+                            return Err(Error::Other(
+                                "fixture membership summary authentication failed".into(),
+                            ));
+                        }
+                        // Same field order and codec as the private summary.
+                        let (mut summary, consumed): (
+                            (
+                                u64,
+                                u64,
+                                TxId,
+                                [u8; 32],
+                                (TxId, u64, u64),
+                                Option<(TxId, u64, u64)>,
+                                Option<(TxId, u64, u64)>,
+                            ),
+                            usize,
+                        ) = bincode::serde::decode_from_slice(
+                            &bytes[8..end],
+                            bincode::config::standard(),
+                        )
+                        .unwrap();
+                        if consumed != end - 8 {
+                            return Err(Error::Other(
+                                "fixture membership summary trailing bytes".into(),
+                            ));
+                        }
+                        summary.4 = (TxId(0), summary.1, summary.0 - summary.1);
+                        summary.5 = None;
+                        summary.6 = None;
+                        let payload =
+                            bincode::serde::encode_to_vec(summary, bincode::config::standard())
+                                .unwrap();
+                        let mut encoded = b"CDBVMS01".to_vec();
+                        encoded.extend_from_slice(&payload);
+                        let mut checksum = blake3::Hasher::new();
+                        checksum.update(&keys.0);
+                        checksum.update(&encoded);
+                        encoded.extend_from_slice(checksum.finalize().as_bytes());
+                        summaries
+                            .insert(keys.0.as_slice(), encoded.as_slice())
+                            .unwrap();
+                        drop(summaries);
+                        let fingerprint = write
+                            .table_root_fingerprint(definition)
+                            .unwrap()
+                            .unwrap_or([0; 32]);
+                        write
+                            .open_table(TableDefinition::<&str, &[u8]>::new(
+                                "__content_identity_metadata",
+                            ))
+                            .unwrap()
+                            .insert(
+                                "vector_membership_summary_pages_root_v1",
+                                fingerprint.as_slice(),
+                            )
+                            .unwrap();
+                    }
+                    write
+                        .open_table(definitions.1)
+                        .unwrap()
+                        .insert(0, b"damaged-fence".as_slice())
+                        .unwrap();
+                    // Retirement does not rewind the live storage namespace:
+                    // B and C still own their allocated page roots.
+                    write.commit().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            db.close().unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let persistence = db.persistence.as_ref().unwrap();
+        assert!(
+            persistence
+                .load_vector_partition_generation_catalog_for(&a.index, &a.partition_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            persistence
+                .load_vector_partition_generation_catalog_for(&b.index, &b.partition_key)
+                .is_err()
+        );
+        let query = "SELECT id FROM repair_items WHERE scope_id = $scope ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2";
+        let healthy_params = HashMap::from([("scope".into(), Value::Int64(2))]);
+        let healthy = db.execute(query, &healthy_params).unwrap().rows;
+        assert_eq!(healthy.len(), 2);
+        let a_params = HashMap::from([("scope".into(), Value::Int64(0))]);
+        let exact = db
+            .execute(&query.replace("INDEXED", "EXACT"), &a_params)
+            .unwrap()
+            .rows;
+        for _ in 0..32 {
+            assert_eq!(db.execute(query, &healthy_params).unwrap().rows, healthy);
+            db.run_maintenance_cycle()
+                .expect("a corrupt B catalog stays local while A and other routes advance");
+            if persistence
+                .load_vector_partition_generation_catalog_for(&a.index, &a.partition_key)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        let replacement = persistence
+            .load_vector_partition_generation_catalog_for(&a.index, &a.partition_key)
+            .unwrap()
+            .expect("A publishes its replacement despite B's present corrupt catalog");
+        assert!(replacement.base.generation_id > old_a);
+        assert!(db.vector_store.partition_has_paged_storage(&a));
+        assert_eq!(db.execute(query, &a_params).unwrap().rows, exact);
+        assert_eq!(db.execute(query, &healthy_params).unwrap().rows, healthy);
+    }
     use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
+    // A whole generation that outgrows the declared reader is replaced even
+    // when the ordinary consolidation policy has no work. The default writer
+    // is unchanged; all stores here are created on the same current source.
+    {
+        let reader_directory = tempfile::tempdir().unwrap();
+        let partition = VectorPartitionRef::new(
+            VectorIndexRef::new("reader_items", "v"),
+            VectorPartitionKey::unpartitioned(),
+        );
+        let create = |db: &Database, prepare_whole_seed: bool| {
+            db.execute("CREATE TABLE reader_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED CONSOLIDATION (CHANGE_PERCENT = 16, TOMBSTONE_PERCENT = 100)) SYNC OFF", &HashMap::new()).unwrap();
+            for id in 0..5_i64 {
+                let vector = match id {
+                    0 => vec![1.0, 0.0, 0.0],
+                    1 => vec![0.9, (1.0_f32 - 0.81).sqrt(), 0.0],
+                    _ => vec![-1.0, 0.0, 0.0],
+                };
+                db.execute(
+                    "INSERT INTO reader_items VALUES ($id,$v)",
+                    &HashMap::from([
+                        ("id".into(), Value::Int64(id)),
+                        ("v".into(), Value::Vector(vector)),
+                    ]),
+                )
+                .unwrap();
+            }
+            if prepare_whole_seed {
+                db.vector_store_for_test().quarantine_partition_route(
+                    &partition,
+                    VectorRouteQuarantineReason::CorruptBase,
+                );
+            }
+            for _ in 0..64 {
+                if db
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_vector_partition_generation_catalog_for(
+                        &partition.index,
+                        &partition.partition_key,
+                    )
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                db.run_maintenance_cycle().unwrap();
+            }
+        };
+        let selected = |db: &Database| {
+            db.persistence
+                .as_ref()
+                .unwrap()
+                .load_vector_partition_generation_catalog_for(
+                    &partition.index,
+                    &partition.partition_key,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let format = |db: &Database, generation| {
+            db.persistence
+                .as_ref()
+                .unwrap()
+                .load_vector_partition_base_generation(
+                    &partition.index,
+                    &partition.partition_key,
+                    generation,
+                )
+                .unwrap()
+                .graph_format_version
+        };
+        let whole_peak = |catalog: &crate::persistence::VectorPartitionGenerationCatalogRecord| {
+            let metadata = vector_route_metadata_workspace(&partition)
+                .unwrap()
+                .max(64 * 1024) as u64;
+            let resident = catalog.base.resident_bytes
+                + catalog.change.map_or(0, |change| change.resident_bytes);
+            let durable = catalog.base.durable_bytes
+                + catalog.change.map_or(0, |change| change.durable_bytes);
+            resident + 2 * (durable + metadata) + metadata
+        };
+        let path = reader_directory.path().join("grown-whole-reader.db");
+        let seed = Database::open_with_options(
+            &path,
+            crate::DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        create(&seed, true);
+        let base = selected(&seed);
+        let whole_format = format(&seed, base.base.generation_id);
+        let base_peak = whole_peak(&base);
+        seed.execute(
+            "INSERT INTO reader_items VALUES (5,'[-1,0,0]')",
+            &HashMap::new(),
+        )
+        .unwrap();
+        seed.run_maintenance_cycle().unwrap();
+        let combined = selected(&seed);
+        assert!(
+            combined.change.is_some(),
+            "one append seals a change without ordinary consolidation"
+        );
+        assert_eq!(combined.base.generation_id, base.base.generation_id);
+        let mut inventory_owner =
+            crate::vector_read_memory::admission(seed.declared_reader_memory().unwrap());
+        let layout = seed
+            .vector_store_for_test()
+            .index_layout(&partition.index, &mut inventory_owner)
+            .unwrap();
+        let info = seed
+            .vector_store_for_test()
+            .partition_info(
+                &partition.index,
+                &partition.partition_key,
+                &mut inventory_owner,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            layout.maintenance_need(&info),
+            None,
+            "one of six rows does not reach the ordinary consolidation percentage"
+        );
+        drop(info);
+        drop(layout);
+        drop(inventory_owner);
+        assert!(
+            !seed
+                .persistence
+                .as_ref()
+                .unwrap()
+                .vector_partition_has_covered_journal_records(&combined)
+                .unwrap()
+        );
+        assert!(
+            !seed
+                .persistence
+                .as_ref()
+                .unwrap()
+                .vector_partition_has_uncovered_journal_records(
+                    &partition.index,
+                    &partition.partition_key,
+                    combined.change.unwrap().covered_lsn
+                )
+                .unwrap()
+        );
+        let combined_peak = whole_peak(&combined);
+        assert!(combined_peak > base_peak);
+        let declared = base_peak + (combined_peak - base_peak) / 2;
+        assert!(base_peak <= declared && declared < combined_peak);
+        assert!(declared < seed.owner_read_config().limits.limits.memory);
+        let exact_sql =
+            "SELECT id FROM reader_items ORDER BY v <=> [1,0,0] USE VECTOR EXACT LIMIT 2";
+        let indexed_sql =
+            "SELECT id FROM reader_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2";
+        let control = seed.execute(exact_sql, &HashMap::new()).unwrap().rows;
+        seed.close().unwrap();
+        drop(seed);
+        let mut options = crate::DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        };
+        options.owner_reads.limits.limits.memory = declared;
+        let reader = Database::open_with_options(&path, options).unwrap();
+        let before = selected(&reader);
+        assert_eq!(
+            before, combined,
+            "reopen leaves the old catalog selected until maintenance publishes"
+        );
+        let old_answer = reader.execute(indexed_sql, &HashMap::new()).unwrap().rows;
+        for _ in 0..64 {
+            reader.run_maintenance_cycle().unwrap();
+            if selected(&reader).base.generation_id != before.base.generation_id {
+                break;
+            }
+        }
+        let replacement = selected(&reader);
+        let replacement_format = format(&reader, replacement.base.generation_id);
+        let replacement_answer = reader.execute(indexed_sql, &HashMap::new()).unwrap().rows;
+        let replacement_no_change = replacement.change.is_none();
+        let replacement_changed = replacement.base.generation_id != before.base.generation_id;
+        reader.close().unwrap();
+        drop(reader);
+        // A fresh build under the same reader bound must choose native pages.
+        // Use the saved single-base requirement itself, just below its bound.
+        let mut options = crate::DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        };
+        options.owner_reads.limits.limits.memory = base_peak - 1;
+        let fresh = Database::open_with_options(
+            reader_directory.path().join("fresh-reader-pages.db"),
+            options,
+        )
+        .unwrap();
+        create(&fresh, false);
+        let published = selected(&fresh);
+        let published_format = format(&fresh, published.base.generation_id);
+        let fresh_control = fresh.execute(exact_sql, &HashMap::new()).unwrap().rows;
+        let published_answer = fresh.execute(indexed_sql, &HashMap::new()).unwrap().rows;
+        fresh.close().unwrap();
+        drop(fresh);
+        let paged = crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
+        assert_ne!(
+            whole_format, paged,
+            "the current-tree default seed really publishes whole"
+        );
+        assert_eq!(
+            old_answer, control,
+            "the old generation serves while replacement is pending"
+        );
+        assert_eq!(replacement_answer, control);
+        assert_eq!(published_answer, fresh_control);
+        assert_eq!(
+            (
+                published_format,
+                replacement_format,
+                replacement_no_change,
+                replacement_changed
+            ),
+            (paged, paged, true, true),
+            "collect fresh publication and idle reader-only replacement before the format matrix"
+        );
+    }
     for with_change in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let _clock = Wallclock::test_clock_guard(|| 0);
@@ -706,11 +2082,13 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         let sql = "SELECT id FROM items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 8";
         insert(0, 100);
         insert(1, 100);
+        db.vector_store_for_test()
+            .quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase);
         db.run_maintenance_cycle().unwrap();
         let first_base = catalog().base.generation_id;
         db.execute("DELETE FROM items", &HashMap::new()).unwrap();
         let snapshot = db.snapshot();
-        let pin = db.pin_snapshot(snapshot);
+        let pin = db.pin_snapshot(snapshot).unwrap();
         let old_rows = db
             .execute_at_snapshot(sql, &HashMap::new(), snapshot)
             .unwrap()
@@ -722,6 +2100,10 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         assert!(catalog().change.is_some());
         db.execute("UPDATE items SET v = '[0,1,0]'", &HashMap::new())
             .unwrap();
+        if with_change {
+            db.vector_store_for_test()
+                .quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase);
+        }
         db.run_maintenance_cycle().unwrap();
         let replacement = catalog();
         assert_ne!(replacement.base.generation_id, first_base);
@@ -909,9 +2291,46 @@ fn canonical_retained_selection_digest(
     partition: &VectorPartitionRef,
     snapshot: SnapshotId,
 ) -> [u8; 32] {
+    let vector_fixture_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_3 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_3.clone());
+    let vector_fixture_count_3 = db
+        .vector_store
+        .partition_generation_entry_counts(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            None,
+            &mut vector_fixture_copy_3,
+        )
+        .expect("count the real selected generation")
+        .0;
+    let vector_fixture_workspace_3 = db
+        .vector_store
+        .reserve_workspace(
+            vector_fixture_copy_3.accountant_for_test().clone(),
+            db.vector_store
+                .generation_copy_bytes_for_test(
+                    &partition.index,
+                    &partition.partition_key,
+                    vector_fixture_count_3,
+                )
+                .expect("price the retained generation"),
+            "fixture_generation_copy",
+            "Use the exact selected fixture generation.",
+        )
+        .expect("admit the actual generation workspace");
+
     let entries = db
         .vector_store
-        .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+        .entries_for_partition_at_snapshot(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            &vector_fixture_workspace_3,
+        )
         .unwrap();
     let mut live = entries
         .iter()
@@ -945,11 +2364,80 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
         )
         .unwrap();
         let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
+        let vector_fixture_reader_4 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_4 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_4.clone());
+        let vector_fixture_count_4 = db
+            .vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+                &mut vector_fixture_copy_4,
+            )
+            .expect("count the real selected generation")
+            .0;
+        let vector_fixture_workspace_4 = db
+            .vector_store
+            .reserve_workspace(
+                vector_fixture_copy_4.accountant_for_test().clone(),
+                db.vector_store
+                    .generation_copy_bytes_for_test(
+                        &partition.index,
+                        &partition.partition_key,
+                        vector_fixture_count_4,
+                    )
+                    .expect("price the retained generation"),
+                "fixture_generation_copy",
+                "Use the exact selected fixture generation.",
+            )
+            .expect("admit the actual generation workspace");
+
         let full = db
             .vector_store
-            .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+            .entries_for_partition_at_snapshot(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                &vector_fixture_workspace_4,
+            )
             .unwrap();
         assert_eq!(full.len(), 16 * 9 + 4);
+        let vector_fixture_reader_5 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_5 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_5.clone());
+        let vector_fixture_count_5 = db
+            .vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+                &mut vector_fixture_copy_5,
+            )
+            .expect("count the real selected generation")
+            .1;
+        let vector_fixture_workspace_5 = db
+            .vector_store
+            .reserve_workspace(
+                vector_fixture_copy_5.accountant_for_test().clone(),
+                db.vector_store
+                    .generation_copy_bytes_for_test(
+                        &partition.index,
+                        &partition.partition_key,
+                        vector_fixture_count_5,
+                    )
+                    .expect("price the retained generation"),
+                "fixture_generation_copy",
+                "Use the exact selected fixture generation.",
+            )
+            .expect("admit the actual generation workspace");
+
         let selected = db
             .vector_store
             .entries_for_partition_generation_at_snapshot(
@@ -957,11 +2445,44 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
                 &partition.partition_key,
                 snapshot,
                 None,
+                &vector_fixture_workspace_5,
             )
             .unwrap();
         assert_eq!(selected.len(), 14);
         assert_eq!(selected.capacity(), 14);
         let expected = canonical_retained_selection_digest(&db, &partition, snapshot);
+        let vector_fixture_reader_6 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_6 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_6.clone());
+        let vector_fixture_count_6 = db
+            .vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                before_change,
+                None,
+                &mut vector_fixture_copy_6,
+            )
+            .expect("count the real selected generation")
+            .1;
+        let vector_fixture_workspace_6 = db
+            .vector_store
+            .reserve_workspace(
+                vector_fixture_copy_6.accountant_for_test().clone(),
+                db.vector_store
+                    .generation_copy_bytes_for_test(
+                        &partition.index,
+                        &partition.partition_key,
+                        vector_fixture_count_6,
+                    )
+                    .expect("price the retained generation"),
+                "fixture_generation_copy",
+                "Use the exact selected fixture generation.",
+            )
+            .expect("admit the actual generation workspace");
+
         let old_selected = db
             .vector_store
             .entries_for_partition_generation_at_snapshot(
@@ -969,6 +2490,7 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
                 &partition.partition_key,
                 before_change,
                 None,
+                &vector_fixture_workspace_6,
             )
             .unwrap();
         assert_eq!(old_selected.len(), 16);
@@ -976,6 +2498,9 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
         drop(full);
         drop(selected);
         drop(old_selected);
+        drop(vector_fixture_workspace_4);
+        drop(vector_fixture_workspace_5);
+        drop(vector_fixture_workspace_6);
         let report = db.run_maintenance_cycle().unwrap();
         assert_eq!(report.vector.first_failure, None, "{report:?}");
         assert_eq!(report.vector.built_partitions, 1, "{report:?}");
@@ -1002,12 +2527,45 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
             0
         );
         assert_eq!(db.accountant.underflow_count_for_test(), 0);
+        let vector_fixture_reader_7 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_7 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_7.clone());
+        let vector_fixture_count_7 = db
+            .vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+                &mut vector_fixture_copy_7,
+            )
+            .expect("count the real selected generation")
+            .0;
+        let vector_fixture_workspace_7 = db
+            .vector_store
+            .reserve_workspace(
+                vector_fixture_copy_7.accountant_for_test().clone(),
+                db.vector_store
+                    .generation_copy_bytes_for_test(
+                        &partition.index,
+                        &partition.partition_key,
+                        vector_fixture_count_7,
+                    )
+                    .expect("price the retained generation"),
+                "fixture_generation_copy",
+                "Use the exact selected fixture generation.",
+            )
+            .expect("admit the actual generation workspace");
+
         assert_eq!(
             db.vector_store
                 .entries_for_partition_at_snapshot(
                     &partition.index,
                     &partition.partition_key,
                     snapshot,
+                    &vector_fixture_workspace_7
                 )
                 .unwrap()
                 .len(),
@@ -1018,6 +2576,201 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
 
 #[test]
 fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_writes() {
+    // Maintenance completes within the declared writer budget, and old reads
+    // keep their generation (maintenance intent line 41; root policy 22).
+    {
+        use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+        const HEADROOM: usize = 512 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(directory.path().join("refused-whole-repair.db")).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v VECTOR(1) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 2, EF_CONSTRUCTION = 2) CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 1))", &HashMap::new()).unwrap();
+        db.execute("INSERT INTO t VALUES (1, '[1]')", &HashMap::new())
+            .unwrap();
+        db.execute("CREATE TABLE healthy (id INT PRIMARY KEY, v VECTOR(1) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 2, EF_CONSTRUCTION = 2))", &HashMap::new()).unwrap();
+        db.execute("INSERT INTO healthy VALUES (2, '[1]')", &HashMap::new())
+            .unwrap();
+        let partition = VectorPartitionRef::new(
+            VectorIndexRef::new("t", "v"),
+            VectorPartitionKey::unpartitioned(),
+        );
+        for _ in 0..8 {
+            db.run_maintenance_cycle().unwrap();
+        }
+        let persistence = db.persistence.as_ref().unwrap();
+        let catalog = || {
+            persistence
+                .load_vector_partition_generation_catalog_for(
+                    &partition.index,
+                    &partition.partition_key,
+                )
+                .unwrap()
+        };
+        let original = catalog().unwrap();
+        let old_snapshot = db.snapshot();
+        let pin = db.pin_snapshot(old_snapshot).unwrap();
+        let query = "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
+        let query_params = HashMap::new();
+        let old_answer = db
+            .execute_at_snapshot(query, &query_params, old_snapshot)
+            .unwrap()
+            .rows;
+        for value in [2, 3] {
+            db.execute(&format!("UPDATE t SET v = '[{value}]'"), &HashMap::new())
+                .unwrap();
+            for _ in 0..8 {
+                db.run_maintenance_cycle().unwrap();
+            }
+        }
+        let before = catalog().unwrap();
+        assert!(before.base.generation_id > original.base.generation_id);
+        let exact = db
+            .execute(&query.replace("INDEXED", "EXACT"), &query_params)
+            .unwrap()
+            .rows;
+        let healthy_sql = "SELECT id, v FROM healthy ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
+        let healthy = db.execute(healthy_sql, &HashMap::new()).unwrap().rows;
+        let catalog_key = persistence
+            .with_db(|storage| {
+                let read = storage.begin_read().unwrap();
+                let table = read
+                    .open_table(TableDefinition::<&[u8], &[u8]>::new(
+                        "vector_partition_generation_catalog",
+                    ))
+                    .unwrap();
+                let mut selected = None;
+                for row in table.iter().unwrap() {
+                    let (key, value) = row.unwrap();
+                    let record = persistence
+                        .decode_maintenance_vector_catalog(value.value())
+                        .unwrap();
+                    if record.index == partition.index
+                        && record.partition_key == partition.partition_key
+                    {
+                        selected = Some(key.value().to_vec());
+                    }
+                }
+                Ok(selected.unwrap())
+            })
+            .unwrap();
+        db.tx_mgr
+            .with_maintenance_publication(|publication| {
+                publication.reserve()?;
+                persistence.with_db(|storage| {
+                    let write = storage.begin_write().unwrap();
+                    {
+                        let mut table = write
+                            .open_table(TableDefinition::<&[u8], &[u8]>::new(
+                                "vector_partition_generation_catalog",
+                            ))
+                            .unwrap();
+                        let mut bytes = table
+                            .get(catalog_key.as_slice())
+                            .unwrap()
+                            .unwrap()
+                            .value()
+                            .to_vec();
+                        *bytes.last_mut().unwrap() ^= 0xff;
+                        table
+                            .insert(catalog_key.as_slice(), bytes.as_slice())
+                            .unwrap();
+                    }
+                    write.commit().unwrap();
+                    Ok(())
+                })?;
+                publication.complete();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            persistence
+                .load_vector_partition_generation_catalog_for(
+                    &partition.index,
+                    &partition.partition_key
+                )
+                .is_err()
+        );
+        db.vector_store
+            .quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase);
+        let operation = db.declared_reader_memory().unwrap();
+        let mut copy = crate::vector_read_memory::admission(operation.clone());
+        let layout = db
+            .vector_store
+            .index_layout(&partition.index, &mut copy)
+            .unwrap();
+        let policy = layout.resolve_policy(1, 1);
+        let mut plan =
+            VectorGenerationWorkspacePlan::new(1, 1, &layout, &partition, policy, 0).unwrap();
+        plan.assign_raw_decode_owner(true, false);
+        let declaration = crate::persistence::vector_paged::PagedDeclaration {
+            dimension: layout.dimension.try_into().unwrap(),
+            quantization: layout.quantization,
+            hnsw_m: policy.hnsw_m.try_into().unwrap(),
+            hnsw_ef_construction: policy.hnsw_ef_construction.try_into().unwrap(),
+            hnsw_ef_search: policy.hnsw_ef_search.try_into().unwrap(),
+            policy_revision: policy.policy_revision,
+        };
+        let finite = vector_paged_build::paged_batch_plan(&declaration)
+            .unwrap()
+            .construction_workspace_bytes()
+            .unwrap();
+        let inventory = (partition.partition_key.estimated_bytes()
+            + partition.index.table.len()
+            + partition.index.column.len()
+            + 1024)
+            * 64;
+        let cleanup_peak =
+            inventory * 8 + db.snapshot_registry.state.lock().active.len() * 256 + 64 * 1024;
+        let repair_peak = plan
+            .build_phase_bytes()
+            .max(plan.encoding_phase_bytes(plan.graph_build_bytes))
+            .max(plan.persistence_phase_bytes(plan.encoded_graph_bound))
+            .max(plan.prepared_phase_bytes(plan.encoded_graph_bound))
+            .max(plan.prepared_phase_bytes(plan.encoded_graph_bound) + cleanup_peak);
+        assert!(
+            finite < HEADROOM && repair_peak > HEADROOM,
+            "the finite builder fits while full whole-repair publication and cleanup do not: finite={finite}, repair={repair_peak}"
+        );
+        drop(layout);
+        drop(copy);
+        drop(operation);
+        let baseline = db.accountant.usage().used;
+        db.accountant.set_budget(Some(baseline + HEADROOM)).unwrap();
+        let context = db.maintenance_context();
+        for _ in 0..64 {
+            assert_eq!(
+                db.execute(healthy_sql, &HashMap::new()).unwrap().rows,
+                healthy
+            );
+            context.persist_built_vector_partition(&partition, db.declared_reader_memory().unwrap())
+                .expect("an over-budget corrupt whole replacement progresses through the finite paged builder");
+            if let Some(current) = catalog()
+                && current.base.generation_id > before.base.generation_id
+            {
+                break;
+            }
+        }
+        let repaired = catalog().expect("bounded repair publishes a complete generation");
+        assert!(repaired.base.generation_id > before.base.generation_id);
+        assert!(db.vector_store.partition_has_paged_storage(&partition));
+        assert_eq!(db.execute(query, &query_params).unwrap().rows, exact);
+        assert_eq!(
+            db.execute_at_snapshot(query, &query_params, old_snapshot)
+                .unwrap()
+                .rows,
+            old_answer
+        );
+        assert_eq!(
+            db.execute(healthy_sql, &HashMap::new()).unwrap().rows,
+            healthy
+        );
+        assert_eq!(
+            db.vector_memory_ownership_receipt_for_test()
+                .temporary_workspace,
+            0
+        );
+        drop(pin);
+    }
     for quantization in ["F32", "SQ8", "SQ4"] {
         let directory = tempfile::tempdir().unwrap();
         let db = Arc::new(seed_retained_generation_selection(
@@ -1030,6 +2783,12 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
         let covered_lsn = db.tx_mgr.current_lsn();
         let expected = canonical_retained_selection_digest(&db, &partition, snapshot);
+        let vector_fixture_reader_8 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_8 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_8.clone());
+
         let counts = db
             .vector_store
             .partition_generation_entry_counts(
@@ -1037,6 +2796,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
                 &partition.partition_key,
                 snapshot,
                 None,
+                &mut vector_fixture_copy_8,
             )
             .unwrap();
         assert_eq!(counts, (16 * 5, 16));
@@ -1081,6 +2841,12 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         }
         writes_before_release.unwrap().unwrap();
         writer.join().unwrap();
+        let vector_fixture_reader_9 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_9 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_9.clone());
+
         assert_eq!(
             db.vector_store
                 .partition_generation_entry_counts(
@@ -1088,10 +2854,43 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
                     &partition.partition_key,
                     snapshot,
                     None,
+                    &mut vector_fixture_copy_9
                 )
                 .unwrap(),
             counts
         );
+        let vector_fixture_reader_10 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_10 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_10.clone());
+        let vector_fixture_count_10 = db
+            .vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+                &mut vector_fixture_copy_10,
+            )
+            .expect("count the real selected generation")
+            .1;
+        let vector_fixture_workspace_10 = db
+            .vector_store
+            .reserve_workspace(
+                vector_fixture_copy_10.accountant_for_test().clone(),
+                db.vector_store
+                    .generation_copy_bytes_for_test(
+                        &partition.index,
+                        &partition.partition_key,
+                        vector_fixture_count_10,
+                    )
+                    .expect("price the retained generation"),
+                "fixture_generation_copy",
+                "Use the exact selected fixture generation.",
+            )
+            .expect("admit the actual generation workspace");
+
         let old = db
             .vector_store
             .entries_for_partition_generation_at_snapshot(
@@ -1099,6 +2898,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
                 &partition.partition_key,
                 snapshot,
                 None,
+                &vector_fixture_workspace_10,
             )
             .unwrap();
         assert_eq!(old.len(), 16);
@@ -1132,6 +2932,38 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
             expected
         );
         let now = SnapshotId(db.tx_mgr.current_tx_max().0);
+        let vector_fixture_reader_11 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_11 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_11.clone());
+        let vector_fixture_count_11 = db
+            .vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                now,
+                Some(covered_lsn),
+                &mut vector_fixture_copy_11,
+            )
+            .expect("count the real selected generation")
+            .0;
+        let vector_fixture_workspace_11 = db
+            .vector_store
+            .reserve_workspace(
+                vector_fixture_copy_11.accountant_for_test().clone(),
+                db.vector_store
+                    .generation_copy_bytes_for_test(
+                        &partition.index,
+                        &partition.partition_key,
+                        vector_fixture_count_11,
+                    )
+                    .expect("price the retained generation"),
+                "fixture_generation_copy",
+                "Use the exact selected fixture generation.",
+            )
+            .expect("admit the actual generation workspace");
+
         let current = db
             .vector_store
             .entries_for_partition_generation_at_snapshot(
@@ -1139,6 +2971,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
                 &partition.partition_key,
                 now,
                 Some(covered_lsn),
+                &vector_fixture_workspace_11,
             )
             .unwrap();
         assert_eq!(
@@ -1155,6 +2988,9 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
             .rows,
             vec![vec![Value::Int64(0)]]
         );
+        drop(current);
+        drop(vector_fixture_workspace_11);
+        drop(vector_fixture_workspace_10);
         assert_eq!(
             db.vector_memory_ownership_receipt_for_test()
                 .temporary_workspace,
@@ -1165,6 +3001,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
 }
 
 #[test]
+#[serial]
 fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_refuses_before_bodies()
  {
     const HEADROOM: usize = 2 * 1024 * 1024;
@@ -1177,6 +3014,12 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
     );
     let partition = selection_partition();
     let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
+    let vector_fixture_reader_12 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_12 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_12.clone());
+
     let (raw_count, graph_count) = db
         .vector_store
         .partition_generation_entry_counts(
@@ -1184,13 +3027,83 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
             &partition.partition_key,
             snapshot,
             None,
+            &mut vector_fixture_copy_12,
         )
         .unwrap();
     assert_eq!((raw_count, graph_count), (16 * 65, 16));
+    let vector_fixture_reader_13 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_13 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_13.clone());
+    let vector_fixture_count_13 = db
+        .vector_store
+        .partition_generation_entry_counts(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            None,
+            &mut vector_fixture_copy_13,
+        )
+        .expect("count the real selected generation")
+        .0;
+    let vector_fixture_workspace_13 = db
+        .vector_store
+        .reserve_workspace(
+            vector_fixture_copy_13.accountant_for_test().clone(),
+            db.vector_store
+                .generation_copy_bytes_for_test(
+                    &partition.index,
+                    &partition.partition_key,
+                    vector_fixture_count_13,
+                )
+                .expect("price the retained generation"),
+            "fixture_generation_copy",
+            "Use the exact selected fixture generation.",
+        )
+        .expect("admit the actual generation workspace");
+
     let full_entries = db
         .vector_store
-        .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+        .entries_for_partition_at_snapshot(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            &vector_fixture_workspace_13,
+        )
         .unwrap();
+    let vector_fixture_reader_14 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_14 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_14.clone());
+    let vector_fixture_count_14 = db
+        .vector_store
+        .partition_generation_entry_counts(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            None,
+            &mut vector_fixture_copy_14,
+        )
+        .expect("count the real selected generation")
+        .1;
+    let vector_fixture_workspace_14 = db
+        .vector_store
+        .reserve_workspace(
+            vector_fixture_copy_14.accountant_for_test().clone(),
+            db.vector_store
+                .generation_copy_bytes_for_test(
+                    &partition.index,
+                    &partition.partition_key,
+                    vector_fixture_count_14,
+                )
+                .expect("price the retained generation"),
+            "fixture_generation_copy",
+            "Use the exact selected fixture generation.",
+        )
+        .expect("admit the actual generation workspace");
+
     let selected_entries = db
         .vector_store
         .entries_for_partition_generation_at_snapshot(
@@ -1198,6 +3111,7 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
             &partition.partition_key,
             snapshot,
             None,
+            &vector_fixture_workspace_14,
         )
         .unwrap();
     let body_bytes = |entries: &[VectorEntry]| -> usize {
@@ -1221,7 +3135,18 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
     );
     drop(full_entries);
     drop(selected_entries);
-    let layout = db.vector_store.index_layout(&partition.index).unwrap();
+    drop(vector_fixture_workspace_13);
+    drop(vector_fixture_workspace_14);
+    let vector_fixture_reader_15 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_15 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_15.clone());
+
+    let layout = db
+        .vector_store
+        .index_layout(&partition.index, &mut vector_fixture_copy_15)
+        .unwrap();
     let policy = layout.resolve_policy(graph_count, 1);
     let mut full =
         VectorGenerationWorkspacePlan::new(raw_count, graph_count, &layout, &partition, policy, 0)
@@ -1250,19 +3175,133 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
     );
     let baseline = db.accountant.usage().used;
     let snapshot_holds = db.snapshot_registry.state.lock().active.len();
-    // The generation's complete admission is below its requirement by one
-    // byte, while its metadata-only inventory can still be inspected.
-    db.accountant
-        .set_budget(Some(baseline + selected.build_phase_bytes() - 1))
+    // Whole-build refusal must yield to a finite paged build when it fits.
+    // Refuse one byte below that finite construction floor, before bodies.
+    let declaration = crate::persistence::vector_paged::PagedDeclaration {
+        dimension: layout.dimension.try_into().unwrap(),
+        quantization: layout.quantization,
+        hnsw_m: policy.hnsw_m.try_into().unwrap(),
+        hnsw_ef_construction: policy.hnsw_ef_construction.try_into().unwrap(),
+        hnsw_ef_search: policy.hnsw_ef_search.try_into().unwrap(),
+        policy_revision: policy.policy_revision,
+    };
+    let finite_floor = vector_paged_build::paged_batch_plan(&declaration)
+        .unwrap()
+        .construction_workspace_bytes()
         .unwrap();
-    let error = db
-        .maintenance_context()
-        .persist_built_vector_partition(&partition)
-        .unwrap_err();
-    assert!(matches!(error, Error::MemoryBudgetExceeded {
+    #[cfg(feature = "test-seams")]
+    {
+        // Independently allocate the real constructor's maximum native
+        // capacities, including owed reachability links and restart cursors.
+        // Their original invoice must outlive every observed physical free.
+        use contextdb_vector::hnsw::paged_builder::{
+            PagedGraphWorkspace, PagedVectorPoint, PagedPoint, PagedEdge,
+            PagedVectorProgress, PointId, encode_paged_point_into,
+        };
+        use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+        let plan = vector_paged_build::paged_batch_plan(&declaration).unwrap();
+        let payer = Arc::new(MemoryAccountant::with_budget(finite_floor));
+        let reservation = db.vector_store.reserve_workspace(payer.clone(), finite_floor,
+            "fixture_generation_copy", "exact finite construction layout").unwrap();
+        assert_eq!(payer.usage().used, finite_floor);
+        let counter = payer.writer_registration_observation_for_test().4;
+        let (storage, requests, count) = oracle::source_requests_for_test(counter, || {
+            let scratch = PagedGraphWorkspace::new(plan.scratch_points);
+            let nodes: [PagedVectorPoint; 6] = std::array::from_fn(|_| {
+                let mut neighbours = Vec::with_capacity(16);
+                for level in 0..16 {
+                    // Four owed layer-zero reachability links are a native
+                    // graph obligation (reachability::LAYER0_SLACK), independent
+                    // of the planner helper this proof is checking.
+                    let capacity = if level == 0 { 2 * policy.hnsw_m + 4 }
+                        else { policy.hnsw_m };
+                    let edge = PagedEdge { point_id: PointId(0, 0), origin_id: 0, distance: 0.0 };
+                    neighbours.push(vec![edge; capacity]);
+                }
+                PagedVectorPoint::F32(PagedPoint { id: PointId(15, 0), origin_id: 0,
+                    values: vec![1.0; layout.dimension], neighbours })
+            });
+            let mut dirty = Vec::with_capacity(plan.dirty_page_bytes);
+            if let PagedVectorPoint::F32(point) = &nodes[0] {
+                encode_paged_point_into(point, &mut dirty).unwrap();
+            }
+            let keys: [Vec<u8>; 3] = std::array::from_fn(|_| vec![0; plan.source_key_bytes]);
+            let mut progress = Box::new(PagedVectorProgress::new(1, 1, TxId(1), Lsn(1), graph_count));
+            progress.last_source_key = Some(vec![0; plan.source_key_bytes]);
+            progress.cleanup_cursor = Some(vec![0; plan.source_key_bytes]);
+            (scratch, nodes, dirty, keys, progress)
+        });
+        assert!(count > 6 && count <= 128, "fixed oracle covers every real construction buffer: {count}");
+        let scratch_bytes: usize = requests[..6].iter().map(|r| r.1).sum();
+        assert!(scratch_bytes > 0 && scratch_bytes <= PagedGraphWorkspace::exact_allocation_bound(plan.scratch_points).unwrap());
+        for node in &storage.1 {
+            let PagedVectorPoint::F32(node) = node else { unreachable!() };
+            let point_capacity = std::mem::size_of::<PagedVectorPoint>()
+                + node.values.capacity() * std::mem::size_of::<f32>()
+                + node.neighbours.capacity() * std::mem::size_of::<Vec<PagedEdge>>()
+                + node.neighbours.iter().map(|v| v.capacity() * std::mem::size_of::<PagedEdge>()).sum::<usize>();
+            assert_eq!(plan.max_node_bytes, point_capacity + 256,
+                "actual owned level/link/value capacities plus codec framing");
+        }
+        assert!(storage.2.len() <= plan.max_node_bytes && storage.2.capacity() == plan.dirty_page_bytes);
+        assert_eq!(plan.progress_bytes, std::mem::size_of_val(storage.4.as_ref()) + 2 * plan.source_key_bytes + 256);
+        assert_eq!(finite_floor, PagedGraphWorkspace::exact_allocation_bound(plan.scratch_points).unwrap()
+            + 6 * plan.max_node_bytes + storage.2.capacity()
+            + storage.3.iter().map(Vec::capacity).sum::<usize>() + plan.progress_bytes);
+        let actual_bytes: usize = requests[..count].iter().map(|r| r.1).sum();
+        assert!(actual_bytes <= finite_floor, "all independently observed native allocations fit their invoice");
+        assert_eq!(oracle::source_unfunded_peak_for_test().0, 0, "construction buffers are admitted before allocation");
+        oracle::watch_source_free_for_test(&requests[..count], counter);
+        drop(storage);
+        for (before_free, after_free, freed) in oracle::source_free_for_test(count).into_iter().take(count) {
+            assert_eq!(freed, 1, "each actual buffer physically frees exactly once");
+            assert_eq!((before_free, after_free), (finite_floor, finite_floor),
+                "the original construction invoice survives physical free");
+        }
+        drop(reservation);
+        assert_eq!(payer.usage().used, 0, "only destruction returns the complete original invoice");
+        eprintln!("physical_construction_layout invoice={finite_floor} actual_bytes={actual_bytes} scratch_bytes={scratch_bytes} allocations={count} all_free_before_refund=true");
+    }
+
+    assert!(finite_floor < selected.build_phase_bytes());
+    db.accountant
+        .set_budget(Some(baseline + finite_floor - 1))
+        .unwrap();
+    let refuse = || {
+        db.maintenance_context().persist_built_vector_partition(
+            &partition,
+            db.declared_reader_memory()
+                .expect("admit the partition fixture reader"),
+        )
+    };
+    #[cfg(feature = "test-seams")]
+    let result = {
+        let ((result, physical), visits) =
+            VectorStore::observe_generation_source_visits_for_test(|| {
+                crate::writer_query_test_seams::observe(refuse)
+            });
+        assert_eq!(
+            visits.entry_bodies_copied, 0,
+            "refusal precedes resident vector-entry body copies"
+        );
+        assert!(
+            !physical.physical_sources.iter().flatten().any(
+                |(family, _)| *family == crate::writer_query_test_seams::PhysicalFamily::Vector
+            ),
+            "refusal precedes durable vector-body source calls: {physical:?}"
+        );
+        result
+    };
+    #[cfg(not(feature = "test-seams"))]
+    let result = refuse();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, Error::MemoryBudgetExceeded {
         subsystem, operation, requested_bytes, available_bytes, ..
     } if subsystem == "vector_index" && operation == "prepare_vector_generation"
-        && requested_bytes == available_bytes + 1));
+        && *requested_bytes == finite_floor && *available_bytes == finite_floor - 1),
+        "finite construction floor={finite_floor}; refusal={error:?}"
+    );
     assert_eq!(db.accountant.usage().used, baseline);
     assert_eq!(
         db.snapshot_registry.state.lock().active.len(),
@@ -1284,6 +3323,12 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
             .unwrap()
             .is_none()
     );
+    let vector_fixture_reader_16 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_16 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_16.clone());
+
     assert_eq!(
         db.vector_store
             .partition_generation_entry_counts(
@@ -1291,12 +3336,17 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
                 &partition.partition_key,
                 snapshot,
                 None,
+                &mut vector_fixture_copy_16
             )
             .unwrap(),
         (raw_count, graph_count)
     );
     db.accountant.set_budget(Some(baseline + HEADROOM)).unwrap();
-    let report = db.run_maintenance_cycle().unwrap();
+    let (result, actual_peak, _) = crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| db.run_maintenance_cycle());
+    let report = result.unwrap();
+    assert!(actual_peak <= HEADROOM,
+        "actual native construction and metadata allocation fits the unchanged fixed workspace: {actual_peak}");
+    eprintln!("physical_construction_growth history_rounds=64 peak_bytes={actual_peak} bound_bytes={HEADROOM}");
     assert_eq!(report.vector.first_failure, None, "{report:?}");
     assert_eq!(report.vector.built_partitions, 1, "{report:?}");
     assert!(
@@ -1315,6 +3365,12 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
             .temporary_workspace,
         0
     );
+    let vector_fixture_reader_17 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_17 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_17.clone());
+
     assert_eq!(
         db.vector_store
             .partition_generation_entry_counts(
@@ -1322,11 +3378,27 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
                 &partition.partition_key,
                 snapshot,
                 None,
+                &mut vector_fixture_copy_17
             )
             .unwrap(),
         (raw_count, graph_count)
     );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
+    for history_rounds in [16, 32] {
+        let grown = seed_retained_generation_selection(
+            &directory.path().join(format!("history-{history_rounds}.db")), 768, "F32", history_rounds);
+        let baseline = grown.accountant.usage().used;
+        grown.accountant.set_budget(Some(baseline + HEADROOM)).unwrap();
+        let (result, actual_peak, _) = crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| grown.run_maintenance_cycle());
+        let report = result.unwrap();
+        assert_eq!(report.vector.first_failure, None, "history={history_rounds}: {report:?}");
+        assert_eq!(report.vector.built_partitions, 1);
+        assert!(actual_peak <= HEADROOM,
+            "N/2N/4N retained history uses the same physical workspace envelope: history={history_rounds} peak={actual_peak}");
+        eprintln!("physical_construction_growth history_rounds={history_rounds} peak_bytes={actual_peak} bound_bytes={HEADROOM}");
+        assert_eq!(grown.vector_memory_ownership_receipt_for_test().temporary_workspace, 0);
+        assert_eq!(grown.accountant.underflow_count_for_test(), 0);
+    }
     eprintln!(
         "resident_selection full_build_bytes={} selected_build_bytes={} raw_snapshot_savings={} fixed_headroom={HEADROOM}",
         full.build_phase_bytes(),

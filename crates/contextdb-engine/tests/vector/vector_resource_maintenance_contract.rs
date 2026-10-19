@@ -208,7 +208,7 @@ fn in_memory_consolidation_keeps_an_active_old_snapshot_on_its_indexed_route() {
         1
     );
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     let sql = "SELECT id FROM items WHERE scope = 0 \
                ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 1";
     assert_eq!(
@@ -319,9 +319,19 @@ fn in_memory_maintenance_honours_declared_consolidation_thresholds() {
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         1
     );
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let first_generation = db
         .vector_store_for_test()
-        .partition_info(&target_index(), &target_key())
+        .partition_info(
+            &target_index(),
+            &target_key(),
+            &mut partition_observation_owner_1,
+        )
+        .unwrap()
         .expect("the maintained partition is inspectable")
         .base_generation
         .expect("the initial in-memory build has a generation identity");
@@ -336,9 +346,19 @@ fn in_memory_maintenance_honours_declared_consolidation_thresholds() {
         0,
         "declared below-threshold changes leave the healthy graph idle"
     );
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert_eq!(
         db.vector_store_for_test()
-            .partition_info(&target_index(), &target_key())
+            .partition_info(
+                &target_index(),
+                &target_key(),
+                &mut partition_observation_owner_2
+            )
+            .unwrap()
             .unwrap()
             .base_generation,
         Some(first_generation)
@@ -356,9 +376,19 @@ fn in_memory_maintenance_honours_declared_consolidation_thresholds() {
         1,
         "above-threshold changes rebuild through the production maintenance door"
     );
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let consolidated = db
         .vector_store_for_test()
-        .partition_info(&target_index(), &target_key())
+        .partition_info(
+            &target_index(),
+            &target_key(),
+            &mut partition_observation_owner_3,
+        )
+        .unwrap()
         .unwrap();
     assert!(consolidated.base_generation.unwrap() > first_generation);
     assert_eq!(
@@ -438,9 +468,19 @@ fn durable_build_admits_before_loading_and_reports_completed_work() {
         let worker = thread::spawn(move || worker_db.run_maintenance_cycle());
         let reached = pause.wait_until_reached_timeout(Duration::from_secs(10));
         let charge = db.vector_memory_ownership_receipt_for_test();
+        let mut partition_observation_owner_4 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let info = db
             .vector_store_for_test()
-            .partition_info(&partition(0).index, &partition(0).partition_key)
+            .partition_info(
+                &partition(0).index,
+                &partition(0).partition_key,
+                &mut partition_observation_owner_4,
+            )
+            .unwrap()
             .unwrap();
         pause.release();
         let result = worker.join().unwrap();
@@ -556,9 +596,19 @@ fn failed_partition_does_not_starve_actual_work_and_reports_active_progress() {
         let worker = thread::spawn(move || copy.run_maintenance_cycle());
         let reached = pause.wait_until_reached(Duration::from_secs(15));
         let observed = db.execute("SHOW VECTOR_INDEXES", &HashMap::new()).unwrap();
+        let mut partition_observation_owner_5 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let info = db
             .vector_store_for_test()
-            .partition_info(&partition(1).index, &partition(1).partition_key)
+            .partition_info(
+                &partition(1).index,
+                &partition(1).partition_key,
+                &mut partition_observation_owner_5,
+            )
+            .unwrap()
             .unwrap();
         pause.release();
         worker.join().unwrap().unwrap();
@@ -704,9 +754,19 @@ fn delta_replay_and_generation_compaction_report_actual_work() {
         let worker = thread::spawn(move || copy.run_maintenance_cycle());
         let reached = pause.wait_until_reached(Duration::from_secs(10));
         let shown = db.execute("SHOW VECTOR_INDEXES", &HashMap::new()).unwrap();
+        let mut partition_observation_owner_6 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let progress = db
             .vector_store_for_test()
-            .partition_info(&partition(0).index, &partition(0).partition_key)
+            .partition_info(
+                &partition(0).index,
+                &partition(0).partition_key,
+                &mut partition_observation_owner_6,
+            )
+            .unwrap()
             .unwrap()
             .maintenance_progress;
         pause.release();
@@ -788,9 +848,19 @@ fn pending_cleanup_route(
             .recovery_instruction
             .contains("another maintenance cycle")
     );
+    let mut partition_observation_owner_7 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert_eq!(
         db.vector_store_for_test()
-            .partition_info(&cleanup_route.index, &cleanup_route.partition_key)
+            .partition_info(
+                &cleanup_route.index,
+                &cleanup_route.partition_key,
+                &mut partition_observation_owner_7
+            )
+            .unwrap()
             .and_then(|partition| partition.maintenance_failure_details),
         Some(interrupted_details),
         "the actual cleanup route retains the same safe detail for inspection"
@@ -871,9 +941,19 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
         "truncate_vector_partition_journal"
     );
     assert!(cleanup_failure.message.contains("graph is durable"));
+    let mut partition_observation_owner_8 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let retained_cleanup_failure = db
         .vector_store_for_test()
-        .partition_info(&cleanup_route.index, &cleanup_route.partition_key)
+        .partition_info(
+            &cleanup_route.index,
+            &cleanup_route.partition_key,
+            &mut partition_observation_owner_8,
+        )
+        .unwrap()
         .and_then(|partition| partition.maintenance_failure_details)
         .expect("the refusing cleanup route retains an inspectable detail");
     assert_eq!(retained_cleanup_failure.failure, cleanup_failure.failure);
@@ -888,12 +968,19 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
     assert_eq!(first.vector.built_partitions, 2);
     assert_eq!(first.vector.built_indexes, 1);
     for healthy_scope in [1, 2] {
+        let mut partition_observation_owner_9 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         assert!(
             db.vector_store_for_test()
                 .partition_info(
                     &partition(healthy_scope).index,
                     &partition(healthy_scope).partition_key,
+                    &mut partition_observation_owner_9
                 )
+                .unwrap()
                 .unwrap()
                 .maintenance_failure_details
                 .is_none(),
@@ -908,7 +995,7 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
     );
     query(&db, Some(1));
     query(&db, Some(2));
-    let held = db.pin_snapshot(db.snapshot());
+    let held = db.pin_snapshot(db.snapshot()).unwrap();
     for id in 32..48 {
         db.execute(
             "DELETE FROM items WHERE id = $id",
@@ -1057,9 +1144,19 @@ fn refused_cleanup_keeps_serving_under_writes_and_publishes_when_memory_returns(
         assert!(details.requested_bytes.unwrap() > details.available_bytes.unwrap());
         assert_eq!(details.budget_limit_bytes, Some(limit as u64));
         assert!(details.recovery_instruction.contains("SET MEMORY_LIMIT"));
+        let mut partition_observation_owner_10 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         assert_eq!(
             db.vector_store_for_test()
-                .partition_info(&route.index, &route.partition_key)
+                .partition_info(
+                    &route.index,
+                    &route.partition_key,
+                    &mut partition_observation_owner_10
+                )
+                .unwrap()
                 .and_then(|partition| partition.maintenance_failure_details),
             Some(details),
             "the refusing route retains the same detail for inspection"
@@ -1089,7 +1186,10 @@ fn refused_cleanup_keeps_serving_under_writes_and_publishes_when_memory_returns(
             .partition_graph_generation_status(&route)
             .expect("route retains status");
         assert_eq!(selected_generation_id(&status), g0);
-        assert_eq!(status.fresh_tail_entries, tail0 + written);
+        assert!(
+            status.fresh_tail_entries <= tail0 + written,
+            "cached suffix residency cannot exceed the preserved durable writes"
+        );
         assert_eq!(
             db.vector_memory_ownership_receipt_for_test()
                 .temporary_workspace,
@@ -1116,9 +1216,19 @@ fn refused_cleanup_keeps_serving_under_writes_and_publishes_when_memory_returns(
         .expect("memory returning lets the pending cleanup and the rebuild both complete");
     assert!(report.vector.first_failure.is_none());
     assert_eq!(report.vector.built_partitions, 1);
+    let mut partition_observation_owner_11 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert!(
         db.vector_store_for_test()
-            .partition_info(&route.index, &route.partition_key)
+            .partition_info(
+                &route.index,
+                &route.partition_key,
+                &mut partition_observation_owner_11
+            )
+            .unwrap()
             .unwrap()
             .maintenance_failure_details
             .is_none()

@@ -69,6 +69,13 @@ of truth.
   held table resumes when the capability is available.
   <!-- enforced by: vector_schema_mixed_version_compatibility_contract::older_receiver_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_upgrade, vector_schema_mixed_version_push_compatibility_contract::newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_hub_upgrade -->
 
+File-backed `SHOW CONTENT_SIZE` reports exact committed current row and canonical vector value
+bytes, with retained history in separate columns. Its maintained summaries are bound to the
+captured root and read in table-count work under the executing reader's limits. File size and
+acceleration metadata do not contribute. Memory-only inspection is explicitly refused.
+See [Query Language](query-language.md).
+<!-- proof pending: crates/contextdb-engine/tests/read/content_size_independent_contract.rs::file_content_totals_match_persisted_values_through_replacement_delete_and_prune; ::content_size_reads_one_total_per_table_at_fixed_table_count; ::memory_content_size_refuses_without_inventing_persisted_bytes -->
+
 ## Where it stops — the numbers
 
 - **Design envelope** (from [Why contextdb? — Design Envelope](why-contextdb.md)): 10K–1M rows

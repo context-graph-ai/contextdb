@@ -1222,7 +1222,8 @@ async fn sync_e2e_value_txid_round_trip() {
             contextdb_core::TenantId::from("txid-e2e"),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_handle = server.clone();
@@ -1243,13 +1244,15 @@ async fn sync_e2e_value_txid_round_trip() {
         fabric.client_as(&edge_a_node_id),
         contextdb_core::TenantId::from("txid-e2e"),
         edge_a_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_b_db.clone(),
         fabric.client_as(&edge_b_node_id),
         contextdb_core::TenantId::from("txid-e2e"),
         edge_b_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     edge_a
         .pull_default()
         .await

@@ -25,6 +25,8 @@
 //! would pass without any anchoring at all, so both fixtures are built so
 //! that the offsets genuinely move.
 
+#[path = "../../contextdb-tx/tests/support/read_memory.rs"]
+mod test_read_memory;
 use contextdb_core::{Direction, Error, GraphExecutor, NodeId, Result, RowId};
 use contextdb_graph::mem::BoundedBfsCursor;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
@@ -46,7 +48,11 @@ struct TestStore {
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         self.graph.apply_inserts(ws.adj_inserts.clone());
         self.graph.apply_deletes(ws.adj_deletes.clone());
         Ok(())
@@ -84,7 +90,7 @@ impl Caller {
                 Ok(())
             }
             None => Err(Error::Other(
-                "declared traversal ceiling reached".to_string(),
+                "declared traversal ceiling reached".to_string().into(),
             )),
         }
     }
@@ -122,9 +128,18 @@ fn connect(
     target: NodeId,
 ) {
     let tx = tx_mgr.begin();
-    exec.insert_edge(tx, source, target, "LINKS".to_string(), HashMap::new())
-        .expect("seed an edge");
-    tx_mgr.commit(tx).expect("commit the seeded edge");
+    exec.insert_edge(
+        tx,
+        source,
+        target,
+        "LINKS".to_string(),
+        HashMap::new(),
+        Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("seed an edge");
+    tx_mgr
+        .commit(tx, Arc::new(test_read_memory::TestReadMemory::default()))
+        .expect("commit the seeded edge");
 }
 
 fn withdraw(
@@ -134,9 +149,17 @@ fn withdraw(
     target: NodeId,
 ) {
     let tx = tx_mgr.begin();
-    exec.delete_edge(tx, source, target, "LINKS")
-        .expect("withdraw an edge before any traversal opens");
-    tx_mgr.commit(tx).expect("commit the withdrawal");
+    exec.delete_edge(
+        tx,
+        source,
+        target,
+        "LINKS",
+        Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("withdraw an edge before any traversal opens");
+    tx_mgr
+        .commit(tx, Arc::new(test_read_memory::TestReadMemory::default()))
+        .expect("commit the withdrawal");
 }
 
 /// One pull of the traversal. The caller's charge runs before every adjacency
@@ -252,6 +275,7 @@ fn a_parked_traversal_emits_every_visible_neighbour_when_all_the_entries_it_cons
             1,
             2,
             snapshot,
+            Arc::new(test_read_memory::TestReadMemory::default()),
             |_| Ok(()),
             |_| {},
         )
@@ -331,6 +355,7 @@ fn a_parked_traversal_emits_every_visible_neighbour_when_a_consumed_entry_surviv
             1,
             2,
             snapshot,
+            Arc::new(test_read_memory::TestReadMemory::default()),
             |_| Ok(()),
             |_| {},
         )

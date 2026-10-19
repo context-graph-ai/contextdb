@@ -8,6 +8,8 @@ pub(crate) fn units(
     db: &Database,
     changes: ChangeSet,
     confirmed: Lsn,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<OutboundSyncUnit>> {
     let mut manifests = Vec::new();
     let mut seen = BTreeSet::new();
@@ -25,13 +27,20 @@ pub(crate) fn units(
             )
         {
             // A missing registration is still offered and individually refused by the hub.
-            if let Some(manifest) = current_manifest(db, &row.table, &row.natural_key)? {
+            if let Some(manifest) =
+                current_manifest(db, &row.table, &row.natural_key, read_memory.clone())?
+            {
                 manifests.push(manifest);
             }
         }
     }
     if manifests.is_empty() {
-        return db.ordinary_dependency_complete_outbound_units(changes, confirmed);
+        return db.ordinary_dependency_complete_outbound_units(
+            changes,
+            confirmed,
+            vector_copy_owner,
+            read_memory.clone(),
+        );
     }
     let mut remaining = changes;
     let mut units = Vec::new();
@@ -89,7 +98,12 @@ pub(crate) fn units(
     let manifested_count = units.len();
     // Ordinary rows retain the original dependency-complete builder. Any manifested
     // dependency it found is already present in its own explicit unit above.
-    for mut ordinary in db.ordinary_dependency_complete_outbound_units(remaining, confirmed)? {
+    for mut ordinary in db.ordinary_dependency_complete_outbound_units(
+        remaining,
+        confirmed,
+        vector_copy_owner,
+        read_memory.clone(),
+    )? {
         ordinary.changes.rows.retain(|row| {
             !covered.contains(
                 &RowRef {
@@ -158,7 +172,7 @@ pub(crate) fn units(
     }
     for (i, unit) in units.iter().enumerate() {
         for row in &unit.changes.rows {
-            for reference in db.custody_parent_refs(row)? {
+            for reference in db.custody_parent_refs(row, vector_copy_owner, read_memory.clone())? {
                 if let Some(j) = rows.get(&reference.order_key())
                     && (i < manifested_count || *j < manifested_count)
                 {

@@ -123,7 +123,7 @@ probes! {
 // neighbours. A session installs its own counter for exactly the span of one
 // operation; the kernel bumps whichever counter is in force on the thread it
 // is running on.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static SESSION_SOURCE_TOUCHES: std::cell::RefCell<Option<Arc<AtomicU64>>> =
         const { std::cell::RefCell::new(None) };
@@ -131,7 +131,7 @@ thread_local! {
 
 /// Put this read's counter in force on this thread, answering with whatever
 /// was there before so the caller can put it back.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn install_session_source_counter(
     counter: Option<Arc<AtomicU64>>,
 ) -> Option<Arc<AtomicU64>> {
@@ -139,7 +139,7 @@ pub(crate) fn install_session_source_counter(
 }
 
 /// Count one real source item against the read this thread is running.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn note_session_source_touch() {
     SESSION_SOURCE_TOUCHES.with(|slot| {
         if let Some(counter) = slot.borrow().as_ref() {
@@ -177,7 +177,7 @@ pub(crate) fn note_cursor_bytes_returned(bytes: u64) {
 /// which is exactly what "the owner did this much for its channel" means.
 /// Nothing outside this process can read it, so a cross-process reader still
 /// sees only its own zero.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 static OWNER_ROUTE_SOURCE_COUNTERS: Mutex<
     Option<
         std::collections::BTreeMap<contextdb_core::read_contract::ChannelAddress, Arc<AtomicU64>>,
@@ -185,7 +185,7 @@ static OWNER_ROUTE_SOURCE_COUNTERS: Mutex<
 > = Mutex::new(None);
 
 /// Publish the counter an owner charges its channel's work against.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn publish_owner_route_source_counter(
     address: contextdb_core::read_contract::ChannelAddress,
     counter: Arc<AtomicU64>,
@@ -199,7 +199,7 @@ pub(crate) fn publish_owner_route_source_counter(
 
 /// Take an owner's counter down with the owner itself, so a later owner at the
 /// same address never inherits a departed one's number.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn withdraw_owner_route_source_counter(
     address: contextdb_core::read_contract::ChannelAddress,
 ) {
@@ -214,7 +214,7 @@ pub(crate) fn withdraw_owner_route_source_counter(
 
 /// The counter the owner at this channel charges, when that owner is in this
 /// process.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn owner_route_source_counter(
     address: contextdb_core::read_contract::ChannelAddress,
 ) -> Option<Arc<AtomicU64>> {

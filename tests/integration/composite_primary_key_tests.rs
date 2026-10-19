@@ -152,6 +152,7 @@ fn rows_only(
 /// from sync (the general keyless-skip).
 fn emitted_identities(db: &Database, table: &str) -> Vec<(String, Value)> {
     db.changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| row.table == table)
@@ -169,7 +170,11 @@ fn replicate(source: &Database) -> Database {
     target.execute(WINDOWS_DDL, &p()).expect("target table");
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("apply the source changeset");
@@ -406,7 +411,11 @@ fn c5b_a_delete_removes_only_the_row_whose_whole_key_matches() {
 
     replica
         .apply_changes(
-            rows_only(source.changes_since(before_delete)),
+            rows_only(
+                source
+                    .changes_since(before_delete)
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .expect("apply the delete");
@@ -504,7 +513,11 @@ fn c5d_guard_a_single_column_primary_key_replicates_unchanged() {
         .expect("target table");
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("replicate notes");
@@ -650,7 +663,11 @@ fn c5d_guard_a_multi_column_index_is_not_an_identity() {
         .expect("target table");
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("replicate indexed rows");
@@ -781,7 +798,11 @@ fn c5b_guard_a_keyless_id_table_replicates_unchanged() {
     let after_insert = source.current_lsn();
     target
         .apply_changes(
-            rows_only(source.changes_since(contextdb_core::Lsn(0))),
+            rows_only(
+                source
+                    .changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes"),
+            ),
             &policies,
         )
         .expect("apply inserts");
@@ -793,7 +814,14 @@ fn c5b_guard_a_keyless_id_table_replicates_unchanged() {
         .execute("DELETE FROM keyless WHERE id = 1", &p())
         .expect("delete row 1");
     target
-        .apply_changes(rows_only(source.changes_since(after_insert)), &policies)
+        .apply_changes(
+            rows_only(
+                source
+                    .changes_since(after_insert)
+                    .expect("read the declared changes"),
+            ),
+            &policies,
+        )
         .expect("apply update and delete");
 
     let mut rows: Vec<(i64, String)> = target
@@ -862,7 +890,9 @@ fn c5c_a_composite_key_sync_safe_table_arrives_by_synced_ddl() {
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
-            source.changes_since(contextdb_core::Lsn(0)),
+            source
+                .changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("the composite-key SYNC SAFE definition must be accepted on arrival");

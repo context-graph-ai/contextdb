@@ -3,10 +3,14 @@ mod bounded_bytes;
 #[cfg(feature = "contextdb-internal")]
 pub use bounded_bytes::{BoundedByteCursor, BoundedByteHandle};
 mod btree;
+#[cfg(feature = "contextdb-internal")]
+pub(crate) use btree::{NativeRangeEntry, fixed_key_value_location};
 mod btree_base;
 mod btree_iters;
 mod btree_mutator;
 mod page_store;
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub(crate) use page_store::rewrite_header_for_test;
 mod table_tree;
 mod table_tree_base;
 
@@ -27,3 +31,10 @@ pub(crate) use page_store::{
 pub use page_store::{InMemoryBackend, Savepoint, file_backend};
 pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut};
 pub(crate) use table_tree_base::{InternalTableDefinition, TableType};
+
+#[cfg(feature = "test-seams")]
+mod random_state_override;
+#[cfg(feature = "test-seams")]
+pub(crate) use random_state_override::fixture_random_state;
+#[cfg(feature = "test-seams")]
+pub use random_state_override::with_random_state_for_test;

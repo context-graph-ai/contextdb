@@ -61,6 +61,7 @@ pub(crate) struct OperationalCommand {
 pub(crate) fn help_signature(spelling: &str) -> &str {
     match spelling {
         ".trace" => ".trace on|off",
+        ".verify history" => ".verify history <table>",
         other => other,
     }
 }
@@ -105,6 +106,10 @@ pub(crate) static META_COMMANDS: &[CommandDeclaration] = &[
     },
     CommandDeclaration {
         spelling: ".maintenance status",
+        effect: CommandEffect::StoreRead,
+    },
+    CommandDeclaration {
+        spelling: ".verify history",
         effect: CommandEffect::StoreRead,
     },
     CommandDeclaration {
@@ -189,6 +194,10 @@ pub(crate) static META_COMMANDS: &[CommandDeclaration] = &[
     },
     CommandDeclaration {
         spelling: ".maintenance",
+        effect: CommandEffect::Invalid,
+    },
+    CommandDeclaration {
+        spelling: ".verify",
         effect: CommandEffect::Invalid,
     },
     CommandDeclaration {
@@ -318,6 +327,7 @@ fn invocation_arguments<'a>(line: &'a str, spelling: &str) -> Option<&'a str> {
 fn invocation_is_valid(declaration: &CommandDeclaration, arguments: &str) -> bool {
     match declaration.spelling {
         ".schema" | ".explain" | ".cursor open" => !arguments.is_empty(),
+        ".verify history" => !arguments.is_empty() && !arguments.contains(char::is_whitespace),
         ".sync policy" => {
             arguments.is_empty()
                 || arguments
@@ -354,6 +364,7 @@ fn invocation_is_valid(declaration: &CommandDeclaration, arguments: &str) -> boo
         | ".sync status"
         | ".events"
         | ".maintenance"
+        | ".verify"
         | ".cursor"
         | ".sync"
         | ".owner" => arguments.is_empty(),
@@ -468,6 +479,10 @@ mod contract_tests {
             effect: CommandEffect::StoreRead,
         },
         CommandDeclaration {
+            spelling: ".verify history",
+            effect: CommandEffect::StoreRead,
+        },
+        CommandDeclaration {
             spelling: ".cursor open",
             effect: CommandEffect::StoreRead,
         },
@@ -550,6 +565,10 @@ mod contract_tests {
         },
         CommandDeclaration {
             spelling: ".maintenance",
+            effect: CommandEffect::Invalid,
+        },
+        CommandDeclaration {
+            spelling: ".verify",
             effect: CommandEffect::Invalid,
         },
         CommandDeclaration {
@@ -647,6 +666,7 @@ mod contract_tests {
             (".explain DELETE FROM entries", CommandEffect::StoreRead),
             (".events status", CommandEffect::StoreRead),
             (".maintenance status", CommandEffect::StoreRead),
+            (".verify history entries", CommandEffect::StoreRead),
             (
                 ".cursor open SELECT * FROM entries",
                 CommandEffect::StoreRead,
@@ -671,6 +691,8 @@ mod contract_tests {
             (".sync status", CommandEffect::SessionOnly),
             (".events", CommandEffect::Invalid),
             (".maintenance", CommandEffect::Invalid),
+            (".verify", CommandEffect::Invalid),
+            (".verify history", CommandEffect::Invalid),
             (".cursor", CommandEffect::Invalid),
             (".cursor open", CommandEffect::Invalid),
             (".cursor fetch every", CommandEffect::Invalid),
@@ -795,6 +817,7 @@ mod contract_tests {
                 ".sync auto" => ".sync auto on",
                 ".help" => ".help vector",
                 ".trace" => ".trace on",
+                ".verify history" => ".verify history entries",
                 _ => row.spelling,
             };
             let authorization = authorize_meta_command_before_dispatch(invocation, false);

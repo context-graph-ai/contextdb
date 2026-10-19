@@ -200,9 +200,10 @@ fn open_configuration_proofs_follow_needed_settings_not_unrelated_config_entries
 
     // Making `DURABLE_LINEAGE_TABLE_GENERATION_PREFIX` a bound open-config key,
     // needed for pending-delete lineage, makes open prove one more needed
-    // setting than before: settings (1, 1, 6), not (0, 0, 5). The lean/crowded
-    // and routed proof-node tuples stay unchanged at (2, 2, 4_270) and
-    // (4, 4, 2_722) — only the settings tuple moves.
+    // setting than before: settings (1, 1, 6), not (0, 0, 5). Open defers the
+    // history proof to the first read that needs it, so it reads no proof
+    // node; what it hashes follows the needed settings, never the unrelated
+    // config entries the crowded fixture adds.
     let lean_settings = copied_startup_setting_count(&lean);
     let crowded_settings = copied_startup_setting_count(&crowded);
     let routed_settings = copied_startup_setting_count(&routed);
@@ -214,21 +215,16 @@ fn open_configuration_proofs_follow_needed_settings_not_unrelated_config_entries
     let crowded_open = observe_open(&crowded);
     let routed_open = observe_open(&routed);
     assert_eq!(crowded_open, lean_open);
-    assert_eq!(
-        (
-            lean_open.proof_nodes_read,
-            lean_open.ordered_proof_nodes_read,
-            lean_open.hashed_bytes
-        ),
-        (2, 2, 4_270)
-    );
-    assert_eq!(
-        (
-            routed_open.proof_nodes_read,
-            routed_open.ordered_proof_nodes_read,
-            routed_open.hashed_bytes
-        ),
-        (4, 4, 2_722)
+    for (label, open) in [("lean", &lean_open), ("routed", &routed_open)] {
+        assert_eq!(
+            (open.proof_nodes_read, open.ordered_proof_nodes_read),
+            (0, 0),
+            "{label}: open defers the history proof: {open:?}"
+        );
+    }
+    assert!(
+        routed_open.hashed_bytes >= lean_open.hashed_bytes,
+        "the routed fixture's needed settings are authenticated at open: lean={lean_open:?} routed={routed_open:?}"
     );
     for open in [lean_open, crowded_open, routed_open] {
         assert_eq!(open.proof_nodes_read - open.ordered_proof_nodes_read, 0);
@@ -336,7 +332,13 @@ fn small_mutation_noop_and_reopen_do_not_run_file_reader_decode_loops() {
         commit.hashed_vectors <= SMALL_ROWS as u64,
         "writer reopen verifies at most the seeded vectors: {commit:?}"
     );
-    assert_eq!(commit.proof_nodes_hashed, commit.proof_nodes_read);
+    // Every proof node read from the store is authenticated. The writer also
+    // authenticates the chunks it builds before it writes them, so hashed
+    // nodes exceed read nodes by exactly that self-check.
+    assert!(
+        commit.proof_nodes_hashed >= commit.proof_nodes_read,
+        "every proof node read is authenticated: {commit:?}"
+    );
     assert!(
         commit.ordered_proof_nodes_read <= 16,
         "writable recovery proves only the bounded history frontier: {commit:?}"
@@ -357,9 +359,10 @@ fn legacy_decode_counters_remain_a_read_open_diagnostic() {
     assert_eq!(large_measurement.rows, LARGE_ROWS);
     println!("read-work actual counters: small={small_measurement:?}; large={large_measurement:?}");
 
-    // Open proves its history frontiers and checks the ordered startup digest.
-    // The configured working set changes history depth, but neither open
-    // decodes row or vector bodies or performs a full-image hash.
+    // Open authenticates the fixed history root controls and the ordered
+    // startup digest; the history proof itself is read by the first request
+    // that needs it. So open costs the same for 10 rows and 10,000, decodes no
+    // row or vector body, and performs no full-image hash.
     let without_open_proof = |open: &ReadWorkCounters| ReadWorkCounters {
         hashed_bytes: 0,
         proof_nodes_read: 0,
@@ -367,24 +370,31 @@ fn legacy_decode_counters_remain_a_read_open_diagnostic() {
         ordered_proof_nodes_read: 0,
         ..*open
     };
-    for (label, measurement, nodes, ordered, bytes) in [
-        ("small", &small_measurement, 2, 2, 4_270),
-        ("large", &large_measurement, 8, 8, 11_159),
-    ] {
-        assert_eq!(measurement.open.proof_nodes_read, nodes, "{label}");
-        assert_eq!(measurement.open.proof_nodes_hashed, nodes, "{label}");
-        assert_eq!(
-            measurement.open.ordered_proof_nodes_read, ordered,
-            "{label}"
-        );
+    for (label, measurement) in [("small", &small_measurement), ("large", &large_measurement)] {
+        assert_eq!(measurement.open.proof_nodes_read, 0, "{label}");
+        assert_eq!(measurement.open.proof_nodes_hashed, 0, "{label}");
+        assert_eq!(measurement.open.ordered_proof_nodes_read, 0, "{label}");
         assert_eq!(
             without_open_proof(&measurement.open),
             ReadWorkCounters::default(),
             "open must load catalog/schema only and must not grow with unrelated stored \
              rows/vectors; observed {label}-file work is {measurement:?}"
         );
-        assert_eq!(measurement.open.hashed_bytes, bytes, "{label}");
     }
+    assert_eq!(
+        small_measurement.open.hashed_bytes, large_measurement.open.hashed_bytes,
+        "open authenticates the same fixed controls whatever the history depth"
+    );
+    // Deferring the proof keeps its refusal: damaged history still opens, and
+    // the first request that depends on it is refused as typed damage, never
+    // answered short.
+    let _serial = crate::direct_file_reader_contract_tests::serialise_direct_file_test();
+    crate::history_answer_is_complete_and_in_author_order::assert_reported_as_damage(
+        crate::history_answer_is_complete_and_in_author_order::damaged_history(
+            contextdb_engine::persistence::read_persistence_test_scaffold::HistoryDamage::RemovedCommitIndexMember,
+        ),
+        "a missing commit-index member behind a bounded open",
+    );
     assert!(
         large_measurement.query.decoded_rows > 0 || large_measurement.query.decoded_vectors > 0,
         "the bounded selected-key query must load its needed pages after open: {large_measurement:?}"

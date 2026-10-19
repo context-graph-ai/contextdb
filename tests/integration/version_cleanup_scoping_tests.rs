@@ -127,7 +127,9 @@ fn a_fresh_edge_pulling_after_cleanup_converges_to_current_truth() {
 
     // What a pull BEFORE cleanup would have delivered, for comparison.
     use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-    let pre_cleanup_snapshot = db.changes_since(contextdb_core::Lsn(0));
+    let pre_cleanup_snapshot = db
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
 
     let report = db
         .compact_currency_versions()
@@ -140,7 +142,8 @@ fn a_fresh_edge_pulling_after_cleanup_converges_to_current_truth() {
     let fresh_edge = Database::open_memory();
     fresh_edge
         .apply_changes(
-            db.changes_since(contextdb_core::Lsn(0)),
+            db.changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
         .expect("a fresh edge must converge after cleanup");
@@ -416,7 +419,9 @@ fn a_persist_failure_mid_pass_leaves_the_in_memory_change_log_matching_what_was_
         // The exact content the live, in-process change log carries BEFORE
         // the failed attempt -- the ground truth to compare against, not a
         // count.
-        let before = db.changes_since(contextdb_core::Lsn(0));
+        let before = db
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes");
 
         db.__arm_currency_compaction_persist_fault_for_test();
         let err = db
@@ -427,7 +432,9 @@ fn a_persist_failure_mid_pass_leaves_the_in_memory_change_log_matching_what_was_
         // Read the log back via the public surface (`changes_since(0)`)
         // immediately after the failed attempt, still in the same process,
         // before any reopen.
-        let after_attempt = db.changes_since(contextdb_core::Lsn(0));
+        let after_attempt = db
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes");
         assert_eq!(
             before.ddl, after_attempt.ddl,
             "a failed version-cleanup pass must not have mutated the DDL log at all"
@@ -454,7 +461,9 @@ fn a_persist_failure_mid_pass_leaves_the_in_memory_change_log_matching_what_was_
     // silently persist a partial change despite returning Err, and that
     // memory did not diverge from what was durably written.
     let db2 = Database::open(&path).expect("reopen after the failed cycle");
-    let after_reopen = db2.changes_since(contextdb_core::Lsn(0));
+    let after_reopen = db2
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(
         before_attempt_ddl, after_reopen.ddl,
         "the reopened DDL log must match the pre-attempt content exactly"
@@ -701,22 +710,42 @@ fn version_cleanup_releases_a_pruned_rows_vector_copy() {
         )
         .expect("churn the vector-bearing row");
     }
-    let vectors_before = db.__vector_entry_count_for_test();
+    let vectors_before = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.__vector_entry_count_for_test(&mut seam_copy_owner)
+            .expect("read the actual fixture observation")
+    };
     assert!(
         vectors_before >= 6,
         "setup: 6 upserts to one vector column must leave at least 6 physical vector entries \
          (this store never filters deleted_tx on all_entries) -- got {vectors_before}"
     );
 
-    let report = db
-        .__compact_currency_versions_for_tables_for_test(&["vector_currency"])
-        .expect("scoped compaction over the vector-bearing table must succeed");
+    let report = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__compact_currency_versions_for_tables_for_test(&["vector_currency"], seam_read_memory)
+    }
+    .expect("scoped compaction over the vector-bearing table must succeed");
     assert!(
         report.pruned_versions > 0,
         "setup must produce prunable row versions: {report:?}"
     );
 
-    let vectors_after = db.__vector_entry_count_for_test();
+    let vectors_after = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.__vector_entry_count_for_test(&mut seam_copy_owner)
+            .expect("read the actual fixture observation")
+    };
     // THE FLIP: pruning superseded row versions now releases their
     // superseded vector copies for real -- a strong assertion (strictly
     // fewer, not merely "changed"), pinning the NEW behavior.

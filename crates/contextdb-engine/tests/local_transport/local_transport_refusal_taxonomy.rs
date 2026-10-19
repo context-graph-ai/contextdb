@@ -13,11 +13,13 @@
 use contextdb_core::read_contract::{
     DeadlineClock, ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits,
 };
+#[cfg(target_os = "linux")]
+use contextdb_engine::local_transport::linux_filesystem_type_is_local;
 use contextdb_engine::local_transport::{
     FrameBufferAllocator, FrameReader, FrameViolation, LocalInboundKind, LocalProtocolBoundary,
     LocalRequestEnvelope, LocalResponseExpectation, LocalTransportError, MAX_FRAME_BYTES,
     ManualDeadlineClock, OrdinaryResultReceiver, decode_message_exact, handshake_with_deadline,
-    linux_filesystem_type_is_local, receive_framed_ordinary_result,
+    receive_framed_ordinary_result,
 };
 use std::future::Future;
 use std::pin::Pin;

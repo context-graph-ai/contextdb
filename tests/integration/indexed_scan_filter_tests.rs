@@ -1866,10 +1866,11 @@ fn nan02_where_equal_nan_returns_zero_rows() {
 }
 
 // ============================================================================
-// NAN03 — parameterized NaN bind returns zero rows.
+// NAN03 — parameterized NaN bind matches the stored NaN row, as PostgreSQL's
+// float8 equality does (NaN = NaN).
 // ============================================================================
 #[test]
-fn nan03_param_nan_bind_returns_zero_rows() {
+fn nan03_param_nan_bind_matches_the_stored_nan() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY, f REAL)", &empty())
         .unwrap();
@@ -1901,15 +1902,15 @@ fn nan03_param_nan_bind_returns_zero_rows() {
         .unwrap();
     assert_eq!(r_pos.trace.physical_plan, "IndexScan");
     assert_eq!(r_pos.rows, vec![vec![Value::Uuid(id_finite)]]);
-    // Negative: NaN-bind short-circuits.
+    // A NaN bind is an ordinary index probe that finds the NaN row.
     let r = db
         .execute(
-            "SELECT f FROM t WHERE f = $p",
+            "SELECT id FROM t WHERE f = $p",
             &params(vec![("p", Value::Float64(f64::NAN))]),
         )
         .unwrap();
     assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r.rows, vec![vec![Value::Uuid(id_nan)]]);
 }
 
 // ============================================================================
@@ -2290,7 +2291,7 @@ fn pr03_index_ddl_emits_ddl_log_entries() {
     db.execute("CREATE INDEX idx ON t (a ASC)", &empty())
         .unwrap();
     db.execute("DROP INDEX idx ON t", &empty()).unwrap();
-    let entries = db.ddl_log_since(before);
+    let entries = db.ddl_log_since(before).unwrap();
     let has_create = entries.iter().any(|d| matches!(
         d,
         DdlChange::CreateIndex { table, name, columns }
@@ -2476,7 +2477,7 @@ fn sy01_create_index_replicates_through_sync() {
     origin
         .execute("CREATE INDEX idx ON t (a)", &empty())
         .unwrap();
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -2532,7 +2533,7 @@ fn sy02_drop_index_replicates_through_sync() {
             .all(|i| i.kind == IndexKind::Auto),
         "origin must show no user-declared indexes after DROP"
     );
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -3510,7 +3511,7 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
     for tag in ["p", "q", "r", "s", "t"] {
         ids_in_insert_order.push(insert_row_t(&edge_a, 7, 0, tag));
     }
-    let ddl = edge_a.ddl_log_since(Lsn(0));
+    let ddl = edge_a.ddl_log_since(Lsn(0)).unwrap();
     let rows_changes: Vec<RowChange> = edge_a
         .change_log_rows_since(before)
         .expect("change log rows");
@@ -3560,7 +3561,7 @@ fn sy04_desc_direction_replicates_through_sync_ddl() {
     origin
         .execute("CREATE INDEX idx_a ON t (a DESC)", &empty())
         .unwrap();
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -3636,7 +3637,7 @@ fn sy05_mixed_direction_composite_replicates_through_sync_ddl() {
     origin
         .execute("CREATE INDEX idx_ab ON t (a ASC, b DESC)", &empty())
         .unwrap();
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -4391,6 +4392,7 @@ fn sync_ddl_createtable_regenerates_auto_indexes_on_peer() {
     // Replicate CreateTable DDL (only) to peer.
     let create_ddl = origin
         .ddl_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .into_iter()
         .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "t"))
         .expect("CreateTable DDL must exist");

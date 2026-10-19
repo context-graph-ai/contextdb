@@ -1,5 +1,6 @@
 //! Operation-scoped admission before allocating a source page. The caller
 //! keeps admitted bytes owned until its read handles have been released.
+use crate::StorageError;
 use std::{cell::RefCell, io, sync::Arc};
 use std::{marker::PhantomData, rc::Rc};
 type Admission = Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>;
@@ -13,6 +14,8 @@ type ChargingAdmission = Arc<dyn Fn(usize) -> io::Result<ReadPageCharge> + Send 
 enum ActiveAdmission {
     Scoped(Admission),
     Charging(ChargingAdmission),
+    StorageScoped(Arc<dyn Fn(usize) -> Result<(), StorageError> + Send + Sync>),
+    StorageCharging(Arc<dyn Fn(usize) -> Result<ReadPageCharge, StorageError> + Send + Sync>),
 }
 
 thread_local! { static ACTIVE: RefCell<Vec<ActiveAdmission>> = const { RefCell::new(Vec::new()) }; }
@@ -46,11 +49,138 @@ pub fn with_read_page_charge<R>(admit: ChargingAdmission, operation: impl FnOnce
     operation()
 }
 
-pub(crate) fn admit_read_memory(bytes: usize) -> io::Result<Option<ReadPageCharge>> {
+/// Like the legacy scoped admission, retaining a caller's typed storage refusal.
+#[doc(hidden)]
+pub fn with_read_memory_admission_storage<R>(
+    admit: Arc<dyn Fn(usize) -> Result<(), StorageError> + Send + Sync>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    ACTIVE.with(|active| {
+        active
+            .borrow_mut()
+            .push(ActiveAdmission::StorageScoped(admit));
+    });
+    let _reset = ResetAdmission;
+    operation()
+}
+
+/// Like the legacy charging admission, retaining a caller's typed storage refusal.
+#[doc(hidden)]
+pub fn with_read_page_charge_storage<R>(
+    admit: Arc<dyn Fn(usize) -> Result<ReadPageCharge, StorageError> + Send + Sync>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    ACTIVE.with(|active| {
+        active
+            .borrow_mut()
+            .push(ActiveAdmission::StorageCharging(admit));
+    });
+    let _reset = ResetAdmission;
+    operation()
+}
+
+pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadPageCharge>, StorageError> {
     ACTIVE.with(|active| match active.borrow().last() {
-        Some(ActiveAdmission::Scoped(admit)) => admit(bytes).map(|()| None),
-        Some(ActiveAdmission::Charging(admit)) => admit(bytes).map(Some),
+        Some(ActiveAdmission::Scoped(admit)) => {
+            admit(bytes).map(|()| None).map_err(StorageError::from)
+        }
+        Some(ActiveAdmission::Charging(admit)) => {
+            admit(bytes).map(Some).map_err(StorageError::from)
+        }
+        Some(ActiveAdmission::StorageScoped(admit)) => admit(bytes).map(|()| None),
+        Some(ActiveAdmission::StorageCharging(admit)) => admit(bytes).map(Some),
         None => Ok(None),
+    })
+}
+
+thread_local! { static SCAN_READS: RefCell<Vec<ScanAllowance>> = const { RefCell::new(Vec::new()) }; }
+
+/// Cache growth one outermost scan may take for pages it installs into free
+/// room, such as the root and branch pages every probe of the scan reuses.
+pub(crate) const SCAN_GROWTH_ALLOWANCE: usize = 16 * 1024;
+
+/// The cache growth one scan may still take for pages it installs into free
+/// room. A statement that scans in several resumed steps keeps one allowance
+/// across them by re-entering with the same value.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ScanAllowance(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Default for ScanAllowance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScanAllowance {
+    /// A fresh allowance of `SCAN_GROWTH_ALLOWANCE` (16 KiB).
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicUsize::new(
+            SCAN_GROWTH_ALLOWANCE,
+        )))
+    }
+
+    /// Enter one-pass scan reads on this thread, drawing on this allowance,
+    /// until the guard drops.
+    pub fn enter(&self) -> ScanReads {
+        SCAN_READS.with(|active| active.borrow_mut().push(self.clone()));
+        ScanReads {
+            _thread: PhantomData,
+        }
+    }
+}
+
+/// While held, this thread's cache misses grow the read cache by at most the
+/// scan's remaining allowance (see [`with_scan_reads`]).
+#[doc(hidden)]
+pub struct ScanReads {
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl Drop for ScanReads {
+    fn drop(&mut self) {
+        SCAN_READS.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
+
+/// Enter one-pass scan reads until the guard drops, drawing on the enclosing
+/// scan's allowance when one is active and on a fresh allowance otherwise.
+#[doc(hidden)]
+pub fn scan_reads() -> ScanReads {
+    let enclosing = SCAN_READS.with(|active| active.borrow().last().cloned());
+    enclosing.unwrap_or_default().enter()
+}
+
+/// Execute a one-pass scan with a bounded cache footprint: its misses may
+/// install into free cache room up to a small growth allowance (the pages
+/// every probe of the scan reuses); past it a miss first evicts as many bytes
+/// as it needs and is installed only if that made room, otherwise it lives
+/// only while its reader holds it. Hits are still served. A whole-partition
+/// scan then grows the cache by at most the allowance.
+#[doc(hidden)]
+pub fn with_scan_reads<R>(operation: impl FnOnce() -> R) -> R {
+    let _scan = scan_reads();
+    operation()
+}
+
+pub(crate) fn scan_reads_active() -> bool {
+    SCAN_READS.with(|active| !active.borrow().is_empty())
+}
+
+/// Take `bytes` of the innermost scan's growth allowance, if that much remains.
+pub(crate) fn take_scan_growth(bytes: usize) -> bool {
+    use std::sync::atomic::Ordering;
+    SCAN_READS.with(|active| {
+        active.borrow().last().is_some_and(|allowance| {
+            allowance
+                .0
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(bytes)
+                })
+                .is_ok()
+        })
     })
 }
 

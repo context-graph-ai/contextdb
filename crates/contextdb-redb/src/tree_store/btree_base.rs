@@ -46,6 +46,13 @@ pub(super) fn leaf_checksum<T: Page>(
             page.memory().len()
         )))
     } else {
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::ChecksumBytes,
+            None,
+            Some(page.get_page_number().to_le_bytes()),
+            end,
+        )?;
         Ok(xxh3_checksum(&page.memory()[..end]))
     }
 }
@@ -76,6 +83,13 @@ pub(super) fn branch_checksum<T: Page>(
             page.memory().len()
         )))
     } else {
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::ChecksumBytes,
+            None,
+            Some(page.get_page_number().to_le_bytes()),
+            end,
+        )?;
         Ok(xxh3_checksum(&page.memory()[..end]))
     }
 }
@@ -224,6 +238,16 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         }
     }
 
+    /// Bytes in the complete backing allocation retained by this guard.
+    /// Fork-only accounting quote; inspecting it neither allocates nor reads IO.
+    #[doc(hidden)]
+    pub fn retained_page_bytes(&self) -> usize {
+        match &self.page {
+            EitherPage::OwnedMemory(value) => value.capacity(),
+            _ => self.page.memory().len(),
+        }
+    }
+
     /// Access the stored value
     pub fn value(&self) -> V::SelfType<'_> {
         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
@@ -308,7 +332,7 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
             self.entry_index,
             self.key_width,
             V::fixed_width(),
-            value_bytes.as_ref(),
+            value_bytes.as_ref().len(),
         ) {
             let mut mutator =
                 LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
@@ -626,8 +650,32 @@ impl<'a> LeafAccessor<'a> {
     }
 }
 
+/// A borrowed serialized value or a length-only reservation. Zero reservations
+/// own no payload; bytes are initialized only in the allocated destination.
+#[derive(Clone, Copy)]
+pub(super) enum LeafValue<'a> {
+    Bytes(&'a [u8]),
+    Zeroes(usize),
+}
+
+impl LeafValue<'_> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Zeroes(len) => len,
+        }
+    }
+
+    fn write(self, destination: &mut [u8]) {
+        match self {
+            Self::Bytes(bytes) => destination.copy_from_slice(bytes),
+            Self::Zeroes(_) => destination.fill(0),
+        }
+    }
+}
+
 pub(super) struct LeafBuilder<'a, 'b> {
-    pairs: Vec<(&'a [u8], &'a [u8])>,
+    pairs: Vec<(&'a [u8], LeafValue<'a>)>,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     total_key_bytes: usize,
@@ -665,6 +713,10 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     }
 
     pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
+        self.push_value(key, LeafValue::Bytes(value));
+    }
+
+    pub(super) fn push_value(&mut self, key: &'a [u8], value: LeafValue<'a>) {
         self.total_key_bytes += key.len();
         self.total_value_bytes += value.len();
         self.pairs.push((key, value));
@@ -720,7 +772,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             first_split_key_bytes,
         );
         for (key, value) in self.pairs.iter().take(division) {
-            builder.append(key, value);
+            builder.append_value(key, *value);
         }
         drop(builder);
 
@@ -739,7 +791,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.total_key_bytes - first_split_key_bytes,
         );
         for (key, value) in &self.pairs[division..] {
-            builder.append(key, value);
+            builder.append_value(key, *value);
         }
         drop(builder);
 
@@ -761,7 +813,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.total_key_bytes,
         );
         for (key, value) in self.pairs {
-            builder.append(key, value);
+            builder.append_value(key, value);
         }
         drop(builder);
         Ok(page)
@@ -885,6 +937,10 @@ impl<'a> RawLeafBuilder<'a> {
     }
 
     pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
+        self.append_value(key, LeafValue::Bytes(value));
+    }
+
+    fn append_value(&mut self, key: &[u8], value: LeafValue<'_>) {
         if let Some(key_width) = self.fixed_key_size {
             assert_eq!(key_width, key.len());
         }
@@ -923,7 +979,7 @@ impl<'a> RawLeafBuilder<'a> {
                     .to_le_bytes(),
             );
         }
-        self.page[value_offset..(value_offset + value.len())].copy_from_slice(value);
+        value.write(&mut self.page[value_offset..(value_offset + value.len())]);
         self.pairs_written += 1;
     }
 }
@@ -967,7 +1023,7 @@ impl<'b> LeafMutator<'b> {
         position: usize,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        new_value: &[u8],
+        new_value_length: usize,
     ) -> bool {
         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
         let remaining = page.memory().len() - accessor.total_length();
@@ -975,7 +1031,7 @@ impl<'b> LeafMutator<'b> {
             .value_range(position)
             .map(|(s, e)| e - s)
             .unwrap_or_default();
-        let required_delta = isize::try_from(new_value.len()).unwrap()
+        let required_delta = isize::try_from(new_value_length).unwrap()
             - isize::try_from(existing_value_len).unwrap();
         required_delta <= isize::try_from(remaining).unwrap()
     }
@@ -986,7 +1042,7 @@ impl<'b> LeafMutator<'b> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
         new_key: &[u8],
-        new_value: &[u8],
+        new_value_length: usize,
     ) -> bool {
         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
         // If this is a large page, only allow in-place appending to avoid write amplification
@@ -997,7 +1053,7 @@ impl<'b> LeafMutator<'b> {
             return false;
         }
         let remaining = page.memory().len() - accessor.total_length();
-        let mut required_delta = new_key.len() + new_value.len();
+        let mut required_delta = new_key.len() + new_value_length;
         if fixed_key_size.is_none() {
             required_delta += size_of::<u32>();
         }
@@ -1009,6 +1065,10 @@ impl<'b> LeafMutator<'b> {
 
     // Replace the value at index `i` with `value`, leaving the key unchanged.
     pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
+        self.replace_value(i, LeafValue::Bytes(value));
+    }
+
+    pub(super) fn replace_value(&mut self, i: usize, value: LeafValue<'_>) {
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let num_pairs = accessor.num_pairs();
         let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
@@ -1039,11 +1099,11 @@ impl<'b> LeafMutator<'b> {
 
         // Write the new value
         dest -= value.len();
-        self.page[dest..(dest + value.len())].copy_from_slice(value);
+        value.write(&mut self.page[dest..(dest + value.len())]);
     }
 
     // Insert the given key, value pair at index i and shift all following pairs to the right
-    pub(crate) fn insert(&mut self, i: usize, key: &[u8], value: &[u8]) {
+    pub(super) fn insert_value(&mut self, i: usize, key: &[u8], value: LeafValue<'_>) {
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let required_delta = {
             let mut delta = key.len() + value.len();
@@ -1101,7 +1161,7 @@ impl<'b> LeafMutator<'b> {
         // Insert the value
         let inserted_value_end: u32 = dest.try_into().unwrap();
         dest -= value.len();
-        self.page[dest..(dest + value.len())].copy_from_slice(value);
+        value.write(&mut self.page[dest..(dest + value.len())]);
 
         // Right shift the trailing key data & preceding value data
         let start = shift_key_start;

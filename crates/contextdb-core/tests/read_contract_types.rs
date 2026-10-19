@@ -1058,7 +1058,7 @@ impl OwnerRequestHandler for EchoHandler {
         _cancel: &OwnerReadCancellation,
     ) -> contextdb_core::Result<Vec<u8>> {
         if request == b"fail" {
-            Err(Error::Other("custom owner handler failed".to_owned()))
+            Err(Error::Other("custom owner handler failed".to_owned().into()))
         } else {
             Ok(request.to_vec())
         }
@@ -1268,7 +1268,7 @@ fn stable_read_failure_vocabulary_round_trips_every_legal_shape() {
     let owner_route_unsupported = ReadFailure::new(
         ReadFailureKind::OwnerRouteUnsupported,
         ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-            inspection: "image_state".to_owned(),
+            inspection: "image_state".to_owned().into(),
         }),
     )
     .expect("the unsupported-inspection detail matches its refusal kind");
@@ -1332,7 +1332,7 @@ fn stable_read_failure_vocabulary_round_trips_every_legal_shape() {
         (
             ReadFailureKind::OwnerNotServing,
             ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-                inspection: "image_state".to_owned(),
+                inspection: "image_state".to_owned().into(),
             }),
         ),
         // A route that refuses an inspection always knows which one it was

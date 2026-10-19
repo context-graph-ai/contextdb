@@ -8,12 +8,18 @@ use contextdb_server::peer_dial_spec;
 use contextdb_server::transport::iroh::{IrohServer, LargeRequestTestController};
 
 // The pinned production transport/iroh.rs:73 ceiling. This is used only to
-// require an actually oversized workload; neither transport nor database
-// limits are overridden by this fixture.
+// require an actually oversized workload. The source explicitly declares
+// reader capacity for its over-frame declaration history; transport is unchanged.
 const FRAME_BYTES: usize = 64 * 1024 * 1024;
 const PADDING_TABLES: usize = 65;
 const DEFAULT_BYTES: usize = 1024 * 1024;
 const TENANT: &str = "whole-migration-chunked-iroh";
+
+fn open_oversized_source(path: &Path) -> contextdb_core::Result<Database> {
+    let mut options = contextdb_engine::DatabaseOpenOptions::default();
+    options.owner_reads.limits.limits.memory = 32 * 1024 * 1024 * 1024;
+    Database::open_with_options(path, options)
+}
 
 struct RealHub {
     endpoint: Option<IrohServer>,
@@ -30,7 +36,10 @@ impl RealHub {
             .expect("real authenticated Iroh hub");
         let controller = endpoint.large_request_test_controller();
         let ticket = endpoint.ticket();
-        let server = Arc::new(SyncServer::new(db, &endpoint, TenantId::from(TENANT)));
+        let server = Arc::new(
+            SyncServer::new(db, &endpoint, TenantId::from(TENANT))
+                .expect("read or construct the declared fixture result"),
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let server = server.clone();
@@ -76,7 +85,9 @@ fn install_oversized_source(db: &Database) -> (Vec<DdlChange>, Lsn) {
     }
     db.commit(tx)
         .expect("the real source must commit the entire oversized migration locally");
-    let changes = db.changes_since(Lsn(0));
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     assert_eq!(
         changes.ddl.len(),
         source_statements().len() + PADDING_TABLES
@@ -113,16 +124,22 @@ fn assert_nothing_published(db: &Database, node: &str, incarnation: Incarnation)
 
 fn assert_no_application_ddl(db: &Database) {
     assert!(
-        db.changes_since(Lsn(0)).ddl.iter().all(|change| matches!(
-            change,
-            DdlChange::CreateTable { name, .. } if name == "work_node_contacts"
-        )),
+        db.changes_since(Lsn(0))
+            .expect("read or construct the declared fixture result")
+            .ddl
+            .iter()
+            .all(|change| matches!(
+                change,
+                DdlChange::CreateTable { name, .. } if name == "work_node_contacts"
+            )),
         "a stored prefix is not a committed application DDL prefix"
     );
 }
 
 fn assert_exact_one_ordered_unit(db: &Database, expected: &[DdlChange], phase: &str) {
-    let changes = db.changes_since(Lsn(0));
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     assert!(
         changes.ddl == expected,
         "{phase}: exact authored DDL vector; actual_count={} expected_count={} first_difference={:?}",
@@ -212,16 +229,19 @@ async fn oversized_schema_first_fragment_crash_child() {
     let hub_identity_path = root.as_path().join("hub.identity");
     let source_identity = FabricIdentity::load_or_generate(&source_identity_path).unwrap();
     let node = source_identity.node_id();
-    let receiver = Arc::new(Database::open(&hub_path).unwrap());
-    let source = Arc::new(Database::open(&source_path).unwrap());
+    let receiver = Arc::new(open_oversized_source(&hub_path).unwrap());
+    let source = Arc::new(open_oversized_source(&source_path).unwrap());
     source.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     receiver.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     let hub = RealHub::start(receiver.clone(), &hub_identity_path).await;
-    let client = Arc::new(SyncClient::new(
-        source.clone(),
-        &peer_dial_spec(&hub.ticket, &source_identity_path),
-        TenantId::from(TENANT),
-    ));
+    let client = Arc::new(
+        SyncClient::new(
+            source.clone(),
+            &peer_dial_spec(&hub.ticket, &source_identity_path),
+            TenantId::from(TENANT),
+        )
+        .expect("read or construct the declared fixture result"),
+    );
     client
         .bind_application_table_policy(ApplicationTablePolicyExpectation::new())
         .await
@@ -286,13 +306,14 @@ async fn oversized_schema_first_fragment_crash_child() {
 
     // Another real authenticated edge can inspect the hub while the first
     // fragment is staged; it receives no prefix of this transaction.
-    let other = Arc::new(Database::open(root.as_path().join("second.db")).unwrap());
+    let other = Arc::new(open_oversized_source(&root.as_path().join("second.db")).unwrap());
     let second_identity = root.as_path().join("second.identity");
     let second_client = SyncClient::new(
         other.clone(),
         &peer_dial_spec(&hub.ticket, &second_identity),
         TenantId::from(TENANT),
-    );
+    )
+    .expect("read or construct the declared fixture result");
     second_client
         .bind_application_table_policy(ApplicationTablePolicyExpectation::new())
         .await
@@ -407,12 +428,15 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
             .unwrap(),
     );
     // Ordinary production writable open recovers the killed source and hub.
-    let source = Arc::new(Database::open(&source_path).unwrap());
-    let receiver = Arc::new(Database::open(&hub_path).unwrap());
+    let source = Arc::new(open_oversized_source(&source_path).unwrap());
+    let receiver = Arc::new(open_oversized_source(&hub_path).unwrap());
     source.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     receiver.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     support::initialize_fixture_callbacks(&source);
-    let ddl = source.changes_since(Lsn(0)).ddl;
+    let ddl = source
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result")
+        .ddl;
     assert_eq!(ddl.len(), source_statements().len() + PADDING_TABLES);
     assert_eq!(
         boundary["source_ddl_entries"].as_u64().unwrap(),
@@ -422,7 +446,7 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
     assert_full_cg_subset(&source);
     assert_nothing_published(&receiver, &node, incarnation);
     assert_no_application_ddl(&receiver);
-    let other = Arc::new(Database::open(root.path().join("second.db")).unwrap());
+    let other = Arc::new(open_oversized_source(&root.path().join("second.db")).unwrap());
     let second_identity = root.path().join("second.identity");
     support::assert_no_schema(&other);
     support::initialize_fixture_callbacks(&other);
@@ -435,11 +459,14 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
         boundary["stage"],
         "SIGKILL/reopen retains exact authenticated fragment identity and bytes"
     );
-    let client = Arc::new(SyncClient::new(
-        source.clone(),
-        &peer_dial_spec(&restarted.ticket, &source_identity_path),
-        TenantId::from(TENANT),
-    ));
+    let client = Arc::new(
+        SyncClient::new(
+            source.clone(),
+            &peer_dial_spec(&restarted.ticket, &source_identity_path),
+            TenantId::from(TENANT),
+        )
+        .expect("read or construct the declared fixture result"),
+    );
     let apply_observer = ReceivedSchemaApplyObserverForTest::new();
     let _observation_scope = receiver.observe_received_schema_applies_for_test(&apply_observer);
     let pause = Arc::new(receiver.pause_before_received_schema_durable_commit_for_test());
@@ -547,7 +574,9 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
     }
     assert_complete_migration(&receiver, &source, &ddl, &node, incarnation, source_lsn);
     assert_eq!(client.pending_push_change_count().unwrap(), 0);
-    let accepted = receiver.changes_since(Lsn(0));
+    let accepted = receiver
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let after = restarted.controller.observations_for_test();
     assert_eq!(
         after.completed_handler_dispatches, 1,
@@ -558,13 +587,26 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
         .push()
         .await
         .expect("explicit caller retry after accepted migration");
-    assert_eq!(receiver.changes_since(Lsn(0)).ddl, accepted.ddl);
-    assert_eq!(receiver.changes_since(Lsn(0)).ddl_lsn, accepted.ddl_lsn);
+    assert_eq!(
+        receiver
+            .changes_since(Lsn(0))
+            .expect("read or construct the declared fixture result")
+            .ddl,
+        accepted.ddl
+    );
+    assert_eq!(
+        receiver
+            .changes_since(Lsn(0))
+            .expect("read or construct the declared fixture result")
+            .ddl_lsn,
+        accepted.ddl_lsn
+    );
     let second_client = SyncClient::new(
         other.clone(),
         &peer_dial_spec(&restarted.ticket, &second_identity),
         TenantId::from(TENANT),
-    );
+    )
+    .expect("read or construct the declared fixture result");
     second_client
         .pull_default()
         .await
@@ -579,7 +621,7 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
     drop(client);
     restarted.stop().await;
     receiver.close().unwrap();
-    let reopened = Database::open(&hub_path).unwrap();
+    let reopened = open_oversized_source(&hub_path).unwrap();
     support::assert_contains_one_ordered_unit(
         &reopened,
         Lsn(0),
@@ -587,8 +629,25 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
         "oversized received migration after hub reopen",
     );
     support::assert_cg_artifacts(&reopened, 0x90000);
+    let oversized_schema_table_count = reopened.table_names().len();
     reopened.close().unwrap();
-    let file = contextdb_engine::ReadSession::open(&hub_path).unwrap();
+    // This file reader decodes the deliberately oversized CURRENT schema,
+    // including 65 one-MiB defaults. Its history stays behind bounded roots.
+    let mut file_options = contextdb_engine::ReadSessionOptions::default();
+    file_options.limits.memory = 32 * 1024 * 1024 * 1024;
+    file_options.limits.active_ms = 120_000;
+    let (file, open_history_work) = contextdb_engine::persistence::read_persistence_test_scaffold::observe_open_history_work_for_test(|| {
+        contextdb_engine::ReadSession::open_with_options(&hub_path, file_options).unwrap()
+    });
+    println!(
+        "OVERSIZED_SCHEMA_FILE_OPEN tables={oversized_schema_table_count} padding_tables={PADDING_TABLES} padding_default_bytes={} history_work={open_history_work:?}",
+        PADDING_TABLES * DEFAULT_BYTES
+    );
+    assert_eq!(
+        open_history_work,
+        contextdb_engine::persistence::read_persistence_test_scaffold::OpenHistoryWork::default(),
+        "the larger fixture time declaration funds current schema, never history walks"
+    );
     assert_eq!(file.route(), contextdb_core::read_contract::ReadRoute::File);
     support::assert_cg_artifact_queries(|sql, p| file.execute(sql, p).unwrap().rows, 0x90000);
 }

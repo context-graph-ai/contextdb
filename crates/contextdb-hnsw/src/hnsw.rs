@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use std::cmp::Ordering;
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
@@ -41,7 +41,9 @@ pub struct NoData;
 /// maximum number of layers
 pub(crate) const NB_LAYER_MAX: u8 = 16; // so max layer is 15!!
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 /// The 2-uple represent layer as u8  and rank in layer as a i32 as stored in our structure
 pub struct PointId(pub u8, pub i32);
 
@@ -421,35 +423,61 @@ impl<'b, T: Clone + Send + Sync> PointWithOrder<'b, T> {
 //============================================================================================
 
 //  LayerGenerator
+#[cfg(test)]
 use rand::distr::Uniform;
 use rand::prelude::*;
 
 /// a struct to randomly generate a level for an item according to an exponential law
 /// of parameter given by scale.
 /// The distribution is constrained to be in [0..maxlevel[
+///
+/// A point's level is a pure function of the generator's seed and the point's
+/// data id, so a build whose points are inserted by several threads draws the
+/// same levels whatever order the threads take.
 pub struct LayerGenerator {
-    rng: Arc<Mutex<rand::rngs::StdRng>>,
-    unif: Uniform<f64>,
+    seed: u64,
     // drives number of levels generated ~ S
     scale: f64,
     maxlevel: usize,
 }
 
+/// The level of the point with data id `id` in a graph built from `seed`:
+/// exponential with scale `scale`, constrained to `[0, maxlevel)`. A pure
+/// function, shared by the resident and the provider-backed builds so both
+/// draw the same levels.
+pub fn level_for_point(seed: u64, id: usize, scale: f64, maxlevel: usize) -> usize {
+    let word = mix_level_word(seed ^ mix_level_word(id as u64));
+    // 53 uniform bits mapped into (0, 1), never 0, so the logarithm is finite.
+    let xsi = ((word >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+    let level = (-xsi.ln() * scale).floor() as usize;
+    // a level >= maxlevel, of very low probability, is redispatched in range
+    if level >= maxlevel {
+        return (mix_level_word(word) % maxlevel as u64) as usize;
+    }
+    level
+}
+
+/// SplitMix64's finaliser: a bijective, well-mixed hash of one 64-bit word.
+fn mix_level_word(mut word: u64) -> u64 {
+    word = word.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    word ^ (word >> 31)
+}
+
 impl LayerGenerator {
     pub fn new(max_nb_connection: usize, maxlevel: usize) -> Self {
-        Self::new_with_rng(max_nb_connection, maxlevel, StdRng::from_os_rng())
+        Self::new_with_seed(
+            max_nb_connection,
+            maxlevel,
+            StdRng::from_os_rng().next_u64(),
+        )
     }
 
     pub fn new_with_seed(max_nb_connection: usize, maxlevel: usize, seed: u64) -> Self {
-        Self::new_with_rng(max_nb_connection, maxlevel, StdRng::seed_from_u64(seed))
-    }
-
-    fn new_with_rng(max_nb_connection: usize, maxlevel: usize, rng: rand::rngs::StdRng) -> Self {
-        let scale = 1. / (max_nb_connection as f64).ln();
         LayerGenerator {
-            rng: Arc::new(Mutex::new(rng)),
-            unif: Uniform::<f64>::new(0., 1.).unwrap(),
-            scale,
+            seed,
+            scale: 1. / (max_nb_connection as f64).ln(),
             maxlevel,
         }
     }
@@ -462,8 +490,7 @@ impl LayerGenerator {
     ) -> Self {
         let scale_default = 1. / (max_nb_connection as f64).ln();
         LayerGenerator {
-            rng: Arc::new(Mutex::new(StdRng::from_os_rng())),
-            unif: Uniform::<f64>::new(0., 1.).unwrap(),
+            seed: StdRng::from_os_rng().next_u64(),
             scale: scale_default * scale_factor,
             maxlevel,
         }
@@ -475,19 +502,11 @@ impl LayerGenerator {
     // for nb_conn = 10, even with maxlevel = 10,  we get P(l >= maxlevel) = 1.E-13
     // In Malkov(2016) S = 1./log(max_nb_connection)
     //
-    /// generate a layer with given maxlevel. upper layers (higher index) are of decreasing probabilities.
-    /// thread safe method.
-    fn generate(&self) -> usize {
-        let mut protected_rng = self.rng.lock();
-        let xsi = protected_rng.sample(self.unif);
-        let level = -xsi.ln() * self.scale;
-        let mut ulevel = level.floor() as usize;
-        // we redispatch possibly sampled level  >= maxlevel to required range
-        if ulevel >= self.maxlevel {
-            // This occurs with very low probability. Cf commentary above.
-            ulevel = protected_rng.sample(Uniform::<usize>::new(0, self.maxlevel).unwrap());
-        }
-        ulevel
+    /// generate the layer of the point with data id `id`, with given maxlevel.
+    /// upper layers (higher index) are of decreasing probabilities.
+    /// A pure function of the seed and `id`: thread safe and order independent.
+    fn generate(&self, id: usize) -> usize {
+        level_for_point(self.seed, id, self.scale, self.maxlevel)
     }
 
     /// just to try some variations on exponential level sampling. Unused.
@@ -567,11 +586,11 @@ impl<T: Clone + Send + Sync> Drop for PointIndexation<'_, T> {
 
 impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
     pub fn new(max_nb_connection: usize, max_layer: usize, max_elements: usize) -> Self {
-        Self::new_with_rng(
+        Self::new_with_seed(
             max_nb_connection,
             max_layer,
             max_elements,
-            StdRng::from_os_rng(),
+            StdRng::from_os_rng().next_u64(),
         )
     }
 
@@ -581,19 +600,14 @@ impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
         max_elements: usize,
         seed: u64,
     ) -> Self {
-        Self::new_with_rng(
-            max_nb_connection,
-            max_layer,
-            max_elements,
-            StdRng::seed_from_u64(seed),
-        )
+        Self::new_with_layer_seed(max_nb_connection, max_layer, max_elements, seed)
     }
 
-    fn new_with_rng(
+    fn new_with_layer_seed(
         max_nb_connection: usize,
         max_layer: usize,
         max_elements: usize,
-        rng: rand::rngs::StdRng,
+        seed: u64,
     ) -> Self {
         let mut points_by_layer = Vec::with_capacity(max_layer);
         for i in 0..max_layer {
@@ -604,7 +618,7 @@ impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
             let expected_size = ((frac * max_elements as f64).round()) as usize;
             points_by_layer.push(Vec::with_capacity(expected_size));
         }
-        let layer_g = LayerGenerator::new_with_rng(max_nb_connection, max_layer, rng);
+        let layer_g = LayerGenerator::new_with_seed(max_nb_connection, max_layer, seed);
         PointIndexation {
             max_nb_connection,
             max_layer,
@@ -647,7 +661,7 @@ impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
     // The function is called by Hnsw insert method
     fn generate_new_point(&self, data: &[T], origin_id: usize) -> (Arc<Point<'b, T>>, usize) {
         // get a write lock at the beginning of the function
-        let level = self.layer_g.generate();
+        let level = self.layer_g.generate(origin_id);
         let new_point;
         {
             // open a write lock on points_by_layer
@@ -1533,13 +1547,13 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         ef_construction: usize,
         f: D,
     ) -> Self {
-        Self::new_with_rng(
+        Self::new_with_layer_seed(
             max_nb_connection,
             max_elements,
             max_layer,
             ef_construction,
             f,
-            StdRng::from_os_rng(),
+            StdRng::from_os_rng().next_u64(),
         )
     }
 
@@ -1551,30 +1565,30 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         f: D,
         seed: u64,
     ) -> Self {
-        Self::new_with_rng(
+        Self::new_with_layer_seed(
             max_nb_connection,
             max_elements,
             max_layer,
             ef_construction,
             f,
-            StdRng::seed_from_u64(seed),
+            seed,
         )
     }
 
-    fn new_with_rng(
+    fn new_with_layer_seed(
         max_nb_connection: usize,
         max_elements: usize,
         max_layer: usize,
         ef_construction: usize,
         f: D,
-        rng: rand::rngs::StdRng,
+        seed: u64,
     ) -> Self {
         let adjusted_max_layer = (NB_LAYER_MAX as usize).min(max_layer);
-        let layer_indexed_points = PointIndexation::<T>::new_with_rng(
+        let layer_indexed_points = PointIndexation::<T>::new_with_seed(
             max_nb_connection,
             adjusted_max_layer,
             max_elements,
-            rng,
+            seed,
         );
         let extend_candidates = false;
         let keep_pruned = false;
@@ -2365,6 +2379,46 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     }
 
     /// Insert and return the physical graph identity for direct candidate routing.
+    /// Append the link `from -> to` at `level` without pruning or dropping
+    /// any existing link; the list stays ordered by distance. Returns whether
+    /// a link was added: `false` when either point is absent or below
+    /// `level`, when `from == to`, or when the link already exists. The
+    /// caller owns any bound on the resulting degree.
+    pub fn append_neighbour(&self, from: PointId, to: PointId, level: usize) -> bool {
+        assert!(
+            self.insertable,
+            "cannot append to a sealed HNSW graph; create a fresh mutable graph"
+        );
+        if from == to || (from.0 as usize) < level || (to.0 as usize) < level {
+            return false;
+        }
+        let (Some(from_point), Some(to_point)) = (
+            self.layer_indexed_points.get_point(&from),
+            self.layer_indexed_points.get_point(&to),
+        ) else {
+            return false;
+        };
+        let distance = self
+            .dist_f
+            .eval(from_point.data.get_v(), to_point.data.get_v());
+        let mut neighbours = from_point.neighbours.write();
+        if neighbours.len() <= level {
+            neighbours.resize_with(level + 1, Vec::new);
+        }
+        if neighbours[level]
+            .iter()
+            .any(|neighbour| neighbour.point_ref.p_id == to)
+        {
+            return false;
+        }
+        let link = PointWithOrder::new(&to_point, distance);
+        let position = neighbours[level]
+            .binary_search(&link)
+            .unwrap_or_else(|position| position);
+        neighbours[level].insert(position, link);
+        true
+    }
+
     pub fn insert_slice_with_point_id(&self, data_with_id: (&[T], usize)) -> PointId {
         assert!(
             self.insertable,
@@ -2546,7 +2600,13 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         );
         let level = new_point.p_id.0;
         for l in (0..level + 1).rev() {
-            for q in &new_point.neighbours.read()[l as usize] {
+            // Never hold one point's adjacency guard while acquiring another
+            // point's write guard: simultaneous mutual links otherwise cycle.
+            let neighbours = {
+                let guard = new_point.neighbours.read();
+                guard[l as usize].clone()
+            };
+            for q in &neighbours {
                 if new_point.p_id != q.point_ref.p_id {
                     // as new point is in global table, do not loop and deadlock!!
                     let q_point = &q.point_ref;
@@ -2606,6 +2666,37 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         }
         //   println!("     exitingreverse update neighbourhood for  new point {:?} ", new_point.p_id);
     } // end of reverse_update_neighborhood
+
+    /// Conservative live allocation bound for one insertion with candidate
+    /// extension disabled. Includes hash-table rehash, heap reallocation and
+    /// conversion, reciprocal-copy and pruning buffers. No vector bodies are
+    /// copied into search scratch. Overflow refuses before worker creation.
+    pub fn insertion_scratch_bound(points: usize, ef: usize, m: usize) -> Option<usize> {
+        let n = points.max(ef).max(4).checked_add(1)?;
+        let buckets = n.checked_mul(8)?.div_ceil(7).checked_next_power_of_two()?;
+        let map_slot = std::mem::size_of::<(PointId, Arc<Point<'b, T>>)>() + 1;
+        let heap_slot = std::mem::size_of::<PointWithOrder<'b, T>>();
+        // At most N distinct visited nodes, one pending candidate per node,
+        // ef return/discarded nodes and conversion heaps. Eight full-capacity
+        // heap buffers dominate their simultaneous old/new growth buffers.
+        let heaps = n
+            .checked_next_power_of_two()?
+            .checked_mul(8)?
+            .checked_mul(heap_slot)?;
+        let maps = buckets
+            .checked_mul(map_slot)?
+            .checked_mul(2)?
+            .checked_add(32)?;
+        // Copy one reciprocal list and prune it while its old list stays live.
+        let links = m
+            .checked_mul(2)?
+            .checked_add(1)?
+            .checked_mul(8)?
+            .checked_mul(heap_slot)?;
+        maps.checked_add(heaps)?
+            .checked_add(links)?
+            .checked_add(4096)
+    }
 
     pub fn get_point_indexation(&self) -> &PointIndexation<'b, T> {
         &self.layer_indexed_points

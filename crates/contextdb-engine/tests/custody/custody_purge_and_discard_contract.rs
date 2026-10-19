@@ -187,11 +187,10 @@ async fn start_hub_with_member_clauses(
             .expect("the member fixture uses canonical declaration clauses"),
     )
     .expect("install durable declaration prerequisites for erasure tests");
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct the authenticated sync endpoint"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -248,6 +247,8 @@ async fn bind_edge_with_member_clauses(
                 .expect("the root expectation is written in the declaration's clause words")
                 .expect_table("record_parts", member_clauses)
                 .expect("the member expectation is written in the declaration's clause words"),
+            db.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         ),
     )
     .await
@@ -377,6 +378,8 @@ fn stage_manifested_unit(
                     .map(|member| ("record_parts", key_of(*member)))
                     .collect(),
             },
+            db.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("canonical manifest registers the source rows before their commit");
     db.commit(tx)
@@ -447,7 +450,8 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     bind_edge(&edge, &client, ROOT_CLAUSES_AFTER_OUTCOME).await;
 
     let selected = Uuid::new_v4();
@@ -466,6 +470,8 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
                     .map(|m| ("record_parts", key_of(*m)))
                     .collect(),
             },
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("canonical selected manifest");
     edge.commit(tx)
@@ -480,6 +486,8 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
                 root_key: key_of(survivor),
                 members: vec![("record_parts", key_of(survivor_member))],
             },
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("canonical survivor manifest");
     edge.commit(tx)
@@ -519,7 +527,8 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
         equivalent_edge.clone(),
         &peer_dial_spec(&hub.ticket, &equivalent_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     bind_edge(
         &equivalent_edge,
         &equivalent_client,
@@ -646,7 +655,8 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
         stale_edge.clone(),
         &peer_dial_spec(&hub.ticket, &stale_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     within(stale_client.pull_default())
         .await
         .expect("the second edge receives the erasure");
@@ -759,19 +769,24 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     bind_edge(&edge, &client, ROOT_CLAUSES_AFTER_OUTCOME).await;
 
     let selected = Uuid::new_v4();
     let selected_member = Uuid::new_v4();
     let survivor = Uuid::new_v4();
     stage_manifested_unit(&edge, &client, "selected", selected, &[selected_member]);
-    within(client.__seed_delivery_outcome_for_test(
-        "records",
-        &key_of(selected),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        client.__seed_delivery_outcome_for_test(
+            "records",
+            &key_of(selected),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .unwrap();
     write_derived_row(&hub.db, "selected", selected);
@@ -1001,11 +1016,10 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         hub_node_id,
         "the restarted hub keeps its identity, so the edge is still bound to it"
     );
-    let server = Arc::new(SyncServer::new(
-        reopened.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(reopened.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct the authenticated sync endpoint"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let ticket = endpoint.ticket();
     let task = tokio::spawn({
@@ -1017,7 +1031,8 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let before_edge_apply = whole_store(&edge);
     edge.__arm_erasure_boundary_persist_fault_for_test();
     let failed_delivery = within(client.pull_default()).await;
@@ -1079,7 +1094,8 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     within(replay.pull_default())
         .await
         .expect("re-delivered instruction remains applied");
@@ -1122,7 +1138,8 @@ async fn discard_never() {
             edge.clone(),
             &peer_dial_spec(&hub.ticket, &identity),
             TenantId::from(tenant),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         bind_edge(&edge, &client, ROOT_CLAUSES_NEVER).await;
         // An unbound push-only name is eligible even on this enrolled edge.
         edge.execute(
@@ -1154,17 +1171,23 @@ async fn discard_never() {
                     root_key: key_of(kept_root),
                     members: vec![("record_parts", key_of(kept_member))],
                 },
+                edge.declared_reader_memory()
+                    .expect("admit the fixture client reader"),
             )
             .expect("install the never-discard unit's signed manifest prerequisite");
         edge.commit(tx)
             .expect("commit rows and delivery metadata atomically");
 
-        within(client.__seed_delivery_outcome_for_test(
-            "records",
-            &key_of(kept_root),
-            DeliveryOutcomeKind::Accepted,
-            None,
-        ))
+        within(
+            client.__seed_delivery_outcome_for_test(
+                "records",
+                &key_of(kept_root),
+                DeliveryOutcomeKind::Accepted,
+                None,
+                edge.declared_reader_memory()
+                    .expect("admit the fixture client reader"),
+            ),
+        )
         .await
         .expect("canonical terminal before mode refusal");
         let before = whole_store(&edge);
@@ -1228,7 +1251,8 @@ async fn discard_after_outcome() {
             edge.clone(),
             &peer_dial_spec(&hub.ticket, &identity),
             TenantId::from(tenant),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         // Establish actual durable hub authority through the public binding.
         within(
             client.bind_application_table_policy(
@@ -1266,6 +1290,8 @@ async fn discard_after_outcome() {
                     root_key: key_of(waiting_root),
                     members: vec![("record_parts", key_of(waiting_member))],
                 },
+                edge.declared_reader_memory()
+                    .expect("admit the fixture client reader"),
             )
             .expect("canonical pending registration");
         edge.commit(tx)
@@ -1310,14 +1336,19 @@ async fn discard_after_outcome() {
             edge.clone(),
             &peer_dial_spec(&hub.ticket, &identity),
             TenantId::from(tenant),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         // Once the hub has answered, the same statement goes through.
-        within(client.__seed_delivery_outcome_for_test(
-            "records",
-            &key_of(waiting_root),
-            DeliveryOutcomeKind::Accepted,
-            None,
-        ))
+        within(
+            client.__seed_delivery_outcome_for_test(
+                "records",
+                &key_of(waiting_root),
+                DeliveryOutcomeKind::Accepted,
+                None,
+                edge.declared_reader_memory()
+                    .expect("admit the fixture client reader"),
+            ),
+        )
         .await
         .expect("canonical terminal before permitted erasure");
         let hub_before = whole_store(&hub.db);
@@ -1462,7 +1493,8 @@ async fn discard_always() {
             edge.clone(),
             &peer_dial_spec(&hub.ticket, &identity),
             TenantId::from(tenant),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         bind_edge_with_member_clauses(&edge, &client, ROOT_CLAUSES_ALWAYS, MEMBER_CLAUSES_ALWAYS)
             .await;
         let unanswered_root = Uuid::new_v4();
@@ -1476,6 +1508,8 @@ async fn discard_always() {
                     root_key: key_of(unanswered_root),
                     members: vec![("record_parts", key_of(unanswered_member))],
                 },
+                edge.declared_reader_memory()
+                    .expect("admit the fixture client reader"),
             )
             .expect("canonical pending registration");
         edge.commit(tx)
@@ -1686,7 +1720,9 @@ async fn discard_always() {
             "the unrelated ordinary write becomes visible with the erasure"
         );
         assert!(reopened.current_lsn() > committed_changes);
-        let changes = reopened.changes_since(committed_changes);
+        let changes = reopened
+            .changes_since(committed_changes)
+            .expect("read the declared changes");
         for (table, key, origin) in &selected_origins {
             assert_eq!(
                 reopened.classify_authoritative_purge_root_for_test(
@@ -1796,7 +1832,8 @@ async fn discard_persistence_failure() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &root.path().join("edge.key")),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     bind_edge_with_member_clauses(&edge, &client, ROOT_CLAUSES_ALWAYS, MEMBER_CLAUSES_ALWAYS).await;
     stage_manifested_unit(
         &edge,

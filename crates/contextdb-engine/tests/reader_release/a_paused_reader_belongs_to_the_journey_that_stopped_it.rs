@@ -51,13 +51,32 @@ fn idle_store(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
+struct PausedTestClock;
+impl contextdb_core::read_contract::DeadlineClock for PausedTestClock {
+    fn now_ms(&self) -> u64 {
+        0
+    }
+    fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn open_paused_reader(path: &Path, runtime: &Path) -> ReadSession {
+    ReadSession::with_runtime_directory_for_test(runtime, || {
+        ReadSession::open_with_clock_for_test(
+            path,
+            ReadSessionOptions::default(),
+            std::sync::Arc::new(PausedTestClock),
+        )
+    })
+    .expect("an idle store is readable")
+}
+
 fn reader(path: &Path, runtime: &Path) -> std::thread::JoinHandle<()> {
     let path = path.to_path_buf();
     let runtime = runtime.to_path_buf();
     std::thread::spawn(move || {
-        let session =
-            ReadSession::open_in_runtime_dir(&path, ReadSessionOptions::default(), Some(runtime))
-                .expect("an idle store is readable");
+        let session = open_paused_reader(&path, &runtime);
         assert_eq!(session.route(), ReadRoute::File);
     })
 }
@@ -78,9 +97,7 @@ fn reader_with_completion_signal(
     let runtime = runtime.to_path_buf();
     let (finished_tx, finished_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let session =
-            ReadSession::open_in_runtime_dir(&path, ReadSessionOptions::default(), Some(runtime))
-                .expect("an idle store is readable");
+        let session = open_paused_reader(&path, &runtime);
         assert_eq!(session.route(), ReadRoute::File);
         let _ = finished_tx.send(());
     });

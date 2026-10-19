@@ -15,7 +15,7 @@ categories.workspace = true
 
 [features]
 in-process-test-seams = []
-test-seams = ["in-process-test-seams", "redb/test-seams", "contextdb-vector/test-seams", "contextdb-core/test-seams", "contextdb-tx/test-seams"]
+test-seams = ["in-process-test-seams", "redb/test-seams", "redb/cache_metrics", "contextdb-vector/test-seams", "contextdb-core/test-seams", "contextdb-tx/test-seams", "contextdb-relational/test-seams"]
 # Build-only validation facility used by the installed release smoke. It keeps
 # the real Iroh path and exposes only two fixed crash checkpoints; it does not
 # enable the broader test seam.
@@ -92,9 +92,12 @@ iroh-mdns-address-lookup = { version = "0.4", optional = true }
 nix = { version = "0.30.1", features = ["fs", "mount", "poll", "socket", "user"] }
 
 [dev-dependencies]
+contextdb-core = { path = "../contextdb-core", version = "1.0", features = ["test-seams"] }
+contextdb-tx = { path = "../contextdb-tx", version = "1.0", features = ["test-seams"] }
+contextdb-relational = { path = "../contextdb-relational", version = "1.0", features = ["test-seams"] }
 contextdb-server = { path = "../contextdb-server", features = ["in-process-test-seams"] }
 contextdb-vector = { path = "../contextdb-vector", version = "1.0", features = ["test-seams"] }
-redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb", features = ["test-seams"] }
+redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb", features = ["test-seams", "cache_metrics"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 num_cpus = "1.16"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -113,6 +116,16 @@ required-features = ["test-seams"]
 [[test]]
 name = "acceptance"
 path = "../../tests/acceptance.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "cdb120_partition_insert_cost"
+path = "tests/cdb120_partition_insert_cost.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "a_row_pays_for_its_partition_key_once"
+path = "tests/a_row_pays_for_its_partition_key_once.rs"
 
 [[test]]
 name = "bounded"
@@ -131,6 +144,7 @@ path = "tests/durable_public_api.rs"
 [[test]]
 name = "engine"
 path = "tests/engine.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "engine_seams"
@@ -165,6 +179,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "sql_surface"
 path = "tests/sql_surface.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "sync"
@@ -182,6 +197,11 @@ path = "tests/bounded_read_of_staged_graph_work_stays_within_its_limits.rs"
 required-features = ["test-seams"]
 
 [[test]]
+name = "tied_index_probes_stay_inside_the_read_limits"
+path = "tests/tied_index_probes_stay_inside_the_read_limits.rs"
+required-features = ["test-seams"]
+
+[[test]]
 name = "bounded_in_subquery_stays_inside_the_read_limits"
 path = "tests/bounded_in_subquery_stays_inside_the_read_limits.rs"
 required-features = ["test-seams"]
@@ -194,6 +214,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "indexed_row_memory_charge_measurement"
 path = "tests/indexed_row_memory_charge_measurement.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "declared_memory_limit_bounds_a_writer"
@@ -213,14 +234,22 @@ required-features = ["test-seams"]
 [[test]]
 name = "memory_limit_admission_holds_for_vectors"
 path = "tests/memory_limit_admission_holds_for_vectors.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "graph_property_memory_charge_measurement"
 path = "tests/graph_property_memory_charge_measurement.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "text_memory_charge_measurement"
 path = "tests/text_memory_charge_measurement.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_terminal_allocations"
+path = "tests/native_terminal_allocations.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "direct_file_image_memory_lifetime"
@@ -238,6 +267,7 @@ required-features = ["test-seams"]
 name = "engine_throughput"
 harness = false
 path = "../../benches/engine_throughput.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "engine_full_throughput"
@@ -258,16 +288,19 @@ path = "../../benches/subscriptions_pr.rs"
 name = "rank_policy_recall"
 harness = false
 path = "../../benches/rank_policy_recall.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_pk_inserts"
 harness = false
 path = "../../benches/indexed_scan_filter_pk_inserts.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_file_backed_open"
 harness = false
 path = "../../benches/indexed_scan_filter_file_backed_open.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_in_memory_pk_inserts"
@@ -278,16 +311,19 @@ path = "../../benches/indexed_scan_filter_in_memory_pk_inserts.rs"
 name = "indexed_scan_filter_entity_list"
 harness = false
 path = "../../benches/indexed_scan_filter_entity_list.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_non_id_pk_inserts"
 harness = false
 path = "../../benches/indexed_scan_filter_non_id_pk_inserts.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "storage_scale_hardening"
 harness = false
 path = "../../benches/storage_scale_hardening.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "acceptance_three_paradigm_query"
@@ -303,11 +339,13 @@ path = "../../benches/sql_surface_distinct.rs"
 name = "graph_adjacency_probe"
 harness = false
 path = "../../benches/graph_adjacency_probe.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "composite_index_routing"
 harness = false
 path = "../../benches/composite_index_routing.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "tier1_atomic_visibility_under_contention"
@@ -353,6 +391,7 @@ path = "../../benches/tier2_state_machine_overhead.rs"
 name = "commit_write_volume_scaling"
 harness = false
 path = "../../benches/commit_write_volume_scaling.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "sigterm_drain_in_flight_persistence"
@@ -376,6 +415,44 @@ name = "event_custody"
 required-features = ["iroh"]
 
 # Receipt for ordinary Iroh delivery cost at scale.
+[[test]]
+name = "writecost_planner_reversed"
+path = "tests/writecost_planner_reversed.rs"
+
 [[example]]
 name = "custody_scale"
 required-features = ["iroh", "test-seams"]
+
+
+[[test]]
+name = "writecost_reclaim"
+path = "tests/writecost_reclaim.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "writecost_planner"
+path = "tests/writecost_planner.rs"
+
+[[test]]
+name = "writecost_cycle_bound"
+path = "tests/writecost_cycle_bound.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_backing_allocator"
+path = "tests/native_backing_allocator.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "in_transaction_count_stays_inside_its_memory"
+path = "tests/in_transaction_count_stays_inside_its_memory.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "float_equality_follows_postgresql"
+path = "tests/float_equality_follows_postgresql.rs"
+
+[[test]]
+name = "seed_commit_memory"
+path = "tests/seed_commit_memory.rs"
+required-features = ["test-seams", "nightly-tests"]

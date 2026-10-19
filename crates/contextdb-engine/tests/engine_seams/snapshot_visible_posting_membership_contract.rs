@@ -505,6 +505,20 @@ fn same_id_membership_and_vector_replacements_compose_with_rollback_and_reopen()
 
 #[test]
 fn membership_admission_refusal_publishes_no_row_or_vector_state() {
+    // The promise is the refusal's type and its effect, not which writer
+    // charge happens to be admitted last: a commit refused at exactly the
+    // writer's current usage is a typed writer memory refusal at that budget,
+    // publishes no row, index key or vector, and returns every charge it took.
+    let assert_writer_refusal = |error: &Error, expected_budget: usize| {
+        assert!(
+            matches!(error, Error::MemoryBudgetExceeded {
+                subsystem, requested_bytes, available_bytes, budget_limit_bytes, ..
+            } if (subsystem == "writer" || subsystem.starts_with("writer_"))
+                && *budget_limit_bytes == expected_budget
+                && available_bytes < requested_bytes),
+            "a refused commit is a typed writer memory refusal at the declared budget: {error:?}"
+        );
+    };
     use contextdb_core::Error;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("refused-members.redb");
@@ -521,6 +535,7 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
     )
     .unwrap();
     let snapshot = db.snapshot();
+    let used_before = db.accountant().usage().used;
     let tx = db.begin().unwrap();
     db.execute_in_tx(
         tx,
@@ -528,16 +543,36 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         &params([("vector", Value::Vector(vec![0.0, 1.0]))]),
     )
     .unwrap();
-    db.accountant()
-        .set_budget(Some(db.accountant().usage().used))
-        .unwrap();
+    let first_budget = db.accountant().usage().used;
+    let first_owners = db.writer_memory_ownership_receipt_for_test();
+    assert_eq!(
+        db.accountant().usage().used,
+        first_budget,
+        "owner observation must remain passive"
+    );
+    assert_eq!(
+        first_owners.reconciliation_gap, 0,
+        "every retained owner is named"
+    );
+    assert_eq!(
+        first_budget, first_owners.named_owner_total,
+        "the exact budget equals the independently summed current owners"
+    );
+    db.accountant().set_budget(Some(first_budget)).unwrap();
     let result = db.commit(tx);
-    assert!(
-        matches!(result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. }) if subsystem == "relational_index" && operation == "membership"),
-        "membership must be admitted before durability: {result:?}"
+    assert_writer_refusal(
+        result
+            .as_ref()
+            .expect_err("the writer refuses before publication"),
+        first_owners.named_owner_total,
     );
     db.accountant().set_budget(None).unwrap();
     let _ = db.rollback(tx);
+    assert_eq!(
+        db.accountant().usage().used,
+        used_before,
+        "the refused commit returns every charge it took"
+    );
     assert_eq!(db.snapshot(), snapshot);
     let sql = "SELECT id, embedding FROM refused_members WHERE active = TRUE";
     let expected = vec![vec![Value::Int64(1), Value::Vector(vec![1.0, 0.0])]];
@@ -545,7 +580,100 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
     db.close().unwrap();
     drop(db);
     let db = Database::open(&path).unwrap();
+    assert_eq!(db.snapshot(), snapshot);
     assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows, expected);
+    assert!(
+        db.execute(
+            "SELECT id FROM refused_members WHERE active = FALSE",
+            &HashMap::new()
+        )
+        .unwrap()
+        .rows
+        .is_empty(),
+        "the refused index key must remain absent after reopen"
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id, embedding FROM refused_members ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1",
+            &params([("query", Value::Vector(vec![1.0, 0.0]))]),
+        )
+        .unwrap()
+        .rows,
+        expected,
+        "the committed vector remains searchable after reopen"
+    );
+
+    // An indexed-table write must not disguise a writer refusal while a
+    // separate row's conditions are revalidated at commit.
+    db.execute(
+        "CREATE TABLE guarded_row (id INTEGER, active BOOLEAN)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO guarded_row VALUES (7, TRUE)", &HashMap::new())
+        .unwrap();
+    let guarded_snapshot = db.snapshot();
+    let guarded_used_before = db.accountant().usage().used;
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE refused_members SET active = FALSE WHERE id = 1",
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert!(
+        db.guard_row_conditions_in_tx(
+            tx,
+            "guarded_row",
+            "id",
+            &Value::Int64(7),
+            &[("active".to_owned(), Value::Bool(true))],
+        )
+        .unwrap()
+    );
+    let mixed_budget = db.accountant().usage().used;
+    let mixed_owners = db.writer_memory_ownership_receipt_for_test();
+    assert_eq!(
+        db.accountant().usage().used,
+        mixed_budget,
+        "owner observation must remain passive"
+    );
+    assert_eq!(
+        mixed_owners.reconciliation_gap, 0,
+        "every retained owner is named"
+    );
+    assert_eq!(
+        mixed_budget, mixed_owners.named_owner_total,
+        "the exact budget equals the independently summed current owners"
+    );
+    db.accountant().set_budget(Some(mixed_budget)).unwrap();
+    let mixed_result = db.commit(tx);
+    assert_writer_refusal(
+        mixed_result
+            .as_ref()
+            .expect_err("the writer refuses before publication"),
+        mixed_owners.named_owner_total,
+    );
+    db.accountant().set_budget(None).unwrap();
+    let _ = db.rollback(tx);
+    assert_eq!(
+        db.accountant().usage().used,
+        guarded_used_before,
+        "the refused commit returns every charge it took"
+    );
+    assert_eq!(db.snapshot(), guarded_snapshot);
+    assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows, expected);
+    db.close().unwrap();
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.snapshot(), guarded_snapshot);
+    assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows, expected);
+    assert_eq!(
+        db.execute("SELECT id, active FROM guarded_row", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(7), Value::Bool(true)]]
+    );
 }
 
 #[test]

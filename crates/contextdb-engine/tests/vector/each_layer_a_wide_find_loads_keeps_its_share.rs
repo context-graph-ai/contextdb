@@ -133,9 +133,15 @@ fn seed_bases_with_changes() -> Fixture {
         admin
             .run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            admin
+                .declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = admin
             .vector_store_for_test()
-            .partition_infos(&index())
+            .partition_infos(&index(), &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
         ready.len() == SHAPE.partitions && ready.iter().all(|partition| partition.graph_available)
     });
@@ -147,8 +153,14 @@ fn seed_bases_with_changes() -> Fixture {
     }
     let layered = |admin: &Database| {
         let store = admin.vector_store_for_test();
+        let vector_fixture_reader_1 = admin
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_1 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
         let partitions = store
-            .partition_infos(&index())
+            .partition_infos(&index(), &mut vector_fixture_copy_1)
             .expect("inspect partition readiness");
         partitions.len() == SHAPE.partitions
             && partitions.iter().all(|info| {
@@ -267,6 +279,7 @@ fn assert_one_share_per_layer(claims: &[Share], what: &str) {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn every_layer_of_a_wide_find_keeps_its_share() {
     let fixture = seed_bases_with_changes();
     let (limit, oracle) = calibrated_limit(&fixture);
@@ -298,6 +311,7 @@ fn every_layer_of_a_wide_find_keeps_its_share() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_load_published_over_is_retried_on_the_share_it_already_claimed() {
     let fixture = seed_bases_with_changes();
     let (limit, oracle) = calibrated_limit(&fixture);

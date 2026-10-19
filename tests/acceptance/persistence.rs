@@ -1,7 +1,7 @@
 use super::common::*;
 use contextdb_core::{Error, Value, VectorIndexRef};
-use contextdb_engine::Database;
 use contextdb_engine::memory_accounting::MemoryAccountant;
+use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -848,6 +848,21 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
         );
         row.unwrap()
     };
+    let durable_idx = indexes
+        .columns
+        .iter()
+        .position(|c| c == "durable_vector_bytes")
+        .unwrap();
+    let charged_vector_idx = indexes
+        .columns
+        .iter()
+        .position(|c| c == "charged_vector_bytes")
+        .unwrap();
+    let charged_index_idx = indexes
+        .columns
+        .iter()
+        .position(|c| c == "charged_index_bytes")
+        .unwrap();
     let text_row = find("vector_text", 4);
     let vision_row = find("vector_vision", 8);
     // vector_count must reflect actual inserted rows, not hardcoded zero.
@@ -859,17 +874,30 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
             ),
             other => panic!("{label}.vector_count must be Int64; got {other:?}"),
         }
-        // bytes must be at least dim * count for f32 storage (4 bytes per dim per row); a hardcoded
-        // bytes=1 stub fails this lower bound.
+        // SHOW's compatibility bytes are actual charged owners. Dormant
+        // durable bodies have their own exact physical-payload field.
         let declared_dim = if label == "vector_text" { 4 } else { 8 };
-        let f32_floor = (row_count * declared_dim * std::mem::size_of::<f32>()) as i64;
-        match &row[bytes_idx] {
-            Value::Int64(n) => assert!(
-                *n >= f32_floor,
-                "{label}.bytes must be at least f32-floor {f32_floor}; got {n}"
-            ),
-            other => panic!("{label}.bytes must be Int64; got {other:?}"),
-        }
+        let durable_bytes = (row_count * declared_dim * std::mem::size_of::<f32>()) as i64;
+        assert_eq!(
+            row[charged_vector_idx],
+            Value::Int64(0),
+            "{label}: dormant bodies own no resident vector payload"
+        );
+        assert_eq!(
+            row[charged_index_idx],
+            Value::Int64(24),
+            "{label}: exact index ownership"
+        );
+        assert_eq!(
+            row[bytes_idx],
+            Value::Int64(24),
+            "{label}: charged vector plus charged index bytes"
+        );
+        assert_eq!(
+            row[durable_idx],
+            Value::Int64(durable_bytes),
+            "{label}: exact durable F32 payload"
+        );
         // Quantization defaults to F32 when no clause is declared.
         assert!(
             matches!(&row[quant_idx], Value::Text(s) if s == "F32"),
@@ -949,6 +977,42 @@ fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
 /// ≥ 95/100, proving SQ8 storage preserves identity after fsync + reopen.
 #[test]
 fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
+    // Engine-owned maintenance races the one-row-per-commit inserts, so two
+    // stores are only comparable at quiescence: both fixtures drive their own
+    // maintenance until every row is in the graph before they close.
+    fn caller_driven(path: &Path) -> Database {
+        Database::open_with_options(
+            path,
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..DatabaseOpenOptions::default()
+            },
+        )
+        .expect("open caller-driven fixture")
+    }
+    fn recall_index_row(db: &Database, column: &str) -> Value {
+        let shown = db
+            .execute("SHOW VECTOR_INDEXES", &empty_params())
+            .expect("show vector indexes");
+        let at = |name: &str| shown.columns.iter().position(|c| c == name).unwrap();
+        let row = shown
+            .rows
+            .iter()
+            .find(|r| matches!(&r[at("table")], Value::Text(t) if t == "recall"))
+            .expect("recall.vec is listed");
+        row[at(column)].clone()
+    }
+    fn drive_to_quiescence(db: &Database) {
+        for _ in 0..256 {
+            let report = db.run_maintenance_cycle().expect("maintenance cycle");
+            if report.vector.remaining_partitions == 0
+                && recall_index_row(db, "pending_inserts") == Value::Int64(0)
+            {
+                return;
+            }
+        }
+        panic!("maintenance must reach quiescence in finite cycles");
+    }
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("q.db");
     let dim: usize = 128;
@@ -975,7 +1039,7 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
 
     let mut inserted: Vec<(Uuid, Vec<f32>)> = Vec::with_capacity(count);
     {
-        let db = Database::open(&db_path).expect("open file db");
+        let db = caller_driven(&db_path);
         db.execute(
             &format!("CREATE TABLE recall (id UUID PRIMARY KEY, vec VECTOR({dim}) WITH (quantization = 'SQ8'))"),
             &empty_params(),
@@ -994,6 +1058,7 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
             .expect("insert");
             inserted.push((id, v));
         }
+        drive_to_quiescence(&db);
         // redb commits each transaction synchronously; drop flushes the final state.
         drop(db);
     }
@@ -1060,11 +1125,12 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
         "reopened SQ8 live storage must retain quantized payloads, not decoded f32 entries; got {storage_bytes:?}"
     );
     let f32_db_path = tmp.path().join("q_f32_baseline.db");
+    let f32_durable_vector_bytes;
     {
         // Match the SQ8 fixture's one-row-per-commit history. The shared
         // footprint helper uses one bulk transaction and compacts afterward,
         // which measures a different storage lifecycle.
-        let f32 = Database::open(&f32_db_path).expect("open F32 footprint db");
+        let f32 = caller_driven(&f32_db_path);
         f32.execute(
             &format!("CREATE TABLE recall (id UUID PRIMARY KEY, vec VECTOR({dim}))"),
             &empty_params(),
@@ -1080,8 +1146,20 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
             )
             .expect("insert F32 footprint row");
         }
+        drive_to_quiescence(&f32);
+        f32_durable_vector_bytes = recall_index_row(&f32, "durable_vector_bytes");
         drop(f32);
     }
+    let (Value::Int64(sq8_durable), Value::Int64(f32_durable)) = (
+        recall_index_row(&reopened, "durable_vector_bytes"),
+        f32_durable_vector_bytes,
+    ) else {
+        panic!("durable_vector_bytes is Int64 on both stores");
+    };
+    assert!(
+        sq8_durable < f32_durable,
+        "SQ8 durable vector bytes must be smaller than the identical F32 store's; sq8={sq8_durable}, f32={f32_durable}"
+    );
     let sq8_file_bytes = file_len(&db_path);
     let f32_file_bytes = file_len(&f32_db_path);
     assert!(

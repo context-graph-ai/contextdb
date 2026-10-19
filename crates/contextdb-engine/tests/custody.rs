@@ -10,6 +10,9 @@ mod custody_purge_and_discard_contract;
 mod delivery_manifest_contract;
 #[path = "custody/delivery_outcome_contract.rs"]
 mod delivery_outcome_contract;
+#[cfg(feature = "nightly-tests")]
+#[path = "schema/find_show_status_stay_fast_while_schema_replays.rs"]
+mod find_show_status_stay_fast_while_schema_replays;
 #[path = "schema/schema_replay_is_proportional_to_affected_tables.rs"]
 mod schema_replay_is_proportional_to_affected_tables;
 #[path = "custody/server_resource_policy_contract_tests.rs"]

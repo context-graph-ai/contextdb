@@ -89,7 +89,8 @@ fn start_hub_with_identity(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -110,7 +111,8 @@ fn edge_with_ddl(broker: &InProcessBroker, tenant: &str, ddl: &str) -> (Arc<Data
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -133,7 +135,8 @@ fn edge_with_ledger(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, S
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 

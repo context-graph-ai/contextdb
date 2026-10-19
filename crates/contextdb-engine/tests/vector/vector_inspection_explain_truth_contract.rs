@@ -236,9 +236,19 @@ fn failed_maintenance_memory_admission_stays_inspectable_until_limit_raise_recov
     assert!(reported.requested_bytes.unwrap() > reported.available_bytes.unwrap());
     assert!(reported.recovery_instruction.contains("SET MEMORY_LIMIT"));
     let alpha_route = route(SCOPE_ALPHA);
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let inspected = db
         .vector_store_for_test()
-        .partition_info(&alpha_route.index, &alpha_route.partition_key)
+        .partition_info(
+            &alpha_route.index,
+            &alpha_route.partition_key,
+            &mut partition_observation_owner_1,
+        )
+        .unwrap()
         .and_then(|partition| partition.maintenance_failure_details)
         .expect("Rust partition inspection retains the same safe failure detail");
     assert_eq!(inspected, reported);
@@ -351,14 +361,26 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
         assert_eq!(int(&indexes, index, "stalled_partitions"), 0);
         assert_eq!(text(&indexes, index, "broad_route_reason"), "none");
         assert_eq!(text(&indexes, index, "broad_route_recovery_action"), "none");
+        // Fund the measured healthy preparation peak. Closing retains only
+        // 264 of those 6,153 bytes, then admits two 1,024-byte paths; the
+        // remaining 3,841 bytes cannot admit a real 4,224-byte payload.
+        let replacement_limit = db.memory_limit();
+        let closing_limit = db.accountant().usage().used + 6_153;
+        db.set_memory_limit(Some(closing_limit))
+            .expect("fund healthy preparation below the closing payload admission");
         let error = db
             .run_maintenance_cycle()
             .expect_err("closing compaction reports its typed resource deferral");
+        db.set_memory_limit(replacement_limit)
+            .expect("restore the replacement-build budget for the next policy change");
         assert!(
             matches!(
                 error,
-                contextdb_core::Error::MemoryBudgetExceeded { .. }
-                    | contextdb_core::Error::DiskBudgetExceeded { .. }
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    ref subsystem, ref operation, requested_bytes: 4_224,
+                    available_bytes, budget_limit_bytes, ..
+                } if subsystem == "storage_compaction" && operation == "relocate_pages"
+                    && available_bytes < 4_224 && budget_limit_bytes == closing_limit
             ),
             "closing compaction resource refusal: {error:?}"
         );
@@ -405,12 +427,19 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
 
     let partition_key = VectorPartitionKey::from_values(&[Value::Text(POLICY_SCOPE.to_owned())])
         .expect("construct the declared TEXT partition key");
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert_eq!(
         db.vector_store_for_test()
             .partition_info(
                 &VectorIndexRef::new("policy_failure_docs", "embedding"),
                 &partition_key,
+                &mut partition_observation_owner_2
             )
+            .unwrap()
             .and_then(|info| info.maintenance_failure),
         None,
         "an obsolete refusal cannot reappear when later changes become eligible"
@@ -892,6 +921,113 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
     });
     assert_eq!(generations_after, generations_before);
     db.close().expect("close durable inspection verification");
+}
+
+// A saved base with a nonempty suffix must inspect without replaying that suffix.
+// Each arm has N surviving inserts and N insert/delete pairs after the same base.
+fn inspect_reopened_backlog_without_maintenance(backlog: usize) -> usize {
+    use contextdb_engine::{DatabaseOpenOptions, writer_query_test_seams};
+    let root = TempDir::new().expect("temporary pending inspection store");
+    let path = root.path().join("vector-inspection-pending.redb");
+    let open = || {
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .expect("open caller-driven inspection store")
+    };
+    let db = open();
+    seed_fixture(&db);
+    drive_to_ready(&db);
+    let context = Uuid::from_u128(0xA11C_E000_0000_0000_0000_0000_0000_0101);
+    for ordinal in 0..backlog {
+        for deleted in [false, true] {
+            let id = Uuid::from_u128(0xBACC_0000 + ordinal as u128 * 2 + u128::from(deleted));
+            db.execute("INSERT INTO vector_inspection_docs (id,context_id,scope_id,kind,embedding) VALUES ($id,$context,$scope,'pending','[0.8,0.2,0.0]')",
+                &params([("id",Value::Uuid(id)),("context",Value::Uuid(context)),
+                         ("scope",Value::Text(SCOPE_ALPHA.to_owned()))])).unwrap();
+            if deleted {
+                db.execute(
+                    "DELETE FROM vector_inspection_docs WHERE id = $id",
+                    &params([("id", Value::Uuid(id))]),
+                )
+                .unwrap();
+            }
+        }
+    }
+    // Do not consolidate the suffix or inspect it before closing.
+    db.close().expect("seal a nonempty insert/delete suffix");
+    drop(db);
+    let db = open();
+    let cache_before = db.__writer_cache_stats_for_test().unwrap();
+    let activity_before = db.__vector_passive_activity_counters_for_test();
+    let charged_before = db.accountant().usage().used;
+    let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
+        db.vector_store_for_test()
+            .partition_graph_generation_status(&route(scope))
+            .unwrap()
+    });
+    db.__reset_vector_membership_records_decoded_for_test();
+    let ((indexes, partitions), work) =
+        writer_query_test_seams::observe(|| (show_indexes(&db), show_partitions(&db)));
+    let cache_after = db.__writer_cache_stats_for_test().unwrap();
+    let row = row_for(&indexes, "vector_inspection_docs", "embedding");
+    assert_eq!(int(&indexes, row, "pending_inserts"), backlog as i64);
+    assert_eq!(int(&indexes, row, "tombstones"), backlog as i64);
+    assert_eq!(int(&indexes, row, "vector_count"), backlog as i64 + 4);
+    let alpha = partition_row_for_scope(&partitions, SCOPE_ALPHA);
+    let bravo = partition_row_for_scope(&partitions, SCOPE_BRAVO);
+    assert_eq!(int(&partitions, alpha, "pending_inserts"), backlog as i64);
+    assert_eq!(int(&partitions, alpha, "tombstones"), backlog as i64);
+    assert_eq!(int(&partitions, alpha, "live_rows"), backlog as i64 + 2);
+    assert_eq!(int(&partitions, bravo, "pending_inserts"), 0);
+    assert_eq!(int(&partitions, bravo, "tombstones"), 0);
+    assert_eq!(int(&partitions, bravo, "live_rows"), 2);
+    assert_eq!(
+        work.history.vector_memberships, 0,
+        "inspection never traverses durable membership history"
+    );
+    assert_eq!(
+        db.__vector_membership_records_decoded_for_test(),
+        0,
+        "truthful pending counts never decode the membership population"
+    );
+    assert_eq!(
+        db.__vector_passive_activity_counters_for_test(),
+        activity_before,
+        "pending inspection cannot load, replay, build, repair, compact or evict vector state"
+    );
+    assert_eq!(db.accountant().usage().used, charged_before);
+    let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
+        db.vector_store_for_test()
+            .partition_graph_generation_status(&route(scope))
+            .unwrap()
+    });
+    assert_eq!(generations_after, generations_before);
+    let indexes_again = show_indexes(&db);
+    let partitions_again = show_partitions(&db);
+    assert_eq!(indexes_again.rows, indexes.rows);
+    assert_eq!(partitions_again.rows, partitions.rows);
+    assert_eq!(
+        db.__vector_passive_activity_counters_for_test(),
+        activity_before
+    );
+    let growth = cache_after.3.checked_sub(cache_before.3).unwrap();
+    db.close().unwrap();
+    growth
+}
+
+#[test]
+fn reopened_nonempty_vector_backlog_inspection_has_fixed_cache_work_and_truthful_counts() {
+    let small = inspect_reopened_backlog_without_maintenance(8);
+    let grown = inspect_reopened_backlog_without_maintenance(256);
+    assert_eq!(
+        grown, small,
+        "metadata-only inspection has the same cache residency increase with a grown insert/delete backlog"
+    );
 }
 
 #[test]

@@ -70,11 +70,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
     declare(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -117,7 +116,8 @@ async fn authoritative_purge_reaches_pull_only_edge_alongside_ordinary_rows() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     within(client.pull_default())
         .await

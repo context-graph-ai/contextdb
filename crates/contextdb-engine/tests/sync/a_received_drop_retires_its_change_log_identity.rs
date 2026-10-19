@@ -104,6 +104,10 @@ fn apply_received(author: &Database, receiver: &Database, changes: ChangeSet) {
         AUTHOR.get_or_init(contextdb_engine::identity::FabricIdentity::generate)
     };
     let node_id = identity.node_id();
+    let fixture_operation_reader_1 = author
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let ddl_provenance: Vec<WireDdlProvenance> = author
         .outbound_ddl_provenance_for_test(
             &changes,
@@ -111,8 +115,15 @@ fn apply_received(author: &Database, receiver: &Database, changes: ChangeSet) {
             &node_id,
             SOURCE_INCARNATION,
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            fixture_operation_reader_1.clone(),
         )
         .expect("the authoring source produces canonical DDL provenance for this schema unit");
+    let fixture_operation_reader_2 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+
     receiver
         .apply_received_schema_for_test(
             changes,
@@ -120,6 +131,8 @@ fn apply_received(author: &Database, receiver: &Database, changes: ChangeSet) {
             TenantId::from(TENANT),
             &node_id,
             SOURCE_INCARNATION,
+            &mut fixture_operation_copy_2,
+            fixture_operation_reader_2.clone(),
         )
         .expect("an authenticated, dependency-complete received schema unit applies");
 }
@@ -136,7 +149,9 @@ fn a_received_drop_and_recreate_leaves_readable_committed_history() {
             &empty(),
         )
         .expect("the author declares the table it will later drop and recreate");
-    let create_changes = author.changes_since(Lsn(0));
+    let create_changes = author
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     assert_eq!(create_changes.ddl.len(), 1, "one authored CREATE TABLE");
 
     {
@@ -171,7 +186,9 @@ fn a_received_drop_and_recreate_leaves_readable_committed_history() {
     author
         .execute("DROP TABLE widgets", &empty())
         .expect("the author drops the table its earlier CREATE declared");
-    let drop_changes = author.changes_since(since_create);
+    let drop_changes = author
+        .changes_since(since_create)
+        .expect("read or construct the declared fixture result");
     assert_eq!(drop_changes.ddl.len(), 1, "one authored DROP TABLE");
 
     let since_drop = author.current_lsn();
@@ -181,7 +198,9 @@ fn a_received_drop_and_recreate_leaves_readable_committed_history() {
             &empty(),
         )
         .expect("the author recreates the table under its old name");
-    let recreate_changes = author.changes_since(since_drop);
+    let recreate_changes = author
+        .changes_since(since_drop)
+        .expect("read or construct the declared fixture result");
     assert_eq!(
         recreate_changes.ddl.len(),
         1,

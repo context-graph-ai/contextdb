@@ -18,6 +18,7 @@ pub enum Statement {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
+    ShowContentSize,
     SetMaintenancePollInterval(u64),
     ShowMaintenancePollInterval,
     /// The serving page cache a maintained vector partition may keep resident.
@@ -25,6 +26,10 @@ pub enum Statement {
     /// memory limit.
     SetVectorServingCache(Option<u64>),
     ShowVectorServingCache,
+    /// Declares storage compaction settings for this store, or returns every
+    /// setting to its default.
+    SetStorageCompaction(StorageCompactionSetting),
+    ShowStorageCompaction,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicy),
@@ -111,6 +116,30 @@ pub enum SetMemoryLimitValue {
     None,
 }
 
+/// `SET STORAGE_COMPACTION`: either back to the defaults, or the clauses the
+/// statement declares. An omitted clause keeps its current value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StorageCompactionSetting {
+    Default,
+    Declare(StorageCompactionClauses),
+}
+
+/// The clauses one `SET STORAGE_COMPACTION` statement declared. Ranges are
+/// checked by the engine when the declaration is applied, for SQL and Rust
+/// callers alike.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StorageCompactionClauses {
+    /// Reclaimable share of the file at which compaction starts, in (0, 1].
+    pub start_ratio: Option<f64>,
+    /// Minimum time between automatic compaction attempts: positive, at most
+    /// `i64::MAX` milliseconds.
+    pub min_interval_ms: Option<u64>,
+    /// Explicit compaction stops sweeping below this reclaimable share, in (0, 1].
+    pub stop_ratio: Option<f64>,
+    /// The most sweeps one explicit compaction runs, at least 1.
+    pub max_sweeps: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub enum SetDiskLimitValue {
     Bytes(u64),
@@ -186,6 +215,10 @@ pub struct SelectBody {
     pub from: Vec<FromItem>,
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
+    /// `GROUP BY` items as written. `parse` admits a nonempty list only in the
+    /// one grouped form the engine answers: `COUNT(*)` per group of plain
+    /// columns of one table.
+    pub group_by: Vec<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub use_vector: Option<VectorSearchMode>,
     pub use_rank: Option<String>,
@@ -246,6 +279,10 @@ pub enum SortDirection {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
+    /// Parsed window specification. It is lowered before scalar evaluation.
+    RowNumber(RowNumberWindow),
+    /// Planner-only binding in the WindowRank output, separate from named columns.
+    WindowRank(WindowBindingId),
     Column(ColumnRef),
     Literal(Literal),
     Parameter(String),
@@ -296,10 +333,28 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRef {
     pub table: Option<String>,
     pub column: String,
+}
+
+/// A binding is local to its WindowRank node and consumed at that query's projection.
+/// SQL identifiers cannot create or address this namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowBindingId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowNumberWindow {
+    /// Empty means a single partition over the input.
+    pub partition_by: Vec<ColumnRef>,
+    pub order_by: Vec<WindowOrderColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowOrderColumn {
+    pub column: ColumnRef,
+    pub direction: SortDirection,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +513,16 @@ pub enum AlterAction {
         /// `None` is the explicit `DEFAULT` spelling.
         auto_index_at: Option<String>,
     },
+    SetVectorAutoExpansionCeiling {
+        column: String,
+        /// `None` is the explicit `DEFAULT` spelling.
+        auto_expansion_ceiling: Option<String>,
+    },
+    SetVectorFlatBelow {
+        column: String,
+        /// `None` is the explicit `DEFAULT` spelling.
+        flat_below: Option<String>,
+    },
     SetVectorHnsw {
         column: String,
         /// `None` is `HNSW DEFAULT`; otherwise omitted members retain their
@@ -526,6 +591,8 @@ pub struct ColumnDef {
     pub max_partitions: Option<String>,
     pub search_mode: Option<VectorSearchMode>,
     pub auto_index_at: Option<String>,
+    pub auto_expansion_ceiling: Option<String>,
+    pub flat_below: Option<String>,
     pub hnsw: VectorHnswOptions,
     pub consolidation: VectorConsolidationOptions,
     pub rank_policy: Option<Box<RankPolicyAst>>,
@@ -542,6 +609,8 @@ pub struct VectorHnswOptions {
     pub m: Option<VectorPolicyValue>,
     pub ef_construction: Option<VectorPolicyValue>,
     pub ef_search: Option<VectorPolicyValue>,
+    /// Kept as written; a decimal is legal for this member only.
+    pub search_radius: Option<VectorPolicyValue>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

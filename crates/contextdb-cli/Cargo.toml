@@ -38,6 +38,7 @@ contextdb-server = { path = "../contextdb-server", version = "1.0", features = [
 # `repl.rs`) -- a real dependency now, not just a test one.
 contextdb-parser = { path = "../contextdb-parser", version = "1.0" }
 rustyline.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 tokio.workspace = true

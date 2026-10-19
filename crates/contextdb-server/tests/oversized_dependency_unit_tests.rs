@@ -23,6 +23,9 @@ use uuid::Uuid;
 
 const TENANT: &str = "oversized-dependency-unit";
 const IROH_FRAME_CEILING_BYTES: usize = 64 * 1024 * 1024;
+/// Room for the fixture's own reads of the oversized row: its stored page
+/// window is twice the row, plus the decoded copies it returns.
+const FIXTURE_READ_LIMIT: u64 = 512 * 1024 * 1024;
 
 fn bind_spec(identity_path: &Path) -> String {
     format!("iroh:?identity={}", identity_path.display())
@@ -93,9 +96,19 @@ fn sync_sent_counters(receipts: &[TransferReceipt]) -> TransferCounters {
         })
 }
 
+/// The fixture reads back a 64 MiB row, so it funds the lookup from the same
+/// explicit fixture budget as its other reads, not the 16 MiB default.
 fn row(db: &Database, table: &str, id: Uuid) -> Option<VersionedRow> {
-    db.point_lookup(table, "id", &Value::Uuid(id), db.snapshot())
-        .expect("point lookup")
+    let read_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        FIXTURE_READ_LIMIT,
+    );
+    db.point_lookup_with_read_memory_for_test(
+        table,
+        "id",
+        &Value::Uuid(id),
+        read_memory.child().expect("admit the fixture lookup"),
+    )
+    .expect("point lookup")
 }
 
 struct Hub {
@@ -114,11 +127,10 @@ async fn start_hub(root: &Path) -> Hub {
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub database"));
     declare_tables(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(TENANT),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -165,7 +177,8 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
     let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
     let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
     declare_tables(&edge);
-    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
 
     client
         .push()
@@ -200,7 +213,18 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
     // this same push durably and immutably binds -- would silently rebuild
     // the reference from a changed fact, not the one the client actually
     // encoded.
-    let (changes, arrivals) = edge.changes_since_with_arrivals(source_before);
+    // The fixture's own reads are caller reads of a 64 MiB row, so they get
+    // an explicit read budget sized to it rather than the 16 MiB default.
+    let fixture_read_memory =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            FIXTURE_READ_LIMIT,
+        );
+    let (changes, arrivals) = edge
+        .changes_since_with_arrivals_with_read_memory_for_test(
+            source_before,
+            fixture_read_memory.child().expect("admit the fixture read"),
+        )
+        .expect("read fixture changes and arrivals");
 
     // Production observation seams (test-seam builds only), read before the
     // push so the verdict below is a delta, not an absolute reading that
@@ -259,6 +283,9 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
             &edge_node_id,
             incarnation,
             dummy_lineage_signer,
+            fixture_read_memory
+                .child()
+                .expect("admit the fixture operation reader"),
         )
         .expect(
             "read back the same outbound row lineages and DDL provenance the sync client just attached",
@@ -397,9 +424,20 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
         "the outcome retains its declared parent reference"
     );
 
-    let dependency_lsns = hub
+    // The hub's change feed carries the 64 MiB row, so this fixture read is
+    // funded from the same explicit fixture budget as the test's other reads.
+    let (hub_changes, _) = hub
         .db
-        .changes_since(hub_before)
+        .changes_since_with_arrivals_with_read_memory_for_test(
+            hub_before,
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                FIXTURE_READ_LIMIT,
+            )
+            .child()
+            .expect("admit the fixture change read"),
+        )
+        .expect("read changes_since fixture");
+    let dependency_lsns = hub_changes
         .rows
         .iter()
         .filter(|change| {

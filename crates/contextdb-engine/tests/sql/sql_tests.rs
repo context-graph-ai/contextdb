@@ -452,7 +452,7 @@ fn begin_commit_rollback_session_sql() {
 }
 
 fn assert_transactional_schema_ddl_vector(db: &Database, phase: &str) -> Lsn {
-    let authored = db.changes_since(Lsn(0));
+    let authored = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(
         matches!(
             authored.ddl.as_slice(),
@@ -542,7 +542,7 @@ fn assert_rolled_back_schema_ddl_absent(db: &Database, phase: &str) {
         db.list_triggers().is_empty(),
         "{phase}: a rolled-back trigger must not remain declared"
     );
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(
         changes.ddl.is_empty(),
         "{phase}: a rolled-back DDL transaction must not leave an authored DDL log"

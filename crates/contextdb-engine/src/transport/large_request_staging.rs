@@ -45,16 +45,19 @@ impl LargeRequestControl {
             Self::FragmentV1(fragment) => (FRAGMENT_KIND, rmp_serde::to_vec_named(fragment)),
         };
         let body = body.map_err(|err| {
-            TransportError::Other(format!("cannot encode oversized request control: {err}"))
+            TransportError::Other(
+                (format!("cannot encode oversized request control: {err}")).into(),
+            )
         })?;
         if kind == BEGIN_KIND && body.len() > MAX_REQUEST_BEGIN_BYTES {
             return Err(TransportError::Other(
-                "oversized request descriptor exceeds its control ceiling".to_string(),
+                ("oversized request descriptor exceeds its control ceiling".to_string()).into(),
             ));
         }
         if kind == FRAGMENT_KIND && body.len() > MAX_REQUEST_FRAGMENT_ENVELOPE_BYTES {
             return Err(TransportError::Other(
-                "oversized request fragment envelope exceeds its frame ceiling".to_string(),
+                ("oversized request fragment envelope exceeds its frame ceiling".to_string())
+                    .into(),
             ));
         }
         let mut encoded = Vec::with_capacity(CONTROL_MAGIC.len() + 2 + body.len());
@@ -137,18 +140,20 @@ impl LargeRequestBegin {
     ) -> TransportResult<Self> {
         let total_bytes = u64::try_from(total_bytes).map_err(|_| {
             TransportError::Other(
-                "oversized request length cannot be represented on this platform".to_string(),
+                ("oversized request length cannot be represented on this platform".to_string())
+                    .into(),
             )
         })?;
         let total_fragments = u32::try_from(fragment_count(usize::try_from(total_bytes).map_err(
             |_| {
                 TransportError::Other(
-                    "oversized request length cannot be represented on this platform".to_string(),
+                    ("oversized request length cannot be represented on this platform".to_string())
+                        .into(),
                 )
             },
         )?))
         .map_err(|_| {
-            TransportError::Other("oversized request has too many fragments".to_string())
+            TransportError::Other(("oversized request has too many fragments".to_string()).into())
         })?;
         let transfer_digest =
             request_transfer_digest(subject, unit_digest, total_bytes, total_fragments);
@@ -164,12 +169,13 @@ impl LargeRequestBegin {
     pub(super) fn validate(&self) -> TransportResult<()> {
         if self.subject.is_empty() || self.subject == CONTROL_SUBJECT || self.total_fragments < 2 {
             return Err(TransportError::Other(
-                "oversized request descriptor has invalid bounds".to_string(),
+                ("oversized request descriptor has invalid bounds".to_string()).into(),
             ));
         }
         let total = usize::try_from(self.total_bytes).map_err(|_| {
             TransportError::Other(
-                "oversized request length cannot be represented on this platform".to_string(),
+                ("oversized request length cannot be represented on this platform".to_string())
+                    .into(),
             )
         })?;
         if fragment_count(total) != self.total_fragments as usize
@@ -182,7 +188,8 @@ impl LargeRequestBegin {
                 )
         {
             return Err(TransportError::Other(
-                "oversized request descriptor identity does not match its bounds".to_string(),
+                ("oversized request descriptor identity does not match its bounds".to_string())
+                    .into(),
             ));
         }
         Ok(())
@@ -190,7 +197,9 @@ impl LargeRequestBegin {
 
     pub(super) fn descriptor_digest(&self) -> TransportResult<[u8; blake3::OUT_LEN]> {
         let bytes = rmp_serde::to_vec_named(self).map_err(|err| {
-            TransportError::Other(format!("cannot encode oversized request descriptor: {err}"))
+            TransportError::Other(
+                (format!("cannot encode oversized request descriptor: {err}")).into(),
+            )
         })?;
         Ok(*blake3::hash(&bytes).as_bytes())
     }
@@ -217,7 +226,9 @@ impl LargeRequestControlReply {
             Self::FragmentProgressV1(progress) => (FRAGMENT_PROGRESS_KIND, progress),
         };
         let body = rmp_serde::to_vec_named(progress).map_err(|err| {
-            TransportError::Other(format!("cannot encode oversized request progress: {err}"))
+            TransportError::Other(
+                (format!("cannot encode oversized request progress: {err}")).into(),
+            )
         })?;
         let mut encoded = Vec::with_capacity(PROGRESS_MAGIC.len() + 2 + body.len());
         encoded.extend_from_slice(PROGRESS_MAGIC);
@@ -272,30 +283,40 @@ impl LargeRequestFragment {
                 unit_digest,
                 u64::try_from(total_bytes).map_err(|_| {
                     TransportError::Other(
-                        "oversized request length cannot be represented on this platform"
-                            .to_string(),
+                        ("oversized request length cannot be represented on this platform"
+                            .to_string())
+                        .into(),
                     )
                 })?,
                 u32::try_from(total_fragments).map_err(|_| {
-                    TransportError::Other("oversized request has too many fragments".to_string())
+                    TransportError::Other(
+                        ("oversized request has too many fragments".to_string()).into(),
+                    )
                 })?,
             ),
             fragment_digest: *blake3::hash(payload).as_bytes(),
             total_bytes: u64::try_from(total_bytes).map_err(|_| {
                 TransportError::Other(
-                    "oversized request length cannot be represented on this platform".to_string(),
+                    ("oversized request length cannot be represented on this platform".to_string())
+                        .into(),
                 )
             })?,
             sequence: u32::try_from(sequence).map_err(|_| {
-                TransportError::Other("oversized request has too many fragments".to_string())
+                TransportError::Other(
+                    ("oversized request has too many fragments".to_string()).into(),
+                )
             })?,
             total_fragments: u32::try_from(total_fragments).map_err(|_| {
-                TransportError::Other("oversized request has too many fragments".to_string())
+                TransportError::Other(
+                    ("oversized request has too many fragments".to_string()).into(),
+                )
             })?,
             payload: payload.to_vec(),
         };
         rmp_serde::to_vec_named(&fragment).map_err(|err| {
-            TransportError::Other(format!("cannot encode oversized request fragment: {err}"))
+            TransportError::Other(
+                (format!("cannot encode oversized request fragment: {err}")).into(),
+            )
         })
     }
 }
@@ -311,7 +332,97 @@ struct StageManifest {
     transfer_digest: [u8; blake3::OUT_LEN],
 }
 
-#[derive(Debug)]
+/// Funds reassembling a complete oversized request from the receiver's own
+/// budget. The serving side installs it; a transport without one assembles
+/// unfunded, as before.
+pub(crate) trait LargeRequestAdmission: Send + Sync {
+    /// Refuse at once, without reserving anything, a request whose assembly
+    /// could never fit the funding budget's limit.
+    fn preflight(&self, bytes: usize) -> std::result::Result<(), contextdb_core::Error>;
+    /// Charge `bytes` before they are allocated. The credit is held until the
+    /// request's handler returns.
+    fn admit(
+        &self,
+        bytes: usize,
+    ) -> std::result::Result<Box<dyn AssemblyCredit>, contextdb_core::Error>;
+}
+
+/// A held reassembly charge.
+pub(crate) trait AssemblyCredit: Send {
+    /// Release all but `bytes` of the charge.
+    fn shrink_to(&mut self, bytes: usize);
+}
+
+/// A typed refusal as it travels in an admission-refused reply.
+#[derive(Debug, Serialize, Deserialize)]
+enum WireAdmissionRefusal {
+    Memory {
+        subsystem: String,
+        operation: String,
+        requested_bytes: u64,
+        available_bytes: u64,
+        budget_limit_bytes: u64,
+        hint: String,
+    },
+    Other(String),
+}
+
+pub(crate) fn encode_admission_refusal(error: &contextdb_core::Error) -> Vec<u8> {
+    let refusal = match error {
+        contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => WireAdmissionRefusal::Memory {
+            subsystem: subsystem.to_string(),
+            operation: operation.to_string(),
+            requested_bytes: *requested_bytes as u64,
+            available_bytes: *available_bytes as u64,
+            budget_limit_bytes: *budget_limit_bytes as u64,
+            hint: hint.to_string(),
+        },
+        other => WireAdmissionRefusal::Other(other.to_string()),
+    };
+    rmp_serde::to_vec(&refusal).unwrap_or_default()
+}
+
+pub(crate) fn decode_admission_refusal(bytes: &[u8]) -> contextdb_core::Error {
+    let saturate = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+    match rmp_serde::from_slice::<WireAdmissionRefusal>(bytes) {
+        Ok(WireAdmissionRefusal::Memory {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        }) => contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: subsystem.into(),
+            operation: operation.into(),
+            requested_bytes: saturate(requested_bytes),
+            available_bytes: saturate(available_bytes),
+            budget_limit_bytes: saturate(budget_limit_bytes),
+            hint: hint.into(),
+        },
+        Ok(WireAdmissionRefusal::Other(detail)) => contextdb_core::Error::SyncError(detail.into()),
+        Err(err) => contextdb_core::Error::SyncError(
+            (format!("the receiver refused the request with an unreadable reason: {err}")).into(),
+        ),
+    }
+}
+
+/// A complete request's payload and, when an admission funded it, its charge.
+type AssembledRequest = (Vec<u8>, Option<Box<dyn AssemblyCredit>>);
+
+/// The bytes a complete request's assembly holds at its peak: every staged
+/// fragment read back plus the assembled payload.
+pub(crate) fn assembly_peak_bytes(total_bytes: usize) -> usize {
+    total_bytes.saturating_mul(2)
+}
+
 pub(super) enum StageOutcome {
     Pending {
         next_missing: u32,
@@ -320,7 +431,32 @@ pub(super) enum StageOutcome {
         subject: String,
         payload: Vec<u8>,
         completed_path: PathBuf,
+        /// The assembled payload's charge, when an admission funded it.
+        credit: Option<Box<dyn AssemblyCredit>>,
     },
+}
+
+impl std::fmt::Debug for StageOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending { next_missing } => f
+                .debug_struct("Pending")
+                .field("next_missing", next_missing)
+                .finish(),
+            Self::Complete {
+                subject,
+                payload,
+                completed_path,
+                credit,
+            } => f
+                .debug_struct("Complete")
+                .field("subject", subject)
+                .field("payload_bytes", &payload.len())
+                .field("completed_path", completed_path)
+                .field("funded", &credit.is_some())
+                .finish(),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -346,11 +482,22 @@ pub(super) fn fragment_count(total_bytes: usize) -> usize {
     total_bytes.div_ceil(FRAGMENT_BYTES)
 }
 
+#[cfg(test)]
 pub(super) fn accept_descriptor_fragment(
     stage_root: &Path,
     authenticated_node_id: &str,
     begin: &LargeRequestBegin,
     fragment: &LargeRequestFragment,
+) -> TransportResult<StageOutcome> {
+    accept_descriptor_fragment_admitted(stage_root, authenticated_node_id, begin, fragment, None)
+}
+
+pub(super) fn accept_descriptor_fragment_admitted(
+    stage_root: &Path,
+    authenticated_node_id: &str,
+    begin: &LargeRequestBegin,
+    fragment: &LargeRequestFragment,
+    admission: Option<&dyn LargeRequestAdmission>,
 ) -> TransportResult<StageOutcome> {
     begin.validate()?;
     let manifest = stage_manifest(authenticated_node_id, begin);
@@ -374,7 +521,7 @@ pub(super) fn accept_descriptor_fragment(
         ));
     }
     persist_manifest_at(&stage, &manifest)?;
-    accept_fragment_at_stage(&stage, &completed_path, &manifest, fragment)
+    accept_fragment_at_stage(&stage, &completed_path, &manifest, fragment, admission)
 }
 
 #[cfg(test)]
@@ -397,12 +544,35 @@ pub(super) fn accept_fragment(
     accept_descriptor_fragment(stage_root, authenticated_node_id, &begin, &fragment)
 }
 
+#[cfg(test)]
 pub(super) fn begin_request(
     stage_root: &Path,
     authenticated_node_id: &str,
     begin: &LargeRequestBegin,
 ) -> TransportResult<StageOutcome> {
+    begin_request_admitted(stage_root, authenticated_node_id, begin, None)
+}
+
+pub(super) fn begin_request_admitted(
+    stage_root: &Path,
+    authenticated_node_id: &str,
+    begin: &LargeRequestBegin,
+    admission: Option<&dyn LargeRequestAdmission>,
+) -> TransportResult<StageOutcome> {
     begin.validate()?;
+    // A request whose assembly can never fit the receiver's budget is refused
+    // before anything is staged, so no transfer is spent on it.
+    if let Some(admission) = admission {
+        let total_bytes = usize::try_from(begin.total_bytes).map_err(|_| {
+            TransportError::Other(
+                ("oversized request length cannot be represented on this platform".to_string())
+                    .into(),
+            )
+        })?;
+        admission
+            .preflight(assembly_peak_bytes(total_bytes))
+            .map_err(TransportError::Refused)?;
+    }
     let manifest = stage_manifest(authenticated_node_id, begin);
     let completed_path = stage_path(stage_root, &manifest);
     let stage = stage_dir(
@@ -416,11 +586,12 @@ pub(super) fn begin_request(
     if next_missing != manifest.total_fragments {
         return Ok(StageOutcome::Pending { next_missing });
     }
-    let payload = assemble_complete_stage_at(&stage, &manifest)?;
+    let (payload, credit) = assemble_complete_stage_at(&stage, &manifest, admission)?;
     Ok(StageOutcome::Complete {
         subject: begin.subject.clone(),
         payload,
         completed_path,
+        credit,
     })
 }
 
@@ -441,6 +612,7 @@ fn accept_fragment_at_stage(
     completed_path: &Path,
     manifest: &StageManifest,
     fragment: &LargeRequestFragment,
+    admission: Option<&dyn LargeRequestAdmission>,
 ) -> TransportResult<StageOutcome> {
     validate_fragment(manifest, fragment)?;
     let next_missing = repair_request_fragment_prefix_at(stage, manifest)?;
@@ -458,11 +630,12 @@ fn accept_fragment_at_stage(
         return Ok(StageOutcome::Pending { next_missing });
     }
 
-    let payload = assemble_complete_stage_at(stage, manifest)?;
+    let (payload, credit) = assemble_complete_stage_at(stage, manifest, admission)?;
     Ok(StageOutcome::Complete {
         subject: manifest.subject.clone(),
         payload,
         completed_path: completed_path.to_path_buf(),
+        credit,
     })
 }
 
@@ -513,13 +686,16 @@ pub(super) fn snapshot_stage(
             total_fragments: u32::try_from(fragment_count(usize::try_from(total_bytes).map_err(
                 |_| {
                     TransportError::Other(
-                        "oversized request length cannot be represented on this platform"
-                            .to_string(),
+                        ("oversized request length cannot be represented on this platform"
+                            .to_string())
+                        .into(),
                     )
                 },
             )?))
             .map_err(|_| {
-                TransportError::Other("oversized request has too many fragments".to_string())
+                TransportError::Other(
+                    ("oversized request has too many fragments".to_string()).into(),
+                )
             })?,
             transfer_digest: request_transfer_digest(
                 subject,
@@ -528,13 +704,16 @@ pub(super) fn snapshot_stage(
                 u32::try_from(fragment_count(usize::try_from(total_bytes).map_err(
                     |_| {
                         TransportError::Other(
-                            "oversized request length cannot be represented on this platform"
-                                .to_string(),
+                            ("oversized request length cannot be represented on this platform"
+                                .to_string())
+                            .into(),
                         )
                     },
                 )?))
                 .map_err(|_| {
-                    TransportError::Other("oversized request has too many fragments".to_string())
+                    TransportError::Other(
+                        ("oversized request has too many fragments".to_string()).into(),
+                    )
                 })?,
             ),
         },
@@ -556,9 +735,9 @@ pub(super) fn snapshot_stage(
         return Ok(None);
     };
     let manifest: StageManifest = rmp_serde::from_slice(&encoded).map_err(|err| {
-        TransportError::Other(format!(
-            "cannot decode durable oversized request manifest: {err}"
-        ))
+        TransportError::Other(
+            (format!("cannot decode durable oversized request manifest: {err}")).into(),
+        )
     })?;
     if manifest.version != MANIFEST_VERSION
         || manifest.subject != subject
@@ -567,7 +746,7 @@ pub(super) fn snapshot_stage(
         || manifest.total_bytes != total_bytes
     {
         return Err(TransportError::Other(
-            "durable oversized request stage identity does not match".to_string(),
+            ("durable oversized request stage identity does not match".to_string()).into(),
         ));
     }
     let mut fragments = Vec::new();
@@ -640,9 +819,9 @@ fn snapshot_all_stages_at(
             continue;
         };
         let manifest: StageManifest = rmp_serde::from_slice(&encoded).map_err(|err| {
-            TransportError::Other(format!(
-                "cannot decode durable oversized request manifest: {err}"
-            ))
+            TransportError::Other(
+                (format!("cannot decode durable oversized request manifest: {err}")).into(),
+            )
         })?;
         let mut fragments = Vec::new();
         for sequence in 0..manifest.total_fragments {
@@ -676,12 +855,13 @@ fn validate_fragment(
 ) -> TransportResult<()> {
     if fragment.transfer_digest != manifest.transfer_digest {
         return Err(TransportError::Other(
-            "oversized request fragment belongs to a different descriptor".to_string(),
+            ("oversized request fragment belongs to a different descriptor".to_string()).into(),
         ));
     }
     if fragment.subject != manifest.subject || fragment.unit_digest != manifest.unit_digest {
         return Err(TransportError::Other(
-            "oversized request fragment metadata does not match its descriptor".to_string(),
+            ("oversized request fragment metadata does not match its descriptor".to_string())
+                .into(),
         ));
     }
     if fragment.total_fragments < 2
@@ -690,33 +870,35 @@ fn validate_fragment(
         || fragment.payload.len() > FRAGMENT_BYTES
     {
         return Err(TransportError::Other(
-            "oversized request fragment has invalid bounds".to_string(),
+            ("oversized request fragment has invalid bounds".to_string()).into(),
         ));
     }
     if fragment.total_bytes != manifest.total_bytes
         || fragment.total_fragments != manifest.total_fragments
     {
         return Err(TransportError::Other(
-            "oversized request fragment count does not match its complete length".to_string(),
+            ("oversized request fragment count does not match its complete length".to_string())
+                .into(),
         ));
     }
     let expected_fragment_bytes = if fragment.sequence + 1 == fragment.total_fragments {
-        let complete_prefix = usize::try_from(fragment.sequence)
-            .ok()
-            .and_then(|sequence| sequence.checked_mul(FRAGMENT_BYTES))
-            .ok_or_else(|| {
-                TransportError::Other(
+        let complete_prefix =
+            usize::try_from(fragment.sequence)
+                .ok()
+                .and_then(|sequence| sequence.checked_mul(FRAGMENT_BYTES))
+                .ok_or_else(|| {
+                    TransportError::Other((
                     "oversized request fragment length cannot be represented on this platform"
-                        .to_string(),
-                )
-            })?;
+                        .to_string()).into())
+                })?;
         usize::try_from(manifest.total_bytes)
             .ok()
             .and_then(|total| total.checked_sub(complete_prefix))
             .ok_or_else(|| {
                 TransportError::Other(
-                    "oversized request fragment length does not match its complete length"
-                        .to_string(),
+                    ("oversized request fragment length does not match its complete length"
+                        .to_string())
+                    .into(),
                 )
             })?
     } else {
@@ -724,12 +906,12 @@ fn validate_fragment(
     };
     if fragment.payload.len() != expected_fragment_bytes {
         return Err(TransportError::Other(
-            "oversized request fragment length does not match its sequence".to_string(),
+            ("oversized request fragment length does not match its sequence".to_string()).into(),
         ));
     }
     if *blake3::hash(&fragment.payload).as_bytes() != fragment.fragment_digest {
         return Err(TransportError::Other(
-            "oversized request fragment failed integrity validation".to_string(),
+            ("oversized request fragment failed integrity validation".to_string()).into(),
         ));
     }
     Ok(())
@@ -1185,7 +1367,9 @@ impl StageDir {
         }
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(length).map_err(|err| {
-            TransportError::Other(format!("cannot reserve {length} bytes for {what}: {err}"))
+            TransportError::Other(
+                (format!("cannot reserve {length} bytes for {what}: {err}")).into(),
+            )
         })?;
         file.read_to_end(&mut bytes).map_err(|err| {
             stage_io_error(
@@ -2071,7 +2255,7 @@ compile_error!(
 
 fn persist_manifest_at(stage: &StageDir, manifest: &StageManifest) -> TransportResult<()> {
     let encoded = rmp_serde::to_vec_named(manifest).map_err(|err| {
-        TransportError::Other(format!("cannot encode oversized request manifest: {err}"))
+        TransportError::Other((format!("cannot encode oversized request manifest: {err}")).into())
     })?;
     match stage.read_optional(
         "manifest.msgpack",
@@ -2081,7 +2265,7 @@ fn persist_manifest_at(stage: &StageDir, manifest: &StageManifest) -> TransportR
         None => stage.persist_new("manifest.msgpack", &encoded, "oversized request manifest"),
         Some(existing) if existing == encoded => Ok(()),
         Some(_) => Err(TransportError::Other(
-            "durable oversized request stage identity does not match".to_string(),
+            ("durable oversized request stage identity does not match".to_string()).into(),
         )),
     }
 }
@@ -2104,7 +2288,8 @@ fn persist_fragment_at(stage: &StageDir, fragment: &LargeRequestFragment) -> Tra
         }
         Some(_) => {
             return Err(TransportError::Other(
-                "durable oversized request fragment differs from the staged bytes".to_string(),
+                ("durable oversized request fragment differs from the staged bytes".to_string())
+                    .into(),
             ));
         }
         None => {}
@@ -2150,7 +2335,7 @@ fn repair_request_fragment_prefix_at(
 fn request_fragment_bytes(manifest: &StageManifest, sequence: u32) -> TransportResult<usize> {
     let total = usize::try_from(manifest.total_bytes).map_err(|_| {
         TransportError::Other(
-            "oversized request length cannot be represented on this platform".to_string(),
+            ("oversized request length cannot be represented on this platform".to_string()).into(),
         )
     })?;
     Ok(if sequence + 1 == manifest.total_fragments {
@@ -2177,12 +2362,19 @@ fn discard_request_fragment_suffix_at(
 fn assemble_complete_stage_at(
     stage: &StageDir,
     manifest: &StageManifest,
-) -> TransportResult<Vec<u8>> {
+    admission: Option<&dyn LargeRequestAdmission>,
+) -> TransportResult<AssembledRequest> {
     let total_bytes = usize::try_from(manifest.total_bytes).map_err(|_| {
         TransportError::Other(
-            "oversized request length cannot be represented on this platform".to_string(),
+            ("oversized request length cannot be represented on this platform".to_string()).into(),
         )
     })?;
+    // Charged before any fragment is read back. A refusal leaves every staged
+    // fragment in place, so the sender's retry resumes the same stage.
+    let mut credit = admission
+        .map(|admission| admission.admit(assembly_peak_bytes(total_bytes)))
+        .transpose()
+        .map_err(TransportError::Refused)?;
     let mut fragments = Vec::new();
     for sequence in 0..manifest.total_fragments {
         let path = format!("{sequence:08}.part");
@@ -2210,23 +2402,28 @@ fn assemble_complete_stage_at(
     // available instead of losing its stage.
     let mut payload = Vec::new();
     payload.try_reserve_exact(total_bytes).map_err(|err| {
-        TransportError::Other(format!(
-            "cannot reserve {total_bytes} bytes for complete oversized request: {err}"
-        ))
+        TransportError::Other(
+            (format!("cannot reserve {total_bytes} bytes for complete oversized request: {err}"))
+                .into(),
+        )
     })?;
     for fragment in fragments {
         payload.extend_from_slice(&fragment);
     }
     if *blake3::hash(&payload).as_bytes() != manifest.unit_digest {
         return Err(TransportError::Other(
-            "complete oversized request failed integrity validation".to_string(),
+            ("complete oversized request failed integrity validation".to_string()).into(),
         ));
     }
-    Ok(payload)
+    // The read-back fragments are gone; only the assembled payload stays held.
+    if let Some(credit) = credit.as_mut() {
+        credit.shrink_to(total_bytes);
+    }
+    Ok((payload, credit))
 }
 
 fn stage_io_error(_path: &Path, action: &str, _err: std::io::Error) -> TransportError {
-    TransportError::Other(action.to_string())
+    TransportError::Other((action.to_string()).into())
 }
 
 #[cfg(unix)]
@@ -2320,7 +2517,9 @@ impl LargeResponseManifest {
 
     pub(super) fn encode(&self) -> TransportResult<Vec<u8>> {
         rmp_serde::to_vec_named(self).map_err(|err| {
-            TransportError::Other(format!("cannot encode oversized response manifest: {err}"))
+            TransportError::Other(
+                (format!("cannot encode oversized response manifest: {err}")).into(),
+            )
         })
     }
 
@@ -2390,9 +2589,9 @@ pub(super) fn stage_large_response_with_budget(
 ) -> TransportResult<LargeResponseManifest> {
     let mut publication_nonce = [0u8; 32];
     getrandom::fill(&mut publication_nonce).map_err(|err| {
-        TransportError::Other(format!(
-            "cannot create a unique oversized response publication: {err}"
-        ))
+        TransportError::Other(
+            (format!("cannot create a unique oversized response publication: {err}")).into(),
+        )
     })?;
     stage_large_response_with_nonce_and_budget(
         root,
@@ -2445,7 +2644,7 @@ fn stage_large_response_with_nonce_and_budget(
     let total_chunks = response.len().div_ceil(RESPONSE_CHUNK_BYTES);
     if total_chunks < 2 {
         return Err(TransportError::Other(
-            "oversized response stage received a fitting reply".to_string(),
+            ("oversized response stage received a fitting reply".to_string()).into(),
         ));
     }
     let manifest = LargeResponseManifest {
@@ -2473,18 +2672,18 @@ fn stage_large_response_with_nonce_and_budget(
     ];
     if encoded.len() > MAX_RESPONSE_CONTROL_BYTES {
         return Err(TransportError::Other(
-            "oversized response manifest cannot fit its control frame".to_string(),
+            ("oversized response manifest cannot fit its control frame".to_string()).into(),
         ));
     }
     for control in controls {
         let encoded_control = rmp_serde::to_vec_named(&control).map_err(|err| {
-            TransportError::Other(format!(
-                "cannot encode oversized response control before staging: {err}"
-            ))
+            TransportError::Other(
+                (format!("cannot encode oversized response control before staging: {err}")).into(),
+            )
         })?;
         if encoded_control.len() > MAX_RESPONSE_CONTROL_BYTES {
             return Err(TransportError::Other(
-                "oversized response manifest cannot fit its control frame".to_string(),
+                ("oversized response manifest cannot fit its control frame".to_string()).into(),
             ));
         }
     }
@@ -2501,7 +2700,7 @@ fn stage_large_response_with_nonce_and_budget(
             })
             .ok_or_else(|| {
                 TransportError::Other(
-                    "oversized response durable size cannot be represented".to_string(),
+                    ("oversized response durable size cannot be represented".to_string()).into(),
                 )
             })?;
         reserve_response_stage_budget(root, budget, admission.protected, required)?;
@@ -2899,7 +3098,8 @@ fn persist_response_chunk_at(
     let expected_bytes = response_chunk_len(manifest, sequence)?;
     if bytes.len() != expected_bytes {
         return Err(TransportError::Other(
-            "oversized response chunk length does not match its manifest sequence".to_string(),
+            ("oversized response chunk length does not match its manifest sequence".to_string())
+                .into(),
         ));
     }
     let digest = *blake3::hash(bytes).as_bytes();
@@ -3012,9 +3212,9 @@ fn reserve_response_stage_budget(
         return if required <= budget {
             Ok(())
         } else {
-            Err(TransportError::Other(format!(
+            Err(TransportError::Other((format!(
                 "durable oversized response storage requires {required} bytes, exceeding the configured {budget}-byte budget while active transfers remain protected"
-            )))
+            )).into()))
         };
     };
     let mut units = Vec::new();
@@ -3054,13 +3254,13 @@ fn reserve_response_stage_budget(
     }
     let needed = total.checked_add(required).ok_or_else(|| {
         TransportError::Other(
-            "durable oversized response storage requirement overflows".to_string(),
+            ("durable oversized response storage requirement overflows".to_string()).into(),
         )
     })?;
     if needed > budget {
-        Err(TransportError::Other(format!(
+        Err(TransportError::Other((format!(
             "durable oversized response storage requires {needed} bytes, exceeding the configured {budget}-byte budget while active transfers remain protected"
-        )))
+        )).into()))
     } else {
         Ok(())
     }

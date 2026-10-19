@@ -96,7 +96,7 @@ fn every_refusal() -> Vec<ReadFailure> {
                 refusals.push(refusal(
                     kind,
                     ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-                        inspection: "image_state".to_owned(),
+                        inspection: "image_state".to_owned().into(),
                     }),
                 ));
             }

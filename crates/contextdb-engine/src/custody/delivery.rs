@@ -13,10 +13,13 @@ pub(crate) fn manifested_request(
     table: &str,
     key: &NaturalKey,
     signer: &LineageSigner,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<crate::protocol::PushRequest> {
     use crate::protocol::*;
-    let m = current_manifest(db, table, key)?.ok_or_else(|| Error::ManifestRequired {
-        table: table.into(),
+    let m = current_manifest(db, table, key, read_memory.clone())?.ok_or_else(|| {
+        Error::ManifestRequired {
+            table: table.into(),
+        }
     })?;
     if m.tenant != *tenant {
         return Err(invalid());
@@ -24,7 +27,7 @@ pub(crate) fn manifested_request(
     let mut changes = ChangeSet::default();
     let mut lineage = std::collections::HashMap::new();
     for evidence in &m.rows {
-        let row = actual_row(db, &evidence.reference)?;
+        let row = actual_row(db, &evidence.reference, read_memory.clone())?;
         lineage.insert(
             (
                 evidence.reference.table.clone(),
@@ -114,9 +117,11 @@ pub(crate) fn wire_packet(packet: &SignedOutcomePacket) -> Result<WireDeliveryOu
     Ok(wire)
 }
 
-pub(crate) fn read_packet(wire: &WireDeliveryOutcome) -> Result<SignedOutcomePacket> {
-    let packet: SignedOutcomePacket =
-        rmp_serde::from_slice(&wire.lookup_source).map_err(|_| invalid())?;
+pub(crate) fn read_packet(
+    wire: &WireDeliveryOutcome,
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+) -> Result<SignedOutcomePacket> {
+    let packet: SignedOutcomePacket = memory.decode_msgpack(&wire.lookup_source)?;
     if wire_packet(&packet)? != *wire {
         return Err(invalid());
     }
@@ -127,9 +132,12 @@ pub(crate) fn packet_for(
     db: &Database,
     t: &TerminalRecord,
     signer: &LineageSigner,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<SignedOutcomePacket> {
-    let block = db
-        .custody_submission(t.submission)?
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    let block = custody_hold
+        .retain(db.custody_submission(t.submission, read_memory.clone())?)?
         .into_iter()
         .find_map(|r| match r {
             Record::Diagnostic {
@@ -141,10 +149,16 @@ pub(crate) fn packet_for(
         })
         .ok_or_else(invalid)?;
     Ok(SignedOutcomePacket {
-        checkpoint: super::checkpoint::current(db, &t.namespace)?,
+        checkpoint: super::checkpoint::current(db, &t.namespace, read_memory.clone())?,
         record: t.clone(),
         block,
-        certificate: committed_certificate(db, &t.namespace, &t.state, signer)?,
+        certificate: committed_certificate(
+            db,
+            &t.namespace,
+            &t.state,
+            signer,
+            read_memory.clone(),
+        )?,
     })
 }
 
@@ -153,6 +167,7 @@ pub(crate) fn attach(
     tenant: &TenantId,
     changes: &ChangeSet,
     signer: &LineageSigner,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<WireDeliveryManifest>> {
     let mut out = Vec::new();
     for row in &changes.rows {
@@ -160,12 +175,19 @@ pub(crate) fn attach(
             && db
                 .table_meta(&row.table)
                 .is_some_and(|m| m.delivery_manifest_tables.is_some())
-            && current_manifest(db, &row.table, &row.natural_key)?.is_some()
+            && current_manifest(db, &row.table, &row.natural_key, read_memory.clone())?.is_some()
         {
             out.extend(
-                manifested_request(db, tenant, &row.table, &row.natural_key, signer)?
-                    .changeset
-                    .manifests,
+                manifested_request(
+                    db,
+                    tenant,
+                    &row.table,
+                    &row.natural_key,
+                    signer,
+                    read_memory.clone(),
+                )?
+                .changeset
+                .manifests,
             );
         }
     }
@@ -178,6 +200,7 @@ pub(crate) struct DeliveryRoute<'a> {
     pub(crate) edge: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn apply(
     db: &Database,
     route: DeliveryRoute<'_>,
@@ -185,7 +208,19 @@ pub(crate) fn apply(
     changes: ChangeSet,
     arrivals: &std::collections::HashMap<contextdb_core::Lsn, Option<contextdb_core::Lsn>>,
     lineages: &[(String, NaturalKey, contextdb_core::Lsn, WireRowLineage)],
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(ApplyResult, Vec<WireDeliveryOutcome>)> {
+    let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
+        db.bounded_read_accountant(),
+        read_memory.clone(),
+        "reader",
+        "decode_custody_metadata",
+        "Reduce selected custody metadata.",
+    )?;
+
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     let DeliveryRoute { tenant, hub, edge } = route;
     let runtime = db.custody_runtime().ok_or_else(invalid)?;
     let signer = &runtime.signer;
@@ -196,13 +231,12 @@ pub(crate) fn apply(
         new_lsn: db.current_lsn(),
     };
     let mut outcomes = Vec::new();
-    let authority = db.custody_authority()?;
+    let authority = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
     let mut remainder = changes;
     let mut covered = Vec::new();
     let mut manifests = Vec::new();
     for wire in &request.changeset.manifests {
-        let m: ManifestRecord =
-            rmp_serde::from_slice(&wire.policy_evidence).map_err(|_| invalid())?;
+        let m: ManifestRecord = decoded_memory.decode_msgpack(&wire.policy_evidence)?;
         m.verify()?;
         if m.tenant != *tenant
             || m.edge_node != edge
@@ -242,12 +276,19 @@ pub(crate) fn apply(
                 })
         })
     });
-    let (missing, refused) =
-        missing_manifest(db, tenant, hub, edge, request.incarnation, &remainder)?;
+    let (missing, refused) = missing_manifest(
+        db,
+        tenant,
+        hub,
+        edge,
+        request.incarnation,
+        &remainder,
+        read_memory.clone(),
+    )?;
     result.skipped_rows += missing.skipped_rows;
     result.conflicts.extend(missing.conflicts);
     outcomes.extend(refused);
-    remove_missing_units(db, &mut remainder);
+    remove_missing_units(db, &mut remainder, read_memory.clone());
     let (after, before): (Vec<_>, Vec<_>) = db
         .custody_remainder_units(remainder)
         .into_iter()
@@ -279,11 +320,13 @@ pub(crate) fn apply(
                 lineages,
                 unit.changes,
                 unit.dependency_complete,
+                read_memory.clone(),
             )?,
         );
     }
     for m in manifests {
-        let mut records = db.custody_root(&m.seal.root)?;
+        let mut records =
+            custody_hold.retain(db.custody_root(&m.seal.root, read_memory.clone())?)?;
         records.extend(authority.iter().cloned());
         let rows = manifested_rows
             .iter()
@@ -303,14 +346,17 @@ pub(crate) fn apply(
                 && t.namespace.edge_node == edge
                 && t.namespace.edge_incarnation == request.incarnation
                 && t.namespace.hub_incarnation
-                    == db.existing_sync_incarnation(tenant).ok().flatten()? =>
+                    == db
+                        .existing_sync_incarnation(tenant, read_memory.clone())
+                        .ok()
+                        .flatten()? =>
             {
                 Some(t)
             }
             _ => None,
         });
         if let Some(t) = existing {
-            let packet = packet_for(db, t, signer)?;
+            let packet = packet_for(db, t, signer, read_memory.clone())?;
             result.skipped_rows += rows.len();
             result.conflicts.extend(packet.block.conflicts.clone());
             outcomes.push(wire_packet(&packet)?);
@@ -358,7 +404,8 @@ pub(crate) fn apply(
             meta.conflict_policy
                 .unwrap_or(contextdb_core::DEFAULT_CONFLICT_POLICY)
                 == contextdb_core::ConflictPolicy::KEEP_FIRST
-        }) && let Some(digest) = db.custody_incumbent_digest(&m.seal.root)?
+        }) && let Some(digest) =
+            db.custody_incumbent_digest(&m.seal.root, vector_copy_owner, read_memory.clone())?
         {
             // A hub-written root has custody even before any
             // terminal exists. Compare its complete held content and membership.
@@ -384,6 +431,8 @@ pub(crate) fn apply(
                 cause: cause.map(str::to_string),
             },
             signer,
+            vector_copy_owner,
+            read_memory.clone(),
         )?;
         if kind == 0 {
             result.applied_rows += rows.len();
@@ -405,18 +454,23 @@ pub(crate) fn apply(
                 lineages,
                 unit.changes,
                 unit.dependency_complete,
+                read_memory.clone(),
             )?,
         );
     }
     if let Some(source_lsn) = source_lsn {
-        db.finish_custody_push(&crate::database::SyncApplyReceipt {
-            tenant_id: tenant.clone(),
-            node_id: edge.into(),
-            incarnation: request.incarnation,
-            source_lsn,
-            dependency_complete: true,
-            hub_contact_ms: None,
-        })?;
+        db.finish_custody_push(
+            &crate::database::SyncApplyReceipt {
+                tenant_id: tenant.clone(),
+                node_id: edge.into(),
+                incarnation: request.incarnation,
+                source_lsn,
+                dependency_complete: true,
+                hub_contact_ms: None,
+            },
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
     }
     Ok((result, outcomes))
 }
@@ -428,7 +482,13 @@ fn missing_manifest(
     edge: &str,
     incarnation: contextdb_core::Incarnation,
     changes: &ChangeSet,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(ApplyResult, Vec<WireDeliveryOutcome>)> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+    let vector_copy_owner = &mut retained_vector_copy;
+
     let signer = db.custody_runtime().ok_or_else(invalid)?.signer;
     if !changes.rows.iter().any(|r| {
         !r.deleted
@@ -449,7 +509,7 @@ fn missing_manifest(
     let namespace = Namespace {
         tenant: tenant.clone(),
         hub_node: hub.into(),
-        hub_incarnation: db.sync_incarnation(tenant)?,
+        hub_incarnation: db.sync_incarnation_with_read_memory(tenant, read_memory.clone())?,
         edge_node: edge.into(),
         edge_incarnation: incarnation,
     };
@@ -466,8 +526,8 @@ fn missing_manifest(
         unit.raw(&full_row_digest(&root.values));
         let digest = unit.digest();
         let submission = uuid::Uuid::from_bytes(digest[..16].try_into().map_err(|_| invalid())?);
-        if let Some(existing) = db
-            .custody_submission(submission)?
+        if let Some(existing) = custody_hold
+            .retain(db.custody_submission(submission, read_memory.clone())?)?
             .iter()
             .find_map(|r| match r {
                 Record::Terminal {
@@ -477,10 +537,15 @@ fn missing_manifest(
                 _ => None,
             })
         {
-            outcomes.push(wire_packet(&packet_for(db, &existing, &signer)?)?);
+            outcomes.push(wire_packet(&packet_for(
+                db,
+                &existing,
+                &signer,
+                read_memory.clone(),
+            )?)?);
             continue;
         }
-        let state = next_state(db, namespace.hub_incarnation)?;
+        let state = next_state(db, namespace.hub_incarnation, read_memory.clone())?;
         let block = DiagnosticBlock {
             salt: random_digest(),
             subjects: vec![(
@@ -493,56 +558,67 @@ fn missing_manifest(
             conflicts: Vec::new(),
         };
         let mut terminal = None;
-        db.commit_delivery_metadata(|lsn| {
-            let mut t = TerminalRecord {
-                namespace: namespace.clone(),
-                root: RowRef {
-                    table: root.table.clone(),
-                    key: root.natural_key.clone(),
-                },
-                origin_life_digest: digest,
-                submission,
-                seal_digest: digest,
-                unit_digest: digest,
-                source: (root.lsn, 0),
-                kind: 2,
-                cause: Some("manifest_required".into()),
-                position: (lsn, 0),
-                state: state.state.clone(),
-                diagnostics: DiagnosticClaim::from_block(&block)?,
-                signature: Vec::new(),
-            };
-            t.signature = signer(&t.bytes()?)?;
-            let mut records = state_records(db, state, &namespace.tenant, &namespace.hub_node)?;
-            records.extend([
-                Record::Terminal {
-                    edge: false,
-                    record: t.clone(),
-                },
-                Record::Diagnostic {
-                    namespace: t.namespace.clone(),
+        db.commit_delivery_metadata(
+            |lsn| {
+                let mut t = TerminalRecord {
+                    namespace: namespace.clone(),
+                    root: RowRef {
+                        table: root.table.clone(),
+                        key: root.natural_key.clone(),
+                    },
+                    origin_life_digest: digest,
                     submission,
-                    block: block.clone(),
-                },
-                Record::Order {
-                    namespace: t.namespace.clone(),
-                    position: t.position,
-                    submission,
-                },
-            ]);
-            terminal = Some(t);
-            Ok(records)
-        })?;
+                    seal_digest: digest,
+                    unit_digest: digest,
+                    source: (root.lsn, 0),
+                    kind: 2,
+                    cause: Some("manifest_required".into()),
+                    position: (lsn, 0),
+                    state: state.state.clone(),
+                    diagnostics: DiagnosticClaim::from_block(&block)?,
+                    signature: Vec::new(),
+                };
+                t.signature = signer(&t.bytes()?)?;
+                let mut records = state_records(
+                    db,
+                    state,
+                    &namespace.tenant,
+                    &namespace.hub_node,
+                    read_memory.clone(),
+                )?;
+                records.extend([
+                    Record::Terminal {
+                        edge: false,
+                        record: t.clone(),
+                    },
+                    Record::Diagnostic {
+                        namespace: t.namespace.clone(),
+                        submission,
+                        block: block.clone(),
+                    },
+                    Record::Order {
+                        namespace: t.namespace.clone(),
+                        position: t.position,
+                        submission,
+                    },
+                ]);
+                terminal = Some(t);
+                Ok(records)
+            },
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
         outcomes.push(wire_packet(&packet_for(
             db,
             &terminal.ok_or_else(invalid)?,
             &signer,
+            read_memory.clone(),
         )?)?);
     }
     Ok((
         ApplyResult {
             applied_rows: 0,
-            skipped_rows: missing_rows(db, changes).len(),
+            skipped_rows: missing_rows(db, changes, read_memory.clone()).len(),
             conflicts: Vec::new(),
             new_lsn: db.current_lsn(),
         },
@@ -557,7 +633,18 @@ pub(crate) fn fetch(
     edge: &str,
     incarnation: contextdb_core::Incarnation,
     since: Option<&[u8]>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Vec<WireDeliveryOutcome>> {
+    let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
+        db.bounded_read_accountant(),
+        read_memory.clone(),
+        "reader",
+        "decode_custody_metadata",
+        "Reduce selected custody metadata.",
+    )?;
+
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     #[derive(serde::Deserialize)]
     struct Cursor {
         tenant_id: TenantId,
@@ -568,10 +655,12 @@ pub(crate) fn fetch(
         position: contextdb_core::Lsn,
         ordinal: u32,
     }
-    let hub_incarnation = db.existing_sync_incarnation(tenant)?.ok_or_else(invalid)?;
+    let hub_incarnation = db
+        .existing_sync_incarnation(tenant, read_memory.clone())?
+        .ok_or_else(invalid)?;
     let after = since
         .map(|bytes| {
-            let cursor: Cursor = rmp_serde::from_slice(bytes).map_err(|_| invalid())?;
+            let cursor: Cursor = decoded_memory.decode_msgpack(bytes)?;
             if cursor.tenant_id != *tenant
                 || cursor.hub_node_id != hub
                 || cursor.hub_incarnation != hub_incarnation
@@ -591,8 +680,10 @@ pub(crate) fn fetch(
         edge_node: edge.into(),
         edge_incarnation: incarnation,
     };
-    let records =
-        db.custody_records_in(&[format!("delivery_hub_outcome.v1.{}.", namespace.key()?)])?;
+    let records = custody_hold.retain(db.custody_records_in(
+        &[format!("delivery_hub_outcome.v1.{}.", namespace.key()?)],
+        read_memory.clone(),
+    )?)?;
     let mut terminals = records
         .iter()
         .filter_map(|r| match r {
@@ -606,34 +697,46 @@ pub(crate) fn fetch(
     terminals.sort_by_key(|t| t.position);
     terminals
         .into_iter()
-        .map(|t| wire_packet(&packet_for(db, t, &signer)?))
+        .map(|t| wire_packet(&packet_for(db, t, &signer, read_memory.clone())?))
         .collect()
 }
 
 // Resend and status share the durable outcome decision.
 // Watermarks can retire ordinary history but cannot retire an unanswered unit.
-pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<ChangeSet> {
+pub(crate) fn pending_changes(
+    db: &Database,
+    mut changes: ChangeSet,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<ChangeSet> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     // Examine the changed identities and the pending index,
     // never all delivered history. Only active local root ownership is eligible.
     let mut terminal_rows = std::collections::BTreeSet::new();
     let mut terminal_vectors = std::collections::BTreeSet::new();
-    let destination = db.custody_authority()?.into_iter().find_map(|r| match r {
-        Record::Destination(d) => Some(d.namespace),
-        _ => None,
-    });
+    let destination = custody_hold
+        .retain(db.custody_authority(read_memory.clone())?)?
+        .into_iter()
+        .find_map(|r| match r {
+            Record::Destination(d) => Some(d.namespace),
+            _ => None,
+        });
     for row in &changes.rows {
-        for record in db.custody_records_in(&[format!(
-            "@row:{}",
-            hex(&RowRef {
-                table: row.table.clone(),
-                key: row.natural_key.clone()
-            }
-            .bytes())
-        )])? {
+        for record in custody_hold.retain(db.custody_records_in(
+            &[format!(
+                "@row:{}",
+                hex(&RowRef {
+                    table: row.table.clone(),
+                    key: row.natural_key.clone()
+                }
+                .bytes())
+            )],
+            read_memory.clone(),
+        )?)? {
             let Record::Manifest(m) = record else {
                 continue;
             };
-            let owned = db.custody_submission(m.id)?;
+            let owned = custody_hold.retain(db.custody_submission(m.id, read_memory.clone())?)?;
             if owned.iter().any(|r| matches!(r, Record::Root {submission, ..} if *submission == m.id)) && owned.iter().any(|r| matches!(r, Record::Terminal {edge:true, record:t} if Some(&t.namespace) == destination.as_ref())) {
                 terminal_rows.extend(m.rows.iter().map(|e| e.reference.order_key()));
                 terminal_vectors.extend(std::iter::once(&m.root_life).chain(&m.member_lives).map(|life| (life.original_table.clone(),life.local_row_id)));
@@ -652,7 +755,7 @@ pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<C
     changes
         .vectors
         .retain(|v| !terminal_vectors.contains(&(v.index.table.clone(), v.row_id.0)));
-    for record in db.custody_pending_manifests()? {
+    for record in custody_hold.retain(db.custody_pending_manifests(read_memory.clone())?)? {
         let Record::Manifest(m) = record else {
             continue;
         };
@@ -664,7 +767,13 @@ pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<C
             continue;
         }
         // Absent or superseded roots cannot resurrect a unit.
-        let Some(m) = current_manifest(db, &m.seal.root.table, &m.seal.root.key)? else {
+        let Some(m) = current_manifest(
+            db,
+            &m.seal.root.table,
+            &m.seal.root.key,
+            read_memory.clone(),
+        )?
+        else {
             continue;
         };
         for e in &m.rows {
@@ -675,7 +784,7 @@ pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<C
             {
                 continue;
             }
-            let row = actual_row(db, &e.reference)?;
+            let row = actual_row(db, &e.reference, read_memory.clone())?;
             changes.rows.push(RowChange {
                 table: e.reference.table.clone(),
                 natural_key: e.reference.key.clone(),
@@ -694,6 +803,7 @@ pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<C
 fn missing_rows(
     db: &Database,
     changes: &ChangeSet,
+    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> std::collections::BTreeSet<(String, Vec<u8>)> {
     let identity = |r: &RowChange| {
         RowRef {
@@ -756,8 +866,12 @@ fn missing_rows(
     }
     missing
 }
-fn remove_missing_units(db: &Database, changes: &mut ChangeSet) {
-    let missing = missing_rows(db, changes);
+fn remove_missing_units(
+    db: &Database,
+    changes: &mut ChangeSet,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) {
+    let missing = missing_rows(db, changes, read_memory.clone());
     changes.rows.retain(|r| {
         !missing.contains(
             &RowRef {
@@ -768,6 +882,7 @@ fn remove_missing_units(db: &Database, changes: &mut ChangeSet) {
         )
     });
 }
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 fn apply_remainder(
     db: &Database,
     route: DeliveryRoute<'_>,
@@ -776,7 +891,11 @@ fn apply_remainder(
     request_lineages: &[(String, NaturalKey, contextdb_core::Lsn, WireRowLineage)],
     mut changes: ChangeSet,
     dependency_complete: bool,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<ApplyResult> {
+    let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+    let vector_copy_owner = &mut retained_vector_copy;
+
     let DeliveryRoute { tenant, hub, edge } = route;
     let lineages = request_lineages
         .iter()
@@ -792,7 +911,7 @@ fn apply_remainder(
         None
     } else {
         validate_wire_ddl_provenance(&request.changeset)
-            .map_err(|e| Error::SyncError(e.to_string()))?;
+            .map_err(|e| Error::SyncError((e.to_string()).into()))?;
         let mut wire = request.changeset.clone();
         let mut indices = Vec::new();
         for (i, lsn) in wire.ddl_lsn.iter().enumerate() {
@@ -817,12 +936,26 @@ fn apply_remainder(
             edge,
             request.incarnation,
             ddl,
+            read_memory.clone(),
+        )?;
+        changes = db.reject_accepted_lineage_replays_with_received_ddl(
+            tenant,
+            changes,
+            &lineages,
+            ddl,
+            read_memory.clone(),
+        )?;
+    } else {
+        db.validate_incoming_push_lineages(
+            tenant,
+            &changes,
+            &lineages,
+            edge,
+            request.incarnation,
+            read_memory.clone(),
         )?;
         changes =
-            db.reject_accepted_lineage_replays_with_received_ddl(tenant, changes, &lineages, ddl)?;
-    } else {
-        db.validate_incoming_push_lineages(tenant, &changes, &lineages, edge, request.incarnation)?;
-        changes = db.reject_accepted_lineage_replays(tenant, changes, &lineages)?;
+            db.reject_accepted_lineage_replays(tenant, changes, &lineages, read_memory.clone())?;
     }
     db.apply_custody_remainder(
         changes,
@@ -834,6 +967,8 @@ fn apply_remainder(
         &lineages,
         ddl.as_ref(),
         dependency_complete,
+        vector_copy_owner,
+        read_memory.clone(),
     )
 }
 

@@ -162,9 +162,14 @@ fn seed(db: &Database) {
     drive_maintenance(
         db,
         |db| {
+            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
             let ready = db
                 .vector_store_for_test()
-                .partition_infos(&index())
+                .partition_infos(&index(), &mut partition_observation_owner_1)
                 .expect("inspect partition readiness");
             ready.len() == CONTEXTS && ready.iter().all(|info| info.graph_available)
         },
@@ -200,7 +205,24 @@ fn seed(db: &Database) {
             .expect("every seeded Context has a partition");
         let layers = usize::from(status.base.is_some() || status.dormant_base.is_some())
             + usize::from(status.change.is_some() || status.dormant_change.is_some())
-            + usize::from(status.fresh_tail_entries != 0);
+            + 1;
+        let suffix = db
+            .inspect_captured_vector_suffix_for_test(
+                &partition(context),
+                db.snapshot(),
+                db.declared_reader_memory()
+                    .expect("admit the suffix reader"),
+                &mut || Ok(()),
+            )
+            .expect("inspect the captured suffix")
+            .expect("each seeded Context has a committed suffix");
+        assert!(suffix.points >= TAIL_ROWS);
+        assert_eq!(status.fresh_tail_entries, 0);
+        assert!(
+            store
+                .with_partition_fresh_tail(&partition(context), |graph| graph.len())
+                .is_none()
+        );
         assert_eq!(
             layers, LAYERS_PER_CONTEXT,
             "the fixture gives Context {context} a base, a change and a live tail"

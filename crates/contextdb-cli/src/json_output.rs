@@ -15,7 +15,9 @@ use contextdb_core::read_contract::{
 };
 use contextdb_engine::QueryResult;
 use contextdb_engine::database::QueryTrace;
-use contextdb_engine::{CompactionReport, MaintenanceReport};
+use contextdb_engine::{
+    CompactionReport, MaintenanceReport, StorageCompactionPolicy, StorageCompactionValue,
+};
 use contextdb_engine::{
     DirectEventsStatus, DirectIndexDirection, DirectMaintenanceStatus, DirectPropagationRule,
     DirectSchema, DirectVectorQuantization, OwnerConfigurationSource, OwnerConfiguredValue,
@@ -75,6 +77,8 @@ impl ErrorClass {
             | Error::ReceivedSchemaAuthorshipUnavailable { .. } => ErrorClass::Sync,
             Error::StoreCorrupted { .. }
             | Error::ReaderCoordinationUnavailable { .. }
+            | Error::ScratchWorkingStorageUnavailable { .. }
+            | Error::VectorMetadataIo { .. }
             | Error::LegacyVectorStoreDetected { .. }
             | Error::DatabaseLocked { .. }
             | Error::ExportIo { .. }
@@ -292,12 +296,67 @@ fn compaction_report_fields(report: &CompactionReport) -> Value {
         "bytes_after": report.bytes_after,
         "file_shrank": report.file_shrank,
         "fragmentation_before": report.fragmentation_before,
+        "page_slack_ratio": report.page_slack_ratio,
+        "policy": compaction_policy_fields(&report.policy),
     })
+}
+
+/// The storage compaction policy that governed one receipt: each setting's
+/// value and whether it was `declared` or the `default`.
+fn compaction_policy_fields(policy: &StorageCompactionPolicy) -> Value {
+    let mut fields = Map::new();
+    for (name, value, declared) in policy.settings() {
+        let value = match value {
+            StorageCompactionValue::Ratio(ratio) => json!(ratio),
+            StorageCompactionValue::Count(count) => json!(count),
+        };
+        fields.insert(
+            name.to_string(),
+            json!({ "value": value, "source": if declared { "declared" } else { "default" } }),
+        );
+    }
+    Value::Object(fields)
+}
+
+/// The same policy as one text token,
+/// `start_ratio:0.5(default),min_interval_ms:3600000(default),…`.
+pub(crate) fn compaction_policy_text(policy: &StorageCompactionPolicy) -> String {
+    policy
+        .settings()
+        .into_iter()
+        .map(|(name, value, declared)| {
+            let value = match value {
+                StorageCompactionValue::Ratio(ratio) => ratio.to_string(),
+                StorageCompactionValue::Count(count) => count.to_string(),
+            };
+            let source = if declared { "declared" } else { "default" };
+            format!("{name}:{value}({source})")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// `.maintenance compact` under `--json`: the explicit, on-demand
 /// full-file redb compaction this call just ran (or, on an in-memory
 /// database, the honest no-op).
+/// `.verify history <table>`: one entry per historical index, each verified.
+pub(crate) fn verify_history_document(
+    table: &str,
+    indexes: &[contextdb_engine::HistoricalIndexVerification],
+) -> Value {
+    json!({ "verify_history": {
+        "table": table,
+        "indexes": indexes
+            .iter()
+            .map(|index| json!({
+                "index": index.index,
+                "postings": index.postings,
+                "versions": index.versions,
+            }))
+            .collect::<Vec<_>>(),
+    }})
+}
+
 pub(crate) fn compaction_report_document(report: &CompactionReport) -> Value {
     json!({ "compaction": compaction_report_fields(report) })
 }
@@ -766,6 +825,32 @@ pub(crate) fn maintenance_status_body_document(status: &DirectMaintenanceStatus)
     })
 }
 
+/// `.maintenance status`: the loop's state plus each storage compaction
+/// setting with its value and source (`declared` or `default`).
+pub(crate) fn maintenance_status_with_compaction_document(
+    status: &DirectMaintenanceStatus,
+    settings: &[(String, String, String)],
+) -> Value {
+    let mut document = maintenance_status_body_document(status);
+    if let Some(maintenance) = document
+        .get_mut("maintenance")
+        .and_then(Value::as_object_mut)
+    {
+        maintenance.insert(
+            "storage_compaction".to_string(),
+            Value::Array(
+                settings
+                    .iter()
+                    .map(|(setting, value, source)| {
+                        json!({ "setting": setting, "value": value, "source": source })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    document
+}
+
 /// `.events status` from the door's body: one bounded page whose items each
 /// say which of the four declared things they are.
 pub(crate) fn events_status_body_document(
@@ -1090,6 +1175,12 @@ fn vector_search_document(disclosure: &contextdb_engine::VectorSearchDisclosure)
         "aggregate_allowed_vectors": disclosure.aggregate_allowed_vectors,
         "effective_auto_index_at": disclosure.effective_auto_index_at,
         "auto_index_at_source": disclosure.auto_index_at_source,
+        "effective_flat_below": disclosure.effective_flat_below,
+        "flat_below_source": disclosure.flat_below_source,
+        "effective_search_radius": disclosure.effective_search_radius_millionths as f64 / 1_000_000.0,
+        "search_radius_source": disclosure.search_radius_source,
+        "effective_auto_expansion_ceiling": disclosure.effective_auto_expansion_ceiling,
+        "auto_expansion_ceiling_source": disclosure.auto_expansion_ceiling_source,
         "partition_key_columns": disclosure.partition_key_columns,
         "scope": disclosure.scope.as_str(),
         "route": disclosure.route.map(contextdb_engine::VectorSearchRoute::as_str),
@@ -1107,6 +1198,7 @@ fn vector_search_document(disclosure: &contextdb_engine::VectorSearchDisclosure)
         "global_candidate_budget": disclosure.global_candidate_budget,
         "admission_evaluations": disclosure.admission_evaluations,
         "expansion_evaluations": disclosure.expansion_evaluations,
+        "rescore_evaluations": disclosure.rescore_evaluations,
         "layers_admitted": disclosure.layers_admitted,
         "budget_terminal": disclosure.budget_terminal,
         "partitions": disclosure.partition_hnsw.iter().map(|partition| json!({
@@ -1203,6 +1295,10 @@ mod tests {
 
         let report = db.run_maintenance_cycle().unwrap();
         let document = maintenance_report_document(&report);
+        assert!(
+            document["maintenance_cycle"]["compaction"]["fragmentation_before"].is_null(),
+            "an in-memory store measures nothing, so the receipt says unknown, never 0: {document}"
+        );
         let detail = &document["maintenance_cycle"]["vector"]["first_failure_details"];
         assert_eq!(
             document["maintenance_cycle"]["vector"]["first_failure"],
@@ -1227,7 +1323,7 @@ mod tests {
         use contextdb_core::Error;
 
         for error in [
-            Error::SyncError("hub refused the changeset".to_string()),
+            Error::SyncError("hub refused the changeset".into()),
             Error::SyncPushUnconfirmed {
                 detail: "no acknowledgement".to_string(),
             },
@@ -1250,12 +1346,12 @@ mod tests {
                 reason: "registry is unreadable".to_string(),
             },
             Error::MemoryBudgetExceeded {
-                subsystem: "vector".to_string(),
-                operation: "build".to_string(),
+                subsystem: "vector".into(),
+                operation: "build".into(),
                 requested_bytes: 2,
                 available_bytes: 1,
                 budget_limit_bytes: 1,
-                hint: "raise the budget".to_string(),
+                hint: "raise the budget".into(),
             },
         ] {
             assert_eq!(ErrorClass::of(&error), ErrorClass::Io, "{error}");

@@ -73,7 +73,7 @@ fn prior_base_loader_cold_root_preserves_source_refusal_and_releases_charge() {
     let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
-    let error = with_source_page_admission(Arc::clone(&accountant), || {
+    let error = with_source_page_admission(accountant.clone().into(), || {
         persistence.load_vector_partition_base_generation_with_expected_graph_bytes(
             &record.index,
             &record.partition_key,
@@ -107,7 +107,7 @@ fn prior_base_loader_cold_root_preserves_source_refusal_and_releases_charge() {
     assert_eq!(accountant.usage().used, CACHE_BYTES);
     drop(observation);
     accountant.set_budget(Some(128 * 1024 * 1024)).unwrap();
-    let loaded = with_source_page_admission(Arc::clone(&accountant), || {
+    let loaded = with_source_page_admission(accountant.clone().into(), || {
         persistence.load_vector_partition_base_generation_with_expected_graph_bytes(
             &record.index,
             &record.partition_key,

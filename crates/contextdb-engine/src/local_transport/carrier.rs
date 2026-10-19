@@ -1,4 +1,6 @@
 #[cfg(unix)]
+use super::query_funding::Funded;
+#[cfg(unix)]
 use super::FinalStaleIdentityObservation;
 #[cfg(unix)]
 use super::stale::{observe_final_stale_identity, remove_channel_if_identity_matches};
@@ -7,9 +9,9 @@ use super::{
     DeadlineOperationWait, FrameViolation, LivenessEvidence, LocalDeadlineOperation,
     LocalHandshake, LocalInboundKind, LocalInboundMessage, LocalOutboundMessage,
     LocalProtocolBoundary, LocalRequestEnvelope, LocalResponse, LocalResponseExpectation,
-    LocalTransportError, MAX_FRAME_BYTES, StaleChannelAction, StaleChannelEvidence,
-    StaleFilesystemEvidence, StaleIdentityEvidence, connect_with_deadline, frame_read_refusal,
-    invalid_channel_data, owner_disconnected, receive_response_with_deadline,
+    LocalTransportError, MAX_FRAME_BYTES, PayloadViolation, StaleChannelAction,
+    StaleChannelEvidence, StaleFilesystemEvidence, StaleIdentityEvidence, connect_with_deadline,
+    frame_read_refusal, invalid_channel_data, owner_disconnected, receive_response_with_deadline,
     response_decode_refusal, retry_route_with_deadline, write_request_with_deadline,
 };
 #[cfg(unix)]
@@ -147,7 +149,7 @@ impl UnixLocalCarrier {
                 ..
             } if *expectation == LocalResponseExpectation::OrdinaryResult
         );
-        let frame = boundary.encode_frame(message)?;
+        let frame = boundary.encode_frame_funded(message)?;
         let result = write_readiness(stream, frame).and_then(|write| write.wait());
         if result.is_err() && ordinary_response {
             boundary.reset_ordinary_outbound();
@@ -160,6 +162,7 @@ impl UnixLocalCarrier {
         stream: &'a std::os::unix::net::UnixStream,
         boundary: &'a LocalProtocolBoundary,
         message: LocalOutboundMessage<'_>,
+        allow_write: impl Fn() -> Result<(), LocalTransportError> + Send + 'static,
     ) -> LocalDeadlineOperation<'a> {
         let ordinary_response = matches!(
             message,
@@ -168,8 +171,8 @@ impl UnixLocalCarrier {
                 ..
             } if *expectation == LocalResponseExpectation::OrdinaryResult
         );
-        let operation: LocalDeadlineOperation<'a> = match boundary.encode_frame(message) {
-            Ok(frame) => match write_readiness(stream, frame) {
+        let operation: LocalDeadlineOperation<'a> = match boundary.encode_frame_funded(message) {
+            Ok(frame) => match guarded_write_readiness(stream, frame, allow_write) {
                 Ok(write) => Box::pin(write),
                 Err(error) => Box::pin(std::future::ready(Err(error))),
             },
@@ -206,7 +209,7 @@ impl UnixLocalCarrier {
         clock: &'a dyn DeadlineClock,
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a> {
-        let operation = match boundary.encode_frame(LocalOutboundMessage::Request(request)) {
+        let operation = match boundary.encode_frame_funded(LocalOutboundMessage::Request(request)) {
             Ok(frame) => match write_readiness(stream, frame) {
                 Ok(write) => Box::pin(write) as LocalDeadlineOperation<'a>,
                 Err(error) => Box::pin(std::future::ready(Err(error))),
@@ -228,7 +231,10 @@ impl UnixLocalCarrier {
             boundary,
             expectation == LocalResponseExpectation::OrdinaryResult,
         );
-        let operation: LocalDeadlineOperation<'a, LocalResponse> = match frame_readiness(stream) {
+        let reader = boundary
+            .cursor_frame_allowance()
+            .and_then(|memory| frame_readiness_with_memory(stream, memory));
+        let operation: LocalDeadlineOperation<'a, LocalResponse> = match reader {
             Ok(reader) => Box::pin(async move {
                 let mut admission_reset = admission_reset;
                 let payload = reader.await.map_err(frame_read_refusal)?;
@@ -238,6 +244,45 @@ impl UnixLocalCarrier {
                 let LocalInboundMessage::Response(response) = inbound else {
                     return Err(invalid_channel_data());
                 };
+                admission_reset.disarm();
+                Ok(response)
+            }),
+            Err(error) => {
+                drop(admission_reset);
+                Box::pin(std::future::ready(Err(error)))
+            }
+        };
+        receive_response_with_deadline(clock, deadline_ms, operation)
+    }
+
+    pub(crate) fn receive_query_response<'a>(
+        &'a self,
+        stream: &'a mut std::os::unix::net::UnixStream,
+        boundary: &'a LocalProtocolBoundary,
+        memory: std::sync::Arc<crate::read_image_memory::ImageMemory>,
+        clock: &'a dyn DeadlineClock,
+        deadline_ms: u64,
+    ) -> DeadlineOperationWait<'a, Funded<LocalResponse>> {
+        let admission_reset = OrdinaryInboundReset::new(boundary, true);
+        let allocator_memory = memory.clone();
+        let ceiling = boundary.effective_limits().memory;
+        let reader = frame_readiness_allocating(stream, None, move |length| {
+            Funded::allocate(Some(allocator_memory), length, || vec![0_u8; length])
+                .map_err(|error| match crate::read_contract::encoding_error_from_core(error, ceiling) {
+                    crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } =>
+                        LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                            ceiling, required: None,
+                        }),
+                    _ => invalid_channel_data(),
+                })
+        });
+        let operation: LocalDeadlineOperation<'a, Funded<LocalResponse>> = match reader {
+            Ok(reader) => Box::pin(async move {
+                let mut admission_reset = admission_reset;
+                let payload = reader.await.map_err(frame_read_refusal)?;
+                let response = boundary.decode_query_response(&payload.value, &memory)
+                    .map_err(response_decode_refusal)?;
+                drop(payload);
                 admission_reset.disarm();
                 Ok(response)
             }),
@@ -581,6 +626,23 @@ fn cloned_blocking_streams(
 pub(crate) fn frame_readiness(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<UnixReadiness<Vec<u8>>, LocalTransportError> {
+    frame_readiness_with_memory(stream, None)
+}
+
+#[cfg(unix)]
+fn frame_readiness_with_memory(
+    stream: &std::os::unix::net::UnixStream,
+    memory: Option<u64>,
+) -> Result<UnixReadiness<Vec<u8>>, LocalTransportError> {
+    frame_readiness_allocating(stream, memory, |length| Ok(vec![0_u8; length]))
+}
+
+#[cfg(unix)]
+fn frame_readiness_allocating<T: AsMut<[u8]> + Send + 'static>(
+    stream: &std::os::unix::net::UnixStream,
+    memory: Option<u64>,
+    allocate: impl FnOnce(usize) -> Result<T, LocalTransportError> + Send + 'static,
+) -> Result<UnixReadiness<T>, LocalTransportError> {
     let (mut worker_stream, cancellation) = cloned_blocking_streams(stream)?;
     #[cfg(feature = "test-seams")]
     FRAME_READINESS_CREATIONS.with(|creations| {
@@ -601,8 +663,20 @@ pub(crate) fn frame_readiness(
                 FrameViolation::LengthExceedsMaximum,
             ));
         }
-        let mut payload = vec![0_u8; length];
-        worker_stream.read_exact(&mut payload).map_err(|error| {
+        // The prefix is the only response allocation needed to refuse a
+        // cursor frame that cannot coexist with its retained state.
+        if let Some(ceiling) = memory
+            && length as u64 > ceiling
+        {
+            return Err(LocalTransportError::Payload(
+                PayloadViolation::MemoryCeilingExceeded {
+                    ceiling,
+                    required: Some(length as u64),
+                },
+            ));
+        }
+        let mut payload = allocate(length)?;
+        worker_stream.read_exact(payload.as_mut()).map_err(|error| {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
                 LocalTransportError::Frame(FrameViolation::TruncatedPayload)
             } else {
@@ -616,14 +690,136 @@ pub(crate) fn frame_readiness(
 #[cfg(unix)]
 fn write_readiness(
     stream: &std::os::unix::net::UnixStream,
-    frame: Vec<u8>,
+    frame: Funded<Vec<u8>>,
 ) -> Result<UnixReadiness<()>, LocalTransportError> {
     let (mut worker_stream, cancellation) = cloned_blocking_streams(stream)?;
     UnixReadiness::spawn("contextdb-local-write", cancellation, move || {
         worker_stream
-            .write_all(&frame)
+            .write_all(&frame.value)
             .map_err(|_| owner_disconnected())
     })
+}
+
+/// A complete frame and its completion flag publish under one state guard.
+/// The syscall cannot wait for a slow peer; readiness waits release that guard,
+/// so deadline cancellation still interrupts a partially written frame.
+#[cfg(unix)]
+fn guarded_write_readiness(
+    stream: &std::os::unix::net::UnixStream,
+    frame: Funded<Vec<u8>>,
+    allow_write: impl Fn() -> Result<(), LocalTransportError> + Send + 'static,
+) -> Result<UnixReadiness<()>, LocalTransportError> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{MsgFlags, send};
+    use std::os::fd::AsRawFd;
+
+    let (worker_stream, cancellation) = cloned_blocking_streams(stream)?;
+    let shared = std::sync::Arc::new((
+        std::sync::Mutex::new(ReadinessState {
+            result: None,
+            waker: None,
+            cancelled: false,
+        }),
+        std::sync::Condvar::new(),
+    ));
+    let worker_shared = shared.clone();
+    let worker = std::thread::Builder::new()
+        .name("contextdb-local-write".to_owned())
+        .spawn(move || {
+            let (state, completion) = &*worker_shared;
+            let mut offset = 0;
+            let mut readiness_error = None;
+            loop {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.cancelled {
+                    return;
+                }
+                let mut wait_for_socket = false;
+                let outcome = if let Some(error) = readiness_error.take() {
+                    Some(Err(error))
+                } else if offset == frame.value.len() {
+                    Some(Ok(()))
+                } else if let Err(error) = allow_write() {
+                    Some(Err(error))
+                } else {
+                    let flags = MsgFlags::MSG_DONTWAIT;
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "freebsd",
+                        target_os = "dragonfly",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                        target_os = "solaris",
+                        target_os = "illumos",
+                        target_os = "fuchsia",
+                        target_os = "haiku"
+                    ))]
+                    let flags = flags | MsgFlags::MSG_NOSIGNAL;
+                    match send(worker_stream.as_raw_fd(), &frame.value[offset..], flags) {
+                        Ok(0) => Some(Err(owner_disconnected())),
+                        Ok(written) => {
+                            offset += written;
+                            (offset == frame.value.len()).then_some(Ok(()))
+                        }
+                        Err(Errno::EINTR) => None,
+                        Err(Errno::EAGAIN) => {
+                            wait_for_socket = true;
+                            None
+                        }
+                        Err(_) => Some(Err(owner_disconnected())),
+                    }
+                };
+                if let Some(result) = outcome {
+                    // A reader may receive the last bytes immediately. Its
+                    // next clock advance must see this completion, even if the
+                    // write worker is descheduled before waking the owner.
+                    state.result = Some(result);
+                    let waker = state.waker.take();
+                    completion.notify_all();
+                    drop(state);
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                    return;
+                }
+                drop(state);
+                if wait_for_socket {
+                    readiness_error = wait_for_write_ready(&worker_stream).err();
+                }
+            }
+        })
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+    Ok(UnixReadiness {
+        shared,
+        cancellation: Some(cancellation),
+        worker: Some(worker),
+        completed: false,
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_write_ready(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), LocalTransportError> {
+    use nix::errno::Errno;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+
+    loop {
+        let mut readiness = [PollFd::new(
+            stream.as_fd(),
+            PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP,
+        )];
+        match poll(&mut readiness, PollTimeout::NONE) {
+            Ok(0) => return Err(owner_disconnected()),
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => continue,
+            Err(_) => return Err(owner_disconnected()),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -641,11 +837,76 @@ enum ConnectWait {
     BacklogCapacity,
 }
 
+/// Close-on-exec and non-blocking at creation where the kernel offers it.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+fn new_socket_flags() -> nix::sys::socket::SockFlag {
+    nix::sys::socket::SockFlag::SOCK_CLOEXEC | nix::sys::socket::SockFlag::SOCK_NONBLOCK
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+fn configure_new_socket(_socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
+    Ok(())
+}
+
+/// Without SOCK_CLOEXEC / SOCK_NONBLOCK (macOS) both are set right after creation.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn new_socket_flags() -> nix::sys::socket::SockFlag {
+    nix::sys::socket::SockFlag::empty()
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn configure_new_socket(socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    fcntl(socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    fcntl(socket, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn connect_readiness(
     path: &std::path::Path,
 ) -> Result<UnixReadiness<ConnectAttempt>, LocalTransportError> {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use nix::sys::socket::{AddressFamily, SockType, UnixAddr, connect, socket};
     use std::os::fd::AsRawFd;
 
     // Same address rule as the bind: what the kernel is shown may be the
@@ -656,10 +917,12 @@ fn connect_readiness(
     let socket = socket(
         AddressFamily::Unix,
         SockType::Stream,
-        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        new_socket_flags(),
         None,
     )
     .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+    configure_new_socket(&socket)
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
     let stream = std::os::unix::net::UnixStream::from(socket);
     let wait = match connect(stream.as_raw_fd(), &address) {
         Ok(()) | Err(nix::errno::Errno::EISCONN) => {

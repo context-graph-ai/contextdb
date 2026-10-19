@@ -3,6 +3,7 @@ use crate::error::TableError;
 use crate::multimap_table::{
     finalize_tree_and_subtree_checksums, multimap_btree_stats, verify_tree_and_subtree_checksums,
 };
+use crate::native_storage_admission::{PendingAlloc, PendingName, pending_allocation_error};
 use crate::tree_store::btree::{UntypedBtreeMut, btree_stats};
 use crate::tree_store::btree_base::BtreeHeader;
 use crate::tree_store::{
@@ -79,6 +80,8 @@ impl Iterator for TableNameIter {
 pub(crate) struct TableTree {
     tree: Btree<&'static str, InternalTableDefinition>,
     mem: Arc<TransactionalMemory>,
+    #[cfg(feature = "contextdb-internal")]
+    prepared_root: Option<super::page_store::PageMemory>,
 }
 
 impl TableTree {
@@ -109,9 +112,46 @@ impl TableTree {
         Ok(Self {
             tree: Btree::new(master_root, page_hint, guard, mem.clone())?,
             mem,
+            #[cfg(feature = "contextdb-internal")]
+            prepared_root: None,
         })
     }
 
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn new_prepared(
+        root: Option<BtreeHeader>,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> std::result::Result<Self, crate::PreparedReadError> {
+        let prepared_root = super::btree::prepared_directory_root(root, &mem)?;
+        Ok(Self {
+            tree: Btree::new_lazy(root, PageHint::Verified, guard, mem.clone()),
+            mem,
+            prepared_root,
+        })
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn prepared_bytes_equal(
+        &self,
+        physical_name: &str,
+        key: &[u8],
+        expected: &[u8],
+    ) -> std::result::Result<bool, crate::PreparedReadError> {
+        let Some(directory) = super::btree::prepared_byte_get(
+            self.root(), &self.mem, physical_name.as_bytes(), true, self.prepared_root.as_ref(),
+        )? else { return Ok(false); };
+        // Validate both stored names in place. The directory guard keeps the
+        // original bytes alive until the scalar root has been extracted.
+        let root = match super::table_tree_base::native_byte_table_root(directory.value()) {
+            Ok(root) => root,
+            Err(cause) => return Err(crate::PreparedReadError::TableDefinition(
+                crate::PreparedTableDefinitionError::new(cause, directory))),
+        };
+        let value = super::btree::prepared_byte_get(root, &self.mem, key, false, None)?;
+        Ok(value.is_some_and(|value| value.value() == expected))
+    }
     pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
         self.tree.transaction_guard()
     }
@@ -172,6 +212,13 @@ impl TableTree {
 
     // root_page: the root of the master table
     pub(crate) fn list_tables(&self, table_type: TableType) -> Result<Vec<String>> {
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::CatalogBegin,
+            None,
+            None,
+            0,
+        )?;
         let iter = self.tree.range::<RangeFull, &str>(&(..))?;
         let iter = TableNameIter {
             inner: iter,
@@ -179,7 +226,15 @@ impl TableTree {
         };
         let mut result = vec![];
         for table in iter {
-            result.push(table?);
+            let table = table?;
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::observe_root_work(
+                crate::commit_work::RootWorkKindForTest::CatalogEntry,
+                Some(&table),
+                None,
+                table.len(),
+            )?;
+            result.push(table);
         }
         Ok(result)
     }
@@ -189,6 +244,13 @@ impl TableTree {
         name: &str,
         table_type: TableType,
     ) -> Result<Option<InternalTableDefinition>, TableError> {
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::DirectoryLookup,
+            Some(name),
+            None,
+            0,
+        )?;
         if let Some(guard) = self.tree.get(&name)? {
             let definition = guard.value();
             definition.check_match_untyped(table_type, name)?;
@@ -251,7 +313,14 @@ pub(crate) struct TableTreeMut<'txn> {
     mem: Arc<TransactionalMemory>,
     // Cached updates from tables that have been closed. These must be flushed to the btree.
     // The bool indicates whether the root has dirty (DEFERRED) checksums that need finalization.
-    pending_table_updates: HashMap<String, (Option<BtreeHeader>, u64, bool)>,
+    pending_table_updates: hashbrown::HashMap<
+        PendingName,
+        (Option<BtreeHeader>, u64, bool),
+        std::hash::RandomState,
+        PendingAlloc,
+    >,
+    pending_error: Option<crate::StorageError>,
+    pending_failed: bool,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
 }
@@ -264,6 +333,16 @@ impl TableTreeMut<'_> {
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
     ) -> Self {
+        let pending_table_updates_hasher = {
+            #[cfg(feature = "test-seams")]
+            {
+                crate::tree_store::fixture_random_state()
+            }
+            #[cfg(not(feature = "test-seams"))]
+            {
+                std::hash::RandomState::new()
+            }
+        };
         Self {
             tree: BtreeMut::new(
                 master_root,
@@ -274,7 +353,12 @@ impl TableTreeMut<'_> {
             ),
             guard,
             mem,
-            pending_table_updates: Default::default(),
+            pending_table_updates: hashbrown::HashMap::with_hasher_in(
+                pending_table_updates_hasher,
+                PendingAlloc::current(),
+            ),
+            pending_error: None,
+            pending_failed: false,
             #[cfg(feature = "test-seams")]
             table_write_observer: Default::default(),
             freed_pages,
@@ -323,16 +407,62 @@ impl TableTreeMut<'_> {
         table_root: Option<BtreeHeader>,
         length: u64,
     ) {
+        if self.pending_failed {
+            return;
+        }
         let dirty = table_root
             .as_ref()
             .is_some_and(|header| self.mem.uncommitted(header.root));
+        if let Err(error) = self.stage_pending(name, (table_root, length, dirty)) {
+            self.pending_failed = true;
+            self.pending_error = Some(error);
+        }
+    }
+
+    fn stage_pending(&mut self, name: &str, update: (Option<BtreeHeader>, u64, bool)) -> Result {
+        if let Some(entry) = self.pending_table_updates.get_mut(name) {
+            *entry = update;
+            return Ok(());
+        }
         self.pending_table_updates
-            .insert(name.to_string(), (table_root, length, dirty));
+            .try_reserve(1)
+            .map_err(|_| pending_allocation_error())?;
+        let key = PendingName::try_new(name, self.pending_table_updates.allocator().clone())?;
+        self.pending_table_updates.insert(key, update);
+        Ok(())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn pending_table_update_contains(&self, name: &str) -> bool {
+        self.pending_table_updates.contains_key(name)
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn pending_table_updates_for_test(&self) -> (usize, usize) {
+        (
+            self.pending_table_updates.len(),
+            self.pending_table_updates.capacity(),
+        )
     }
 
     pub(crate) fn clear_root_updates_and_close(&mut self) {
         self.pending_table_updates.clear();
-        self.allocated_pages.lock().unwrap().close();
+        self.allocated_pages.lock().unwrap_or_else(|error| error.into_inner()).close();
+    }
+
+    // Sealing does not consume allocation custody. A refused preparation can
+    // still use the ordinary abort path, whose close is then the only close.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn seal_user_root(&mut self) -> Result<Option<BtreeHeader>> {
+        self.flush_inner()
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn close_sealed(&mut self) -> Result<(HashSet<PageNumber>, Vec<PageNumber>)> {
+        // Acquire both locks before the irreversible single close.
+        let mut allocated = self.allocated_pages.lock()?;
+        let mut freed = self.freed_pages.lock()?;
+        Ok((allocated.close(), mem::take(&mut *freed)))
     }
 
     pub(crate) fn flush_and_close(
@@ -356,70 +486,143 @@ impl TableTreeMut<'_> {
     }
 
     fn flush_inner(&mut self) -> Result<Option<BtreeHeader>> {
+        #[cfg(feature = "test-seams")]
+        let _directory_scope = crate::commit_work::root_work_table_scope("__redb_table_directory");
         self.flush_table_root_updates()?.finalize_dirty_checksums()
     }
 
+    // Finalization changes only the selected table's pending header. Publication
+    // remains a separate boundary, even when the native page address is unchanged.
+    pub(crate) fn finalize_table_root(&mut self, name: &str) -> Result {
+        if self.pending_failed {
+            return Err(crate::StorageError::PreviousIo);
+        }
+        let result = self.finalize_table_root_inner(name);
+        if result.is_err() {
+            self.pending_failed = true;
+        }
+        result
+    }
+
+    fn finalize_table_root_inner(&mut self, name: &str) -> Result {
+        let Some((new_root, new_length, dirty)) = self.pending_table_updates.get(name).copied()
+        else {
+            return Ok(());
+        };
+        if !dirty {
+            return Ok(());
+        }
+        let definition = { self.tree.get(&name)?.expect("pending table exists").value() };
+        #[cfg(feature = "test-seams")]
+        let _table_scope = crate::commit_work::root_work_table_scope(name);
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::FinalizeBegin,
+            Some(name),
+            None,
+            0,
+        )?;
+        let root = match definition {
+            InternalTableDefinition::Normal {
+                fixed_key_size,
+                fixed_value_size,
+                ..
+            } => {
+                let mut tree = UntypedBtreeMut::new(
+                    new_root,
+                    self.mem.clone(),
+                    self.freed_pages.clone(),
+                    fixed_key_size,
+                    fixed_value_size,
+                );
+                tree.finalize_dirty_checksums()?
+            }
+            InternalTableDefinition::Multimap {
+                fixed_key_size,
+                fixed_value_size,
+                ..
+            } => finalize_tree_and_subtree_checksums(
+                new_root,
+                fixed_key_size,
+                fixed_value_size,
+                self.mem.clone(),
+            )?,
+        };
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::FinalizeEnd,
+            Some(name),
+            None,
+            0,
+        )?;
+        *self
+            .pending_table_updates
+            .get_mut(name)
+            .expect("pending entry retained") = (root, new_length, false);
+        Ok(())
+    }
+
     pub(crate) fn flush_table_root_updates(&mut self) -> Result<&mut Self> {
-        for (name, (new_root, new_length, dirty)) in self.pending_table_updates.drain() {
-            // Bypass .get_table() since the table types are dynamic
-            let mut definition = self.tree.get(&name.as_str())?.unwrap().value();
-            // No-op if the root has not changed and checksums are already finalized
-            if !dirty {
-                match definition {
-                    InternalTableDefinition::Normal { table_root, .. }
-                    | InternalTableDefinition::Multimap { table_root, .. } => {
-                        if table_root == new_root {
-                            continue;
-                        }
-                    }
-                }
-            }
-            // Finalize any dirty checksums
-            match definition {
-                InternalTableDefinition::Normal {
-                    ref mut table_root,
-                    ref mut table_length,
-                    fixed_key_size,
-                    fixed_value_size,
-                    ..
-                } => {
-                    let mut tree = UntypedBtreeMut::new(
-                        new_root,
-                        self.mem.clone(),
-                        self.freed_pages.clone(),
-                        fixed_key_size,
-                        fixed_value_size,
-                    );
-                    *table_root = tree.finalize_dirty_checksums()?;
-                    *table_length = new_length;
-                }
-                InternalTableDefinition::Multimap {
-                    ref mut table_root,
-                    ref mut table_length,
-                    fixed_key_size,
-                    fixed_value_size,
-                    ..
-                } => {
-                    *table_root = finalize_tree_and_subtree_checksums(
-                        new_root,
-                        fixed_key_size,
-                        fixed_value_size,
-                        self.mem.clone(),
-                    )?;
-                    *table_length = new_length;
-                }
-            }
-            self.tree.insert(&name.as_str(), &definition)?;
-            #[cfg(feature = "test-seams")]
-            crate::table_write_observer::record(
-                &self.table_write_observer,
-                "__redb_user_table_directory",
-                crate::TableWriteOperationForTest::DirectoryInsert,
-                name.as_bytes(),
-                InternalTableDefinition::as_bytes(&definition).len(),
-            );
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        if self.pending_failed {
+            return Err(crate::StorageError::PreviousIo);
+        }
+        if let Err(error) = self.flush_table_root_updates_inner() {
+            self.pending_failed = true;
+            return Err(error);
         }
         Ok(self)
+    }
+
+    fn flush_table_root_updates_inner(&mut self) -> Result {
+        while !self.pending_table_updates.is_empty() {
+            // Move one paid key out, retaining it until publication succeeds.
+            // Error exits retain this entry and all not-yet-published entries.
+            let first = self.pending_table_updates.keys().next().unwrap();
+            let name = PendingName::try_new(first, self.pending_table_updates.allocator().clone())?;
+            self.finalize_table_root(&name)?;
+            let (root, length, _) = self.pending_table_updates[name.as_str()];
+            let mut definition = {
+                self.tree
+                    .get(&name.as_str())?
+                    .expect("pending table exists")
+                    .value()
+            };
+            let unchanged = match &definition {
+                InternalTableDefinition::Normal { table_root, .. }
+                | InternalTableDefinition::Multimap { table_root, .. } => *table_root == root,
+            } && definition.get_length() == length;
+            if !unchanged {
+                definition.set_header(root, length);
+                #[cfg(feature = "test-seams")]
+                crate::commit_work::observe_root_work(
+                    crate::commit_work::RootWorkKindForTest::PublishBegin,
+                    Some(&name),
+                    None,
+                    0,
+                )?;
+                self.tree.insert(&name.as_str(), &definition)?;
+                #[cfg(feature = "test-seams")]
+                crate::commit_work::observe_root_work(
+                    crate::commit_work::RootWorkKindForTest::PublishEnd,
+                    Some(&name),
+                    None,
+                    0,
+                )?;
+                #[cfg(feature = "test-seams")]
+                crate::table_write_observer::record(
+                    &self.table_write_observer,
+                    "__redb_user_table_directory",
+                    crate::TableWriteOperationForTest::DirectoryInsert,
+                    name.as_bytes(),
+                    InternalTableDefinition::as_bytes(&definition).len(),
+                );
+            }
+            self.pending_table_updates.remove(name.as_str());
+        }
+        Ok(())
     }
 
     // Opens a table, calls the provided closure to insert entries into it, and then
@@ -585,9 +788,9 @@ impl TableTreeMut<'_> {
             if self.get_table_untyped(new_name, table_type)?.is_some() {
                 return Err(TableError::TableExists(new_name.to_string()));
             }
-            if let Some(update) = self.pending_table_updates.remove(name) {
-                self.pending_table_updates
-                    .insert(new_name.to_string(), update);
+            if let Some(update) = self.pending_table_updates.get(name).copied() {
+                self.stage_pending(new_name, update)?;
+                self.pending_table_updates.remove(name);
             }
             assert!(self.tree.remove(&name)?.is_some());
             #[cfg(feature = "test-seams")]
@@ -740,16 +943,15 @@ impl TableTreeMut<'_> {
                 definition.set_header(*updated_root, *updated_length);
             }
 
+            let name = entry.key().to_owned();
+            drop(entry);
             if let Some(new_root) = definition.relocate_tree(
                 self.mem.clone(),
                 self.freed_pages.clone(),
                 relocation_map,
             )? {
                 // Relocated roots have already-finalized checksums
-                self.pending_table_updates.insert(
-                    entry.key().to_string(),
-                    (Some(new_root), definition.get_length(), false),
-                );
+                self.stage_pending(&name, (Some(new_root), definition.get_length(), true))?;
             }
         }
 
@@ -762,6 +964,7 @@ impl TableTreeMut<'_> {
         &self,
         cursor: &mut crate::transactions::CompactionCursor,
         maximum: usize,
+        protected_table: Option<&str>,
     ) -> Result<(Option<String>, Vec<PagePath>, usize)> {
         use std::ops::Bound;
         let target = if cursor.phase.is_multiple_of(2) {
@@ -785,12 +988,24 @@ impl TableTreeMut<'_> {
             };
             let entry = entry?;
             let name = entry.key().to_owned();
+            if protected_table == Some(name.as_str()) {
+                // Advance exactly one table without faulting any protected
+                // source pages. A later call resumes the finite traversal.
+                cursor.table = Some(name);
+                cursor.advance_table = true;
+                cursor.position.clear();
+                return Ok((None, Vec::new(), 0));
+            }
             if cursor.table.as_ref() != Some(&name) {
                 cursor.position.clear();
             }
             cursor.table = Some(name.clone());
             cursor.advance_table = false;
-            Some((name, entry.value()))
+            let mut definition = entry.value();
+            if let Some((root, length, _)) = self.pending_table_updates.get(name.as_str()) {
+                definition.set_header(*root, *length);
+            }
+            Some((name, definition))
         };
         let (pages, next, examined) = if let Some((_, definition)) = &target {
             definition.page_batch(self.mem.clone(), &cursor.position, maximum)?
@@ -826,20 +1041,21 @@ impl TableTreeMut<'_> {
             return Ok(());
         }
         if let Some(name) = target {
-            let mut definition = self
-                .tree
-                .get(&name)?
-                .expect("selected table exists")
-                .value();
+            let mut definition = {
+                self.tree
+                    .get(&name)?
+                    .expect("selected table exists")
+                    .value()
+            };
+            if let Some((root, length, _)) = self.pending_table_updates.get(name) {
+                definition.set_header(*root, *length);
+            }
             if let Some(root) = definition.relocate_tree(
                 self.mem.clone(),
                 self.freed_pages.clone(),
                 relocation_map,
             )? {
-                self.pending_table_updates.insert(
-                    name.to_owned(),
-                    (Some(root), definition.get_length(), false),
-                );
+                self.stage_pending(name, (Some(root), definition.get_length(), true))?;
             }
         } else {
             self.tree.relocate(relocation_map)?;
@@ -930,6 +1146,146 @@ impl Drop for TableTreeMut<'_> {
     }
 }
 
+#[cfg(feature = "contextdb-internal")]
+impl TableTree {
+    pub(crate) fn get_native_byte_value(
+        &self,
+        physical_name: &str,
+        key: &[u8],
+    ) -> std::result::Result<
+        Option<crate::AccessGuard<'static, &'static [u8]>>,
+        crate::NativeColdReadError,
+    > {
+        Self::captured_native_get(self.root(), &self.mem, physical_name, key, false)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl TableTree {
+    pub(crate) fn get_native_text_value(
+        &self,
+        physical_name: &str,
+        key: &str,
+    ) -> std::result::Result<
+        Option<crate::AccessGuard<'static, &'static [u8]>>,
+        crate::NativeColdReadError,
+    > {
+        let directory =
+            super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
+                .ok_or(crate::NativeColdReadError::TableAbsent)?;
+        let root = super::table_tree_base::native_text_table_root(directory.value())?;
+        super::btree::native_byte_get(root, &self.mem, key.as_bytes(), false)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl TableTree {
+    pub(crate) fn next_native_text_range(
+        &self,
+        physical_name: &str,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
+        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        before_page()?;
+        let directory =
+            super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
+                .ok_or(crate::NativeColdReadError::TableAbsent)?;
+        let root = super::table_tree_base::native_text_table_root(directory.value())?;
+        super::btree::native_text_range_next(
+            root,
+            &self.mem,
+            lower,
+            exclusive,
+            upper,
+            true,
+            before_page,
+        )
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl TableTree {
+    pub(crate) fn next_native_byte_range(
+        &self,
+        physical_name: &str,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
+        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        before_page()?;
+        let directory =
+            super::btree::native_byte_get(self.root(), &self.mem, physical_name.as_bytes(), true)?
+                .ok_or(crate::NativeColdReadError::TableAbsent)?;
+        let root = super::table_tree_base::native_byte_table_root(directory.value())?;
+        super::btree::native_text_range_next(
+            root,
+            &self.mem,
+            lower,
+            exclusive,
+            upper,
+            false,
+            before_page,
+        )
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl TableTree {
+    // Native descriptor authentication shared with the ordinary tree's byte reader.
+    pub(crate) fn captured_native_table_root(
+        root: Option<BtreeHeader>,
+        mem: &TransactionalMemory,
+        name: &str,
+        u8_key: bool,
+        text_key: bool,
+    ) -> std::result::Result<Option<Option<BtreeHeader>>, crate::NativeColdReadError> {
+        let Some(directory) = super::btree::native_byte_get(root, mem, name.as_bytes(), true)?
+        else {
+            return Ok(None);
+        };
+        let table = if u8_key {
+            super::table_tree_base::native_u8_table_root(directory.value())?
+        } else if text_key {
+            super::table_tree_base::native_text_table_root(directory.value())?
+        } else {
+            super::table_tree_base::native_byte_table_root(directory.value())?
+        };
+        Ok(Some(table))
+    }
+    pub(crate) fn captured_native_text_get(
+        root: Option<BtreeHeader>,
+        mem: &TransactionalMemory,
+        name: &str,
+        key: &str,
+    ) -> std::result::Result<
+        Option<crate::AccessGuard<'static, &'static [u8]>>,
+        crate::NativeColdReadError,
+    > {
+        let table = Self::captured_native_table_root(root, mem, name, false, true)?
+            .ok_or(crate::NativeColdReadError::TableAbsent)?;
+        super::btree::native_byte_get(table, mem, key.as_bytes(), false)
+    }
+    pub(crate) fn captured_native_get(
+        root: Option<BtreeHeader>,
+        mem: &TransactionalMemory,
+        name: &str,
+        key: &[u8],
+        u8_key: bool,
+    ) -> std::result::Result<
+        Option<crate::AccessGuard<'static, &'static [u8]>>,
+        crate::NativeColdReadError,
+    > {
+        let table = Self::captured_native_table_root(root, mem, name, u8_key, false)?
+            .ok_or(crate::NativeColdReadError::TableAbsent)?;
+        super::btree::native_key_get(table, mem, key, false, u8_key)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::Value;
@@ -950,5 +1306,23 @@ mod test {
         };
         let y = InternalTableDefinition::from_bytes(InternalTableDefinition::as_bytes(&x).as_ref());
         assert_eq!(x, y);
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl TableTree {
+    pub(crate) fn next_native_directory_record(&self, lower: &[u8], exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
+        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
+        super::btree::native_text_range_next(self.root(), &self.mem, lower, exclusive, None, true, before)
+    }
+    pub(crate) fn next_native_u64_bytes_range(&self, name: &str, lower: u64, exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
+        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
+        before()?;
+        let directory = super::btree::native_byte_get(self.root(), &self.mem, name.as_bytes(), true)?
+            .ok_or(crate::NativeColdReadError::TableAbsent)?;
+        let root = super::table_tree_base::native_u64_bytes_table_root(directory.value())?;
+        super::btree::native_u64_range_next(root, &self.mem, &lower.to_le_bytes(), exclusive, None, before)
     }
 }

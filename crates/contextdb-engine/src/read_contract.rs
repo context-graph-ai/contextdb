@@ -3,6 +3,9 @@
 //! The encoder is intentionally route-neutral: it accepts query and page values, never a file
 //! handle, owner channel, or route. The local protocol layer owns framing and byte-level fixtures.
 
+pub(crate) mod cursor_observation;
+pub(crate) use cursor_observation::{decode_observed_cursor_page, encode_observed_cursor_page};
+
 use crate::local_transport::{
     preflight_canonical_query_result, preflight_cursor_page_payload,
     preflight_metadata_page_payload,
@@ -13,7 +16,6 @@ use crate::{
     VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
 use bincode::config::standard;
-use bincode::serde::decode_from_slice;
 use contextdb_core::read_contract::{CursorPage, MetadataPage, ReadLimits};
 use contextdb_core::{Value, VectorIndexRef, VectorSearchMode};
 use serde::de::DeserializeOwned;
@@ -40,6 +42,7 @@ pub struct CanonicalQueryTrace {
     /// in-process `.explain` prints.
     #[serde(default)]
     pub maintained_count: Option<CanonicalMaintainedCountDisclosure>,
+    pub groups: Vec<crate::database::GroupDisclosure>,
 }
 
 /// `used` is the maintained count serving the answer; `false` with `declared`
@@ -81,19 +84,18 @@ fn canonical_count_columns(
 fn restored_count_columns(
     columns: Vec<(String, bool)>,
 ) -> Vec<(String, contextdb_core::SortDirection)> {
-    columns
-        .into_iter()
-        .map(|(column, descending)| {
-            (
-                column,
-                if descending {
-                    contextdb_core::SortDirection::Desc
-                } else {
-                    contextdb_core::SortDirection::Asc
-                },
-            )
-        })
-        .collect()
+    let mut restored = Vec::with_capacity(columns.len());
+    for (column, descending) in columns {
+        restored.push((
+            column,
+            if descending {
+                contextdb_core::SortDirection::Desc
+            } else {
+                contextdb_core::SortDirection::Asc
+            },
+        ));
+    }
+    restored
 }
 
 impl CanonicalMaintainedCountDisclosure {
@@ -113,11 +115,13 @@ impl CanonicalMaintainedCountDisclosure {
             (false, false) => MaintainedCountDisclosure::NotDeclared {
                 table: self.table,
                 columns,
-                already_declared: self
-                    .already_declared
-                    .into_iter()
-                    .map(restored_count_columns)
-                    .collect(),
+                already_declared: {
+                    let mut lists = Vec::with_capacity(self.already_declared.len());
+                    for columns in self.already_declared {
+                        lists.push(restored_count_columns(columns));
+                    }
+                    lists
+                },
             },
         }
     }
@@ -143,6 +147,12 @@ pub struct CanonicalVectorSearchDisclosure {
     pub aggregate_allowed_vectors: Option<u64>,
     pub effective_auto_index_at: u64,
     pub auto_index_at_source: String,
+    pub effective_flat_below: u64,
+    pub flat_below_source: String,
+    pub effective_search_radius_millionths: u64,
+    pub search_radius_source: String,
+    pub effective_auto_expansion_ceiling: u64,
+    pub auto_expansion_ceiling_source: String,
     pub partition_key_columns: Vec<String>,
     pub scope: String,
     pub route: Option<String>,
@@ -162,6 +172,8 @@ pub struct CanonicalVectorSearchDisclosure {
     #[serde(default)]
     pub expansion_evaluations: Option<u64>,
     #[serde(default)]
+    pub rescore_evaluations: Option<u64>,
+    #[serde(default)]
     pub layers_admitted: Option<u64>,
     #[serde(default)]
     pub budget_terminal: Option<String>,
@@ -178,6 +190,13 @@ impl From<&VectorSearchDisclosure> for CanonicalVectorSearchDisclosure {
                 .map(|count| count as u64),
             effective_auto_index_at: disclosure.effective_auto_index_at as u64,
             auto_index_at_source: disclosure.auto_index_at_source.clone(),
+            effective_flat_below: disclosure.effective_flat_below as u64,
+            flat_below_source: disclosure.flat_below_source.clone(),
+            effective_search_radius_millionths: disclosure.effective_search_radius_millionths
+                as u64,
+            search_radius_source: disclosure.search_radius_source.clone(),
+            effective_auto_expansion_ceiling: disclosure.effective_auto_expansion_ceiling as u64,
+            auto_expansion_ceiling_source: disclosure.auto_expansion_ceiling_source.clone(),
             partition_key_columns: disclosure.partition_key_columns.clone(),
             scope: disclosure.scope.as_str().to_owned(),
             route: disclosure.route.map(|route| route.as_str().to_owned()),
@@ -192,6 +211,7 @@ impl From<&VectorSearchDisclosure> for CanonicalVectorSearchDisclosure {
             global_candidate_budget: disclosure.global_candidate_budget.map(|count| count as u64),
             admission_evaluations: disclosure.admission_evaluations.map(|count| count as u64),
             expansion_evaluations: disclosure.expansion_evaluations.map(|count| count as u64),
+            rescore_evaluations: disclosure.rescore_evaluations.map(|count| count as u64),
             layers_admitted: disclosure.layers_admitted.map(|count| count as u64),
             budget_terminal: disclosure.budget_terminal.clone(),
             partition_hnsw: disclosure
@@ -277,6 +297,19 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
             effective_auto_index_at: usize::try_from(disclosure.effective_auto_index_at)
                 .map_err(|_| ())?,
             auto_index_at_source: disclosure.auto_index_at_source,
+            effective_flat_below: usize::try_from(disclosure.effective_flat_below)
+                .map_err(|_| ())?,
+            flat_below_source: disclosure.flat_below_source,
+            effective_search_radius_millionths: usize::try_from(
+                disclosure.effective_search_radius_millionths,
+            )
+            .map_err(|_| ())?,
+            search_radius_source: disclosure.search_radius_source,
+            effective_auto_expansion_ceiling: usize::try_from(
+                disclosure.effective_auto_expansion_ceiling,
+            )
+            .map_err(|_| ())?,
+            auto_expansion_ceiling_source: disclosure.auto_expansion_ceiling_source,
             partition_key_columns: disclosure.partition_key_columns,
             scope,
             route,
@@ -303,17 +336,21 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
                 .map(usize::try_from)
                 .transpose()
                 .map_err(|_| ())?,
+            rescore_evaluations: disclosure
+                .rescore_evaluations
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| ())?,
             layers_admitted: disclosure
                 .layers_admitted
                 .map(usize::try_from)
                 .transpose()
                 .map_err(|_| ())?,
             budget_terminal: disclosure.budget_terminal,
-            partition_hnsw: disclosure
-                .partition_hnsw
-                .into_iter()
-                .map(|partition| {
-                    Ok(VectorPartitionHnswDisclosure {
+            partition_hnsw: {
+                let mut partitions = Vec::with_capacity(disclosure.partition_hnsw.len());
+                for partition in disclosure.partition_hnsw {
+                    partitions.push(VectorPartitionHnswDisclosure {
                         partition: partition.partition,
                         route: partition
                             .route
@@ -333,10 +370,30 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
                             .map_err(|_| ())?,
                         ef_search_source: partition.ef_search_source,
                         policy_revision: partition.policy_revision,
-                    })
-                })
-                .collect::<Result<Vec<_>, ()>>()?,
+                    });
+                }
+                partitions
+            },
         })
+    }
+}
+
+impl CanonicalQueryTrace {
+    /// Empty inline trace for measuring a moved result's row buffers through
+    /// the existing shared native-capacity walker.
+    pub(crate) fn empty() -> Self {
+        Self {
+            physical_plan: String::new(),
+            index_used: None,
+            predicates_pushed: Vec::new(),
+            indexes_considered: Vec::new(),
+            sort_elided: false,
+            query_vector_source: None,
+            vector_search: None,
+            rows_examined: 0,
+            maintained_count: None,
+            groups: Vec::new(),
+        }
     }
 }
 
@@ -362,6 +419,7 @@ impl From<&QueryTrace> for CanonicalQueryTrace {
             query_vector_source: trace.query_vector_source.clone(),
             vector_search: trace.vector_search.as_ref().map(Into::into),
             rows_examined: trace.rows_examined,
+            groups: trace.groups.to_vec(),
             maintained_count: trace.maintained_count.as_deref().map(|disclosure| {
                 use crate::maintained_counts::MaintainedCountDisclosure;
                 let (used, declared, table, columns, already_declared) = match disclosure {
@@ -483,7 +541,7 @@ fn encoding_error_from_transport(
 ) -> ReadEncodingError {
     match error {
         crate::local_transport::LocalTransportError::Payload(
-            crate::local_transport::PayloadViolation::MemoryCeilingExceeded { ceiling },
+            crate::local_transport::PayloadViolation::MemoryCeilingExceeded { ceiling, .. },
         ) => ReadEncodingError::MemoryCeilingExceeded { ceiling },
         _ => ReadEncodingError::InvalidPayload,
     }
@@ -499,6 +557,339 @@ pub fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncoding
         }
     }
     encode(&CanonicalQueryResultView::from(result))
+}
+
+// Stack-only views of the existing canonical fields, in the identical
+// order. Encoding never constructs an owned trace/cascade merely to measure
+// and serialize it. These types are private and are not a new wire contract.
+#[derive(Serialize)]
+struct QueryPartitionView<'a> {
+    partition: &'a str,
+    route: Option<&'a str>,
+    reason: Option<&'a str>,
+    hnsw_m: u64,
+    hnsw_ef_construction: u64,
+    hnsw_ef_search: u64,
+    ef_search_source: &'a str,
+    policy_revision: u64,
+}
+#[derive(Serialize)]
+struct QueryVectorView<'a> {
+    route_evidence: &'a str,
+    requested_mode: &'a str,
+    resolved_mode: &'a str,
+    aggregate_allowed_vectors: Option<u64>,
+    effective_auto_index_at: u64,
+    auto_index_at_source: &'a str,
+    effective_flat_below: u64,
+    flat_below_source: &'a str,
+    effective_search_radius_millionths: u64,
+    search_radius_source: &'a str,
+    effective_auto_expansion_ceiling: u64,
+    auto_expansion_ceiling_source: &'a str,
+    partition_key_columns: &'a [String],
+    scope: &'a str,
+    route: Option<&'a str>,
+    base: &'a str,
+    change: &'a str,
+    tail: &'a str,
+    residual: &'a str,
+    fallback: Option<&'a str>,
+    refusal: Option<&'a str>,
+    recovery: Option<&'a str>,
+    query_source: &'a str,
+    partition_hnsw: QueryPartitionSequence<'a>,
+    global_candidate_budget: Option<u64>,
+    admission_evaluations: Option<u64>,
+    expansion_evaluations: Option<u64>,
+    rescore_evaluations: Option<u64>,
+    layers_admitted: Option<u64>,
+    budget_terminal: Option<&'a str>,
+}
+#[derive(Serialize)]
+struct QueryTraceView<'a> {
+    physical_plan: &'a str,
+    index_used: Option<&'a str>,
+    predicates_pushed: &'a [std::borrow::Cow<'static, str>],
+    indexes_considered: QueryCandidateSequence<'a>,
+    sort_elided: bool,
+    query_vector_source: Option<&'a VectorIndexRef>,
+    vector_search: Option<QueryVectorView<'a>>,
+    rows_examined: u64,
+    maintained_count: Option<QueryCountView<'a>>,
+    groups: &'a [crate::database::GroupDisclosure],
+}
+#[derive(Serialize)]
+struct QueryCountView<'a> {
+    used: bool, declared: bool, table: &'a str,
+    columns: QueryCountColumns<'a>, already_declared: QueryCountLists<'a>,
+}
+#[derive(Serialize)]
+struct QueryCascadeView<'a> { dropped_indexes: &'a [String] }
+#[derive(Serialize)]
+struct QueryResultView<'a> {
+    columns: &'a [String], rows: QueryRows<'a>, rows_affected: u64,
+    trace: QueryTraceView<'a>, cascade: Option<QueryCascadeView<'a>>,
+}
+// The core JSON serializer builds a temporary String. This private binary
+// view writes that SAME length-prefixed UTF-8 directly, without a second
+// engine-held copy. Other Value variants keep their existing serializer.
+struct QueryRows<'a>(&'a [Vec<Value>]);
+struct QueryRow<'a>(&'a [Value]);
+struct QueryValue<'a>(&'a Value);
+impl Serialize for QueryRows<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for row in self.0 { sequence.serialize_element(&QueryRow(row))?; }
+        sequence.end()
+    }
+}
+impl Serialize for QueryRow<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 { sequence.serialize_element(&QueryValue(value))?; }
+        sequence.end()
+    }
+}
+impl Serialize for QueryValue<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Value::Json(value) => serializer.serialize_newtype_variant("Value", 7, "Json", &QueryJson(value)),
+            value => value.serialize(serializer),
+        }
+    }
+}
+struct QueryJson<'a>(&'a serde_json::Value);
+struct QueryJsonSize(usize);
+impl std::io::Write for QueryJsonSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len())
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+struct QueryJsonSequence<S: serde::ser::SerializeSeq> {
+    sequence: S,
+    failure: Option<S::Error>,
+}
+impl<S: serde::ser::SerializeSeq> std::io::Write for QueryJsonSequence<S> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for byte in bytes {
+            if let Err(error) = self.sequence.serialize_element(byte) {
+                self.failure = Some(error);
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+impl Serialize for QueryJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq};
+        let mut size = QueryJsonSize(0);
+        serde_json::to_writer(&mut size, self.0).map_err(S::Error::custom)?;
+        let mut output = QueryJsonSequence {
+            sequence: serializer.serialize_seq(Some(size.0))?, failure: None,
+        };
+        let encoded = serde_json::to_writer(&mut output, self.0);
+        if let Some(error) = output.failure { return Err(error); }
+        encoded.map_err(S::Error::custom)?;
+        output.sequence.end()
+    }
+}
+struct QueryCandidateSequence<'a>(&'a [crate::database::IndexCandidate]);
+impl Serialize for QueryCandidateSequence<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        #[derive(Serialize)]
+        struct Candidate<'a> { name: &'a str, rejected_reason: &'a str }
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for candidate in self.0 {
+            sequence.serialize_element(&Candidate { name: &candidate.name,
+                rejected_reason: candidate.rejected_reason.as_ref() })?;
+        }
+        sequence.end()
+    }
+}
+struct QueryPartitionSequence<'a>(&'a [VectorPartitionHnswDisclosure]);
+impl Serialize for QueryPartitionSequence<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for partition in self.0 {
+            sequence.serialize_element(&QueryPartitionView {
+                partition: &partition.partition,
+                route: partition.route.map(|route| route.as_str()),
+                reason: partition.reason.as_deref(), hnsw_m: partition.hnsw_m as u64,
+                hnsw_ef_construction: partition.hnsw_ef_construction as u64,
+                hnsw_ef_search: partition.hnsw_ef_search as u64,
+                ef_search_source: &partition.ef_search_source, policy_revision: partition.policy_revision,
+            })?;
+        }
+        sequence.end()
+    }
+}
+struct QueryCountColumns<'a>(&'a [(String, contextdb_core::SortDirection)]);
+impl Serialize for QueryCountColumns<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (name, direction) in self.0 {
+            sequence.serialize_element(&(name, matches!(direction, contextdb_core::SortDirection::Desc)))?;
+        }
+        sequence.end()
+    }
+}
+struct QueryCountLists<'a>(&'a [Vec<(String, contextdb_core::SortDirection)>]);
+impl Serialize for QueryCountLists<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for columns in self.0 { sequence.serialize_element(&QueryCountColumns(columns))?; }
+        sequence.end()
+    }
+}
+impl<'a> From<&'a crate::maintained_counts::MaintainedCountDisclosure> for QueryCountView<'a> {
+    fn from(value: &'a crate::maintained_counts::MaintainedCountDisclosure) -> Self {
+        use crate::maintained_counts::MaintainedCountDisclosure;
+        let (used, declared, table, columns, lists) = match value {
+            MaintainedCountDisclosure::Used { table, columns } => (true, true, table, columns, &[][..]),
+            MaintainedCountDisclosure::DeclaredNotServed { table, columns } => (false, true, table, columns, &[][..]),
+            MaintainedCountDisclosure::NotDeclared { table, columns, already_declared } =>
+                (false, false, table, columns, already_declared.as_slice()),
+        };
+        Self { used, declared, table, columns: QueryCountColumns(columns), already_declared: QueryCountLists(lists) }
+    }
+}
+impl<'a> From<&'a QueryTrace> for QueryTraceView<'a> {
+    fn from(trace: &'a QueryTrace) -> Self {
+        Self {
+            physical_plan: trace.physical_plan, index_used: trace.index_used.as_deref(),
+            predicates_pushed: &trace.predicates_pushed,
+            indexes_considered: QueryCandidateSequence(&trace.indexes_considered),
+            sort_elided: trace.sort_elided, query_vector_source: trace.query_vector_source.as_ref(),
+            vector_search: trace.vector_search.as_ref().map(Into::into), rows_examined: trace.rows_examined,
+            maintained_count: trace.maintained_count.as_deref().map(Into::into), groups: &trace.groups,
+        }
+    }
+}
+impl<'a> From<&'a VectorSearchDisclosure> for QueryVectorView<'a> {
+    fn from(disclosure: &'a VectorSearchDisclosure) -> Self {
+        Self {
+            route_evidence: disclosure.route_evidence.as_str(),
+            requested_mode: disclosure.requested_mode.as_str(),
+            resolved_mode: disclosure.resolved_mode.as_str(),
+            aggregate_allowed_vectors: disclosure
+                .aggregate_allowed_vectors
+                .map(|count| count as u64),
+            effective_auto_index_at: disclosure.effective_auto_index_at as u64,
+            auto_index_at_source: disclosure.auto_index_at_source.as_str(),
+            effective_flat_below: disclosure.effective_flat_below as u64,
+            flat_below_source: disclosure.flat_below_source.as_str(),
+            effective_search_radius_millionths: disclosure.effective_search_radius_millionths
+                as u64,
+            search_radius_source: disclosure.search_radius_source.as_str(),
+            effective_auto_expansion_ceiling: disclosure.effective_auto_expansion_ceiling as u64,
+            auto_expansion_ceiling_source: disclosure.auto_expansion_ceiling_source.as_str(),
+            partition_key_columns: disclosure.partition_key_columns.as_slice(),
+            scope: disclosure.scope.as_str(),
+            route: disclosure.route.map(|route| route.as_str()),
+            base: disclosure.base.as_str(),
+            change: disclosure.change.as_str(),
+            tail: disclosure.tail.as_str(),
+            residual: disclosure.residual.as_str(),
+            fallback: disclosure.fallback.as_deref(),
+            refusal: disclosure.refusal.as_deref(),
+            recovery: disclosure.recovery.as_deref(),
+            query_source: disclosure.query_source.as_str(),
+            global_candidate_budget: disclosure.global_candidate_budget.map(|count| count as u64),
+            admission_evaluations: disclosure.admission_evaluations.map(|count| count as u64),
+            expansion_evaluations: disclosure.expansion_evaluations.map(|count| count as u64),
+            rescore_evaluations: disclosure.rescore_evaluations.map(|count| count as u64),
+            layers_admitted: disclosure.layers_admitted.map(|count| count as u64),
+            budget_terminal: disclosure.budget_terminal.as_deref(),
+            partition_hnsw: QueryPartitionSequence(&disclosure.partition_hnsw),
+        }
+    }
+}
+
+
+pub(crate) fn encode_query_result_funded(
+    result: &QueryResult,
+    owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory_ceiling: u64,
+) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
+    for row in &result.rows {
+        if row.len() != result.columns.len() { return Err(ReadEncodingError::InvalidPayload); }
+    }
+    let view = QueryResultView {
+        columns: &result.columns, rows: QueryRows(&result.rows), rows_affected: result.rows_affected,
+        trace: QueryTraceView::from(&result.trace),
+        cascade: result.cascade.as_ref().map(|cascade| QueryCascadeView { dropped_indexes: &cascade.dropped_indexes }),
+    };
+    encode_transport_funded(&view, Some(owner), memory_ceiling)
+}
+
+/// The Query variant has the same tag, field order and map ordering as the
+/// owned public DTO. Only JSON values use the existing streaming wire view.
+#[derive(Serialize)]
+struct QueryRequestEnvelopeView<'a> { limits: ReadLimits, request: QueryRequestView<'a> }
+#[derive(Serialize)]
+enum QueryRequestView<'a> { Query { statement: &'a str, params: QueryParamsView<'a> } }
+struct QueryParamsView<'a>(&'a std::collections::BTreeMap<String, Value>);
+impl Serialize for QueryParamsView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in self.0 { map.serialize_entry(key, &QueryValue(value))?; }
+        map.end()
+    }
+}
+pub(crate) fn encode_request_funded(
+    request: &crate::local_transport::LocalRequestEnvelope,
+    owner: Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    memory_ceiling: u64,
+) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
+    if let crate::local_transport::LocalRequest::Query { statement, params } = &request.request {
+        encode_transport_funded(&QueryRequestEnvelopeView { limits: request.limits,
+            request: QueryRequestView::Query { statement, params: QueryParamsView(params) } },
+            owner, memory_ceiling)
+    } else { encode_transport_funded(request, owner, memory_ceiling) }
+}
+
+pub(crate) fn encode_transport_funded<T: Serialize>(
+    value: &T,
+    owner: Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    memory_ceiling: u64,
+) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
+    let mut measured = bincode::enc::write::SizeWriter::default();
+    bincode::serde::encode_into_writer(value, &mut measured, standard())
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    let mut output = crate::local_transport::query_funding::Funded::allocate(owner,
+        measured.bytes_written, || Vec::with_capacity(measured.bytes_written))
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    bincode::serde::encode_into_std_write(value, &mut output.value, standard())
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    if output.value.len() != measured.bytes_written { return Err(ReadEncodingError::InvalidPayload); }
+    Ok(output)
+}
+
+pub(crate) fn decode_query_result_funded(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory_ceiling: u64,
+) -> Result<crate::local_transport::query_funding::Funded<CanonicalQueryResult>, ReadEncodingError> {
+    #[cfg(feature = "test-seams")]
+    crate::local_transport::OrdinaryResultReceiver::observe_actual_canonical_decode_entry_for_test(bytes);
+    preflight_canonical_query_result(bytes, memory_ceiling)?;
+    let result = crate::local_transport::query_funding::decode(bytes, memory)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    validate_query_result(&result.value)?;
+    Ok(result)
 }
 
 /// Decode with no caller ceiling in hand. The shipped default stands in as
@@ -520,7 +911,9 @@ pub fn decode_query_result_under_memory_ceiling(
         bytes,
     );
     preflight_canonical_query_result(bytes, memory_ceiling)?;
-    let result = decode_exact(bytes)?;
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let result = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
     validate_query_result(&result)?;
     Ok(result)
 }
@@ -568,7 +961,7 @@ pub(crate) fn encode_metadata_body_measured(
         counting: false,
     };
     crate::read_image::write_metadata_body(&mut bytes, body);
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::read_image::answer_encoded_for_test();
     bytes.finish()
 }
@@ -661,10 +1054,44 @@ impl CanonicalWriter {
 pub fn decode_metadata_body(
     bytes: &[u8],
 ) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
-    let mut reader = CanonicalReader::new(bytes);
-    let body = crate::read_image::read_metadata_body(&mut reader)?;
-    reader.finish()?;
-    Ok(body)
+    let memory = decoder_memory(ReadLimits::SHIPPED_MEMORY)
+        .map_err(|error| encoding_error_from_core(error, ReadLimits::SHIPPED_MEMORY))?;
+    decode_metadata_body_with_memory(bytes, &memory, ReadLimits::SHIPPED_MEMORY)
+}
+
+pub(crate) fn decode_metadata_body_with_memory(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    ceiling: u64,
+) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
+    let bound = bytes
+        .len()
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or(ReadEncodingError::MemoryCeilingExceeded { ceiling })?;
+    let transient = contextdb_core::read_memory::ReadCredit::try_new(
+        memory.clone(),
+        bound,
+        "reader",
+        "metadata_body",
+        "Raise reader memory to decode this metadata body.",
+    )
+    .map_err(|error| encoding_error_from_core(error, ceiling))?;
+    let result = memory.scope(|| {
+        let mut reader = CanonicalReader::new(bytes);
+        let body = crate::read_image::read_metadata_body(&mut reader)?;
+        reader.finish()?;
+        Ok(body)
+    });
+    // The body keeps its admitted JSON payload on this same owner; its
+    // construction-only input/container upper bound ends here.
+    drop(transient);
+    result.map_err(|error| match error {
+        ReadEncodingError::MemoryCeilingExceeded { .. } => {
+            ReadEncodingError::MemoryCeilingExceeded { ceiling }
+        }
+        error => error,
+    })
 }
 
 /// A cursor over canonical bytes, reading exactly what [`CanonicalWriter`]
@@ -779,7 +1206,9 @@ pub fn decode_cursor_page_under_memory_ceiling(
     memory_ceiling: u64,
 ) -> Result<CursorPage, ReadEncodingError> {
     preflight_cursor_page_payload(bytes, memory_ceiling).map_err(encoding_error_from_transport)?;
-    let page: CursorPage = decode_exact(bytes)?;
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let page: CursorPage = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(page)
@@ -809,7 +1238,9 @@ pub fn decode_metadata_page_under_memory_ceiling(
 ) -> Result<MetadataPage, ReadEncodingError> {
     preflight_metadata_page_payload(bytes, memory_ceiling)
         .map_err(encoding_error_from_transport)?;
-    let page: MetadataPage = decode_exact(bytes)?;
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let page: MetadataPage = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(page)
@@ -841,19 +1272,94 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
     Ok(encoded)
 }
 
-/// The decoder's own limit counts wire reads, and counts each integer field at
-/// its fixed width rather than the shorter form actually consumed, so it is
-/// stated at the decoder's worst case per admitted wire byte. What the decoded
-/// form costs in live memory is charged by the preflight each caller runs
-/// above, before the decoder is entered.
-const DECODE_WIRE_CLAIM_CEILING: usize = crate::local_transport::MAX_FRAME_BYTES * 8;
+/// Use the existing declared reader root as the standalone codec's host
+/// capability boundary. Every engine-created native control is admitted to
+/// its operation child before the corresponding Arc allocations.
+pub(crate) fn decoder_memory(
+    memory_ceiling: u64,
+) -> contextdb_core::Result<std::sync::Arc<crate::read_image_memory::ImageMemory>> {
+    let root = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(memory_ceiling);
+    let child = root.child()?;
+    let controls = std::mem::size_of::<crate::memory_accounting::MemoryAccountant>()
+        + 2 * std::mem::size_of::<usize>()
+        + 2 * (std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+            + 2 * std::mem::size_of::<usize>());
+    child.try_reserve(
+        controls,
+        "reader",
+        "decode_accountant",
+        "Reduce the payload or raise the declared reader memory limit.",
+    )?;
+    let accountant = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+        usize::try_from(memory_ceiling).unwrap_or(usize::MAX),
+    ));
+    let memory = match crate::read_image_memory::ImageMemory::operation_reader(
+        accountant.into(),
+        child.clone(),
+    ) {
+        Ok(memory) => memory,
+        Err(error) => {
+            child.release(controls);
+            return Err(error);
+        }
+    };
+    memory.adopt_reader_credit(&child, controls)?;
+    Ok(memory)
+}
 
-fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ReadEncodingError> {
-    let configuration = standard().with_limit::<DECODE_WIRE_CLAIM_CEILING>();
-    let (value, consumed) =
-        decode_from_slice(bytes, configuration).map_err(|_| ReadEncodingError::InvalidPayload)?;
+pub(crate) fn encoding_error_from_core(
+    error: contextdb_core::Error,
+    memory_ceiling: u64,
+) -> ReadEncodingError {
+    match error {
+        error if crate::read_image_memory::is_memory_refusal(&error) => {
+            ReadEncodingError::MemoryCeilingExceeded {
+                ceiling: memory_ceiling,
+            }
+        }
+        _ => ReadEncodingError::InvalidPayload,
+    }
+}
+
+/// Borrowed wire input coexists with all decoded buffers. This credit is
+/// temporary; payload credit stays on the same owner until its DTO boundary.
+pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory_ceiling: u64,
+) -> Result<T, ReadEncodingError> {
+    let input = contextdb_core::read_memory::ReadCredit::try_new(
+        memory.clone(),
+        bytes.len(),
+        "reader",
+        "decode_input",
+        "Reduce the payload or raise the declared reader memory limit.",
+    )
+    .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let before = memory.held();
+    let (value, consumed) = memory
+        .scope(|| crate::read_image_memory::decode(bytes))
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     if consumed != bytes.len() {
+        drop(value);
+        memory.release(memory.held() - before);
         return Err(ReadEncodingError::InvalidPayload);
     }
+    drop(input);
     Ok(value)
+}
+
+pub(crate) fn decode_query_result_with_memory(
+    bytes: &[u8],
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory_ceiling: u64,
+) -> Result<CanonicalQueryResult, ReadEncodingError> {
+    #[cfg(feature = "test-seams")]
+    crate::local_transport::OrdinaryResultReceiver::observe_actual_canonical_decode_entry_for_test(
+        bytes,
+    );
+    preflight_canonical_query_result(bytes, memory_ceiling)?;
+    let result = decode_exact_with_memory(bytes, memory, memory_ceiling)?;
+    validate_query_result(&result)?;
+    Ok(result)
 }

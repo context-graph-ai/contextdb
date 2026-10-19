@@ -31,12 +31,12 @@ impl FabricIdentity {
 
     fn load(path: &Path) -> contextdb_core::Result<Self> {
         let bytes = std::fs::read(path)
-            .map_err(|_| Error::SyncError("cannot read fabric identity file".to_string()))?;
+            .map_err(|_| Error::SyncError(("cannot read fabric identity file".to_string()).into()))?;
         let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            Error::SyncError(format!(
+            Error::SyncError((format!(
                 "fabric identity file is corrupt: expected 32 secret-seed bytes, found {}",
                 bytes.len()
-            ))
+            )).into())
         })?;
         Ok(Self { seed })
     }
@@ -46,7 +46,7 @@ impl FabricIdentity {
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|_| {
-                Error::SyncError("cannot create fabric identity directory".to_string())
+                Error::SyncError(("cannot create fabric identity directory".to_string()).into())
             })?;
         }
         let mut options = std::fs::OpenOptions::new();
@@ -58,9 +58,9 @@ impl FabricIdentity {
         }
         let mut file = options
             .open(path)
-            .map_err(|_| Error::SyncError("cannot create fabric identity file".to_string()))?;
+            .map_err(|_| Error::SyncError(("cannot create fabric identity file".to_string()).into()))?;
         file.write_all(&self.seed)
-            .map_err(|_| Error::SyncError("cannot write fabric identity file".to_string()))?;
+            .map_err(|_| Error::SyncError(("cannot write fabric identity file".to_string()).into()))?;
         Ok(())
     }
 
@@ -100,6 +100,14 @@ impl FabricIdentity {
             .to_vec()
     }
 
+    /// Native sibling: the original fabric seed, with a stack-only signature.
+    pub(crate) fn sign_lineage_fixed(&self, bytes: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        ed25519_dalek::SigningKey::from_bytes(&self.seed)
+            .sign(bytes)
+            .to_bytes()
+    }
+
     /// Sign as this identity from a test that stands in for a peer holding
     /// this key -- the same signature a transport-owned signer would make.
     #[cfg(feature = "test-seams")]
@@ -120,15 +128,14 @@ impl FabricIdentity {
 
         let public_bytes = hex_node_id(node_id)?;
         let verifying = ed25519_dalek::VerifyingKey::from_bytes(&public_bytes).map_err(|err| {
-            Error::SyncError(format!("invalid lineage author node identity: {err}"))
+            Error::SyncError((format!("invalid lineage author node identity: {err}")).into())
         })?;
         let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|err| {
-            Error::SyncError(format!("invalid lineage signature encoding: {err}"))
+            Error::SyncError((format!("invalid lineage signature encoding: {err}")).into())
         })?;
         verifying.verify(bytes, &signature).map_err(|_| {
-            Error::SyncError(
-                "wire row lineage signature does not verify for its author".to_string(),
-            )
+            Error::SyncError((
+                "wire row lineage signature does not verify for its author".to_string()).into())
         })
     }
 
@@ -145,17 +152,16 @@ fn hex_node_id(node_id: &str) -> contextdb_core::Result<[u8; 32]> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
-        return Err(Error::SyncError(
-            "lineage author node identity must be 32 lowercase hex bytes".to_string(),
-        ));
+        return Err(Error::SyncError((
+            "lineage author node identity must be 32 lowercase hex bytes".to_string()).into()));
     }
     let mut bytes = [0u8; 32];
     for (index, pair) in node_id.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(pair).map_err(|_| {
-            Error::SyncError("lineage author node identity is not valid hex".to_string())
+            Error::SyncError(("lineage author node identity is not valid hex".to_string()).into())
         })?;
         bytes[index] = u8::from_str_radix(text, 16).map_err(|_| {
-            Error::SyncError("lineage author node identity is not valid hex".to_string())
+            Error::SyncError(("lineage author node identity is not valid hex".to_string()).into())
         })?;
     }
     Ok(bytes)

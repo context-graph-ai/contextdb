@@ -9,6 +9,7 @@ use contextdb_core::read_contract::{
     OwnerReadCancellation, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
     ReadFailureLimit, ReadLimits,
 };
+use contextdb_engine::vector_read_memory::{DeclaredReadMemory, ReadRequestBudgetProvider};
 use contextdb_engine::{Database, MetadataBody, MetadataRequest, ReadCursor, ReadSession};
 use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_INTERRUPTED_PUSH_UNCONFIRMED, EXIT_OK};
 use contextdb_server::{SyncClient, SyncPlugin};
@@ -31,6 +32,7 @@ use std::sync::{Arc, Mutex};
 pub enum Session {
     Reading {
         reader: ReadSession,
+        read_memory: Arc<DeclaredReadMemory>,
         /// The store this session was pointed at. `.owner status` asks the
         /// path about its owner rather than the session, because it resolves
         /// no route and must answer even when there is no owner to route to.
@@ -39,20 +41,48 @@ pub enum Session {
     Writing {
         database: Arc<Database>,
         reader: ReadSession,
+        read_memory: Arc<DeclaredReadMemory>,
     },
 }
 
 impl Session {
     /// Build a writing session over an already-open database, with the bounded
     /// read view its own reads will go through.
-    pub fn writing(database: Arc<Database>, limits: ReadLimits) -> contextdb_core::Result<Self> {
+    pub fn writing(
+        database: Arc<Database>,
+        limits: ReadLimits,
+        read_memory: Arc<DeclaredReadMemory>,
+    ) -> contextdb_core::Result<Self> {
         let reader = database.read_session(limits)?;
-        Ok(Self::Writing { database, reader })
+        Ok(Self::Writing {
+            database,
+            reader,
+            read_memory,
+        })
     }
 
     /// Adopt an already-selected read route as a reading session.
-    pub fn reading(reader: ReadSession, path: PathBuf) -> Self {
-        Self::Reading { reader, path }
+    pub fn reading(
+        reader: ReadSession,
+        path: PathBuf,
+        read_memory: Arc<DeclaredReadMemory>,
+    ) -> Self {
+        Self::Reading {
+            reader,
+            path,
+            read_memory,
+        }
+    }
+
+    /// Each operation shares the working-set parent declared by this session.
+    pub fn request_read_memory(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        match self {
+            Self::Reading { read_memory, .. } | Self::Writing { read_memory, .. } => {
+                read_memory.request_budget()
+            }
+        }
     }
 
     /// The bounded view every read in this session goes through, whichever
@@ -446,7 +476,7 @@ fn read_failure_message(
         ReadFailureKind::HeldByWriter => {
             Some("drop --write: a read session reaches the live owner's channel")
         }
-        ReadFailureKind::HeldByReaders => Some("retry once they finish hydrating"),
+        ReadFailureKind::HeldByReaders => Some("retry once they finish"),
         ReadFailureKind::OwnerNotRunning => Some("this session reads the committed file directly"),
         ReadFailureKind::OwnerNotServing => {
             Some("close the writer and rerun, or start it without --no-owner-reads")
@@ -1059,6 +1089,7 @@ fn process_meta_line(
         let _cmd = parts.next();
         let rest = parts.next().unwrap_or("").trim();
         let outcome = run_sync_command(
+            session_handle,
             sync_client,
             rt,
             rest,
@@ -1068,7 +1099,11 @@ fn process_meta_line(
         if outcome.ok {
             report_success(&outcome.message, &outcome.json, input.output);
         } else {
-            report_failure(outcome.class, &outcome.message, input);
+            if let Some(error @ Error::ReadFailure(_)) = &outcome.error {
+                report_error(error, input);
+            } else {
+                report_failure(outcome.class, &outcome.message, input);
+            }
             session.had_error = true;
         }
     } else if is_trace_command(line) {
@@ -1148,6 +1183,7 @@ struct SyncCommandOutcome {
     ok: bool,
     /// Which error family a failure belongs to, for the `--json` envelope.
     class: ErrorClass,
+    error: Option<Error>,
 }
 
 impl SyncCommandOutcome {
@@ -1157,6 +1193,7 @@ impl SyncCommandOutcome {
             json,
             ok: true,
             class: ErrorClass::Sync,
+            error: None,
         }
     }
 
@@ -1166,6 +1203,17 @@ impl SyncCommandOutcome {
             json: serde_json::Value::Null,
             ok: false,
             class,
+            error: None,
+        }
+    }
+
+    fn failed_error(error: Error, message: String) -> Self {
+        Self {
+            message,
+            json: serde_json::Value::Null,
+            ok: false,
+            class: ErrorClass::of(&error),
+            error: Some(error),
         }
     }
 }
@@ -1266,15 +1314,22 @@ pub(crate) fn handle_meta_command(
                 session,
             );
         }
+        ".verify" => {
+            // The registry admitted exactly `history <table>`.
+            let table = rest.strip_prefix("history").unwrap_or_default().trim();
+            return answer_metadata(
+                session_handle,
+                MetadataRequest::VerifyHistory {
+                    table: table.to_owned(),
+                },
+                None,
+                input,
+                session,
+            );
+        }
         ".maintenance" => {
             if rest == "status" {
-                return answer_metadata(
-                    session_handle,
-                    MetadataRequest::MaintenanceStatus,
-                    None,
-                    input,
-                    session,
-                );
+                return answer_maintenance_status(session_handle, input, session);
             }
             // Running a cycle and compacting CHANGE the store, so they are the
             // live database's to do; only a writing session ever reaches here,
@@ -1286,7 +1341,10 @@ pub(crate) fn handle_meta_command(
                 return MetaCommandOutcome::failed();
             };
             match rest {
-                "run" => match db.run_maintenance_cycle() {
+                "run" => match session_handle
+                    .request_read_memory()
+                    .and_then(|read_memory| db.run_maintenance_cycle_with_read_memory(read_memory))
+                {
                     Ok(report) => {
                         if input.output.json {
                             json_output::print_document(&json_output::maintenance_report_document(
@@ -1317,7 +1375,8 @@ pub(crate) fn handle_meta_command(
                                  vector_failure_requested_bytes={} vector_failure_available_bytes={} \
                                  vector_failure_current_bytes={} vector_failure_budget_limit_bytes={} \
                                  vector_failure_message={} vector_failure_recovery_action={} \
-                                 vector_failure_recovery_instruction={}",
+                                 vector_failure_recovery_instruction={} \
+                                 auto_compact_fragmentation_before={} compaction_policy={}",
                                 report.pruning.pruned_rows,
                                 report.pruning.rows_deferred_for_readers,
                                 report.currency.pruned_versions,
@@ -1342,6 +1401,11 @@ pub(crate) fn handle_meta_command(
                                 failure_details.map_or("none", |details| details.recovery_action()),
                                 failure_details
                                     .map_or("none", |details| details.recovery_instruction),
+                                report.compaction.fragmentation_before.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
+                                json_output::compaction_policy_text(&report.compaction.policy),
                             );
                         }
                     }
@@ -1359,13 +1423,22 @@ pub(crate) fn handle_meta_command(
                         } else {
                             println!(
                                 "ran={} duration_micros={} bytes_before={} bytes_after={} \
-                                 file_shrank={} fragmentation_before={}",
+                                 file_shrank={} fragmentation_before={} page_slack_ratio={} \
+                                 compaction_policy={}",
                                 report.ran,
                                 report.duration_micros,
                                 render_optional_value(report.bytes_before),
                                 render_optional_value(report.bytes_after),
                                 report.file_shrank,
-                                report.fragmentation_before,
+                                report.fragmentation_before.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
+                                report.page_slack_ratio.map_or_else(
+                                    || "unknown".to_string(),
+                                    |ratio| ratio.to_string()
+                                ),
+                                json_output::compaction_policy_text(&report.policy),
                             );
                         }
                     }
@@ -1401,9 +1474,13 @@ pub(crate) fn handle_meta_command(
             );
         }
         ".sync" => {
-            let outcome = handle_sync_command(sync_client, rt, rest, sync_plugin);
+            let outcome = handle_sync_command(session_handle, sync_client, rt, rest, sync_plugin);
             if !outcome.ok {
-                report_failure(outcome.class, &outcome.message, input);
+                if let Some(error @ Error::ReadFailure(_)) = &outcome.error {
+                    report_error(error, input);
+                } else {
+                    report_failure(outcome.class, &outcome.message, input);
+                }
                 return MetaCommandOutcome::failed();
             }
             report_success(&outcome.message, &outcome.json, input.output);
@@ -1551,6 +1628,78 @@ fn answer_metadata(
     }
 }
 
+/// `.maintenance status`: the loop's state from the metadata door, plus the
+/// store's storage compaction settings with each value's source
+/// (`SHOW STORAGE_COMPACTION`, a read the same session answers).
+fn answer_maintenance_status(
+    session_handle: &Session,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    note_read_route(session_handle, input, session);
+    let answer = match session_handle
+        .reader()
+        .metadata(MetadataRequest::MaintenanceStatus, None)
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            report_error(&error, input);
+            return MetaCommandOutcome::failed();
+        }
+    };
+    let compaction = match session_handle
+        .reader()
+        .execute("SHOW STORAGE_COMPACTION", &HashMap::new())
+    {
+        Ok(result) => result,
+        Err(error) => {
+            report_error(&error, input);
+            return MetaCommandOutcome::failed();
+        }
+    };
+    let MetadataBody::MaintenanceStatus { status } = &answer.body else {
+        publish_metadata(&answer, input);
+        return MetaCommandOutcome::done();
+    };
+    let settings: Vec<(String, String, String)> = compaction
+        .rows
+        .iter()
+        .map(|row| {
+            let text = |value: &contextdb_core::Value| match value {
+                contextdb_core::Value::Text(text) => text.clone(),
+                contextdb_core::Value::Int64(number) => number.to_string(),
+                contextdb_core::Value::Float64(number) => number.to_string(),
+                other => format!("{other:?}"),
+            };
+            (text(&row[0]), text(&row[1]), text(&row[2]))
+        })
+        .collect();
+    if input.output.json {
+        json_output::print_document(&json_output::maintenance_status_with_compaction_document(
+            status, &settings,
+        ));
+    } else {
+        println!(
+            "running={} retention_enabled={} currency_compaction_enabled={} \
+             active_maintenance_loops={} policy={}",
+            status.running,
+            status.retention_enabled,
+            status.currency_compaction_enabled,
+            status.active_maintenance_loops,
+            status.policy,
+        );
+        println!(
+            "storage_compaction {}",
+            settings
+                .iter()
+                .map(|(setting, value, source)| format!("{setting}={value}({source})"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    MetaCommandOutcome::done()
+}
+
 /// One metadata answer, rendered for whoever is reading.
 fn publish_metadata(answer: &contextdb_engine::MetadataAnswer, input: InputContext) {
     let json = input.output.json;
@@ -1632,6 +1781,18 @@ fn publish_metadata(answer: &contextdb_engine::MetadataAnswer, input: InputConte
                 println!("{physical_plan}");
                 if let Some(index) = index {
                     println!("index: {index}");
+                }
+            }
+        }
+        MetadataBody::VerifyHistory { table, indexes } => {
+            if json {
+                json_output::print_document(&json_output::verify_history_document(table, indexes));
+            } else {
+                for index in indexes {
+                    println!(
+                        "table={table} index={} postings={} versions={} verified=true",
+                        index.index, index.postings, index.versions
+                    );
                 }
             }
         }
@@ -2099,6 +2260,7 @@ fn command_gloss(spelling: &str) -> &'static str {
         ".explain" => "Show a statement's execution plan; never applies a write.",
         ".events status" => "Bounded, resumable event/sink/route/schedule health.",
         ".maintenance status" => "One complete bounded maintenance-state response.",
+        ".verify history" => "Check every historical index of a table against its row versions.",
         ".cursor open" => "Page a result larger than an ordinary ceiling.",
         ".cursor fetch" => "Next page; omit the count to use the declared page size.",
         ".cursor close" => "Release this session's cursor.",
@@ -2320,13 +2482,21 @@ fn report_error(error: &Error, input: InputContext) {
 }
 
 fn handle_sync_command(
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     args: &str,
     sync_plugin: Option<&SyncPlugin>,
 ) -> SyncCommandOutcome {
     let mut unconfirmed_push = false;
-    run_sync_command(sync_client, rt, args, sync_plugin, &mut unconfirmed_push)
+    run_sync_command(
+        session_handle,
+        sync_client,
+        rt,
+        args,
+        sync_plugin,
+        &mut unconfirmed_push,
+    )
 }
 
 /// The pull-progress rendering DECISION, pulled out of the sleep-driven
@@ -2361,6 +2531,7 @@ fn interactive_pull_progress_line(pages_read: u64, last_reported: u64) -> Option
 /// watching stdout as text and nothing parses stderr as JSON there, so
 /// there's nothing to usefully stream.
 fn pull_with_progress(
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     client: &SyncClient,
     rt: &tokio::runtime::Runtime,
 ) -> Result<contextdb_engine::sync_types::ApplyResult, contextdb_core::Error> {
@@ -2397,13 +2568,14 @@ fn pull_with_progress(
                 }
             });
         }
-        let result = rt.block_on(client.pull_default());
+        let result = rt.block_on(client.pull_default_with_read_memory(read_memory));
         progress_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         result
     })
 }
 
 fn run_sync_command(
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     args: &str,
@@ -2457,6 +2629,17 @@ fn run_sync_command(
         };
     };
 
+    let read_memory = if !matches!(sub, "push" | "pull") {
+        None
+    } else {
+        Some(match session_handle.request_read_memory() {
+            Ok(read_memory) => read_memory,
+            Err(error) => {
+                let message = error.to_string();
+                return SyncCommandOutcome::failed_error(error, message);
+            }
+        })
+    };
     match sub {
         "status" => {
             let connected = rt.block_on(client.ensure_connected()).is_ok();
@@ -2509,7 +2692,9 @@ fn run_sync_command(
                 serde_json::json!({ "sync": document }),
             )
         }
-        "push" => match rt.block_on(client.push()) {
+        "push" => match rt.block_on(
+            client.push_with_read_memory(read_memory.clone().expect("push admitted its reader")),
+        ) {
             Ok(result) => {
                 let mut msg = format!(
                     "Pushed: {} applied, {} skipped, {} conflicts",
@@ -2574,52 +2759,54 @@ fn run_sync_command(
                 ),
             ),
         },
-        "pull" => match pull_with_progress(client, rt) {
-            Ok(result) => {
-                let mut msg = format!(
-                    "Pulled: {} applied, {} skipped, {} conflicts",
-                    result.applied_rows,
-                    result.skipped_rows,
-                    result.conflicts.len()
-                );
-                for conflict in &result.conflicts {
-                    msg.push_str(&format!(
-                        "\n  conflict: {}",
-                        contextdb_engine::cli_render::render_sync_conflict(conflict)
-                    ));
-                }
-                let mut pull_doc = apply_result_json(&result, "applied");
-                if let Some(object) = pull_doc.as_object_mut() {
-                    // Cumulative across every pull this client has issued.
-                    object.insert(
-                        "pull_pages_read".to_string(),
-                        serde_json::json!(client.pull_pages_read()),
+        "pull" => {
+            match pull_with_progress(read_memory.expect("pull admitted its reader"), client, rt) {
+                Ok(result) => {
+                    let mut msg = format!(
+                        "Pulled: {} applied, {} skipped, {} conflicts",
+                        result.applied_rows,
+                        result.skipped_rows,
+                        result.conflicts.len()
                     );
-                    // THIS pull's own page count, distinct from the
-                    // cumulative counter above -- a no-op second pull reads
-                    // 0 here while the cumulative counter holds steady, so
-                    // a caller can tell "this pull did nothing" from "this
-                    // pull did a lot" without diffing two cumulative reads.
-                    object.insert(
-                        "pull_pages_read_this_pull".to_string(),
-                        serde_json::json!(client.pull_pages_read_this_pull()),
-                    );
+                    for conflict in &result.conflicts {
+                        msg.push_str(&format!(
+                            "\n  conflict: {}",
+                            contextdb_engine::cli_render::render_sync_conflict(conflict)
+                        ));
+                    }
+                    let mut pull_doc = apply_result_json(&result, "applied");
+                    if let Some(object) = pull_doc.as_object_mut() {
+                        // Cumulative across every pull this client has issued.
+                        object.insert(
+                            "pull_pages_read".to_string(),
+                            serde_json::json!(client.pull_pages_read()),
+                        );
+                        // THIS pull's own page count, distinct from the
+                        // cumulative counter above -- a no-op second pull reads
+                        // 0 here while the cumulative counter holds steady, so
+                        // a caller can tell "this pull did nothing" from "this
+                        // pull did a lot" without diffing two cumulative reads.
+                        object.insert(
+                            "pull_pages_read_this_pull".to_string(),
+                            serde_json::json!(client.pull_pages_read_this_pull()),
+                        );
+                    }
+                    SyncCommandOutcome::succeeded(msg, serde_json::json!({ "sync_pull": pull_doc }))
                 }
-                SyncCommandOutcome::succeeded(msg, serde_json::json!({ "sync_pull": pull_doc }))
-            }
-            Err(e) => SyncCommandOutcome::failed(
-                ErrorClass::of(&e),
-                format!(
-                    "Pull from sync endpoint {} (tenant {}) failed: {}",
-                    client.endpoint(),
-                    client.tenant_id(),
-                    with_sentence_break(
-                        &e,
-                        "Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync pull`.",
-                    )
+                Err(e) => SyncCommandOutcome::failed(
+                    ErrorClass::of(&e),
+                    format!(
+                        "Pull from sync endpoint {} (tenant {}) failed: {}",
+                        client.endpoint(),
+                        client.tenant_id(),
+                        with_sentence_break(
+                            &e,
+                            "Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync pull`.",
+                        )
+                    ),
                 ),
-            ),
-        },
+            }
+        }
         "reconnect" => {
             rt.block_on(client.reconnect());
             let connected = rt.block_on(client.is_connected());
@@ -2664,10 +2851,10 @@ fn run_sync_command(
                     ),
                     serde_json::json!({ "sync_destination": { "hub_node_id": node_id } }),
                 ),
-                Err(err) => SyncCommandOutcome::failed(
-                    ErrorClass::of(&err),
-                    format!("Changing destination failed: {err}"),
-                ),
+                Err(err) => {
+                    let message = format!("Changing destination failed: {err}");
+                    SyncCommandOutcome::failed_error(err, message)
+                }
             }
         }
         "auto" => {
@@ -2899,7 +3086,11 @@ fn execute_sql(
     let cancellation = OwnerReadCancellation::new();
     let executed = match session_handle.database() {
         // A write has one door, and it is the live database.
-        Some(database) if writes => database.execute(sql, &HashMap::new()),
+        Some(database) if writes => session_handle
+            .request_read_memory()
+            .and_then(|read_memory| {
+                database.execute_with_read_memory(sql, &HashMap::new(), read_memory)
+            }),
         // Every read takes the bounded door, including a writer's own read
         // inside the transaction it opened itself — reading your own
         // uncommitted rows and staying under a ceiling are not in tension, so
@@ -3014,8 +3205,14 @@ mod tests {
     /// A writing session over a throwaway in-memory database — what these
     /// fixtures drive, and the mode `:memory:` always has.
     fn writing_session(database: &Arc<Database>) -> Session {
-        Session::writing(Arc::clone(database), ReadLimits::default())
-            .expect("a live database opens its own bounded read view")
+        Session::writing(
+            Arc::clone(database),
+            ReadLimits::default(),
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                ReadLimits::default().memory,
+            ),
+        )
+        .expect("a live database opens its own bounded read view")
     }
 
     /// A scripted, human-output context — what the meta-command tests below
@@ -3265,7 +3462,12 @@ mod tests {
         // engine's own bounded seam.
         let mut fire_count = 0;
         for _ in 0..5 {
-            let _ = db.cron_run_due_now_for_test();
+            let read_memory = db
+                .declared_reader_memory()
+                .expect("declare cron fixture reader");
+            let mut vector_copy =
+                contextdb_engine::vector_read_memory::admission(read_memory.clone());
+            let _ = db.cron_run_due_now_for_test(&mut vector_copy, read_memory);
             fire_count = db
                 .cron_status()
                 .iter()
@@ -3352,6 +3554,8 @@ mod tests {
     // it believes reached the hub.
     #[test]
     fn b2_sync_not_configured_message() {
+        let db = Arc::new(Database::open_memory());
+        let session = writing_session(&db);
         for (subcmd, expected_ok) in [
             ("status", true),
             ("auto", true),
@@ -3360,7 +3564,7 @@ mod tests {
             ("reconnect", false),
             ("destination", false),
         ] {
-            let result = handle_sync_command(None, None, subcmd, None);
+            let result = handle_sync_command(&session, None, None, subcmd, None);
             assert!(
                 result.message.contains("Sync not configured"),
                 "subcmd '{}' should return 'Sync not configured', got: {}",
@@ -3379,6 +3583,7 @@ mod tests {
     #[test]
     fn b5_sync_invalid_args() {
         let db = Arc::new(Database::open_memory());
+        let session = writing_session(&db);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = rt.block_on(async {
             SyncClient::new(
@@ -3386,6 +3591,7 @@ mod tests {
                 "iroh:invalid-test-ticket",
                 contextdb_core::TenantId::from("b5-test"),
             )
+            .expect("construct SyncClient fixture")
         });
 
         for bad_input in [
@@ -3397,7 +3603,8 @@ mod tests {
             "policy table_only",
             "policy t InvalidPolicy",
         ] {
-            let result = handle_sync_command(Some(&client), Some(&rt), bad_input, None).message;
+            let result =
+                handle_sync_command(&session, Some(&client), Some(&rt), bad_input, None).message;
             assert!(
                 !result.contains("not implemented"),
                 "bad input '{}' should not return 'not implemented', got: {}",
@@ -3579,6 +3786,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let edge_identity = Arc::new(contextdb_server::FabricIdentity::generate());
+        let session = writing_session(&db);
         let client = SyncClient::with_authenticated_transport_and_identity_for_test(
             db,
             Arc::new(UnreachableAfterConnect {
@@ -3586,7 +3794,8 @@ mod tests {
             }),
             contextdb_core::TenantId::from("usr19-exit"),
             edge_identity,
-        );
+        )
+        .expect("construct SyncClient fixture");
 
         // The library surfaces the distinct indeterminate error — never a bare
         // SyncError and never a false Ok.
@@ -3601,6 +3810,7 @@ mod tests {
         // code 3.
         let mut unconfirmed_push = false;
         let outcome = run_sync_command(
+            &session,
             Some(&client),
             Some(&rt),
             "push",

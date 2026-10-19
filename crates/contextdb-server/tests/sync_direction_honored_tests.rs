@@ -94,7 +94,8 @@ fn start_empty_hub(broker: &InProcessBroker) -> RunningHub {
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -114,6 +115,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> Syn
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// A table declared `SYNC OFF` stays on the machine that wrote it — the
@@ -299,7 +301,8 @@ fn start_hub_holding(broker: &InProcessBroker, tables: &[(&str, &str)]) -> Runni
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -444,7 +447,8 @@ async fn c1g_a_declared_direction_does_not_bypass_tenant_scoping() {
         broker.client_as(&node_id),
         TenantId::from("other-tenant"),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     // The push may fail outright (nobody is listening for that tenant) or return;
     // either way what matters is what the hub ends up holding.
     let _ = within(other_tenant.push()).await;
@@ -512,7 +516,9 @@ fn c1g_a_declared_direction_does_not_bypass_context_isolation() {
     // Rows only — the schema is provisioned on each receiver by its own admin
     // handle, exactly as an operator provisions it out of band; a context-scoped
     // handle cannot take DDL over sync.
-    let full = writer.changes_since(Lsn(0));
+    let full = writer
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     let rows_only = ChangeSet {
         rows: full.rows,
         ..Default::default()
@@ -606,7 +612,8 @@ async fn a_non_retained_push_only_table_is_suppressed_at_the_server_for_a_fresh_
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({

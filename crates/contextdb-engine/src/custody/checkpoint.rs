@@ -108,19 +108,30 @@ fn prefix_digest(count: u64, peaks: &[Option<Digest>]) -> Result<Digest> {
     }
     Ok(e.digest())
 }
-fn read(db: &Database, key: &str, ws: Option<&contextdb_tx::WriteSet>) -> Result<Option<Record>> {
+fn read(
+    db: &Database,
+    key: &str,
+    ws: Option<&dyn super::preparation::CommitWriteSource>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<Record>> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     if let Some((_, bytes)) =
-        ws.and_then(|ws| ws.config_writes.iter().rev().find(|(k, _)| k == key))
+        ws.and_then(|ws| ws.config_writes().iter().rev().find(|(k, _)| k == key))
     {
         return decode(bytes).map(Some);
     }
-    Ok(db
-        .custody_records_in(&[key.into()])?
+    Ok(custody_hold
+        .retain(db.custody_records_in(&[key.into()], read_memory.clone())?)?
         .into_iter()
         .find(|r| r.key().ok().as_deref() == Some(key)))
 }
-pub(crate) fn current(db: &Database, ns: &Namespace) -> Result<Option<Checkpoint>> {
-    match read(db, &frontier_key(ns)?, None)? {
+pub(crate) fn current(
+    db: &Database,
+    ns: &Namespace,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<Checkpoint>> {
+    match read(db, &frontier_key(ns)?, None, read_memory.clone())? {
         Some(Record::CheckpointFrontier(f)) => Ok(Some(f.checkpoint)),
         None => Ok(None),
         _ => Err(invalid()),
@@ -130,12 +141,13 @@ pub(crate) fn current(db: &Database, ns: &Namespace) -> Result<Option<Checkpoint
 // sharing a source transaction in the existing private test adapter.
 pub(crate) fn append(
     db: &Database,
-    ws: &mut contextdb_tx::WriteSet,
+    ws: &mut dyn super::preparation::CommitWriteSource,
     ns: &Namespace,
     signer: &LineageSigner,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<()> {
     let key = frontier_key(ns)?;
-    let (old_count, mut peaks) = match read(db, &key, Some(ws))? {
+    let (old_count, mut peaks) = match read(db, &key, Some(ws), read_memory.clone())? {
         Some(Record::CheckpointFrontier(f)) => (f.checkpoint.count, f.peaks),
         None => (0, vec![None; 64]),
         _ => return Err(invalid()),
@@ -153,7 +165,7 @@ pub(crate) fn append(
         };
         node.checksum = node.checksum()?;
         let record = Record::CheckpointNode(node);
-        ws.config_writes.push((record.key()?, encode(&record)?));
+        ws.push_config((record.key()?, encode(&record)?))?;
         if old_count & (1u64 << height) == 0 {
             peaks[height as usize] = Some(hash);
             break;
@@ -174,11 +186,18 @@ pub(crate) fn append(
     };
     checkpoint.signature = signer(&checkpoint.bytes()?)?;
     let record = Record::CheckpointFrontier(Frontier { checkpoint, peaks });
-    ws.config_writes.push((key, encode(&record)?));
+    ws.push_config((key, encode(&record)?))?;
     Ok(())
 }
-pub(crate) fn held(db: &Database, checkpoint: &Checkpoint) -> Result<bool> {
-    let Some(current) = current(db, &checkpoint.namespace)? else {
+// Owned append uses a fixed stack frontier. Every emitted native namespace,
+// signature, encoder and source ConfigWrite has its own original admission.
+
+pub(crate) fn held(
+    db: &Database,
+    checkpoint: &Checkpoint,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
+    let Some(current) = current(db, &checkpoint.namespace, read_memory.clone())? else {
         return Ok(false);
     };
     if checkpoint.count > current.count {
@@ -191,7 +210,12 @@ pub(crate) fn held(db: &Database, checkpoint: &Checkpoint) -> Result<bool> {
     let mut start = 0;
     for height in (0..64u8).rev() {
         if checkpoint.count & (1u64 << height) != 0 {
-            match read(db, &node_key(&checkpoint.namespace, height, start)?, None)? {
+            match read(
+                db,
+                &node_key(&checkpoint.namespace, height, start)?,
+                None,
+                read_memory.clone(),
+            )? {
                 Some(Record::CheckpointNode(node)) => {
                     node.verify()?;
                     peaks[height as usize] = Some(node.digest);
@@ -207,9 +231,18 @@ pub(crate) fn held(db: &Database, checkpoint: &Checkpoint) -> Result<bool> {
 pub(crate) fn edge_key(ns: &Namespace) -> Result<String> {
     Ok(format!("delivery_edge_checkpoint.v1.{}", ns.key()?))
 }
-pub(crate) fn admission(db: &Database, checkpoint: &Checkpoint) -> Result<Option<Record>> {
+pub(crate) fn admission(
+    db: &Database,
+    checkpoint: &Checkpoint,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<Record>> {
     checkpoint.verify()?;
-    if let Some(Record::EdgeCheckpoint(old)) = read(db, &edge_key(&checkpoint.namespace)?, None)? {
+    if let Some(Record::EdgeCheckpoint(old)) = read(
+        db,
+        &edge_key(&checkpoint.namespace)?,
+        None,
+        read_memory.clone(),
+    )? {
         if old.count > checkpoint.count {
             return Ok(None);
         }

@@ -304,7 +304,15 @@ fn a_graph_edge_cursor_emits_every_visible_edge_when_retention_compacts_entries_
     for target in &withdrawn {
         insert_node(*target, ALREADY);
     }
-    let (_, adjacency_before) = db.__vector_and_graph_fingerprint_for_test();
+    let (_, adjacency_before) = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.__vector_and_graph_fingerprint_for_test(&mut seam_copy_owner)
+            .expect("read the actual fixture observation")
+    };
     let report = db
         .run_pruning_cycle_checked()
         .expect("run one real retention cycle while the graph cursor is pinned");
@@ -316,7 +324,15 @@ fn a_graph_edge_cursor_emits_every_visible_edge_when_retention_compacts_entries_
          either expired row the pinned reader can still see would take an edge the reader is \
          owed"
     );
-    let (_, adjacency_after) = db.__vector_and_graph_fingerprint_for_test();
+    let (_, adjacency_after) = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.__vector_and_graph_fingerprint_for_test(&mut seam_copy_owner)
+            .expect("read the actual fixture observation")
+    };
     assert_ne!(
         adjacency_before, adjacency_after,
         "{journey}: the adjacency must really have been compacted, otherwise the cursor never \

@@ -15,6 +15,15 @@ const SMALL_STREAM_ROWS: i64 = 10;
 const LARGE_STREAM_ROWS: i64 = 20_010;
 const NEIGHBOUR_ROWS: i64 = 20_000;
 const CONNECTOR_ID: &str = "test.connector";
+/// Durable arm sizes. Beside a 1,000-row neighbour stream, both the 10-row and
+/// the 1,010-row arm save a three-level source-stream index, so a reopened
+/// lookup that scans its stream instead of seeking examines up to a thousand
+/// entries where the seek examines one.
+const DURABLE_LARGE_STREAM_ROWS: i64 = 1_010;
+const DURABLE_NEIGHBOUR_ROWS: i64 = 1_000;
+
+#[path = "newest_event_merges_staged_order_without_sort.rs"]
+mod newest_event_merges_staged_order_without_sort;
 
 fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<String, Value> {
     pairs
@@ -32,7 +41,9 @@ fn event_id(stream: Uuid, sequence: i64) -> Uuid {
 }
 
 fn new_database() -> Database {
-    let database = Database::open_memory();
+    declare_database(Database::open_memory())
+}
+fn declare_database(database: Database) -> Database {
     database
         .execute(
             "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID NOT NULL, connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, seq INTEGER NOT NULL, payload TEXT, UNIQUE (context_id, connector_id, source_instance_ref, seq))",
@@ -530,4 +541,124 @@ fn reverse_range_seek_ignores_twenty_thousand_keys_above_the_cutoff() {
         (1, 1),
         "each bounded reverse seek touches only its answer"
     );
+}
+
+#[test]
+fn durable_newest_event_examines_constant_entries_after_restart() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let mut measurements = Vec::new();
+    for completed in [SMALL_STREAM_ROWS, DURABLE_LARGE_STREAM_ROWS] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("newest.redb");
+        let database = declare_database(
+            Database::open_with_options(
+                &path,
+                contextdb_engine::DatabaseOpenOptions {
+                    memory_limit: Some(64 << 20),
+                    maintenance_policy: contextdb_engine::MaintenancePolicy::CallerDriven,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        seed_stream(&database, stream_id(1), stream_id(2), completed);
+        seed_stream(
+            &database,
+            stream_id(1),
+            stream_id(3),
+            DURABLE_NEIGHBOUR_ROWS,
+        );
+        database
+            .execute(
+                "CREATE TABLE newest_pressure (id INT PRIMARY KEY, body TEXT) SYNC OFF",
+                &HashMap::new(),
+            )
+            .unwrap();
+        let tx = database.begin_or_panic();
+        for id in 0..128 {
+            database
+                .execute_in_tx(
+                    tx,
+                    "INSERT INTO newest_pressure VALUES ($id, $body)",
+                    &params([
+                        ("id", Value::Int64(id)),
+                        ("body", Value::Text("p".repeat(65536))),
+                    ]),
+                )
+                .unwrap();
+        }
+        database.commit(tx).unwrap();
+        database.close().unwrap();
+        drop(database);
+        let filter = format!(
+            "{}::durable_newest_event_reader_child",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &filter, "--nocapture"])
+            .env("CONTEXTDB_DURABLE_NEWEST_FIXTURE", &path)
+            .env("CONTEXTDB_DURABLE_NEWEST_COMPLETED", completed.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fresh newest child: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let work = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("DURABLE_NEWEST "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        measurements.push(work);
+    }
+    assert_eq!(measurements[0], measurements[1]);
+    assert_eq!(measurements[0], 1);
+}
+#[test]
+fn durable_newest_event_reader_child() {
+    let Some(path) = std::env::var_os("CONTEXTDB_DURABLE_NEWEST_FIXTURE") else {
+        return;
+    };
+    let completed = std::env::var("CONTEXTDB_DURABLE_NEWEST_COMPLETED")
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let database = Database::open_with_options(
+        &path,
+        contextdb_engine::DatabaseOpenOptions {
+            memory_limit: Some(64 << 20),
+            maintenance_policy: contextdb_engine::MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = database.__writer_cache_stats_for_test().unwrap();
+    for id in 0..128 {
+        assert_eq!(
+            database
+                .execute(
+                    &format!("SELECT body FROM newest_pressure WHERE id = {id}"),
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("p".repeat(65536))]]
+        );
+    }
+    let displaced = database.__writer_cache_stats_for_test().unwrap();
+    assert!(displaced.1 > before.1 && displaced.2 > before.2);
+    let answer = newest(&database, stream_id(1), stream_id(2));
+    asserted_newest(
+        &database,
+        &answer,
+        completed - 1,
+        "fresh saved index after displacement",
+    );
+    assert!(answer.trace.sort_elided);
+    assert!(database.__writer_cache_stats_for_test().unwrap().1 > displaced.1);
+    println!("DURABLE_NEWEST {}", answer.trace.rows_examined);
+    database.close().unwrap();
 }

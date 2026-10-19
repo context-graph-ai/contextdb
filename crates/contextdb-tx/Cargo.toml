@@ -18,3 +18,4 @@ test-seams = []
 [dependencies]
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
 parking_lot.workspace = true
+serde.workspace = true

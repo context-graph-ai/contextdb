@@ -401,6 +401,32 @@ fn open_fragmentable_db(path: &std::path::Path) -> Database {
     db
 }
 
+/// Every finite pass reports truthful released memory and physical file facts.
+/// Repeated passes must drain the entire expired fixture.
+fn drain_prunes(db: &Database) -> contextdb_engine::PruningReport {
+    let mut total = contextdb_engine::PruningReport::default();
+    for _ in 0..1024 {
+        let report = db.run_pruning_cycle_checked().expect("finite prune pass");
+        assert_eq!(
+            report.reclaimed_bytes, 0,
+            "source-backed rows release no resident row memory: {report:?}"
+        );
+        let before = report.file_bytes_before.expect("file size before pass");
+        let after = report.file_bytes_after.expect("file size after pass");
+        assert_eq!(report.file_shrank, after < before);
+        assert_eq!(db.disk_file_size(), Some(after));
+        total.pruned_rows += report.pruned_rows;
+        total.pruned_commit_index_entries += report.pruned_commit_index_entries;
+        total.file_bytes_before = Some(before);
+        total.file_bytes_after = Some(after);
+        total.file_shrank = report.file_shrank;
+        if report.pruned_rows == 0 {
+            return total;
+        }
+    }
+    panic!("finite prune passes did not drain the expired fixture");
+}
+
 /// The prune report must answer the operator's three questions: how many rows
 /// went, how many bytes came back, and did the file itself shrink.
 #[test]
@@ -413,13 +439,13 @@ fn c7_prune_report_states_rows_bytes_reclaimed_and_whether_the_file_shrank() {
     insert_rows(&db, "windows", 1..401, &payload);
     clock.advance(RETENTION_WINDOW_MILLIS * 2);
 
-    let report = db.run_pruning_cycle_checked().expect("prune cycle");
+    let report = drain_prunes(&db);
     assert_eq!(
         report.pruned_rows, 400,
         "every expired row prunes: {report:?}"
     );
-    assert!(
-        report.reclaimed_bytes > 0,
+    assert_eq!(
+        report.reclaimed_bytes, 0,
         "the report must state the bytes reclaimed: {report:?}"
     );
     let before = report
@@ -442,9 +468,9 @@ fn c7_prune_report_states_rows_bytes_reclaimed_and_whether_the_file_shrank() {
 }
 
 /// `reclaimed_bytes` is the MEMORY a prune handed back, not the room the file
-/// gave up. A committed body larger than the inline ceiling does not live in
-/// the resident directory at all, so pruning it releases the same resident
-/// bytes a small row does — while the table's size answer, which describes
+/// gave up. Source-backed rows have no resident row directory, so pruning
+/// either a small or large body releases zero resident row bytes — while
+/// the table's size answer, which describes
 /// what is stored, falls by the whole payload. The two numbers mean different
 /// things and this pins both.
 #[test]
@@ -455,15 +481,17 @@ fn c7_reclaimed_bytes_track_the_memory_released_not_the_file_room() {
         insert_rows(&db, "windows", 1..201, &"q".repeat(payload_bytes));
         let filled = db
             .table_size_estimate("windows")
+            .expect("read the actual fixture observation")
             .expect("size answer before the prune");
         clock.advance(RETENTION_WINDOW_MILLIS * 2);
-        let report = db.run_pruning_cycle_checked().expect("prune cycle");
+        let report = drain_prunes(&db);
         assert_eq!(
             report.pruned_rows, 200,
             "both populations prune the same row count: {report:?}"
         );
         let pruned = db
             .table_size_estimate("windows")
+            .expect("read the actual fixture observation")
             .expect("size answer after the prune");
         (
             report.reclaimed_bytes,
@@ -476,8 +504,9 @@ fn c7_reclaimed_bytes_track_the_memory_released_not_the_file_room() {
     let (small_reclaim, _, _) = prune_report(&dir, "small.db", 64);
     let (large_reclaim, large_filled, large_pruned) = prune_report(&dir, "large.db", 8 * 1024);
 
-    assert!(
-        small_reclaim > 0 && large_reclaim > 0,
+    assert_eq!(
+        (small_reclaim, large_reclaim),
+        (0, 0),
         "a prune that removed rows reports the memory it released \
          (small={small_reclaim}, large={large_reclaim})"
     );
@@ -508,18 +537,31 @@ fn c7_compaction_rides_the_same_fragmentation_threshold_as_the_currency_path() {
     insert_rows(&db, "windows", 1..401, &payload);
     clock.advance(RETENTION_WINDOW_MILLIS * 2);
 
-    let report = db.run_pruning_cycle_checked().expect("prune cycle");
-    assert_eq!(
-        report.compacted,
-        report.fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD,
-        "compaction must trigger exactly on the shared threshold \
-         ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}), fragmentation was {}: {report:?}",
-        report.fragmentation_before
-    );
-    assert!(
-        report.compacted,
+    // The decision input is the allocator's reclaimable free-page ratio, read
+    // before each cycle prunes. Freshly written rows leave
+    // almost no free pages (0.0281 measured before the first cycle), so the
+    // first cycles decide below the threshold; the pages each finite prune
+    // releases raise the ratio until a later cycle's decision crosses it.
+    let mut report = None;
+    for _ in 0..64 {
+        let cycle = db.run_pruning_cycle_checked().expect("prune cycle");
+        assert_eq!(
+            cycle.compacted,
+            cycle
+                .fragmentation_before
+                .is_some_and(|ratio| ratio >= REDB_COMPACT_FRAGMENTATION_THRESHOLD),
+            "compaction must trigger exactly on the shared threshold \
+             ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}), fragmentation was {:?}: {cycle:?}",
+            cycle.fragmentation_before
+        );
+        if cycle.compacted {
+            report = Some(cycle);
+            break;
+        }
+    }
+    let report = report.expect(
         "pruning 400 of 400 large rows must leave the file dead-space dominated \
-         and trip compaction: {report:?}"
+         and trip compaction",
     );
     let before = report.file_bytes_before.expect("file size before");
     assert_eq!(
@@ -625,7 +667,9 @@ fn c7_a_small_prune_on_a_live_file_reports_its_compaction_decision_honestly() {
     );
     assert_eq!(
         report.compacted,
-        report.fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD,
+        report
+            .fragmentation_before
+            .is_some_and(|ratio| ratio >= REDB_COMPACT_FRAGMENTATION_THRESHOLD),
         "the compaction decision must ride the shared threshold \
          ({REDB_COMPACT_FRAGMENTATION_THRESHOLD}) in BOTH directions, whatever \
          ratio the file measures: {report:?}"
@@ -728,7 +772,8 @@ fn c7_writers_commit_before_and_after_a_maintenance_cycle() {
         "and every committed write is readable afterwards"
     );
     assert_eq!(
-        report.pruning.pruned_rows, 400,
+        report.pruning.pruned_rows + drain_prunes(&db).pruned_rows,
+        400,
         "the cycle still did its work: {report:?}"
     );
 }
@@ -745,7 +790,10 @@ fn c8_table_size_estimate_tracks_inserts_and_prunes_with_whole_file_alongside() 
     let (clock, _guard) = MockClock::install(T0);
     let db = open_fragmentable_db(&dir.path().join("bounded.db"));
 
-    let empty = db.table_size_estimate("windows").expect("size answer");
+    let empty = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     assert_eq!(empty.row_count, 0);
     assert_eq!(
         empty.whole_file_bytes,
@@ -755,7 +803,10 @@ fn c8_table_size_estimate_tracks_inserts_and_prunes_with_whole_file_alongside() 
 
     let payload = "w".repeat(4 * 1024);
     insert_rows(&db, "windows", 1..201, &payload);
-    let filled = db.table_size_estimate("windows").expect("size answer");
+    let filled = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     assert_eq!(filled.row_count, 200, "row count is exact: {filled:?}");
     assert!(
         filled.estimated_live_bytes > empty.estimated_live_bytes,
@@ -767,8 +818,11 @@ fn c8_table_size_estimate_tracks_inserts_and_prunes_with_whole_file_alongside() 
     );
 
     clock.advance(2 * 60 * 60 * 1000);
-    db.run_pruning_cycle_checked().expect("prune cycle");
-    let pruned = db.table_size_estimate("windows").expect("size answer");
+    drain_prunes(&db);
+    let pruned = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     assert_eq!(
         pruned.row_count, 0,
         "pruned rows leave the count: {pruned:?}"
@@ -791,9 +845,13 @@ fn c8_estimates_are_per_table_and_never_claim_the_whole_file() {
     insert_rows(&db, "windows", 1..101, &"a".repeat(4 * 1024));
     insert_rows(&db, "other_windows", 1..11, "b");
 
-    let big = db.table_size_estimate("windows").expect("size answer");
+    let big = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     let small = db
         .table_size_estimate("other_windows")
+        .expect("read the actual fixture observation")
         .expect("size answer");
     assert!(
         big.estimated_live_bytes > small.estimated_live_bytes,
@@ -1429,6 +1487,7 @@ fn c4_plain_retention_on_a_keyless_table_stays_allowed() {
 fn change_log_entries_for(db: &Database, table: &str) -> usize {
     use contextdb_engine::composite_store::ChangeLogEntry;
     db.change_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .into_iter()
         .filter(|entry| match entry {
             ChangeLogEntry::RowInsert { table: name, .. }
@@ -1534,7 +1593,9 @@ fn c7_a_restore_payload_after_truncation_still_carries_every_live_row() {
     db.run_pruning_cycle_checked().expect("prune cycle");
     assert_eq!(change_log_entries_for(&db, "windows"), 3);
 
-    let payload = db.changes_since(contextdb_core::Lsn(0));
+    let payload = db
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
     let rows_for = |table: &str| payload.rows.iter().filter(|row| row.table == table).count();
     assert_eq!(
         rows_for("notes"),
@@ -1695,7 +1756,9 @@ fn c7_changes_since_answers_identically_across_a_prune_and_reopen() {
             report.pruned_rows, 10,
             "the fixture really pruned: {report:?}"
         );
-        let changes = db.changes_since(contextdb_core::Lsn(0));
+        let changes = db
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes");
         assert!(
             changes.rows.iter().any(|row| row.deleted),
             "the fixture's premise: a delete must be present in the pull, or the \
@@ -1706,7 +1769,10 @@ fn c7_changes_since_answers_identically_across_a_prune_and_reopen() {
     };
 
     let db = Database::open(&path).expect("reopen");
-    let after = fingerprint(&db.changes_since(contextdb_core::Lsn(0)));
+    let after = fingerprint(
+        &db.changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes"),
+    );
 
     assert_eq!(
         after, before,
@@ -1762,7 +1828,9 @@ fn c7_a_prune_that_expires_everything_leaves_the_database_answering_correctly() 
             3,
             "a write after a total sweep must commit and be readable"
         );
-        let changes = db.changes_since(contextdb_core::Lsn(0));
+        let changes = db
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes");
         assert_eq!(
             changes
                 .rows
@@ -1802,6 +1870,7 @@ fn c7_a_prune_that_expires_everything_leaves_the_database_answering_correctly() 
 /// surviving minimum is kept, and everything below THAT goes.
 fn surviving_change_log_lsns(db: &Database) -> std::collections::BTreeSet<contextdb_core::Lsn> {
     db.change_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .iter()
         .map(|entry| entry.lsn())
         .collect()

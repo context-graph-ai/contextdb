@@ -33,7 +33,7 @@ The same command works whether the store is idle or already owned by a live proc
 | Idle or missing store | `contextdb <path> --write` | Full read-write session; the store is created if missing. <!-- enforced by: read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing, read_cli_journeys_invocation::write_flag_creates_the_store_a_read_refused_to_create --> |
 | Live file-backed owner | `contextdb <path>` | Reading session over that owner's authenticated local channel. <!-- enforced by: read_cli_journeys_live_owner::a_reading_session_routes_through_the_live_owner_and_says_so_once --> |
 | Live file-backed owner | `contextdb <path> --write` | Refused with `held_by_writer`; the refusal says a read session (drop `--write`) reaches the live owner's channel. <!-- enforced by: read_cli_journeys_machine_surface::every_refusal_carries_its_ratified_class_and_kind --> |
-| Readers hydrating | `contextdb <path> --write` | Refused with `held_by_readers`, listing the hydrating readers when identifiable, else "N direct readers are hydrating this store; retry in a moment". <!-- unbound: no wall test yet — a hydrating-readers race needs a second process holding the shared lock --> |
+| Readers hydrating | `contextdb <path> --write` | Refused with `held_by_readers`, listing the readers when identifiable, else "N direct readers are hydrating or finishing with this store; retry in a moment". A reader that is finishing holds the store for the same short, retryable span while it removes its runtime registry. <!-- unbound: no wall test yet — a hydrating-readers race needs a second process holding the shared lock --> |
 
 ### Options
 
@@ -128,6 +128,7 @@ Every meta-command emits a document whose top-level key names its payload:
 | `.schema <table>` | `{"schema":{"table":…,"columns":[…],"primary_key":[…],"indexes":[…],…,"ddl":…}}` — the full declared contract, namespaced |
 | `.events status` | `{"events_status":{"items":[…],"has_more":bool,"continuation":"…"\|null}}` <!-- enforced by: read_cli_journeys_metadata::tables_under_json_is_a_namespaced_page_document, read_cli_journeys_metadata::events_status_pages_under_its_own_namespaced_key, read_cli_journeys_metadata::tables_resumes_through_its_own_continuation_until_exhausted, read_cli_journeys_metadata::a_human_metadata_page_prints_the_exact_follow_up_command, read_cli_journeys_metadata::a_continuation_is_refused_by_a_command_that_did_not_issue_it, read_cli_journeys_metadata::a_complete_metadata_response_that_does_not_fit_refuses_with_the_setting_that_would --> |
 | `.maintenance status` | `{"maintenance":{…}}` |
+| `.verify history <table>` | `{"verify_history":{"table":…,"indexes":[{"index":…,"postings":n,"versions":n}]}}` <!-- enforced by: read_cli_journeys_metadata::verify_history_checks_each_historical_index_from_a_read_session --> |
 | `.explain <sql>` | `{"explain":{"physical_plan":…,"runtime_trace":true|false,…}}` |
 | `.cursor open` / `.cursor fetch` | `{"cursor":{"columns":[…],"rows":[…],"has_more":bool}}` <!-- enforced by: read_cli_journeys_cursor::a_first_page_carries_its_columns --> |
 | `.cursor close` | `{"cursor":{"closed":true}}` |
@@ -467,6 +468,7 @@ Paste a meta-command's whole invocation, including any SQL argument, on one line
 | `.trace on` / `.trace off` | | session | Toggle one-line execution traces. |
 | `.events status [--continue <c>]` | | read | Bounded, resumable event/sink/route/schedule health. |
 | `.maintenance status` | | read | One complete bounded maintenance-state response. |
+| `.verify history <table>` | | read | Check every historical index of a table against its row versions; refuses with `StoreCorrupted` on the first disagreement. |
 | `.maintenance run` / `.maintenance compact` | | **write** | Run one synchronous maintenance cycle / explicitly drain file compaction. |
 | `.cursor open/fetch/close` | | read | Bounded traversal beyond an ordinary-result ceiling. |
 | `.owner status` | | status | Owner policy and state; works at capacity. |
@@ -494,7 +496,7 @@ caller-driven`, which starts no background worker and leaves scheduling to this
 command. An idle file-backed store prints one line of counters:
 
 ```text
-pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message=none vector_failure_recovery_action=none vector_failure_recovery_instruction=none
+pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message=none vector_failure_recovery_action=none vector_failure_recovery_instruction=none auto_compact_fragmentation_before=unknown compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),stop_ratio:0.05(default),max_sweeps:8(default)
 ```
 
 `--json` emits one `maintenance_cycle` document with those same facts as named
@@ -503,6 +505,35 @@ fields (`pruned_rows`, `rows_deferred_for_readers`, `reclaimed_bytes`,
 `currency_redb_compacted`, `pruned_trigger_audit_rows`, `vector`, `compaction`).
 Compaction byte counts and duration depend on the file.
 <!-- enforced by: read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
+
+A compaction receipt's `fragmentation_before` is the share of the file a tidy-up could give
+back by moving pages: interior free pages over the pages a trim would leave. Both the automatic
+path and `.maintenance compact` report this one quantity, and automatic compaction starts when
+it reaches the declared start ratio (0.5 by default; see `SET STORAGE_COMPACTION` in the query
+language reference). `.maintenance compact` also reports `page_slack_ratio`: the share of bytes
+inside live pages that hold no data, from an exact walk of the file. Compaction moves whole
+pages and does not repack them, so that slack is not given back; it is `unknown` (JSON `null`)
+when the walk failed, and always JSON `null` in `.maintenance run`'s `compaction` document. When nothing was measured, the field is unknown:
+JSON `null`, text `fragmentation_before=unknown` (`auto_compact_fragmentation_before=unknown` in
+the `.maintenance run` line). That covers a cycle with no check due, a store whose allocator
+totals are not trusted, a failed measurement, and an in-memory store. A check that found the
+file below the start ratio reports what it measured. Every later batch of a sweep reports the
+measurement that sweep started on, so a sweep that started unmeasured stays unknown until it
+completes, across reopen. It is never reported as 0.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::untrusted_free_page_totals_report_unknown_fragmentation_and_take_no_decision, storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::an_unknown_measurement_stays_unknown_when_an_interrupted_sweep_resumes, read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
+
+Each compaction receipt also names the storage compaction policy that governed it. JSON carries
+a `policy` object under `compaction`, mapping each setting to its `value` and `source`
+(`declared` or `default`). Text carries one `compaction_policy=` token, for example
+`compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),stop_ratio:0.05(default),max_sweeps:8(default)`.
+<!-- enforced by: storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown::every_maintenance_receipt_names_the_policy_that_governed_it, read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
+
+`.maintenance status` adds a `storage_compaction` list. Each entry is a `setting`, `value` and
+`source`; `source` is `declared` or `default`. The text form adds one line, for example
+`storage_compaction start_ratio=0.5(default) min_interval_ms=3600000(default) stop_ratio=0.05(default) max_sweeps=8(default)`.
+Both read routes show the same declaration and sources: the committed file when no writer is
+open, and the live owner when one is.
+<!-- enforced by: read_cli_journeys_metadata::maintenance_status_and_explain_keep_their_own_document_keys, read_cli_journeys_metadata::a_declared_storage_compaction_shows_its_source_through_both_read_routes -->
 
 ### Trace vs Explain
 
@@ -560,6 +591,27 @@ Four things the printed DDL does not reproduce literally, and what to read inste
   declared a narrowed set of scopes gets every row instead of only its own. As with `CONTEXT_ID`,
   neither the printed DDL nor `--json` names this column today, so replaying `.schema` output
   alone silently drops the narrowing.
+
+### `.verify history` — check a table's historical indexes
+
+A historical index answers a read at an older snapshot from its postings alone, so its postings
+must cover exactly what the row versions cover. Every write commits to both, and a read at an
+older snapshot already refuses a commitment that does not authenticate. `.verify history <table>`
+runs the full check: it recomputes both sides from every stored posting and row version, checks
+that no row's postings overlap or touch and no row's versions overlap, and requires the result
+to match the published commitment. It works in a read session, visits every posting and row
+version once, and refuses with `StoreCorrupted` (exit code 1) naming the first disagreement.
+
+```bash
+db="$(mktemp -d)/history.db"
+printf "%s\n" \
+  "CREATE TABLE tagged (id INTEGER PRIMARY KEY, tag TEXT) HISTORY ALL;" \
+  "CREATE INDEX tagged_by_tag ON tagged (tag);" \
+  "INSERT INTO tagged VALUES (1, 'a');" \
+  "UPDATE tagged SET tag = 'b' WHERE id = 1;" | contextdb "$db" --write --json > /dev/null
+echo ".verify history tagged" | contextdb "$db" --json
+# {"verify_history":{"table":"tagged","indexes":[…,{"index":"tagged_by_tag","postings":2,"versions":2}]}}
+```
 
 ### Vector inspection and recovery
 

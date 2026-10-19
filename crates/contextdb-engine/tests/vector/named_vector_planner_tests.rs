@@ -289,7 +289,9 @@ fn nv07c_receiver_promoted_to_leader_emits_correct_index_keyed_envelopes() {
 
     // The promoted leader's outgoing changeset must carry both (table, column) pairs — not a default,
     // not inferred from "first match per row_id", not coalesced into a single envelope.
-    let outgoing = receiver.changes_since(leader_lsn_before);
+    let outgoing = receiver
+        .changes_since(leader_lsn_before)
+        .expect("read the declared changes");
     let by_index: std::collections::HashSet<&VectorIndexRef> =
         outgoing.vectors.iter().map(|c| &c.index).collect();
     assert!(

@@ -7,7 +7,7 @@ use contextdb_core::Error;
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
     ReaderRegistrationLockPhase, WriterReaderSnapshotRegistryObservation,
     observe_writer_reader_snapshots_for_test, pause_reader_registration_lock_for_test,
-    pause_reader_snapshot_registry_scan_for_test,
+    pause_reader_snapshot_registry_scan_for_test, registration_attempt_counts_for_test,
 };
 use contextdb_engine::{Database, ReadSession};
 use std::collections::HashMap;
@@ -393,15 +393,29 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         }
     }
     let (refused_id, refusal) = refused.expect("allocator must reach projected growth boundary");
-    assert!(matches!(
-        refusal,
-        Error::DiskBudgetExceeded {
-            current_bytes,
-            budget_limit_bytes,
-            ..
-        } if current_bytes <= limit && budget_limit_bytes == limit
-    ));
-    assert!(std::fs::metadata(&path).expect("stat refused store").len() <= limit);
+    let refused_file_bytes = std::fs::metadata(&path).unwrap().len();
+    let attributed = |error: &Error| {
+        matches!(error, Error::DiskBudgetExceeded {
+        operation, current_bytes, budget_limit_bytes, .. }
+        if operation == "allocate storage pages" && *current_bytes == refused_file_bytes
+            && *current_bytes <= limit && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(&refusal), "{refusal:?}");
+    if let Error::DiskBudgetExceeded {
+        current_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &refusal
+    {
+        assert!(!attributed(&Error::DiskBudgetExceeded {
+            operation: "purge".to_owned(),
+            current_bytes: *current_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
+    assert!(refused_file_bytes <= limit);
     assert_eq!(
         writer
             .__projected_disk_growth_bytes_for_test()
@@ -425,16 +439,19 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .expect("a smaller transaction reuses available pages after refusal");
 
     drop(reader);
-    for generation in 0..3i64 {
+    // Each admitted storage commit frees at most 64 native page-list entries.
+    // Drain the observed backlog, including the two commit fences, before retry.
+    let initial = writer.__deferred_free_backlog_for_test().unwrap();
+    let passes = initial
+        .iter()
+        .map(|(_, pages)| *pages)
+        .sum::<usize>()
+        .div_ceil(64)
+        + 2;
+    for _pass in 0..passes {
         writer
-            .execute(
-                "UPDATE allocation_churn SET value = $value WHERE id = 0",
-                &HashMap::from([(
-                    "value".into(),
-                    contextdb_core::Value::Text(format!("reclaim-{generation}")),
-                )]),
-            )
-            .expect("reclaim after retained reader release");
+            .__commit_storage_transaction_for_test()
+            .expect("finite deferred-free pass fits the unchanged disk ceiling");
     }
     assert_eq!(
         writer
@@ -550,11 +567,15 @@ fn run_race_child(scenario: &str) {
 #[test]
 fn closing_the_last_reader_while_another_opens_does_not_reject_the_new_reader() {
     run_race_child("validated");
+    run_race_child("validated-two-roots");
+    run_race_child("leave-first");
+    run_race_child("leave-first-two-roots");
 }
 
 #[test]
 fn closing_the_last_reader_before_the_new_reader_validates_its_lock_does_not_reject_it() {
     run_race_child("descriptor-opened");
+    run_race_child("descriptor-opened-two-roots");
 }
 
 #[test]
@@ -642,7 +663,14 @@ fn last_reader_close_race_child() {
         return;
     }
 
-    let departing = ReadSession::open(&path).expect("open the reader that will close");
+    let supplied = scenario.ends_with("-two-roots").then(|| {
+        let supplied = root.path().join("supplied-runtime");
+        std::fs::create_dir(&supplied).unwrap();
+        std::fs::set_permissions(&supplied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        supplied
+    });
+    let departing = ReadSession::open_in_runtime_dir(&path, Default::default(), supplied.clone())
+        .expect("open the reader that will close");
     assert_eq!(read_rows(&departing), original_rows());
     let registry_directory = departing
         .file_storage_registration_for_test()
@@ -652,69 +680,113 @@ fn last_reader_close_race_child() {
         .expect("registration lives in its physical registry directory")
         .to_path_buf();
 
-    let phase = match scenario.as_str() {
-        "validated" => ReaderRegistrationLockPhase::Validated,
+    let leave_first = scenario.starts_with("leave-first");
+    let phase = match scenario.trim_end_matches("-two-roots") {
+        "validated" | "leave-first" => ReaderRegistrationLockPhase::Validated,
         "descriptor-opened" | "repeated" => ReaderRegistrationLockPhase::DescriptorOpened,
         other => panic!("unknown scenario {other}"),
     };
-    let teardowns: u64 = if scenario == "repeated" { 12 } else { 1 };
+    let before = registration_attempt_counts_for_test(&path);
     let pause = pause_reader_registration_lock_for_test(&path, phase)
         .expect("arm the arriving reader's registration pause");
+    let mut departing = Some(departing);
+    let leave_park = leave_first.then(|| {
+        contextdb_engine::persistence::read_persistence_test_scaffold::arm_reader_leave_park_for_test()
+    });
+    let mut departure = leave_park.as_ref().map(|park| {
+        let leaving = departing.take();
+        let thread = std::thread::spawn(move || drop(leaving));
+        park.parked.recv().expect("real leave owns the stable root serializer");
+        thread
+    });
+    let (join_waiting, join_wait_seen) = mpsc::channel();
     let arriving_path = path.clone();
+    let arriving_runtime = supplied.clone();
     let (opened, arrival) = mpsc::channel();
-    std::thread::spawn(move || {
-        let outcome = ReadSession::open(&arriving_path)
-            .map_err(|error| error.to_string())
-            .map(|session| {
-                let rows = read_rows(&session);
-                let registration = session
-                    .file_storage_registration_for_test()
-                    .and_then(|registration| registration.registration_path);
-                (session, rows, registration)
-            });
+    let arrival_thread = std::thread::spawn(move || {
+        if leave_first {
+            contextdb_engine::persistence::read_persistence_test_scaffold::install_reader_join_wait_hook_for_test(
+                Box::new(move || join_waiting.send(()).expect("observe the actual blocking join")),
+            );
+        }
+        let outcome =
+            ReadSession::open_in_runtime_dir(&arriving_path, Default::default(), arriving_runtime)
+                .map_err(|error| error.to_string())
+                .map(|session| {
+                    let rows = read_rows(&session);
+                    let registration = session
+                        .file_storage_registration_for_test()
+                        .and_then(|registration| registration.registration_path);
+                    (session, rows, registration)
+                });
         opened.send(outcome).expect("report the arriving reader");
     });
 
-    // Tear the registry down under the paused opener, once per attempt. The
-    // first teardown is the original last reader closing; each later one is
-    // another reader that opens and closes in full while the opener holds a
-    // lock descriptor it has not validated yet.
-    let mut departing = Some(departing);
-    for attempt in 1..=teardowns {
-        if !pause.wait_for_attempt_for_test(attempt, std::time::Duration::from_secs(30)) {
-            let outcome = arrival
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .map(|outcome| outcome.map(|_| ()));
-            panic!("the opener never made attempt {attempt}: {outcome:?}");
-        }
-        match departing.take() {
-            Some(last) => drop(last),
-            None => {
-                let passing = ReadSession::open(&path).expect("a passing reader opens");
-                assert_eq!(read_rows(&passing), original_rows());
-                drop(passing);
-            }
-        }
-        assert!(
-            !registry_directory.exists(),
-            "teardown {attempt} left no reader, so it removed the registry"
-        );
-        if attempt == teardowns {
-            pause.stop_pausing_for_test();
-        } else {
-            pause.resume_for_test();
-        }
+    if let Some(park) = &leave_park {
+        join_wait_seen.recv().expect("join reaches its blocking root flock after pinning its data root");
+        assert_eq!(pause.attempts_for_test(), 0, "join cannot open a registry under the leaving serializer");
+        park.resume.send(()).expect("release the real last leave");
+        departure.take().unwrap().join().expect("leave completes before join publication");
     }
+    assert!(pause.wait_for_attempt_for_test(1, std::time::Duration::from_secs(30)));
+    // Joining owns the stable runtime root before opening its registry
+    // descriptor. A last leaver cannot unlink that descriptor at either
+    // checkpoint; inspect the actual cross-process lock, not a retry counter.
+    let runtime =
+        std::fs::File::open(std::env::var_os("XDG_RUNTIME_DIR").expect("private runtime")).unwrap();
+    let refused = fs2::FileExt::try_lock_exclusive(&runtime)
+        .expect_err("the joining reader owns the runtime root until publication finishes");
+    assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+    if let Some(supplied) = &supplied {
+        let second_root = std::fs::File::open(supplied).unwrap();
+        fs2::FileExt::try_lock_exclusive(&second_root)
+            .expect("the joining reader holds at most one root serializer");
+    }
+    if let Some(departing) = departing.take() {
+        departure = Some(std::thread::spawn(move || drop(departing)));
+    }
+    pause.stop_pausing_for_test();
 
     let (arriving, rows, arriving_registration) = arrival
         .recv()
         .expect("the arriving reader reports")
         .expect("teardown must not reject a reader opening a healthy store");
+    arrival_thread.join().expect("the arriving reader thread joins");
+    if let Some(departure) = departure {
+        departure.join().expect("the old reader finishes leaving");
+    }
+    let roots = if supplied.is_some() { 2 } else { 1 };
+    assert_eq!(pause.attempts_for_test(), roots, "one acquisition per root");
+    let after = registration_attempt_counts_for_test(&path);
     assert_eq!(
-        pause.attempts_for_test(),
-        teardowns + 1,
-        "the opener retried once per finished teardown and then succeeded"
+        after.opens - before.opens,
+        roots,
+        "one registry descriptor open"
     );
+    assert_eq!(
+        after.l0_takes - before.l0_takes,
+        roots,
+        "one registry lock take"
+    );
+    assert_eq!(after.retries - before.retries, 0, "no departure retry");
+    assert!(
+        registry_directory.is_dir(),
+        "the arriving reader keeps the registry"
+    );
+    if scenario == "repeated" {
+        for _ in 0..12 {
+            let passing = ReadSession::open(&path).expect("a passing reader opens");
+            assert_eq!(read_rows(&passing), original_rows());
+            drop(passing);
+            assert!(registry_directory.is_dir());
+            let expected_handle = arriving.file_storage_registration_for_test().unwrap().handle_identity;
+            let (writer, observed) = captured_writer_registry(&path);
+            assert!(matches!(observed,
+                WriterReaderSnapshotRegistryObservation::Complete(ref records)
+                    if records.len() == 1 && records[0].handle_identity == expected_handle));
+            writer.close().expect("close churn authentication writer");
+        }
+    }
     drop(pause);
     assert_eq!(rows, original_rows());
     let arriving_registration =

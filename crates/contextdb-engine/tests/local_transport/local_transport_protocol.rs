@@ -65,11 +65,6 @@ const CUSTOM_BODY: &[u8] = &[7, 1, b'n', 2, 0x5a, 0x5b];
 const RESULT_CHUNK_FIXTURE: &[u8] = &[0, 2, 0xc1, 0xc2];
 const TERMINAL_SUCCESS_FIXTURE: &[u8] = &[1, 1, 0xc3];
 const CANONICAL_CURSOR_PAGE: &[u8] = &[2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
-const CURSOR_OPENED_FIXTURE: &[u8] = &[
-    2, 0, 0, 0, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
-    0x44, 0x44, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1,
-];
-const CURSOR_PAGE_FIXTURE: &[u8] = &[3, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
 const CURSOR_CLOSED_TRUE_FIXTURE: &[u8] = &[4, 1];
 const CURSOR_CLOSED_FALSE_FIXTURE: &[u8] = &[4, 0];
 const TABLE_METADATA_PAYLOAD: &[u8] = &[0, 1, 0, 1, b't', 1, 1, 1, b'n'];
@@ -875,7 +870,27 @@ fn illegal_caller_limit_relationships_are_rejected_at_the_typed_boundary() {
 
 #[test]
 fn every_response_envelope_has_checked_in_bytes() {
-    let cursor_id = [0x44; 16];
+    let payload = owner_cursor_payload();
+    assert_response_boundary(
+        &LocalResponse::CursorOpened {
+            opened: CursorOpenedResponse {
+                effective_limits: None,
+                storage_snapshot: None,
+                physical_identity: None,
+                cursor_id: [0x44; 16],
+                payload: payload.clone(),
+            },
+        },
+        LocalResponseExpectation::CursorOpen,
+        &owner_opened_fixture(),
+    );
+    assert_response_boundary(
+        &LocalResponse::CursorPage {
+            page: CursorPageResponse { payload },
+        },
+        LocalResponseExpectation::CursorFetch,
+        &owner_page_fixture(),
+    );
     let invalid_channel = failure(ReadFailureKind::InvalidChannelData, ReadFailureDetail::None);
     let operation_already_completed = failure(
         ReadFailureKind::OperationAlreadyCompleted,
@@ -899,28 +914,6 @@ fn every_response_envelope_has_checked_in_bytes() {
             },
             LocalResponseExpectation::OrdinaryResult,
             TERMINAL_SUCCESS_FIXTURE,
-        ),
-        (
-            LocalResponse::CursorOpened {
-                opened: CursorOpenedResponse {
-                    effective_limits: None,
-                    storage_snapshot: None,
-                    physical_identity: None,
-                    cursor_id,
-                    payload: CANONICAL_CURSOR_PAGE.to_vec(),
-                },
-            },
-            LocalResponseExpectation::CursorOpen,
-            CURSOR_OPENED_FIXTURE,
-        ),
-        (
-            LocalResponse::CursorPage {
-                page: CursorPageResponse {
-                    payload: CANONICAL_CURSOR_PAGE.to_vec(),
-                },
-            },
-            LocalResponseExpectation::CursorFetch,
-            CURSOR_PAGE_FIXTURE,
         ),
         (
             LocalResponse::CursorClosed {
@@ -1068,18 +1061,17 @@ fn every_success_response_field_changes_independent_literal_bytes() {
                 storage_snapshot: None,
                 physical_identity: None,
                 cursor_id,
-                payload: CANONICAL_CURSOR_PAGE.to_vec(),
+                payload: owner_cursor_payload(),
             },
         },
         LocalResponseExpectation::CursorOpen,
-        CURSOR_OPENED_FIXTURE,
+        &owner_opened_fixture(),
         4,
         0x45,
     );
-    for (payload_offset, fixture_offset, byte) in
-        [(2, 23, b'j'), (8, 29, 4), (10, 31, 43), (11, 32, 0)]
-    {
-        let mut payload = CANONICAL_CURSOR_PAGE.to_vec();
+    for (payload_offset, byte) in [(2, b'j'), (8, 4), (10, 43), (11, 0)] {
+        let mut payload = owner_cursor_payload();
+        let payload_len = payload.len();
         payload[payload_offset] = byte;
         assert_response_mutation(
             LocalResponse::CursorOpened {
@@ -1092,23 +1084,22 @@ fn every_success_response_field_changes_independent_literal_bytes() {
                 },
             },
             LocalResponseExpectation::CursorOpen,
-            CURSOR_OPENED_FIXTURE,
-            fixture_offset,
+            &owner_opened_fixture(),
+            owner_opened_fixture().len() - payload_len + payload_offset,
             byte,
         );
     }
-    for (payload_offset, fixture_offset, byte) in
-        [(2, 4, b'j'), (8, 10, 4), (10, 12, 43), (11, 13, 0)]
-    {
-        let mut payload = CANONICAL_CURSOR_PAGE.to_vec();
+    for (payload_offset, byte) in [(2, b'j'), (8, 4), (10, 43), (11, 0)] {
+        let mut payload = owner_cursor_payload();
+        let payload_len = payload.len();
         payload[payload_offset] = byte;
         assert_response_mutation(
             LocalResponse::CursorPage {
                 page: CursorPageResponse { payload },
             },
             LocalResponseExpectation::CursorFetch,
-            CURSOR_PAGE_FIXTURE,
-            fixture_offset,
+            &owner_page_fixture(),
+            owner_page_fixture().len() - payload_len + payload_offset,
             byte,
         );
     }
@@ -1319,7 +1310,7 @@ fn typed_boundary_admits_exactly_four_mebibytes_and_refuses_one_more() {
 
 #[test]
 fn successful_response_variants_cannot_cross_operation_expectations() {
-    let cursor_page = CANONICAL_CURSOR_PAGE.to_vec();
+    let cursor_page = owner_cursor_payload();
     let mismatches = [
         (
             LocalResponse::ResultChunk {
@@ -1652,4 +1643,25 @@ fn contradictory_owner_status_is_rejected_on_encode_and_complete_decode() {
         ),
         Err(invalid_channel_data())
     );
+}
+
+use super::owner_cursor_test_support;
+
+fn owner_cursor_payload() -> Vec<u8> {
+    let page_bytes = CANONICAL_CURSOR_PAGE;
+    let payload = owner_cursor_test_support::with_empty_observation(page_bytes.to_vec());
+    let page = contextdb_engine::read_contract::decode_cursor_page(page_bytes)
+        .expect("decode the public page fixture");
+    owner_cursor_test_support::assert_empty_observation(&payload, &page);
+    payload
+}
+
+fn owner_opened_fixture() -> Vec<u8> {
+    let mut prefix = vec![2, 0, 0, 0];
+    prefix.extend([0x44; 16]);
+    owner_cursor_test_support::owner_response_fixture(&prefix, CANONICAL_CURSOR_PAGE)
+}
+
+fn owner_page_fixture() -> Vec<u8> {
+    owner_cursor_test_support::owner_response_fixture(&[3], CANONICAL_CURSOR_PAGE)
 }

@@ -111,7 +111,8 @@ async fn start_hub_with_expectation(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -131,7 +132,8 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> (S
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     (client, node_id)
 }
 
@@ -167,6 +169,10 @@ fn seed_committed_manifest(
                     .map(|member| (MEMBER_TABLE, root_key(*member)))
                     .collect(),
             },
+            client
+                .db()
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("prepare a committed unit before exercising push");
 }
@@ -386,9 +392,16 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
 
     let edge_db = Arc::new(Database::open_memory());
     let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds the hub's declaration before it writes a unit");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds the hub's declaration before it writes a unit");
     declare_edge_tables(&edge_db);
 
     // A unit whose membership is two rows, committed with its rows.
@@ -452,10 +465,16 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     let manifests: Vec<WireDeliveryManifest> = [root_id, empty_root]
         .into_iter()
         .flat_map(|id| {
-            edge.__delivery_push_request_for_test(ROOT_TABLE, &root_key(id))
-                .unwrap()
-                .changeset
-                .manifests
+            edge.__delivery_push_request_for_test(
+                ROOT_TABLE,
+                &root_key(id),
+                edge_db
+                    .declared_reader_memory()
+                    .expect("admit the fixture client reader"),
+            )
+            .unwrap()
+            .changeset
+            .manifests
         })
         .collect();
     assert_eq!(
@@ -517,9 +536,16 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     // content produces byte-identical digests.
     let other_edge_db = Arc::new(Database::open_memory());
     let (other_edge, _other_node_id) = edge_client(&other_edge_db, &broker, tenant);
-    within(other_edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the second edge binds the same declaration");
+    within(
+        other_edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            other_edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the second edge binds the same declaration");
     declare_edge_tables(&other_edge_db);
     commit_unit(
         &other_edge_db,
@@ -533,7 +559,13 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
         .into_iter()
         .flat_map(|id| {
             other_edge
-                .__delivery_push_request_for_test(ROOT_TABLE, &root_key(id))
+                .__delivery_push_request_for_test(
+                    ROOT_TABLE,
+                    &root_key(id),
+                    other_edge_db
+                        .declared_reader_memory()
+                        .expect("admit the fixture client reader"),
+                )
                 .unwrap()
                 .changeset
                 .manifests
@@ -570,13 +602,26 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     // Hold every root column and key fixed: only explicit membership differs.
     let empty_db = Arc::new(Database::open_memory());
     let (empty_edge, _) = edge_client(&empty_db, &broker, tenant);
-    within(empty_edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .unwrap();
+    within(
+        empty_edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            empty_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     declare_edge_tables(&empty_db);
     commit_unit(&empty_db, root_id, "root-body", &[]).unwrap();
     let same_root_empty = empty_edge
-        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root_id))
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(root_id),
+            empty_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
         .unwrap();
     assert_eq!(
         same_root_empty.changeset.manifests[0].member_count_for_test(),
@@ -614,9 +659,16 @@ async fn registering_a_manifest_for_an_undeclared_root_an_unnamed_member_table_a
         .execute(UNDECLARED_ROOT_DDL, &p())
         .expect("edge undeclared root table");
     let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds before it writes");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds before it writes");
     declare_edge_tables(&edge_db);
     edge_db
         .execute(UNNAMED_MEMBER_DDL, &p())
@@ -840,9 +892,16 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
 
     let edge_db = Arc::new(Database::open_memory());
     let (edge, _edge_node_id) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds before it writes");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds before it writes");
     declare_edge_tables(&edge_db);
     // A manifested unit and ordinary accepted/conflicting rows
     // actually share one source transaction and one authenticated push envelope.
@@ -1124,16 +1183,20 @@ async fn oversized_manifested_unit() {
         .await
         .expect("bind the authenticated hub endpoint");
     let ticket = endpoint.ticket();
-    let iroh_hub_db = Arc::new(Database::open(root.path().join("hub.db")).expect("open hub store"));
+    let mut oversized_reader = contextdb_engine::DatabaseOpenOptions::default();
+    oversized_reader.owner_reads.limits.limits.memory = 2 * 1024 * 1024 * 1024;
+    let iroh_hub_db = Arc::new(
+        Database::open_with_options(root.path().join("hub.db"), oversized_reader.clone())
+            .expect("open hub store"),
+    );
     declare_hub_tables(&iroh_hub_db);
     iroh_hub_db
         .__seed_tenant_table_policies_for_test(TenantId::from(iroh_tenant), expectation())
         .expect("canonical hub declarations");
-    let server = Arc::new(SyncServer::new(
-        iroh_hub_db.clone(),
-        &endpoint,
-        TenantId::from(iroh_tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(iroh_hub_db.clone(), &endpoint, TenantId::from(iroh_tenant))
+            .expect("construct the authenticated sync endpoint"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -1144,16 +1207,26 @@ async fn oversized_manifested_unit() {
     let edge_identity_path = root.path().join("edge.db.fabric-identity.key");
     FabricIdentity::load_or_generate(&edge_identity_path).expect("persist the edge identity");
     let dial_spec = peer_dial_spec(&ticket, &edge_identity_path);
-    let iroh_edge_db =
-        Arc::new(Database::open(root.path().join("edge.db")).expect("open edge store"));
+    let iroh_edge_db = Arc::new(
+        Database::open_with_options(root.path().join("edge.db"), oversized_reader)
+            .expect("open edge store"),
+    );
     let iroh_edge = SyncClient::new(
         iroh_edge_db.clone(),
         &dial_spec,
         TenantId::from(iroh_tenant),
-    );
-    within(iroh_edge.__seed_application_table_policy_binding_for_test(expectation()))
-        .await
-        .expect("the edge binds over the authenticated transport");
+    )
+    .expect("construct the authenticated sync endpoint");
+    within(
+        iroh_edge.__seed_application_table_policy_binding_for_test(
+            expectation(),
+            iroh_edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("the edge binds over the authenticated transport");
     declare_edge_tables(&iroh_edge_db);
     let big_root = Uuid::from_u128(0x3333_0000_0000_0000_0000_0000_0000_0011);
     let big_member = Uuid::from_u128(0x3333_0000_0000_0000_0000_0000_0000_0012);
@@ -1237,9 +1310,16 @@ async fn receiver_refusal(case: &str) {
     } else {
         expectation()
     };
-    within(edge.__seed_application_table_policy_binding_for_test(source_policy))
-        .await
-        .unwrap();
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            source_policy,
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     // Bind the edge's actual root declaration to a policy that
     // differs from the hub's declaration before installing its manifested unit.
     // The existing signed binding fixture makes this an authenticated source
@@ -1289,7 +1369,13 @@ async fn receiver_refusal(case: &str) {
     seed_committed_manifest(&edge, tx, root, &members);
     edge_db.commit(tx).unwrap();
     let mut request = edge
-        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root))
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(root),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
         .unwrap();
     assert_eq!(
         request.changeset.rows.len(),
@@ -1321,7 +1407,13 @@ async fn receiver_refusal(case: &str) {
     }
     // Adapter: add the same-transaction ordinary row and its real
     // authenticated lineage to the deliberately incomplete unit request.
-    let all = edge.__ordinary_push_request_for_test().unwrap();
+    let all = edge
+        .__ordinary_push_request_for_test(
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
+        .unwrap();
     request.changeset.rows.extend(
         all.changeset
             .rows

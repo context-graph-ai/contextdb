@@ -12,6 +12,68 @@ mod read_cli_support;
 
 use read_cli_support::*;
 
+fn vector_insert_refusal_limit(extra_table: bool) -> usize {
+    use contextdb_engine::memory_accounting::{
+        MemoryAccountant, take_budget_ledger_for_test, watch_budget_ledger_for_test,
+    };
+    let root = tempfile::tempdir().expect("task-scoped owner profile");
+    let accountant = std::sync::Arc::new(MemoryAccountant::no_limit());
+    let db = contextdb_engine::Database::open_with_config(
+        root.path().join("profile.db"),
+        std::sync::Arc::new(contextdb_engine::plugin::CorePlugin),
+        accountant,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048))",
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    if extra_table {
+        db.execute(
+            "CREATE TABLE empty_t (id UUID PRIMARY KEY)",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+    }
+    watch_budget_ledger_for_test();
+    let literal = std::iter::repeat_n("1.0", 2048)
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(
+        &format!(
+            "INSERT INTO audio_clips VALUES ('11111111-1111-1111-1111-111111111111', [{literal}])"
+        ),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let ledger = take_budget_ledger_for_test();
+    let position = ledger
+        .iter()
+        .position(|entry| {
+            entry
+                .what
+                .contains("vector_insert@audio_clips.vector_audio")
+        })
+        .unwrap_or_else(|| panic!("vector owner must be present: {ledger:?}"));
+    let owner = &ledger[position];
+    // SQL exposes whole KiB units; use the largest expressible ceiling below this owner.
+    let limit = (owner.used_after - 1) / 1024 * 1024;
+    assert!(
+        ledger[..position]
+            .iter()
+            .all(|entry| entry.used_after <= limit),
+        "prior real owners fit before the vector body"
+    );
+    db.close().unwrap();
+    limit
+}
+
+fn attributed_vector_memory_refusal(message: &str) -> bool {
+    message.to_lowercase().contains("memory")
+        && message.contains("vector_insert@audio_clips.vector_audio")
+}
+
 fn vector_literal(len: usize) -> String {
     std::iter::repeat_n("1.0", len)
         .collect::<Vec<_>>()
@@ -26,8 +88,10 @@ fn vector_literal(len: usize) -> String {
 fn a_memory_refusal_is_followed_by_independent_work_and_recovery() {
     let store = absent_store();
     let vec_body = vector_literal(2048);
+    let limit = vector_insert_refusal_limit(false);
+    let limit_kib = limit / 1024;
     let script = format!(
-        "SET MEMORY_LIMIT '72K';\n\
+        "SET MEMORY_LIMIT '{limit_kib}K';\n\
          CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
          INSERT INTO audio_clips (id, vector_audio) VALUES \
          ('11111111-1111-1111-1111-111111111111', [{vec_body}]);\n\
@@ -35,7 +99,8 @@ fn a_memory_refusal_is_followed_by_independent_work_and_recovery() {
          SHOW MEMORY_LIMIT;\n\
          SET MEMORY_LIMIT '10M';\n\
          INSERT INTO audio_clips (id, vector_audio) VALUES \
-         ('22222222-2222-2222-2222-222222222222', [{vec_body}]);\n"
+         ('22222222-2222-2222-2222-222222222222', [{vec_body}]);\n\
+         SELECT id FROM audio_clips;\n"
     );
     let outcome = run(&[store.path_str(), "--write", "--json"], &script);
 
@@ -60,7 +125,7 @@ fn a_memory_refusal_is_followed_by_independent_work_and_recovery() {
         .expect("SHOW MEMORY_LIMIT must publish its recovery-inspection result");
     assert_eq!(
         rows_of(&show_limit)[0]["limit"],
-        73728,
+        limit,
         "SHOW MEMORY_LIMIT must report the limit set before the refusal.\n{}",
         outcome.describe()
     );
@@ -69,7 +134,7 @@ fn a_memory_refusal_is_followed_by_independent_work_and_recovery() {
     assert_eq!(
         errors.len(),
         1,
-        "exactly one refusal (the INSERT under the 72K budget), not the recovery statements.\n{}",
+        "exactly one refusal (the INSERT under the derived vector-owner budget), not the recovery statements.\n{}",
         outcome.describe()
     );
     assert!(
@@ -80,6 +145,21 @@ fn a_memory_refusal_is_followed_by_independent_work_and_recovery() {
             .contains("memory"),
         "the refusal must name the resource it exhausted.\n{}",
         outcome.describe()
+    );
+
+    let message = errors[0]["message"].as_str().unwrap();
+    assert!(attributed_vector_memory_refusal(message), "{message}");
+    assert!(!attributed_vector_memory_refusal(
+        &message.replace("audio_clips.vector_audio", "other.vector_audio")
+    ));
+    let recovered = documents_named(&docs, "result")
+        .into_iter()
+        .find(|doc| rows_of(doc).first().and_then(|row| row.get("id")).is_some())
+        .expect("recovery publishes the fitting row");
+    assert_eq!(rows_of(&recovered).len(), 1);
+    assert_eq!(
+        rows_of(&recovered)[0]["id"],
+        "22222222-2222-2222-2222-222222222222"
     );
 
     assert_eq!(
@@ -226,12 +306,10 @@ fn a_refusal_through_the_translated_sync_inspection_route_still_continues() {
 fn a_refusal_is_distinguishable_from_a_successful_empty_result() {
     let store = absent_store();
     let vec_body = vector_literal(2048);
-    // Two tables are declared before the refused INSERT (each table's own
-    // primary-key index carries a fixed ~66KB exact-probe filter charge),
-    // so the setup budget must clear both before the INSERT
-    // gets a chance to be the one refused statement.
+    let limit = vector_insert_refusal_limit(true);
+    let limit_kib = limit / 1024;
     let script = format!(
-        "SET MEMORY_LIMIT '137K';\n\
+        "SET MEMORY_LIMIT '{limit_kib}K';\n\
          CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
          CREATE TABLE empty_t (id UUID PRIMARY KEY);\n\
          SELECT * FROM empty_t;\n\
@@ -269,6 +347,10 @@ fn a_refusal_is_distinguishable_from_a_successful_empty_result() {
         outcome.describe()
     );
     let message = errors[0]["message"].as_str().unwrap_or_default();
+    assert!(attributed_vector_memory_refusal(message), "{message}");
+    assert!(!attributed_vector_memory_refusal(
+        &message.replace("audio_clips.vector_audio", "audio_clips.other")
+    ));
     assert!(
         message.to_lowercase().contains("memory"),
         "the refusal must name the resource (memory) it exhausted; got: {message}"

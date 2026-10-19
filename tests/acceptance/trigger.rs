@@ -93,7 +93,7 @@ fn register_audit_callback(db: &Database, fire_count: Arc<AtomicUsize>) {
         {
             return Err(Error::Other(format!(
                 "unexpected trigger context identity: {ctx:?}"
-            )));
+            ).into()));
         }
         fire_count.fetch_add(1, Ordering::SeqCst);
         let write_id = ctx
@@ -255,20 +255,37 @@ fn hnsw_baseline_failure(
         ),
         &HashMap::from([("query".to_string(), Value::Vector(vec![0.0, 0.0, 1.0]))]),
     );
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     let Some(info) = db
         .vector_store_for_test()
-        .partition_info(&index, &VectorPartitionKey::unpartitioned())
+        .partition_info(
+            &index,
+            &VectorPartitionKey::unpartitioned(),
+            &mut vector_fixture_copy_1,
+        )
+        .expect("partition metadata inspection must succeed")
     else {
         return Some(format!(
             "{label} maintained vector partition is missing for {index:?}"
         ));
     };
+    let vector_fixture_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_2 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
     let actual = HnswBaseline {
         point_count: info.live_rows,
         layer0_points: info.live_rows,
         dimension: db
             .vector_store_for_test()
-            .index_layout(&index)
+            .index_layout(&index, &mut vector_fixture_copy_2)
             .map(|layout| layout.dimension)
             .unwrap_or(0),
         has_layer0_edges: info.graph_available,
@@ -346,7 +363,9 @@ fn reopened_rollback_absence_failure(
             ));
         }
     }
-    let leaked_changes = reopened.changes_since(since);
+    let leaked_changes = reopened
+        .changes_since(since)
+        .expect("read the declared changes");
     if changeset_has_data(&leaked_changes) {
         failures.push(format!("changes_since({since}) leaked {leaked_changes:?}"));
     }
@@ -367,7 +386,10 @@ where
 {
     row_ids
         .into_iter()
-        .filter(|row_id| db.has_live_vector(*row_id, db.snapshot()))
+        .filter(|row_id| {
+            db.has_live_vector(*row_id, db.snapshot())
+                .expect("inspect the live vector")
+        })
         .collect()
 }
 
@@ -375,7 +397,11 @@ fn live_vector_count(db: &Database, table: &str) -> usize {
     db.scan(table, db.snapshot())
         .unwrap()
         .iter()
-        .filter(|row| db.live_vector_entry(row.row_id, db.snapshot()).is_some())
+        .filter(|row| {
+            db.live_vector_entry(row.row_id, db.snapshot())
+                .expect("read the actual fixture observation")
+                .is_some()
+        })
         .count()
 }
 
@@ -429,9 +455,20 @@ fn warm_hnsw_fixture(
         !warm.rows.is_empty(),
         "{label} HNSW warmup query must return fixture rows"
     );
+    let vector_fixture_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_3 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_3.clone());
+
     let info = db
         .vector_store_for_test()
-        .partition_info(&index, &VectorPartitionKey::unpartitioned())
+        .partition_info(
+            &index,
+            &VectorPartitionKey::unpartitioned(),
+            &mut vector_fixture_copy_3,
+        )
+        .expect("partition metadata inspection must succeed")
         .expect("fixture must publish a maintained vector partition");
     assert_eq!(
         info.live_rows, expected_rows,
@@ -441,12 +478,18 @@ fn warm_hnsw_fixture(
         info.graph_available,
         "{label} fixture must publish a maintained graph generation; info={info:?}"
     );
+    let vector_fixture_reader_4 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_4 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_4.clone());
+
     let baseline = HnswBaseline {
         point_count: info.live_rows,
         layer0_points: info.live_rows,
         dimension: db
             .vector_store_for_test()
-            .index_layout(&index)
+            .index_layout(&index, &mut vector_fixture_copy_4)
             .unwrap()
             .dimension,
         has_layer0_edges: true,
@@ -733,7 +776,10 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
         || !cold_vector_leaks.is_empty()
         || !cold_hnsw_raw_leaks.is_empty()
         || cold_hnsw_failure.is_some()
-        || changeset_has_data(&db.changes_since(sync_since))
+        || changeset_has_data(
+            &db.changes_since(sync_since)
+                .expect("read the declared changes"),
+        )
     {
         failures.push(format!(
             "sync apply into trigger-attached tables must fail closed atomically until callbacks are ready; got {sync_gated:?}, sibling_rows={}, sibling_vector_rows={}, host_rows={}, leaked_edges={}, leaked_vector_rows={cold_vector_leaks:?}, leaked_hnsw_rows={cold_hnsw_raw_leaks:?}, hnsw_failure={cold_hnsw_failure:?}, leaked_changes={:?}",
@@ -742,7 +788,7 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
             count_rows(&db, "host_writes"),
             db.edge_count(uuid(0x199), "COLD_APPLY_LEAK", db.snapshot())
                 .unwrap(),
-            db.changes_since(sync_since)
+            db.changes_since(sync_since).expect("read the declared changes")
         ));
     }
 
@@ -774,7 +820,9 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let leaked_global_apply_changes = db.changes_since(global_apply_since);
+    let leaked_global_apply_changes = db
+        .changes_since(global_apply_since)
+        .expect("read the declared changes");
     if !matches!(
         non_trigger_apply,
         Err(Error::EngineNotInitialized { ref operation }) if operation.contains("apply_changes")
@@ -893,7 +941,7 @@ fn t3_sync_apply_requires_complete_initialization_after_callback_registration() 
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let leaked_changes = db.changes_since(since);
+    let leaked_changes = db.changes_since(since).expect("read the declared changes");
     let has_user_index = db
         .table_meta("host_writes")
         .unwrap()
@@ -940,6 +988,7 @@ fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callb
     );
     let unknown_drop_trigger_ddl = unknown_drop_trigger_db
         .changes_since(unknown_drop_trigger_since)
+        .expect("read the declared changes")
         .ddl;
     assert!(
         matches!(
@@ -980,8 +1029,9 @@ fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callb
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let data_then_drop_changes =
-        data_then_drop_trigger_db.changes_since(data_then_drop_trigger_since);
+    let data_then_drop_changes = data_then_drop_trigger_db
+        .changes_since(data_then_drop_trigger_since)
+        .expect("read the declared changes");
     assert!(
         matches!(
             data_then_drop_trigger_result,
@@ -1024,8 +1074,9 @@ fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callb
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let same_lsn_data_drop_changes =
-        same_lsn_data_drop_trigger_db.changes_since(same_lsn_data_drop_trigger_since);
+    let same_lsn_data_drop_changes = same_lsn_data_drop_trigger_db
+        .changes_since(same_lsn_data_drop_trigger_since)
+        .expect("read the declared changes");
     assert!(
         matches!(
             same_lsn_data_drop_trigger_result,
@@ -1074,6 +1125,7 @@ fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callb
     );
     let partial_drop_trigger_ddl = partial_drop_trigger_db
         .changes_since(partial_drop_trigger_since)
+        .expect("read the declared changes")
         .ddl;
     let partial_triggers = partial_drop_trigger_db.list_triggers();
     let still_booting = partial_drop_trigger_db.complete_initialization();
@@ -1171,7 +1223,10 @@ fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callb
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let drop_trigger_ddl = drop_trigger_db.changes_since(drop_trigger_since).ddl;
+    let drop_trigger_ddl = drop_trigger_db
+        .changes_since(drop_trigger_since)
+        .expect("read the declared changes")
+        .ddl;
     assert!(
         drop_trigger_result.is_ok()
             && drop_trigger_db.list_triggers().is_empty()
@@ -1202,7 +1257,10 @@ fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callb
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let drop_table_ddl = drop_table_db.changes_since(drop_table_since).ddl;
+    let drop_table_ddl = drop_table_db
+        .changes_since(drop_table_since)
+        .expect("read the declared changes")
+        .ddl;
     assert!(
         drop_table_result.is_ok()
             && drop_table_db.table_meta("host_writes").is_none()
@@ -1264,13 +1322,17 @@ fn t3_sync_trigger_ddl_rejects_invalid_event_bus_batch_without_trigger_leak() {
         "failed sync batch must not persist trigger declarations"
     );
     assert!(
-        db.changes_since(since).ddl.iter().all(|ddl| {
-            !matches!(
-                ddl,
-                DdlChange::CreateTrigger { name, .. }
-                    if name == "trigger_before_bad_event_route"
-            )
-        }),
+        db.changes_since(since)
+            .expect("read the declared changes")
+            .ddl
+            .iter()
+            .all(|ddl| {
+                !matches!(
+                    ddl,
+                    DdlChange::CreateTrigger { name, .. }
+                        if name == "trigger_before_bad_event_route"
+                )
+            }),
         "failed sync batch must not append trigger DDL history"
     );
     assert!(
@@ -1327,12 +1389,16 @@ fn t3_sync_trigger_ddl_with_same_batch_rows_fails_closed_until_callback_ready() 
         "failed mixed sync batch must not ingest trigger-attached rows"
     );
     assert!(
-        db.changes_since(since).ddl.iter().all(|ddl| {
-            !matches!(
-                ddl,
-                DdlChange::CreateTrigger { name, .. } if name == "synced_trigger"
-            )
-        }),
+        db.changes_since(since)
+            .expect("read the declared changes")
+            .ddl
+            .iter()
+            .all(|ddl| {
+                !matches!(
+                    ddl,
+                    DdlChange::CreateTrigger { name, .. } if name == "synced_trigger"
+                )
+            }),
         "failed mixed sync batch must not append trigger DDL history"
     );
 }
@@ -1391,13 +1457,18 @@ fn t3_sync_trigger_ddl_with_same_batch_unrelated_data_fails_closed_until_callbac
         "failed mixed sync batch must not ingest unrelated data while the handle would become booting"
     );
     assert!(
-        !changeset_has_data(&db.changes_since(since))
-            && db.changes_since(since).ddl.iter().all(|ddl| {
-                !matches!(
-                    ddl,
-                    DdlChange::CreateTrigger { name, .. } if name == "synced_trigger"
-                )
-            }),
+        !changeset_has_data(&db.changes_since(since).expect("read the declared changes"))
+            && db
+                .changes_since(since)
+                .expect("read the declared changes")
+                .ddl
+                .iter()
+                .all(|ddl| {
+                    !matches!(
+                        ddl,
+                        DdlChange::CreateTrigger { name, .. } if name == "synced_trigger"
+                    )
+                }),
         "failed mixed sync batch must not append data or trigger DDL history"
     );
 }
@@ -1446,13 +1517,18 @@ fn t3_sync_trigger_ddl_with_same_batch_vector_data_fails_before_trigger_leak() {
         "failed vector-only mixed sync batch must not persist trigger declarations"
     );
     assert!(
-        !changeset_has_data(&db.changes_since(since))
-            && db.changes_since(since).ddl.iter().all(|ddl| {
-                !matches!(
-                    ddl,
-                    DdlChange::CreateTrigger { name, .. } if name == "vector_trigger"
-                )
-            }),
+        !changeset_has_data(&db.changes_since(since).expect("read the declared changes"))
+            && db
+                .changes_since(since)
+                .expect("read the declared changes")
+                .ddl
+                .iter()
+                .all(|ddl| {
+                    !matches!(
+                        ddl,
+                        DdlChange::CreateTrigger { name, .. } if name == "vector_trigger"
+                    )
+                }),
         "failed vector-only mixed sync batch must not append data or trigger DDL history"
     );
 }
@@ -1503,7 +1579,7 @@ fn t3_sync_mixed_ddl_preflight_uses_sender_lsn_order_before_trigger_side_effects
             .any(|trigger| trigger.name == "host_write_trigger"),
         "earlier trigger DDL must not leak when a later sender-LSN row is invalid"
     );
-    let leaked_changes = db.changes_since(since);
+    let leaked_changes = db.changes_since(since).expect("read the declared changes");
     assert!(
         leaked_changes.ddl.is_empty()
             && leaked_changes.rows.is_empty()
@@ -1542,7 +1618,9 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
         },
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     );
-    let invalid_type_leaked_changes = invalid_type_db.changes_since(invalid_type_since);
+    let invalid_type_leaked_changes = invalid_type_db
+        .changes_since(invalid_type_since)
+        .expect("read the declared changes");
     assert!(
         matches!(
             invalid_type_result,
@@ -1590,7 +1668,9 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
         matches!(create_result, Err(Error::TableNotFound(ref table)) if table == "missing_index_table"),
         "sync DDL preflight must reject CreateIndex for a missing projected table before applying earlier same-LSN DDL; got {create_result:?}"
     );
-    let create_leaked_changes = db.changes_since(create_since);
+    let create_leaked_changes = db
+        .changes_since(create_since)
+        .expect("read the declared changes");
     assert!(
         db.table_meta("leaked_sync_ddl").is_none()
             && create_leaked_changes.ddl.is_empty()
@@ -1628,7 +1708,9 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
         matches!(drop_result, Err(Error::TableNotFound(ref table)) if table == "doomed_writes"),
         "sync DDL preflight must reject CreateIndex after a same-LSN DropTable before dropping the local table; got {drop_result:?}"
     );
-    let drop_leaked_changes = db.changes_since(drop_since);
+    let drop_leaked_changes = db
+        .changes_since(drop_since)
+        .expect("read the declared changes");
     assert!(
         db.table_meta("doomed_writes").is_some()
             && drop_leaked_changes.ddl.is_empty()
@@ -1669,7 +1751,9 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let bad_row_leaked_changes = bad_row_db.changes_since(bad_row_since);
+    let bad_row_leaked_changes = bad_row_db
+        .changes_since(bad_row_since)
+        .expect("read the declared changes");
     assert!(
         matches!(
             bad_row_result,
@@ -1765,7 +1849,7 @@ fn t3_sync_mixed_ddl_preflight_rejects_noncanonical_natural_key_envelopes_withou
             0,
             "malformed natural-key envelope must not ingest host rows"
         );
-        let leaked_changes = db.changes_since(since);
+        let leaked_changes = db.changes_since(since).expect("read the declared changes");
         assert!(
             leaked_changes.ddl.is_empty()
                 && leaked_changes.rows.is_empty()
@@ -1790,7 +1874,10 @@ fn t3_drop_table_removes_attached_triggers_and_persists_tombstones() {
         db.list_triggers().is_empty(),
         "dropping a trigger-attached table must detach its trigger declarations"
     );
-    let ddl = db.changes_since(since).ddl;
+    let ddl = db
+        .changes_since(since)
+        .expect("read the declared changes")
+        .ddl;
     assert!(
         ddl.iter()
             .any(|change| matches!(change, DdlChange::DropTable { name } if name == "host_writes"))
@@ -1807,7 +1894,10 @@ fn t3_drop_table_removes_attached_triggers_and_persists_tombstones() {
         "implicit trigger cleanup must survive reopen without cold-starting dead schema; triggers={:?}",
         reopened.list_triggers()
     );
-    let reopened_ddl = reopened.changes_since(Lsn(0)).ddl;
+    let reopened_ddl = reopened
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     assert!(
         reopened_ddl.iter().any(
             |change| matches!(change, DdlChange::DropTrigger { name } if name == "host_write_trigger")
@@ -1875,7 +1965,7 @@ fn t3_sync_trigger_ddl_preflight_rejects_fk_invalid_data_before_any_trigger_ddl_
         db.list_triggers().is_empty(),
         "preflight rejection must not leave a trigger declaration behind"
     );
-    let leaked_changes = db.changes_since(since);
+    let leaked_changes = db.changes_since(since).expect("read the declared changes");
     assert!(
         leaked_changes.ddl.is_empty()
             && leaked_changes.rows.is_empty()
@@ -1954,7 +2044,7 @@ fn t3_sync_trigger_ddl_fk_preflight_respects_sender_lsn_order() {
         db.list_triggers().is_empty(),
         "chronological FK preflight rejection must not leave a trigger declaration behind"
     );
-    let leaked_changes = db.changes_since(since);
+    let leaked_changes = db.changes_since(since).expect("read the declared changes");
     assert!(
         leaked_changes.ddl.is_empty()
             && leaked_changes.rows.is_empty()
@@ -2041,7 +2131,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_parent_delete_before_trigger_leak() 
         1,
         "rejected parent delete must not mutate committed parent rows"
     );
-    let leaked_changes = db.changes_since(since);
+    let leaked_changes = db.changes_since(since).expect("read the declared changes");
     assert!(
         leaked_changes.ddl.is_empty()
             && leaked_changes.rows.is_empty()
@@ -2150,7 +2240,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_stale_parent_prefix_after_update() {
         matches!(parent.values.get("ref_id"), Some(Value::Uuid(value)) if *value == old_ref),
         "stale-prefix rejection must not update the committed parent row; got {parent:?}"
     );
-    let leaked_changes = db.changes_since(since);
+    let leaked_changes = db.changes_since(since).expect("read the declared changes");
     assert!(
         leaked_changes.ddl.is_empty()
             && leaked_changes.rows.is_empty()
@@ -2347,7 +2437,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_server_wins_child_update_before_edge
         matches!(child.values.get("parent_id"), Some(Value::Uuid(value)) if *value == parent_id),
         "skipped child update must not detach the committed child; got {child:?}"
     );
-    let leaked_changes = db.changes_since(since);
+    let leaked_changes = db.changes_since(since).expect("read the declared changes");
     assert!(
         leaked_changes.ddl.is_empty()
             && leaked_changes.rows.is_empty()
@@ -2402,7 +2492,10 @@ fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
         db.table_names(),
         db.list_triggers()
     );
-    let ddl = db.changes_since(Lsn(0)).ddl;
+    let ddl = db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     assert!(
         ddl.iter()
             .any(|change| matches!(change, DdlChange::CreateTrigger { name, table, .. } if name == "replay_trigger" && table == "replay_writes"))
@@ -2444,7 +2537,10 @@ fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
-    let same_lsn_ddl = db.changes_since(same_lsn_since).ddl;
+    let same_lsn_ddl = db
+        .changes_since(same_lsn_since)
+        .expect("read the declared changes")
+        .ddl;
     let same_lsn_create_trigger_pos = same_lsn_ddl
         .iter()
         .position(|change| matches!(change, DdlChange::CreateTrigger { name, table, .. } if name == "same_lsn_replay_trigger" && table == "same_lsn_replay_writes"));
@@ -2511,7 +2607,9 @@ fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
     let mixed_lsn_marker_row = row_for_column_uuid(&db, "same_lsn_marker", "id", mixed_marker_id);
-    let mixed_lsn_changes = db.changes_since(mixed_lsn_since);
+    let mixed_lsn_changes = db
+        .changes_since(mixed_lsn_since)
+        .expect("read the declared changes");
     let mixed_lsn_create_trigger_pos = mixed_lsn_changes
         .ddl
         .iter()
@@ -2598,7 +2696,10 @@ fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
     );
 
     let row = row_for_column_uuid(&db, "host_vectors", "id", vector_id);
-    let ddl = db.changes_since(since).ddl;
+    let ddl = db
+        .changes_since(since)
+        .expect("read the declared changes")
+        .ddl;
     let fired = fired_trigger_history(&db, "vector_history_trigger");
     assert!(
         result.is_ok()
@@ -2655,7 +2756,10 @@ fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
     let same_lsn_row = row_for_column_uuid(&db, "host_vectors", "id", same_lsn_id);
-    let same_lsn_ddl = db.changes_since(same_lsn_since).ddl;
+    let same_lsn_ddl = db
+        .changes_since(same_lsn_since)
+        .expect("read the declared changes")
+        .ddl;
     let same_lsn_fired = fired_trigger_history(&db, "same_lsn_vector_history_trigger");
     assert!(
         same_lsn_result.is_ok()
@@ -2673,6 +2777,194 @@ fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
             ),
         "same-sender-LSN CreateTrigger -> data -> DropTrigger replay must preserve committed data, tombstone final state, and fired audit without callbacks; result={same_lsn_result:?}, row={same_lsn_row:?}, fired={same_lsn_fired:?}, ddl={same_lsn_ddl:?}, triggers={:?}",
         db.list_triggers()
+    );
+    #[cfg(feature = "test-seams")]
+    assert_sequential_vector_source_unit_credit();
+}
+
+#[cfg(feature = "test-seams")]
+// Acceptance: each committed source unit releases its reader scratch before the next unit.
+fn assert_sequential_vector_source_unit_credit() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let mut peaks = Vec::new();
+    for units in [2usize, 4] {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("unit-credit.redb");
+        let open = || {
+            contextdb_engine::Database::open_with_options(
+                &path,
+                contextdb_engine::DatabaseOpenOptions {
+                    memory_limit: Some(64 << 20),
+                    maintenance_policy: MaintenancePolicy::CallerDriven,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let db = open();
+        db.execute("CREATE TABLE unit_vectors (id INTEGER PRIMARY KEY, embedding VECTOR(8), spare INTEGER) HISTORY ALL SYNC TWO WAY",
+            &empty()).unwrap();
+        let vector = vec![1.0, 0.0, 0.5, 0.0, 0.25, 0.0, 0.125, 0.0];
+        db.execute(
+            "INSERT INTO unit_vectors (id, embedding) VALUES (1, $v)",
+            &HashMap::from([("v".into(), Value::Vector(vector.clone()))]),
+        )
+        .unwrap();
+        db.execute(
+            "ALTER TABLE unit_vectors ALTER COLUMN embedding SET HNSW (EF_SEARCH = 64)",
+            &empty(),
+        )
+        .unwrap();
+        let initial_lsn = db.current_lsn();
+        // Produce actual supported declarations through SQL. Every toggle is
+        // independently committed and preserves the full table constraints.
+        let source = Database::open_memory();
+        source.execute(
+            "CREATE TABLE unit_vectors (id INTEGER PRIMARY KEY, embedding VECTOR(8), spare INTEGER) HISTORY ALL SYNC TWO WAY",
+            &empty(),
+        ).unwrap();
+        source
+            .execute(
+                "INSERT INTO unit_vectors (id, embedding) VALUES (1, $v)",
+                &HashMap::from([("v".into(), Value::Vector(vector.clone()))]),
+            )
+            .unwrap();
+        source
+            .execute(
+                "ALTER TABLE unit_vectors ALTER COLUMN embedding SET HNSW (EF_SEARCH = 64)",
+                &empty(),
+            )
+            .unwrap();
+        let source_frontier = source.current_lsn();
+        for unit in 0..units {
+            let breadth = if unit % 2 == 0 { 128 } else { 64 };
+            source.execute(
+                &format!("ALTER TABLE unit_vectors ALTER COLUMN embedding SET HNSW (EF_SEARCH = {breadth})"),
+                &empty(),
+            ).unwrap();
+            assert_eq!(
+                source.current_lsn(),
+                Lsn(source_frontier.0 + unit as u64 + 1),
+                "each authored SQL declaration produces a real independent source commit"
+            );
+        }
+        let changes = source.changes_since(source_frontier).unwrap();
+        assert_eq!(changes.ddl.len(), units);
+        assert_eq!(
+            changes.ddl_lsn,
+            (1..=units)
+                .map(|unit| Lsn(source_frontier.0 + unit as u64))
+                .collect::<Vec<_>>(),
+            "the emitted source units retain every authored commit frontier"
+        );
+        assert!(
+            changes.ddl.iter().all(|change| matches!(
+                change, DdlChange::AlterTable { name, constraints, .. }
+                    if name == "unit_vectors" && !constraints.is_empty()
+            )),
+            "SQL preserves the complete declared HISTORY/SYNC constraints"
+        );
+        let ddl = changes.ddl.clone();
+        source.close().unwrap();
+        drop(source);
+        let (result, credit) = contextdb_engine::database::resident_history_test_seams::observe_source_unit_credit_for_test(
+            &db, changes, &ConflictPolicies::uniform(ConflictPolicy::LatestWins));
+        let result = result.expect("each ordered source declaration commits and publishes");
+        eprintln!("SOURCE_UNIT_CREDIT units={units} report={credit:?}");
+        assert_eq!(
+            credit.baseline, 257,
+            "the actual operation holds a nonzero standing credit"
+        );
+        assert_eq!(
+            credit.cuts.len(),
+            units + 1,
+            "initial plus EACH committed unit is observed"
+        );
+        for (unit, cut) in credit.cuts.iter().enumerate() {
+            assert_eq!(
+                cut.committed_lsn,
+                Lsn(initial_lsn.0 + unit as u64),
+                "a cut follows the real durable source-unit commit, in order"
+            );
+            assert_eq!(
+                cut.used, 257,
+                "after unit {unit}, no earlier materialized copy credit survives into the next unit"
+            );
+        }
+        assert_eq!(
+            credit.before_caller_drop, 257,
+            "success does not defer release to the batch caller"
+        );
+        assert_eq!(
+            credit.after_caller_drop, 257,
+            "the caller carries no completed-unit credit"
+        );
+        assert_eq!(
+            credit.after_standing_drop, 0,
+            "the operation returns every remaining standing byte"
+        );
+        assert_eq!(
+            credit.parent_after, credit.parent_before,
+            "the declared parent returns to its exact standing baseline"
+        );
+        assert!(
+            credit.cuts[1..].iter().all(|cut| cut.peak > 257),
+            "each unit actually exercises reader-funded preparation"
+        );
+        peaks.push(
+            credit.cuts[1..]
+                .iter()
+                .map(|cut| cut.peak - 257)
+                .max()
+                .unwrap(),
+        );
+        assert_eq!(result.applied_rows, 0);
+        assert_eq!(result.skipped_rows, 0);
+        assert!(result.conflicts.is_empty());
+        assert_eq!(result.new_lsn, Lsn(initial_lsn.0 + units as u64));
+        let durable = db
+            .changes_since(initial_lsn)
+            .expect("read the committed declarations");
+        assert_eq!(
+            durable.ddl, ddl,
+            "every source declaration stays installed in authored order"
+        );
+        assert_eq!(
+            durable.ddl_lsn,
+            (1..=units)
+                .map(|unit| Lsn(initial_lsn.0 + unit as u64))
+                .collect::<Vec<_>>(),
+            "each source unit retains its independent local commit"
+        );
+        let expected = vec![vec![Value::Int64(1), Value::Vector(vector), Value::Null]];
+        let check = |database: &Database| {
+            assert_eq!(
+                database
+                    .execute(
+                        "SELECT id, embedding, spare FROM unit_vectors ORDER BY id",
+                        &empty()
+                    )
+                    .unwrap()
+                    .rows,
+                expected,
+                "schema replay preserves the exact live row and vector through reopen"
+            )
+        };
+        check(&db);
+        db.close().unwrap();
+        drop(db);
+        let db = open();
+        check(&db);
+        assert_eq!(
+            db.changes_since(initial_lsn).unwrap().ddl,
+            ddl,
+            "every independent source declaration remains durable after reopen"
+        );
+        db.close().unwrap();
+    }
+    assert_eq!(
+        peaks[0], peaks[1],
+        "doubling equal-shape source units leaves the actual per-unit reader peak unchanged"
     );
 }
 
@@ -2738,6 +3030,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         .collect::<BTreeSet<_>>();
     let race_ddl_names = race_db
         .changes_since(Lsn(0))
+        .expect("read the declared changes")
         .ddl
         .into_iter()
         .filter_map(|change| match change {
@@ -2841,7 +3134,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         {
             return Err(Error::Other(format!(
                 "unexpected INSERT trigger context identity: {ctx:?}"
-            )));
+            ).into()));
         }
         captured_insert_contexts.lock().unwrap().push((
             ctx.event,
@@ -2972,7 +3265,9 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         ));
     }
     if update.is_ok() {
-        let update_changes = db.changes_since(update_since);
+        let update_changes = db
+            .changes_since(update_since)
+            .expect("read the declared changes");
         let update_host_lsns = update_changes
             .rows
             .iter()
@@ -3235,7 +3530,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         {
             return Err(Error::Other(format!(
                 "unexpected sync trigger context: {ctx:?}"
-            )));
+            ).into()));
         }
         sync_contexts
             .lock()
@@ -3328,7 +3623,10 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         &empty_params(),
     );
     let sync_contexts_snapshot = sync_contexts_for_callback.lock().unwrap().clone();
-    let sync_ddl_history = sync_admin.changes_since(sync_since).ddl;
+    let sync_ddl_history = sync_admin
+        .changes_since(sync_since)
+        .expect("read the declared changes")
+        .ddl;
     let sync_fired_history = sync_admin
         .trigger_audit_history(TriggerAuditFilter {
             trigger_name: Some("sync_trigger".into()),
@@ -3438,6 +3736,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         Err(Error::TriggerEventUnsupported { event }) if event == "DELETE"
     ) || sync_admin
         .changes_since(sync_since)
+        .expect("read the declared changes")
         .ddl
         .iter()
         .any(|change| {
@@ -3457,14 +3756,17 @@ fn t3_reg_introspection_and_delete_event_rejection() {
     {
         failures.push(format!(
             "sync-applied trigger DDL batch must validate all trigger declarations and mixed DDL/data row schemas before persisting any trigger declaration; partial_batch={sync_partial_batch:?}, mixed_bad_row={sync_mixed_bad_row:?}, ddl={:?}, triggers={:?}",
-            sync_admin.changes_since(sync_since).ddl,
+            sync_admin.changes_since(sync_since).expect("read the declared changes").ddl,
             sync_admin.list_triggers()
         ));
     }
     sync_admin.close().unwrap();
     let reopened_sync_admin = Database::open(&sync_path).unwrap();
     let reopened_sync_ready = reopened_sync_admin.complete_initialization();
-    let reopened_sync_ddl = reopened_sync_admin.changes_since(sync_since).ddl;
+    let reopened_sync_ddl = reopened_sync_admin
+        .changes_since(sync_since)
+        .expect("read the declared changes")
+        .ddl;
     let reopened_sync_create_triggers = reopened_sync_ddl
         .iter()
         .filter(|change| {
@@ -3542,7 +3844,10 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             .unwrap();
         durable.complete_initialization().unwrap();
         let drop = durable.execute("DROP TRIGGER durable_trigger", &empty());
-        durable_drop_history = durable.changes_since(since).ddl;
+        durable_drop_history = durable
+            .changes_since(since)
+            .expect("read the declared changes")
+            .ddl;
         if create.is_err()
             || drop.is_err()
             || !matches!(
@@ -3584,7 +3889,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             .iter()
             .any(|trigger| trigger.name == "durable_trigger")
         || reopened_durable
-            .changes_since(Lsn(0))
+            .changes_since(Lsn(0)).expect("read the declared changes")
             .ddl
             .iter()
             .filter(|change| matches!(change, DdlChange::DropTrigger { name } if name == "durable_trigger"))
@@ -3594,7 +3899,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         failures.push(format!(
             "reopen must not resurrect a dropped durable trigger and must retain the drop tombstone; ready={reopened_ready:?}, triggers={:?}, ddl={:?}, original_drop_history={durable_drop_history:?}",
             reopened_durable.list_triggers(),
-            reopened_durable.changes_since(Lsn(0)).ddl
+            reopened_durable.changes_since(Lsn(0)).expect("read the declared changes").ddl
         ));
     }
     reopened_durable.close().unwrap();
@@ -3631,7 +3936,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                 other => {
                     return Err(Error::Other(format!(
                         "in-flight DROP TRIGGER must be blocked with a typed callback/admin error; got {other:?}"
-                    )));
+                    ).into()));
                 }
             }
 
@@ -3854,7 +4159,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                         ]),
                     ).map(|_| ());
                 }
-                other => return Err(Error::Other(format!("unexpected scoped branch {other}"))),
+                other => return Err(Error::Other(format!("unexpected scoped branch {other}").into())),
             };
             db_handle.execute(
                 "INSERT INTO scoped_audits (id, write_id, note, embedding, context_id) VALUES ($id, $write_id, $note, $embedding, $ctx)",
@@ -3938,9 +4243,11 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             scoped_fire.snapshot(),
         )
         .unwrap();
-    let scoped_allowed_vector = allowed_audit_row
-        .as_ref()
-        .and_then(|row| scoped_fire.live_vector_entry(row.row_id, scoped_fire.snapshot()));
+    let scoped_allowed_vector = allowed_audit_row.as_ref().and_then(|row| {
+        scoped_fire
+            .live_vector_entry(row.row_id, scoped_fire.snapshot())
+            .expect("read the actual fixture observation")
+    });
     let expected_scope = BTreeSet::from([ContextId::new(ctx_a)]);
     let scoped_denied_ok = |result: &Result<contextdb_engine::QueryResult>| {
         matches!(
@@ -4640,7 +4947,7 @@ fn t3_trigger_dispatch_uses_commit_final_write_set() {
                 return Err(Error::Other(format!(
                     "{trigger_name} saw wrong event {:?}",
                     ctx.event
-                )));
+                ).into()));
             }
             let slug = ctx
                 .row_values
@@ -4825,7 +5132,9 @@ fn t3_sync_trigger_ddl_replay_respects_sender_lsn_order() {
         .execute("DROP TRIGGER host_write_trigger", &empty())
         .unwrap();
 
-    let changes = origin.changes_since(Lsn(0));
+    let changes = origin
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let trigger_create_lsn = changes
         .ddl
         .iter()
@@ -4925,7 +5234,7 @@ fn t3_sibling_callback_cascades_validate_after_all_triggers_stage() {
             other => {
                 return Err(Error::Other(format!(
                     "unexpected sibling source kind {other}"
-                )));
+                ).into()));
             }
         }
         Ok(())
@@ -4973,7 +5282,7 @@ fn t3_atomicity_cascade_rows_share_lsn_and_event() {
     db.execute(host_insert_sql(), &insert_host_params(uuid(10), "first"))
         .unwrap();
 
-    let changes = db.changes_since(since);
+    let changes = db.changes_since(since).expect("read the declared changes");
     let host_lsns: HashSet<Lsn> = changes
         .rows
         .iter()
@@ -5062,6 +5371,7 @@ fn t3_atomicity_cascade_rows_share_lsn_and_event() {
         .expect("audit row must be visible");
     let vector_entry = db
         .live_vector_entry(audit_row_id, db.snapshot())
+        .expect("read the actual fixture observation")
         .expect("trigger callback vector entry must be visible");
     assert_eq!(vector_entry.vector, vec![1.0, 0.0, 0.0]);
     assert_eq!(
@@ -5118,7 +5428,9 @@ fn t3_atomicity_cascade_rows_share_lsn_and_event() {
         )
         .expect("direct insert_row into a trigger-attached table must be a firing write route");
     api_db.commit(api_tx).unwrap();
-    let api_changes = api_db.changes_since(api_since);
+    let api_changes = api_db
+        .changes_since(api_since)
+        .expect("read the declared changes");
     let api_event = api_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("direct insert_row firing must publish one event");
@@ -5134,7 +5446,7 @@ fn t3_atomicity_cascade_rows_share_lsn_and_event() {
             &api_audit_row,
             Some(row)
                 if row.values.get("note") == Some(&Value::Text("cascade:direct-api".into()))
-                    && api_db.live_vector_entry(row.row_id, api_db.snapshot()).is_some()
+                    && api_db.live_vector_entry(row.row_id, api_db.snapshot()).expect("read the actual fixture observation").is_some()
         )
         || api_event.row_count != 4
         || row_group_signatures(&api_db, api_changes).len() != 1
@@ -5215,7 +5527,7 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
 
         let since = db.current_lsn();
         let result = db.execute(host_insert_sql(), &insert_host_params(uuid(20), "dup"));
-        let leaked_changes = db.changes_since(since);
+        let leaked_changes = db.changes_since(since).expect("read the declared changes");
         let mut rollback_probe_rows = candidate_row_ids_after(audit_hnsw_max_row_id);
         rollback_probe_rows.extend(rollback_vector_rows.lock().unwrap().iter().copied());
         let leaked_vector_rows = live_vector_rows(&db, rollback_probe_rows.iter().copied());
@@ -5341,7 +5653,7 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             host_insert_sql(),
             &insert_host_params(uuid(25), "callback-error"),
         );
-        let leaked_changes = db.changes_since(since);
+        let leaked_changes = db.changes_since(since).expect("read the declared changes");
         let mut rollback_probe_rows = candidate_row_ids_after(audit_hnsw_max_row_id);
         rollback_probe_rows.extend(rollback_vector_rows.lock().unwrap().iter().copied());
         let leaked_vector_rows = live_vector_rows(&db, rollback_probe_rows.iter().copied());
@@ -5442,7 +5754,7 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
         db.complete_initialization().unwrap();
         let since = db.current_lsn();
         let result = db.execute(host_insert_sql(), &insert_host_params(uuid(21), "fk"));
-        let leaked_changes = db.changes_since(since);
+        let leaked_changes = db.changes_since(since).expect("read the declared changes");
         if !matches!(
             result,
             Err(Error::ForeignKeyViolation { ref child_table, ref child_columns, .. })
@@ -5521,7 +5833,7 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
         db.complete_initialization().unwrap();
         let since = db.current_lsn();
         let result = db.execute(host_insert_sql(), &insert_host_params(uuid(22), "state"));
-        let leaked_changes = db.changes_since(since);
+        let leaked_changes = db.changes_since(since).expect("read the declared changes");
         if !matches!(result, Err(Error::InvalidStateTransition(_)))
             || count_rows(&db, "host_writes") != 0
             || count_rows(&db, "cascade_states") != 0
@@ -5631,6 +5943,7 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
         assert_eq!(fires.load(Ordering::SeqCst), 1);
         expected_fire_lsn = db
             .changes_since(since)
+            .expect("read the declared changes")
             .rows
             .iter()
             .find(|row| row.table == "host_writes")
@@ -5685,11 +5998,17 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
                 if operation.contains("host_writes")
         ) && count_rows(&reopened, "host_writes") == 1
             && count_rows(&reopened, "host_audits") == 1
-            && !changeset_has_data(&reopened.changes_since(cold_gate_since)),
+            && !changeset_has_data(
+                &reopened
+                    .changes_since(cold_gate_since)
+                    .expect("read the declared changes")
+            ),
         "direct Database::insert_row must also enter the persisted-trigger cold gate before callback registration and must not leak staged data; result={cold_direct_insert:?}, host_rows={}, audit_rows={}, leaked_changes={:?}",
         count_rows(&reopened, "host_writes"),
         count_rows(&reopened, "host_audits"),
-        reopened.changes_since(cold_gate_since)
+        reopened
+            .changes_since(cold_gate_since)
+            .expect("read the declared changes")
     );
     let cold_vector_tx = reopened.begin_or_panic();
     let cold_vector_insert = reopened.insert_vector(
@@ -5715,9 +6034,15 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
             Err(Error::EngineNotInitialized { ref operation })
                 if operation.contains("host_writes")
                     && operation.contains("delete_vector")
-        ) && !changeset_has_data(&reopened.changes_since(cold_gate_since)),
+        ) && !changeset_has_data(
+            &reopened
+                .changes_since(cold_gate_since)
+                .expect("read the declared changes")
+        ),
         "direct vector APIs must also fail closed for trigger-attached tables before callback registration; insert={cold_vector_insert:?}, delete={cold_vector_delete:?}, leaked_changes={:?}",
-        reopened.changes_since(cold_gate_since)
+        reopened
+            .changes_since(cold_gate_since)
+            .expect("read the declared changes")
     );
     let replay_fires = Arc::new(AtomicUsize::new(0));
     register_audit_callback(&reopened, replay_fires.clone());
@@ -5788,7 +6113,9 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
         2,
         "post-reopen trigger cascade row must persist"
     );
-    let post_reopen_changes = reopened.changes_since(post_reopen_since);
+    let post_reopen_changes = reopened
+        .changes_since(post_reopen_since)
+        .expect("read the declared changes");
     let post_reopen_lsn = post_reopen_changes
         .rows
         .iter()
@@ -5805,6 +6132,7 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
     assert!(
         reopened
             .live_vector_entry(post_reopen_audit.row_id, reopened.snapshot())
+            .expect("read the actual fixture observation")
             .is_some(),
         "post-reopen trigger cascade vector must be visible"
     );
@@ -5859,7 +6187,9 @@ fn t3_sync_originator_fires_receiver_does_not_refire() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
     setup_host_tables(&origin);
-    let origin_schema = origin.changes_since(Lsn(0));
+    let origin_schema = origin
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     receiver
         .apply_changes(
             origin_schema,
@@ -5906,14 +6236,18 @@ fn t3_sync_originator_fires_receiver_does_not_refire() {
         "receiver local writes must still fire receiver callbacks"
     );
     let receiver_fires_before_sync = receiver_fires.load(Ordering::SeqCst);
-    let receiver_local_history = receiver.changes_since(receiver_since);
+    let receiver_local_history = receiver
+        .changes_since(receiver_since)
+        .expect("read the declared changes");
     let since = origin.current_lsn();
     origin
         .execute(host_insert_sql(), &insert_host_params(uuid(40), "sync"))
         .unwrap();
     receiver
         .apply_changes(
-            origin.changes_since(since),
+            origin
+                .changes_since(since)
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
         .unwrap();
@@ -5942,6 +6276,7 @@ fn t3_sync_originator_fires_receiver_does_not_refire() {
     assert!(
         receiver
             .live_vector_entry(audit_row_id, receiver.snapshot())
+            .expect("read the actual fixture observation")
             .is_some(),
         "originator vector cascade must sync as data"
     );
@@ -5979,6 +6314,7 @@ fn t3_sync_originator_fires_receiver_does_not_refire() {
     assert!(
         origin
             .live_vector_entry(reverse_audit_row_id, origin.snapshot())
+            .expect("read the actual fixture observation")
             .is_some(),
         "receiver-originated vector cascade must sync back to origin as data"
     );
@@ -6009,7 +6345,8 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
             contextdb_core::TenantId::from(tenant_id),
             hub_node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = server.clone();
@@ -6035,13 +6372,15 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
         fabric.client_as(&edge_a_node_id),
         contextdb_core::TenantId::from(tenant_id),
         edge_a_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let mut edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_b_db.clone(),
         fabric.client_as(&edge_b_node_id),
         contextdb_core::TenantId::from(tenant_id),
         edge_b_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let create_push = edge_a.push().await;
     let create_pull = edge_b.pull_default().await;
     let server_trigger_after_create = server_db.list_triggers();
@@ -6090,7 +6429,8 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
         fabric.client_as(&edge_b_node_id),
         contextdb_core::TenantId::from(tenant_id),
         edge_b_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
 
     let server_fires = Arc::new(AtomicUsize::new(0));
     let edge_b_fires = Arc::new(AtomicUsize::new(0));
@@ -6116,7 +6456,12 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
         expected_ids.len(),
         "origin edge must generate one local cascade per host write before SyncClient push"
     );
-    let edge_a_groups = row_group_signatures(&edge_a_db, edge_a_db.changes_since(data_since));
+    let edge_a_groups = row_group_signatures(
+        &edge_a_db,
+        edge_a_db
+            .changes_since(data_since)
+            .expect("read the declared changes"),
+    );
     assert_eq!(
         edge_a_groups.len(),
         expected_ids.len(),
@@ -6124,8 +6469,12 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     );
     let server_data_since = server_db.current_lsn();
     let data_push = edge_a.push().await;
-    let server_groups =
-        row_group_signatures(&server_db, server_db.changes_since(server_data_since));
+    let server_groups = row_group_signatures(
+        &server_db,
+        server_db
+            .changes_since(server_data_since)
+            .expect("read the declared changes"),
+    );
     assert!(
         data_push.is_ok()
             && server_fires.load(Ordering::SeqCst) == 0
@@ -6143,8 +6492,12 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let edge_b_data_since = edge_b_db.current_lsn();
     let edge_b_rx = edge_b_db.subscribe();
     let data_pull = edge_b.pull_default().await;
-    let edge_b_groups =
-        row_group_signatures(&edge_b_db, edge_b_db.changes_since(edge_b_data_since));
+    let edge_b_groups = row_group_signatures(
+        &edge_b_db,
+        edge_b_db
+            .changes_since(edge_b_data_since)
+            .expect("read the declared changes"),
+    );
     let mut edge_b_events = Vec::new();
     for _ in 0..server_groups.len() + 1 {
         match edge_b_rx.recv_timeout(Duration::from_millis(500)) {
@@ -6168,6 +6521,7 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
         .filter(|row| {
             edge_b_db
                 .live_vector_entry(row.row_id, edge_b_db.snapshot())
+                .expect("read the actual fixture observation")
                 .is_some()
         })
         .count();
@@ -6194,7 +6548,9 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let server_noop_since = server_db.current_lsn();
     let server_noop_rx = server_db.subscribe();
     let data_push_noop = edge_a.push().await;
-    let server_noop_changes = server_db.changes_since(server_noop_since);
+    let server_noop_changes = server_db
+        .changes_since(server_noop_since)
+        .expect("read the declared changes");
     let server_noop_event = server_noop_rx.recv_timeout(Duration::from_millis(300));
     let server_noop_user_rows = server_noop_changes
         .rows
@@ -6231,11 +6587,19 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     );
 
     let edge_b_history_before_noop = fired_trigger_history(&edge_b_db, "host_write_trigger");
-    let edge_b_ddl_before_noop = format!("{:?}", edge_b_db.changes_since(Lsn(0)).ddl);
+    let edge_b_ddl_before_noop = format!(
+        "{:?}",
+        edge_b_db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl
+    );
     let edge_b_noop_since = edge_b_db.current_lsn();
     let edge_b_noop_rx = edge_b_db.subscribe();
     let data_pull_noop = edge_b.pull_default().await;
-    let edge_b_noop_changes = edge_b_db.changes_since(edge_b_noop_since);
+    let edge_b_noop_changes = edge_b_db
+        .changes_since(edge_b_noop_since)
+        .expect("read the declared changes");
     let edge_b_noop_event = edge_b_noop_rx.recv_timeout(Duration::from_millis(300));
     assert!(
         data_pull_noop.is_ok()
@@ -6244,14 +6608,23 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
             && edge_b_fires.load(Ordering::SeqCst) == 0
             && fired_trigger_history(&edge_b_db, "host_write_trigger")
                 == edge_b_history_before_noop
-            && format!("{:?}", edge_b_db.changes_since(Lsn(0)).ddl) == edge_b_ddl_before_noop
+            && format!(
+                "{:?}",
+                edge_b_db
+                    .changes_since(Lsn(0))
+                    .expect("read the declared changes")
+                    .ddl
+            ) == edge_b_ddl_before_noop
             && count_rows(&edge_b_db, "host_writes") == expected_ids.len()
             && count_rows(&edge_b_db, "host_audits") == expected_ids.len()
             && audited_edge_count(&edge_b_db, &expected_ids) == expected_ids.len()
             && live_vector_count(&edge_b_db, "host_audits") == expected_ids.len(),
         "repeating SyncClient pull after data is already applied must be a no-op with no receiver re-fire or duplicate history; pull={data_pull_noop:?}, changes={edge_b_noop_changes:?}, event={edge_b_noop_event:?}, fires={}, ddl_before={edge_b_ddl_before_noop:?}, ddl_after={:?}, history_before={edge_b_history_before_noop:?}, history_after={:?}, counts=({}, {}, edges {}, vectors {})",
         edge_b_fires.load(Ordering::SeqCst),
-        edge_b_db.changes_since(Lsn(0)).ddl,
+        edge_b_db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl,
         fired_trigger_history(&edge_b_db, "host_write_trigger"),
         count_rows(&edge_b_db, "host_writes"),
         count_rows(&edge_b_db, "host_audits"),
@@ -6263,7 +6636,10 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let drop_push = edge_a.push().await;
     let drop_pull = edge_b.pull_default().await;
     let edge_b_ready_after_drop = edge_b_db.complete_initialization();
-    let edge_b_ddl_history = edge_b_db.changes_since(Lsn(0)).ddl;
+    let edge_b_ddl_history = edge_b_db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     let edge_b_tables = edge_b_ddl_history
         .iter()
         .filter_map(|change| match change {
@@ -6314,17 +6690,33 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
 
     let server_drop_noop_since = server_db.current_lsn();
     let server_drop_noop_rx = server_db.subscribe();
-    let edge_b_drop_ddl_before_noop = format!("{:?}", edge_b_db.changes_since(Lsn(0)).ddl);
+    let edge_b_drop_ddl_before_noop = format!(
+        "{:?}",
+        edge_b_db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl
+    );
     let edge_b_drop_history_before_noop = fired_trigger_history(&edge_b_db, "host_write_trigger");
     let edge_b_drop_noop_since = edge_b_db.current_lsn();
     let edge_b_drop_noop_rx = edge_b_db.subscribe();
     let drop_push_noop = edge_a.push().await;
     let drop_pull_noop = edge_b.pull_default().await;
-    let server_drop_noop_changes = server_db.changes_since(server_drop_noop_since);
-    let edge_b_drop_noop_changes = edge_b_db.changes_since(edge_b_drop_noop_since);
+    let server_drop_noop_changes = server_db
+        .changes_since(server_drop_noop_since)
+        .expect("read the declared changes");
+    let edge_b_drop_noop_changes = edge_b_db
+        .changes_since(edge_b_drop_noop_since)
+        .expect("read the declared changes");
     let server_drop_noop_event = server_drop_noop_rx.recv_timeout(Duration::from_millis(300));
     let edge_b_drop_noop_event = edge_b_drop_noop_rx.recv_timeout(Duration::from_millis(300));
-    let edge_b_drop_ddl_after_noop = format!("{:?}", edge_b_db.changes_since(Lsn(0)).ddl);
+    let edge_b_drop_ddl_after_noop = format!(
+        "{:?}",
+        edge_b_db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl
+    );
     let server_drop_noop_user_rows = server_drop_noop_changes
         .rows
         .iter()
@@ -6365,7 +6757,10 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     edge_b_db.close().unwrap();
     let reopened_edge_b = Database::open(&edge_b_path).unwrap();
     let reopened_edge_b_ready = reopened_edge_b.complete_initialization();
-    let reopened_edge_b_ddl = reopened_edge_b.changes_since(Lsn(0)).ddl;
+    let reopened_edge_b_ddl = reopened_edge_b
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     let reopened_edge_b_create_triggers = reopened_edge_b_ddl
         .iter()
         .filter(|change| {
@@ -6392,6 +6787,7 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
         .filter(|row| {
             reopened_edge_b
                 .live_vector_entry(row.row_id, reopened_edge_b.snapshot())
+                .expect("read the actual fixture observation")
                 .is_some()
         })
         .count();
@@ -6728,7 +7124,9 @@ fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
         origin.commit(tx).expect("origin sender group commit");
     }
 
-    let origin_changes = origin.changes_since(origin_since);
+    let origin_changes = origin
+        .changes_since(origin_since)
+        .expect("read the declared changes");
     let expected_groups = row_group_signatures(&origin, origin_changes.clone());
     assert_eq!(
         expected_groups.len(),
@@ -6763,7 +7161,12 @@ fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
             Err(_) => break,
         }
     }
-    let receiver_groups = row_group_signatures(&receiver, receiver.changes_since(Lsn(0)));
+    let receiver_groups = row_group_signatures(
+        &receiver,
+        receiver
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+    );
 
     assert_eq!(
         events.len(),
@@ -6800,7 +7203,12 @@ fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
             .sum::<usize>();
         let vector_count = audit_rows
             .iter()
-            .filter(|row| receiver.live_vector_entry(row.row_id, snapshot).is_some())
+            .filter(|row| {
+                receiver
+                    .live_vector_entry(row.row_id, snapshot)
+                    .expect("read the actual fixture observation")
+                    .is_some()
+            })
             .count();
         let snapshot_rows = ["host_writes", "host_audits"]
             .into_iter()
@@ -6868,7 +7276,12 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
             .unwrap();
     }
     assert_eq!(server_fires.load(Ordering::SeqCst), expected_ids.len());
-    let expected_groups = row_group_signatures(&server_seed, server_seed.changes_since(Lsn(0)));
+    let expected_groups = row_group_signatures(
+        &server_seed,
+        server_seed
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+    );
     server_seed.close().unwrap();
     let server_db = Arc::new(Database::open(&server_path).unwrap());
 
@@ -6879,7 +7292,8 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
             contextdb_core::TenantId::from(tenant_id),
             hub_node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = server.clone();
@@ -6899,7 +7313,8 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
         fabric.client_as(&fresh_node_id),
         contextdb_core::TenantId::from(tenant_id),
         fresh_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let first_pull = fresh.pull_default().await;
     let missing_callback = fresh_db.complete_initialization();
     assert!(
@@ -6933,11 +7348,20 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
             && fresh_fires.load(Ordering::SeqCst) == 0
             && count_rows(&fresh_db, "host_writes") == expected_ids.len()
             && count_rows(&fresh_db, "host_audits") == expected_ids.len()
-            && row_group_signatures(&fresh_db, fresh_db.changes_since(fresh_since))
-                == expected_groups,
+            && row_group_signatures(
+                &fresh_db,
+                fresh_db
+                    .changes_since(fresh_since)
+                    .expect("read the declared changes")
+            ) == expected_groups,
         "fresh full-history pull must replay data only after callback registration and must not re-fire receiver callbacks; second_pull={second_pull:?}, fires={}, groups={:?} expected={:?}, counts=({}, {})",
         fresh_fires.load(Ordering::SeqCst),
-        row_group_signatures(&fresh_db, fresh_db.changes_since(fresh_since)),
+        row_group_signatures(
+            &fresh_db,
+            fresh_db
+                .changes_since(fresh_since)
+                .expect("read the declared changes")
+        ),
         expected_groups,
         count_rows(&fresh_db, "host_writes"),
         count_rows(&fresh_db, "host_audits")
@@ -6952,7 +7376,9 @@ fn t3_freshdisk_pull_replays_server_history_atomic_and_no_refire() {
     let tmp = TempDir::new().unwrap();
     let server = Database::open(tmp.path().join("server.redb")).unwrap();
     setup_host_tables(&server);
-    let schema_snapshot = server.changes_since(Lsn(0));
+    let schema_snapshot = server
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let server_fires = Arc::new(AtomicUsize::new(0));
     register_audit_callback(&server, server_fires.clone());
     server.complete_initialization().unwrap();
@@ -6965,7 +7391,9 @@ fn t3_freshdisk_pull_replays_server_history_atomic_and_no_refire() {
             .unwrap();
     }
     assert_eq!(server_fires.load(Ordering::SeqCst), 3);
-    let server_history = server.changes_since(since);
+    let server_history = server
+        .changes_since(since)
+        .expect("read the declared changes");
     let expected_groups = row_group_signatures(&server, server_history.clone());
     assert_eq!(
         expected_groups.len(),
@@ -7044,6 +7472,7 @@ fn t3_freshdisk_pull_replays_server_history_atomic_and_no_refire() {
         assert!(
             fresh
                 .live_vector_entry(audit_row.row_id, fresh.snapshot())
+                .expect("read the actual fixture observation")
                 .is_some(),
             "fresh audit row for {expected_id} must retain its own vector entry"
         );
@@ -7094,7 +7523,12 @@ fn t3_freshdisk_pull_replays_server_history_atomic_and_no_refire() {
         );
     }
     assert_eq!(
-        row_group_signatures(&fresh, fresh.changes_since(fresh_since)),
+        row_group_signatures(
+            &fresh,
+            fresh
+                .changes_since(fresh_since)
+                .expect("read the declared changes")
+        ),
         expected_groups,
         "fresh-disk receiver history must match server atomic row/edge/vector groups by content"
     );
@@ -7502,7 +7936,7 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
         ) {
             return Err(Error::Other(format!(
                 "apply_changes inside cron-trigger callback must be rejected with CallbackReentry{{Cron}}; got {apply_result:?}"
-            )));
+            ).into()));
         }
         let write_id = ctx
             .row_values
@@ -7543,7 +7977,7 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
         ) {
             return Err(Error::Other(format!(
                 "apply_changes after cron-fired trigger returns must still be rejected with CallbackReentry{{Cron}}; got {apply_result:?}"
-            )));
+            ).into()));
         }
         Ok(())
     })
@@ -7554,7 +7988,15 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
     std::thread::sleep(Duration::from_millis(700));
     let cron_since = db.current_lsn();
     let cron_rx = db.subscribe();
-    let fires = db.cron_run_due_now_for_test().unwrap();
+    let fires = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .unwrap();
     assert_eq!(fires, 1);
     assert_eq!(
         trigger_fires.load(Ordering::SeqCst),
@@ -7574,7 +8016,9 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
         cron_rx.try_recv().is_err(),
         "cron-origin firing row and trigger cascade must not publish separate commit events"
     );
-    let cron_changes = db.changes_since(cron_since);
+    let cron_changes = db
+        .changes_since(cron_since)
+        .expect("read the declared changes");
     let host_row = db
         .scan("host_writes", db.snapshot())
         .unwrap()
@@ -8076,7 +8520,7 @@ fn including_sync_delete_received_ddl_is_typed_and_never_persisted() {
             .all(|trigger| trigger.name != "delete_received")
     );
     assert!(db
-        .ddl_log_since(before)
+        .ddl_log_since(before).unwrap()
         .iter()
         .all(|ddl| !matches!(ddl, DdlChange::CreateTriggerIncludingSync { name, .. } if name == "delete_received")));
 }
@@ -8099,7 +8543,7 @@ fn including_sync_callback_failure_rolls_back_incoming_and_derived_rows() {
             ]),
         )?;
         Err(Error::Other(
-            "deliberate received-trigger failure".to_string(),
+            "deliberate received-trigger failure".to_string().into(),
         ))
     })
     .unwrap();
@@ -8263,7 +8707,11 @@ fn including_sync_forbidden_effect_families_are_typed_atomic_and_audited() {
         );
         assert_eq!(count_rows(&db, "sync_trigger_source"), 0);
         assert_eq!(count_rows(&db, "sync_trigger_derived"), 1);
-        assert!(db.changes_since(before).is_empty());
+        assert!(
+            db.changes_since(before)
+                .expect("read the declared changes")
+                .is_empty()
+        );
         let audits = db
             .trigger_audit_history(TriggerAuditFilter {
                 trigger_name: Some("received_insert".to_string()),
@@ -8296,7 +8744,13 @@ fn local_trigger_callback_keeps_graph_mutation_api() {
         &HashMap::from([("id".to_string(), Value::Uuid(uuid(0x52_402)))]),
     )
     .unwrap();
-    assert_eq!(db.changes_since(Lsn(0)).edges.len(), 1);
+    assert_eq!(
+        db.changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .edges
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -8542,7 +8996,9 @@ fn including_sync_declaration_persists_reopens_and_transports_as_typed_ddl() {
     let path = tmp.path().join("including-sync.redb");
     let source = Database::open(&path).unwrap();
     setup_received_insert_trigger(&source, true);
-    let ddl = source.changes_since(Lsn(0));
+    let ddl = source
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert!(ddl.ddl.iter().any(|change| matches!(
         change,
         DdlChange::CreateTriggerIncludingSync { name, table, on_events }
@@ -8599,7 +9055,8 @@ async fn including_sync_hub_derivation_reaches_another_edge_without_outbound_ech
             contextdb_core::TenantId::from(tenant_id),
             hub_node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = server.clone();
@@ -8633,14 +9090,16 @@ async fn including_sync_hub_derivation_reaches_another_edge_without_outbound_ech
         fabric.client_as(&edge_a_node_id),
         contextdb_core::TenantId::from(tenant_id),
         edge_a_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let edge_b_identity_for_reopen = edge_b_identity.clone();
     let edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_b_db.clone(),
         fabric.client_as(&edge_b_node_id),
         contextdb_core::TenantId::from(tenant_id),
         edge_b_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
 
     edge_a.push().await.unwrap();
     edge_b.pull_default().await.unwrap();
@@ -8670,7 +9129,9 @@ async fn including_sync_hub_derivation_reaches_another_edge_without_outbound_ech
         )
         .unwrap();
     edge_a_db.commit(graph_tx).unwrap();
-    let source_only = edge_a_db.changes_since(source_since);
+    let source_only = edge_a_db
+        .changes_since(source_since)
+        .expect("read the declared changes");
     assert_eq!(source_only.rows.len(), 1);
     assert_eq!(source_only.edges.len(), 1);
     assert!(
@@ -8712,7 +9173,8 @@ async fn including_sync_hub_derivation_reaches_another_edge_without_outbound_ech
         fabric.client_as(&edge_b_node_id),
         contextdb_core::TenantId::from(tenant_id),
         edge_b_identity_for_reopen,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     assert_eq!(reopened_edge_b.pending_push_change_count().unwrap(), 0);
     reopened_edge_b.pull_default().await.unwrap();
     assert_eq!(count_rows(&edge_b_db, "sync_trigger_source"), 1);

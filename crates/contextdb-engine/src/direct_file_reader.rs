@@ -7,16 +7,20 @@
 //! retain a lazy persistence or blob resolver.
 
 use crate::QueryResult;
+use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::sync_types::{DdlChange, EdgeChange, RowChange, VectorChange};
 use contextdb_core::read_contract::{
-    CursorPage, DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
+    DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
 };
-use contextdb_core::{ContextId, Lsn, Principal, RowId, ScopeLabel, TxId, Value, VectorIndexRef};
+use contextdb_core::{ContextId, Lsn, Principal, ScopeLabel, TxId, Value};
+#[cfg(any(test, feature = "test-seams"))]
+use contextdb_core::{RowId, VectorIndexRef};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-seams"))]
 use uuid::Uuid;
 
 /// Inputs controlled by route assembly rather than by a file opener.
@@ -117,6 +121,7 @@ pub struct DirectTypedImageDigest {
 }
 
 /// One owned relational row in the committed image.
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredRow {
     pub table: String,
@@ -125,6 +130,7 @@ pub struct DirectStoredRow {
 }
 
 /// One owned graph edge, including all persisted edge properties.
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredEdge {
     pub source: Uuid,
@@ -142,6 +148,7 @@ pub enum DirectVectorQuantization {
 
 /// One decoded vector entry. Quantized stores are reconstructed into their
 /// owned queryable values during hydration, never by consulting the file later.
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredVector {
     pub index: VectorIndexRef,
@@ -447,13 +454,19 @@ pub enum DirectMetadataRequest {
     ImageState {
         kind: DirectImageMetadataKind,
     },
+    /// Recompute what every historical index of `table` commits to and check
+    /// it against the published, authenticated commitment.
+    VerifyHistory {
+        table: String,
+    },
 }
 
 pub(crate) fn metadata_publication_tables(request: &DirectMetadataRequest) -> BTreeSet<String> {
     match request {
         DirectMetadataRequest::DeliveryStatus { root_table }
         | DirectMetadataRequest::DeliveryOutcome { root_table, .. }
-        | DirectMetadataRequest::Schema { table: root_table } => {
+        | DirectMetadataRequest::Schema { table: root_table }
+        | DirectMetadataRequest::VerifyHistory { table: root_table } => {
             BTreeSet::from([root_table.clone()])
         }
         _ => BTreeSet::from(["*".to_owned()]),
@@ -508,6 +521,10 @@ pub enum DirectMetadataBody {
     ImageState {
         state: DirectImageState,
     },
+    VerifyHistory {
+        table: String,
+        indexes: Vec<crate::HistoricalIndexVerification>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -523,11 +540,77 @@ pub struct DirectMetadataResponse {
     pub(crate) charge: crate::read_image_memory::AnswerCharge,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct DirectCursorPage {
     pub page: CursorPage,
+    pub(crate) observation: crate::executor::CursorObservation,
     pub canonical_bytes: Vec<u8>,
     pub snapshot: DirectSnapshot,
+    #[allow(dead_code)] // Owns the canonical copy until its payload is dropped.
+    pub(crate) canonical_credit: Option<contextdb_core::read_memory::ReadCredit>,
+}
+
+impl DirectCursorPage {
+    pub(crate) fn try_clone(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Self, DirectFileReaderError> {
+        let canonical_credit = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            self.canonical_bytes.len(),
+            "read_channel",
+            "copy_direct_page",
+            "Reduce the page or raise the reader memory limit.",
+        )
+        .map_err(crate::read_image::history_answer_error)?;
+        let page = self
+            .page
+            .try_clone(read_memory)
+            .map_err(crate::read_image::history_answer_error)?;
+        Ok(Self {
+            page,
+            observation: self.observation.clone(),
+            canonical_bytes: self.canonical_bytes.clone(),
+            snapshot: self.snapshot,
+            canonical_credit: Some(canonical_credit),
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl DirectCursorPage {
+    /// Construct an empty synthetic page fixture without exposing observations.
+    #[doc(hidden)]
+    pub fn new_for_test(
+        page: contextdb_core::read_contract::CursorPage,
+        canonical_bytes: Vec<u8>,
+        snapshot: DirectSnapshot,
+    ) -> Self {
+        assert!(
+            page.rows.is_empty(),
+            "synthetic cursor fixture must be empty"
+        );
+        Self {
+            page: CursorPage::from_parts(page.columns, page.rows, page.has_more),
+            observation: crate::executor::CursorObservation {
+                trace: std::sync::Arc::new(crate::database::QueryTrace::scan()),
+                rows_examined: 0,
+                charge: None,
+                group_page_returns: None,
+            },
+            canonical_bytes,
+            snapshot,
+            canonical_credit: None,
+        }
+    }
+}
+
+impl PartialEq for DirectCursorPage {
+    fn eq(&self, other: &Self) -> bool {
+        self.page == other.page
+            && self.canonical_bytes == other.canonical_bytes
+            && self.snapshot == other.snapshot
+    }
 }
 
 pub struct DirectCursorOpen {
@@ -576,18 +659,19 @@ pub struct DirectCursor {
     state: DirectCursorState,
     publication: Arc<crate::persistence::ReadSnapshotRegistrationGuard>,
     publication_scope: crate::executor::ReadPublicationScope,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 }
 
 /// Weak, privately constructed evidence for the two production-owned cursor
 /// resources. Tests can observe their destruction but cannot manufacture or
 /// release either resource.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub struct DirectCursorResourceWitness {
     snapshot: std::sync::Weak<DirectCursorSnapshotRetention>,
     memory: std::sync::Weak<DirectCursorMemoryReservation>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl DirectCursorResourceWitness {
     pub fn snapshot_is_retained(&self) -> bool {
         self.snapshot.upgrade().is_some()
@@ -611,7 +695,7 @@ enum HydrationPhase {
 /// `PersistenceReleaseSealed` can only follow consumption of persistence's
 /// privately sealed receipt; `BackendTargetConstructed` can only follow the
 /// private target-construction receipt.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HydrationCheckpoint {
     PersistenceReleaseSealed { breadcrumb_path: Option<PathBuf> },
@@ -619,25 +703,25 @@ pub enum HydrationCheckpoint {
     ExternallyUsable { breadcrumb_path: Option<PathBuf> },
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub trait HydrationObserver: Send + Sync {
     fn checkpoint(&self, checkpoint: HydrationCheckpoint);
 }
 
 struct HydrationObservation {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn HydrationObserver>>,
 }
 
 impl HydrationObservation {
     fn disabled() -> Self {
         Self {
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             observer: None,
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn from_test_observer(observer: Arc<dyn HydrationObserver>) -> Self {
         Self {
             observer: Some(observer),
@@ -645,7 +729,7 @@ impl HydrationObservation {
     }
 
     fn checkpoint(&self, phase: HydrationPhase) {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(observer) = self.observer.as_ref() {
             let checkpoint = match phase {
                 HydrationPhase::PersistenceReleaseSealed { breadcrumb_path } => {
@@ -667,7 +751,7 @@ impl HydrationObservation {
 
 /// Aggregate of persistence, bounded-target, and subsystem-owned probes. The
 /// direct module does not maintain or self-certify any of these counters.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectReaderCounters {
     pub persistence_read_only_opens: u64,
@@ -694,7 +778,7 @@ pub struct DirectReaderCounters {
     pub owner_service_starts: u64,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectStorageRegistrationObservation {
     pub physical_device: u64,
@@ -773,6 +857,9 @@ pub enum DirectFileReaderError {
     /// a route that must report the same fault the same way whichever way it
     /// reached the store picks the typed answer up there.
     Engine(String),
+    /// A decoder configuration refusal retains its static taxonomy across the
+    /// file route, without allocating or formatting an engine error.
+
     /// Startup admission failed before a target existed to retain the error.
     MemoryBudget {
         subsystem: String,
@@ -823,6 +910,7 @@ impl fmt::Display for DirectFileReaderError {
             Self::Cancelled => formatter.write_str("direct read was cancelled"),
             Self::ReadFailure(failure) => write!(formatter, "direct read failed: {failure:?}"),
             Self::Engine(reason) => write!(formatter, "direct read failed: {reason}"),
+
             Self::MemoryBudget {
                 subsystem,
                 operation,
@@ -851,6 +939,9 @@ pub struct DirectFileReader {
     verified_digest: DirectTypedImageDigest,
     image_memory: Arc<crate::read_image_memory::ImageMemory>,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
+    read_requests: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    #[cfg(any(test, feature = "test-seams"))]
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 }
 
 /// Privately constructible proof that target construction, owned-image
@@ -864,6 +955,9 @@ struct BackendTargetConstructionReceipt {
     verified_digest: DirectTypedImageDigest,
     image_memory: Arc<crate::read_image_memory::ImageMemory>,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
+    read_requests: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    #[cfg(any(test, feature = "test-seams"))]
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 }
 
 impl BackendTargetConstructionReceipt {
@@ -881,6 +975,9 @@ impl BackendTargetConstructionReceipt {
             clock: self.clock,
             verified_digest: self.verified_digest,
             retained_source: self.retained_source,
+            read_requests: self.read_requests,
+            #[cfg(any(test, feature = "test-seams"))]
+            declared_read_memory: self.declared_read_memory,
         })
     }
 }
@@ -889,6 +986,7 @@ fn construct_backend_neutral_target(
     pending_image: crate::persistence::ReadPersistenceImage,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     config: DirectReaderConfig,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
 ) -> Result<BackendTargetConstructionReceipt, DirectFileReaderError> {
     let limits = config.limits;
     let constructed = pending_image.into_committed_image(
@@ -897,8 +995,15 @@ fn construct_backend_neutral_target(
         config.contexts,
         config.scope_labels,
         config.principal,
+        declared_read_memory.clone(),
     )?;
+    #[cfg(any(test, feature = "test-seams"))]
+    crate::read_work_probe::note_commit_directory_image_memory(&constructed.memory);
+    let read_requests = constructed.target.declared_read_request_provider();
     Ok(BackendTargetConstructionReceipt {
+        #[cfg(any(test, feature = "test-seams"))]
+        declared_read_memory,
+        read_requests,
         image_memory: constructed.memory,
         target: constructed.target,
         image: constructed.image,
@@ -914,6 +1019,7 @@ fn handoff_to_backend_neutral_reader(
     release_receipt: crate::persistence::ReadPersistenceReleaseReceipt,
     retained_source: Arc<crate::persistence::RetainedReadSource>,
     config: DirectReaderConfig,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     observation: HydrationObservation,
 ) -> Result<DirectFileReader, DirectFileReaderError> {
     if release_receipt.source_accesses() == 0 {
@@ -944,7 +1050,12 @@ fn handoff_to_backend_neutral_reader(
 
     // No target observation is possible until this fallible call returns its
     // private receipt. The current narrow stub returns the typed missing seam.
-    let constructed = construct_backend_neutral_target(pending_image, retained_source, config)?;
+    let constructed = construct_backend_neutral_target(
+        pending_image,
+        retained_source,
+        config,
+        declared_read_memory,
+    )?;
     observation.checkpoint(HydrationPhase::BackendTargetConstructed {
         breadcrumb_path: breadcrumb_path.clone(),
     });
@@ -959,6 +1070,7 @@ fn handoff_to_backend_neutral_reader(
 fn consume_released_persistence_load(
     load: crate::persistence::ReadPersistenceLoad,
     config: DirectReaderConfig,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
     observation: HydrationObservation,
 ) -> Result<DirectFileReader, DirectFileReaderError> {
     let (pending_image, release_receipt, retained_source): (
@@ -971,6 +1083,7 @@ fn consume_released_persistence_load(
         release_receipt,
         retained_source,
         config,
+        declared_read_memory,
         observation,
     )
 }
@@ -985,20 +1098,21 @@ fn execute_on_backend_neutral_target(
     let constructed = reader.target.read_query(
         sql,
         params,
+        reader.request_read_memory()?,
         reader.limits,
         Arc::clone(&reader.clock),
         cancellation,
     )?;
-    let result = DirectQuery {
-        result: constructed.0,
-        canonical_bytes: constructed.1,
-        snapshot: reader.image.snapshot,
-    };
-    publish_direct_result(
+    let result = publish_direct_result(
         reader.retained_source.registration(),
         &constructed.2,
-        result,
-    )
+        constructed.0,
+    )?;
+    Ok(DirectQuery {
+        result: result.into_public(),
+        canonical_bytes: constructed.1,
+        snapshot: reader.image.snapshot,
+    })
 }
 
 fn publish_direct_result<T>(
@@ -1012,6 +1126,7 @@ fn publish_direct_result<T>(
             contextdb_core::Error::ReadFailure(failure) => {
                 DirectFileReaderError::ReadFailure(failure)
             }
+
             error => DirectFileReaderError::Engine(error.to_string()),
         })
 }
@@ -1025,9 +1140,11 @@ fn open_cursor_on_backend_neutral_target(
 ) -> Result<DirectCursorOpen, DirectFileReaderError> {
     let mut limits = reader.limits;
     limits.cursor_page_rows = rows.get() as u64;
+    let read_memory = reader.request_read_memory()?;
     let constructed = Arc::clone(&reader.target).open_read_cursor(
         sql,
         params,
+        read_memory.clone(),
         limits,
         Arc::clone(&reader.clock),
         cancellation,
@@ -1059,6 +1176,7 @@ fn open_cursor_on_backend_neutral_target(
             },
             publication: Arc::clone(reader.retained_source.registration()),
             publication_scope: constructed.3.clone(),
+            read_memory,
         },
         first_page: constructed.1,
     };
@@ -1080,7 +1198,7 @@ fn fetch_backend_neutral_cursor(
             return publish_direct_result(
                 &cursor.publication,
                 &cursor.publication_scope,
-                request.clone(),
+                request.try_clone(cursor.read_memory.clone())?,
             );
         }
         DirectCursorState::Closed => {
@@ -1123,6 +1241,23 @@ fn fetch_backend_neutral_cursor(
 }
 
 impl DirectFileReader {
+    pub(crate) fn request_read_memory(
+        &self,
+    ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>, DirectFileReaderError> {
+        self.read_requests
+            .request_budget()
+            .map_err(crate::read_image::history_answer_error)
+    }
+
+    /// Obtain the existing reader's operation owner for private page fixtures.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn request_read_memory_for_test(
+        &self,
+    ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>, DirectFileReaderError> {
+        self.request_read_memory()
+    }
+
     /// Current bytes charged to this committed-image reader's accountant.
     pub(crate) fn charged_bytes(&self) -> u64 {
         self.image_memory
@@ -1159,36 +1294,82 @@ impl DirectFileReader {
         path: impl AsRef<Path>,
         config: DirectReaderConfig,
     ) -> Result<Self, DirectFileReaderError> {
-        Self::open_inner(path.as_ref(), config, HydrationObservation::disabled())
+        Self::open_with_cancellation(path.as_ref(), config, &OwnerReadCancellation::new())
     }
 
-    pub(crate) fn from_owner_snapshot(
+    pub(crate) fn open_with_cancellation(
+        path: &Path,
+        config: DirectReaderConfig,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<Self, DirectFileReaderError> {
+        Self::open_inner_with_cancellation(
+            path,
+            config,
+            HydrationObservation::disabled(),
+            None,
+            cancellation,
+        )
+    }
+
+    pub(crate) fn from_owner_snapshot_with_cancellation(
         path: &Path,
         config: DirectReaderConfig,
         registration: crate::persistence::ReadSnapshotRegistrationGuard,
+        cancellation: &OwnerReadCancellation,
     ) -> Result<Self, DirectFileReaderError> {
-        let load = crate::persistence::load_read_image_at_registration(
+        Self::open_inner_with_cancellation(
             path,
-            config.memory_limit,
-            config.runtime_dir.as_deref(),
+            config,
+            HydrationObservation::disabled(),
             Some(registration),
+            cancellation,
         )
-        .map_err(|error| error.into_direct_reader_error())?;
-        consume_released_persistence_load(load, config, HydrationObservation::disabled())
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     fn open_inner(
         path: &Path,
         config: DirectReaderConfig,
         observation: HydrationObservation,
     ) -> Result<Self, DirectFileReaderError> {
-        let load = crate::persistence::load_read_image_with_memory_in_runtime_dir(
+        Self::open_inner_with_cancellation(
+            path,
+            config,
+            observation,
+            None,
+            &OwnerReadCancellation::new(),
+        )
+    }
+
+    fn open_inner_with_cancellation(
+        path: &Path,
+        config: DirectReaderConfig,
+        observation: HydrationObservation,
+        registration: Option<crate::persistence::ReadSnapshotRegistrationGuard>,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<Self, DirectFileReaderError> {
+        // Resolve this image's declared parent once. Preparation and captured
+        // directory reads retain one child; statements use this same parent.
+        let declared_read_memory =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(config.limits.memory);
+        let open_context = crate::executor::bounded::ReadOpenContext::new(
+            declared_read_memory
+                .child()
+                .map_err(crate::read_image::history_answer_error)?,
+            config.limits,
+            config.clock.clone(),
+            cancellation.clone(),
+        )
+        .map_err(crate::read_image::history_answer_error)?;
+        let load = crate::persistence::load_read_image_at_registration_with_context(
             path,
             config.memory_limit,
             config.runtime_dir.as_deref(),
+            registration,
+            open_context,
         )
         .map_err(|error| error.into_direct_reader_error())?;
-        consume_released_persistence_load(load, config, observation)
+        consume_released_persistence_load(load, config, declared_read_memory, observation)
     }
 
     #[allow(dead_code)]
@@ -1245,6 +1426,7 @@ impl DirectFileReader {
         let tables = metadata_publication_tables(&request);
         let started_ms = self.clock.now_ms();
         let response = self.target.read_metadata(
+            self.request_read_memory()?,
             request,
             &self.image,
             self.limits,
@@ -1268,6 +1450,7 @@ impl DirectFileReader {
                     DirectFileReaderError::ReadFailure(failure)
                 }
                 contextdb_core::Error::ReadCancelled => DirectFileReaderError::Cancelled,
+
                 error => DirectFileReaderError::Engine(error.to_string()),
             })
     }
@@ -1295,6 +1478,16 @@ impl DirectFileReader {
 }
 
 impl DirectCursor {
+    pub(crate) fn work_observation(
+        &self,
+    ) -> Result<Option<crate::executor::CursorObservation>, DirectFileReaderError> {
+        match &self.state {
+            DirectCursorState::Active { load, .. } => load.read_cursor_observation(),
+            DirectCursorState::Exhausted { request } => Ok(Some(request.observation.clone())),
+            DirectCursorState::Closed => Ok(None),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn fetch(
         &mut self,
@@ -1353,7 +1546,7 @@ impl DirectCursor {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod test_seams {
     use std::path::Path;
@@ -1378,7 +1571,9 @@ pub mod test_seams {
 
     pub use crate::read_image::{AnswerEncodingHookGuard, while_encoding_answers_for_test};
     pub use crate::read_work_probe::{
-        ReadWorkCounters, ReadWorkObservation, ReadWorkObservationScope, ReadWorkPhase,
+        CommitDirectoryFunding, CommitDirectorySourceRegistrationFunding, DeclaredReadChildFunding,
+        HistoricalReadWorkCounters, ReadWorkCounters, ReadWorkObservation,
+        ReadWorkObservationScope, ReadWorkPhase,
     };
     pub use contextdb_core::read_contract::OwnerReadCancellation as DirectCancellation;
 
@@ -1500,7 +1695,11 @@ pub mod test_seams {
     ) {
         let erased: Arc<dyn Send + Sync> = reader.image_memory.clone();
         (
-            reader.image_memory.accountant.usage(),
+            {
+                let mut usage = reader.image_memory.accountant.usage();
+                usage.reader_file_high_water = reader.declared_read_memory.file_child_high_water();
+                usage
+            },
             reader.image_memory.held(),
             Arc::downgrade(&erased),
         )
@@ -1562,6 +1761,27 @@ pub mod test_seams {
         reader.target.force_change_log_gap_for_test();
     }
 
+    /// Hold competing admitted work so a request has exactly `room` left.
+    /// The credit is returned by its ordinary owner on drop.
+    pub fn hold_reader_memory_leaving_for_test(
+        reader: &DirectFileReader,
+        room: usize,
+    ) -> contextdb_core::Result<contextdb_core::read_memory::ReadCredit> {
+        let held = reader.declared_read_memory.retained_bytes_for_test();
+        let available = reader.limits.memory.saturating_sub(held);
+        let bytes = usize::try_from(available)
+            .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?
+            .checked_sub(room)
+            .ok_or_else(|| contextdb_core::Error::Other("reader already has less room".into()))?;
+        contextdb_core::read_memory::ReadCredit::try_new(
+            reader.declared_read_memory.clone(),
+            bytes,
+            "reader_test",
+            "competing_work",
+            "Leave more reader memory available.",
+        )
+    }
+
     /// The memory an answer holds against its reader's limit while it is
     /// held.
     pub fn held_answer_bytes_for_test(response: &DirectMetadataResponse) -> usize {
@@ -1579,6 +1799,10 @@ pub mod test_seams {
 
     /// Bytes this reader's session accountant took through the writer's
     /// unconditional retention door, `charge_retained`.
+    pub fn cache_index_charge_for_test(reader: &DirectFileReader) -> (usize, usize) {
+        reader.retained_source.cache_index_charge_for_test()
+    }
+
     pub fn retained_charge_bytes_for_test(reader: &DirectFileReader) -> usize {
         reader
             .image_memory
@@ -1660,9 +1884,9 @@ pub mod test_seams {
         let mut image = (*reader.image).clone();
         image.sync = reader.target.committed_sync_state(
             &|| Ok(()),
-            &crate::read_image_memory::ImageMemory::charging(Arc::clone(
-                &reader.image_memory.accountant,
-            )),
+            &crate::read_image_memory::ImageMemory::charging(
+                reader.image_memory.accountant.clone(),
+            ),
         )?;
         Ok(image)
     }

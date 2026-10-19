@@ -36,6 +36,7 @@ const ADMISSION_SLACK_PER_LOAD: u64 = 256 * 1024;
 
 #[cfg(unix)]
 #[test]
+#[ignore = "encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_wide_find_is_priced_at_what_its_loads_hold() {
     let fixture = seed_shape(SHAPE);
     let mut failures = Vec::new();
@@ -76,6 +77,7 @@ fn a_wide_find_is_priced_at_what_its_loads_hold() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn each_load_leaves_room_for_the_loads_still_to_come() {
     let fixture = seed_shape(SHAPE);
     let working = calibrate(&fixture);

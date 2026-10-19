@@ -290,11 +290,27 @@ fn walk_rows(load: &ReadPersistenceLoad) -> Result<usize> {
     let meta = &load.image.table_meta[TABLE];
     let snapshot = snapshot_of(load);
     let mut seen = 0;
-    load.source
-        .bounded_visit_relational_rows::<Error>(TABLE, meta, snapshot, |_| {
+    let declared_reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        load.source
+            .verified_ordered_runs
+            .memory
+            .accountant
+            .usage()
+            .limit
+            .map(|bytes| bytes as u64)
+            .unwrap_or(u64::MAX),
+    );
+    let read_memory = declared_reader.child()?;
+    load.source.bounded_visit_relational_rows::<Error>(
+        TABLE,
+        meta,
+        snapshot,
+        |_| {
             seen += 1;
             Ok(())
-        })?;
+        },
+        read_memory,
+    )?;
     Ok(seen)
 }
 
@@ -480,7 +496,7 @@ fn a_read_is_answered_although_a_full_resident_set_is_holding_the_last_declared_
 
     // Take everything still free, so the next walk's proof admissions can only
     // be served by the resident chunks giving their bytes back.
-    let accountant = Arc::clone(&load.source.verified_ordered_runs.memory.accountant);
+    let accountant = load.source.verified_ordered_runs.memory.accountant.clone();
     let available = accountant
         .usage()
         .available
@@ -523,17 +539,21 @@ fn a_changed_row_body_is_typed_corruption_although_its_proof_chunks_are_resident
     change_one_row_body(&path, &meta);
 
     let load = load(&path, 64 * 1024 * 1024);
-    let (_, cold) = observe(|| walk_rows(&load));
+    let (cold_result, cold) = observe(|| walk_rows(&load));
     let error = walk_rows(&load).expect_err("a changed row body cannot be authenticated");
     assert!(
         matches!(error, Error::StoreCorrupted { .. }),
         "the read reports the existing typed corruption error: {error:?}"
     );
     assert!(
-        load.source.resident_proof_chunks_for_test().0 > 0,
-        "the chunks that proved the range really were resident for the refusal"
+        load.source.resident_proof_chunks_for_test().0 == 0,
+        "row-head authentication refuses the changed body before retaining proof chunks"
     );
-    assert!(cold.chunk_reads > 0);
+    assert!(matches!(cold_result, Err(Error::StoreCorrupted { .. })));
+    assert_eq!(
+        cold.chunk_reads, 0,
+        "the damaged body refuses before proof loading"
+    );
 }
 
 /// Rewrite one stored row body in place, keeping its physical key, so the
@@ -607,11 +627,16 @@ fn a_repeat_resident_search_on_the_public_reader_re_proves_fewer_chunks() {
         "the identical repeat performs no physical proof-chunk read"
     );
     assert!(
-        other.chunk_reads * 4 < cold.chunk_reads,
+        other.chunk_reads > warm.chunk_reads && other.chunk_reads < cold.chunk_reads,
         "a different search over the same resident range re-proves far fewer chunks: \
          {} against {} cold",
         other.chunk_reads,
         cold.chunk_reads
+    );
+    assert_eq!(
+        (cold.chunk_reads, warm.chunk_reads, other.chunk_reads),
+        (13, 0, 5),
+        "fixed proof windows on this authenticated engine path"
     );
     assert!(
         other.work.hashed_bytes < cold.work.hashed_bytes,

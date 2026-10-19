@@ -31,6 +31,7 @@ struct ReleaseOnceOutcome {
     second_charge: usize,
     removed_count: usize,
     accountant_released: usize,
+    staged_controls_released: usize,
 }
 
 impl ReleaseOnceOutcome {
@@ -38,7 +39,7 @@ impl ReleaseOnceOutcome {
         self.first_charge == admitted
             && self.second_charge == 0
             && self.removed_count == 1
-            && self.accountant_released == admitted
+            && self.accountant_released == admitted + self.staged_controls_released
     }
 }
 
@@ -113,7 +114,19 @@ fn passage_writer_residency_has_named_owners_at_one_thousand_rows() {
         }
         let owners = db.writer_memory_ownership_receipt_for_test();
         eprintln!("E20_PASSAGE rows={} owners={owners:?}", first + 100);
-        assert_eq!(owners.current_row_versions, first + 102);
+        assert_eq!(
+            db.execute("SELECT COUNT(*) FROM event_search_passages", &empty)
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int64((first + 100) as i64)]],
+            "the complete committed passage population is read from the durable store"
+        );
+        assert_eq!(owners.current_row_versions, 0);
+        assert_eq!(owners.current_row_values, 0);
+        assert_eq!(owners.current_row_index_postings, 0);
+        assert_eq!(owners.current_membership_charge, 0);
+        assert_eq!(owners.staged_row_versions, 0);
+        assert_eq!(owners.staged_row_admissions, 0);
         assert_eq!(owners.reconciliation_gap, 0);
         assert_eq!(
             owners.current_membership_by_table.values().sum::<usize>(),
@@ -121,7 +134,15 @@ fn passage_writer_residency_has_named_owners_at_one_thousand_rows() {
         );
     }
     let final_owners = db.writer_memory_ownership_receipt_for_test();
-    assert_eq!(final_owners.current_row_versions, ROWS + 2);
+    assert_eq!(final_owners.current_row_versions, 0);
+    for table in ["contexts", "event_search_generations"] {
+        assert_eq!(
+            db.execute(&format!("SELECT COUNT(*) FROM {table}"), &empty)
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int64(1)]],
+        );
+    }
     db.close().unwrap();
 }
 
@@ -247,7 +268,20 @@ fn repeated_sql_updates_release_superseded_staged_row_charges() {
     }
     db.commit(tx).unwrap();
     let owners = db.writer_memory_ownership_receipt_for_test();
-    assert_eq!(owners.current_row_versions, 1);
+    assert_eq!(owners.current_row_versions, 0);
+    assert_eq!(owners.staged_row_versions, 0);
+    assert_eq!(owners.staged_row_admissions, 0);
+    assert_eq!(owners.staged_index_postings, 0);
+    assert_eq!(
+        db.execute(
+            "SELECT counter FROM generation WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(id)),])
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Int64(3)]],
+        "the committed durable row retains the last replacement"
+    );
     assert_eq!(owners.reconciliation_gap, 0);
     db.close().unwrap();
 }
@@ -267,7 +301,11 @@ fn concurrent_deletes_retire_one_staged_admission() {
     assert_eq!(split_lock.0.first_charge, split_lock.1);
     assert_eq!(split_lock.0.second_charge, split_lock.1);
     assert_eq!(split_lock.0.removed_count, 1);
-    assert_eq!(split_lock.0.accountant_released, 2 * split_lock.1);
+    assert_eq!(
+        split_lock.0.accountant_released,
+        2 * split_lock.1 + split_lock.0.staged_controls_released,
+        "the bad path releases the same admission twice, in addition to its real declaration retirement"
+    );
 }
 
 fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOnceOutcome, usize) {
@@ -302,6 +340,10 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
     std::thread::scope(|scope| {
         let first_db = db.clone();
         let first = scope.spawn(move || {
+            let fixture_operation_reader_1 = first_db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             first_db.delete_relational_row_with_race_hook_for_test(
                 tx,
                 "staged_once",
@@ -317,6 +359,7 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
                     }
                     StagedDeleteRacePointForTest::BeforeRetirement => {}
                 },
+                fixture_operation_reader_1.clone(),
             )
         });
         // The first caller has read admission through the real write set.
@@ -325,6 +368,10 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
         let second_db = db.clone();
         let probe_db = db.clone();
         let second = scope.spawn(move || {
+            let fixture_operation_reader_2 = second_db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             second_db.delete_relational_row_with_race_hook_for_test(
                 tx,
                 "staged_once",
@@ -347,6 +394,7 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
                         }
                     }
                 },
+                fixture_operation_reader_2.clone(),
             )
         });
         let real_lock_held = second_arrived_rx.recv().unwrap();
@@ -380,7 +428,21 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
         second_charge,
         removed_count: before.staged_row_versions - after.staged_row_versions,
         accountant_released: before.vector.accountant_total - after.vector.accountant_total,
+        staged_controls_released: before
+            .staged_index_postings
+            .checked_sub(after.staged_index_postings)
+            .unwrap()
+            + before
+                .writer_adapter_controls
+                .checked_sub(after.writer_adapter_controls)
+                .unwrap(),
     };
+    assert_eq!(before.table_metadata, after.table_metadata);
+    assert_eq!(
+        before.named_owner_total - after.named_owner_total,
+        admitted + outcome.staged_controls_released,
+        "named owners lose one admission and the actual staged declaration controls"
+    );
     if mode == StagedDeleteRaceModeForTest::Repaired {
         assert_eq!(after.reconciliation_gap, 0);
         assert_eq!(db.writer_memory_underflow_count_for_test(), 0);
@@ -389,13 +451,36 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
     }
     db.rollback(tx).unwrap();
     let rolled_back = db.writer_memory_ownership_receipt_for_test();
+    assert!(after.staged_index_postings > 0);
     assert_eq!(
-        rolled_back.vector.accountant_total,
-        after.vector.accountant_total
+        after
+            .vector
+            .accountant_total
+            .checked_sub(rolled_back.vector.accountant_total),
+        Some(
+            after.staged_index_postings + after.writer_adapter_controls
+                - rolled_back.writer_adapter_controls
+        ),
+        "rollback releases the actual remaining staged declaration controls"
     );
+    assert_eq!(
+        after.named_owner_total - rolled_back.named_owner_total,
+        after.staged_index_postings + after.writer_adapter_controls
+            - rolled_back.writer_adapter_controls
+    );
+    assert_eq!(rolled_back.staged_row_versions, 0);
+    assert_eq!(rolled_back.staged_row_admissions, 0);
+    assert_eq!(rolled_back.staged_index_postings, 0);
+    assert_eq!(after.active_transactions, 1);
+    assert_eq!(rolled_back.active_transactions, 0);
     assert_eq!(rolled_back.reconciliation_gap, after.reconciliation_gap);
     if mode == StagedDeleteRaceModeForTest::Repaired {
         assert_eq!(db.writer_memory_underflow_count_for_test(), 0);
+    }
+    if mode == StagedDeleteRaceModeForTest::SplitLock {
+        // This negative control deliberately corrupted custody. Strict lifecycle
+        // cleanup must reject its duplicate refund rather than certify it.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(db))).is_err());
     }
     (outcome, admitted)
 }
@@ -413,8 +498,17 @@ fn repeated_replacement_rollback_reconciles_every_staged_charge() {
     let mut previous = None;
     for size in [64, 256, 1024, 4096] {
         if let Some(row_id) = previous {
-            db.delete_relational_row_releasing_staged_for_test(tx, "staged_rollback", row_id)
-                .unwrap();
+            let fixture_operation_reader_3 = db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
+            db.delete_relational_row_releasing_staged_for_test(
+                tx,
+                "staged_rollback",
+                row_id,
+                fixture_operation_reader_3.clone(),
+            )
+            .unwrap();
             let retired = db.writer_memory_ownership_receipt_for_test();
             assert_eq!(retired.staged_row_versions, 0);
             assert_eq!(retired.reconciliation_gap, 0);
@@ -468,15 +562,29 @@ fn failed_delete_keeps_the_staged_row_and_its_charge() {
         .unwrap()
         .unwrap();
     let before = db.writer_memory_ownership_receipt_for_test();
+    let fixture_operation_reader_4 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
-        db.delete_relational_row_releasing_staged_for_test(tx, "missing_table", row_id)
-            .is_err()
+        db.delete_relational_row_releasing_staged_for_test(
+            tx,
+            "missing_table",
+            row_id,
+            fixture_operation_reader_4.clone()
+        )
+        .is_err()
     );
+    let fixture_operation_reader_5 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         db.delete_relational_row_releasing_staged_for_test(
             TxId(u64::MAX),
             "staged_failure",
             row_id,
+            fixture_operation_reader_5.clone()
         )
         .is_err()
     );

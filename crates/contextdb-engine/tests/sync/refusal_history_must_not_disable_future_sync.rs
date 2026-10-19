@@ -181,7 +181,9 @@ impl ClientTransport for RefusalHistoryTransport {
 }
 
 fn current_authored_unit(db: &Database, identity: &FabricIdentity) -> (Lsn, [u8; 32]) {
-    let history = db.changes_since(Lsn(0));
+    let history = db
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let ddl = history.ddl.last().unwrap().clone();
     let lsn = *history.ddl_lsn.last().unwrap();
     let unit = ChangeSet {
@@ -189,6 +191,10 @@ fn current_authored_unit(db: &Database, identity: &FabricIdentity) -> (Lsn, [u8;
         ddl_lsn: vec![lsn],
         ..Default::default()
     };
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let authors = db
         .outbound_ddl_provenance_for_test(
             &unit,
@@ -197,6 +203,7 @@ fn current_authored_unit(db: &Database, identity: &FabricIdentity) -> (Lsn, [u8;
             db.sync_incarnation_for_test(&TenantId::from(TENANT))
                 .unwrap(),
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            fixture_operation_reader_1.clone(),
         )
         .unwrap();
     let author = authors[0].author.as_ref().unwrap();
@@ -235,6 +242,7 @@ fn client(
         TenantId::from(TENANT),
         identity.clone(),
     )
+    .expect("read or construct the declared fixture result")
 }
 
 #[tokio::test]
@@ -449,7 +457,8 @@ async fn an_empty_exact_query_reports_the_fresh_hub_life_it_initializes() {
         TenantId::from(TENANT),
         hub_node,
         identity,
-    );
+    )
+    .expect("read or construct the declared fixture result");
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let shutdown = shutdown.clone();

@@ -100,7 +100,8 @@ async fn start_hub(root: &std::path::Path, tenant: &str, rows: usize) -> Running
             TenantId::from(tenant),
             node_id.clone(),
             fabric_identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({

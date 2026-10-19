@@ -39,7 +39,13 @@ impl<'a> CurrentAuthority<'a> {
     }
 }
 
-pub(crate) fn status(db: &Database, table: &str) -> Result<DeliveryStatusCounts> {
+pub(crate) fn status(
+    db: &Database,
+    table: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<DeliveryStatusCounts> {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
     let mut status = DeliveryStatusCounts::default();
     let Some(meta) = db.table_meta(table) else {
         return Ok(status);
@@ -52,7 +58,7 @@ pub(crate) fn status(db: &Database, table: &str) -> Result<DeliveryStatusCounts>
     if status.disabled {
         return Ok(status);
     }
-    let records = db.custody_table(table)?;
+    let records = custody_hold.retain(db.custody_table(table, read_memory.clone())?)?;
     let hub = db.retention_sync_peer();
     let authority = CurrentAuthority::read(&records, hub.as_deref());
     let manifests = records
@@ -84,7 +90,7 @@ pub(crate) fn status(db: &Database, table: &str) -> Result<DeliveryStatusCounts>
         let Some(root) = manifests.get(submission) else {
             continue;
         };
-        if !db.delivery_root_visible(&root.table, &root.key)? {
+        if !db.delivery_root_visible(&root.table, &root.key, read_memory.clone())? {
             continue;
         }
         status.eligible += 1;
@@ -131,15 +137,21 @@ pub(crate) fn outcome(
     db: &Database,
     table: &str,
     key: &crate::sync_types::NaturalKey,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<Option<DeliveryOutcome>> {
-    if !db.delivery_root_visible(table, key)? {
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    if !db.delivery_root_visible(table, key, read_memory.clone())? {
         return Ok(None);
     }
-    let mut records = db.custody_root(&RowRef {
-        table: table.into(),
-        key: key.clone(),
-    })?;
-    records.extend(db.custody_authority()?);
+    let mut records = custody_hold.retain(db.custody_root(
+        &RowRef {
+            table: table.into(),
+            key: key.clone(),
+        },
+        read_memory.clone(),
+    )?)?;
+    records.extend(custody_hold.retain(db.custody_authority(read_memory.clone())?)?);
     let hub = db.retention_sync_peer();
     let authority = CurrentAuthority::read(&records, hub.as_deref());
     let terminal = records
@@ -173,6 +185,7 @@ pub(crate) fn outcome(
         if !db.delivery_root_visible(
             conflict.table.as_deref().unwrap_or(table),
             &conflict.natural_key,
+            read_memory.clone(),
         )? {
             outcome.conflicts = None;
             break;
@@ -188,10 +201,13 @@ pub(crate) fn show(
     limit: Option<usize>,
     offset: usize,
     params: &std::collections::HashMap<String, contextdb_core::Value>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<crate::database::QueryResult> {
-    super::policy::require_admin(db)?;
+    let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
+
+    super::policy::require_admin(db, read_memory.clone())?;
     use contextdb_core::Value;
-    let records = db.custody_table(table)?;
+    let records = custody_hold.retain(db.custody_table(table, read_memory.clone())?)?;
     let hub = db.retention_sync_peer();
     let authority = CurrentAuthority::read(&records, hub.as_deref());
     let mut result = empty_outcome_inspection();
@@ -280,18 +296,19 @@ pub(crate) fn show(
 pub(crate) fn metadata(
     db: &Database,
     request: crate::direct_file_reader::DirectMetadataRequest,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
     use crate::direct_file_reader::{DirectMetadataBody as Body, DirectMetadataRequest as Request};
     match request {
         Request::DeliveryStatus { root_table } => Ok(Body::DeliveryStatus {
-            counts: Some(status(db, &root_table)?),
+            counts: Some(status(db, &root_table, read_memory.clone())?),
             has_more: false,
         }),
         Request::DeliveryOutcome {
             root_table,
             root_key,
         } => Ok(Body::DeliveryOutcome {
-            outcome: outcome(db, &root_table, &root_key)?,
+            outcome: outcome(db, &root_table, &root_key, read_memory.clone())?,
             has_more: false,
         }),
         _ => Err(super::canonical::invalid()),

@@ -78,6 +78,7 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
                     "vector_partition_graph_pages",
                     "vector_partition_generation_catalog",
                     "vector_partition_journal",
+                    "vector_paged_generation_pages",
                 ] {
                     let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
                     write.delete_table(definition).unwrap();
@@ -101,11 +102,21 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
     drop(persistence);
     // Reopen after the copy so no source extent comes from a write buffer.
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let pending = persistence
         .debug_vector_partition_journal_for_test(&partition)
         .unwrap();
     assert!(!pending.1.is_empty());
+    // A producer's current generation owns both native pages and a captured root.
+    let source_root = persistence
+        .initialize_writer_snapshot(db.snapshot(), db.current_lsn())
+        .unwrap();
+    let retained_root = Arc::clone(&source_root);
+    persistence.set_paged_root_capture(
+        Arc::new(move || Ok(Arc::clone(&retained_root))),
+        Arc::new(|| Ok(None)),
+    );
+    drop(source_root);
     let mut context = db.maintenance_context();
     context.persistence = Some(Arc::clone(&persistence));
     let selected = catalog.change.unwrap_or(catalog.base).generation_id;
@@ -124,7 +135,7 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         .flatten()
         .any(|generation| generation.generation_id == selected)
     );
-    let accountant = Arc::clone(&db.accountant);
+    let accountant = db.accountant.clone();
     let baseline = accountant.usage().used;
     let limit = baseline + 1024;
     accountant.set_budget(Some(limit)).unwrap();
@@ -133,8 +144,19 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
     let observation = redb::observe_backend_reads(Arc::new(move |_| {
         observed.fetch_add(1, Ordering::SeqCst);
     }));
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     let error = context
-        .retry_one_vector_journal_truncation(&persistence, &catalog, &partition, true)
+        .retry_one_vector_journal_truncation(
+            &persistence,
+            &catalog,
+            &partition,
+            true,
+            fixture_operation_reader_1.clone(),
+        )
         .unwrap_err();
     drop(observation);
     assert_eq!(backend_reads.load(Ordering::SeqCst), 0);
@@ -172,8 +194,19 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         catalog
     );
     assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows, old_rows);
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     context
-        .retry_one_vector_journal_truncation(&persistence, &catalog, &partition, true)
+        .retry_one_vector_journal_truncation(
+            &persistence,
+            &catalog,
+            &partition,
+            true,
+            fixture_operation_reader_2.clone(),
+        )
         .unwrap();
     let installed = context
         .vector
@@ -213,9 +246,11 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
     drop(persistence);
     db.close().unwrap();
     drop(db);
+    // The engine accountant keeps its own fixed control charge for as long as
+    // this test holds it; every credit the retry took is gone.
     assert_eq!(
         accountant.usage().used,
-        0,
+        accountant.writer_fixed_ownership().1,
         "final retry owner releases every credit"
     );
     assert_eq!(accountant.underflow_count_for_test(), 0);

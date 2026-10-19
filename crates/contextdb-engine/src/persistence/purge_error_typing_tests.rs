@@ -40,9 +40,9 @@ fn write_marker(persistence: &RedbPersistence, bytes: &[u8]) {
 #[test]
 fn malformed_retention_deferred_edge_count_reports_typed_store_corruption() {
     let (_directory, persistence) = writer();
-    let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(Arc::new(
-        crate::memory_accounting::MemoryAccountant::no_limit(),
-    ));
+    let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(
+        Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into(),
+    );
     assert!(
         persistence
             .load_retention_deferred_edge_nodes_admitted(&mut workspace)
@@ -129,6 +129,10 @@ fn invalid_purge_generation_candidates_report_typed_store_corruption() {
         catalog,
     };
     let mut projection = AuthoritativePurgePersistenceProjection {
+        row_graph_entries: Vec::new(),
+        row_graph_credit: contextdb_core::read_memory::ReadCredit::new(
+            crate::read_image_memory::ImageMemory::new(Some(0)),
+        ),
         row_versions: Vec::new(),
         source_provenance: Vec::new(),
         vectors: Vec::new(),

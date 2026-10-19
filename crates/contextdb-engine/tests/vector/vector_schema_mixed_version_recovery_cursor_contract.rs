@@ -116,7 +116,8 @@ async fn start_server_with_identity(
             TenantId::from(tenant),
             node_id,
             identity.clone(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -329,7 +330,9 @@ impl ClientTransport for ObservePullPages {
 }
 
 fn assert_authored_table_history(source: &Database, pages: &[RecordedPullPage], table: &str) {
-    let original = source.changes_since(Lsn(0));
+    let original = source
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     // Sign the witness with a valid key, then compare the authored statement
     // identity independently of the transport's author key.
     let schema = contextdb_engine::sync_types::ChangeSet {
@@ -338,15 +341,20 @@ fn assert_authored_table_history(source: &Database, pages: &[RecordedPullPage], 
         ..Default::default()
     };
     let witness = FabricIdentity::generate();
-    let (_, provenance) = source
-        .outbound_row_lineages_and_ddl_provenance_for_test(
+    let (_, provenance) = {
+        let seam_read_memory = source
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        source.outbound_row_lineages_and_ddl_provenance_for_test(
             &schema,
             &TenantId::from("authored-history-witness"),
             &witness.node_id(),
             contextdb_core::Incarnation::mint(),
             &|bytes| Ok(witness.sign_for_test(bytes)),
+            seam_read_memory,
         )
-        .unwrap();
+    }
+    .unwrap();
     let expected = schema
         .ddl
         .into_iter()
@@ -734,7 +742,8 @@ async fn held_table_recovery_keeps_ordinary_rows_and_graph_edges_exactly_once_wi
         transport.clone(),
         TenantId::from(CURSOR_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -866,7 +875,8 @@ async fn cut_last_held_back_page_then_upgrade_recovers_without_skipping_ordinary
         transport.clone(),
         TenantId::from(CUT_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -1002,7 +1012,8 @@ async fn restoring_default_schema_keeps_authored_history_held_until_the_peer_upg
         broker.client_as(&receiver_node),
         TenantId::from(SILENCE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -1113,7 +1124,8 @@ async fn held_recovery_pages_purge_before_later_shape_work_and_keeps_erased_vect
         transport.clone(),
         TenantId::from(ERASURE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -1302,7 +1314,8 @@ async fn held_recovery_bootstraps_trigger_ddl_before_later_rows() {
         transport.clone(),
         TenantId::from(TRIGGER_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -1457,7 +1470,8 @@ async fn a_reverted_declaration_keeps_its_authored_history_until_capability_catc
         transport.clone(),
         TenantId::from(REVERTED_BEFORE_HOLDBACK_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -1558,7 +1572,8 @@ async fn intermediate_alters_keep_exact_history_through_capability_catchup() {
         transport.clone(),
         TenantId::from(RELEASED_AFTER_ALTER_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -1676,7 +1691,8 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
         old_transport.clone(),
         TenantId::from(ALL_DEFAULT_HNSW_TENANT),
         old_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&old_node, false);
@@ -1699,7 +1715,8 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
         current_transport.clone(),
         TenantId::from(ALL_DEFAULT_HNSW_TENANT),
         current_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&current_node, true);
@@ -1850,7 +1867,8 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
         transport.clone(),
         TenantId::from(REVERTED_GRAPH_AND_CROSSOVER_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -1930,7 +1948,8 @@ async fn a_dropped_partitioned_table_keeps_its_authored_create_and_drop() {
         transport.clone(),
         TenantId::from(DROPPED_PARTITIONED_TABLE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -2017,7 +2036,8 @@ async fn authored_schema_holdback_survives_both_nodes_reopening_before_capabilit
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&node_id, false);
@@ -2055,7 +2075,8 @@ async fn authored_schema_holdback_survives_both_nodes_reopening_before_capabilit
         transport.clone(),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&node_id, false);

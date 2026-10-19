@@ -32,8 +32,8 @@ use std::{io, panic, thread};
 
 const MAX_PAGES_PER_COMPACTION: usize = 1_000_000;
 
-/// An in-process scheduling position. No storage pages or read transaction
-/// survive a compaction batch, so it is safe to discard this on restart.
+/// A bounded scheduling position. No storage pages or read transaction
+/// survive a compaction batch; callers may checkpoint its scalar state.
 #[doc(hidden)]
 #[derive(Clone, Debug, Default)]
 pub struct CompactionCursor {
@@ -47,6 +47,41 @@ pub struct CompactionCursor {
 impl CompactionCursor {
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn checkpoint(&self) -> (u8, Option<&str>, bool, &[usize], bool) {
+        (
+            self.phase,
+            self.table.as_deref(),
+            self.advance_table,
+            &self.position,
+            self.active,
+        )
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn restore_checkpoint(
+        phase: u8,
+        table: Option<String>,
+        advance_table: bool,
+        position: Vec<usize>,
+        active: bool,
+    ) -> Result<Self, StorageError> {
+        if phase > 3 {
+            return Err(StorageError::Corrupted(
+                "invalid compaction checkpoint phase".into(),
+            ));
+        }
+        Ok(Self {
+            phase,
+            table,
+            advance_table,
+            position,
+            active,
+        })
     }
 }
 
@@ -222,6 +257,8 @@ pub(crate) enum AllocatorStateKey {
     Region(u32),
     RegionTracker,
     TransactionId,
+    /// Allocator-wide free and region page totals of the saved snapshot.
+    FreeTotals,
 }
 
 impl Value for AllocatorStateKey {
@@ -242,6 +279,7 @@ impl Value for AllocatorStateKey {
             3 => Self::Region(u32::from_le_bytes(data[1..].try_into().unwrap())),
             4 => Self::RegionTracker,
             5 => Self::TransactionId,
+            6 => Self::FreeTotals,
             _ => unreachable!(),
         }
     }
@@ -262,6 +300,9 @@ impl Value for AllocatorStateKey {
             }
             Self::TransactionId => {
                 result[0] = 5;
+            }
+            Self::FreeTotals => {
+                result[0] = 6;
             }
             AllocatorStateKey::Deprecated => {
                 result[0] = 0;
@@ -588,7 +629,10 @@ impl<'db> SystemNamespace<'db> {
 }
 
 struct TableNamespace<'db> {
-    open_tables: HashMap<String, &'static panic::Location<'static>>,
+    open_tables: crate::table_registry::OpenTables,
+    // Read only through the hidden `contextdb-internal` funding surface.
+    #[cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
+    registry_funding: Arc<crate::table_registry::RegistryFunding>,
     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     table_tree: TableTreeMut<'db>,
@@ -611,8 +655,10 @@ impl TableNamespace<'_> {
             freed_pages.clone(),
             allocated.clone(),
         );
+        let registry_funding = Arc::new(crate::table_registry::RegistryFunding::default());
         Self {
-            open_tables: Default::default(),
+            open_tables: crate::table_registry::new_open_tables(&registry_funding),
+            registry_funding,
             table_tree,
             freed_pages,
             allocated_pages: allocated,
@@ -646,8 +692,9 @@ impl TableNamespace<'_> {
         let root = self
             .table_tree
             .get_or_create_table::<K, V>(name, table_type)?;
+        self.registry_funding.count_call();
         self.open_tables
-            .insert(name.to_string(), panic::Location::caller());
+            .insert(Box::from(name), panic::Location::caller());
 
         Ok(root)
     }
@@ -774,9 +821,126 @@ impl TableNamespace<'_> {
         table: &BtreeMut<K, V>,
         length: u64,
     ) {
+        self.registry_funding.count_call();
         self.open_tables.remove(name).unwrap();
         self.table_tree
             .stage_update_table_root(name, table.get_root(), length);
+    }
+
+    /// The exact layout a reserve of `additional` open tables would allocate,
+    /// learned by refusing it: the registry keeps its entries and allocation.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_cost_to_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
+        self.registry_funding.count_call();
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
+        match self.open_tables.try_reserve(additional) {
+            Ok(()) => Ok(None),
+            Err(error) => match crate::table_registry::reserve_error(error, &call) {
+                crate::table_registry::RegistryReserveError::AllocError(layout) => Ok(Some(layout)),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// Reserve room for `additional` open tables, paying with `credit` bytes.
+    /// Returns the bytes of the array this replaced, which is now freed.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_reserve_with(
+        &mut self,
+        additional: usize,
+        credit: usize,
+    ) -> Result<usize, crate::table_registry::RegistryReserveError> {
+        self.registry_funding.count_call();
+        let before = self.open_tables.allocation_size();
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
+        let allocations = call.allocations();
+        match self.open_tables.try_reserve(additional) {
+            Ok(()) if call.allocations() != allocations => Ok(before),
+            Ok(()) => Ok(0),
+            Err(error) => Err(crate::table_registry::reserve_error(error, &call)),
+        }
+    }
+
+    /// The exact layout an empty registry array for `len` tables allocates.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_cost_to_hold(
+        &self,
+        len: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::table_registry::RegistryReserveError> {
+        self.registry_funding.count_call();
+        let mut scratch = crate::table_registry::new_open_tables(&self.registry_funding);
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, 0);
+        match scratch.try_reserve(len) {
+            Ok(()) => Ok(None),
+            Err(error) => match crate::table_registry::reserve_error(error, &call) {
+                crate::table_registry::RegistryReserveError::AllocError(layout) => Ok(Some(layout)),
+                other => Err(other),
+            },
+        }
+    }
+
+    /// An empty registry array for `len` tables, paid with `credit` bytes.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_prepare_replacement(
+        &self,
+        len: usize,
+        credit: usize,
+    ) -> Result<
+        crate::table_registry::RegistryReplacement,
+        crate::table_registry::RegistryReserveError,
+    > {
+        self.registry_funding.count_call();
+        let mut map = crate::table_registry::new_open_tables(&self.registry_funding);
+        let call = crate::table_registry::FundedCall::enter(&self.registry_funding, credit);
+        map.try_reserve(len)
+            .map_err(|error| crate::table_registry::reserve_error(error, &call))?;
+        drop(call);
+        Ok(crate::table_registry::RegistryReplacement { map })
+    }
+
+    /// Move the open tables into `replacement` (or, with none, into an
+    /// unallocated registry when no table is open) and free the current
+    /// array, allocating nothing. Returns the freed array's bytes. On refusal
+    /// the registry and the replacement are returned unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    fn registry_install_replacement(
+        &mut self,
+        replacement: Option<crate::table_registry::RegistryReplacement>,
+    ) -> Result<
+        usize,
+        (
+            crate::table_registry::RegistryReserveError,
+            Option<crate::table_registry::RegistryReplacement>,
+        ),
+    > {
+        let mut next = match replacement {
+            Some(replacement) if replacement.map.capacity() >= self.open_tables.len() => {
+                replacement.map
+            }
+            None if self.open_tables.is_empty() => {
+                crate::table_registry::new_open_tables(&self.registry_funding)
+            }
+            other => {
+                return Err((
+                    crate::table_registry::RegistryReserveError::ReplacementTooSmall,
+                    other,
+                ));
+            }
+        };
+        // `next` has room for every entry, so these inserts allocate nothing;
+        // a monitored caller would see any allocation as an overdraft.
+        self.registry_funding.count_call();
+        for (name, location) in self.open_tables.drain() {
+            self.registry_funding.count_call();
+            next.insert(name, location);
+        }
+        let previous = std::mem::replace(&mut self.open_tables, next);
+        let freed = previous.allocation_size();
+        drop(previous);
+        Ok(freed)
     }
 }
 
@@ -842,6 +1006,22 @@ impl SavepointTransactionState {
     }
 }
 
+/// Transaction-local normal-table root lifecycle. Policy and witness storage belong to callers.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum TableRootEvent {
+    BeforeOpen,
+    AfterClose,
+    BeforeDelete,
+    AfterDelete,
+    BeforeRelocate,
+    AfterRelocate,
+}
+
+#[cfg(feature = "contextdb-internal")]
+type TableRootHook = fn(&WriteTransaction, &str, TableRootEvent) -> Result<(), StorageError>;
+
 /// A read/write transaction
 ///
 /// Only a single [`WriteTransaction`] may exist at a time
@@ -859,9 +1039,206 @@ pub struct WriteTransaction {
     shrink_policy: ShrinkPolicy,
     quick_repair: bool,
     deferred_free_budget: (usize, usize),
+    // An exclusive upper bound on the freeing transaction ids this commit may reclaim, applied on
+    // top of the reader floor. Set only by a bounded maintenance reclaim step.
+    reclaim_ceiling: Option<TransactionId>,
     // All transaction-local savepoint lifecycle state. See
     // `SavepointTransactionState` for the commit/abort contract.
     savepoint_state: Mutex<SavepointTransactionState>,
+    #[cfg(feature = "contextdb-internal")]
+    table_root_hook: Option<TableRootHook>,
+    table_root_hook_error: Mutex<Option<StorageError>>,
+}
+
+/// Caller-owned observation of one actual write's publication interval.
+/// Construct with `WriteTransaction::durable_publication` and retain across
+/// the consuming `commit_publishing` call, including Err and unwind.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct DurablePublication {
+    // Retain identity: a dropped database's address cannot be recycled while
+    // this marker is alive. Cloning this existing Arc allocates nothing.
+    mem: Arc<TransactionalMemory>,
+    transaction_id: TransactionId,
+    state: std::sync::atomic::AtomicU8,
+    prepared_guard: Option<Arc<TransactionGuard>>,
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl DurablePublication {
+    const UNSTARTED: u8 = 0;
+    const HEADER_BEGUN: u8 = 1;
+    const DURABLE: u8 = 2;
+
+    #[doc(hidden)]
+    pub fn is_unstarted(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::UNSTARTED
+    }
+
+    #[doc(hidden)]
+    pub fn is_header_begun(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::HEADER_BEGUN
+    }
+
+    #[doc(hidden)]
+    pub fn is_durable(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::DURABLE
+    }
+
+    pub(crate) fn validate(
+        &self,
+        mem: &TransactionalMemory,
+        transaction_id: TransactionId,
+    ) -> Result {
+        if !std::ptr::eq(self.mem.as_ref(), mem)
+            || self.transaction_id != transaction_id
+            || !self.is_unstarted()
+        {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable publication marker does not identify this unstarted write",
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn header_begun(&self) {
+        self.state.store(Self::HEADER_BEGUN, Ordering::Release);
+    }
+
+    pub(crate) fn durable(&self) {
+        if let Some(guard) = &self.prepared_guard {
+            guard.activate_prepared();
+        }
+        self.state.store(Self::DURABLE, Ordering::Release);
+    }
+}
+
+/// A sealed user tree. No table or read guard can escape preparation, and
+/// dropping a refused preparation releases its pin before ordinary abort.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct PreparedWrite<P> {
+    read: Option<Arc<ReadTransaction>>,
+    prepared: Option<P>,
+    marker: DurablePublication,
+    user_root: Option<BtreeHeader>,
+    write: Option<WriteTransaction>,
+    preserve_failure: bool,
+}
+
+/// Abort custody before the caller admits preparation controls. This is not a
+/// prepared/durable capability and deliberately exposes no commit operation.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct PreparedReadInput(PreparedWrite<()>);
+
+#[cfg(feature = "contextdb-internal")]
+impl PreparedReadInput {
+    pub fn prepare_commit_with_read<P, E>(
+        mut self,
+        admission: crate::NativeStorageAdmission,
+        map_storage: impl Fn(StorageError) -> E,
+        map_read: impl Fn(crate::PreparedReadError) -> E,
+        prepare: impl FnOnce(&PreparedReadView<'_>) -> std::result::Result<P, E>,
+    ) -> std::result::Result<PreparedWrite<P>, E> {
+        // The old wrapper becomes empty before the consuming path takes over;
+        // exactly one owner can abort/close the actual allocation tracker.
+        self.0.write.take().expect("one actual write preparation")
+            .prepare_commit_with_read(admission, map_storage, map_read, prepare)
+    }
+}
+
+/// Inspection deliberately exposes neither the read nor an owned table.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct PreparedReadView<'a>(&'a ReadTransaction);
+
+#[cfg(feature = "contextdb-internal")]
+impl PreparedReadView<'_> {
+    pub fn identity(&self) -> StorageSnapshotIdentity { self.0.storage_snapshot_identity() }
+
+    /// Scalar lookup for the admitted prepared reader. Names are borrowed and
+    /// all new pages/navigation controls use the enclosing exact admission.
+    pub fn bytes_equal_prepared(
+        &self,
+        table: TableDefinition<&[u8], &[u8]>,
+        key: &[u8],
+        expected: &[u8],
+    ) -> std::result::Result<bool, crate::PreparedReadError> {
+        self.0.tree.prepared_bytes_equal(table.name(), key, expected)
+    }
+
+    pub fn bytes_equal(&self, table: TableDefinition<&[u8], &[u8]>, key: &[u8], expected: &[u8]) -> Result<bool> {
+        let table = match self.0.open_table(table) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(error.into_storage_error_or_corrupted("prepared root table")),
+        };
+        Ok(table.get(key)?.is_some_and(|value| value.value() == expected))
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl<P> PreparedWrite<P> {
+    /// These are concrete controls, excluding page buffers covered by the
+    /// caller's ordinary read/page admission. Pay before prepare_commit.
+    pub fn control_bytes() -> usize {
+        fn arc_bytes<T>() -> usize {
+            std::alloc::Layout::new::<[usize; 2]>().extend(std::alloc::Layout::new::<T>())
+                .unwrap().0.pad_to_align().size()
+        }
+        std::mem::size_of::<Self>() + arc_bytes::<ReadTransaction>()
+            + arc_bytes::<TransactionGuard>() + arc_bytes::<AtomicBool>()
+            + std::mem::size_of::<crate::transaction_tracker::PreparedPin>()
+    }
+
+    pub fn commit(&mut self) -> Result<(), CommitError> {
+        self.preserve_failure = true;
+        let write = self.write.as_mut().expect("one sealed commit");
+        // Keep write in this owner on refusal: its prepared read must disappear
+        // before abort. Acquire both close locks before consuming either list.
+        let (allocated, freed) = write.tables.lock().map_err(StorageError::from)?.table_tree.close_sealed()?;
+        write.completed = true;
+        let mut write = self.write.take().unwrap();
+        let result = write.commit_finalized_publishing(self.user_root, allocated, freed, &self.marker);
+        self.preserve_failure = result.is_err();
+        result
+    }
+
+    pub fn is_durable(&self) -> bool { self.marker.is_durable() }
+
+    /// Only moves prepaid owners. It neither reads storage nor registers a
+    /// root, and is valid after a postflush Err or caught unwind.
+    pub fn take_durable(&mut self) -> Option<(Arc<ReadTransaction>, P)> {
+        if !self.marker.is_durable() { return None; }
+        match (self.read.take(), self.prepared.take()) {
+            (Some(read), Some(prepared)) => Some((read, prepared)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl<P> Drop for PreparedWrite<P> {
+    fn drop(&mut self) {
+        let already_unwinding = thread::panicking() || self.preserve_failure;
+        let mut first = None;
+        let mut cleanup = |action: &mut dyn FnMut()| {
+            if let Err(payload) = panic::catch_unwind(panic::AssertUnwindSafe(action)) {
+                if first.is_none() { first = Some(payload); } else { std::mem::forget(payload); }
+            }
+        };
+        // Each owner is taken before its destructor runs. Even a failed refund
+        // cannot skip ordinary abort or close the allocation tracker twice.
+        cleanup(&mut || drop(self.read.take()));
+        cleanup(&mut || drop(self.marker.prepared_guard.take()));
+        cleanup(&mut || drop(self.prepared.take()));
+        cleanup(&mut || { if let Some(write) = self.write.take() { let _ = write.abort(); } });
+        if let Some(payload) = first {
+            if already_unwinding { std::mem::forget(payload); } else { panic::resume_unwind(payload); }
+        }
+    }
 }
 
 impl WriteTransaction {
@@ -900,9 +1277,116 @@ impl WriteTransaction {
             two_phase_commit: false,
             quick_repair: false,
             deferred_free_budget,
+            reclaim_ceiling: None,
             shrink_policy: ShrinkPolicy::Default,
             savepoint_state: Mutex::new(SavepointTransactionState::default()),
+            #[cfg(feature = "contextdb-internal")]
+            table_root_hook: None,
+            table_root_hook_error: Mutex::new(None),
         })
+    }
+
+    /// Install fixed transaction-local lifecycle policy; no inventory is retained.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_table_root_hook(
+        mut self,
+        hook: fn(&Self, &str, TableRootEvent) -> Result<(), StorageError>,
+    ) -> Self {
+        self.table_root_hook = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn call_table_root_hook(&self, name: &str, event: TableRootEvent) -> Result<(), StorageError> {
+        if let Some(hook) = self.table_root_hook {
+            hook(self, name, event)?;
+        }
+        Ok(())
+    }
+
+    /// Distinguish absent from empty using one normal-table directory lookup.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn normal_table_root(&self, name: &str) -> Result<Option<Option<[u8; 32]>>, TableError> {
+        self.capture_table_root(name, true)
+    }
+
+    /// Current pending header, with no checksum or directory mutation.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn normal_table_root_current(
+        &self,
+        name: &str,
+    ) -> Result<Option<Option<[u8; 32]>>, TableError> {
+        self.capture_table_root(name, false)
+    }
+
+    fn capture_table_root(
+        &self,
+        name: &str,
+        finalize: bool,
+    ) -> Result<Option<Option<[u8; 32]>>, TableError> {
+        let result = (|| {
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::observe_root_work(
+                crate::commit_work::RootWorkKindForTest::CaptureBegin,
+                Some(name),
+                None,
+                0,
+            )?;
+            let mut tables = self.tables.lock().unwrap();
+            if finalize {
+                tables.table_tree.finalize_table_root(name)?;
+            }
+            let root = tables
+                .table_tree
+                .get_table_untyped(name, TableType::Normal)?
+                .map(|table| match table {
+                    InternalTableDefinition::Normal { table_root, .. } => {
+                        table_root.map(BtreeHeader::to_le_bytes)
+                    }
+                    InternalTableDefinition::Multimap { .. } => unreachable!(),
+                });
+            drop(tables);
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::observe_root_work(
+                crate::commit_work::RootWorkKindForTest::CaptureEnd,
+                Some(name),
+                None,
+                0,
+            )?;
+            Ok(root)
+        })();
+        self.poison_failed_capture(&result);
+        result
+    }
+
+    fn poison_failed_capture<T>(&self, result: &Result<T, TableError>) {
+        if result.is_err() {
+            let mut failure = self.table_root_hook_error.lock().unwrap();
+            if failure.is_none() {
+                *failure = Some(StorageError::PreviousIo);
+            }
+        }
+    }
+
+    /// Entry count of one normal table from its directory header, without
+    /// opening it: `None` when the table is absent.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn normal_table_len(&self, name: &str) -> Result<Option<u64>, TableError> {
+        let tables = self.tables.lock().unwrap();
+        Ok(tables
+            .table_tree
+            .get_table_untyped(name, TableType::Normal)?
+            .map(|table| match table {
+                InternalTableDefinition::Normal { table_root, .. } => {
+                    table_root.map_or(0, |header| header.length)
+                }
+                InternalTableDefinition::Multimap { .. } => unreachable!(),
+            }))
     }
 
     #[cfg(feature = "test-seams")]
@@ -929,6 +1413,35 @@ impl WriteTransaction {
     #[doc(hidden)]
     pub fn set_deferred_free_budget(&mut self, extents: usize, entries: usize) {
         self.deferred_free_budget = (extents, entries);
+    }
+
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    /// Limit this commit's reclamation to entries freed by transactions before `ceiling`, in
+    /// addition to the reader floor. The ceiling only ever lowers what may be freed.
+    pub(crate) fn set_reclaim_ceiling(&mut self, ceiling: TransactionId) {
+        self.reclaim_ceiling = Some(ceiling);
+    }
+
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    pub(crate) fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    /// Whether either deferred-free tree has an entry freed before `ceiling`.
+    pub(crate) fn pending_free_pages_before(&self, ceiling: TransactionId) -> Result<bool> {
+        let mut system_tables = self.system_tables.lock().unwrap();
+        for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
+            let table = system_tables.open_system_table(self, definition)?;
+            if table
+                .tree
+                .first()?
+                .is_some_and(|(key, _)| key.value().transaction_id < ceiling.raw_id())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // Explicit whole-file compaction retains its upstream full-drain semantics.
@@ -959,6 +1472,29 @@ impl WriteTransaction {
             return Ok(true);
         }
 
+        Ok(false)
+    }
+
+    /// Inspect only the oldest entry in each free tree using the same fence
+    /// as `durable_commit`. A live reader protects newer entries, not every
+    /// deferred allocation in the file.
+    pub(crate) fn eligible_pending_free_pages(&self) -> Result<bool> {
+        let free_until = self
+            .transaction_tracker
+            .oldest_live_read_transaction()
+            .map_or(self.transaction_id, |id| TransactionId::min(id.next(), self.transaction_id))
+            .raw_id();
+        let mut system_tables = self.system_tables.lock().unwrap();
+        for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
+            let table = system_tables.open_system_table(self, definition)?;
+            if table
+                .tree
+                .first()?
+                .is_some_and(|(key, _)| key.value().transaction_id < free_until)
+            {
+                return Ok(true);
+            }
+        }
         Ok(false)
     }
 
@@ -1197,6 +1733,10 @@ impl WriteTransaction {
             return Err(SavepointError::InvalidSavepoint);
         }
 
+        {
+            let mut tables = self.tables.lock().unwrap();
+            tables.table_tree.flush_table_root_updates()?;
+        }
         let (id, transaction_id) = self.allocate_savepoint()?;
         #[cfg(feature = "logging")]
         debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
@@ -1416,7 +1956,203 @@ impl WriteTransaction {
         &'txn self,
         definition: TableDefinition<K, V>,
     ) -> Result<Table<'txn, K, V>, TableError> {
+        #[cfg(feature = "contextdb-internal")]
+        self.call_table_root_hook(definition.name(), TableRootEvent::BeforeOpen)?;
         self.tables.lock().unwrap().open_table(self, definition)
+    }
+
+    /// Check a user family's directory entry without finalizing dirty payload pages.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn table_exists<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<bool, TableError> {
+        Ok(self
+            .tables
+            .lock()
+            .unwrap()
+            .table_tree
+            .get_table::<K, V>(definition.name(), TableType::Normal)?
+            .is_some())
+    }
+
+    /// Open tables registered in this transaction.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_len(&self) -> usize {
+        self.tables.lock().unwrap().open_tables.len()
+    }
+
+    /// Bytes of the open-table registry's array.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_bytes(&self) -> usize {
+        self.tables.lock().unwrap().open_tables.allocation_size()
+    }
+
+    /// The exact layout the registry would allocate to make room for
+    /// `additional` more open tables, or `None` when it already has room. The
+    /// registry keeps its entries and its allocation (a tombstone-only rehash
+    /// may reorder slots without allocating).
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_cost_to_reserve(
+        &self,
+        additional: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::RegistryReserveError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_cost_to_reserve(additional)
+    }
+
+    /// Make room for `additional` more open tables with at most `credit`
+    /// newly allocated bytes. Returns the bytes of the array this freed (zero
+    /// when nothing was reallocated). On refusal the registry is unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_reserve(
+        &self,
+        additional: usize,
+        credit: usize,
+    ) -> Result<usize, crate::RegistryReserveError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_reserve_with(additional, credit)
+    }
+
+    /// The exact layout of an empty registry array holding `len` tables, or
+    /// `None` when such an array allocates nothing.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_cost_to_hold(
+        &self,
+        len: usize,
+    ) -> Result<Option<std::alloc::Layout>, crate::RegistryReserveError> {
+        self.tables.lock().unwrap().registry_cost_to_hold(len)
+    }
+
+    /// Allocate, with at most `credit` bytes, an empty registry array for
+    /// `len` tables to be installed later without allocating.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_prepare(
+        &self,
+        len: usize,
+        credit: usize,
+    ) -> Result<crate::RegistryReplacement, crate::RegistryReserveError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_prepare_replacement(len, credit)
+    }
+
+    /// Move the open tables into `replacement`, or into an unallocated
+    /// registry when none is given and no table is open, freeing the current
+    /// array without allocating. Returns the freed bytes; on refusal both are
+    /// returned unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_install(
+        &self,
+        replacement: Option<crate::RegistryReplacement>,
+    ) -> Result<
+        usize,
+        (
+            crate::RegistryReserveError,
+            Option<crate::RegistryReplacement>,
+        ),
+    > {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_install_replacement(replacement)
+    }
+
+    /// Count registry allocations made outside a funded reserve until the
+    /// returned monitor drops.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_table_registry_monitor(&self) -> crate::RegistryMonitor {
+        crate::table_registry::RegistryMonitor::start(&self.tables.lock().unwrap().registry_funding)
+    }
+
+    /// Whether `name` already has a staged root update in this transaction.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn pending_table_update_contains(&self, name: &str) -> bool {
+        self.tables
+            .lock()
+            .unwrap()
+            .table_tree
+            .pending_table_update_contains(name)
+    }
+
+    /// Start recording every registry array allocation and free.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_record_for_test(&self) {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_funding
+            .start_recording();
+    }
+
+    /// The recorded registry allocations and frees, plus live and peak bytes.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_records_for_test(
+        &self,
+    ) -> (Vec<crate::RegistryAllocationRecord>, usize, usize) {
+        let tables = self.tables.lock().unwrap();
+        let (live, peak) = tables.registry_funding.live_and_peak();
+        (tables.registry_funding.take_records(), live, peak)
+    }
+
+    /// Make the next registry array allocation fail as the global allocator
+    /// would.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_fail_next_allocation_for_test(&self) {
+        self.tables
+            .lock()
+            .unwrap()
+            .registry_funding
+            .fail_next_allocation();
+    }
+
+    /// (registry operations, array allocations) in this transaction so far.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_work_for_test(&self) -> (usize, usize) {
+        self.tables.lock().unwrap().registry_funding.work()
+    }
+
+    /// The address and length of every registry key box.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn open_table_registry_keys_for_test(&self) -> Vec<(usize, usize)> {
+        self.tables
+            .lock()
+            .unwrap()
+            .open_tables
+            .keys()
+            .map(|key| (key.as_ptr() as usize, key.len()))
+            .collect()
+    }
+
+    /// Staged root updates: (entries, capacity).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn pending_table_updates_for_test(&self) -> (usize, usize) {
+        self.tables
+            .lock()
+            .unwrap()
+            .table_tree
+            .pending_table_updates_for_test()
     }
 
     /// Return the finalized root header of a user table after its open handles
@@ -1427,18 +2163,18 @@ impl WriteTransaction {
         &self,
         definition: TableDefinition<K, V>,
     ) -> Result<Option<[u8; 32]>, TableError> {
-        let mut tables = self.tables.lock().unwrap();
-        tables.table_tree.flush_table_root_updates()?;
-        let table = tables
-            .table_tree
-            .get_table::<K, V>(definition.name(), TableType::Normal)?;
-        Ok(match table {
-            Some(InternalTableDefinition::Normal { table_root, .. }) => {
-                table_root.map(BtreeHeader::to_le_bytes)
+        let result = (|| {
+            {
+                let tables = self.tables.lock().unwrap();
+                tables
+                    .table_tree
+                    .get_table::<K, V>(definition.name(), TableType::Normal)?;
             }
-            Some(InternalTableDefinition::Multimap { .. }) => unreachable!(),
-            None => None,
-        })
+            self.capture_table_root(definition.name(), true)
+                .map(Option::flatten)
+        })();
+        self.poison_failed_capture(&result);
+        result
     }
 
     /// Open the given table
@@ -1462,6 +2198,13 @@ impl WriteTransaction {
         length: u64,
     ) {
         self.tables.lock().unwrap().close_table(name, table, length);
+        #[cfg(feature = "contextdb-internal")]
+        if let Err(error) = self.call_table_root_hook(name, TableRootEvent::AfterClose) {
+            let mut failure = self.table_root_hook_error.lock().unwrap();
+            if failure.is_none() {
+                *failure = Some(error);
+            }
+        }
     }
 
     /// Rename the given table
@@ -1473,10 +2216,21 @@ impl WriteTransaction {
         let name = definition.name().to_string();
         // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
         drop(definition);
+        #[cfg(feature = "contextdb-internal")]
+        {
+            self.call_table_root_hook(&name, TableRootEvent::BeforeDelete)?;
+            self.call_table_root_hook(new_name.name(), TableRootEvent::BeforeOpen)?;
+        }
         self.tables
             .lock()
             .unwrap()
-            .rename_table(self, &name, new_name.name())
+            .rename_table(self, &name, new_name.name())?;
+        #[cfg(feature = "contextdb-internal")]
+        {
+            self.call_table_root_hook(&name, TableRootEvent::AfterDelete)?;
+            self.call_table_root_hook(new_name.name(), TableRootEvent::AfterClose)?;
+        }
+        Ok(())
     }
 
     /// Rename the given multimap table
@@ -1501,13 +2255,19 @@ impl WriteTransaction {
         let name = definition.name().to_string();
         // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
         drop(definition);
+        #[cfg(feature = "contextdb-internal")]
+        self.call_table_root_hook(&name, TableRootEvent::BeforeDelete)?;
+        let result = self.tables.lock().unwrap().delete_table(self, &name);
+        #[cfg(feature = "contextdb-internal")]
+        if result.is_ok() {
+            self.call_table_root_hook(&name, TableRootEvent::AfterDelete)?;
+        }
         #[cfg(not(feature = "test-seams"))]
         {
-            self.tables.lock().unwrap().delete_table(self, &name)
+            result
         }
         #[cfg(feature = "test-seams")]
         {
-            let result = self.tables.lock().unwrap().delete_table(self, &name);
             if matches!(result, Ok(true)) {
                 self.record_table_write_for_test(
                     &name,
@@ -1563,9 +2323,125 @@ impl WriteTransaction {
     /// All writes performed in this transaction will be visible to future transactions, and are
     /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
     pub fn commit(mut self) -> Result<(), CommitError> {
+        if let Some(error) = self.table_root_hook_error.lock().unwrap().take() {
+            return Err(error.into());
+        }
         // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
         self.completed = true;
         self.commit_inner()
+    }
+
+    /// Bind a stack marker to this database instance and actual write id.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn durable_publication(&self) -> DurablePublication {
+        DurablePublication {
+            mem: Arc::clone(&self.mem),
+            transaction_id: self.transaction_id,
+            state: std::sync::atomic::AtomicU8::new(DurablePublication::UNSTARTED),
+            prepared_guard: None,
+        }
+    }
+
+    /// Consume the actual write and seal its final user tree while abort is
+    /// still legal. All caller preparation runs before closing the tracker or
+    /// reclaiming system pages. Only Immediate durability has this capability.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn prepare_commit<P, E>(
+        self,
+        map_storage: impl Fn(StorageError) -> E,
+        prepare: impl FnOnce(&PreparedReadView<'_>) -> std::result::Result<P, E>,
+    ) -> std::result::Result<PreparedWrite<P>, E> {
+        self.prepare_commit_read_with(
+            &map_storage,
+            |root, guard, mem| TableTree::new(root, PageHint::Verified, guard, mem).map_err(&map_storage),
+            prepare,
+        )
+    }
+
+    /// Place the actual write under the canonical abort/unwind owner before
+    /// a caller performs any fallible Original/control bootstrap.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn into_prepared_read(self) -> PreparedReadInput {
+        PreparedReadInput(PreparedWrite {
+            read: None, prepared: None, marker: self.durable_publication(),
+            user_root: None, write: Some(self), preserve_failure: true,
+        })
+    }
+
+    /// Internal exact-owner variant. Install admission BEFORE constructing
+    /// the verified root, retain its paid copy in the actual ReadTransaction,
+    /// and lend only scalar inspection while the same scope remains installed.
+    /// Public read/write entry points and the consuming commit are unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn prepare_commit_with_read<P, E>(
+        self,
+        admission: crate::NativeStorageAdmission,
+        map_storage: impl Fn(StorageError) -> E,
+        map_read: impl Fn(crate::PreparedReadError) -> E,
+        prepare: impl FnOnce(&PreparedReadView<'_>) -> std::result::Result<P, E>,
+    ) -> std::result::Result<PreparedWrite<P>, E> {
+        crate::with_native_storage_admission(admission, || {
+            self.prepare_commit_read_with(
+                &map_storage,
+                |root, guard, mem| TableTree::new_prepared(root, guard, mem).map_err(&map_read),
+                prepare,
+            )
+        })
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn prepare_commit_read_with<P, E>(
+        self,
+        map_storage: impl Fn(StorageError) -> E,
+        read_tree: impl FnOnce(Option<BtreeHeader>, Arc<TransactionGuard>, Arc<TransactionalMemory>)
+            -> std::result::Result<TableTree, E>,
+        prepare: impl FnOnce(&PreparedReadView<'_>) -> std::result::Result<P, E>,
+    ) -> std::result::Result<PreparedWrite<P>, E> {
+        let mut prepared = PreparedWrite {
+            read: None, prepared: None, marker: self.durable_publication(), user_root: None, write: Some(self), preserve_failure: true,
+        };
+        let write = prepared.write.as_ref().unwrap();
+        if !matches!(write.durability, InternalDurability::Immediate) {
+            return Err(map_storage(StorageError::Io(io::Error::new(io::ErrorKind::InvalidInput,
+                "prepared publication requires Immediate durability"))));
+        }
+        if let Some(error) = write.table_root_hook_error.lock().map_err(StorageError::from).map_err(&map_storage)?.take() {
+            return Err(map_storage(error));
+        }
+        let root = write.tables.lock().map_err(StorageError::from).map_err(&map_storage)?
+            .table_tree.seal_user_root().map_err(&map_storage)?;
+        prepared.user_root = root;
+        let guard = Arc::new(TransactionGuard::new_prepared(write.transaction_id, write.transaction_tracker.clone()));
+        let read = Arc::new(ReadTransaction {
+            mem: write.mem.clone(),
+            tree: read_tree(root, guard.clone(), write.mem.clone())?,
+        });
+        write.transaction_tracker.register_prepared_pin(read.storage_snapshot_identity(), &guard).map_err(&map_storage)?;
+        prepared.marker.prepared_guard = Some(guard);
+        prepared.read = Some(read);
+        let value = prepare(&PreparedReadView(prepared.read.as_deref().unwrap()))?;
+        prepared.prepared = Some(value);
+        prepared.preserve_failure = false;
+        Ok(prepared)
+    }
+
+    /// Commit while exposing the exact lower durable-publication point.
+    /// A HeaderBegun error retains its original storage error; Durable on Err
+    /// or unwind must be settled by the caller without rollback or rewind.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn commit_publishing(mut self, marker: &DurablePublication) -> Result<(), CommitError> {
+        marker.validate(&self.mem, self.transaction_id)?;
+        if let Some(error) = self.table_root_hook_error.lock().unwrap().take() {
+            return Err(error.into());
+        }
+        // Match consuming commit: no abort of possibly published pages on drop.
+        self.completed = true;
+        self.commit_inner_publishing(marker)
     }
 
     fn commit_inner(&mut self) -> Result<(), CommitError> {
@@ -1583,7 +2459,7 @@ impl WriteTransaction {
             crate::commit_work::observe_commit_span_count();
             crate::commit_work::observe_commit_span(
                 crate::commit_work::CommitSpan::FlushAndClose,
-                span_started.elapsed().as_nanos() as u64,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
             span_started = std::time::Instant::now();
         }
@@ -1597,12 +2473,21 @@ impl WriteTransaction {
             crate::commit_work::observe_commit(data_freed.len(), allocated_pages.len());
             crate::commit_work::set_tag(crate::commit_work::TAG_COMMIT_BOOKKEEPING)
         };
+        if self.transaction_tracker.keep_pace_reclaim {
+            // Reclaim at least as much as this commit frees, so an active writer's backlog does not
+            // grow while eligible older work exists. Explicit budgets above this stay in force.
+            let own = data_freed.len();
+            self.deferred_free_budget = (
+                self.deferred_free_budget.0.max(own),
+                self.deferred_free_budget.1.max(own),
+            );
+        }
         self.store_data_freed_pages(data_freed)?;
         self.store_allocated_pages(allocated_pages)?;
         #[cfg(feature = "test-seams")]
         crate::commit_work::observe_commit_span(
             crate::commit_work::CommitSpan::StorePageLists,
-            span_started.elapsed().as_nanos() as u64,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
 
         #[cfg(feature = "logging")]
@@ -1613,6 +2498,112 @@ impl WriteTransaction {
         match self.durability {
             InternalDurability::None => self.non_durable_commit(user_root)?,
             InternalDurability::Immediate => self.durable_commit(user_root)?,
+        }
+
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::set_tag(restore_tag);
+
+        self.savepoint_state
+            .lock()
+            .unwrap()
+            .apply_on_commit(&self.transaction_tracker);
+
+        assert!(
+            self.system_tables
+                .lock()
+                .unwrap()
+                .system_freed_pages()
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            self.tables
+                .lock()
+                .unwrap()
+                .freed_pages
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        #[cfg(feature = "logging")]
+        debug!(
+            "Finished commit of transaction id={:?}",
+            self.transaction_id
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn commit_inner_publishing(&mut self, marker: &DurablePublication) -> Result<(), CommitError> {
+        // Quick-repair requires 2-phase commit
+        if self.quick_repair {
+            self.two_phase_commit = true;
+        }
+
+        #[cfg(feature = "test-seams")]
+        let span_started = std::time::Instant::now();
+        let (user_root, allocated_pages, data_freed) =
+            self.tables.lock().unwrap().table_tree.flush_and_close()?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span_count();
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::FlushAndClose,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
+
+        self.commit_finalized_publishing(user_root, allocated_pages, data_freed, marker)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn commit_finalized_publishing(
+        &mut self,
+        user_root: Option<BtreeHeader>,
+        allocated_pages: HashSet<PageNumber>,
+        data_freed: Vec<PageNumber>,
+        marker: &DurablePublication,
+    ) -> Result<(), CommitError> {
+        if self.quick_repair { self.two_phase_commit = true; }
+        #[cfg(feature = "test-seams")]
+        let span_started = std::time::Instant::now();
+        let allocated_pages: Vec<_> = allocated_pages.into_iter().collect();
+        // Everything from here to the end of the commit is the commit's own
+        // system-table bookkeeping, and the pages it copies belong to the next
+        // commit's freed list rather than to the one just taken.
+        #[cfg(feature = "test-seams")]
+        let restore_tag = {
+            crate::commit_work::observe_commit(data_freed.len(), allocated_pages.len());
+            crate::commit_work::set_tag(crate::commit_work::TAG_COMMIT_BOOKKEEPING)
+        };
+        if self.transaction_tracker.keep_pace_reclaim {
+            // Reclaim at least as much as this commit frees, so an active writer's backlog does not
+            // grow while eligible older work exists. Explicit budgets above this stay in force.
+            let own = data_freed.len();
+            self.deferred_free_budget = (
+                self.deferred_free_budget.0.max(own),
+                self.deferred_free_budget.1.max(own),
+            );
+        }
+        self.store_data_freed_pages(data_freed)?;
+        self.store_allocated_pages(allocated_pages)?;
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_commit_span(
+            crate::commit_work::CommitSpan::StorePageLists,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+
+        #[cfg(feature = "logging")]
+        debug!(
+            "Committing transaction id={:?} with durability={:?} two_phase={} quick_repair={}",
+            self.transaction_id, self.durability, self.two_phase_commit, self.quick_repair
+        );
+        match self.durability {
+            InternalDurability::None => self.non_durable_commit(user_root)?,
+            InternalDurability::Immediate => self.durable_commit_publishing(user_root, marker)?,
         }
 
         #[cfg(feature = "test-seams")]
@@ -1742,7 +2733,7 @@ impl WriteTransaction {
         debug!("Aborting transaction id={:?}", self.transaction_id);
         self.tables
             .lock()
-            .unwrap()
+            .unwrap_or_else(|error| error.into_inner())
             .table_tree
             .clear_root_updates_and_close();
         // Release all transaction-local savepoint state. The on-disk mutations
@@ -1751,7 +2742,7 @@ impl WriteTransaction {
         // in-memory TransactionTracker state that rollback cannot see.
         self.savepoint_state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|error| error.into_inner())
             .apply_on_abort(&self.transaction_tracker);
         self.mem.rollback_uncommitted_writes()?;
         #[cfg(feature = "logging")]
@@ -1762,16 +2753,19 @@ impl WriteTransaction {
     pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
         #[cfg(feature = "test-seams")]
         let mut span_started = std::time::Instant::now();
-        let free_until_transaction = self
+        let mut free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |x| x.next());
+            .map_or(self.transaction_id, |x| TransactionId::min(x.next(), self.transaction_id));
+        if let Some(ceiling) = self.reclaim_ceiling {
+            free_until_transaction = TransactionId::min(free_until_transaction, ceiling);
+        }
         self.process_freed_pages(free_until_transaction)?;
         #[cfg(feature = "test-seams")]
         {
             crate::commit_work::observe_commit_span(
                 crate::commit_work::CommitSpan::ProcessFreedPages,
-                span_started.elapsed().as_nanos() as u64,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
             span_started = std::time::Instant::now();
         }
@@ -1779,9 +2773,17 @@ impl WriteTransaction {
         let mut system_tables = self.system_tables.lock().unwrap();
         let system_freed_pages = system_tables.system_freed_pages();
         let system_tree = system_tables.table_tree.flush_table_root_updates()?;
-        system_tree
-            .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
-            .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+        let retire_saved_allocator = if self.quick_repair {
+            self.mem.materialize_allocator_source()?;
+            true
+        } else {
+            self.mem.materialize_small_allocator_source()?
+        };
+        if retire_saved_allocator {
+            system_tree
+                .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+                .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+        }
 
         if self.quick_repair {
             system_tree.create_table_and_flush_table_root(
@@ -1827,11 +2829,13 @@ impl WriteTransaction {
         {
             crate::commit_work::observe_commit_span(
                 crate::commit_work::CommitSpan::SystemTree,
-                span_started.elapsed().as_nanos() as u64,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
             span_started = std::time::Instant::now();
         }
 
+        #[cfg(all(feature = "test-seams", unix))]
+        self.pause_reclaim_step_before_durable_publication_from_env()?;
         self.mem.commit(
             user_root,
             system_root,
@@ -1842,7 +2846,7 @@ impl WriteTransaction {
         #[cfg(feature = "test-seams")]
         crate::commit_work::observe_commit_span(
             crate::commit_work::CommitSpan::StorageCommit,
-            span_started.elapsed().as_nanos() as u64,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
 
         // Mark any pending non-durable commits as fully committed.
@@ -1854,6 +2858,146 @@ impl WriteTransaction {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn durable_commit_publishing(
+        &mut self,
+        user_root: Option<BtreeHeader>,
+        marker: &DurablePublication,
+    ) -> Result {
+        #[cfg(feature = "test-seams")]
+        let mut span_started = std::time::Instant::now();
+        let mut free_until_transaction = self
+            .transaction_tracker
+            .oldest_live_read_transaction()
+            .map_or(self.transaction_id, |x| TransactionId::min(x.next(), self.transaction_id));
+        if let Some(ceiling) = self.reclaim_ceiling {
+            free_until_transaction = TransactionId::min(free_until_transaction, ceiling);
+        }
+        self.process_freed_pages(free_until_transaction)?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::ProcessFreedPages,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+            span_started = std::time::Instant::now();
+        }
+
+        let mut system_tables = self.system_tables.lock().unwrap();
+        let system_freed_pages = system_tables.system_freed_pages();
+        let system_tree = system_tables.table_tree.flush_table_root_updates()?;
+        let retire_saved_allocator = if self.quick_repair {
+            self.mem.materialize_allocator_source()?;
+            true
+        } else {
+            self.mem.materialize_small_allocator_source()?
+        };
+        if retire_saved_allocator {
+            system_tree
+                .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+                .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+        }
+
+        if self.quick_repair {
+            system_tree.create_table_and_flush_table_root(
+                ALLOCATOR_STATE_TABLE_NAME,
+                |system_tree_ref, tree: &mut AllocatorStateTreeMut| {
+                    let mut pagination_counter = 0;
+
+                    loop {
+                        let num_regions = self
+                            .mem
+                            .reserve_allocator_state(tree, self.transaction_id)?;
+
+                        // We can't free pages after the commit, because that would invalidate our
+                        // saved allocator state. Everything needs to go through the transactional
+                        // free mechanism
+                        self.store_system_freed_pages(
+                            system_tree_ref,
+                            system_freed_pages.clone(),
+                            None,
+                            &mut pagination_counter,
+                        )?;
+
+                        if self.mem.try_save_allocator_state(tree, num_regions)? {
+                            return Ok(());
+                        }
+
+                        // Clear out the table before retrying, just in case the number of regions
+                        // has somehow shrunk. Don't use retain_in() for this, since it doesn't
+                        // free the pages immediately -- we need to reuse those pages to guarantee
+                        // that our retry loop will eventually terminate
+                        while let Some(guards) = tree.last()? {
+                            let key = guards.0.value();
+                            drop(guards);
+                            tree.remove(&key)?;
+                        }
+                    }
+                },
+            )?;
+        }
+
+        let system_root = system_tree.finalize_dirty_checksums()?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::SystemTree,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+            span_started = std::time::Instant::now();
+        }
+
+        #[cfg(all(feature = "test-seams", unix))]
+        self.pause_reclaim_step_before_durable_publication_from_env()?;
+        self.mem.commit_publishing(
+            user_root,
+            system_root,
+            self.transaction_id,
+            self.two_phase_commit,
+            self.shrink_policy,
+            marker,
+        )?;
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_commit_span(
+            crate::commit_work::CommitSpan::StorageCommit,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+
+        // Mark any pending non-durable commits as fully committed.
+        self.transaction_tracker.clear_pending_non_durable_commits();
+
+        // Immediately free the pages that were freed from the system-tree. These are only
+        // accessed by write transactions, so it's safe to free them as soon as the commit is done.
+        for page in system_freed_pages.lock().unwrap().drain(..) {
+            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
+        }
+
+        Ok(())
+    }
+
+    /// Stop an explicitly armed reclaim transaction after its mutations are
+    /// staged but immediately before durable publication so an integration test
+    /// can terminate the process there.
+    /// This is compiled only into the test-seams Unix test surface.
+    #[cfg(all(feature = "test-seams", unix))]
+    fn pause_reclaim_step_before_durable_publication_from_env(&self) -> Result {
+        const SOCKET_ENV: &str = "WRITECOST_REDB_PAUSE_BEFORE_DURABLE_COMMIT_SOCKET";
+        const MARKER: &[u8] = b"RECLAIM_MUTATIONS_STAGED";
+
+        if self.reclaim_ceiling.is_none() {
+            return Ok(());
+        }
+        let Some(socket) = std::env::var_os(SOCKET_ENV) else {
+            return Ok(());
+        };
+        let stream = std::os::unix::net::UnixDatagram::unbound()?;
+        stream.connect(socket)?;
+        stream.send(MARKER)?;
+        let mut release = [0];
+        stream.recv(&mut release)?;
         Ok(())
     }
 
@@ -1922,6 +3066,9 @@ impl WriteTransaction {
     // Relocate pages to lower number regions/pages
     // Returns true if a page(s) was moved
     pub(crate) fn compact_pages(&mut self) -> Result<bool> {
+        // Relocation can replace the allocator-state tree's source pages. Copy
+        // its lazy bitmap words to scratch before those pages become reusable.
+        self.mem.materialize_allocator_source()?;
         let mut progress = false;
 
         // Find the 1M highest pages
@@ -1996,11 +3143,41 @@ impl WriteTransaction {
     /// fingerprints changed by page movement in this same transaction.
     #[doc(hidden)]
     pub fn compact_step_with_hook(
-        mut self,
+        self,
+        cursor: &mut CompactionCursor,
+        maximum: usize,
+        admit: impl FnMut(usize) -> std::io::Result<()>,
+        on_batch: impl FnOnce(&Self) -> Result<(), StorageError>,
+    ) -> Result<CompactionProgress, crate::CompactionError> {
+        self.compact_step_with_cursor_hook(cursor, maximum, admit, |txn, _| on_batch(txn))
+    }
+
+    /// Checkpoint the successor cursor in the relocation transaction. The
+    /// caller sees the successor in memory only after that commit succeeds.
+    #[doc(hidden)]
+    pub fn compact_step_with_cursor_hook(
+        self,
         cursor: &mut CompactionCursor,
         maximum: usize,
         mut admit: impl FnMut(usize) -> std::io::Result<()>,
-        on_batch: impl FnOnce(&Self) -> Result<(), StorageError>,
+        on_batch: impl FnOnce(&Self, &CompactionCursor) -> Result<(), StorageError>,
+    ) -> Result<CompactionProgress, crate::CompactionError> {
+        self.compact_step_with_cursor_hook_storage(
+            cursor,
+            maximum,
+            |bytes| admit(bytes).map_err(StorageError::from),
+            on_batch,
+        )
+    }
+
+    /// Checkpoint relocation while retaining typed caller admission errors.
+    #[doc(hidden)]
+    pub fn compact_step_with_cursor_hook_storage(
+        mut self,
+        cursor: &mut CompactionCursor,
+        maximum: usize,
+        mut admit: impl FnMut(usize) -> Result<(), StorageError>,
+        on_batch: impl FnOnce(&Self, &CompactionCursor) -> Result<(), StorageError>,
     ) -> Result<CompactionProgress, crate::CompactionError> {
         assert!(maximum > 0);
         if self.transaction_tracker.any_savepoint_exists() {
@@ -2012,7 +3189,7 @@ impl WriteTransaction {
         let mut next = cursor.clone();
         next.active = true;
         let progress = self.compact_page_batch(&mut next, maximum, &mut admit)?;
-        on_batch(&self)?;
+        on_batch(&self, &next)?;
         self.commit_compaction_frees()
             .map_err(|e| e.into_storage_error())?;
         *cursor = next;
@@ -2031,8 +3208,15 @@ impl WriteTransaction {
         &mut self,
         cursor: &mut CompactionCursor,
         maximum: usize,
-        admit: &mut impl FnMut(usize) -> std::io::Result<()>,
+        admit: &mut impl FnMut(usize) -> Result<(), StorageError>,
     ) -> Result<CompactionProgress> {
+        // The saved allocator tree is a live lazy bitmap source. Keep that
+        // one root reachable instead of copying all its words under the writer
+        // lock before a finite batch's admission. Relocating the system master
+        // tree preserves this table's child root. Quick repair and explicit
+        // whole-file compaction detach the source before replacing its pages.
+        let protected_table = (cursor.phase >= 2 && self.mem.has_saved_allocator_source())
+            .then_some(ALLOCATOR_STATE_TABLE_NAME);
         let mut tables = self.tables.lock().unwrap();
         let mut system_tables = self.system_tables.lock().unwrap();
         let tree = if cursor.phase < 2 {
@@ -2040,7 +3224,15 @@ impl WriteTransaction {
         } else {
             &mut system_tables.table_tree
         };
-        let (target, pages, examined) = tree.compaction_page_batch(cursor, maximum)?;
+        let user_table = cursor.phase < 2;
+        let (target, pages, examined) =
+            tree.compaction_page_batch(cursor, maximum, protected_table)?;
+        drop(system_tables);
+        drop(tables);
+        #[cfg(feature = "contextdb-internal")]
+        if user_table && let Some(name) = target.as_deref() {
+            self.call_table_root_hook(name, TableRootEvent::BeforeRelocate)?;
+        }
         let mut relocation_map = HashMap::new();
         let pages = pages
             .into_iter()
@@ -2050,8 +3242,13 @@ impl WriteTransaction {
             if relocation_map.contains_key(&path.page_number()) {
                 continue;
             }
+            let bytes = self
+                .mem
+                .get_page_size()
+                .checked_shl(u32::from(path.page_number().page_order))
+                .ok_or_else(|| StorageError::Corrupted("relocation extent size overflow".into()))?;
+            admit(bytes.saturating_add(128))?;
             let old = self.mem.get_page(path.page_number(), PageHint::None)?;
-            admit(old.memory().len().saturating_add(128))?;
             let mut new = self.mem.allocate_lowest(old.memory().len())?;
             let number = new.get_page_number();
             new.memory_mut()[0] = old.memory()[0];
@@ -2065,8 +3262,15 @@ impl WriteTransaction {
                 if relocation_map.contains_key(parent) {
                     continue;
                 }
+                let bytes = self
+                    .mem
+                    .get_page_size()
+                    .checked_shl(u32::from(parent.page_order))
+                    .ok_or_else(|| {
+                        StorageError::Corrupted("relocation extent size overflow".into())
+                    })?;
+                admit(bytes.saturating_add(128))?;
                 let old = self.mem.get_page(*parent, PageHint::None)?;
-                admit(old.memory().len().saturating_add(128))?;
                 let mut new = self.mem.allocate_lowest(old.memory().len())?;
                 new.memory_mut()[0] = old.memory()[0];
                 relocation_map.insert(*parent, new.get_page_number());
@@ -2076,7 +3280,23 @@ impl WriteTransaction {
         // the normal deferred-free tree. process_freed_pages uses the oldest
         // read transaction fence; neither relocation nor subsequent recording
         // can reuse those addresses until that reader releases its snapshot.
-        tree.relocate_compaction_batch(target.as_deref(), &relocation_map)?;
+        {
+            let mut tables = self.tables.lock().unwrap();
+            let mut system_tables = self.system_tables.lock().unwrap();
+            let tree = if user_table {
+                &mut tables.table_tree
+            } else {
+                &mut system_tables.table_tree
+            };
+            tree.relocate_compaction_batch(target.as_deref(), &relocation_map)?;
+        }
+        #[cfg(feature = "contextdb-internal")]
+        if user_table
+            && !relocation_map.is_empty()
+            && let Some(name) = target.as_deref()
+        {
+            self.call_table_root_hook(name, TableRootEvent::AfterRelocate)?;
+        }
         #[cfg(all(test, debug_assertions))]
         online_relocation_tests::RELOCATIONS.with(|pairs| {
             pairs
@@ -2218,7 +3438,7 @@ impl WriteTransaction {
     pub fn external_snapshot_retention_stats(&self) -> Result<ExternalSnapshotRetentionStats> {
         let snapshots = self
             .transaction_tracker
-            .external_snapshot_page_sets(&self.mem)?;
+            .authenticated_external_snapshot_page_sets(&self.mem)?;
         let protected = snapshots
             .iter()
             .flat_map(|(_, pages)| pages.iter().copied())
@@ -2621,12 +3841,27 @@ impl ReadTransaction {
         mem: Arc<TransactionalMemory>,
         guard: TransactionGuard,
     ) -> Result<Self, TransactionError> {
+        Self::new_with_hint(mem, guard, PageHint::Clean)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn new_verified(
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+    ) -> Result<Self, TransactionError> {
+        Self::new_with_hint(mem, guard, PageHint::Verified)
+    }
+
+    fn new_with_hint(
+        mem: Arc<TransactionalMemory>,
+        guard: TransactionGuard,
+        hint: PageHint,
+    ) -> Result<Self, TransactionError> {
         let root_page = mem.get_data_root();
         let guard = Arc::new(guard);
         Ok(Self {
             mem: mem.clone(),
-            tree: TableTree::new(root_page, PageHint::Clean, guard, mem)
-                .map_err(TransactionError::Storage)?,
+            tree: TableTree::new(root_page, hint, guard, mem).map_err(TransactionError::Storage)?,
         })
     }
 
@@ -2731,6 +3966,21 @@ impl ReadTransaction {
             Some(InternalTableDefinition::Multimap { .. }) => unreachable!(),
             None => None,
         })
+    }
+
+    /// Read one committed normal-table header, distinguishing empty from absent.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn normal_table_root(&self, name: &str) -> Result<Option<Option<[u8; 32]>>, TableError> {
+        Ok(self
+            .tree
+            .get_table_untyped(name, TableType::Normal)?
+            .map(|table| match table {
+                InternalTableDefinition::Normal { table_root, .. } => {
+                    table_root.map(BtreeHeader::to_le_bytes)
+                }
+                InternalTableDefinition::Multimap { .. } => unreachable!(),
+            }))
     }
 
     /// Open the given table without a type
@@ -3113,6 +4363,97 @@ mod test {
         );
         registered.lock().unwrap().clear();
         db.begin_write().unwrap().abort().unwrap();
+        refresh_keeps_native_floor_until_external_installation();
+    }
+
+    fn refresh_keeps_native_floor_until_external_installation() {
+        let file = crate::create_tempfile();
+        let seed = Database::create(file.path()).unwrap();
+        let write = seed.begin_write().unwrap();
+        write.open_table(X).unwrap().insert("first", "old").unwrap();
+        write.commit().unwrap();
+        drop(seed);
+        let supplied = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::clone(&supplied);
+        let backend = FileBackend::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.path())
+                .unwrap(),
+        )
+        .unwrap();
+        let mut builder = Database::builder();
+        builder.set_cache_size(0);
+        let db = builder
+            .open_with_backend_and_external_snapshots(
+                backend,
+                Arc::new(move || Ok(provider.lock().unwrap().clone())),
+            )
+            .unwrap();
+        let oldest = db.begin_read().unwrap();
+        let floor = oldest.storage_snapshot_identity().transaction_id;
+        let write = db.begin_write().unwrap();
+        let tracker = Arc::clone(&write.transaction_tracker);
+        write
+            .open_table(X)
+            .unwrap()
+            .insert("middle", "kept")
+            .unwrap();
+        write.commit().unwrap();
+        let middle = db.begin_read().unwrap();
+        let snapshot = middle.storage_snapshot_identity();
+        drop(middle);
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(X)
+            .unwrap()
+            .insert("latest", "excluded")
+            .unwrap();
+        write.commit().unwrap();
+        supplied.lock().unwrap().push(snapshot);
+
+        // A zero-capacity cache makes authentication fault this historical
+        // root. Release the last original native reader during that real I/O.
+        let release = Arc::new(Mutex::new(Some(oldest)));
+        let observed = Arc::new(Mutex::new(None));
+        let hook_release = Arc::clone(&release);
+        let hook_observed = Arc::clone(&observed);
+        let hook_tracker = Arc::clone(&tracker);
+        let observation = crate::read_admission::observe_backend_reads(Arc::new(move |_| {
+            if let Some(native) = hook_release.lock().unwrap().take() {
+                drop(native);
+                *hook_observed.lock().unwrap() = Some(
+                    hook_tracker
+                        .oldest_live_read_transaction()
+                        .map(|tx| tx.raw_id()),
+                );
+            }
+        }));
+        let admitted = db.begin_external_read(snapshot).unwrap();
+        drop(observation);
+        assert!(
+            release.lock().unwrap().is_none(),
+            "authentication drove the release schedule"
+        );
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(Some(floor)),
+            "the refresh retains its floor until installation"
+        );
+        assert_eq!(
+            tracker.oldest_live_read_transaction().map(|tx| tx.raw_id()),
+            Some(snapshot.transaction_id),
+            "installation transfers retention without keeping the earlier floor"
+        );
+        let table = admitted.open_table(X).unwrap();
+        assert_eq!(table.get("middle").unwrap().unwrap().value(), "kept");
+        assert!(table.get("latest").unwrap().is_none());
+        drop(table);
+        drop(admitted);
+        supplied.lock().unwrap().clear();
+        db.begin_write().unwrap().abort().unwrap();
+        assert!(tracker.oldest_live_read_transaction().is_none());
     }
 }
 
@@ -3717,5 +5058,201 @@ mod bounded_reclamation_tests {
                 .value(),
             &[16; 8192]
         );
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Internal exact lookup over THIS transaction's captured directory.
+    /// Native qualification is restricted to clean misses; legacy cache cells
+    /// are refused rather than retroactively assigned native receipt ownership.
+    #[doc(hidden)]
+    pub fn get_native_byte_value(
+        &self,
+        physical_name: &str,
+        key: &[u8],
+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError>
+    {
+        self.tree.get_native_byte_value(physical_name, key)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Dependency-internal text-key sibling over THIS captured directory.
+    /// Existing byte lookup and all ordinary/public table APIs are unchanged.
+    #[doc(hidden)]
+    pub fn get_native_text_value(
+        &self,
+        physical_name: &str,
+        key: &str,
+    ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError>
+    {
+        self.tree.get_native_text_value(physical_name, key)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Hidden text-key/byte-value range sibling over THIS captured transaction.
+    /// Returns the first key >= lower (or > lower), strictly below upper.
+    /// Raw endpoint bytes support a non-UTF-8 exclusive prefix successor.
+    #[doc(hidden)]
+    pub fn next_native_text_range(
+        &self,
+        physical_name: &str,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
+        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        self.tree
+            .next_native_text_range(physical_name, lower, exclusive, upper, before_page)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Internal byte-key range over this captured transaction; exact raw bounds.
+    #[doc(hidden)]
+    pub fn next_native_byte_range(
+        &self,
+        physical_name: &str,
+        lower: &[u8],
+        exclusive: bool,
+        upper: Option<&[u8]>,
+        before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        self.tree
+            .next_native_byte_range(physical_name, lower, exclusive, upper, before_page)
+    }
+}
+
+/// Internally admitted immutable root and one shared retention guard.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct NativeReadView {
+    mem: Arc<TransactionalMemory>,
+    root: Option<BtreeHeader>,
+    id: TransactionId,
+    _guard: crate::native_storage_admission::NativeStorageShared<TransactionGuard>,
+    admission: crate::native_storage_admission::NativeStorageAdmission,
+}
+#[cfg(feature = "contextdb-internal")]
+impl std::fmt::Debug for NativeReadView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReadView")
+            .field("snapshot", &self.storage_snapshot_identity())
+            .finish()
+    }
+}
+#[cfg(feature = "contextdb-internal")]
+impl NativeReadView {
+    pub(crate) fn new(
+        mem: Arc<TransactionalMemory>,
+        root: Option<BtreeHeader>,
+        id: TransactionId,
+        guard: crate::native_storage_admission::NativeStorageShared<TransactionGuard>,
+        admission: crate::native_storage_admission::NativeStorageAdmission,
+    ) -> Self {
+        Self {
+            mem,
+            root,
+            id,
+            _guard: guard,
+            admission,
+        }
+    }
+    pub fn storage_snapshot_identity(&self) -> StorageSnapshotIdentity {
+        StorageSnapshotIdentity {
+            transaction_id: self.id.raw_id(),
+            user_root: self.root.map(|root| StorageUserRootIdentity {
+                page: root.root.to_le_bytes(),
+                checksum: root.checksum,
+                length: root.length,
+            }),
+        }
+    }
+    pub fn table_root_fingerprint<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Option<[u8; 32]>> {
+        use std::any::TypeId;
+        let u8_key = TypeId::of::<K>() == TypeId::of::<u8>();
+        let text_key = TypeId::of::<K>() == TypeId::of::<&str>();
+        if (!u8_key && !text_key && TypeId::of::<K>() != TypeId::of::<&[u8]>())
+            || TypeId::of::<V>() != TypeId::of::<&[u8]>()
+        {
+            return Err(crate::native_storage_admission::native_storage_error(
+                crate::NativeColdReadError::TypeMismatch,
+            ));
+        }
+        crate::with_native_storage_admission(self.admission.clone(), || {
+            TableTree::captured_native_table_root(
+                self.root,
+                &self.mem,
+                definition.name(),
+                u8_key,
+                text_key,
+            )
+            .map(|table| table.flatten().map(BtreeHeader::to_le_bytes))
+            .map_err(crate::native_storage_admission::native_storage_error)
+        })
+    }
+    pub fn get_native_byte_value(
+        &self,
+        physical_name: &str,
+        key: &[u8],
+    ) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        self.get(physical_name, key, false)
+    }
+    pub fn get_native_text_value(
+        &self,
+        physical_name: &str,
+        key: &str,
+    ) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        crate::with_native_storage_admission(self.admission.clone(), || {
+            TableTree::captured_native_text_get(self.root, &self.mem, physical_name, key)
+        })
+        .map_err(crate::native_storage_admission::native_storage_error)
+    }
+    pub fn get_native_u8_value(
+        &self,
+        physical_name: &str,
+        key: u8,
+    ) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        self.get(physical_name, &[key], true)
+    }
+    fn get(
+        &self,
+        physical_name: &str,
+        key: &[u8],
+        u8_key: bool,
+    ) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        crate::with_native_storage_admission(self.admission.clone(), || {
+            TableTree::captured_native_get(self.root, &self.mem, physical_name, key, u8_key)
+                .map_err(crate::native_storage_admission::native_storage_error)
+        })
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadTransaction {
+    /// Borrow directory records of THIS captured user root; no table-name list.
+    #[doc(hidden)]
+    pub fn next_native_directory_record(&self, lower: &[u8], exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
+        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
+        self.tree.next_native_directory_record(lower, exclusive, before)
+    }
+    /// Internal numeric-key/byte-value range for the vector cleanup owner.
+    #[doc(hidden)]
+    pub fn next_native_u64_bytes_range(&self, name: &str, lower: u64, exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
+        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
+        self.tree.next_native_u64_bytes_range(name, lower, exclusive, before)
     }
 }

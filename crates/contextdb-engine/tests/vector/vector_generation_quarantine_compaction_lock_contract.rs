@@ -198,8 +198,18 @@ fn insert_route(db: &Database, scope: Uuid, first_id: u128, axis: usize) {
 }
 
 fn graph_ready(db: &Database, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(&index(), &partition(scope))
+        .partition_info(
+            &index(),
+            &partition(scope),
+            &mut partition_observation_owner_1,
+        )
+        .unwrap()
         .is_some_and(|info| info.graph_available)
 }
 
@@ -227,9 +237,18 @@ fn reset_vector_trace(db: &Database) {
     db.__reset_last_query_vector_trace_for_test();
 }
 
-fn take_vector_trace(db: &Database, what: &str) -> contextdb_vector::VectorSearchDebugTrace {
-    db.__take_last_query_vector_trace_for_test()
-        .unwrap_or_else(|| panic!("{what}: the completed public query published no vector trace"))
+fn take_vector_trace(
+    db: &Database,
+    what: &str,
+) -> contextdb_engine::database::VectorSearchTraceObservation {
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .unwrap_or_else(|| panic!("{what}: the completed public query published no vector trace"))
 }
 
 fn drive_maintenance_until_ready(db: &Database, scopes: &[Uuid]) {
@@ -689,7 +708,7 @@ fn repair_preserves_a_dormant_generation_selected_by_a_held_old_snapshot() {
     let db = Database::open(&path).expect("reopen with the first graph dormant");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "INSERT INTO generation_items (id, scope_id, embedding) VALUES ($id, $scope, $embedding)",
         &params([
@@ -1111,9 +1130,19 @@ fn caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart
                 &HashMap::new(),
             )
             .unwrap();
+        let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let progress = db
             .vector_store_for_test()
-            .partition_info(&route(alpha).index, &route(alpha).partition_key)
+            .partition_info(
+                &route(alpha).index,
+                &route(alpha).partition_key,
+                &mut partition_observation_owner_2,
+            )
+            .unwrap()
             .unwrap()
             .maintenance_progress;
         pause.release();
@@ -1491,10 +1520,19 @@ fn later_mutations_publish_a_new_generation_truncate_only_covered_journal_and_re
         vec![tail],
         "the later journal suffix remains searchable after restart"
     );
+    let suffix = db
+        .inspect_captured_vector_suffix_for_test(
+            &route(scope),
+            db.snapshot(),
+            db.declared_reader_memory()
+                .expect("admit the restarted suffix reader"),
+            &mut || Ok(()),
+        )
+        .expect("inspect the restarted operation-owned captured suffix")
+        .expect("the post-base suffix remains capturable after restart");
     assert_eq!(
-        generation_status(&db, scope).fresh_tail_entries,
-        1,
-        "restart replays only the post-base suffix, not the compacted history"
+        suffix.points, 1,
+        "restart captures only the post-base suffix, not the compacted history"
     );
 }
 
@@ -1512,7 +1550,7 @@ fn pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_
     drive_maintenance_until_ready(&db, &[scope]);
     let prior_generation = generation(&db, scope);
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "INSERT INTO generation_items (id, scope_id, embedding) VALUES ($id, $scope, $embedding)",
         &params([
@@ -1815,4 +1853,110 @@ fn graph_search_callback_pause_does_not_hold_the_generation_publication_mutex() 
             .expect("released indexed query succeeds"),
         vec![Uuid::from_u128(0xA700)]
     );
+}
+
+/// A route whose selected chain is a published base plus a sealed change, with
+/// both routes' catalogs readable. Returns alpha's ids, the extra change row
+/// included.
+fn seed_base_plus_change_fixture(path: &std::path::Path, alpha: Uuid, bravo: Uuid) -> Vec<Uuid> {
+    seed_durable_two_route_fixture(path, alpha, bravo);
+    let db = Database::open(path).expect("reopen to seal a change generation");
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    let extra = Uuid::from_u128(0xA0FF);
+    db.execute(
+        "INSERT INTO generation_items (id, scope_id, embedding) VALUES ($id, $scope, $embedding)",
+        &params([
+            ("id", Value::Uuid(extra)),
+            ("scope", Value::Uuid(alpha)),
+            ("embedding", Value::Vector(axis(1))),
+        ]),
+    )
+    .expect("commit one newer alpha vector");
+    for _ in 0..MAX_MAINTENANCE_CYCLES {
+        db.run_maintenance_cycle()
+            .expect("publish alpha's change generation");
+        if generation_status(&db, alpha).change.is_some() {
+            break;
+        }
+    }
+    assert!(
+        generation_status(&db, alpha).change.is_some(),
+        "the fixture's alpha route serves a base plus a sealed change"
+    );
+    db.close().expect("close the base-plus-change fixture");
+    let mut ids = route_ids(0xA000);
+    ids.push(extra);
+    ids.sort();
+    ids
+}
+
+/// Damage inside alpha's selected chain (its base or its change) with a readable
+/// catalog quarantines alpha; maintenance then rebuilds alpha from its
+/// authoritative vectors without reading the damaged artifacts, publishes a
+/// fresh generation that survives restart, and leaves bravo untouched.
+fn repair_replaces_a_damaged_chain_member(damage: fn(&std::path::Path, &VectorPartitionRef)) {
+    let root = TempDir::new().expect("temporary durable store directory");
+    let path = root.path().join("repair-chain.redb");
+    let alpha = Uuid::from_u128(0xA105);
+    let bravo = Uuid::from_u128(0xB105);
+    let alpha_ids = seed_base_plus_change_fixture(&path, alpha, bravo);
+    let (old_generation, healthy_generation) = {
+        let db = Database::open(&path).expect("open the healthy chain fixture");
+        let old = generation(&db, alpha);
+        let healthy = generation(&db, bravo);
+        db.close().expect("close before durable damage");
+        (old, healthy)
+    };
+    damage(&path, &route(alpha));
+    {
+        let db = Database::open(&path).expect("open the damaged chain fixture");
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        assert!(
+            matches!(
+                vector_search(&db, alpha, axis(0), "INDEXED"),
+                Err(Error::VectorIndexedRouteUnavailable { .. })
+            ),
+            "the first indexed read finds the damage and quarantines alpha"
+        );
+        drive_maintenance_until_ready(&db, &[alpha]);
+        let repaired = generation(&db, alpha);
+        assert!(
+            repaired.generation_id > old_generation.generation_id,
+            "repair publishes a newer complete generation rather than reusing the damaged chain"
+        );
+        let mut served = vector_search_limit(&db, alpha, axis(0), "INDEXED", alpha_ids.len())
+            .expect("the repaired route serves indexed search");
+        served.sort();
+        assert_eq!(
+            served, alpha_ids,
+            "the repair covers every authoritative alpha row"
+        );
+        assert_eq!(
+            generation(&db, bravo),
+            healthy_generation,
+            "repairing alpha leaves bravo's generation untouched"
+        );
+        db.close().expect("close the repaired store");
+    }
+    let db = Database::open(&path).expect("reopen the repaired store");
+    let mut served = vector_search_limit(&db, alpha, axis(0), "INDEXED", alpha_ids.len())
+        .expect("the repaired route survives restart");
+    served.sort();
+    assert_eq!(served, alpha_ids);
+}
+
+#[test]
+fn repair_replaces_a_damaged_base_under_a_readable_catalog_and_sealed_change() {
+    repair_replaces_a_damaged_chain_member(|path, partition| {
+        Database::__corrupt_vector_partition_base_record_for_test(path, partition)
+            .expect("damage alpha's selected base")
+    });
+}
+
+#[test]
+fn repair_replaces_a_damaged_change_under_a_readable_catalog() {
+    repair_replaces_a_damaged_chain_member(|path, partition| {
+        Database::__corrupt_vector_partition_change_record_for_test(path, partition)
+            .expect("damage alpha's selected change")
+    });
 }

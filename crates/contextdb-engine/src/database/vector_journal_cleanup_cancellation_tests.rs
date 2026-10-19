@@ -150,7 +150,12 @@ fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservati
         }
     });
     *db.last_maintenance_cycle_at.lock() = None;
-    let result = context.run_cycle(CurrencyGate::Always);
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_1.clone());
     drop(hook);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
     assert!(captured_workspace.load(Ordering::SeqCst) > 0);
@@ -204,6 +209,7 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
         .map(|partition| db.vector_store.partition_graph_generation_status(partition))
         .collect::<Vec<_>>();
     let baseline = db.vector_memory_ownership_receipt_for_test();
+    let baseline_writer = db.writer_memory_ownership_receipt_for_test();
     let stop = Arc::new(AtomicBool::new(false));
     let mut context = db.maintenance_context();
     context.worker_stop = Some(Arc::clone(&stop));
@@ -229,7 +235,12 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
         }
     });
     *db.last_maintenance_cycle_at.lock() = None;
-    let result = context.run_cycle(CurrencyGate::Always);
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_2.clone());
     drop(hook);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
     assert!(captured_workspace.load(Ordering::SeqCst) > 0);
@@ -274,8 +285,16 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
     let released = db.vector_memory_ownership_receipt_for_test();
     assert_eq!(released.temporary_workspace, 0);
     assert_eq!(
-        released.non_vector_total, baseline.non_vector_total,
-        "catalog inventory and route reservations also release"
+        released.non_vector_total,
+        baseline.non_vector_total
+            + 2 * MemoryAccountant::writer_vector_adapter_type_layout_for_test().size(),
+        "only the newly installed paged change's standing adapters remain"
+    );
+    let released_writer = db.writer_memory_ownership_receipt_for_test();
+    assert_eq!(released_writer.reconciliation_gap, 0);
+    assert_eq!(
+        released_writer.writer_adapter_controls - baseline_writer.writer_adapter_controls,
+        2 * MemoryAccountant::writer_vector_adapter_type_layout_for_test().size()
     );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
     drop(context);
@@ -489,7 +508,12 @@ fn publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_f
     });
     *db.last_maintenance_cycle_at.lock() = None;
     let context = db.maintenance_context();
-    let result = context.run_cycle(CurrencyGate::Always);
+    let fixture_operation_reader_3 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_3.clone());
     drop(hook);
     assert!(
         matches!(result, Err(Error::PublicationInterrupted)),

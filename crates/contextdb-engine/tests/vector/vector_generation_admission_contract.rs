@@ -188,9 +188,19 @@ fn assert_published(db: &Database, report: contextdb_engine::MaintenanceReport) 
     assert_eq!(report.vector.remaining_partitions, 0, "{report:?}");
     assert!(report.vector.first_failure.is_none(), "{report:?}");
     assert!(report.vector.first_failure_details.is_none());
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let partition = db
         .vector_store_for_test()
-        .partition_info(&route().index, &route().partition_key)
+        .partition_info(
+            &route().index,
+            &route().partition_key,
+            &mut partition_observation_owner_1,
+        )
+        .unwrap()
         .unwrap();
     assert!(partition.graph_available);
     assert_eq!(partition.pending_inserts, 0);
@@ -214,9 +224,14 @@ fn fresh_ten_thousand_dense_vectors_publish_and_restart_under_writer_limit() {
     let path = directory.path().join("fresh.db");
     let db = open(&path);
     seed(&db, 10_000, 24, 400);
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let partitions = db
         .vector_store_for_test()
-        .partition_infos(&route().index)
+        .partition_infos(&route().index, &mut partition_observation_owner_2)
         .unwrap();
     assert_eq!(partitions.len(), 1);
     assert_eq!(partitions[0].live_rows, 10_000);
@@ -253,7 +268,7 @@ fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph()
     assert_eq!(first.vector.built_partitions, 1, "{first:?}");
     assert!(first.vector.first_failure.is_none());
     let old_snapshot = db.snapshot();
-    let pin = db.pin_snapshot(old_snapshot);
+    let pin = db.pin_snapshot(old_snapshot).unwrap();
     let old_generation = generation(&db);
     db.execute(
         "DELETE FROM admission_items WHERE id < 3700",
@@ -275,9 +290,19 @@ fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph()
         }
         db.commit(tx).unwrap();
     }
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let info = db
         .vector_store_for_test()
-        .partition_info(&route().index, &route().partition_key)
+        .partition_info(
+            &route().index,
+            &route().partition_key,
+            &mut partition_observation_owner_3,
+        )
+        .unwrap()
         .unwrap();
     assert_eq!(info.live_rows, 6300);
     assert_eq!(info.retained_rows, 6700);
@@ -446,7 +471,7 @@ fn multiple_pinned_generations_remain_charged_until_their_final_snapshot_release
     assert_indexed(&db, 63, 0);
     let first_generation = generation(&db);
     let first_snapshot = db.snapshot();
-    let first_pin = db.pin_snapshot(first_snapshot);
+    let first_pin = db.pin_snapshot(first_snapshot).unwrap();
     replace_vectors(&db, 1);
     db.execute(
         "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 20, EF_CONSTRUCTION = 300)",
@@ -468,10 +493,10 @@ fn multiple_pinned_generations_remain_charged_until_their_final_snapshot_release
         second_generation.generation_id
     );
     let second_snapshot = db.snapshot();
-    let second_pin = db.pin_snapshot(second_snapshot);
+    let second_pin = db.pin_snapshot(second_snapshot).unwrap();
     // Two independent reader holds at the same generation: releasing one is
     // insufficient to reclaim the graph still reachable by the other.
-    let second_pin_again = db.pin_snapshot(second_snapshot);
+    let second_pin_again = db.pin_snapshot(second_snapshot).unwrap();
     replace_vectors(&db, 2);
     db.execute(
         "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",

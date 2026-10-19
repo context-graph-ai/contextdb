@@ -319,10 +319,13 @@ from an interactive session, because nobody can act on it once the process is go
   `:memory:` accepts and ignores it.
 - **`LIMIT` is required on vector search.** Unbounded `ORDER BY <=>` is rejected. See the
   `vector-search` skill.
-- **Not supported, by design:** `GROUP BY`/`HAVING`, `UNION`/`INTERSECT`/`EXCEPT`,
-  `INSERT ... SELECT`, window functions, `WITH RECURSIVE`, subqueries outside `IN`, and aggregates
-  other than `COUNT` and `SUM` (`AVG`, `MIN` and `MAX` each refuse with
-  `plan error: unknown function`). Full list: [`docs/query-language.md`](../../docs/query-language.md#unsupported-features).
+- **Not supported, by design:** `HAVING`, `UNION`/`INTERSECT`/`EXCEPT`, `INSERT ... SELECT`,
+  `WITH RECURSIVE`, subqueries outside `IN`, and aggregates other than `COUNT` and `SUM` (`AVG`,
+  `MIN` and `MAX` each refuse with `plan error: unknown function`). `GROUP BY` works in one form
+  only — `COUNT(*)` grouped by a column list the table declares under `MAINTAIN COUNT` — and every
+  other grouped form is refused. The one window function is `ROW_NUMBER() OVER ([PARTITION BY
+  cols] ORDER BY cols)`; other window forms are refused by name. Full list:
+  [`docs/query-language.md`](../../docs/query-language.md#unsupported-features).
 - **Logs go to stderr** at level `ERROR` by default; raise with `RUST_LOG=debug`.
 
 ## Verify a store deterministically — run the script, don't hand-check

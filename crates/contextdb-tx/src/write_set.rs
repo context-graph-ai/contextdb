@@ -1,3 +1,4 @@
+use crate::OwnedAdjEntry;
 use contextdb_core::*;
 use std::collections::{HashMap, HashSet};
 
@@ -9,15 +10,23 @@ pub struct RelationalDeletePredicate {
 
 #[derive(Debug, Default, Clone)]
 pub struct WriteSet {
+    /// Captured once at begin; owned with the transaction's staged state.
+    pub base_read: Option<crate::manager::PublishedRead>,
     pub relational_inserts: Vec<(TableName, VersionedRow)>,
+    /// Maintained by the engine's admitted declared-index staging doors.
+    pub ordered_staged_rows: crate::ordered_staged::OrderedStagedRows,
     pub relational_deletes: Vec<(TableName, RowId, TxId)>,
     pub relational_delete_predicates: Vec<RelationalDeletePredicate>,
+    pub row_adj_inserts: Vec<OwnedAdjEntry>,
+    pub row_adj_deletes: Vec<(OwnedAdjEntry, TxId)>,
     pub adj_inserts: Vec<AdjEntry>,
     pub adj_deletes: Vec<(NodeId, EdgeType, NodeId, TxId)>,
     pub vector_inserts: Vec<VectorEntry>,
     pub vector_deletes: Vec<(VectorIndexRef, RowId, TxId)>,
     pub vector_moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
     pub commit_lsn: Option<Lsn>,
+    /// Canonical local visibility identity finalized by the commit manager.
+    pub finalized_tx: Option<TxId>,
     pub relational_insert_source_lsns: HashMap<TableName, HashMap<RowId, Lsn>>,
     pub relational_insert_source_kinds: HashMap<TableName, HashMap<RowId, u8>>,
     /// What each staged row version's admission actually charged, keyed the
@@ -66,6 +75,8 @@ impl WriteSet {
     pub fn is_empty(&self) -> bool {
         self.relational_inserts.is_empty()
             && self.relational_deletes.is_empty()
+            && self.row_adj_inserts.is_empty()
+            && self.row_adj_deletes.is_empty()
             && self.adj_inserts.is_empty()
             && self.adj_deletes.is_empty()
             && self.vector_inserts.is_empty()
@@ -87,6 +98,9 @@ impl WriteSet {
         for entry in &mut self.adj_inserts {
             entry.lsn = lsn;
         }
+        for entry in &mut self.row_adj_inserts {
+            entry.stamp_lsn(lsn);
+        }
 
         for entry in &mut self.vector_inserts {
             entry.lsn = lsn;
@@ -105,13 +119,58 @@ impl WriteSet {
             inserts.reverse();
             self.relational_inserts = inserts;
         }
+        if self.row_adj_inserts.len() > 1 {
+            // The staged owner and this temporary key are the two owner
+            // copies covered by OwnedAdjEntry::estimated_bytes. Native engine
+            // staging uses admitted auxiliary splices instead of this legacy
+            // WriteSet canonicalization door.
+            let mut seen = HashSet::new();
+            let mut inserts = self
+                .row_adj_inserts
+                .drain(..)
+                .rev()
+                .filter(|owned| seen.insert(owned.owner.clone()))
+                .collect::<Vec<_>>();
+            inserts.reverse();
+            self.row_adj_inserts = inserts;
+        }
+        self.rebind_ordered_staged_rows();
+    }
+
+    /// Call after checkpoint truncation/restoration as well as canonicalization.
+    pub fn rebind_ordered_staged_rows(&mut self) {
+        if self.ordered_staged_rows.is_empty() {
+            return;
+        }
+        // Posting admission reserves this transient position/control map as
+        // well as retained keys. No row values or index keys are copied here.
+        let mut positions: HashMap<&str, HashMap<RowId, (usize, TxId)>> = HashMap::new();
+        for (position, (table, row)) in self.relational_inserts.iter().enumerate() {
+            positions
+                .entry(table.as_str())
+                .or_default()
+                .insert(row.row_id, (position, row.created_tx));
+        }
+        self.ordered_staged_rows.rebind(&positions);
     }
 
     pub fn reassign_tx(&mut self, from: TxId, to: TxId) {
+        if self.finalized_tx == Some(from) {
+            self.finalized_tx = Some(to);
+        }
         if from == to {
             return;
         }
 
+        self.ordered_staged_rows.reassign_tx(from, to);
+        for entry in &mut self.row_adj_inserts {
+            entry.reassign_tx(from, to);
+        }
+        for (_, deleted_tx) in &mut self.row_adj_deletes {
+            if *deleted_tx == from {
+                *deleted_tx = to;
+            }
+        }
         for (_, row) in &mut self.relational_inserts {
             if row.created_tx == from {
                 row.created_tx = to;
@@ -196,6 +255,7 @@ impl WriteSet {
     /// staged versions in bulk; a record left behind for one of them would be
     /// read again if the same row identity were staged a second time.
     pub fn forget_admitted_bytes_for_unstaged_rows(&mut self) {
+        self.rebind_ordered_staged_rows();
         if self.relational_insert_admitted_bytes.is_empty() {
             return;
         }
@@ -273,13 +333,67 @@ pub fn row_matches_delete_predicates(
 }
 
 pub trait WriteSetApplicator: Send + Sync {
-    fn apply(&self, ws: &WriteSet) -> Result<()>;
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()>;
     fn new_row_id(&self) -> RowId;
+    /// Return the already prepared root after successful durable apply. All
+    /// fallible reservation/root creation belongs to prepare/apply; a failure
+    /// after durability must poison the writer, never report rollback.
+    /// Admit the successor root before a direct metadata persistence callback.
+    fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        Ok(None)
+    }
+    /// Durability has succeeded; failure must terminate serving, never roll back.
+    fn complete_metadata_publication(
+        &self,
+        _reservation: Option<Box<dyn std::any::Any + Send>>,
+        _snapshot: SnapshotId,
+        _lsn: Lsn,
+    ) {
+    }
+    fn publication_interrupted(&self) -> bool {
+        false
+    }
+    /// Private Native transport; a selected Native store never exports its root
+    /// through the Legacy raw Arc hook.
+    #[doc(hidden)]
+    fn native_publication_handle(&self) -> Option<crate::native_capture::NativeCapture> { None }
+    fn publication_handle(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
 }
 
 impl WriteSetApplicator for Box<dyn WriteSetApplicator> {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
-        (**self).apply(ws)
+    fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        (**self).reserve_metadata_publication()
+    }
+    fn complete_metadata_publication(
+        &self,
+        reservation: Option<Box<dyn std::any::Any + Send>>,
+        snapshot: SnapshotId,
+        lsn: Lsn,
+    ) {
+        (**self).complete_metadata_publication(reservation, snapshot, lsn);
+    }
+    fn publication_interrupted(&self) -> bool {
+        (**self).publication_interrupted()
+    }
+    fn native_publication_handle(&self) -> Option<crate::native_capture::NativeCapture> {
+        (**self).native_publication_handle()
+    }
+    fn publication_handle(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        (**self).publication_handle()
+    }
+
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        (**self).apply(ws, read_memory)
     }
 
     fn new_row_id(&self) -> RowId {

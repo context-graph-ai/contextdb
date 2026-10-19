@@ -30,6 +30,7 @@ pub trait RelationalExecutor: Send + Sync {
 }
 
 pub trait GraphExecutor: Send + Sync {
+    #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     fn bfs(
         &self,
         start: NodeId,
@@ -38,6 +39,7 @@ pub trait GraphExecutor: Send + Sync {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
     ) -> Result<TraversalResult>;
     #[allow(clippy::type_complexity)]
     fn neighbors(
@@ -46,6 +48,7 @@ pub trait GraphExecutor: Send + Sync {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
+        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<(NodeId, EdgeType, HashMap<String, Value>)>>;
     fn insert_edge(
         &self,
@@ -54,11 +57,21 @@ pub trait GraphExecutor: Send + Sync {
         target: NodeId,
         edge_type: EdgeType,
         properties: HashMap<String, Value>,
+        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
     ) -> Result<bool>;
-    fn delete_edge(&self, tx: TxId, source: NodeId, target: NodeId, edge_type: &str) -> Result<()>;
+    fn delete_edge(
+        &self,
+        tx: TxId,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+    ) -> Result<()>;
 }
 
 pub trait VectorExecutor: Send + Sync {
+    type SearchOwner;
+    type SearchOutput: IntoIterator<Item = (RowId, f32)> + std::ops::Deref<Target = [(RowId, f32)]>;
     fn search(
         &self,
         index: VectorIndexRef,
@@ -66,20 +79,32 @@ pub trait VectorExecutor: Send + Sync {
         k: usize,
         candidates: Option<&roaring::RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<Vec<(RowId, f32)>>;
+        owner: Self::SearchOwner,
+    ) -> Result<Self::SearchOutput>;
     fn insert_vector(
         &self,
         tx: TxId,
         index: VectorIndexRef,
         row_id: RowId,
         vector: Vec<f32>,
+        executing_owner: Self::SearchOwner,
     ) -> Result<()>;
-    fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()>;
+    fn delete_vector(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+        executing_owner: Self::SearchOwner,
+    ) -> Result<()>;
 }
 
 pub trait TransactionManager: Send + Sync {
     fn begin(&self) -> TxId;
-    fn commit(&self, tx: TxId) -> Result<()>;
+    fn commit(
+        &self,
+        tx: TxId,
+        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+    ) -> Result<()>;
     fn rollback(&self, tx: TxId) -> Result<()>;
     fn snapshot(&self) -> SnapshotId;
 }

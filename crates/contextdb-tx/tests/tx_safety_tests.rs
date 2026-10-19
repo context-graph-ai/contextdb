@@ -1,3 +1,5 @@
+#[path = "support/read_memory.rs"]
+mod test_read_memory;
 use contextdb_core::{Error, Lsn, Result, RowId, TxId, Value, VersionedRow};
 use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
 use parking_lot::{Condvar, Mutex};
@@ -14,9 +16,13 @@ struct FailingStore {
 }
 
 impl WriteSetApplicator for FailingStore {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         if self.fail_apply.load(Ordering::SeqCst) {
-            return Err(Error::Other("apply failed".to_string()));
+            return Err(Error::Other("apply failed".to_string().into()));
         }
         self.applied.lock().push(ws.clone());
         Ok(())
@@ -53,7 +59,11 @@ impl BlockingStore {
 }
 
 impl WriteSetApplicator for BlockingStore {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         let mut state = self.state.lock();
         self.apply_entered.store(true, Ordering::SeqCst);
         self.waiters.notify_all();
@@ -102,7 +112,12 @@ fn tx_01_failed_apply_removes_transaction_under_commit_lock() {
         .expect("sync floor should stage before commit");
     stage_empty_row(&txm, tx, 1);
 
-    let err = txm.commit(tx).expect_err("commit should fail");
+    let err = txm
+        .commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .expect_err("commit should fail");
     assert!(
         err.to_string().contains("apply failed"),
         "expected applicator failure, got {err}"
@@ -110,7 +125,7 @@ fn tx_01_failed_apply_removes_transaction_under_commit_lock() {
 
     txm.store().fail_apply.store(false, Ordering::SeqCst);
     assert!(
-        matches!(txm.commit(tx), Err(Error::TxNotFound(missing)) if missing == tx),
+        matches!(txm.commit(tx, std::sync::Arc::new(test_read_memory::TestReadMemory::default())), Err(Error::TxNotFound(missing)) if missing == tx),
         "failed commit must not leave a retryable active transaction"
     );
     assert!(
@@ -135,7 +150,12 @@ fn tx_02_commit_failure_does_not_advance_watermark() {
     let before = txm.snapshot();
     stage_empty_row(&txm, tx, 1);
 
-    let _ = txm.commit(tx).expect_err("commit should fail");
+    let _ = txm
+        .commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .expect_err("commit should fail");
 
     assert_eq!(
         txm.snapshot(),
@@ -163,7 +183,11 @@ fn tx_03_sync_txid_floor_is_not_visible_until_commit() {
         "staging a peer TxId must not advance public visibility before commit"
     );
 
-    txm.commit(tx).expect("commit should succeed");
+    txm.commit(
+        tx,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("commit should succeed");
     assert_eq!(
         txm.snapshot().0,
         100,
@@ -183,7 +207,12 @@ fn tx_04_failed_apply_rewinds_lsn_allocator() {
     let before = txm.current_lsn();
     stage_empty_row(&txm, tx, 1);
 
-    let _ = txm.commit(tx).expect_err("commit should fail");
+    let _ = txm
+        .commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .expect_err("commit should fail");
 
     assert_eq!(
         txm.current_lsn(),
@@ -203,7 +232,12 @@ fn tx_05_commit_removes_active_transaction_before_apply() {
     stage_empty_row(&txm, tx, 1);
 
     let committing = Arc::clone(&txm);
-    let handle = thread::spawn(move || committing.commit(tx));
+    let handle = thread::spawn(move || {
+        committing.commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+    });
 
     txm.store().wait_until_apply_entered();
     assert!(
@@ -234,7 +268,7 @@ fn tx_06_failed_ddl_lsn_allocation_does_not_advance_current_lsn() {
     let before = txm.current_lsn();
 
     let err = txm
-        .allocate_ddl_lsn(|_| Err::<(), _>(Error::Other("ddl log failed".to_string())))
+        .allocate_ddl_lsn(|_| Err::<(), _>(Error::Other("ddl log failed".to_string().into())))
         .expect_err("failed DDL logging should surface");
 
     assert!(
@@ -275,7 +309,7 @@ fn tx_07_prepare_runs_after_transaction_is_frozen() {
     .expect("write set exists before commit");
 
     let (_, committed_ws) = txm
-        .commit_with_lsn_prepared(tx, |ws| {
+        .commit_with_lsn_prepared(tx, std::sync::Arc::new(test_read_memory::TestReadMemory::default()), |ws| {
             assert_eq!(
                 ws.commit_lsn,
                 Some(Lsn(1)),
@@ -342,14 +376,18 @@ fn tx_08_prepare_apply_and_return_see_canonical_final_rows() {
     .expect("write set exists before commit");
 
     let (_, committed_ws) = txm
-        .commit_with_lsn_prepared(tx, |ws| {
-            assert_eq!(ws.relational_inserts.len(), 1);
-            assert_eq!(
-                ws.relational_inserts[0].1.values.get("v"),
-                Some(&Value::Text("new".to_string()))
-            );
-            Ok(())
-        })
+        .commit_with_lsn_prepared(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            |ws| {
+                assert_eq!(ws.relational_inserts.len(), 1);
+                assert_eq!(
+                    ws.relational_inserts[0].1.values.get("v"),
+                    Some(&Value::Text("new".to_string()))
+                );
+                Ok(())
+            },
+        )
         .expect("commit should succeed");
 
     assert_eq!(committed_ws.relational_inserts.len(), 1);
@@ -379,7 +417,7 @@ fn tx_09_after_apply_publication_precedes_commit_visibility() {
 
     let (lsn, _) = txm
         .commit_with_lsn_active_prepare_and_applied_mut(
-            tx,
+            tx, std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
             |_, _| Ok(()),
             |_| Ok(()),
             |lsn, _| {

@@ -44,6 +44,21 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
             .map(|tx| tx.0)
             .unwrap(),
     );
+    let persistence_fixture_parent_1 =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            load.source
+                .verified_ordered_runs
+                .memory
+                .accountant
+                .usage()
+                .limit
+                .map(|bytes| bytes as u64)
+                .unwrap_or(u64::MAX),
+        );
+    let persistence_fixture_reader_1 = persistence_fixture_parent_1
+        .child()
+        .expect("admit the persistence fixture reader child");
+
     load.source
         .bounded_relational_ordered_next(
             "postings",
@@ -54,6 +69,7 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
             &mut || Ok(()),
             &mut || Ok(()),
             &mut |_| Ok(()),
+            persistence_fixture_reader_1,
         )
         .map(|row| row.map(|row| row.row_id))
 }
@@ -122,6 +138,21 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
                         .map(|tx| tx.0)
                         .unwrap(),
                 );
+                let persistence_fixture_parent_2 =
+                    crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                        load.source
+                            .verified_ordered_runs
+                            .memory
+                            .accountant
+                            .usage()
+                            .limit
+                            .map(|bytes| bytes as u64)
+                            .unwrap_or(u64::MAX),
+                    );
+                let persistence_fixture_reader_2 = persistence_fixture_parent_2
+                    .child()
+                    .expect("admit the persistence fixture reader child");
+
                 let error = load.source.bounded_visit_verified_ordered_identities(
                     "postings",
                     "by_bucket",
@@ -132,6 +163,7 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
                         actual.push(id);
                         Err(Error::Other("suspend after delivery".into()))
                     },
+                    persistence_fixture_reader_2,
                 );
                 assert!(error.is_err());
             } else {
@@ -169,6 +201,361 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
 
 #[test]
 fn canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings() {
+    // Historical point and identity batches prove the complete addressed
+    // version group before exposing values or absence. The private historical
+    // variants have no public older-snapshot entry.
+    {
+        let mut failed_doors = Vec::new();
+        for door in ["point", "identity", "authentication_batch"] {
+            for damage in [
+                "missing_interior_version",
+                "entirely_missing_deleted_group",
+                "injected_extra_version",
+                "reordered_version_bodies",
+                "false_terminal_absence",
+            ] {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    use redb::ReadableTable;
+                    let directory = tempfile::tempdir().unwrap();
+                    let path = directory.path().join("historical-door.db");
+                    let db = Database::open(&path).unwrap();
+                    db.execute(
+                        "CREATE TABLE version_rows (id INT PRIMARY KEY, body TEXT)",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                    db.execute(
+                        "CREATE TABLE control_rows (id INT PRIMARY KEY, body TEXT)",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                    db.execute(
+                        "INSERT INTO control_rows (id, body) VALUES (1, 'unaffected')",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                    db.execute(
+                        "INSERT INTO version_rows (id, body) VALUES (1, 'first')",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                    db.execute(
+                        "UPDATE version_rows SET body = 'interior' WHERE id = 1",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                    let historical = db.writer_read_root().unwrap().unwrap().snapshot;
+                    let interior = db
+                        .scan("version_rows", historical)
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    db.execute(
+                        "UPDATE version_rows SET body = 'head' WHERE id = 1",
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                    if damage == "entirely_missing_deleted_group" {
+                        db.execute("DELETE FROM version_rows WHERE id = 1", &HashMap::new())
+                            .unwrap();
+                    }
+                    let current = db.writer_read_root().unwrap().unwrap().snapshot;
+                    let meta = db.table_meta("version_rows").unwrap();
+                    let control_meta = db.table_meta("control_rows").unwrap();
+                    let control_row = db
+                        .scan("control_rows", current)
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let control_before = db
+                        .scan("control_rows", current)
+                        .unwrap()
+                        .into_iter()
+                        .map(|row| (row.row_id, row.values))
+                        .collect::<Vec<_>>();
+                    let read_memory = db.declared_reader_memory().unwrap();
+                    let fixture_writer_accountant = db.bounded_read_accountant();
+                    let before = [historical, current].map(|snapshot| {
+                        db.scan("version_rows", snapshot)
+                            .unwrap()
+                            .into_iter()
+                            .map(|row| (row.row_id, row.values))
+                            .collect::<Vec<_>>()
+                    });
+                    drop(db);
+                    {
+                        let (image, receipt, source) = load_read_image(&path).unwrap().into_parts();
+                        receipt.validate_released().unwrap();
+                        let mut authentication =
+                            source.content_identity.batch(RETAINED_CONTENT_PROOF_BYTES);
+                        let (control, _control_memory) = source
+                            .with_read(|read| {
+                                source.row_identity_by_id_in_read(
+                                    read,
+                                    "control_rows",
+                                    &control_meta,
+                                    control_row.row_id,
+                                    current,
+                                    Some(&mut authentication),
+                                )
+                            })
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            (control.row_id, control.values),
+                            (control_row.row_id, control_row.values.clone()),
+                            "{door}/{damage}: the shared real authentication batch first proves the unaffected identity and value"
+                        );
+                        for (snapshot, expected) in [historical, current].into_iter().zip(&before) {
+                            let actual = source
+                                .with_read(|read| match door {
+                                    "point" => source.row_by_id_in_read(
+                                        read,
+                                        "version_rows",
+                                        &meta,
+                                        interior.row_id,
+                                        snapshot,
+                                    ),
+                                    "identity" => source.row_identity_by_id_in_read(
+                                        read,
+                                        "version_rows",
+                                        &meta,
+                                        interior.row_id,
+                                        snapshot,
+                                        None,
+                                    ),
+                                    "authentication_batch" => source.row_identity_by_id_in_read(
+                                        read,
+                                        "version_rows",
+                                        &meta,
+                                        interior.row_id,
+                                        snapshot,
+                                        Some(&mut authentication),
+                                    ),
+                                    _ => unreachable!(),
+                                })
+                                .unwrap()
+                                .into_iter()
+                                .map(|(row, _memory)| (row.row_id, row.values))
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                actual, *expected,
+                                "{door}/{damage}: lawful complete historical/current answer equals fresh public scan at the same snapshot"
+                            );
+                        }
+                        drop(authentication);
+                        drop((source, image));
+                    }
+
+                    // The production decoder identifies the interior member. The raw
+                    // mutation below copies production-encoded bytes without a codec.
+                    let fixture_open_accountant_261 =
+                        std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+                    let _fixture_decode_scope_261 =
+                        crate::read_image_memory::ImageMemory::enter_writer_operation(
+                            std::sync::Arc::clone(&fixture_open_accountant_261).into(),
+                        )
+                        .unwrap();
+                    let store = RedbPersistence::open(&path).unwrap();
+                    store.attach_memory_accountant(
+                        std::sync::Arc::clone(&fixture_open_accountant_261).into(),
+                    );
+                    let versions = store.load_relational_table("version_rows").unwrap();
+                    let interior_position = versions
+                        .iter()
+                        .position(|row| {
+                            row.row_id == interior.row_id
+                                && row.created_tx == interior.created_tx
+                                && row.lsn == interior.lsn
+                        })
+                        .unwrap();
+                    drop(store);
+                    drop(_fixture_decode_scope_261);
+                    let table_name = RedbPersistence::rel_table_name("version_rows");
+                    let definition = redb::TableDefinition::<&[u8], &[u8]>::new(&table_name);
+                    let raw = redb::Database::create(&path).unwrap();
+                    let saved = {
+                        let read = raw.begin_read().unwrap();
+                        let table = read.open_table(definition).unwrap();
+                        table
+                            .iter()
+                            .unwrap()
+                            .map(|entry| {
+                                let (key, value) = entry.unwrap();
+                                (key.value().to_vec(), value.value().to_vec())
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        saved.len(),
+                        versions.len(),
+                        "the corruption fixture maps every saved key to the production-decoded sequence"
+                    );
+                    drop(raw);
+                    if damage == "injected_extra_version" {
+                        // Lawful public replacement retires this exact member first;
+                        // injecting its original bytes leaves an extra physical member.
+                        let fixture_open_accountant_283 = fixture_writer_accountant.clone();
+                        let _fixture_decode_scope_283 =
+                            crate::read_image_memory::ImageMemory::enter_writer_operation(
+                                fixture_open_accountant_283.clone(),
+                            )
+                            .unwrap();
+                        let store = RedbPersistence::open(&path).unwrap();
+                        store.attach_memory_accountant(fixture_open_accountant_283.clone());
+                        let retained = versions
+                            .iter()
+                            .enumerate()
+                            .filter(|(position, _)| *position != interior_position)
+                            .map(|(_, row)| row.clone())
+                            .collect::<Vec<_>>();
+                        store.rewrite_table_rows("version_rows", &retained).unwrap();
+                        drop(store);
+                        drop(_fixture_decode_scope_283);
+                    }
+                    let raw = redb::Database::create(&path).unwrap();
+                    let write = raw.begin_write().unwrap();
+                    {
+                        let mut table = write.open_table(definition).unwrap();
+                        match damage {
+                            "missing_interior_version" => {
+                                table.remove(saved[interior_position].0.as_slice()).unwrap();
+                            }
+                            "entirely_missing_deleted_group" | "false_terminal_absence" => {
+                                for (key, _) in &saved {
+                                    table.remove(key.as_slice()).unwrap();
+                                }
+                            }
+                            "injected_extra_version" => {
+                                let (key, value) = &saved[interior_position];
+                                table.insert(key.as_slice(), value.as_slice()).unwrap();
+                            }
+                            "reordered_version_bodies" => {
+                                // Redb orders keys. Exchanging two intact encoded bodies
+                                // makes their version identities disagree with that order.
+                                table
+                                    .insert(
+                                        saved[0].0.as_slice(),
+                                        saved[interior_position].1.as_slice(),
+                                    )
+                                    .unwrap();
+                                table
+                                    .insert(
+                                        saved[interior_position].0.as_slice(),
+                                        saved[0].1.as_slice(),
+                                    )
+                                    .unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    write.commit().unwrap();
+                    drop(raw);
+                    let (image, receipt, source) = crate::persistence::load_read_image(&path)
+                        .unwrap()
+                        .into_parts();
+                    receipt.validate_released().unwrap();
+
+                    let mut authentication =
+                        source.content_identity.batch(RETAINED_CONTENT_PROOF_BYTES);
+                    let (control, _control_memory) = source
+                        .with_read(|read| {
+                            source.row_identity_by_id_in_read(
+                                read,
+                                "control_rows",
+                                &control_meta,
+                                control_row.row_id,
+                                current,
+                                Some(&mut authentication),
+                            )
+                        })
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        (control.row_id, control.values),
+                        (control_row.row_id, control_row.values.clone()),
+                        "{door}/{damage}: a batch proves the unaffected identity before the affected group refuses"
+                    );
+                    for snapshot in [historical, current] {
+                        let answer = source.with_read(|read| match door {
+                            "point" => source.row_by_id_in_read(
+                                read,
+                                "version_rows",
+                                &meta,
+                                interior.row_id,
+                                snapshot,
+                            ),
+                            "identity" => source.row_identity_by_id_in_read(
+                                read,
+                                "version_rows",
+                                &meta,
+                                interior.row_id,
+                                snapshot,
+                                None,
+                            ),
+                            "authentication_batch" => source.row_identity_by_id_in_read(
+                                read,
+                                "version_rows",
+                                &meta,
+                                interior.row_id,
+                                snapshot,
+                                Some(&mut authentication),
+                            ),
+                            _ => unreachable!(),
+                        });
+                        match answer {
+                            Err(Error::StoreCorrupted {
+                                path: actual,
+                                reason,
+                            }) => {
+                                assert_eq!(
+                                    actual,
+                                    path.display().to_string(),
+                                    "{door}/{damage}: corruption identifies the affected store"
+                                );
+                                assert!(
+                                    !reason.is_empty(),
+                                    "{door}/{damage}: corruption has an explanation"
+                                );
+                            }
+                            other => panic!(
+                                "{door}/{damage}: historical/current point refuses before an affected value or false absence, got {other:?}"
+                            ),
+                        }
+                    }
+                    let mut unaffected = Vec::new();
+                    source
+                        .bounded_visit_relational_rows(
+                            "control_rows",
+                            &control_meta,
+                            current,
+                            |row| {
+                                unaffected.push((row.row_id, row.values.clone()));
+                                Ok::<(), Error>(())
+                            },
+                            read_memory.clone(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        unaffected, control_before,
+                        "{door}/{damage}: unaffected table retains the complete fresh control answer"
+                    );
+                    drop(authentication);
+                    drop((source, image));
+                }));
+                if outcome.is_err() {
+                    failed_doors.push((door, damage));
+                }
+            }
+        }
+        assert_eq!(
+            failed_doors,
+            Vec::<(&str, &str)>::new(),
+            "every named historical private door executes its own lawful and corrupt oracle"
+        );
+    }
     for damage in ["missing", "extra", "changed", "hidden"] {
         for reverse in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -344,6 +731,21 @@ fn the_pinned_working_set_does_not_grow_with_the_range() {
                 .map(|tx| tx.0)
                 .unwrap(),
         );
+        let persistence_fixture_parent_3 =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                load.source
+                    .verified_ordered_runs
+                    .memory
+                    .accountant
+                    .usage()
+                    .limit
+                    .map(|bytes| bytes as u64)
+                    .unwrap_or(u64::MAX),
+            );
+        let persistence_fixture_reader_3 = persistence_fixture_parent_3
+            .child()
+            .expect("admit the persistence fixture reader child");
+
         load.source
             .bounded_relational_ordered_next(
                 "wide",
@@ -354,6 +756,7 @@ fn the_pinned_working_set_does_not_grow_with_the_range() {
                 &mut || Ok(()),
                 &mut || Ok(()),
                 &mut |_| Ok(()),
+                persistence_fixture_reader_3,
             )
             .map(|row| row.map(|row| row.row_id))
     }
@@ -589,15 +992,43 @@ fn a_budget_too_small_for_one_working_page_is_still_the_typed_refusal() {
     let path = dir.path().join("no-room.db");
     fixture(&path);
     let load = load_read_image_with_memory(&path, Some(256 * 1024 * 1024)).unwrap();
-    let memory = Arc::clone(&load.source.verified_ordered_runs.memory);
-    let free = (256 * 1024 * 1024usize).saturating_sub(memory.accountant.usage().used);
+    let reader = load.image.open_context.read_memory();
+    let memory = crate::read_image_memory::ImageMemory::charging_reader(
+        load.source.verified_ordered_runs.memory.accountant.clone(),
+        reader.clone(),
+    );
+    let free = match memory.reserve(256 * 1024 * 1024) {
+        Err(Error::MemoryBudgetExceeded {
+            available_bytes, ..
+        }) => available_bytes,
+        other => panic!("the supplied reader has a finite declared ceiling: {other:?}"),
+    };
     // Leave a few hundred bytes: not a page, not a descent, not one posting.
     memory
         .reserve(free.saturating_sub(256))
         .expect("the session may hold what it has already admitted");
 
     let mut walk = cursor(false);
-    let refused = pull(&load, &mut walk);
+    let meta = &load.image.table_meta["postings"];
+    let declaration = RedbPersistence::relational_index_declarations(meta)
+        .into_iter()
+        .find(|d| d.name == "by_bucket")
+        .unwrap();
+    let snapshot = SnapshotId(load.image.newest_committed_tx_for_test().unwrap().0);
+    let refused = load
+        .source
+        .bounded_relational_ordered_next(
+            "postings",
+            meta,
+            &declaration,
+            snapshot,
+            &mut walk,
+            &mut || Ok(()),
+            &mut || Ok(()),
+            &mut |_| Ok(()),
+            reader,
+        )
+        .map(|row| row.map(|row| row.row_id));
     assert!(
         matches!(refused, Err(Error::MemoryBudgetExceeded { .. })),
         "a budget that cannot hold one working page is the existing typed \

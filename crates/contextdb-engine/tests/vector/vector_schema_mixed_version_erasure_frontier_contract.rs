@@ -136,7 +136,8 @@ async fn start_server(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -199,7 +200,8 @@ async fn a_held_tables_authoritative_purge_reaches_the_old_copy_after_upgrade() 
         broker.client_as(&receiver_node),
         TenantId::from(PURGE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -304,7 +306,8 @@ async fn a_rebuilt_edge_with_the_same_identity_receives_compatible_history_from_
         broker.client_as(&receiver_node),
         TenantId::from(REBUILT_EDGE_TENANT),
         receiver_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -334,7 +337,8 @@ async fn a_rebuilt_edge_with_the_same_identity_receives_compatible_history_from_
         broker.client_as(&receiver_node),
         TenantId::from(REBUILT_EDGE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -381,7 +385,8 @@ async fn a_rebuilt_hub_with_the_same_identity_receives_compatible_history_from_z
         broker.client_as(&edge_node),
         TenantId::from(REBUILT_HUB_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
     client
         .push()
@@ -444,7 +449,8 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
             broker.client_as(&edge_node),
             TenantId::from(SCHEMA_RACE_TENANT),
             edge_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
 
     let socket_root = tempfile::Builder::new()
@@ -613,7 +619,8 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         broker.client_as(&edge_node),
         TenantId::from(POLICY_SYNC_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.expect(
         "both peers run at PROTOCOL_VERSION: the vector policy vocabulary is not held back",
     );
@@ -839,4 +846,162 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
 
     running.stop().await;
     edge.close().expect("close policy-sync edge");
+}
+
+// Graph row ownership uses the existing authenticated purge/restore journey.
+// Two same-triad rows must reconstruct two local bindings; sending their
+// adjacency again as standalone EdgeChange would leave an erased artifact.
+#[tokio::test]
+async fn sibling_edge_rows_survive_replication_retry_erasure_and_a_wiped_receiver() {
+    const TENANT: &str = "edge-row-ownership";
+    let root = tempfile::TempDir::new().unwrap();
+    let source = Arc::new(Database::open(root.path().join("edge-source.db")).unwrap());
+    let receiver_path = root.path().join("edge-receiver.db");
+    let receiver = Arc::new(Database::open(&receiver_path).unwrap());
+    source.execute(
+        "CREATE TABLE edge_rows (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL, context_id UUID NOT NULL, valid_from TXID NOT NULL, valid_to TXID, properties JSON, subtype_key TEXT NOT NULL, UNIQUE(source_id,target_id,edge_type,subtype_key)) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        &empty()).unwrap();
+    let (start, target, context) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    for (id, subtype) in [(first, "first"), (second, "second")] {
+        source.execute(
+            "INSERT INTO edge_rows (id,source_id,target_id,edge_type,context_id,valid_from,subtype_key) VALUES ($id,$source,$target,'RELATES_TO',$context,$from,$subtype)",
+            &params([("id",Value::Uuid(id)),("source",Value::Uuid(start)),("target",Value::Uuid(target)),
+                ("context",Value::Uuid(context)),("from",Value::TxId(contextdb_core::TxId(1))),("subtype",Value::Text(subtype.into()))])).unwrap();
+    }
+    let traverse = |db: &Database| {
+        db.execute(
+        "SELECT t FROM GRAPH_TABLE(edge_rows MATCH (a)-[:RELATES_TO]->(b) WHERE a.id=$start COLUMNS(b.id AS t))",
+        &params([("start",Value::Uuid(start))])).unwrap().rows
+    };
+    let row_ids = |db: &Database| {
+        db.execute("SELECT id FROM edge_rows ORDER BY id", &empty())
+            .unwrap()
+            .rows
+    };
+    let initial_outbound = source.changes_since(contextdb_core::Lsn(0)).unwrap();
+    assert!(
+        initial_outbound.edges.is_empty(),
+        "row-owned edges have no independent transport lane"
+    );
+    let broker = InProcessBroker::new();
+    let running = start_server(
+        &broker,
+        TENANT,
+        source.clone(),
+        Arc::new(FabricIdentity::generate()),
+    )
+    .await;
+    let identity = Arc::new(FabricIdentity::generate());
+    let node = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        receiver.clone(),
+        broker.client_as(&node),
+        TenantId::from(TENANT),
+        identity.clone(),
+    )
+    .unwrap();
+    client.pull_default().await.unwrap();
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]; 2]);
+    let before_retry = row_ids(&receiver);
+    client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&receiver), before_retry);
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]; 2]);
+    let stale_peer = Arc::new(Database::open(root.path().join("stale-edge-receiver.db")).unwrap());
+    let stale_identity = Arc::new(FabricIdentity::generate());
+    let stale_node = stale_identity.node_id();
+    let stale_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        stale_peer.clone(),
+        broker.client_as(&stale_node),
+        TenantId::from(TENANT),
+        stale_identity,
+    )
+    .unwrap();
+    stale_client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&stale_peer), before_retry);
+    source
+        .execute(
+            "PURGE FROM edge_rows WHERE id=$id",
+            &params([("id", Value::Uuid(second))]),
+        )
+        .unwrap();
+    client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&receiver), vec![vec![Value::Uuid(first)]]);
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]]);
+    client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&receiver), vec![vec![Value::Uuid(first)]]);
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]]);
+    assert_eq!(
+        row_ids(&stale_peer),
+        before_retry,
+        "the disconnected peer still holds the erased root before reconnecting"
+    );
+    assert_eq!(
+        stale_peer
+            .execute(
+                "UPDATE edge_rows SET subtype_key=$subtype WHERE id=$id",
+                &params([
+                    ("id", Value::Uuid(second)),
+                    ("subtype", Value::Text("stale-edit".into()))
+                ]),
+            )
+            .unwrap()
+            .rows_affected,
+        1
+    );
+    assert!(
+        stale_peer
+            .changes_since(contextdb_core::Lsn(0))
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.values.get("id") == Some(&Value::Uuid(second))
+                && row.values.get("subtype_key") == Some(&Value::Text("stale-edit".into())))
+    );
+    stale_client
+        .push()
+        .await
+        .expect("authenticated reconnect handles the old erased lineage");
+    assert_eq!(
+        row_ids(&source),
+        vec![vec![Value::Uuid(first)]],
+        "stale lineage cannot recreate its source row"
+    );
+    stale_client
+        .pull_default()
+        .await
+        .expect("pull delivers authoritative erasure to the stale peer");
+    assert_eq!(
+        row_ids(&stale_peer),
+        vec![vec![Value::Uuid(first)]],
+        "the stale peer erases the old lineage on reconnect"
+    );
+    assert_eq!(traverse(&stale_peer), vec![vec![Value::Uuid(target)]]);
+    client.pull_default().await.unwrap();
+    assert_eq!(
+        row_ids(&receiver),
+        vec![vec![Value::Uuid(first)]],
+        "stale lineage cannot recreate an erased receiver owner"
+    );
+    assert_eq!(traverse(&receiver), vec![vec![Value::Uuid(target)]]);
+    drop(stale_client);
+    stale_peer.close().unwrap();
+    drop(stale_peer);
+    drop(client);
+    receiver.close().unwrap();
+    drop(receiver);
+    let rebuilt = Arc::new(Database::open(root.path().join("rebuilt-edge-receiver.db")).unwrap());
+    let rebuilt_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        rebuilt.clone(),
+        broker.client_as(&node),
+        TenantId::from(TENANT),
+        identity,
+    )
+    .unwrap();
+    rebuilt_client.pull_default().await.unwrap();
+    assert_eq!(row_ids(&rebuilt), vec![vec![Value::Uuid(first)]]);
+    assert_eq!(traverse(&rebuilt), vec![vec![Value::Uuid(target)]]);
+    rebuilt_client.pull_default().await.unwrap();
+    assert_eq!(traverse(&rebuilt), vec![vec![Value::Uuid(target)]]);
+    running.stop().await;
 }

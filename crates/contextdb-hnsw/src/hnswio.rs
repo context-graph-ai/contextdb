@@ -211,6 +211,21 @@ where
     T: DeserializeOwned + Clone + Sized + Send + Sync + 'static,
     D: Distance<T> + Send + Sync,
 {
+    decode_owned_graph_with_layer0_slack(bytes, distance, 0)
+}
+
+/// `decode_owned_graph` for a graph whose layer-zero lists may hold up to
+/// `layer0_slack` links beyond the construction degree, appended by
+/// `Hnsw::append_neighbour`.
+pub fn decode_owned_graph_with_layer0_slack<T, D>(
+    bytes: &[u8],
+    distance: D,
+    layer0_slack: usize,
+) -> Result<LoadedHnsw<T, D>>
+where
+    T: DeserializeOwned + Clone + Sized + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
     let mut reader = Cursor::new(bytes);
     let mut payload: OwnedGraphPayload<T> = bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -307,8 +322,10 @@ where
                         "ContextDB HNSW graph has an edge above its layer limit"
                     ));
                 }
+                let slack = if layer == 0 { layer0_slack } else { 0 };
                 if encoded_neighbours.len()
                     > crate::hnsw::layer0_max_nb_connection(payload.max_nb_connection)
+                        .saturating_add(slack)
                 {
                     return Err(anyhow!("ContextDB HNSW graph has too many neighbours"));
                 }
@@ -1756,9 +1773,301 @@ impl<T: Serialize + DeserializeOwned + Clone + Sized + Send + Sync, D: Distance<
 
 //===============================================================================================================
 
+/// Stream a provider-backed graph using the existing owned graph layout. The
+/// provider admits and authenticates one point at a time; no topology or
+/// generation-sized encoded buffer is retained by this encoder.
+pub fn encode_paged_graph_into<T, S, W>(
+    storage: &mut S,
+    state: &crate::paged::PagedGraphState,
+    policy: crate::paged::PagedGraphPolicy,
+    dimension: usize,
+    mut output: W,
+) -> std::result::Result<(), crate::paged::PagedGraphError<S::Error>>
+where
+    T: Serialize,
+    S: crate::paged::PagedPointStorage<T>,
+    W: std::io::Write,
+{
+    use crate::paged::PagedGraphError;
+    if !policy.validate() {
+        return Err(PagedGraphError::InvalidPolicy);
+    }
+    let codec = bincode::DefaultOptions::new().with_fixint_encoding();
+    // Encoding failures are separate from provider errors; the storage
+    // transaction owns the output and must roll it back after either one.
+    let write = |result: bincode::Result<()>| result.map_err(|_| PagedGraphError::Encoding);
+    write(codec.serialize_into(
+        &mut output,
+        &(
+            CONTEXTDB_OWNED_GRAPH_FORMAT_VERSION,
+            policy.m,
+            policy.ef_construction,
+            policy.extend_candidates,
+            policy.keep_pruned,
+            policy.max_layer,
+            dimension,
+            1. / (policy.m as f64).ln(),
+        ),
+    ))?;
+    write(codec.serialize_into(&mut output, &(policy.max_layer as u64)))?;
+    for layer in 0..policy.max_layer {
+        write(codec.serialize_into(&mut output, &(state.layer_counts[layer] as u64)))?;
+        for rank in 0..state.layer_counts[layer] {
+            storage.checkpoint().map_err(PagedGraphError::Storage)?;
+            let id = PointId(
+                layer as u8,
+                i32::try_from(rank).map_err(|_| PagedGraphError::InvalidState)?,
+            );
+            let point = storage.load_point(id).map_err(PagedGraphError::Storage)?;
+            if point.id != id {
+                return Err(PagedGraphError::InvalidPoint);
+            }
+            write(codec.serialize_into(
+                &mut output,
+                &(
+                    point.origin_id,
+                    OwnedPointId {
+                        layer: id.0,
+                        rank: id.1,
+                    },
+                    point.values.as_slice(),
+                ),
+            ))?;
+            write(codec.serialize_into(&mut output, &(point.neighbours.len() as u64)))?;
+            for neighbours in &point.neighbours {
+                write(codec.serialize_into(&mut output, &(neighbours.len() as u64)))?;
+                for neighbour in neighbours {
+                    write(codec.serialize_into(
+                        &mut output,
+                        &OwnedNeighbour {
+                            origin_id: neighbour.origin_id,
+                            point_id: OwnedPointId {
+                                layer: neighbour.point_id.0,
+                                rank: neighbour.point_id.1,
+                            },
+                            distance: neighbour.distance,
+                        },
+                    ))?;
+                }
+            }
+        }
+    }
+    let entry = state.entry_point.map(|id| OwnedPointId {
+        layer: id.0,
+        rank: id.1,
+    });
+    write(codec.serialize_into(&mut output, &entry))?;
+    std::result::Result::Ok(())
+}
+
+/// Encode an independently stored point in the existing sealed graph point
+/// layout. The page owner adds its identity envelope and checksum.
+pub fn encode_paged_point_into<T: Serialize, W: std::io::Write>(
+    point: &crate::paged::PagedPoint<T>,
+    mut output: W,
+) -> Result<()> {
+    let codec = bincode::DefaultOptions::new().with_fixint_encoding();
+    codec.serialize_into(
+        &mut output,
+        &(
+            point.origin_id,
+            OwnedPointId {
+                layer: point.id.0,
+                rank: point.id.1,
+            },
+            point.values.as_slice(),
+        ),
+    )?;
+    codec.serialize_into(&mut output, &(point.neighbours.len() as u64))?;
+    for layer in &point.neighbours {
+        codec.serialize_into(&mut output, &(layer.len() as u64))?;
+        for edge in layer {
+            codec.serialize_into(
+                &mut output,
+                &OwnedNeighbour {
+                    origin_id: edge.origin_id,
+                    point_id: OwnedPointId {
+                        layer: edge.point_id.0,
+                        rank: edge.point_id.1,
+                    },
+                    distance: edge.distance,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// The serving point decoder reserves each sequence once at its encoded
+// length. Native callers pre-admit these exact allocations plus conversion.
+struct ExactPointVec<T>(Vec<T>);
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ExactPointVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for V<T> {
+            type Value = ExactPointVec<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a bounded point sequence") }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let n = seq.size_hint().ok_or_else(|| serde::de::Error::custom("point sequence has no encoded length"))?;
+                let mut values = Vec::with_capacity(n);
+                for _ in 0..n {
+                    values.push(seq.next_element()?.ok_or_else(|| serde::de::Error::custom("short point sequence"))?);
+                }
+                std::result::Result::Ok(ExactPointVec(values))
+            }
+        }
+        d.deserialize_seq(V(std::marker::PhantomData))
+    }
+}
+#[derive(serde::Deserialize)]
+struct ExactGraphPoint<T> {
+    origin_id: usize,
+    point_id: OwnedPointId,
+    values: ExactPointVec<T>,
+    neighbours: ExactPointVec<ExactPointVec<OwnedNeighbour>>,
+}
+
+fn validate_point_sequence_lengths<T>(bytes: &[u8]) -> Result<()> {
+    let mut at = 13usize;
+    let count = |at: &mut usize| -> Result<usize> {
+        let end = at.checked_add(8).ok_or_else(|| anyhow!("point length overflow"))?;
+        let raw = bytes.get(*at..end).ok_or_else(|| anyhow!("short point length"))?;
+        *at = end;
+        usize::try_from(u64::from_le_bytes(raw.try_into().unwrap())).map_err(|_| anyhow!("point length overflow"))
+    };
+    let n = count(&mut at)?;
+    at = at.checked_add(n.checked_mul(std::mem::size_of::<T>().max(1)).ok_or_else(|| anyhow!("point values overflow"))?)
+        .ok_or_else(|| anyhow!("point values overflow"))?;
+    if at > bytes.len() { return Err(anyhow!("short point values")); }
+    let layers = count(&mut at)?;
+    if layers > 16 { return Err(anyhow!("invalid point layer count")); }
+    for _ in 0..layers {
+        let n = count(&mut at)?;
+        at = at.checked_add(n.checked_mul(17).ok_or_else(|| anyhow!("point links overflow"))?)
+            .ok_or_else(|| anyhow!("point links overflow"))?;
+        if at > bytes.len() { return Err(anyhow!("short point links")); }
+    }
+    if at != bytes.len() { return Err(anyhow!("point has trailing bytes")); }
+    Ok(())
+}
+
+/// Decode one sealed-layout point after its page envelope was authenticated.
+/// The byte limit is the caller's admitted finite decode window.
+pub fn decode_paged_point<T: DeserializeOwned>(
+    bytes: &[u8],
+    byte_limit: usize,
+) -> Result<crate::paged::PagedPoint<T>> {
+    if bytes.len() > byte_limit {
+        return Err(anyhow!("HNSW point exceeds its admitted decode window"));
+    }
+    validate_point_sequence_lengths::<T>(bytes)?;
+    let point: ExactGraphPoint<T> = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(byte_limit as u64)
+        .reject_trailing_bytes()
+        .deserialize(bytes)?;
+    if point.point_id.layer >= 16 || point.point_id.rank < 0 || point.neighbours.0.len() > 16 {
+        return Err(anyhow!("invalid HNSW point identity or layer count"));
+    }
+    let neighbours = point
+        .neighbours.0
+        .into_iter()
+        .map(|layer| {
+            layer.0
+                .into_iter()
+                .map(|edge| crate::paged::PagedEdge {
+                    point_id: PointId(edge.point_id.layer, edge.point_id.rank),
+                    origin_id: edge.origin_id,
+                    distance: edge.distance,
+                })
+                .collect()
+        })
+        .collect();
+    Ok(crate::paged::PagedPoint {
+        id: PointId(point.point_id.layer, point.point_id.rank),
+        origin_id: point.origin_id,
+        values: point.values.0,
+        neighbours,
+    })
+}
+
 #[cfg(test)]
 
 mod tests {
+    #[test]
+    fn appended_links_keep_order_survive_encoding_and_need_declared_slack() {
+        use super::*;
+        use anndists::dist::distances::DistL1;
+        let graph = Hnsw::new_with_seed(2, 64, 16, 16, DistL1, 5);
+        for id in 0..64 {
+            graph.insert((&[id as f32, 0.0], id));
+        }
+        let degree = graph.get_max_nb_connection_layer0();
+        let points = graph
+            .get_point_indexation()
+            .points_by_layer
+            .read()
+            .iter()
+            .flatten()
+            .map(|point| point.get_point_id())
+            .collect::<Vec<_>>();
+        let from = points[0];
+        let mut appended = 0;
+        for to in &points[1..] {
+            if graph.append_neighbour(from, *to, 0) {
+                appended += 1;
+            }
+        }
+        let identity = |links: &[Neighbour]| {
+            links
+                .iter()
+                .map(|link| (link.p_id, link.distance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let links = graph
+            .get_point_indexation()
+            .get_point(&from)
+            .unwrap()
+            .get_neighborhood_id()[0]
+            .clone();
+        assert_eq!(
+            links.len(),
+            points.len() - 1,
+            "every other point is linked once"
+        );
+        assert!(appended > 0 && links.len() > degree);
+        assert!(
+            links
+                .windows(2)
+                .all(|pair| pair[0].distance <= pair[1].distance),
+            "appended links keep the list ordered by distance"
+        );
+        assert!(
+            !graph.append_neighbour(from, points[1], 0),
+            "no duplicate link"
+        );
+        assert!(!graph.append_neighbour(from, from, 0), "no self link");
+        let bytes = encode_owned_graph(&graph).unwrap();
+        assert!(
+            decode_owned_graph::<f32, _>(&bytes, DistL1).is_err(),
+            "an undeclared degree is still refused"
+        );
+        let slack = links.len() - degree;
+        assert!(decode_owned_graph_with_layer0_slack::<f32, _>(&bytes, DistL1, slack - 1).is_err());
+        let loaded = decode_owned_graph_with_layer0_slack::<f32, _>(&bytes, DistL1, slack).unwrap();
+        assert_eq!(
+            identity(
+                &loaded
+                    .get_point_indexation()
+                    .get_point(&from)
+                    .unwrap()
+                    .get_neighborhood_id()[0]
+            ),
+            identity(&links),
+            "every appended link survives encoding"
+        );
+    }
+
     #[test]
     fn inactive_layer_headers_are_absent_while_public_and_durable_layers_stay_complete() {
         use super::*;

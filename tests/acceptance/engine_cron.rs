@@ -52,8 +52,24 @@ fn t27_01_schedule_fires_inside_tx_and_commits_callback_writes() {
     // `cron_run_due_now_for_test` returns only AFTER the cron tx has committed,
     // so two successful drives prove the schedule RE-ARMS (fires more than once,
     // not a one-shot) AND that callback writes commit inside the cron tx.
-    db.cron_run_due_now_for_test().expect("first cron drive");
-    db.cron_run_due_now_for_test().expect("second cron drive");
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .expect("first cron drive");
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .expect("second cron drive");
     let rows = db.scan("gc_log", db.snapshot()).unwrap();
     assert!(
         rows.len() >= 2,
@@ -102,7 +118,15 @@ fn t27_02_only_due_schedules_dispatch() {
     // Deterministic dispatch: drive due-now once. Only the DUE schedule (soon)
     // dispatches; the far-future `later` (60s) is not due and must not fire.
     // Replaces a 100ms tickler-race poll.
-    db.cron_run_due_now_for_test().expect("cron drive");
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .expect("cron drive");
 
     let soon_count = db.scan("soon_log", db.snapshot()).unwrap().len();
     let later_count = db.scan("later_log", db.snapshot()).unwrap().len();
@@ -136,7 +160,15 @@ fn t27_03_skip_and_audit_records_missed_ticks() {
         // Sleep long enough for ~3 missed ticks (1.6s).
         let _pause = db.pause_cron_tickler_for_test();
         std::thread::sleep(Duration::from_millis(1_600));
-        let fires = db.cron_run_due_now_for_test().unwrap();
+        let fires = {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .unwrap();
         assert_eq!(
             fires, 1,
             "skip-and-audit must dispatch exactly one fire after a missed window"
@@ -193,7 +225,15 @@ fn t27_04_catch_up_within_window_dispatches_all_missed() {
 
     let _pause = db.pause_cron_tickler_for_test();
     std::thread::sleep(Duration::from_millis(1_600));
-    let fires = db.cron_run_due_now_for_test().unwrap();
+    let fires = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .unwrap();
     assert!(
         fires >= 3,
         "catch-up must dispatch all missed fires; got {fires}"
@@ -241,7 +281,15 @@ fn t27_04_catch_up_within_window_dispatches_all_missed() {
 
     let _pause = capped.pause_cron_tickler_for_test();
     std::thread::sleep(Duration::from_millis(2_600));
-    let capped_fires = capped.cron_run_due_now_for_test().unwrap();
+    let capped_fires = {
+        let seam_read_memory = capped
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        capped.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .unwrap();
     assert!(
         (1..=2).contains(&capped_fires),
         "catch-up WITHIN 1 SECONDS must bound replay to recent missed ticks, not replay the full backlog; got {capped_fires}"
@@ -274,7 +322,15 @@ fn t27_05_drop_schedule_stops_dispatch() {
 
     db.execute("DROP SCHEDULE s", &empty()).unwrap();
     std::thread::sleep(Duration::from_millis(700));
-    let _ = db.cron_run_due_now_for_test().unwrap();
+    let _ = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .unwrap();
     let rows = db.scan("log", db.snapshot()).unwrap();
     assert_eq!(rows.len(), 0, "dropped schedule must not fire");
 }
@@ -467,7 +523,14 @@ fn t27_08_fail_loud_missed_tick_returns_error() {
     {
         let _pause = db.pause_cron_tickler_for_test();
         std::thread::sleep(Duration::from_millis(1_400));
-        let result = db.cron_run_due_now_for_test();
+        let result = {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        };
         let err = result.err();
         assert!(err.is_some(), "fail-loud must return Err on missed ticks");
         let err = err.unwrap();
@@ -641,9 +704,15 @@ fn t27_11_missing_registered_callback_records_failed_audit_without_panic() {
     {
         let _pause = db.pause_cron_tickler_for_test();
         std::thread::sleep(Duration::from_millis(700));
-        let fires = db
-            .cron_run_due_now_for_test()
-            .expect("missing callback should be audited without panicking or poisoning cron");
+        let fires = {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .expect("missing callback should be audited without panicking or poisoning cron");
         assert_eq!(
             fires, 1,
             "healthy schedule must still fire after missing callback is audited"
@@ -724,9 +793,15 @@ fn t27_12_registered_callback_error_rolls_back_partial_writes_and_audits() {
     {
         let _pause = db.pause_cron_tickler_for_test();
         std::thread::sleep(Duration::from_millis(700));
-        let fires = db
-            .cron_run_due_now_for_test()
-            .expect("registered callback error should be recorded in audit without poisoning cron");
+        let fires = {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .expect("registered callback error should be recorded in audit without poisoning cron");
         assert_eq!(
             fires, 1,
             "healthy schedule must still fire after failed callback is rolled back and audited"
@@ -873,9 +948,15 @@ fn t27_14_callback_rejects_nested_ddl_and_transaction_control() {
 
     let _pause = db.pause_cron_tickler_for_test();
     std::thread::sleep(Duration::from_millis(700));
-    let fires = db
-        .cron_run_due_now_for_test()
-        .expect("nested DDL/tx-control rejection must not poison cron");
+    let fires = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .expect("nested DDL/tx-control rejection must not poison cron");
     assert_eq!(fires, 1);
 }
 
@@ -991,9 +1072,15 @@ fn t27_16_callback_rejects_cross_thread_handle_use() {
     .unwrap();
 
     std::thread::sleep(Duration::from_millis(150));
-    let fires = db
-        .cron_run_due_now_for_test()
-        .expect("cross-thread rejection must not poison cron");
+    let fires = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .expect("cross-thread rejection must not poison cron");
     assert_eq!(fires, 1);
 
     let rows = db.scan("cron_items", db.snapshot()).unwrap();

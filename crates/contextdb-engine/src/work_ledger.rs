@@ -217,7 +217,7 @@ impl BlobHash {
 
     pub fn from_hex(hex: &str) -> Result<BlobHash> {
         if hex.len() != 64 {
-            return Err(Error::Other("blob hash hex must be 64 chars".to_string()));
+            return Err(Error::Other(("blob hash hex must be 64 chars".to_string()).into()));
         }
         let mut out = [0u8; 32];
         for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
@@ -225,7 +225,7 @@ impl BlobHash {
             let lo = (pair[1] as char).to_digit(16);
             match (hi, lo) {
                 (Some(hi), Some(lo)) => out[i] = (hi * 16 + lo) as u8,
-                _ => return Err(Error::Other("blob hash hex has a non-hex byte".to_string())),
+                _ => return Err(Error::Other(("blob hash hex has a non-hex byte".to_string()).into())),
             }
         }
         Ok(BlobHash(out))
@@ -639,10 +639,10 @@ fn encode_payload(bytes: &[u8]) -> String {
 
 fn decode_payload(encoded: &str) -> Result<Vec<u8>> {
     if !encoded.len().is_multiple_of(2) {
-        return Err(Error::Other(format!(
+        return Err(Error::Other((format!(
             "work ledger: malformed payload encoding (odd length {})",
             encoded.len()
-        )));
+        )).into()));
     }
     let mut out = Vec::with_capacity(encoded.len() / 2);
     let bytes = encoded.as_bytes();
@@ -652,9 +652,8 @@ fn decode_payload(encoded: &str) -> Result<Vec<u8>> {
         match (hi, lo) {
             (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
             _ => {
-                return Err(Error::Other(
-                    "work ledger: malformed payload encoding (non-hex byte)".to_string(),
-                ));
+                return Err(Error::Other((
+                    "work ledger: malformed payload encoding (non-hex byte)".to_string()).into()));
             }
         }
     }
@@ -665,15 +664,15 @@ fn column_index(columns: &[String], name: &str) -> Result<usize> {
     columns
         .iter()
         .position(|c| c == name)
-        .ok_or_else(|| Error::Other(format!("work ledger: missing column {name}")))
+        .ok_or_else(|| Error::Other((format!("work ledger: missing column {name}")).into()))
 }
 
 fn text_at(row: &[Value], idx: usize, what: &str) -> Result<String> {
     match &row[idx] {
         Value::Text(s) => Ok(s.clone()),
-        other => Err(Error::Other(format!(
+        other => Err(Error::Other((format!(
             "work ledger: {what} must be TEXT, found {other:?}"
-        ))),
+        )).into())),
     }
 }
 
@@ -681,9 +680,9 @@ fn opt_text_at(row: &[Value], idx: usize, what: &str) -> Result<Option<String>> 
     match &row[idx] {
         Value::Null => Ok(None),
         Value::Text(s) => Ok(Some(s.clone())),
-        other => Err(Error::Other(format!(
+        other => Err(Error::Other((format!(
             "work ledger: {what} must be TEXT or NULL, found {other:?}"
-        ))),
+        )).into())),
     }
 }
 
@@ -691,9 +690,9 @@ fn int_at(row: &[Value], idx: usize, what: &str) -> Result<i64> {
     match &row[idx] {
         Value::Int64(n) => Ok(*n),
         Value::Timestamp(n) => Ok(*n),
-        other => Err(Error::Other(format!(
+        other => Err(Error::Other((format!(
             "work ledger: {what} must be a number, found {other:?}"
-        ))),
+        )).into())),
     }
 }
 
@@ -708,22 +707,22 @@ fn json_at(row: &[Value], idx: usize, what: &str) -> Result<serde_json::Value> {
     match &row[idx] {
         Value::Json(v) => Ok(v.clone()),
         Value::Null => Ok(serde_json::Value::Null),
-        other => Err(Error::Other(format!(
+        other => Err(Error::Other((format!(
             "work ledger: {what} must be JSON, found {other:?}"
-        ))),
+        )).into())),
     }
 }
 
 fn string_list(value: &serde_json::Value, what: &str) -> Result<Vec<String>> {
     let items = value
         .as_array()
-        .ok_or_else(|| Error::Other(format!("work ledger: {what} must be a JSON array")))?;
+        .ok_or_else(|| Error::Other((format!("work ledger: {what} must be a JSON array")).into()))?;
     items
         .iter()
         .map(|item| {
             item.as_str()
                 .map(str::to_string)
-                .ok_or_else(|| Error::Other(format!("work ledger: {what} entries must be strings")))
+                .ok_or_else(|| Error::Other((format!("work ledger: {what} entries must be strings")).into()))
         })
         .collect()
 }
@@ -731,15 +730,15 @@ fn string_list(value: &serde_json::Value, what: &str) -> Result<Vec<String>> {
 fn input_refs_from_json(value: &serde_json::Value) -> Result<Vec<InputRef>> {
     let items = value
         .as_array()
-        .ok_or_else(|| Error::Other("work ledger: input_refs must be a JSON array".to_string()))?;
+        .ok_or_else(|| Error::Other(("work ledger: input_refs must be a JSON array".to_string()).into()))?;
     items
         .iter()
         .map(|item| {
             let kind = item
                 .get("kind")
-                .and_then(|k| k.as_str())
+                .and_then(|kind| kind.as_str())
                 .ok_or_else(|| {
-                    Error::Other("work ledger: every input ref needs a string kind".to_string())
+                    Error::Other(("work ledger: every input ref needs a string kind".to_string()).into())
                 })?
                 .to_string();
             let detail = item
@@ -757,9 +756,8 @@ fn input_refs_from_json(value: &serde_json::Value) -> Result<Vec<InputRef>> {
 /// outcome before crossing a persistence boundary.
 pub(crate) fn canonical_blob_hashes_from_input_refs(value: &Value) -> Result<Vec<String>> {
     let Value::Json(value) = value else {
-        return Err(Error::Other(
-            "work ledger: input_refs must be JSON".to_string(),
-        ));
+        return Err(Error::Other((
+            "work ledger: input_refs must be JSON".to_string()).into()));
     };
     input_refs_from_json(value)?
         .into_iter()
@@ -770,7 +768,7 @@ pub(crate) fn canonical_blob_hashes_from_input_refs(value: &Value) -> Result<Vec
                 .get("hash")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
-                    Error::Other("work ledger: blob_ref input needs a string hash".to_string())
+                    Error::Other(("work ledger: blob_ref input needs a string hash".to_string()).into())
                 })?;
             BlobHash::from_hex(hash).map(|hash| hash.to_hex())
         })
@@ -788,6 +786,15 @@ fn input_refs_to_json(refs: &[InputRef]) -> serde_json::Value {
 /// Create the seven ledger tables if absent. Idempotent; safe to call at
 /// every open, and safe when the schema already arrived via sync.
 pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    install_work_ledger_schema_with_read_memory(db, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn install_work_ledger_schema_with_read_memory(
+    db: &Database,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
     let existing = db.table_names();
     let ddl: [(&str, &str); 7] = [
         ("work_jobs", LEDGER_TABLE_DECLARATIONS[0]),
@@ -802,7 +809,7 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         if existing.iter().any(|name| name == table) {
             continue;
         }
-        db.execute(create, &HashMap::new())?;
+        db.execute_with_read_memory(create, &HashMap::new(), read_memory.clone())?;
     }
     // The two tables that keep several rows per job need `job_id` reachable
     // without a walk. Install any missing index so a query about a handful
@@ -815,7 +822,7 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         if meta.indexes.iter().any(|declared| declared.name == index) {
             continue;
         }
-        db.execute(create, &HashMap::new())?;
+        db.execute_with_read_memory(create, &HashMap::new(), read_memory.clone())?;
     }
     // Existing tables are not re-created. Reconcile work_capabilities through
     // ordinary ALTER TABLE so its declared policy permits version cleanup.
@@ -826,15 +833,17 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         && let Some(meta) = db.table_meta("work_capabilities")
     {
         if meta.conflict_policy != Some(contextdb_core::ConflictPolicy::KEEP_LATEST) {
-            db.execute(
+            db.execute_with_read_memory(
                 "ALTER TABLE work_capabilities SET SYNC CONFLICT KEEP LATEST",
                 &HashMap::new(),
+                read_memory.clone(),
             )?;
         }
         if meta.history_policy != Some(contextdb_core::HistoryPolicy::CurrentOnly) {
-            db.execute(
+            db.execute_with_read_memory(
                 "ALTER TABLE work_capabilities SET HISTORY CURRENT ONLY",
                 &HashMap::new(),
+                read_memory.clone(),
             )?;
         }
     }
@@ -844,7 +853,11 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         && let Some(meta) = db.table_meta("work_inputs")
         && meta.default_ttl_seconds.is_none()
     {
-        db.execute("ALTER TABLE work_inputs SET RETAIN 7 DAYS", &HashMap::new())?;
+        db.execute_with_read_memory(
+            "ALTER TABLE work_inputs SET RETAIN 7 DAYS",
+            &HashMap::new(),
+            read_memory.clone(),
+        )?;
     }
     // Installing the capability registry makes this database compaction-eligible;
     // start the engine-owned maintenance loop now so a fresh node self-bounds
@@ -945,15 +958,24 @@ pub(crate) fn apply_work_ledger_policy_overrides(policies: &mut ConflictPolicies
 /// Write the job row inside the caller's open transaction, so submission
 /// commits atomically with the caller's own writes.
 pub fn submit_job_in_tx(db: &Database, tx: TxId, spec: &JobSpec) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    submit_job_in_tx_with_read_memory(db, tx, spec, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn submit_job_in_tx_with_read_memory(
+    db: &Database,
+    tx: TxId,
+    spec: &JobSpec,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
     if spec.job_id.is_empty() {
-        return Err(Error::Other(
-            "work ledger: job_id must not be empty".to_string(),
-        ));
+        return Err(Error::Other((
+            "work ledger: job_id must not be empty".to_string()).into()));
     }
     if spec.max_attempts < 1 {
-        return Err(Error::Other(
-            "work ledger: max_attempts must be at least 1".to_string(),
-        ));
+        return Err(Error::Other((
+            "work ledger: max_attempts must be at least 1".to_string()).into()));
     }
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(&spec.job_id));
@@ -998,7 +1020,7 @@ pub fn submit_job_in_tx(db: &Database, tx: TxId, spec: &JobSpec) -> Result<()> {
         "submitted_at".to_string(),
         Value::Timestamp(spec.submitted_at_ms),
     );
-    db.execute_in_tx(
+    db.execute_in_tx_with_read_memory(
         tx,
         "INSERT INTO work_jobs (job_id, work_class, mode, requirement_tags, input_refs, \
          output_schema, priority, deadline, max_attempts, submitter_node_id, provenance, \
@@ -1006,6 +1028,7 @@ pub fn submit_job_in_tx(db: &Database, tx: TxId, spec: &JobSpec) -> Result<()> {
          $output_schema, $priority, $deadline, $max_attempts, $submitter_node_id, $provenance, \
          $submitted_at)",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
@@ -1019,16 +1042,30 @@ pub fn add_job_input_in_tx(
     seq: i64,
     payload: &[u8],
 ) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    add_job_input_in_tx_with_read_memory(db, tx, job_id, seq, payload, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn add_job_input_in_tx_with_read_memory(
+    db: &Database,
+    tx: TxId,
+    job_id: &str,
+    seq: i64,
+    payload: &[u8],
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
     let mut params = HashMap::new();
     params.insert("input_key".to_string(), text(&input_key(job_id, seq)));
     params.insert("job_id".to_string(), text(job_id));
     params.insert("seq".to_string(), Value::Int64(seq));
     params.insert("payload".to_string(), text(&encode_payload(payload)));
-    db.execute_in_tx(
+    db.execute_in_tx_with_read_memory(
         tx,
         "INSERT INTO work_inputs (input_key, job_id, seq, payload) \
          VALUES ($input_key, $job_id, $seq, $payload)",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
@@ -1040,16 +1077,37 @@ pub fn add_job_input_in_tx(
 /// Returns an error (via [`contextdb_core::Error::Other`]) if `spec.job_id`
 /// is empty, or if `spec.max_attempts` is less than 1.
 pub fn submit_job<I: AsRef<[u8]>>(db: &Database, spec: &JobSpec, inputs: &[I]) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    submit_job_with_read_memory(db, spec, inputs, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn submit_job_with_read_memory<I: AsRef<[u8]>>(
+    db: &Database,
+    spec: &JobSpec,
+    inputs: &[I],
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
+    let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
+    let vector_copy_owner = &mut retained_vector_copy;
+
     let tx = db.begin()?;
     let write = (|| -> Result<()> {
-        submit_job_in_tx(db, tx, spec)?;
+        submit_job_in_tx_with_read_memory(db, tx, spec, read_memory.clone())?;
         for (seq, payload) in inputs.iter().enumerate() {
-            add_job_input_in_tx(db, tx, &spec.job_id, seq as i64, payload.as_ref())?;
+            add_job_input_in_tx_with_read_memory(
+                db,
+                tx,
+                &spec.job_id,
+                seq as i64,
+                payload.as_ref(),
+                read_memory.clone(),
+            )?;
         }
         Ok(())
     })();
     match write {
-        Ok(()) => db.commit(tx),
+        Ok(()) => db.commit_with_read_memory(tx, vector_copy_owner, read_memory.clone()),
         Err(err) => {
             let _ = db.rollback(tx);
             Err(err)
@@ -1064,8 +1122,9 @@ fn select_rows_with_work(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>, u64)> {
-    let result = db.execute(sql, params)?;
+    let result = db.execute_with_read_memory(sql, params, read_memory.clone())?;
     Ok((result.columns, result.rows, result.trace.rows_examined))
 }
 
@@ -1073,8 +1132,9 @@ fn select_rows(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    let (columns, rows, _work) = select_rows_with_work(db, sql, params)?;
+    let (columns, rows, _work) = select_rows_with_work(db, sql, params, read_memory.clone())?;
     Ok((columns, rows))
 }
 
@@ -1094,6 +1154,7 @@ fn read_rows_for_jobs(
     job_ids: &[&str],
     work: &mut LedgerWork,
     mut visit: impl FnMut(&[String], &[Vec<Value>]) -> Result<()>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<()> {
     for chunk in job_ids.chunks(KEYED_LOOKUP_WIDTH) {
         let mut params = HashMap::with_capacity(chunk.len());
@@ -1108,7 +1169,8 @@ fn read_rows_for_jobs(
             params.insert(name, text(job_id));
         }
         let sql = format!("SELECT {columns} FROM {table} WHERE job_id IN ({placeholders})");
-        let (columns, rows, examined) = select_rows_with_work(db, &sql, &params)?;
+        let (columns, rows, examined) =
+            select_rows_with_work(db, &sql, &params, read_memory.clone())?;
         work.rows_examined = work.rows_examined.saturating_add(examined);
         if !rows.is_empty() {
             visit(&columns, &rows)?;
@@ -1117,13 +1179,18 @@ fn read_rows_for_jobs(
     Ok(())
 }
 
-fn job_row(db: &Database, job_id: &str) -> Result<Option<JobSnapshot>> {
+fn job_row(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<JobSnapshot>> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
     let (columns, rows) = select_rows(
         db,
         "SELECT * FROM work_jobs WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     let Some(row) = rows.first() else {
         return Ok(None);
@@ -1170,7 +1237,17 @@ fn job_snapshot_from_row(columns: &[String], row: &[Value]) -> Result<JobSnapsho
 
 /// Read back one job's submitted form.
 pub fn job_snapshot(db: &Database, job_id: &str) -> Result<Option<JobSnapshot>> {
-    job_row(db, job_id)
+    let read_memory = db.declared_reader_memory()?;
+    job_snapshot_with_read_memory(db, job_id, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn job_snapshot_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<JobSnapshot>> {
+    job_row(db, job_id, read_memory.clone())
 }
 
 #[derive(Clone)]
@@ -1180,13 +1257,18 @@ struct ClaimRow {
     lease_deadline_ms: i64,
 }
 
-fn claim_rows(db: &Database, job_id: &str) -> Result<Vec<ClaimRow>> {
+fn claim_rows(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Vec<ClaimRow>> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
     let (columns, rows) = select_rows(
         db,
         "SELECT attempt, node_id, lease_deadline FROM work_claims WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     let attempt_idx = column_index(&columns, "attempt")?;
     let node_idx = column_index(&columns, "node_id")?;
@@ -1202,13 +1284,18 @@ fn claim_rows(db: &Database, job_id: &str) -> Result<Vec<ClaimRow>> {
         .collect()
 }
 
-fn failure_attempts(db: &Database, job_id: &str) -> Result<Vec<i64>> {
+fn failure_attempts(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Vec<i64>> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
     let (columns, rows) = select_rows(
         db,
         "SELECT attempt, failed_at FROM work_failures WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     let attempt_idx = column_index(&columns, "attempt")?;
     rows.iter()
@@ -1216,24 +1303,34 @@ fn failure_attempts(db: &Database, job_id: &str) -> Result<Vec<i64>> {
         .collect()
 }
 
-fn cancellation_exists(db: &Database, job_id: &str) -> Result<bool> {
+fn cancellation_exists(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
     let (_, rows) = select_rows(
         db,
         "SELECT job_id FROM work_cancellations WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     Ok(!rows.is_empty())
 }
 
-fn result_exists(db: &Database, job_id: &str) -> Result<bool> {
+fn result_exists(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
     let (_, rows) = select_rows(
         db,
         "SELECT job_id FROM work_results WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     Ok(!rows.is_empty())
 }
@@ -1252,10 +1349,25 @@ fn result_exists(db: &Database, job_id: &str) -> Result<bool> {
 /// keep a row per attempt, so asking about one job never costs a walk of the
 /// whole ledger. The reads stop at the first rule that settles the job.
 pub fn job_state(db: &Database, job_id: &str, now_ms: i64) -> Result<JobState> {
-    let Some(job) = job_row(db, job_id)? else {
+    let read_memory = db.declared_reader_memory()?;
+    job_state_with_read_memory(db, job_id, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn job_state_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<JobState> {
+    let Some(job) = job_row(db, job_id, read_memory.clone())? else {
         return Err(Error::NotFound(format!("work ledger job {job_id}")));
     };
-    let mut rows = LedgerJobRows { db, job_id };
+    let mut rows = LedgerJobRows {
+        db,
+        job_id,
+        read_memory: read_memory.clone(),
+    };
     state_of_job(&job, &mut rows, now_ms)
 }
 
@@ -1276,23 +1388,24 @@ trait JobStateRows {
 struct LedgerJobRows<'a> {
     db: &'a Database,
     job_id: &'a str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 }
 
 impl JobStateRows for LedgerJobRows<'_> {
     fn result_recorded(&mut self) -> Result<bool> {
-        result_exists(self.db, self.job_id)
+        result_exists(self.db, self.job_id, self.read_memory.clone())
     }
 
     fn cancellation_recorded(&mut self) -> Result<bool> {
-        cancellation_exists(self.db, self.job_id)
+        cancellation_exists(self.db, self.job_id, self.read_memory.clone())
     }
 
     fn failed_attempts(&mut self) -> Result<Vec<i64>> {
-        failure_attempts(self.db, self.job_id)
+        failure_attempts(self.db, self.job_id, self.read_memory.clone())
     }
 
     fn claims(&mut self) -> Result<Vec<ClaimRow>> {
-        claim_rows(self.db, self.job_id)
+        claim_rows(self.db, self.job_id, self.read_memory.clone())
     }
 }
 
@@ -1468,7 +1581,19 @@ pub fn job_state_counts(
     job_ids: &[impl AsRef<str>],
     now_ms: i64,
 ) -> Result<JobStateCounts> {
-    let (counts, _work) = job_state_counts_with_work(db, job_ids, now_ms)?;
+    let read_memory = db.declared_reader_memory()?;
+    job_state_counts_with_read_memory(db, job_ids, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn job_state_counts_with_read_memory(
+    db: &Database,
+    job_ids: &[impl AsRef<str>],
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<JobStateCounts> {
+    let (counts, _work) =
+        job_state_counts_with_work_with_read_memory(db, job_ids, now_ms, read_memory.clone())?;
     Ok(counts)
 }
 
@@ -1482,6 +1607,17 @@ pub fn job_state_counts_with_work(
     job_ids: &[impl AsRef<str>],
     now_ms: i64,
 ) -> Result<(JobStateCounts, LedgerWork)> {
+    let read_memory = db.declared_reader_memory()?;
+    job_state_counts_with_work_with_read_memory(db, job_ids, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn job_state_counts_with_work_with_read_memory(
+    db: &Database,
+    job_ids: &[impl AsRef<str>],
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<(JobStateCounts, LedgerWork)> {
     let mut counts = JobStateCounts::default();
     let mut work = LedgerWork::default();
     if job_ids.is_empty() {
@@ -1493,13 +1629,21 @@ pub fn job_state_counts_with_work(
     wanted.dedup();
 
     let mut jobs: HashMap<String, JobSnapshot> = HashMap::new();
-    read_rows_for_jobs(db, "*", "work_jobs", &wanted, &mut work, |columns, rows| {
-        for row in rows {
-            let snapshot = job_snapshot_from_row(columns, row)?;
-            jobs.insert(snapshot.job_id.clone(), snapshot);
-        }
-        Ok(())
-    })?;
+    read_rows_for_jobs(
+        db,
+        "*",
+        "work_jobs",
+        &wanted,
+        &mut work,
+        |columns, rows| {
+            for row in rows {
+                let snapshot = job_snapshot_from_row(columns, row)?;
+                jobs.insert(snapshot.job_id.clone(), snapshot);
+            }
+            Ok(())
+        },
+        read_memory.clone(),
+    )?;
 
     let mut results: HashSet<String> = HashSet::new();
     read_rows_for_jobs(
@@ -1515,6 +1659,7 @@ pub fn job_state_counts_with_work(
             }
             Ok(())
         },
+        read_memory.clone(),
     )?;
 
     let mut cancellations: HashSet<String> = HashSet::new();
@@ -1531,6 +1676,7 @@ pub fn job_state_counts_with_work(
             }
             Ok(())
         },
+        read_memory.clone(),
     )?;
 
     let mut failures: HashMap<String, Vec<i64>> = HashMap::new();
@@ -1551,6 +1697,7 @@ pub fn job_state_counts_with_work(
             }
             Ok(())
         },
+        read_memory.clone(),
     )?;
 
     let mut claims: HashMap<String, Vec<ClaimRow>> = HashMap::new();
@@ -1577,6 +1724,7 @@ pub fn job_state_counts_with_work(
             }
             Ok(())
         },
+        read_memory.clone(),
     )?;
 
     for job_id in job_ids {
@@ -1687,15 +1835,35 @@ pub fn claimable_jobs(
     policy: &MovementPolicy,
     now_ms: i64,
 ) -> Result<Vec<JobSnapshot>> {
-    let (columns, rows) = select_rows(db, "SELECT job_id FROM work_jobs", &HashMap::new())?;
+    let read_memory = db.declared_reader_memory()?;
+    claimable_jobs_with_read_memory(db, node_id, advertised_tags, policy, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn claimable_jobs_with_read_memory(
+    db: &Database,
+    node_id: &str,
+    advertised_tags: &[String],
+    policy: &MovementPolicy,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Vec<JobSnapshot>> {
+    let (columns, rows) = select_rows(
+        db,
+        "SELECT job_id FROM work_jobs",
+        &HashMap::new(),
+        read_memory.clone(),
+    )?;
     let id_idx = column_index(&columns, "job_id")?;
     let mut matching = Vec::new();
     for row in &rows {
         let job_id = text_at(row, id_idx, "job_id")?;
-        if job_state(db, &job_id, now_ms)? != JobState::Pending {
+        if job_state_with_read_memory(db, &job_id, now_ms, read_memory.clone())?
+            != JobState::Pending
+        {
             continue;
         }
-        let Some(job) = job_row(db, &job_id)? else {
+        let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
         };
         let tags_satisfied = job
@@ -1741,6 +1909,18 @@ pub fn node_holds_claim_for_blob(
     hash: &BlobHash,
     now_ms: i64,
 ) -> Result<bool> {
+    let read_memory = db.declared_reader_memory()?;
+    node_holds_claim_for_blob_with_read_memory(db, node_id, hash, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn node_holds_claim_for_blob_with_read_memory(
+    db: &Database,
+    node_id: &str,
+    hash: &BlobHash,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
     let target_hex = hash.to_hex();
     let (columns, rows) = select_rows(
         db,
@@ -1750,6 +1930,7 @@ pub fn node_holds_claim_for_blob(
             params.insert("node_id".to_string(), text(node_id));
             params
         },
+        read_memory.clone(),
     )?;
     let job_idx = column_index(&columns, "job_id")?;
     let attempt_idx = column_index(&columns, "attempt")?;
@@ -1761,10 +1942,10 @@ pub fn node_holds_claim_for_blob(
         }
         let job_id = text_at(row, job_idx, "job_id")?;
         let attempt = int_at(row, attempt_idx, "attempt")?;
-        if failure_attempts(db, &job_id)?.contains(&attempt) {
+        if failure_attempts(db, &job_id, read_memory.clone())?.contains(&attempt) {
             continue;
         }
-        let Some(job) = job_row(db, &job_id)? else {
+        let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
         };
         let carries_hash = job.input_refs.iter().any(|input_ref| {
@@ -1791,11 +1972,23 @@ pub fn node_holds_claim_for_blob(
 /// [`node_holds_claim_for_blob`] check against the transport-authenticated
 /// caller is what actually authorizes a fetch.
 pub fn any_node_holds_claim_for_blob(db: &Database, hash: &BlobHash, now_ms: i64) -> Result<bool> {
+    let read_memory = db.declared_reader_memory()?;
+    any_node_holds_claim_for_blob_with_read_memory(db, hash, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn any_node_holds_claim_for_blob_with_read_memory(
+    db: &Database,
+    hash: &BlobHash,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
     let target_hex = hash.to_hex();
     let (columns, rows) = select_rows(
         db,
         "SELECT job_id, attempt, lease_deadline FROM work_claims",
         &HashMap::new(),
+        read_memory.clone(),
     )?;
     let job_idx = column_index(&columns, "job_id")?;
     let attempt_idx = column_index(&columns, "attempt")?;
@@ -1807,10 +2000,10 @@ pub fn any_node_holds_claim_for_blob(db: &Database, hash: &BlobHash, now_ms: i64
         }
         let job_id = text_at(row, job_idx, "job_id")?;
         let attempt = int_at(row, attempt_idx, "attempt")?;
-        if failure_attempts(db, &job_id)?.contains(&attempt) {
+        if failure_attempts(db, &job_id, read_memory.clone())?.contains(&attempt) {
             continue;
         }
-        let Some(job) = job_row(db, &job_id)? else {
+        let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
         };
         let carries_hash = job.input_refs.iter().any(|input_ref| {
@@ -1847,6 +2040,19 @@ pub fn node_claim_permits_movement(
     policy: MovementPolicy,
     now_ms: i64,
 ) -> Result<bool> {
+    let read_memory = db.declared_reader_memory()?;
+    node_claim_permits_movement_with_read_memory(db, node_id, hash, policy, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn node_claim_permits_movement_with_read_memory(
+    db: &Database,
+    node_id: &str,
+    hash: &BlobHash,
+    policy: MovementPolicy,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
     let target_hex = hash.to_hex();
     let (columns, rows) = select_rows(
         db,
@@ -1856,6 +2062,7 @@ pub fn node_claim_permits_movement(
             params.insert("node_id".to_string(), text(node_id));
             params
         },
+        read_memory.clone(),
     )?;
     let job_idx = column_index(&columns, "job_id")?;
     let attempt_idx = column_index(&columns, "attempt")?;
@@ -1867,10 +2074,10 @@ pub fn node_claim_permits_movement(
         }
         let job_id = text_at(row, job_idx, "job_id")?;
         let attempt = int_at(row, attempt_idx, "attempt")?;
-        if failure_attempts(db, &job_id)?.contains(&attempt) {
+        if failure_attempts(db, &job_id, read_memory.clone())?.contains(&attempt) {
             continue;
         }
-        let Some(job) = job_row(db, &job_id)? else {
+        let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
         };
         let carries_hash = job.input_refs.iter().any(|input_ref| {
@@ -1900,18 +2107,35 @@ pub fn blob_ref_retention_eligible(
     now_ms: i64,
     grace_ms: i64,
 ) -> Result<bool> {
+    let read_memory = db.declared_reader_memory()?;
+    blob_ref_retention_eligible_with_read_memory(db, hash, now_ms, grace_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn blob_ref_retention_eligible_with_read_memory(
+    db: &Database,
+    hash: &BlobHash,
+    now_ms: i64,
+    grace_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
     let target_hex = hash.to_hex();
-    let (columns, rows) = select_rows(db, "SELECT job_id FROM work_jobs", &HashMap::new())?;
+    let (columns, rows) = select_rows(
+        db,
+        "SELECT job_id FROM work_jobs",
+        &HashMap::new(),
+        read_memory.clone(),
+    )?;
     let id_idx = column_index(&columns, "job_id")?;
     for row in &rows {
         let job_id = text_at(row, id_idx, "job_id")?;
-        let Some(job) = job_row(db, &job_id)? else {
+        let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
         };
         if !input_refs_carry_blob(&job, &target_hex) {
             continue;
         }
-        let Some(terminal_at) = terminal_since(db, &job, now_ms)? else {
+        let Some(terminal_at) = terminal_since(db, &job, now_ms, read_memory.clone())? else {
             // A live referencing job pins the blob.
             return Ok(false);
         };
@@ -1938,12 +2162,25 @@ fn input_refs_carry_blob(job: &JobSnapshot, target_hex: &str) -> bool {
 /// The attempt number a new claim must use: one past the highest attempt any
 /// claim or failure row records.
 pub fn next_attempt(db: &Database, job_id: &str) -> Result<i64> {
-    let highest_claim = claim_rows(db, job_id)?
+    let read_memory = db.declared_reader_memory()?;
+    next_attempt_with_read_memory(db, job_id, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn next_attempt_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<i64> {
+    let highest_claim = claim_rows(db, job_id, read_memory.clone())?
         .iter()
         .map(|c| c.attempt)
         .max()
         .unwrap_or(0);
-    let highest_failure = failure_attempts(db, job_id)?.into_iter().max().unwrap_or(0);
+    let highest_failure = failure_attempts(db, job_id, read_memory.clone())?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
     Ok(highest_claim.max(highest_failure) + 1)
 }
 
@@ -1957,7 +2194,29 @@ pub fn insert_claim(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Result<ClaimInsert> {
-    if let Some(holder) = claim_holder(db, job_id, attempt)? {
+    let read_memory = db.declared_reader_memory()?;
+    insert_claim_with_read_memory(
+        db,
+        job_id,
+        attempt,
+        node_id,
+        lease_deadline_ms,
+        now_ms,
+        read_memory,
+    )
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn insert_claim_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    attempt: i64,
+    node_id: &str,
+    lease_deadline_ms: i64,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<ClaimInsert> {
+    if let Some(holder) = claim_holder_with_read_memory(db, job_id, attempt, read_memory.clone())? {
         return Ok(ClaimInsert::AlreadyHeld { holder });
     }
     let mut params = HashMap::new();
@@ -1970,21 +2229,24 @@ pub fn insert_claim(
         Value::Timestamp(lease_deadline_ms),
     );
     params.insert("claimed_at".to_string(), Value::Timestamp(now_ms));
-    let inserted = db.execute(
+    let inserted = db.execute_with_read_memory(
         "INSERT INTO work_claims (claim_key, job_id, attempt, node_id, lease_deadline, \
          claimed_at) VALUES ($claim_key, $job_id, $attempt, $node_id, $lease_deadline, \
          $claimed_at)",
         &params,
+        read_memory.clone(),
     );
     match inserted {
         Ok(result) if result.rows_affected == 0 => {
             // A concurrent local claimant won the primary key.
-            let holder = claim_holder(db, job_id, attempt)?.unwrap_or_default();
+            let holder = claim_holder_with_read_memory(db, job_id, attempt, read_memory.clone())?
+                .unwrap_or_default();
             Ok(ClaimInsert::AlreadyHeld { holder })
         }
         Ok(_) => Ok(ClaimInsert::Inserted),
         Err(Error::UniqueViolation { .. }) => {
-            let holder = claim_holder(db, job_id, attempt)?.unwrap_or_default();
+            let holder = claim_holder_with_read_memory(db, job_id, attempt, read_memory.clone())?
+                .unwrap_or_default();
             Ok(ClaimInsert::AlreadyHeld { holder })
         }
         Err(err) => Err(err),
@@ -1993,12 +2255,24 @@ pub fn insert_claim(
 
 /// Who holds the claim row for (job, attempt), if anyone.
 pub fn claim_holder(db: &Database, job_id: &str, attempt: i64) -> Result<Option<String>> {
+    let read_memory = db.declared_reader_memory()?;
+    claim_holder_with_read_memory(db, job_id, attempt, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn claim_holder_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    attempt: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<String>> {
     let mut params = HashMap::new();
     params.insert("claim_key".to_string(), text(&claim_key(job_id, attempt)));
     let (columns, rows) = select_rows(
         db,
         "SELECT node_id FROM work_claims WHERE claim_key = $claim_key",
         &params,
+        read_memory.clone(),
     )?;
     let Some(row) = rows.first() else {
         return Ok(None);
@@ -2022,7 +2296,32 @@ pub fn record_result(
     receipt: serde_json::Value,
     now_ms: i64,
 ) -> Result<()> {
-    if job_result(db, job_id)?.is_some() {
+    let read_memory = db.declared_reader_memory()?;
+    record_result_with_read_memory(
+        db,
+        job_id,
+        attempt,
+        executor_node_id,
+        output,
+        receipt,
+        now_ms,
+        read_memory,
+    )
+}
+
+/// Execute using the caller's existing operation read owner.
+#[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+pub fn record_result_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    attempt: i64,
+    executor_node_id: &str,
+    output: &[u8],
+    receipt: serde_json::Value,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
+    if job_result_with_read_memory(db, job_id, read_memory.clone())?.is_some() {
         return Ok(());
     }
     let mut params = HashMap::new();
@@ -2032,23 +2331,35 @@ pub fn record_result(
     params.insert("output".to_string(), text(&encode_payload(output)));
     params.insert("receipt".to_string(), Value::Json(receipt));
     params.insert("completed_at".to_string(), Value::Timestamp(now_ms));
-    db.execute(
+    db.execute_with_read_memory(
         "INSERT INTO work_results (job_id, attempt, executor_node_id, output, receipt, \
          completed_at) VALUES ($job_id, $attempt, $executor_node_id, $output, $receipt, \
          $completed_at)",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
 
 /// Read back the job's result, if one landed.
 pub fn job_result(db: &Database, job_id: &str) -> Result<Option<JobResult>> {
+    let read_memory = db.declared_reader_memory()?;
+    job_result_with_read_memory(db, job_id, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn job_result_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<JobResult>> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
     let (columns, rows) = select_rows(
         db,
         "SELECT * FROM work_results WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     let Some(row) = rows.first() else {
         return Ok(None);
@@ -2078,6 +2389,20 @@ pub fn record_failure(
     error: &str,
     now_ms: i64,
 ) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    record_failure_with_read_memory(db, job_id, attempt, node_id, error, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn record_failure_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    attempt: i64,
+    node_id: &str,
+    error: &str,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
     let key = failure_key(job_id, attempt);
     let mut probe = HashMap::new();
     probe.insert("failure_key".to_string(), text(&key));
@@ -2085,6 +2410,7 @@ pub fn record_failure(
         db,
         "SELECT failure_key FROM work_failures WHERE failure_key = $failure_key",
         &probe,
+        read_memory.clone(),
     )?;
     if !rows.is_empty() {
         return Ok(());
@@ -2096,10 +2422,11 @@ pub fn record_failure(
     params.insert("node_id".to_string(), text(node_id));
     params.insert("error".to_string(), text(error));
     params.insert("failed_at".to_string(), Value::Timestamp(now_ms));
-    db.execute(
+    db.execute_with_read_memory(
         "INSERT INTO work_failures (failure_key, job_id, attempt, node_id, error, failed_at) \
          VALUES ($failure_key, $job_id, $attempt, $node_id, $error, $failed_at)",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
@@ -2113,7 +2440,20 @@ pub fn cancel_job(
     reason: Option<&str>,
     now_ms: i64,
 ) -> Result<()> {
-    if cancellation_exists(db, job_id)? {
+    let read_memory = db.declared_reader_memory()?;
+    cancel_job_with_read_memory(db, job_id, requested_by, reason, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn cancel_job_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    requested_by: &str,
+    reason: Option<&str>,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
+    if cancellation_exists(db, job_id, read_memory.clone())? {
         return Ok(());
     }
     let mut params = HashMap::new();
@@ -2127,10 +2467,11 @@ pub fn cancel_job(
         },
     );
     params.insert("cancelled_at".to_string(), Value::Timestamp(now_ms));
-    db.execute(
+    db.execute_with_read_memory(
         "INSERT INTO work_cancellations (job_id, requested_by, reason, cancelled_at) \
          VALUES ($job_id, $requested_by, $reason, $cancelled_at)",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
@@ -2154,6 +2495,19 @@ pub fn advertise_capability(
     tags: &[String],
     now_ms: i64,
 ) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    advertise_capability_with_read_memory(db, node_id, capability_id, tags, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn advertise_capability_with_read_memory(
+    db: &Database,
+    node_id: &str,
+    capability_id: &str,
+    tags: &[String],
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<()> {
     let key = capability_key(node_id, capability_id);
     let mut params = HashMap::new();
     params.insert("capability_key".to_string(), text(&key));
@@ -2162,24 +2516,36 @@ pub fn advertise_capability(
     params.insert("tags".to_string(), Value::Json(serde_json::json!(tags)));
     params.insert("detail".to_string(), Value::Null);
     params.insert("advertised_at".to_string(), Value::Timestamp(now_ms));
-    db.execute(
+    db.execute_with_read_memory(
         "INSERT INTO work_capabilities (capability_key, node_id, capability_id, tags, detail, \
          advertised_at) VALUES ($capability_key, $node_id, $capability_id, $tags, $detail, \
          $advertised_at) ON CONFLICT (capability_key) DO UPDATE SET \
          advertised_at = $advertised_at, tags = $tags, detail = $detail",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
 
 /// The union of tags this node has advertised across its capability rows.
 pub fn advertised_tags(db: &Database, node_id: &str) -> Result<Vec<String>> {
+    let read_memory = db.declared_reader_memory()?;
+    advertised_tags_with_read_memory(db, node_id, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn advertised_tags_with_read_memory(
+    db: &Database,
+    node_id: &str,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Vec<String>> {
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), text(node_id));
     let (columns, rows) = select_rows(
         db,
         "SELECT tags FROM work_capabilities WHERE node_id = $node_id",
         &params,
+        read_memory.clone(),
     )?;
     let tags_idx = column_index(&columns, "tags")?;
     let mut union: Vec<String> = Vec::new();
@@ -2210,14 +2576,26 @@ pub fn materialize_inputs(
     node_id: &str,
     policy: &MovementPolicy,
 ) -> Result<ExecutionInputs> {
-    let job = job_row(db, job_id)?;
+    let read_memory = db.declared_reader_memory()?;
+    materialize_inputs_with_read_memory(db, job_id, node_id, policy, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn materialize_inputs_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    node_id: &str,
+    policy: &MovementPolicy,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<ExecutionInputs> {
+    let job = job_row(db, job_id, read_memory.clone())?;
     let mut declares_ledger_input = false;
     if let Some(job) = &job {
         if !policy.permits_input_read(job, node_id) {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "work ledger: the movement policy does not permit node {node_id} to read the \
                  input of job {job_id}"
-            )));
+            )).into()));
         }
         // A blob_ref input has no work_inputs row (its bytes never ride the
         // ledger); reading only work_inputs would silently return empty (pure
@@ -2243,6 +2621,7 @@ pub fn materialize_inputs(
         db,
         "SELECT seq, payload FROM work_inputs WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     let seq_idx = column_index(&columns, "seq")?;
     let payload_idx = column_index(&columns, "payload")?;
@@ -2268,9 +2647,17 @@ pub fn materialize_inputs(
     Ok(inputs)
 }
 
-fn terminal_since(db: &Database, job: &JobSnapshot, now_ms: i64) -> Result<Option<i64>> {
-    match job_state(db, &job.job_id, now_ms)? {
-        JobState::Done => Ok(job_result(db, &job.job_id)?.map(|r| r.completed_at_ms)),
+fn terminal_since(
+    db: &Database,
+    job: &JobSnapshot,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<Option<i64>> {
+    match job_state_with_read_memory(db, &job.job_id, now_ms, read_memory.clone())? {
+        JobState::Done => Ok(
+            job_result_with_read_memory(db, &job.job_id, read_memory.clone())?
+                .map(|r| r.completed_at_ms),
+        ),
         JobState::Cancelled => {
             let mut params = HashMap::new();
             params.insert("job_id".to_string(), text(&job.job_id));
@@ -2278,6 +2665,7 @@ fn terminal_since(db: &Database, job: &JobSnapshot, now_ms: i64) -> Result<Optio
                 db,
                 "SELECT cancelled_at FROM work_cancellations WHERE job_id = $job_id",
                 &params,
+                read_memory.clone(),
             )?;
             let idx = column_index(&columns, "cancelled_at")?;
             rows.first()
@@ -2291,6 +2679,7 @@ fn terminal_since(db: &Database, job: &JobSnapshot, now_ms: i64) -> Result<Optio
                 db,
                 "SELECT failed_at FROM work_failures WHERE job_id = $job_id",
                 &params,
+                read_memory.clone(),
             )?;
             let idx = column_index(&columns, "failed_at")?;
             let mut latest = None;
@@ -2310,15 +2699,31 @@ fn terminal_since(db: &Database, job: &JobSnapshot, now_ms: i64) -> Result<Optio
 /// provably cannot change any job's state. Returns the number of rows
 /// removed on this node.
 pub fn run_input_retention(db: &Database, now_ms: i64, grace_ms: i64) -> Result<usize> {
-    let (columns, rows) = select_rows(db, "SELECT job_id FROM work_jobs", &HashMap::new())?;
+    let read_memory = db.declared_reader_memory()?;
+    run_input_retention_with_read_memory(db, now_ms, grace_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn run_input_retention_with_read_memory(
+    db: &Database,
+    now_ms: i64,
+    grace_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<usize> {
+    let (columns, rows) = select_rows(
+        db,
+        "SELECT job_id FROM work_jobs",
+        &HashMap::new(),
+        read_memory.clone(),
+    )?;
     let id_idx = column_index(&columns, "job_id")?;
     let mut removed = 0usize;
     for row in &rows {
         let job_id = text_at(row, id_idx, "job_id")?;
-        let Some(job) = job_row(db, &job_id)? else {
+        let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
         };
-        let Some(terminal_at) = terminal_since(db, &job, now_ms)? else {
+        let Some(terminal_at) = terminal_since(db, &job, now_ms, read_memory.clone())? else {
             continue;
         };
         if terminal_at + grace_ms > now_ms {
@@ -2326,7 +2731,11 @@ pub fn run_input_retention(db: &Database, now_ms: i64, grace_ms: i64) -> Result<
         }
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(&job_id));
-        let result = db.execute("DELETE FROM work_inputs WHERE job_id = $job_id", &params)?;
+        let result = db.execute_with_read_memory(
+            "DELETE FROM work_inputs WHERE job_id = $job_id",
+            &params,
+            read_memory.clone(),
+        )?;
         removed += result.rows_affected as usize;
     }
     Ok(removed)
@@ -2344,19 +2753,31 @@ pub fn should_abandon(
     node_id: &str,
     now_ms: i64,
 ) -> Result<bool> {
+    let read_memory = db.declared_reader_memory()?;
+    should_abandon_with_read_memory(db, job_id, attempt, node_id, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn should_abandon_with_read_memory(
+    db: &Database,
+    job_id: &str,
+    attempt: i64,
+    node_id: &str,
+    now_ms: i64,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<bool> {
     let _ = now_ms;
-    if job_result(db, job_id)?.is_some() {
+    if job_result_with_read_memory(db, job_id, read_memory.clone())?.is_some() {
         return Ok(true);
     }
-    if cancellation_exists(db, job_id)? {
+    if cancellation_exists(db, job_id, read_memory.clone())? {
         return Ok(true);
     }
-    match claim_holder(db, job_id, attempt)? {
+    match claim_holder_with_read_memory(db, job_id, attempt, read_memory.clone())? {
         Some(holder) => Ok(holder != node_id),
         None => Ok(true),
     }
 }
-
 #[cfg(test)]
 mod jobspec_builder_tests {
     use super::*;

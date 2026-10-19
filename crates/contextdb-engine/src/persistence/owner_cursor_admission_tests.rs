@@ -6,6 +6,7 @@ use std::rc::Rc;
 type ReaderDescriptorValidationHook = ([u8; 16], Box<dyn FnOnce()>);
 
 thread_local! {
+    static BEFORE_PHYSICAL_PRESENCE_PROBE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static BEFORE_PROVIDER_ADMISSION: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static BEFORE_READER_DESCRIPTOR_VALIDATION: RefCell<Option<ReaderDescriptorValidationHook>> = const { RefCell::new(None) };
 }
@@ -174,6 +175,8 @@ fn owner_cursor_refresh_contention_refuses_before_refresh_release() {
             .owner_cursor_pin()
             .expect("retry after refresh release"),
     );
+    #[cfg(target_os = "linux")]
+    maintenance_contention_row(MaintenanceContention::PendingHandoff, false);
 }
 
 #[test]
@@ -239,7 +242,7 @@ fn owner_cursor_fence_contention_refuses_before_either_lock_release() {
 }
 
 #[test]
-fn owner_cursor_provider_contention_refuses_and_inventory_clears_teardown_fallback() {
+fn owner_cursor_provider_contention_retains_and_admits() {
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let held = Rc::new(RefCell::new(None));
@@ -254,47 +257,23 @@ fn owner_cursor_provider_contention_refuses_and_inventory_clears_teardown_fallba
         }));
     });
 
-    let error = persistence
-        .owner_cursor_pin_for_admission()
-        .err()
-        .expect("provider contention yields admission");
-    assert!(
-        matches!(&error, OwnerCursorPinAdmissionError::Busy(_)),
-        "healthy registry scan contention reaches the bounded admission retry"
-    );
-    assert_coordination_refusal(
-        error.into_error(),
-        &runtime,
-        "external snapshot admission failed",
-    );
+    // Ruling R4: a provider scan that meets an occupied registry does not
+    // refuse. It answers the exact roots plus tx 0 (retain everything), and
+    // the admission SUCCEEDS.
+    let pin = match persistence.owner_cursor_pin_for_admission() {
+        Ok(pin) => pin,
+        Err(error) => panic!(
+            "a busy registry retains and admits; it never refuses the cursor: {:?}",
+            error.into_error()
+        ),
+    };
     assert!(held.borrow().as_ref().unwrap().locked);
-    let stale = snapshot_paths(&runtime, identity);
     assert_eq!(
-        stale.len(),
+        snapshot_paths(&runtime, identity).len(),
         1,
-        "busy-registry cleanup leaves only the existing stale-file fallback"
+        "while the registry is held elsewhere the pin's own registration is present"
     );
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&stale[0])
-        .unwrap();
-    fs2::FileExt::try_lock_exclusive(&file).expect("fallback closed the snapshot's lifetime lock");
-    fs2::FileExt::unlock(&file).unwrap();
-    let owner = persistence
-        .writer_file
-        .read()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .unwrap();
-    assert!(
-        !owner
-            .unknown_reader_presence(&ReaderSnapshotRegistry::Complete(Vec::new()))
-            .unwrap(),
-        "refused admission releases physical reader presence before registry release",
-    );
-
+    drop(pin);
     drop(held.borrow_mut().take());
     assert!(matches!(
         capture_reader_snapshot_registry(identity, Some(&runtime)),
@@ -302,14 +281,87 @@ fn owner_cursor_provider_contention_refuses_and_inventory_clears_teardown_fallba
     ));
     assert!(
         snapshot_paths(&runtime, identity).is_empty(),
-        "the next inventory removes the unlocked fallback"
+        "after the pin and the other holder are gone the registry is consistent and empty"
     );
     assert!(!OWNER_CURSOR_COORDINATION_NONBLOCKING.with(|mode| mode.get()));
     drop(
         persistence
             .owner_cursor_pin()
-            .expect("retry succeeds after provider registry release"),
+            .expect("a later pin succeeds once the registry is free"),
     );
+    let rows = [true, false].map(|native_floor| {
+        catch_unwind(AssertUnwindSafe(|| {
+            newer_registered_root_is_protected_by_an_older_admitted_reader(native_floor);
+        }))
+        .is_ok()
+    });
+    assert_eq!(
+        rows,
+        [true, true],
+        "native and external floor rows both admit"
+    );
+}
+
+// A housekeeping commit advances the physical transaction without changing
+// the user root. A later external reader can publish that exact transaction
+// after its native capture ends: the older admitted reader still fences every
+// page the later snapshot can address. Exercise the real registration and
+// owner-admission doors without requiring a probabilistic reader overlap.
+fn newer_registered_root_is_protected_by_an_older_admitted_reader(native_floor: bool) {
+    let (_directory, persistence, runtime) = writer();
+    let OwnerCursorStoragePin {
+        read,
+        _registration,
+    } = persistence.owner_cursor_pin().unwrap();
+    let old = read.storage_snapshot_identity();
+    let (old_read, registration) = if native_floor {
+        // Drop the external registration: only the real native read remains.
+        drop(_registration);
+        (read, None)
+    } else {
+        // External reads carry no native transaction pin. The registered
+        // earlier root alone must retain the intervening transaction range.
+        let external = persistence
+            .with_db(|db| Ok(Arc::new(db.begin_external_read(old).unwrap())))
+            .unwrap();
+        drop(read);
+        (external, Some(_registration))
+    };
+    let identity = persistence.physical_identity().unwrap();
+    let (database_identity, run, _, _) = published_writer_identity(persistence.path()).unwrap();
+    let later = persistence
+        .with_db(|db| {
+            db.begin_write().unwrap().commit().unwrap();
+            let native = db.begin_read().unwrap();
+            let snapshot = native.storage_snapshot_identity();
+            assert!(snapshot.transaction_id > old.transaction_id);
+            assert_eq!(snapshot.user_root, old.user_root);
+            let registration = ReadSnapshotRegistrationGuard::from_owner(
+                persistence.path(),
+                database_identity,
+                run,
+                identity,
+                snapshot,
+                Some(&runtime),
+            )
+            .unwrap();
+            drop(native);
+            Ok(registration)
+        })
+        .unwrap();
+    let admitted = match persistence.owner_cursor_pin_from_read(Some(Arc::clone(&old_read))) {
+        Ok(pin) => pin,
+        Err(error) => panic!(
+            "the earlier reader protects the newer external registration: {:?}",
+            error.into_error()
+        ),
+    };
+    assert_eq!(admitted.read.storage_snapshot_identity(), old);
+    assert!(later.snapshot.storage_snapshot.transaction_id > old.transaction_id);
+    drop(admitted);
+    drop(later);
+    drop(registration);
+    drop(old_read);
 }
 
 #[test]
@@ -330,18 +382,6 @@ fn untrusted_provider_scan_registry_is_a_terminal_typed_refusal() {
     let path = reader_snapshot_registry_lock_path(&runtime, identity);
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     drop(persistence.owner_cursor_pin().unwrap());
-}
-
-#[test]
-fn provider_io_wouldblock_does_not_imply_registry_scan_contention() {
-    let error = redb::TransactionError::Storage(redb::StorageError::Io(std::io::Error::new(
-        std::io::ErrorKind::WouldBlock,
-        "reader snapshot registry scan is held by another operation",
-    )));
-    assert!(
-        !writer_file::is_reader_registry_scan_contention(&error),
-        "an arbitrary provider I/O error with the same kind and text stays terminal"
-    );
 }
 
 #[test]
@@ -564,4 +604,525 @@ fn a_registry_replaced_before_validation_is_a_terminal_typed_admission_refusal()
         "not a trusted private regular file",
     );
     assert_eq!(pause.attempts_for_test(), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum MaintenanceContention {
+    PendingHandoff,
+    Registry,
+    PhysicalHold,
+}
+
+// Original-view continuity and optional-maintenance deferral.
+// These extend the owner-admission schedules; the real caller
+// must distinguish temporary contention from permission to reclaim pages.
+#[cfg(target_os = "linux")]
+fn maintenance_contention_row(contention: MaintenanceContention, retention: bool) {
+    use super::read_persistence_test_scaffold::{
+        ReaderRegistrationLockPhase, pause_reader_registration_lock_for_test,
+    };
+    use crate::{Database, DatabaseOpenOptions, MaintenancePolicy};
+    use contextdb_core::{Value, Wallclock};
+    use std::collections::HashMap;
+    let _clock = Wallclock::test_clock_guard(|| 1_000_000);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("maintenance.db");
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let open = || {
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                owner_reads: crate::OwnerReadConfig {
+                    runtime_dir: Some(runtime.clone()),
+                    ..Default::default()
+                },
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let db = open();
+    if retention {
+        db.execute("CREATE TABLE retained (id INT PRIMARY KEY, expires TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF", &HashMap::new()).unwrap();
+        db.execute(
+            "INSERT INTO retained VALUES (1, $expires)",
+            &HashMap::from([("expires".into(), Value::Timestamp(2_000_000))]),
+        )
+        .unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+    // Use the compaction fixture's physical layout with only 64
+    // half-empty leaves: deleting alternate leaves creates interior free pages.
+    const PAYLOAD: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("payload");
+    let raw = redb::Database::create(&path).unwrap();
+    let tx = raw.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(PAYLOAD).unwrap();
+        let body = vec![0x5c; 4100];
+        for key in 0..64 {
+            table.insert(key, body.as_slice()).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    drop(raw);
+    let db = open();
+    db.compact_now().unwrap();
+    db.close().unwrap();
+    drop(db);
+    let raw = redb::Database::create(&path).unwrap();
+    let tx = raw.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(PAYLOAD).unwrap();
+        for key in (0..63).step_by(2) {
+            table.remove(key).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    raw.begin_write().unwrap().commit().unwrap();
+    drop(raw);
+    let db = open();
+    if retention {
+        db.execute(
+            "SET STORAGE_COMPACTION START_RATIO 1 MIN_INTERVAL 1 SECONDS",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let checked = db.run_maintenance_cycle().unwrap();
+        assert_eq!(checked.pruning.pruned_rows, 0);
+        assert!(!checked.compaction.ran);
+    }
+    db.execute(
+        "SET STORAGE_COMPACTION START_RATIO 0.000001 MIN_INTERVAL 1 SECONDS",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let _due_clock = Wallclock::test_clock_guard(|| 3_000_000);
+    let (persistence, _, _) = db.maintenance_publication_state_for_test();
+    assert!(
+        persistence.allocator_free_page_ratio().unwrap().unwrap()
+            >= db.storage_compaction_policy().start_ratio()
+    );
+    let identity = persistence.physical_identity().unwrap();
+    let state = || {
+        let (_, interval, interrupted) = db.maintenance_publication_state_for_test();
+        let durable_checkpoint = persistence
+            .with_db(|db| {
+                let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
+                let table = match read.open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "writer_storage_compaction",
+                )) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(error) => return Err(RedbPersistence::storage_error(error)),
+                };
+                Ok(table
+                    .get("cursor")
+                    .map_err(RedbPersistence::storage_error)?
+                    .map(|bytes| bytes.value().to_vec()))
+            })
+            .unwrap();
+        let state = persistence.storage_compaction.lock().unwrap();
+        let cursor = state.0.checkpoint();
+        (
+            (
+                cursor.0,
+                cursor.1.map(str::to_owned),
+                cursor.2,
+                cursor.3.to_vec(),
+                cursor.4,
+            ),
+            (state.1.pages_examined, state.1.pages_relocated),
+            state.2,
+            state.3.as_ref().map(PersistenceBytes::bytes),
+            interval,
+            interrupted,
+            durable_checkpoint,
+        )
+    };
+    let old_reader = (!retention).then(|| persistence.owner_cursor_pin().unwrap());
+    let read_payload = |pin: &OwnerCursorStoragePin| {
+        use redb::ReadableTable as _;
+        pin.read
+            .open_table(PAYLOAD)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (key.value(), value.value().to_vec())
+            })
+            .collect::<Vec<_>>()
+    };
+    let original = old_reader.as_ref().map(&read_payload);
+    let before = state();
+    let mut held_registry = None;
+    let mut held_physical = None;
+    let mut handoff = None;
+    let mut pause = None;
+    match contention {
+        MaintenanceContention::Registry => {
+            let mut held = ReaderSnapshotRegistryLock::create(&runtime, identity).unwrap();
+            held.lock_exclusive().unwrap();
+            held_registry = Some(held);
+        }
+        MaintenanceContention::PhysicalHold => {
+            let held = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            assert!(matches!(
+                physical_admission::try_byte(
+                    &held,
+                    physical_admission::READER_HOLD_OFFSET,
+                    physical_admission::ByteLock::Shared
+                )
+                .unwrap(),
+                physical_admission::Granted::Yes
+            ));
+            held_physical = Some(held);
+        }
+        MaintenanceContention::PendingHandoff => {
+            let (database_identity, run, _, _) = published_writer_identity(&path).unwrap();
+            let parked = pause_reader_registration_lock_for_test(
+                &path,
+                ReaderRegistrationLockPhase::DescriptorOpened,
+            )
+            .unwrap();
+            let reader_path = path.clone();
+            let reader_runtime = runtime.clone();
+            handoff = Some(std::thread::spawn(move || {
+                ReadSnapshotRegistrationGuard::owner_handoff_start(
+                    &reader_path,
+                    database_identity,
+                    run,
+                    Some(&reader_runtime),
+                )
+            }));
+            assert!(parked.wait_for_attempt_for_test(1, std::time::Duration::from_secs(30)));
+            pause = Some(parked);
+        }
+    }
+    let observed = if retention {
+        db.run_pruning_cycle_checked()
+            .map(|report| (report.compacted, report.pruned_rows))
+    } else {
+        db.run_maintenance_cycle()
+            .map(|report| (report.compaction.ran, report.pruning.pruned_rows))
+    };
+    let after = state();
+    // Sample optional work before explicit controls can alter its fixture.
+    let explicit = db.compact_now();
+    let purge_refused = matches!(persistence.acquire_authoritative_purge_publication(), Err(Error::ReaderCoordinationUnavailable { ref operation, .. }) if operation == "authoritative purge");
+    // Always release the real locks and join before an assertion can panic.
+    drop(held_registry);
+    drop(held_physical);
+    if let Some(pause) = pause {
+        pause.stop_pausing_for_test();
+    }
+    if let Some(handoff) = handoff {
+        drop(handoff.join().unwrap().unwrap());
+    }
+    let (ran, pruned) = observed
+        .expect("temporary contention must defer optional maintenance through its actual caller");
+    assert!(
+        !ran,
+        "contention cannot authorize a successful relocation batch"
+    );
+    assert!(
+        matches!(explicit, Err(Error::ReaderCoordinationUnavailable { ref operation, .. }) if operation == "storage reclamation"),
+        "explicit compaction must refuse: {explicit:?}"
+    );
+    assert!(purge_refused, "purge must refuse temporary contention");
+    assert_eq!(
+        (&after.0, after.1, after.2, after.3, after.5),
+        (&before.0, before.1, before.2, before.3, before.5),
+        "deferred maintenance cannot advance cursor, checkpoint, counters or interrupted state"
+    );
+    assert_eq!(
+        after.6, before.6,
+        "deferred maintenance leaves its durable checkpoint byte-identical"
+    );
+    if retention {
+        assert!(before.4.is_some(), "fixture has a prior completed interval");
+        assert_eq!(
+            after.4, None,
+            "deferred retention invalidates the completed interval"
+        );
+    } else {
+        assert_eq!(
+            after.4, before.4,
+            "deferred automatic work keeps its interval"
+        );
+    }
+    assert_eq!(
+        old_reader.as_ref().map(&read_payload),
+        original,
+        "old reader keeps its exact payload through deferred maintenance"
+    );
+    assert_eq!(
+        pruned,
+        u64::from(retention),
+        "committed prune count survives deferral"
+    );
+    let resumed = db.run_maintenance_cycle().unwrap();
+    assert_eq!(
+        resumed.pruning.pruned_rows, 0,
+        "no new expiration is needed to retry pending relocation"
+    );
+    assert!(
+        resumed.compaction.ran,
+        "pending relocation advances after contention releases"
+    );
+    assert_ne!(
+        state(),
+        before,
+        "resumption changes actual compaction state"
+    );
+    assert_eq!(
+        old_reader.as_ref().map(&read_payload),
+        original,
+        "old reader keeps its exact payload through resumed maintenance"
+    );
+    drop(old_reader);
+    db.close().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_compaction_defers_registry_contention() {
+    maintenance_contention_row(MaintenanceContention::Registry, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_compaction_defers_physical_publication_hold() {
+    maintenance_contention_row(MaintenanceContention::PhysicalHold, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retention_compaction_defers_registry_contention() {
+    maintenance_contention_row(MaintenanceContention::Registry, true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retention_compaction_defers_physical_publication_hold() {
+    maintenance_contention_row(MaintenanceContention::PhysicalHold, true);
+}
+
+pub(super) fn before_physical_presence_probe() {
+    let hook = BEFORE_PHYSICAL_PRESENCE_PROBE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inventory_excludes_publication_until_its_physical_probe_finishes() {
+    let (_directory, persistence, runtime) = writer();
+    let persistence = Arc::new(persistence);
+    let identity = persistence.physical_identity().unwrap();
+    let publisher = Arc::clone(&persistence);
+    let observed_busy = Rc::new(RefCell::new(false));
+    let observed = Rc::clone(&observed_busy);
+    BEFORE_PHYSICAL_PRESENCE_PROBE.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            // Real sanctioned publisher, driven exactly in the scan/probe gap.
+            // Admission must yield before publishing even its first registration.
+            *observed.borrow_mut() = matches!(
+                publisher.owner_cursor_pin_for_admission(),
+                Err(OwnerCursorPinAdmissionError::Busy(_))
+            );
+        }))
+    });
+    let owner = persistence
+        .writer_file
+        .read()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .unwrap();
+    let audit = persistence.refuse_unknown_reader_presence(&owner, "storage reclamation");
+    assert!(
+        *observed_busy.borrow(),
+        "the audit must own physical exclusion across registry capture and presence probe"
+    );
+    audit.unwrap();
+    assert!(snapshot_paths(&runtime, identity).is_empty());
+    let pin = persistence.owner_cursor_pin().unwrap();
+    let handle = pin._registration.snapshot.handle_identity;
+    let snapshot = pin.storage_identity();
+    assert!(
+        matches!(capture_reader_snapshot_registry(identity, Some(&runtime)), ReaderSnapshotRegistry::Complete(snapshots) if snapshots.iter().any(|registered| registered.handle_identity == handle && registered.storage_snapshot == snapshot))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn purge_without_registered_readers_keeps_physical_custody() {
+    let (_directory, persistence, runtime) = writer();
+    let identity = persistence.physical_identity().unwrap();
+    assert!(
+        matches!(capture_reader_snapshot_registry(identity, Some(&runtime)), ReaderSnapshotRegistry::Complete(snapshots) if snapshots.is_empty())
+    );
+    let publication = persistence
+        .acquire_authoritative_purge_publication()
+        .unwrap();
+    // The empty-fence path still owns exclusion. A new real description is
+    // used so an aliased OFD cannot manufacture a successful safety proof.
+    let arriving = OpenOptions::new()
+        .read(true)
+        .open(persistence.path())
+        .unwrap();
+    let while_prepared = physical_admission::try_byte(
+        &arriving,
+        physical_admission::READER_HOLD_OFFSET,
+        physical_admission::ByteLock::Shared,
+    )
+    .unwrap();
+    drop(arriving);
+    drop(publication);
+    assert!(
+        matches!(while_prepared, physical_admission::Granted::HeldByAnother),
+        "purge must retain H even with zero registered readers/fences"
+    );
+    let arriving = OpenOptions::new()
+        .read(true)
+        .open(persistence.path())
+        .unwrap();
+    assert!(matches!(
+        physical_admission::try_byte(
+            &arriving,
+            physical_admission::READER_HOLD_OFFSET,
+            physical_admission::ByteLock::Shared
+        )
+        .unwrap(),
+        physical_admission::Granted::Yes
+    ));
+}
+
+/// Control 1: Audited reader snapshots under hold succeeds with complete own-reader inventory under unrelated root contention.
+///
+/// Contract: Exporting under concurrent unrelated-store reader registration succeeds with
+/// authenticated complete own-reader inventory; active own readers are never inferred absent.
+///
+/// Baseline oracle (expected RED): In baseline code, LockedWriterFile::audit_reader_snapshots_under_hold
+/// delegates directly to capture_reader_snapshot_registry without physical admission hold.
+/// When an unrelated store holds the root serializer (e.g. during reader join/leave),
+/// the scan meets root contention (WouldBlock) and returns ReaderSnapshotRegistry::Contended.
+/// audit_reader_snapshots_under_hold translates Contended to ReaderAuditOutcome::Busy(runtime),
+/// causing compaction and export to fail closed with Error::ReaderCoordinationUnavailable.
+///
+/// Repaired contract (expected GREEN): On Linux, LockedWriterFile::audit_reader_snapshots_under_hold
+/// acquires exclusive READER_HOLD_OFFSET before scanning. Because the physical hold freezes
+/// this store's admission and publication, the writer proves its own readers are frozen and
+/// authenticates complete own-reader inventory, yielding ReaderAuditOutcome::Proven without
+/// being blocked by unrelated root contention.
+#[cfg(target_os = "linux")]
+#[test]
+fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention() {
+    let (_directory, persistence, runtime) = writer();
+    let owner = persistence
+        .writer_file
+        .read()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .unwrap();
+
+    let pin = persistence.owner_cursor_pin().unwrap();
+    let handle = pin._registration.snapshot.handle_identity;
+    let snapshot = pin.storage_identity();
+
+    // Hold the task-scoped runtime root serializer on a separate real descriptor,
+    // simulating an unrelated store in the same runtime root currently joining or leaving.
+    let root_serializer =
+        serialize_runtime_root(&runtime, false).expect("acquire runtime root serializer");
+
+    let outcome = owner.audit_reader_snapshots_under_hold();
+
+    // Release serializer before any blocking cleanup
+    drop(root_serializer);
+
+    match outcome {
+        writer_file::ReaderAuditOutcome::Proven(audit) => {
+            assert!(
+                !audit.unknown,
+                "registered own reader must not be marked unknown"
+            );
+            match &audit.registry {
+                ReaderSnapshotRegistry::Complete(snapshots) => {
+                    assert!(
+                        snapshots.iter().any(|registered| {
+                            registered.handle_identity == handle
+                                && registered.storage_snapshot == snapshot
+                        }),
+                        "own registered reader must be authenticated in complete audit inventory"
+                    );
+                }
+                other => panic!("expected Complete registry in Proven audit, got {other:?}"),
+            }
+        }
+        writer_file::ReaderAuditOutcome::Busy(ref path) => {
+            panic!(
+                "baseline refusal (RED): audit returned Busy({path:?}) due to unrelated root contention; repaired contract requires Proven"
+            );
+        }
+        writer_file::ReaderAuditOutcome::Refused(ref path, ref err) => {
+            panic!("unexpected audit Refused({path:?}, {err})");
+        }
+    }
+
+    drop(pin);
+}
+
+/// Control 2: Generic reader registry scanner under root contention strictly remains Contended.
+///
+/// Contract: Existing general capture_reader_snapshot_registry without exclusive physical
+/// admission MUST fail closed on a contended root, returning Contended. Once the root serializer
+/// is released, it returns Complete with own registered reader present.
+#[test]
+fn generic_reader_registry_scanner_fails_closed_under_root_serializer_contention() {
+    let (_directory, persistence, runtime) = writer();
+    let identity = persistence.physical_identity().unwrap();
+
+    let pin = persistence.owner_cursor_pin().unwrap();
+    let handle = pin._registration.snapshot.handle_identity;
+    let snapshot = pin.storage_identity();
+
+    // Hold the task-scoped runtime root serializer on a separate real descriptor
+    let root_serializer =
+        serialize_runtime_root(&runtime, false).expect("acquire runtime root serializer");
+
+    let registry = capture_reader_snapshot_registry(identity, Some(&runtime));
+    assert!(
+        matches!(&registry, ReaderSnapshotRegistry::Contended(path) if path == &runtime),
+        "generic scanner without physical hold must return Contended on contended root: {registry:?}"
+    );
+
+    // Release serializer
+    drop(root_serializer);
+
+    let registry = capture_reader_snapshot_registry(identity, Some(&runtime));
+    assert!(
+        matches!(
+            &registry,
+            ReaderSnapshotRegistry::Complete(snapshots)
+                if snapshots.iter().any(|registered| {
+                    registered.handle_identity == handle
+                        && registered.storage_snapshot == snapshot
+                })
+        ),
+        "generic scanner succeeds after serializer release with authenticated own reader: {registry:?}"
+    );
+
+    drop(pin);
 }

@@ -273,14 +273,14 @@ fn callerless_applied_push_writer_is_absent() {
 
 #[test]
 fn visibility_changing_macro_definitions_match_the_audited_contract() {
-    const TEST_SEAM_PUBLIC: &str = r#"#[cfg(feature = "test-seams")]
+    const TEST_SEAM_PUBLIC: &str = r#"#[cfg(any(test, feature = "test-seams"))]
 macro_rules! sync_test_seam {
     ($(#[$attr:meta])* fn $($item:tt)*) => {
         $(#[$attr])*
         pub fn $($item)*
     };
 }"#;
-    const TEST_SEAM_CRATE_PRIVATE: &str = r#"#[cfg(not(feature = "test-seams"))]
+    const TEST_SEAM_CRATE_PRIVATE: &str = r#"#[cfg(not(any(test, feature = "test-seams")))]
 macro_rules! sync_test_seam {
     ($(#[$attr:meta])* fn $($item:tt)*) => {
         $(#[$attr])*
@@ -432,6 +432,50 @@ fn database_public_methods(engine: &Path) -> Vec<ImplItemFn> {
         .collect()
 }
 
+// Inventory every declared method, but normal-build reachability also honors
+// the enclosing out-of-line module's test-only gate.
+fn database_normal_public_methods(engine: &Path) -> Vec<ImplItemFn> {
+    let root = engine.join("src/database.rs");
+    let source = std::fs::read_to_string(&root).expect("read Database module declarations");
+    let file = syn::parse_file(&source).expect("parse Database module declarations");
+    let gated = file
+        .items
+        .iter()
+        .filter_map(|item| {
+            let Item::Mod(module) = item else {
+                return None;
+            };
+            module
+                .attrs
+                .iter()
+                .any(cfg_is_test_only)
+                .then(|| module.ident.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut paths = vec![root];
+    collect_rust_files(&engine.join("src/database"), &mut paths);
+    paths
+        .iter()
+        .filter(|path| {
+            let Ok(relative) = path.strip_prefix(engine.join("src/database")) else {
+                return true;
+            };
+            let first = relative
+                .components()
+                .next()
+                .expect("module path")
+                .as_os_str();
+            let module = Path::new(first)
+                .file_stem()
+                .expect("module name")
+                .to_str()
+                .expect("UTF-8 module");
+            !gated.contains(module)
+        })
+        .flat_map(|path| public_impl_methods(path, "Database"))
+        .collect()
+}
+
 fn collect_rust_files(directory: &Path, paths: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).expect("read Database implementation directory") {
         let path = entry.expect("Database implementation entry").path();
@@ -485,6 +529,7 @@ fn method_mentions(method: &ImplItemFn, wanted: &str) -> bool {
 }
 
 #[test]
+#[allow(clippy::needless_borrow)] // Preserve the existing test expression and assertion contract.
 fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
     let engine = engine_root();
     let root = engine.ancestors().nth(2).expect("contextdb root");
@@ -497,6 +542,13 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         .expect("read server reexports");
 
     let database_names = method_names(&database);
+    let database_normal_names = method_names(&database_normal_public_methods(&engine));
+    for name in database_names.difference(&database_normal_names) {
+        assert!(
+            is_test_door(name),
+            "only test seams may disappear without their cfg: {name}"
+        );
+    }
     let client_names = method_names(&client);
     let server_names = method_names(&server);
     let accountant = public_impl_methods(
@@ -533,8 +585,21 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         .iter()
         .find(|method| method.sig.ident == "new")
         .expect("safe SyncServer::new constructor remains public");
+    let explicit_server_new = server
+        .iter()
+        .find(|method| method.sig.ident == "new_with_read_budget_provider")
+        .expect("the server host constructor accepts its declared request provider");
+    let safe_client_new = client
+        .iter()
+        .find(|method| method.sig.ident == "new")
+        .expect("safe SyncClient::new constructor remains public");
+    let explicit_client_new = client
+        .iter()
+        .find(|method| method.sig.ident == "new_with_read_memory")
+        .expect("the client host constructor accepts its executing read owner");
+    assert_embedder_read_owner_facades(&root);
     assert_eq!(
-        database_names,
+        database_normal_names,
         frozen_names(include_str!("../fixtures/public_api_database_names.txt")),
         "Database public impl-name inventory drifted from the frozen durable surface"
     );
@@ -568,7 +633,7 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         "SyncClient methods still expose policy, direction, or arbitrary transport types: {client_sensitive_reachability:?}"
     );
     for (surface, names) in [
-        ("Database", &database_names),
+        ("Database", &database_normal_names),
         ("SyncClient", &client_names),
         ("SyncServer", &server_names),
         ("MemoryAccountant", &accountant_names),
@@ -586,8 +651,29 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         !method_mentions(safe_server_new, "ConflictPolicies")
             && !method_mentions(safe_server_new, "ConflictPolicy")
             && !method_mentions(safe_server_new, "ServerTransport")
+            && !method_mentions(safe_server_new, "ReadRequestBudgetProvider")
+            && method_mentions(safe_server_new, "Result")
             && safe_server_new.sig.inputs.len() == 3,
         "SyncServer::new must remain the typed production constructor without policy or arbitrary transport arguments"
+    );
+
+    assert!(
+        method_mentions(explicit_server_new, "ReadRequestBudgetProvider")
+            && method_mentions(explicit_server_new, "Result")
+            && !method_mentions(explicit_server_new, "ConflictPolicies")
+            && !method_mentions(explicit_server_new, "ConflictPolicy")
+            && !method_mentions(explicit_server_new, "ServerTransport")
+            && explicit_server_new.sig.inputs.len() == 4,
+        "the explicit server constructor requires a request provider without arbitration or transport injection"
+    );
+    assert!(
+        !method_mentions(safe_client_new, "ReadMemoryBudget")
+            && method_mentions(safe_client_new, "Result")
+            && safe_client_new.sig.inputs.len() == 3
+            && method_mentions(explicit_client_new, "ReadMemoryBudget")
+            && method_mentions(explicit_client_new, "Result")
+            && explicit_client_new.sig.inputs.len() == 4,
+        "the client keeps its original constructor inputs and requires a read owner only on the host variant"
     );
     for forbidden_reexport in [
         "pub use sync_types::*",
@@ -600,4 +686,95 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
             "role-relative arbitration types must not remain reachable through public reexports: {forbidden_reexport}"
         );
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ReadOwnerFacade {
+    source: String,
+    name: String,
+    inputs: String,
+    explicit: String,
+    budget: String,
+    top_level: bool,
+}
+
+fn public_declaration_inputs(source: &str, name: &str, top_level: bool) -> String {
+    let mut start = None;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let declaration = if top_level { line } else { line.trim_start() };
+        for prefix in [format!("pub fn {name}"), format!("pub async fn {name}")] {
+            if let Some(suffix) = declaration.strip_prefix(&prefix)
+                && (suffix.starts_with('(') || suffix.starts_with('<'))
+            {
+                let parenthesis = line.find('(').expect("function input list");
+                start = Some(offset + parenthesis + 1);
+                break;
+            }
+        }
+        if start.is_some() {
+            break;
+        }
+        offset += line.len();
+    }
+    let start = start.unwrap_or_else(|| panic!("public declaration {name} is absent"));
+    let mut depth = 1;
+    for (offset, character) in source[start..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            let inputs: String = source[start..start + offset]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            return inputs.trim_end_matches(',').to_owned();
+        }
+    }
+    panic!("public declaration {name} has no closing input list")
+}
+
+fn assert_embedder_read_owner_facades(root: &Path) {
+    let facades: Vec<ReadOwnerFacade> = serde_json::from_str(include_str!(
+        "../fixtures/public_api_read_owner_facades.json"
+    ))
+    .expect("parse declared embedder inputs");
+    assert_eq!(facades.len(), 48);
+    for facade in facades {
+        let source =
+            std::fs::read_to_string(root.join(&facade.source)).expect("read facade source");
+        syn::parse_file(&source).expect("facade declarations parse");
+        assert_eq!(
+            public_declaration_inputs(&source, &facade.name, facade.top_level),
+            facade.inputs,
+            "{}::{} must keep its original embedder inputs",
+            facade.source,
+            facade.name,
+        );
+        let explicit = public_declaration_inputs(&source, &facade.explicit, facade.top_level);
+        assert!(
+            explicit.contains(&facade.budget),
+            "{}::{} requires the host's declared read capability",
+            facade.source,
+            facade.explicit,
+        );
+    }
+}
+
+// Acceptance: embedders construct QueryResult using its five existing public fields.
+#[test]
+fn external_embedder_query_result_literal_keeps_its_five_public_fields() {
+    let result = contextdb_engine::QueryResult {
+        columns: vec!["id".to_owned()],
+        rows: vec![vec![contextdb_core::Value::Int64(7)]],
+        rows_affected: 0,
+        trace: contextdb_engine::QueryTrace::default(),
+        cascade: None,
+    };
+    assert_eq!(result.columns, vec!["id"]);
+    assert_eq!(result.rows, vec![vec![contextdb_core::Value::Int64(7)]]);
+    assert_eq!(result.rows_affected, 0);
+    assert!(result.cascade.is_none());
 }

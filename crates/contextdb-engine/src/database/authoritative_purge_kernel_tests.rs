@@ -1,6 +1,7 @@
 #![cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
 
 use super::*;
+use redb::ReadableDatabase;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
@@ -54,10 +55,10 @@ struct OwnedCopies {
     survivor_note_disk_sync_source: Option<(Lsn, u8)>,
     selected_edge_disk_sync_source: Option<(Lsn, u8)>,
     survivor_edge_disk_sync_source: Option<(Lsn, u8)>,
-    selected_note_memory_sync_source: Option<(Lsn, u8)>,
-    survivor_note_memory_sync_source: Option<(Lsn, u8)>,
-    selected_edge_memory_sync_source: Option<(Lsn, u8)>,
-    survivor_edge_memory_sync_source: Option<(Lsn, u8)>,
+    selected_note_scoped_sync_source: Option<(Lsn, u8)>,
+    survivor_note_scoped_sync_source: Option<(Lsn, u8)>,
+    selected_edge_scoped_sync_source: Option<(Lsn, u8)>,
+    survivor_edge_scoped_sync_source: Option<(Lsn, u8)>,
     selected_note_live_sidecar: Option<AuthoritativePurgeLiveRowSidecarSnapshot>,
     survivor_note_live_sidecar: Option<AuthoritativePurgeLiveRowSidecarSnapshot>,
     selected_edge_live_sidecar: Option<AuthoritativePurgeLiveRowSidecarSnapshot>,
@@ -66,6 +67,8 @@ struct OwnedCopies {
     survivor_deletion_state: DurableDeletionStateSnapshot,
     selected_edge_deletion_state: DurableDeletionStateSnapshot,
     survivor_edge_deletion_state: DurableDeletionStateSnapshot,
+    selected_row_graph_owner: Option<contextdb_tx::RowEdgeOwner>,
+    survivor_row_graph_owner: Option<contextdb_tx::RowEdgeOwner>,
     selected_graph_arrival: Option<DurableGraphArrival>,
     survivor_graph_arrival: Option<DurableGraphArrival>,
 }
@@ -178,6 +181,60 @@ fn graph_neighbors(db: &Database, node: Uuid, direction: Direction) -> BTreeSet<
     .collect()
 }
 
+fn row_graph_owner(db: &Database, row_id: RowId) -> Option<contextdb_tx::RowEdgeOwner> {
+    let memory = db
+        .declared_reader_memory()
+        .expect("admit exact row graph owner probe");
+    let row = db
+        .committed_row_at(EDGES, row_id, db.snapshot_for_read(), memory.clone())
+        .expect("read exact owning row")?;
+    let generation = db
+        .durable_lineage_table_generation(EDGES, memory.clone())
+        .expect("read authoritative edge table generation");
+    db.with_row_graph_witness(
+        EDGES,
+        generation,
+        &row,
+        memory,
+        |_, owner| Ok(owner.clone()),
+    )
+    .expect("read exact graph witness owned by this row")
+}
+
+// Consult the captured physical graph root with the SAVED exact row owner,
+// never look up a deleted owning row and mistake None for absent adjacency.
+fn assert_saved_row_witnesses(db: &Database, fixture: &Fixture, before: &OwnedCopies, selected_present: bool) {
+    let memory = db.declared_reader_memory().unwrap();
+    let root = db.graph_snapshot(db.snapshot_for_read(), memory).unwrap();
+    for (owner, source, target, present) in [
+        (before.selected_row_graph_owner.as_ref().unwrap(), fixture.selected, fixture.selected_graph_target, selected_present),
+        (before.survivor_row_graph_owner.as_ref().unwrap(), fixture.survivor, fixture.survivor_graph_target, true),
+    ] {
+        for (node, other, direction) in [(source, target, Direction::Outgoing), (target, source, Direction::Incoming)] {
+            let mut count = 0;
+            db.graph_store.visit_row_edges(root.as_ref(), contextdb_graph::source::GraphQuery {
+                node, direction, identity: Some((other, EDGE_TYPE)),
+            }, owner, |edge| {
+                assert_eq!(edge.source, source);
+                assert_eq!(edge.target, target);
+                assert_eq!(edge.edge_type, EDGE_TYPE);
+                assert_eq!(edge.created_tx, owner.created_tx);
+                assert_eq!(edge.lsn, owner.lsn);
+                count += 1;
+                Ok(true)
+            }).expect("read physical row-owner lane without logical visibility filtering");
+            assert_eq!(count, usize::from(present), "saved exact witness in each physical direction");
+        }
+    }
+}
+
+fn standalone_copies(db: &Database, source: Uuid, target: Uuid) -> (Option<DurableGraphArrival>, BTreeSet<Uuid>, BTreeSet<Uuid>) {
+    let memory = db.declared_reader_memory().unwrap();
+    let arrival = db.with_graph_arrival(&(source, target, EDGE_TYPE.to_owned()),
+        |record| Ok(record.cloned()), memory).unwrap();
+    (arrival, graph_neighbors(db, source, Direction::Outgoing), graph_neighbors(db, target, Direction::Incoming))
+}
+
 fn graph_probe(db: &Database, fixture: &Fixture) -> GraphProbe {
     GraphProbe {
         selected_forward: graph_neighbors(db, fixture.selected, Direction::Outgoing),
@@ -224,14 +281,20 @@ fn disk_sync_source(db: &Database, table: &str, row_id: RowId) -> Option<(Lsn, u
     ))
 }
 
-fn memory_sync_source(db: &Database, table: &str, row_id: RowId) -> Option<(Lsn, u8)> {
-    let lsn = db.relational_store.sync_source_lsn(table, row_id)?;
-    let kind = match db.relational_store.sync_source_kind(table, row_id)? {
-        contextdb_relational::store::SyncSourceKind::Pulled => 0,
-        contextdb_relational::store::SyncSourceKind::AcceptedLocal => 1,
-        contextdb_relational::store::SyncSourceKind::AcceptedLocalPending => 2,
-    };
-    Some((lsn, kind))
+fn scoped_sync_source(db: &Database, table: &str, row_id: RowId) -> Option<(Lsn, u8)> {
+    let (_, root) = db
+        .capture_writer_statement()
+        .expect("capture durable sidecar root");
+    root.expect("file-backed sidecar source")
+        .sync_source(
+            crate::persistence::writer_source::SourceWindowOwner::Read(
+                db.declared_reader_memory()
+                    .expect("admit the durable sidecar reader"),
+            ),
+            table,
+            row_id,
+        )
+        .expect("read only this row's durable provenance sidecar")
 }
 
 fn exact_edge_rows(db: &Database, id: Uuid) -> Vec<Vec<Value>> {
@@ -254,12 +317,23 @@ fn captured(selection: &AuthoritativePurgeSelection, row_id: RowId) -> CapturedL
 
 fn current_row_change(db: &Database, table: &str, key: &NaturalKey) -> RowChange {
     let snapshot = db.snapshot();
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let current_lsn = db
-        .visible_row_by_natural_key(table, key, snapshot, &std::collections::HashSet::new())
+        .visible_row_by_natural_key(
+            table,
+            key,
+            snapshot,
+            &std::collections::HashSet::new(),
+            fixture_operation_reader_1.clone(),
+        )
         .expect("find fixture row by its exact natural key")
         .expect("fixture row remains live while recording acknowledgement")
         .lsn;
     db.changes_since(Lsn(0))
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| {
@@ -303,7 +377,7 @@ fn assert_owned_copies_equal_after_reopen(before: &OwnedCopies, after: &OwnedCop
 
 fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
     let vectors = vector_row_ids(db);
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let selected_history = changes
         .rows
         .iter()
@@ -332,6 +406,14 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
         })
         .cloned()
         .collect::<Vec<_>>();
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     OwnedCopies {
         selected_live: exact_rows(db, NOTES, fixture.selected, None),
         selected_secondary_index: secondary_index_rows(db, "selected-after-update"),
@@ -368,22 +450,22 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
             EDGES,
             fixture.survivor_edge_lineage.row_id,
         ),
-        selected_note_memory_sync_source: memory_sync_source(
+        selected_note_scoped_sync_source: scoped_sync_source(
             db,
             NOTES,
             fixture.selected_note.row_id,
         ),
-        survivor_note_memory_sync_source: memory_sync_source(
+        survivor_note_scoped_sync_source: scoped_sync_source(
             db,
             NOTES,
             fixture.survivor_note.row_id,
         ),
-        selected_edge_memory_sync_source: memory_sync_source(
+        selected_edge_scoped_sync_source: scoped_sync_source(
             db,
             EDGES,
             fixture.selected_edge_lineage.row_id,
         ),
-        survivor_edge_memory_sync_source: memory_sync_source(
+        survivor_edge_scoped_sync_source: scoped_sync_source(
             db,
             EDGES,
             fixture.survivor_edge_lineage.row_id,
@@ -404,24 +486,30 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
             .durable_deletion_state_for_test(EDGES, &Value::Uuid(fixture.selected_edge)),
         survivor_edge_deletion_state: db
             .durable_deletion_state_for_test(EDGES, &Value::Uuid(fixture.survivor_edge)),
+        selected_row_graph_owner: row_graph_owner(db, fixture.selected_edge_lineage.row_id),
+        survivor_row_graph_owner: row_graph_owner(db, fixture.survivor_edge_lineage.row_id),
         selected_graph_arrival: db
-            .sync_graph_arrivals
-            .read()
-            .get(&(
-                fixture.selected,
-                fixture.selected_graph_target,
-                EDGE_TYPE.to_string(),
-            ))
-            .cloned(),
+            .with_graph_arrival(
+                &(
+                    fixture.selected,
+                    fixture.selected_graph_target,
+                    EDGE_TYPE.to_string(),
+                ),
+                |record| Ok(record.cloned()),
+                fixture_operation_reader_1.clone(),
+            )
+            .expect("read scoped durable graph arrival"),
         survivor_graph_arrival: db
-            .sync_graph_arrivals
-            .read()
-            .get(&(
-                fixture.survivor,
-                fixture.survivor_graph_target,
-                EDGE_TYPE.to_string(),
-            ))
-            .cloned(),
+            .with_graph_arrival(
+                &(
+                    fixture.survivor,
+                    fixture.survivor_graph_target,
+                    EDGE_TYPE.to_string(),
+                ),
+                |record| Ok(record.cloned()),
+                fixture_operation_reader_2.clone(),
+            )
+            .expect("read scoped durable graph arrival"),
     }
 }
 
@@ -550,6 +638,10 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
     let fixture_identity = crate::identity::FabricIdentity::generate();
     let fixture_node_id = fixture_identity.node_id();
     let fixture_incarnation = Incarnation(0xb2);
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let bound_lineages = db
         .outbound_row_lineages(
             &ChangeSet {
@@ -560,6 +652,7 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
             &fixture_node_id,
             fixture_incarnation,
             &|bytes| Ok(fixture_identity.sign_lineage(bytes)),
+            fixture_operation_reader_2.clone(),
         )
         .expect("bind exact current fixture rows through outbound lineage");
     let lineage_key = |row: &RowChange| {
@@ -607,18 +700,49 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
         selected_lineage.author_local_mutation_position < selected_current.lsn,
         "the body-only update retains its original creation root"
     );
+    let fixture_operation_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
 
     let note_selection = db
-        .resolve_authoritative_purge_selection(NOTES, &selected_note_key)
+        .resolve_authoritative_purge_selection(
+            NOTES,
+            &selected_note_key,
+            fixture_operation_reader_3.clone(),
+        )
         .expect("resolve selected note lineage");
+    let fixture_operation_reader_4 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let edge_selection = db
-        .resolve_authoritative_purge_selection(EDGES, &selected_edge_key)
+        .resolve_authoritative_purge_selection(
+            EDGES,
+            &selected_edge_key,
+            fixture_operation_reader_4.clone(),
+        )
         .expect("resolve selected edge lineage separately from notes");
+    let fixture_operation_reader_5 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let survivor_note_selection = db
-        .resolve_authoritative_purge_selection(NOTES, &survivor_note_key)
+        .resolve_authoritative_purge_selection(
+            NOTES,
+            &survivor_note_key,
+            fixture_operation_reader_5.clone(),
+        )
         .expect("resolve survivor note lineage");
+    let fixture_operation_reader_6 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let survivor_edge_selection = db
-        .resolve_authoritative_purge_selection(EDGES, &survivor_edge_key)
+        .resolve_authoritative_purge_selection(
+            EDGES,
+            &survivor_edge_key,
+            fixture_operation_reader_6.clone(),
+        )
         .expect("resolve survivor edge lineage");
     assert_eq!(
         note_selection.lineage_root,
@@ -761,6 +885,7 @@ fn assert_full_selected_absence_after_reopen(
     note_frontier: Lsn,
     edge_frontier: Lsn,
     survivor_before: &OwnedCopies,
+    expected_indexed: &BTreeSet<RowId>,
 ) {
     assert!(exact_rows(db, NOTES, fixture.selected, None).is_empty());
     assert!(exact_edge_rows(db, fixture.selected_edge).is_empty());
@@ -779,7 +904,7 @@ fn assert_full_selected_absence_after_reopen(
         survivor_secondary_index.index_used.as_deref(),
         Some("notes_body_idx")
     );
-    let reopened_changes = db.changes_since(Lsn(0));
+    let reopened_changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(
         reopened_changes.rows.iter().all(|row| {
             row.table != NOTES || row.natural_key != fixture.selected_note.natural_key
@@ -815,11 +940,8 @@ fn assert_full_selected_absence_after_reopen(
     let reopened_vectors = vector_row_ids(db);
     assert!(!reopened_vectors.contains(&fixture.selected_note.row_id));
     assert!(reopened_vectors.contains(&fixture.survivor_note.row_id));
-    assert_eq!(
-        db.__debug_vector_hnsw_len(VectorIndexRef::new(NOTES, "embedding")),
-        None,
-        "after reopen the 999-survivor query follows the ordinary below-threshold lazy path"
-    );
+    assert_eq!(&indexed_note_coverage(db), expected_indexed,
+        "reopen serves exactly the saved survivors through INDEXED with no query build");
     assert!(graph_neighbors(db, fixture.selected, Direction::Outgoing).is_empty());
     assert!(graph_neighbors(db, fixture.selected_graph_target, Direction::Incoming).is_empty());
     assert_eq!(
@@ -852,7 +974,7 @@ fn assert_full_selected_absence_after_reopen(
         None
     );
     assert_eq!(
-        memory_sync_source(db, NOTES, fixture.selected_note.row_id),
+        scoped_sync_source(db, NOTES, fixture.selected_note.row_id),
         None
     );
     assert_eq!(
@@ -860,7 +982,7 @@ fn assert_full_selected_absence_after_reopen(
         None
     );
     assert_eq!(
-        memory_sync_source(db, EDGES, fixture.selected_edge_lineage.row_id),
+        scoped_sync_source(db, EDGES, fixture.selected_edge_lineage.row_id),
         None
     );
     assert_eq!(
@@ -868,16 +990,16 @@ fn assert_full_selected_absence_after_reopen(
         survivor_before.survivor_note_disk_sync_source
     );
     assert_eq!(
-        memory_sync_source(db, NOTES, fixture.survivor_note.row_id),
-        survivor_before.survivor_note_memory_sync_source
+        scoped_sync_source(db, NOTES, fixture.survivor_note.row_id),
+        survivor_before.survivor_note_scoped_sync_source
     );
     assert_eq!(
         disk_sync_source(db, EDGES, fixture.survivor_edge_lineage.row_id),
         survivor_before.survivor_edge_disk_sync_source
     );
     assert_eq!(
-        memory_sync_source(db, EDGES, fixture.survivor_edge_lineage.row_id),
-        survivor_before.survivor_edge_memory_sync_source
+        scoped_sync_source(db, EDGES, fixture.survivor_edge_lineage.row_id),
+        survivor_before.survivor_edge_scoped_sync_source
     );
     assert_eq!(
         db.authoritative_purge_live_row_sidecar_for_test(&fixture.note_selection),
@@ -919,21 +1041,129 @@ fn assert_full_selected_absence_after_reopen(
     );
 }
 
+/// Public INDEXED answer for every live note. Policy 22's maintained route
+/// must cover the rows; `Database::execute` is the same entry this fixture
+/// already uses, and `USE VECTOR INDEXED` refuses instead of scanning.
+fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
+    let index = VectorIndexRef::new(NOTES, "embedding");
+    let builds_before = db
+        .__vector_passive_activity_counters_for_test()
+        .hnsw_builds;
+    let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index.clone());
+    db.__reset_last_query_vector_trace_for_test();
+    let result = db
+        .execute(
+            "SELECT id FROM notes ORDER BY embedding <=> [1,0,0] USE VECTOR INDEXED LIMIT 1000",
+            &HashMap::new(),
+        )
+        .expect("public INDEXED coverage query");
+    let builds_after = db
+        .__vector_passive_activity_counters_for_test()
+        .hnsw_builds;
+    let serial_after = db.__debug_vector_hnsw_build_serial_for_test(index);
+    assert_eq!(
+        builds_after, builds_before,
+        "the INDEXED coverage query must not build a graph"
+    );
+    assert_eq!(
+        serial_after, serial_before,
+        "the INDEXED coverage query must not publish another graph build"
+    );
+    assert!(
+        result.trace.physical_plan.contains("HNSWSearch"),
+        "INDEXED coverage must execute the maintained route, plan {}",
+        result.trace.physical_plan
+    );
+    assert!(
+        !result.trace.physical_plan.contains("BruteForce"),
+        "INDEXED coverage must not fall back to an exact scan, plan {}",
+        result.trace.physical_plan
+    );
+    let disclosure = result
+        .trace
+        .vector_search
+        .as_ref()
+        .expect("the executed query publishes its vector route receipt");
+    assert_eq!(
+        disclosure.route_evidence,
+        VectorSearchRouteEvidence::Executed
+    );
+    assert_eq!(
+        disclosure.requested_mode,
+        contextdb_core::VectorSearchMode::Indexed
+    );
+    assert_eq!(
+        disclosure.resolved_mode,
+        contextdb_core::VectorSearchMode::Indexed
+    );
+    assert_eq!(disclosure.route, Some(VectorSearchRoute::Indexed));
+    assert_eq!(disclosure.fallback, None);
+    assert_eq!(disclosure.refusal, None);
+    assert!(
+        disclosure
+            .partition_hnsw
+            .iter()
+            .all(|partition| partition.route == Some(VectorSearchRoute::Indexed)),
+        "every executed partition stays on the indexed route: {disclosure}"
+    );
+    let read_memory = db
+        .declared_reader_memory()
+        .expect("admit the fixture operation reader");
+    let trace = db
+        .__take_last_query_vector_trace_for_test(read_memory)
+        .expect("read the admitted trace observation")
+        .expect("the vector query publishes its route trace");
+    assert!(trace.used_hnsw, "the executed answer traversed the maintained graph");
+    assert_eq!(trace.fallback_reason, None);
+    assert!(
+        trace.partition_routes.iter().all(|route| {
+            route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
+        }),
+        "the executed partition route must be indexed: {:?}",
+        trace.partition_routes
+    );
+    assert_eq!(
+        result.rows.len(),
+        trace.final_row_ids.len(),
+        "the public INDEXED rows and the executed row-id trace cover the same answer"
+    );
+    let ids = trace.final_row_ids.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        ids.len(),
+        trace.final_row_ids.len(),
+        "the INDEXED answer must not repeat a row id"
+    );
+    ids
+}
+
 #[test]
 fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage() {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
-    let pinned = seed.db.pin_snapshot(pinned_snapshot);
+    let pinned = seed.db.pin_snapshot(pinned_snapshot).unwrap();
     let fixture = finish_fixture(&seed, pinned_snapshot);
+    // Independent standalone contribution uses its real insertion API and
+    // arrival lane; row-owned witnesses above remain a distinct lane.
+    let standalone_source = Uuid::new_v4();
+    let standalone_target = Uuid::new_v4();
+    let standalone_tx = seed.db.begin().unwrap();
+    assert!(seed.db.insert_edge(standalone_tx, standalone_source, standalone_target,
+        EDGE_TYPE.to_owned(), HashMap::new()).unwrap());
+    seed.db.commit(standalone_tx).unwrap();
+    let standalone_before = standalone_copies(&seed.db, standalone_source, standalone_target);
+    assert!(standalone_before.0.is_some(), "real standalone contribution has a durable arrival");
+    assert_eq!(standalone_before.1, BTreeSet::from([standalone_target]));
+    assert_eq!(standalone_before.2, BTreeSet::from([standalone_source]));
     let before = owned_copies(&seed.db, &fixture);
+    assert_saved_row_witnesses(&seed.db, &fixture, &before, true);
     assert_eq!(before.selected_note_disk_sync_source, Some((Lsn(701), 1)));
     assert_eq!(before.survivor_note_disk_sync_source, Some((Lsn(702), 1)));
     assert_eq!(before.selected_edge_disk_sync_source, Some((Lsn(703), 1)));
     assert_eq!(before.survivor_edge_disk_sync_source, Some((Lsn(704), 1)));
-    assert_eq!(before.selected_note_memory_sync_source, Some((Lsn(701), 1)));
-    assert_eq!(before.survivor_note_memory_sync_source, Some((Lsn(702), 1)));
-    assert_eq!(before.selected_edge_memory_sync_source, Some((Lsn(703), 1)));
-    assert_eq!(before.survivor_edge_memory_sync_source, Some((Lsn(704), 1)));
+    assert_eq!(before.selected_note_scoped_sync_source, Some((Lsn(701), 1)));
+    assert_eq!(before.survivor_note_scoped_sync_source, Some((Lsn(702), 1)));
+    assert_eq!(before.selected_edge_scoped_sync_source, Some((Lsn(703), 1)));
+    assert_eq!(before.survivor_edge_scoped_sync_source, Some((Lsn(704), 1)));
     assert!(!before.selected_live.is_empty());
     assert!(!before.selected_secondary_index.rows.is_empty());
     assert_eq!(
@@ -962,8 +1192,13 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert!(before.survivor_note_live_sidecar.is_some());
     assert!(before.selected_edge_live_sidecar.is_some());
     assert!(before.survivor_edge_live_sidecar.is_some());
-    assert!(before.selected_graph_arrival.is_some());
-    assert!(before.survivor_graph_arrival.is_some());
+    assert!(before.selected_row_graph_owner.is_some());
+    assert!(before.survivor_row_graph_owner.is_some());
+    assert!(
+        before.selected_graph_arrival.is_none(),
+        "row-derived graph witnesses do not use the standalone arrival lane"
+    );
+    assert!(before.survivor_graph_arrival.is_none());
     assert_eq!(
         before.graph.selected_forward,
         BTreeSet::from([fixture.selected_graph_target])
@@ -980,12 +1215,41 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.graph.survivor_reverse,
         BTreeSet::from([fixture.survivor])
     );
+    let indexed_before = indexed_note_coverage(&seed.db);
+    assert_eq!(
+        indexed_before.len(),
+        1000,
+        "maintained INDEXED search must cover every live note before purge"
+    );
+    assert!(
+        indexed_before.contains(&fixture.selected_note.row_id),
+        "the pre-purge INDEXED answer includes the selected row"
+    );
+    assert!(
+        indexed_before.contains(&fixture.survivor_note.row_id),
+        "the pre-purge INDEXED answer includes the survivor row"
+    );
+    let fixture_operation_reader_7 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_7 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_7.clone());
 
     let note_frontier = seed
         .db
-        .commit_authoritative_purge_kernel(&fixture.note_selection)
+        .commit_authoritative_purge_kernel(
+            &fixture.note_selection,
+            &mut fixture_operation_copy_7,
+            fixture_operation_reader_7.clone(),
+        )
         .expect("commit selected note lineage purge");
     let after_notes = owned_copies(&seed.db, &fixture);
+    assert_saved_row_witnesses(&seed.db, &fixture, &before, true);
+    assert!(standalone_copies(&seed.db, standalone_source, standalone_target) == standalone_before,
+        "unrelated note erasure preserves the standalone arrival and both directions");
+    assert_eq!(after_notes.selected_row_graph_owner, before.selected_row_graph_owner);
+    assert_eq!(after_notes.survivor_row_graph_owner, before.survivor_row_graph_owner);
     assert!(after_notes.selected_live.is_empty());
     assert!(after_notes.selected_secondary_index.rows.is_empty());
     assert_eq!(
@@ -996,7 +1260,20 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert_eq!(after_notes.selected_history_count, 0);
     assert!(!after_notes.selected_vector_present);
     assert!(after_notes.survivor_vector_present);
-    assert_eq!(after_notes.hnsw_len, before.hnsw_len - 1);
+    // HnswIndex::len documents vector count. The durable-pages arm currently
+    // counts points; that production defect must not weaken this N-1 oracle.
+    assert_eq!(after_notes.hnsw_len, before.hnsw_len - 1,
+        "logical vector membership loses exactly the erased row, including shared representations");
+    let indexed_after = indexed_note_coverage(&seed.db);
+    let mut indexed_without_selected = indexed_before.clone();
+    assert!(
+        indexed_without_selected.remove(&fixture.selected_note.row_id),
+        "purge coverage is the pre-purge INDEXED answer minus the selected row"
+    );
+    assert_eq!(
+        indexed_after, indexed_without_selected,
+        "INDEXED search after purge drops only the selected row"
+    );
     assert!(
         !after_notes
             .durable_sink_payloads
@@ -1008,7 +1285,7 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
             .contains_key(&fixture.selected_note.row_id)
     );
     assert_eq!(after_notes.selected_note_disk_sync_source, None);
-    assert_eq!(after_notes.selected_note_memory_sync_source, None);
+    assert_eq!(after_notes.selected_note_scoped_sync_source, None);
     assert_eq!(after_notes.selected_note_live_sidecar, None);
     assert_eq!(
         after_notes
@@ -1049,8 +1326,8 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.survivor_note_disk_sync_source
     );
     assert_eq!(
-        after_notes.survivor_note_memory_sync_source,
-        before.survivor_note_memory_sync_source
+        after_notes.survivor_note_scoped_sync_source,
+        before.survivor_note_scoped_sync_source
     );
     assert_eq!(after_notes.selected_edge_live, before.selected_edge_live);
     assert_eq!(after_notes.survivor_edge_live, before.survivor_edge_live);
@@ -1071,12 +1348,12 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.survivor_edge_disk_sync_source
     );
     assert_eq!(
-        after_notes.selected_edge_memory_sync_source,
-        before.selected_edge_memory_sync_source
+        after_notes.selected_edge_scoped_sync_source,
+        before.selected_edge_scoped_sync_source
     );
     assert_eq!(
-        after_notes.survivor_edge_memory_sync_source,
-        before.survivor_edge_memory_sync_source
+        after_notes.survivor_edge_scoped_sync_source,
+        before.survivor_edge_scoped_sync_source
     );
     assert_eq!(after_notes.graph, before.graph);
     assert_eq!(
@@ -1100,18 +1377,36 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         after_notes.survivor_note_live_sidecar,
         before.survivor_note_live_sidecar
     );
+    let fixture_operation_reader_8 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_8 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_8.clone());
 
     let edge_frontier = seed
         .db
-        .commit_authoritative_purge_kernel(&fixture.edge_selection)
+        .commit_authoritative_purge_kernel(
+            &fixture.edge_selection,
+            &mut fixture_operation_copy_8,
+            fixture_operation_reader_8.clone(),
+        )
         .expect("commit selected edge lineage purge separately from notes");
     let after_edges = owned_copies(&seed.db, &fixture);
+    assert_saved_row_witnesses(&seed.db, &fixture, &before, false);
+    assert!(standalone_copies(&seed.db, standalone_source, standalone_target) == standalone_before,
+        "selected row-owner erasure preserves the independent standalone contribution");
     assert!(after_edges.selected_edge_live.is_empty());
     assert!(after_edges.selected_edge_history.is_empty());
     assert_eq!(after_edges.selected_edge_history_count, 0);
     assert_eq!(after_edges.selected_edge_disk_sync_source, None);
-    assert_eq!(after_edges.selected_edge_memory_sync_source, None);
+    assert_eq!(after_edges.selected_edge_scoped_sync_source, None);
     assert_eq!(after_edges.selected_edge_live_sidecar, None);
+    assert_eq!(after_edges.selected_row_graph_owner, None);
+    assert_eq!(
+        after_edges.survivor_row_graph_owner,
+        before.survivor_row_graph_owner
+    );
     assert_eq!(after_edges.selected_graph_arrival, None);
     assert_eq!(
         after_edges.survivor_graph_arrival,
@@ -1131,8 +1426,8 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.survivor_edge_disk_sync_source
     );
     assert_eq!(
-        after_edges.survivor_edge_memory_sync_source,
-        before.survivor_edge_memory_sync_source
+        after_edges.survivor_edge_scoped_sync_source,
+        before.survivor_edge_scoped_sync_source
     );
     assert_eq!(
         after_edges.survivor_edge_live_sidecar,
@@ -1176,7 +1471,11 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         note_frontier,
         edge_frontier,
         &before,
+        &indexed_without_selected,
     );
+    assert_saved_row_witnesses(&reopened, &fixture, &before, false);
+    assert!(standalone_copies(&reopened, standalone_source, standalone_target) == standalone_before,
+        "standalone arrival and both directions survive reopen");
     assert_eq!(
         reopened.classify_authoritative_purge_root_for_test(
             NOTES,
@@ -1203,11 +1502,26 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
 fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
-    let pinned = seed.db.pin_snapshot(pinned_snapshot);
+    let pinned = seed.db.pin_snapshot(pinned_snapshot).unwrap();
     let fixture = finish_fixture(&seed, pinned_snapshot);
+    let saved_graph_before = owned_copies(&seed.db, &fixture);
+    let mut expected_indexed = indexed_note_coverage(&seed.db);
+    assert_eq!(expected_indexed.len(), 1000);
+    assert!(expected_indexed.remove(&fixture.selected_note.row_id));
+    let fixture_operation_reader_9 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_9 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_9.clone());
+
     let edge_frontier = seed
         .db
-        .commit_authoritative_purge_kernel(&fixture.edge_selection)
+        .commit_authoritative_purge_kernel(
+            &fixture.edge_selection,
+            &mut fixture_operation_copy_9,
+            fixture_operation_reader_9.clone(),
+        )
         .expect("commit edge purge before export captures its snapshot");
     let edge_purged_baseline = owned_copies(&seed.db, &fixture);
     assert!(edge_purged_baseline.selected_edge_live.is_empty());
@@ -1258,9 +1572,20 @@ fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
             pause.wait_until_reached(Duration::from_secs(5)),
             "export must capture its snapshot before the private kernel commits"
         );
+        let fixture_operation_reader_10 = seed
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_10 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_10.clone());
+
         let note_frontier = seed
             .db
-            .commit_authoritative_purge_kernel(&fixture.note_selection)
+            .commit_authoritative_purge_kernel(
+                &fixture.note_selection,
+                &mut fixture_operation_copy_10,
+                fixture_operation_reader_10.clone(),
+            )
             .expect("commit note purge while export is paused");
         // The export has observed the required ordering. Release it before
         // any assertion that can panic so scoped-thread cleanup cannot strand
@@ -1306,7 +1631,9 @@ fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
                     note_frontier,
                     edge_frontier,
                     &edge_purged_baseline,
+                    &expected_indexed,
                 );
+                assert_saved_row_witnesses(&artifact, &fixture, &saved_graph_before, false);
             }
             Err(error) => {
                 assert_exact_export_fence(error, &fixture.selected_note, note_frontier);
@@ -1325,14 +1652,25 @@ fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
 fn authoritative_file_purge_kernel_rolls_back_every_owned_copy_on_persistence_failure() {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
-    let pinned = seed.db.pin_snapshot(pinned_snapshot);
+    let pinned = seed.db.pin_snapshot(pinned_snapshot).unwrap();
     let fixture = finish_fixture(&seed, pinned_snapshot);
     let before = owned_copies(&seed.db, &fixture);
     seed.db
         .arm_authoritative_purge_point_remove_persistence_failure_for_test();
+    let fixture_operation_reader_11 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_11 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_11.clone());
+
     assert!(
         seed.db
-            .commit_authoritative_purge_kernel(&fixture.note_selection)
+            .commit_authoritative_purge_kernel(
+                &fixture.note_selection,
+                &mut fixture_operation_copy_11,
+                fixture_operation_reader_11.clone()
+            )
             .is_err(),
         "the staged point-removes must fail before their one Redb commit"
     );
@@ -1344,9 +1682,19 @@ fn authoritative_file_purge_kernel_rolls_back_every_owned_copy_on_persistence_fa
     let after_notes = owned_copies(&reopened_notes, &fixture);
     assert_owned_copies_equal_after_reopen(&before, &after_notes);
     reopened_notes.arm_authoritative_purge_point_remove_persistence_failure_for_test();
+    let fixture_operation_reader_12 = reopened_notes
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_12 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_12.clone());
+
     assert!(
         reopened_notes
-            .commit_authoritative_purge_kernel(&fixture.edge_selection)
+            .commit_authoritative_purge_kernel(
+                &fixture.edge_selection,
+                &mut fixture_operation_copy_12,
+                fixture_operation_reader_12.clone()
+            )
             .is_err(),
         "the graph-owning edge selection must fail before its one Redb commit"
     );
@@ -1368,4 +1716,210 @@ fn authoritative_file_purge_kernel_rolls_back_every_owned_copy_on_persistence_fa
             Value::Text("selected-before-update".to_string()),
         ]],
     );
+}
+
+// Policy 12 / read publication: adopted tables must join the same exclusive
+// scope as selected tables, before allocating a local LSN. These are rows of
+// the existing purge-kernel contract, sharing one deterministic gate driver.
+// Decisive mutations: omit the pure-adoption gate; omit adopted tables from
+// the mixed/receipt kernel scope. Neither is caught by a wildcard-only reader.
+#[derive(Clone, Copy)]
+enum AdoptionGroup {
+    Pure,
+    Mixed,
+    Receipt,
+}
+
+#[derive(Debug)]
+struct FrozenPublicationClock;
+impl contextdb_core::read_contract::DeadlineClock for FrozenPublicationClock {
+    fn now_ms(&self) -> u64 {
+        0
+    }
+    fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn adoption_excludes_an_explicit_reader(group: AdoptionGroup) {
+    use crate::writer_commit_test_seams::{self, CommitBoundary};
+    let directory = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(directory.path().join("adoption.db")).unwrap());
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    for table in ["selected_rows", "adopted_rows"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, body TEXT)"),
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute(
+            &format!("INSERT INTO {table} VALUES (1, 'selected'), (2, 'survivor')"),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+    db.execute("PURGE FROM adopted_rows WHERE id = 1", &HashMap::new())
+        .unwrap();
+    let record = db
+        .list_lineage_records(&db.lineage_state_lock.lock())
+        .unwrap()
+        .into_iter()
+        .map(|(_, record)| record)
+        .find(|record| {
+            record.table == "adopted_rows"
+                && record.delete_obligation == DurableDeleteObligation::Purged
+        })
+        .unwrap();
+    let adoption = IncomingPurgeFrontierAdoption {
+        table: record.table.clone(),
+        natural_key: record.natural_key.clone(),
+        table_generation: record.table_generation,
+        lineage_root: record.lineage_root.clone(),
+        existing: Some(record),
+    };
+    let memory = db.declared_reader_memory().unwrap();
+    let selected = db
+        .resolve_authoritative_purge_selection(
+            "selected_rows",
+            &NaturalKey::single("id".into(), Value::Int64(1)),
+            memory.clone(),
+        )
+        .unwrap();
+    let snapshot_lsn = db.current_lsn();
+    let mut scope = crate::executor::ReadPublicationScope::bounded(
+        snapshot_lsn,
+        BTreeSet::from(["adopted_rows".into()]),
+        contextdb_core::read_contract::ReadLimits::default(),
+        Arc::new(FrozenPublicationClock),
+        contextdb_core::read_contract::OwnerReadCancellation::new(),
+        0,
+    );
+    scope.read_memory = Some(memory);
+    let answer = db.authorize_authoritative_read_publication(&scope).unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let writer = db.clone();
+    let worker = std::thread::spawn(move || {
+        let observer = Arc::new(move |boundary| {
+            if matches!(
+                boundary,
+                CommitBoundary::ErasureWaitingForReaders | CommitBoundary::BeforeDdlLsnAllocation
+            ) {
+                sent.send(boundary).unwrap();
+            }
+        });
+        writer_commit_test_seams::observe(observer, || match group {
+            AdoptionGroup::Pure => writer.commit_incoming_purge_frontier_adoptions(&[adoption]),
+            AdoptionGroup::Mixed | AdoptionGroup::Receipt => {
+                let memory = writer.declared_reader_memory()?;
+                let mut copy = crate::vector_read_memory::admission(memory.clone());
+                let selections = if matches!(group, AdoptionGroup::Mixed) {
+                    vec![selected]
+                } else {
+                    Vec::new()
+                };
+                let receipts = if matches!(group, AdoptionGroup::Receipt) {
+                    vec![format!(
+                        "authoritative_purge_local_applied.v1.{}",
+                        Uuid::nil()
+                    )]
+                } else {
+                    Vec::new()
+                };
+                writer
+                    .commit_authoritative_purge_kernel_batch(
+                        &selections,
+                        &[adoption],
+                        false,
+                        crate::custody::erasure::PurgeReportShape::None,
+                        purge_predicate::Instructions {
+                            outgoing: &[],
+                            applied: &receipts,
+                        },
+                        &mut copy,
+                        memory,
+                    )
+                    .map(|_| ())
+            }
+        })
+    });
+    let boundary = received.recv().unwrap();
+    let before_release = db.current_lsn();
+    // Always release and join before asserting, including on a decisive mutant.
+    drop(answer);
+    worker.join().unwrap().unwrap();
+    assert_eq!(boundary, CommitBoundary::ErasureWaitingForReaders);
+    assert_eq!(
+        before_release, snapshot_lsn,
+        "no local LSN allocated while the explicit answer owns its guard"
+    );
+    assert!(db.current_lsn() > snapshot_lsn);
+    if matches!(group, AdoptionGroup::Receipt) {
+        assert_eq!(
+            db.persistence
+                .as_ref()
+                .unwrap()
+                .load_config_value::<bool>(&format!(
+                    "authoritative_purge_local_applied.v1.{}",
+                    Uuid::nil()
+                ),)
+                .unwrap(),
+            Some(true)
+        );
+    }
+    let frontiers = db
+        .persistence
+        .as_ref()
+        .unwrap()
+        .with_db(|native| {
+            let read = native
+                .begin_read()
+                .map_err(RedbPersistence::storage_error)?;
+            let table = read
+                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                    "read_erasure_frontiers",
+                ))
+                .map_err(RedbPersistence::storage_error)?;
+            let named = table
+                .get(&b"adopted_rows"[..])
+                .map_err(RedbPersistence::storage_error)?
+                .unwrap();
+            let global = table
+                .get(&[0xff][..])
+                .map_err(RedbPersistence::storage_error)?
+                .unwrap();
+            Ok((
+                Lsn(u64::from_le_bytes(named.value().try_into().unwrap())),
+                Lsn(u64::from_le_bytes(global.value().try_into().unwrap())),
+            ))
+        })
+        .unwrap();
+    assert_eq!(frontiers, (db.current_lsn(), db.current_lsn()));
+    let emitted = std::sync::atomic::AtomicUsize::new(0);
+    let result: Result<()> = db.publish_authoritative_read(
+        &scope,
+        |error| error,
+        || {
+            emitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert!(
+        matches!(result, Err(Error::ReadFailure(failure)) if failure.kind() == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure)
+    );
+    assert_eq!(emitted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(scope);
+    db.close().unwrap();
+}
+
+#[test]
+fn read_publication_pure_adoption_waits_before_lsn_allocation() {
+    adoption_excludes_an_explicit_reader(AdoptionGroup::Pure);
+}
+#[test]
+fn read_publication_mixed_group_excludes_the_adopted_table() {
+    adoption_excludes_an_explicit_reader(AdoptionGroup::Mixed);
+}
+#[test]
+fn read_publication_receipt_group_excludes_the_adopted_table() {
+    adoption_excludes_an_explicit_reader(AdoptionGroup::Receipt);
 }

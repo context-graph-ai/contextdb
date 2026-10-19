@@ -63,7 +63,7 @@ pub fn author_migration(db: &Database) -> ChangeSet {
         .unwrap();
     // The root's transitive FK closure is all 100 existing tables. Listing 100
     // ADD COLUMN entries would hide a broken dependency-closure calculation.
-    db.changes_since(since)
+    db.changes_since(since).expect("read the declared changes")
 }
 
 pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {

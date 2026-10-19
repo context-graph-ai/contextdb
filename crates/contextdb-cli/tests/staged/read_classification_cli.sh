@@ -665,12 +665,13 @@ for case_row in "${AST_READ_STATEMENTS[@]}"; do
         ast-read-show-memory-limit)
             read_assertion='
                 length == 1 and
-                .[0].result.columns == ["limit", "used", "available", "startup_ceiling"] and
+                .[0].result.columns == ["limit", "used", "available", "startup_ceiling", "ceiling_refresh_failures"] and
                 (.[0].result.rows | length) == 1 and
                 .[0].result.rows[0].limit == $memory_limit_bytes and
                 (.[0].result.rows[0].used | type == "number") and
                 .[0].result.rows[0].available == ($memory_limit_bytes - .[0].result.rows[0].used) and
-                .[0].result.rows[0].startup_ceiling == "none"
+                .[0].result.rows[0].startup_ceiling == "none" and
+                (.[0].result.rows[0].ceiling_refresh_failures | type == "number")
             '
             ;;
         ast-read-show-disk-limit)

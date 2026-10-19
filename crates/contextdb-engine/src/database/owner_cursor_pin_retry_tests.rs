@@ -44,12 +44,17 @@ fn busy_cursor_pin_retries_outside_commit_and_recaptures_the_complete_root() {
                 });
                 let clock: Arc<dyn DeadlineClock> = Arc::new(ManualDeadlineClock::at(0));
                 let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
+                let fixture_operation_reader_1 = reader_db
+                    .declared_reader_memory()
+                    .expect("admit the actual fixture reader");
+
                 reader_db
                     .bounded_cursor_snapshot_registration(
                         clock,
                         10_000,
                         &budget,
                         &OwnerReadCancellation::new(),
+                        fixture_operation_reader_1.clone(),
                     )
                     .unwrap()
                     .unwrap()
@@ -115,12 +120,17 @@ fn busy_cursor_pin_cancellation_and_deadline_finish_before_handle_release() {
                     });
                     let clock: Arc<dyn DeadlineClock> = reader_clock;
                     let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
+                    let fixture_operation_reader_2 = reader_db
+                        .declared_reader_memory()
+                        .expect("admit the actual fixture reader");
+
                     reader_db
                         .bounded_cursor_snapshot_registration(
                             clock,
                             10_000,
                             &budget,
                             &reader_withdrawn,
+                            fixture_operation_reader_2.clone(),
                         )
                         .map(|pin| pin.is_some())
                 });
@@ -161,6 +171,8 @@ enum RegistryWaitOutcome {
 enum RegistryWaitPhase {
     Registration,
     ProviderScan,
+    FirstRoot,
+    SecondRoot,
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
@@ -189,7 +201,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         &path,
         DatabaseOpenOptions {
             owner_reads: OwnerReadConfig {
-                runtime_dir: Some(runtime_dir),
+                runtime_dir: Some(runtime_dir.clone()),
                 limits: OwnerReadLimits {
                     limits,
                     ..OwnerReadLimits::default()
@@ -274,11 +286,23 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         scan.wait_until_inspected_for_test();
         reader
     });
-    let reader = db
-        .persistence
-        .as_ref()
-        .unwrap()
-        .with_owner_cursor_registry_locked_for_test(|| {
+    let persistence = db.persistence.as_ref().unwrap();
+    let registry_paths = persistence.owner_cursor_registry_paths_for_test();
+    let root_index = match phase {
+        RegistryWaitPhase::FirstRoot => Some(0),
+        RegistryWaitPhase::SecondRoot => Some(1),
+        _ => None,
+    };
+    let held_root = root_index.map(|index| {
+        assert_eq!(registry_paths.len(), 2, "private platform plus supplied root fixture");
+        let stable_root = if index == 0 {
+            registry_paths[index].parent().unwrap().parent().unwrap().to_path_buf()
+        } else { registry_paths[index].parent().unwrap().to_path_buf() };
+        let root = std::fs::File::open(stable_root).unwrap();
+        fs2::FileExt::lock_exclusive(&root).unwrap();
+        root
+    });
+    let wait_while_contended = || {
             let reader = match scan_reader {
                 Some(reader) => {
                     scan_pause.as_ref().unwrap().resume_for_test();
@@ -329,9 +353,17 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
                 assert!(db.snapshot_registry.state.lock().active.is_empty());
             }
             reader
-        });
+        };
+    let reader = if held_root.is_some() {
+        wait_while_contended()
+    } else {
+        persistence.with_owner_cursor_registry_locked_for_test(wait_while_contended)
+    };
+    if let Some(root) = held_root {
+        fs2::FileExt::unlock(&root).unwrap();
+    }
     if matches!(outcome, RegistryWaitOutcome::Released) {
-        let expected_first = if matches!(phase, RegistryWaitPhase::ProviderScan) {
+        let expected_first = if matches!(phase, RegistryWaitPhase::ProviderScan | RegistryWaitPhase::FirstRoot | RegistryWaitPhase::SecondRoot) {
             // The failed scan releases every pin and the commit boundary.
             // Retry must capture the whole root after this intervening commit.
             db.execute("UPDATE items SET id = 3 WHERE id = 1", &HashMap::new())
@@ -348,7 +380,12 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         let [LocalResponse::CursorOpened { opened }] = responses.as_slice() else {
             panic!("expected owner cursor page: {responses:?}");
         };
-        let page = crate::read_contract::decode_cursor_page(&opened.payload).unwrap();
+        let page = crate::read_contract::decode_observed_cursor_page(
+            &opened.payload,
+            ReadLimits::SHIPPED_MEMORY,
+        )
+        .unwrap()
+        .page;
         assert_eq!(page.rows, vec![vec![expected_first]]);
         assert!(page.has_more);
     }
@@ -357,6 +394,23 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         scan.finish_for_test();
     }
     db.close().unwrap();
+    if root_index.is_some() {
+        let inventory = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = inventory.clone();
+        let reopened = crate::persistence::read_persistence_test_scaffold::observe_writer_reader_snapshots_for_test(
+            Arc::new(move |records| sink.lock().unwrap().push(records)),
+            || Database::open_with_options(&path, DatabaseOpenOptions {
+                owner_reads: OwnerReadConfig { enabled: false, runtime_dir: Some(runtime_dir.clone()), ..OwnerReadConfig::default() },
+                ..DatabaseOpenOptions::default()
+            }),
+        ).unwrap();
+        assert_eq!(*inventory.lock().unwrap(), vec![
+            crate::persistence::read_persistence_test_scaffold::WriterReaderSnapshotRegistryObservation::Complete(Vec::new())
+        ], "both configured roots have no live failed-admission registrations");
+        assert_eq!(reopened.persistence.as_ref().unwrap().external_snapshot_retention_for_test().unwrap(),
+            Default::default(), "authenticated inventory reclaims failed partial publication; no live floor remains");
+        reopened.close().unwrap();
+    }
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
@@ -562,9 +616,6 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
         ReaderRegistrationLockPhase::DescriptorOpened,
     )
     .unwrap();
-    let busy_pause = ApplyPhasePauseGuard::arm_for_test(
-        db.snapshot_registry.owner_cursor_busy_test_pause.clone(),
-    );
     let (finished, completed) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
         let result = executor.block_on(client.request_watching(
@@ -585,6 +636,7 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
         "real owner admission opens the registry descriptor before validation"
     );
     let parked = registry_paths[0].with_extension("parked");
+    let mut departure = None;
     if matches!(outcome, RegistryTeardownOutcome::Replaced) {
         // Keep the original descriptor linked: replacement must never look like
         // a trusted last-reader departure, even when the new file is private.
@@ -598,30 +650,19 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
             .set_permissions(std::fs::Permissions::from_mode(0o600))
             .unwrap();
     } else {
-        drop(last_reader.take());
-        assert!(
-            registry_paths.iter().all(|path| !path.exists()),
-            "the last real registration unlinks its registry lock"
+        let root = std::fs::File::open(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).unwrap();
+        assert_eq!(
+            fs2::FileExt::try_lock_exclusive(&root).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "owner publication excludes a last leaver until its root is published"
         );
-    }
-    descriptor_pause.stop_pausing_for_test();
-    if !matches!(outcome, RegistryTeardownOutcome::Replaced) {
-        assert!(
-            busy_pause.wait_until_reached(Duration::from_secs(30)),
-            "trusted departure yields to the outer bounded retry"
-        );
-        assert!(
-            db.tx_mgr
-                .try_with_commit_lock_for(Duration::ZERO, || ())
-                .is_some(),
-            "teardown retries release the commit boundary"
-        );
-        assert!(db.snapshot_registry.state.lock().active.is_empty());
+        let leaving = last_reader.take();
+        departure = Some(std::thread::spawn(move || drop(leaving)));
         if matches!(outcome, RegistryTeardownOutcome::Cancelled) {
             cancelled.cancel();
         }
     }
-    busy_pause.release();
+    descriptor_pause.stop_pausing_for_test();
     let result = completed.recv_timeout(Duration::from_secs(30)).unwrap();
     match outcome {
         RegistryTeardownOutcome::Released => {
@@ -629,12 +670,18 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
             let [LocalResponse::CursorOpened { opened }] = responses.as_slice() else {
                 panic!("expected owner cursor page: {responses:?}");
             };
-            let page = crate::read_contract::decode_cursor_page(&opened.payload).unwrap();
+            let page = crate::read_contract::decode_observed_cursor_page(
+                &opened.payload,
+                ReadLimits::SHIPPED_MEMORY,
+            )
+            .unwrap()
+            .page;
             assert_eq!(page.rows, vec![vec![Value::Int64(1)]]);
             assert!(page.has_more);
-            assert!(
-                descriptor_pause.attempts_for_test() >= 2,
-                "successful admission reopens rather than using the departed descriptor"
+            assert_eq!(
+                descriptor_pause.attempts_for_test(),
+                registry_paths.len() as u64,
+                "owner publication acquires each root once without a departure retry"
             );
         }
         RegistryTeardownOutcome::Cancelled => {
@@ -643,7 +690,7 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
                     &result,
                     Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
                 ),
-                "typed cancellation during the teardown retry: {result:?}"
+                "typed cancellation during serialized registration: {result:?}"
             );
             assert!(db.snapshot_registry.state.lock().active.is_empty());
         }
@@ -666,6 +713,9 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
         }
     }
     reader.join().unwrap();
+    if let Some(departure) = departure {
+        departure.join().unwrap();
+    }
     drop(last_reader);
     db.close().unwrap();
 }
@@ -722,4 +772,14 @@ fn owner_channel_registry_teardown_child() {
         "replaced" => RegistryTeardownOutcome::Replaced,
         other => panic!("unknown registry teardown outcome {other}"),
     });
+    if outcome != "replaced" {
+        for phase in [RegistryWaitPhase::FirstRoot, RegistryWaitPhase::SecondRoot] {
+            owner_channel_registry_wait(
+                if outcome == "released" { RegistryWaitOutcome::Released }
+                else { RegistryWaitOutcome::Cancelled }, phase);
+            if outcome == "cancelled" {
+                owner_channel_registry_wait(RegistryWaitOutcome::Deadline, phase);
+            }
+        }
+    }
 }

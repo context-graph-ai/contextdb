@@ -20,8 +20,7 @@ use contextdb_engine::owner_read::{
     OwnerServicePublicationObserver, OwnerServiceSpec, ValidatedOwnerListener,
 };
 use contextdb_engine::read_contract::{
-    cursor_page_encoded_size, decode_cursor_page, decode_metadata_body, decode_metadata_page,
-    decode_query_result, query_result_encoded_size,
+    decode_metadata_body, decode_metadata_page, decode_query_result, query_result_encoded_size,
 };
 use contextdb_engine::{
     Database, MaintenancePolicy, MetadataBody, OwnerReadConfig, OwnerReadTestHooks, cli_render,
@@ -207,7 +206,7 @@ impl OwnerRequestHandler for GatedHandler {
         state.invocations += 1;
         if namespace == "proof.fail" {
             return Err(Error::Other(
-                "owner custom handler fixture failed".to_owned(),
+                "owner custom handler fixture failed".to_owned().into(),
             ));
         }
         if namespace == "proof.oversized-response" {
@@ -933,6 +932,9 @@ struct ObserverState {
     shutdown_signals: u64,
     finished_requests: u64,
     active_clock_base_ms: u64,
+    record_budget: bool,
+    blocked_budget_ledger: Vec<contextdb_engine::memory_accounting::BudgetLedgerEntry>,
+    reader_reservations: Vec<(TestWorkSource, usize)>,
 }
 
 #[derive(Clone, Default)]
@@ -965,6 +967,7 @@ impl ProductionObserver {
         state.max_work = 0;
         state.peak_temporary_bytes = 0;
         state.cancellation_observed = 0;
+        state.reader_reservations.clear();
     }
 
     fn arm_block(&self, operation: OwnerBoundedOperation) {
@@ -1099,6 +1102,9 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
         cancellation: OwnerReadCancellation,
     ) {
         let mut state = self.state.0.lock().expect("bounded observer state");
+        if state.record_budget {
+            contextdb_engine::vector_read_memory::watch_reader_budget_ledger_for_test();
+        }
         state.next_event = state.next_event.saturating_add(1);
         let operation_event = state.next_event;
         state.records.push(OperationRecord {
@@ -1126,6 +1132,10 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
             let should_block = state.blocked_operation == Some(state.records[current].operation)
                 && !state.released;
             if should_block {
+                if state.record_budget {
+                    state.blocked_budget_ledger =
+                        contextdb_engine::vector_read_memory::take_reader_budget_ledger_for_test();
+                }
                 state.blocked = true;
                 changed.notify_all();
             }
@@ -1171,11 +1181,17 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
 
     fn after_temporary_reservation(
         &self,
-        _source: TestWorkSource,
+        source: TestWorkSource,
         reserved_bytes: u64,
         held_temporary_bytes: u64,
     ) {
         let mut state = self.state.0.lock().expect("bounded observer state");
+        if state.record_budget {
+            state.reader_reservations.push((
+                source,
+                usize::try_from(reserved_bytes).expect("reservation fits usize"),
+            ));
+        }
         state.peak_temporary_bytes = state
             .peak_temporary_bytes
             .max(held_temporary_bytes)
@@ -1497,8 +1513,8 @@ fn eof_hup_cancels_once_at_bounded_work_discards_publication_and_releases_every_
     assert_eq!(while_disconnected_handler_ignores.buffered_bytes, 0);
     assert_eq!(while_disconnected_handler_ignores.active_cancellations, 1);
     assert_eq!(
-        while_disconnected_handler_ignores.accountant_used_bytes,
-        baseline.accountant_used_bytes,
+        while_disconnected_handler_ignores.reader_used_bytes,
+        baseline.reader_used_bytes,
     );
 
     handler.release();
@@ -2240,7 +2256,7 @@ fn custom_namespace_against_a_handler_less_owner_answers_a_named_owner_route_uns
     assert_eq!(
         failure.detail(),
         &ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-            inspection: "proof.unregistered".to_owned(),
+            inspection: "proof.unregistered".to_owned().into(),
         })
     );
 }
@@ -2300,8 +2316,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     assert!(first.has_more);
     let full_two_row_bytes =
-        u64::try_from(cursor_page_encoded_size(&first).expect("canonical two-row page size"))
-            .expect("cursor page size fits u64");
+        u64::try_from(opened.payload.len()).expect("cursor page size fits u64");
     let live = harness.service.resources();
     assert_eq!(live.active_slots, baseline.active_slots + 1);
     assert_eq!(live.cursor_count, baseline.cursor_count + 1);
@@ -2310,8 +2325,8 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
         "a live cursor has a strict independently visible retained charge",
     );
     assert_eq!(
-        live.accountant_used_bytes - baseline.accountant_used_bytes,
-        live.cursor_retained_bytes,
+        live.reader_used_bytes - baseline.reader_used_bytes,
+        live.cursor_retained_bytes + live.reader_control_bytes - baseline.reader_control_bytes,
     );
     let live_status = owner_status(
         harness
@@ -2616,10 +2631,8 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     let calibration_page =
         decode_cursor_page(&calibration.payload).expect("decode calibration cursor page");
-    let required_page_bytes = u64::try_from(
-        cursor_page_encoded_size(&calibration_page).expect("canonical cursor page encoded size"),
-    )
-    .expect("cursor page size fits u64");
+    let required_page_bytes =
+        u64::try_from(calibration.payload.len()).expect("cursor page size fits u64");
     assert!(!calibration_page.has_more);
     assert_resources(&harness.service, baseline);
 
@@ -2935,6 +2948,7 @@ fn eof_hup_reaches_execute_open_and_fetch_production_blockers() {
 #[test]
 fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
     let observer = Arc::new(ProductionObserver::default());
+    observer.state.0.lock().unwrap().record_budget = true;
     let harness = observed_cursor_harness(Arc::clone(&observer));
     let mut original_limits = limits();
     original_limits.result_rows = 4;
@@ -2958,8 +2972,8 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
     assert_eq!(live.cursor_count, baseline.cursor_count + 1);
     assert!(live.cursor_retained_bytes > 0);
     assert_eq!(
-        live.accountant_used_bytes - baseline.accountant_used_bytes,
-        live.cursor_retained_bytes,
+        live.reader_used_bytes - baseline.reader_used_bytes,
+        live.cursor_retained_bytes + live.reader_control_bytes - baseline.reader_control_bytes,
     );
     observer.clear();
     observer.arm_block(OwnerBoundedOperation::CursorFetch);
@@ -2988,6 +3002,17 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
         during_fetch.cursor_retained_bytes,
         live.cursor_retained_bytes
     );
+    // Native page/proof holds also belong to this reader. The source ledger
+    // below proves each selected source term exactly once; operation completion
+    // proves the whole reader balance, including those native holds, is refunded.
+    assert!(
+        during_fetch.reader_used_bytes
+            >= live.reader_used_bytes
+                + 24
+                + 266
+                + "cancellation_cursor".len() as u64
+                + (during_fetch.reader_control_bytes - live.reader_control_bytes)
+    );
     assert_eq!(
         during_fetch.accountant_used_bytes,
         live.accountant_used_bytes
@@ -2999,19 +3024,65 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             .expect("status bypasses admission during a blocked cursor fetch"),
     );
     assert_eq!(status.admission.active_readers, 1);
-    assert_eq!(status.memory.used_bytes, live.accountant_used_bytes);
+    assert_eq!(status.memory.used_bytes, during_fetch.accountant_used_bytes);
     observer.cancel_current();
     assert!(observer.current_is_cancelled());
     observer.release_block();
+    let cancelled = cancelled.join().expect("cancelled fetch joins");
     assert!(matches!(
-        cancelled
-            .join()
-            .expect("cancelled fetch joins")
-            .expect_err("cancelled fetch publishes no page"),
+        cancelled.expect_err("cancelled fetch publishes no page"),
         OwnerReadScaffoldError::Database(Error::ReadCancelled)
     ));
+    let ledger = observer
+        .state
+        .0
+        .lock()
+        .unwrap()
+        .blocked_budget_ledger
+        .clone();
+    let source_owners = ledger
+        .iter()
+        .map(|entry| {
+            let source = match entry.what.as_str() {
+                "bounded_read/read/table_scan" => TestWorkSource::TableScan,
+                "bounded_read/read/index_range" => TestWorkSource::IndexRange,
+                other => panic!("unexpected reader owner: {other}"),
+            };
+            (source, entry.bytes)
+        })
+        .collect::<Vec<_>>();
+    let expected_owners = observer.state.0.lock().unwrap().reader_reservations.clone();
+    assert!(!expected_owners.is_empty());
+    assert_eq!(
+        source_owners, expected_owners,
+        "each admitted source term is charged once at the reader owner"
+    );
+    let mut wrong_owner = source_owners.clone();
+    wrong_owner[0].0 = TestWorkSource::IndexRange;
+    assert_ne!(
+        wrong_owner, expected_owners,
+        "the same bytes under a different owner must fail reconciliation"
+    );
     assert_eq!(observer.cancellation_observed(), 1);
-    assert_resources(&harness.service, live);
+    let after_cancel = harness.service.resources();
+    let observation_bytes = ledger
+        .iter()
+        .filter(|entry| entry.what == "bounded_read/read/table_scan")
+        .map(|entry| entry.bytes as u64)
+        .sum::<u64>();
+    assert_eq!(
+        observation_bytes,
+        26 + 112,
+        "one admitted observation payload and carrier"
+    );
+    let mut cancelled_receipt = live;
+    cancelled_receipt.cursor_retained_bytes += observation_bytes;
+    cancelled_receipt.reader_used_bytes += observation_bytes;
+    assert_eq!(
+        after_cancel, cancelled_receipt,
+        "source temporaries refund; the single observation remains charged"
+    );
+    let live = after_cancel;
 
     harness
         .database
@@ -3021,6 +3092,11 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
         )
         .expect("commit a later row between cancellation and resume");
     let live_after_later_commit = harness.service.resources();
+    let captured_root = harness
+        .database
+        .writer_memory_ownership_receipt_for_test()
+        .captured_root_charge;
+    assert_eq!(captured_root, 264);
     assert_eq!(live_after_later_commit.active_slots, live.active_slots);
     assert_eq!(live_after_later_commit.cursor_count, live.cursor_count);
     assert_eq!(
@@ -3103,10 +3179,20 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             - live.cursor_retained_bytes,
         buffered_bytes: live_after_later_commit.buffered_bytes,
         active_cancellations: live_after_later_commit.active_cancellations,
-        accountant_used_bytes: live_after_later_commit.accountant_used_bytes
-            - live.cursor_retained_bytes,
+        reader_used_bytes: live_after_later_commit.reader_used_bytes
+            - live.cursor_retained_bytes
+            - (live.reader_control_bytes - baseline.reader_control_bytes),
+        reader_control_bytes: baseline.reader_control_bytes,
+        accountant_used_bytes: live_after_later_commit.accountant_used_bytes - captured_root as u64,
     };
     assert_resources(&harness.service, expected_after_exhaustion);
+    assert_eq!(
+        harness
+            .database
+            .writer_memory_ownership_receipt_for_test()
+            .captured_root_charge,
+        0
+    );
     let current = harness
         .database
         .execute(
@@ -3399,6 +3485,13 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
         .run_maintenance_cycle()
         .expect("maintenance and pruning can run while the snapshot pin is live");
     let live_after_writer = harness.service.resources();
+    let held_writer = harness.database.writer_memory_ownership_receipt_for_test();
+    assert_eq!(held_writer.captured_root_charge, 264);
+    assert_eq!(held_writer.reconciliation_gap, 0);
+    assert_eq!(
+        held_writer.named_owner_total as u64,
+        live_after_writer.accountant_used_bytes
+    );
     assert_eq!(live_after_writer.active_slots, live.active_slots);
     assert_eq!(live_after_writer.cursor_count, live.cursor_count);
     assert_eq!(
@@ -3438,9 +3531,31 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
                 - live.cursor_retained_bytes,
             buffered_bytes: live_after_writer.buffered_bytes,
             active_cancellations: live_after_writer.active_cancellations,
+            reader_used_bytes: live_after_writer.reader_used_bytes
+                - live.cursor_retained_bytes
+                - (live.reader_control_bytes - baseline.reader_control_bytes),
+            reader_control_bytes: baseline.reader_control_bytes,
             accountant_used_bytes: live_after_writer.accountant_used_bytes
-                - live.cursor_retained_bytes,
+                - held_writer.captured_root_charge as u64,
         },
+    );
+
+    let released_writer = harness.database.writer_memory_ownership_receipt_for_test();
+    let reconciles = |receipt: &contextdb_engine::database::WriterMemoryOwnershipReceiptForTest| {
+        receipt.captured_root_charge == 0
+            && receipt.published_root_charge == held_writer.published_root_charge
+            && receipt.storage_maintenance_control_charge
+                == held_writer.storage_maintenance_control_charge
+            && receipt.reconciliation_gap == 0
+            && receipt.named_owner_total as u64 == harness.service.resources().accountant_used_bytes
+    };
+    assert!(reconciles(&released_writer));
+    let mut wrong_owner = released_writer.clone();
+    wrong_owner.captured_root_charge = 264;
+    wrong_owner.published_root_charge -= 264;
+    assert!(
+        !reconciles(&wrong_owner),
+        "relabelled root ownership must fail even with the same total"
     );
 
     let current = harness
@@ -3538,7 +3653,7 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
     assert_eq!(while_ignoring.active_slots, baseline.active_slots + 2);
     assert_eq!(while_ignoring.cursor_count, baseline.cursor_count + 1);
     assert!(while_ignoring.cursor_retained_bytes > baseline.cursor_retained_bytes);
-    assert!(while_ignoring.accountant_used_bytes > baseline.accountant_used_bytes);
+    assert!(while_ignoring.reader_used_bytes > baseline.reader_used_bytes);
     harness.clock.advance_to(111);
     handler.pulse();
     let timed_out = drain
@@ -3587,8 +3702,10 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         assert_simple_refusal(&closed_cursor_request, ReadFailureKind::OwnerNotServing);
         assert_eq!(harness.service.resources(), while_ignoring);
     }
+    // A drain that missed its deadline keeps the channel owned, admitting
+    // nothing, until a later close finishes it.
     #[cfg(unix)]
-    assert!(!harness.service.channel_path().exists());
+    assert!(harness.service.channel_path().exists());
 
     harness
         .database
@@ -3605,7 +3722,7 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
     #[cfg(unix)]
     {
         assert!(harness.service.channel_is_bound_for_test());
-        assert!(!harness.service.channel_path().exists());
+        assert!(harness.service.channel_path().exists());
     }
 
     handler.release();
@@ -3622,6 +3739,9 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         .service
         .shutdown_and_drain()
         .expect("retry succeeds after cancellation-ignoring handler releases");
+    // Admitted work has left, so the retried close removes the channel.
+    #[cfg(unix)]
+    assert!(!harness.service.channel_path().exists());
     assert_resources(&harness.service, baseline);
     harness
         .database
@@ -3636,6 +3756,92 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
 #[cfg(feature = "test-seams")]
 #[test]
 fn remote_explain_of_a_bound_partition_key_reports_the_bound_scopes_count_and_route() {
+    {
+        // An owner reader receives the consumer's ranked session answer even
+        // when its bound Context contains no session rows.
+        let harness = Harness::new(limits(), 4, None);
+        for ddl in [
+            "CREATE TABLE contexts (id UUID PRIMARY KEY CONTEXT_ID, name TEXT NOT NULL UNIQUE, labels JSON, properties JSON, created_at TXID NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            "CREATE TABLE event_context_sessions (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, event_count INTEGER NOT NULL, latest_occurred_at TIMESTAMP, PRIMARY KEY (context_id, connector_id, session_ref)) SYNC OFF",
+            "CREATE INDEX idx_event_context_sessions_recency ON event_context_sessions (context_id, latest_occurred_at DESC, connector_id ASC, session_ref ASC)",
+        ] {
+            harness
+                .database
+                .execute(ddl, &HashMap::new())
+                .expect("declare the consumer session schema and recency index");
+        }
+        let populated = uuid::Uuid::from_u128(1);
+        let empty = uuid::Uuid::from_u128(2);
+        for (context, name) in [(populated, "populated"), (empty, "empty")] {
+            harness
+                .database
+                .execute(
+                    "INSERT INTO contexts (id, name, created_at) VALUES ($id, $name, $tx)",
+                    &HashMap::from([
+                        ("id".to_owned(), Value::Uuid(context)),
+                        ("name".to_owned(), Value::Text(name.to_owned())),
+                        ("tx".to_owned(), Value::TxId(contextdb_core::TxId(1))),
+                    ]),
+                )
+                .expect("commit each consumer Context parent");
+        }
+        harness.database.execute(
+            "INSERT INTO event_context_sessions (context_id, connector_id, session_ref, event_count, latest_occurred_at) VALUES ($context, 'connector', 'session', 1, $occurred)",
+            &HashMap::from([
+                ("context".to_owned(), Value::Uuid(populated)),
+                ("occurred".to_owned(), Value::Timestamp(1)),
+            ]),
+        ).expect("commit one actual consumer session summary");
+        let statement = "WITH ranked_sessions AS (SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at, ROW_NUMBER() OVER (PARTITION BY context_id ORDER BY latest_occurred_at DESC, connector_id ASC, session_ref ASC) AS session_rank FROM event_context_sessions WHERE context_id = $recent_context_0 AND latest_occurred_at IS NOT NULL) SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at FROM ranked_sessions WHERE (context_id = $rank_context_0 AND session_rank <= $rank_limit_0) ORDER BY context_id ASC, session_rank ASC";
+        let answers: Vec<_> = [(70, populated), (71, empty)]
+            .into_iter()
+            .map(|(connection, context)| {
+                let answer = harness.request(
+                    connection,
+                    limits(),
+                    LocalRequest::CursorOpen {
+                        statement: statement.to_owned(),
+                        params: BTreeMap::from([
+                            ("recent_context_0".to_owned(), Value::Uuid(context)),
+                            ("rank_context_0".to_owned(), Value::Uuid(context)),
+                            ("rank_limit_0".to_owned(), Value::Int64(10)),
+                        ]),
+                    },
+                );
+                (connection, context, answer)
+            })
+            .collect();
+        for (connection, context, answer) in answers {
+            let opened = cursor_opened(
+                answer.expect("ranked session CursorOpen answers rather than disconnecting"),
+            );
+            let page = decode_cursor_page(&opened.payload)
+                .expect("decode the owner's complete ranked session page");
+            let expected = if context == populated {
+                vec![vec![
+                    Value::Uuid(populated),
+                    Value::Text("connector".to_owned()),
+                    Value::Text("session".to_owned()),
+                    Value::Int64(1),
+                    Value::Timestamp(1),
+                ]]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                page.rows, expected,
+                "nonempty and empty Contexts keep their exact session answers"
+            );
+            assert!(!page.has_more, "the one-row and empty answers are complete");
+            let responses = harness
+                .request(connection, limits(), query("SELECT 1"))
+                .expect("the same owner connection remains usable after the ranked answer");
+            assert!(matches!(
+                responses.last(),
+                Some(LocalResponse::TerminalSuccess { .. })
+            ));
+        }
+    }
     const SCOPE: &str = "alpha-scope";
 
     let harness = Harness::new(limits(), 4, None);
@@ -3771,4 +3977,131 @@ fn a_cancelled_owner_read_is_reported_as_cancelled() {
         !rendered.contains("unimplemented"),
         "a cancelled owner read must not be reported as unimplemented: {rendered}"
     );
+}
+
+use super::owner_cursor_test_support;
+use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
+
+// Acceptance: a real authenticated service publishes the decoder's typed
+// memory refusal, retains request ordinals and FIFO, and serves later queries
+// on the same stream. Failed acquisition is tested separately at inbound receive.
+// Decisive mutant: completed691's early decoder `?` closes this stream.
+// Existing Harness request tests cannot send a carrier-fitting / decoder-
+// expanding frame without client-side query allocation taking precedence.
+#[test]
+fn actual_inbound_decoder_refusal_preserves_the_authenticated_stream_and_ordinals() {
+    use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+    use contextdb_engine::local_transport::{
+        encode_message, encode_payload_frame, LocalInboundKind, LocalInboundMessage,
+        LocalOutboundMessage, LocalProtocolBoundary, LocalResponseExpectation, UnixLocalCarrier,
+    };
+
+    #[derive(Default)]
+    struct Ordinals(Mutex<Vec<u64>>);
+    impl OwnerServicePublicationObserver for Ordinals {
+        fn before_cursor_page_publication(&self, _: u64) {}
+        fn cancellation_received(&self, _: u64) {}
+        fn cursor_page_published(&self, _: u64) {}
+        fn publication_authorized(&self, ordinal: u64) {
+            self.0.lock().unwrap().push(ordinal);
+        }
+    }
+
+    for refusal_source in ["request limit", "native parent limit"] {
+        let ordinals = Arc::new(Ordinals::default());
+        let harness = Harness::new_with_publication_observer(limits(), 2, None, ordinals.clone());
+        let carrier = UnixLocalCarrier;
+        let boundary = LocalProtocolBoundary::with_effective_limits(limits());
+        let mut stream = block_on(carrier.connect(harness.service.channel_path(),
+            &harness.clock, harness.clock.now_ms() + 1_000)).expect("same real carrier as OwnerClient");
+        carrier.send_message(&mut stream, &boundary,
+            LocalOutboundMessage::Handshake(&harness.handshake)).unwrap();
+        carrier.send_message(&mut stream, &boundary,
+            LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                limits: limits(), request: LocalRequest::OwnerStatus,
+            })).unwrap();
+        assert!(matches!(carrier.receive_message(&mut stream, &boundary,
+            LocalInboundKind::Response(LocalResponseExpectation::OwnerStatus)).unwrap(),
+            LocalInboundMessage::Response(LocalResponse::OwnerStatus { .. })));
+
+        let parent = harness.database.declared_read_memory_for_test();
+        let pressure = if refusal_source != "request limit" {
+            let available = ReadLimits::SHIPPED_MEMORY - parent.retained_bytes_for_test()
+                - 64 * 1024;
+            let budget: Arc<dyn ReadMemoryBudget> = parent.clone();
+            Some(ReadCredit::try_new(budget, available as usize,
+                "reader", "test_pressure", "test pressure").unwrap())
+        } else { None };
+        let request = LocalRequestEnvelope {
+            limits: ReadLimits { memory: if refusal_source == "request limit" { 64 * 1024 } else { limits().memory }, ..limits() },
+            request: LocalRequest::Query {
+                statement: "SELECT 1".into(),
+                params: BTreeMap::from([("a".into(), Value::Json(
+                    serde_json::Value::Array(vec![serde_json::json!(0); 8192])))]),
+            },
+        };
+        // Use the real serializer and frame codec; the ordinary OwnerClient
+        // would perform its own narrow-budget admission before sending.
+        let frame = encode_payload_frame(&encode_message(&request).unwrap()).unwrap();
+        std::io::Write::write_all(&mut stream, &frame).unwrap();
+        let response = carrier.receive_message(&mut stream, &boundary,
+            LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult))
+            .expect("completed valid request earns a terminal refusal, never Ended");
+            let LocalInboundMessage::Response(LocalResponse::Failure { failure }) = response
+                else { panic!("actual decoder retains transport Failure, not EngineFailure") };
+            assert_eq!(failure, ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail {
+                limit: ReadFailureLimit::Memory, value: limits().memory,
+                required: None, statement: None,
+            }));
+        drop(pressure);
+        // Two requests are deliberately pipelined onto the SAME authenticated
+        // stream. Distinct answers and exact publication ordinals expose
+        // reordering, reset, duplicate consumption and hidden reconnects.
+        for sql in ["SELECT 17 AS answer", "SELECT 29 AS answer"] {
+            carrier.send_message(&mut stream, &boundary,
+                LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                    limits: limits(), request: query(sql),
+                })).unwrap();
+        }
+        for expected in [17, 29] {
+            let mut responses = Vec::new();
+            loop {
+                let LocalInboundMessage::Response(response) = carrier.receive_message(
+                    &mut stream, &boundary,
+                    LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)).unwrap()
+                    else { panic!("ordinary response") };
+                let terminal = matches!(&response, LocalResponse::TerminalSuccess { .. });
+                responses.push(response);
+                if terminal { break; }
+            }
+            let result = published_result(responses);
+            assert_eq!(result.rows, vec![vec![Value::Int64(expected)]]);
+        }
+        assert_eq!(*ordinals.0.lock().unwrap(), vec![3, 4],
+            "status is ordinal 1, refused query is 2, following queries remain 3 and 4");
+        // A late interrupt keeps the existing acknowledgement contract; this
+        // does not claim cancellation of an active deferred refusal.
+        carrier.send_message(&mut stream, &boundary,
+            LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                limits: limits(), request: LocalRequest::CancelInFlight { request_ordinal: 2 },
+            })).unwrap();
+        assert!(matches!(carrier.receive_message(&mut stream, &boundary,
+            LocalInboundKind::Response(LocalResponseExpectation::Custom)).unwrap(),
+            LocalInboundMessage::Response(LocalResponse::CancelApplied { request_ordinal: 2 })));
+        carrier.send_message(&mut stream, &boundary,
+            LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                limits: limits(), request: query("SELECT 41 AS answer"),
+            })).unwrap();
+        let mut responses = Vec::new();
+        loop {
+            let LocalInboundMessage::Response(response) = carrier.receive_message(&mut stream, &boundary,
+                LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)).unwrap()
+                else { panic!("final query response") };
+            let terminal = matches!(&response, LocalResponse::TerminalSuccess { .. });
+            responses.push(response);
+            if terminal { break; }
+        }
+        assert_eq!(published_result(responses).rows, vec![vec![Value::Int64(41)]]);
+        assert_eq!(*ordinals.0.lock().unwrap(), vec![3, 4, 5]);
+    }
 }

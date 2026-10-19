@@ -6,7 +6,10 @@
 //! test seams passively observe graph and raw-body residency, then prove that
 //! pressure evicts only the least-recently-used route needed to admit another.
 
-use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey};
+use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
+use contextdb_engine::memory_accounting::{
+    take_budget_ledger_for_test, watch_budget_ledger_for_test,
+};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -15,8 +18,8 @@ use uuid::Uuid;
 const INDEXED_ROWS_PER_PARTITION: usize = 1_000;
 const VECTOR_DIMENSION: usize = 512;
 const MAX_MAINTENANCE_CYCLES: usize = 64;
-// Admit both encoded record owners, including the record envelope. The raw
-// partition control below must still exceed this same fixed working-set cap.
+// Admit encoded graph records and streamed vector bodies. A complete raw
+// partition reservation still exceeds this same fixed working-set cap.
 const LOAD_WORKSPACE_HEADROOM: usize = 2 * 1024 * 1024 + 64 * 1024;
 const SQ4_STORED_BYTES_PER_ENTRY: usize = VECTOR_DIMENSION.div_ceil(2) + 8;
 const DECODED_F32_BYTES_PER_ENTRY: usize = VECTOR_DIMENSION * std::mem::size_of::<f32>();
@@ -92,8 +95,14 @@ fn graph_status(
 }
 
 fn graph_ready(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(index, &partition(scope))
+        .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
+        .unwrap()
         .is_some_and(|info| info.graph_available)
 }
 
@@ -211,9 +220,14 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         vec![Uuid::from_u128(0x100_000)],
         "the production SQL route selects alpha through its maintained index"
     );
-    let alpha_trace = db
-        .__take_last_query_vector_trace_for_test()
-        .expect("the selected indexed route publishes its trace");
+    let alpha_trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .expect("the selected indexed route publishes its trace");
     assert!(
         alpha_trace.used_hnsw,
         "the selected answer stays on the maintained indexed route"
@@ -321,9 +335,14 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         vec![Uuid::from_u128(0x300_000)],
         "pressure reclaims the least-recently-used bravo graph and admits charlie"
     );
-    let pressure_trace = db
-        .__take_last_query_vector_trace_for_test()
-        .expect("the selected indexed route publishes its trace");
+    let pressure_trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .expect("the selected indexed route publishes its trace");
     assert!(
         pressure_trace.used_hnsw,
         "the bounded answer stays on the maintained indexed route"
@@ -383,7 +402,8 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         "indexed pressure leaves complete raw bodies dormant"
     );
 
-    let bulk_error = db
+    watch_budget_ledger_for_test();
+    let streamed = db
         .execute(
             "SELECT id FROM lazy_restart_items WHERE scope_id = $scope \
              ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1",
@@ -392,23 +412,73 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
                 ("query", Value::Vector(axis(0))),
             ]),
         )
-        .expect_err("the same memory ceiling must refuse a complete raw-partition load");
-    assert!(
-        matches!(
-            bulk_error,
-            Error::MemoryBudgetExceeded { operation, .. } if operation == "load_raw_vector_partition"
-        ),
-        "the raw-load control must fail at bulk raw-vector admission"
-    );
-    let activity_after_bulk_refusal = db.__vector_passive_activity_counters_for_test();
+        .expect("EXACT streams stored bodies inside the same working-set ceiling");
+    let ledger = take_budget_ledger_for_test();
     assert_eq!(
-        activity_after_bulk_refusal.raw_partition_loads,
-        activity_after_pressure.raw_partition_loads,
-        "the refused bulk control must not install a raw partition"
+        streamed.rows,
+        vec![vec![Value::Uuid(Uuid::from_u128(0x100_000))]]
+    );
+    let activity_after_stream = db.__vector_passive_activity_counters_for_test();
+    assert_eq!(
+        activity_after_stream.raw_partition_loads, activity_after_pressure.raw_partition_loads,
+        "streaming EXACT leaves whole raw partitions dormant"
+    );
+    assert_eq!(
+        activity_after_stream.raw_candidate_point_loads
+            - activity_after_pressure.raw_candidate_point_loads,
+        INDEXED_ROWS_PER_PARTITION as u64,
+        "EXACT fetches each selected visible body once"
+    );
+    assert_eq!(
+        activity_after_stream.raw_candidate_point_body_bytes
+            - activity_after_pressure.raw_candidate_point_body_bytes,
+        (INDEXED_ROWS_PER_PARTITION * SQ4_STORED_BYTES_PER_ENTRY) as u64
     );
     assert_eq!(
         db.accountant().usage().used,
         two_route_charge,
-        "the selected graph working set remains inside the same memory ceiling after the refused bulk control"
+        "streamed bodies and scores release without displacing the selected graph working set"
+    );
+    for (scope, resident) in [(alpha, true), (bravo, false), (charlie, true)] {
+        assert_eq!(graph_status(&db, &index, scope).base_resident, resident);
+        assert!(
+            !db.vector_store_for_test()
+                .raw_partition_resident_for_test(&index, &partition(scope))
+        );
+    }
+    let body_bytes = 2 * (DECODED_F32_BYTES_PER_ENTRY + SQ4_STORED_BYTES_PER_ENTRY);
+    assert_eq!(body_bytes, 4624);
+    let mut held_body = false;
+    let mut bodies = 0;
+    for entry in &ledger {
+        if entry.what == "bounded_read/read/vector_candidates" && entry.bytes == body_bytes {
+            assert!(
+                !held_body,
+                "the previous streamed body releases before the next is admitted"
+            );
+            held_body = true;
+            bodies += 1;
+        } else if entry.what == "release" && entry.bytes == body_bytes {
+            assert!(held_body, "each release belongs to an admitted body");
+            held_body = false;
+        }
+    }
+    assert!(!held_body);
+    assert_eq!(bodies, INDEXED_ROWS_PER_PARTITION);
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|entry| entry.what == "vector_search/search")
+            .map(|entry| entry.bytes)
+            .collect::<Vec<_>>(),
+        vec![6144]
+    );
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|entry| entry.what == "bounded_read/read/rank_candidates")
+            .map(|entry| entry.bytes)
+            .collect::<Vec<_>>(),
+        vec![192]
     );
 }

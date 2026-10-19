@@ -96,7 +96,8 @@ fn start_hub(broker: &InProcessBroker, tenant: &str, hub_db: Arc<Database>) -> R
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -115,7 +116,7 @@ fn row_count(db: &Database, table: &str) -> usize {
 }
 
 fn assert_only_optional_peer_contact_changes_since(db: &Database, before_lsn: Lsn, exchange: &str) {
-    let changes = db.change_log_since(before_lsn);
+    let changes = db.change_log_since(before_lsn).unwrap();
     assert!(
         changes.iter().all(|entry| matches!(
             entry,
@@ -322,7 +323,8 @@ async fn a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advanci
         transport,
         TenantId::from(tenant),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     let tenant_id = TenantId::from(tenant);
     let hub_watermark_before = hub_db
@@ -400,7 +402,8 @@ async fn a_version_mismatched_peer_is_refused_on_pull_moving_no_rows_and_advanci
         transport,
         TenantId::from(tenant),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     let tenant_id = TenantId::from(tenant);
     let hub_lsn_before = hub_db.current_lsn();

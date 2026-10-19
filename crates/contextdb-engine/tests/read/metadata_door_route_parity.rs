@@ -919,7 +919,7 @@ fn an_image_state_question_over_the_owner_route_names_what_it_cannot_answer() {
         assert_eq!(
             failure.detail(),
             &ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-                inspection: IMAGE_STATE_INSPECTION.to_owned(),
+                inspection: IMAGE_STATE_INSPECTION.to_owned().into(),
             }),
             "the refusal names the inspection it could not answer, for {kind:?}"
         );

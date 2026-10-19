@@ -261,8 +261,14 @@ fn engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopene
         .execute(indexed_sql, &query)
         .expect("the publisher serves its completed indexed route");
     assert!(
-        db.__take_last_query_vector_trace_for_test()
-            .is_some_and(|trace| trace.used_hnsw),
+        {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                .expect("read the admitted trace observation")
+        }
+        .is_some_and(|trace| trace.used_hnsw),
         "the publisher's successful query uses the maintained route"
     );
     drop(worker_clock);
@@ -291,9 +297,15 @@ fn engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopene
         .expect("the reopened reader serves the durable indexed route");
     assert_eq!(reopened_result.rows, writer_result.rows);
     assert!(
-        reader
-            .__take_last_query_vector_trace_for_test()
-            .is_some_and(|trace| trace.used_hnsw),
+        {
+            let seam_read_memory = reader
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            reader
+                .__take_last_query_vector_trace_for_test(seam_read_memory)
+                .expect("read the admitted trace observation")
+        }
+        .is_some_and(|trace| trace.used_hnsw),
         "the reopened reader uses the durable indexed route rather than row presence alone"
     );
     let after_read = graph_generation_status(&reader, &primary);
@@ -406,8 +418,14 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
         .expect("INDEXED execution uses the maintenance-published route");
     assert_eq!(indexed_ready.rows.len(), 10);
     assert!(
-        db.__debug_last_query_vector_trace_for_test()
-            .is_some_and(|trace| trace.used_hnsw),
+        {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            db.__debug_last_query_vector_trace_for_test(seam_read_memory)
+                .expect("read the admitted trace observation")
+        }
+        .is_some_and(|trace| trace.used_hnsw),
         "INDEXED execution must use the published route"
     );
 

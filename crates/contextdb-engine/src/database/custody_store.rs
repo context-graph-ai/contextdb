@@ -2,10 +2,38 @@
 use super::*;
 use crate::custody::{records::*, store::Store};
 
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static SKIP_CUSTODY_VALIDATION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CUSTODY_VALIDATION_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST: std::cell::RefCell<Option<Arc<crate::read_image_memory::ImageMemory>>> = const { std::cell::RefCell::new(None) };
+    static LAST_CUSTODY_RETAINED_BYTES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LAST_RETIRED_FUNDING_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MEASURED_READER_FOR_TEST: std::cell::RefCell<Option<Arc<crate::read_image_memory::ImageMemory>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A captured writer root held by a test.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub struct HeldCustodyRootForTest(crate::persistence::writer_source::WriterSnapshotHandle);
+
+/// Which captured writer root a custody call reads.
+#[derive(Clone, Copy)]
+enum CustodyRoot {
+    /// The calling operation's captured root (or the latest when it has none).
+    Operation,
+    /// The latest published root: commit preparation and retirement.
+    Latest,
+}
+
 pub(crate) struct CustodyDelta {
     _publication: crate::custody::store::Publication,
-    records: BTreeMap<String, Option<Record>>,
+    records: crate::custody::store::DeltaRecords,
+    tenant_growth: Option<crate::custody::store::TenantGrowth>,
     bytes: BTreeMap<String, Option<Vec<u8>>>,
+    /// The writer admission of `records`, released only after they are
+    /// published or the commit aborts. Declared last so it drops last.
+    _retained: crate::custody::store::CustodyCharge,
 }
 
 impl Database {
@@ -14,12 +42,35 @@ impl Database {
         &self,
         changes: ChangeSet,
         confirmed: Lsn,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<OutboundSyncUnit>> {
-        crate::custody::outbound::units(self, changes, confirmed)
+        let mut ordinary = ChangeSet::default();
+        let mut connected = Vec::new();
+        for (group,is_connected) in self.connected_delivery_groups(changes,vector_copy_owner,read_memory.clone())? {
+            if is_connected {
+                connected.push(OutboundSyncUnit { changes: group, dependency_complete: true });
+            } else {
+                ordinary.rows.extend(group.rows); ordinary.edges.extend(group.edges);
+                ordinary.vectors.extend(group.vectors); ordinary.ddl.extend(group.ddl); ordinary.ddl_lsn.extend(group.ddl_lsn);
+            }
+        }
+        if !ordinary.is_empty() {
+            connected.extend(crate::custody::outbound::units(self,ordinary,confirmed,
+                vector_copy_owner,read_memory.clone())?);
+        }
+        connected.sort_by_key(|unit| unit.changes.rows.iter().map(|row|row.lsn)
+            .chain(unit.changes.edges.iter().map(|edge|edge.lsn))
+            .chain(unit.changes.vectors.iter().map(|vector|vector.lsn))
+            .chain(unit.changes.ddl_lsn.iter().copied()).min());
+        Ok(connected)
     }
+
     pub(crate) fn custody_parent_refs(
         &self,
         row: &RowChange,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<crate::custody::records::RowRef>> {
         let mut parents = Vec::new();
         if let Some(meta) = self.table_meta(&row.table) {
@@ -56,6 +107,8 @@ impl Database {
                     &values,
                     self.snapshot(),
                     &HashSet::new(),
+                    vector_copy_owner,
+                    read_memory.clone(),
                 )? {
                     parents.push(crate::custody::records::RowRef {
                         table,
@@ -70,18 +123,58 @@ impl Database {
         &self,
         f: impl FnOnce(&mut Store) -> Result<T>,
     ) -> Result<T> {
+        self.with_custody_store_at(CustodyRoot::Operation, f)
+    }
+    /// The latest published writer root. Commit preparation validates and
+    /// retires against it, so it sees every commit published before this one.
+    pub(crate) fn latest_custody_root(
+        &self,
+    ) -> Result<crate::persistence::writer_source::WriterSnapshotHandle> {
+        super::writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?
+            .ok_or_else(|| Error::Other("writer publication has no durable root".into()))
+    }
+    fn with_custody_store_at<T>(
+        &self,
+        at: CustodyRoot,
+        f: impl FnOnce(&mut Store) -> Result<T>,
+    ) -> Result<T> {
+        // Capture the root before the cache lock: publication takes the
+        // published-read lock and then the cache, never the reverse.
+        let root = self.persistence.as_ref().map(|_| match at {
+            CustodyRoot::Operation => self.writer_read_root().and_then(|root| {
+                root.ok_or_else(|| Error::Other("writer publication has no durable root".into()))
+            }),
+            CustodyRoot::Latest => self.latest_custody_root(),
+        });
         let mut cache = self.custody_cache.lock();
         if cache.is_none() {
             let mut entries = BTreeMap::new();
-            if let Some(persistence) = &self.persistence {
-                // Never dump unrelated config; each owned journal is a Redb prefix range.
-                for prefix in [
-                    "tenant_table_policy.v1.",
-                    "tenant_policy_binding.v1.",
-                    "delivery_",
-                ] {
-                    entries.extend(persistence.load_config_values_raw_with_prefix(prefix)?);
-                }
+            if let Some(persistence) = &self.persistence
+                && !persistence.custody_groups_complete()?
+            {
+                // Never load the whole journal in place of a missing index.
+                return Err(crate::persistence::custody_source::incomplete_custody_index());
+            } else if let Some(persistence) = &self.persistence {
+                // The delivery journal stays durable and is read through the
+                // derived group index. Only the bounded tenant policy and
+                // binding records are mirrored.
+                // Each prefix's raw entries are sized first and admitted to
+                // the writer before they are loaded; the raw load is released
+                // once the mirror (admitted entry by entry) is built.
+                let mut raw = crate::custody::store::MirrorCharge::new(self.accountant.clone());
+                let mut load = |prefix: &str| {
+                    persistence.load_config_values_raw_admitted(prefix, &mut |bytes| {
+                        raw.admit("custody_tenant_raw", bytes)?;
+                        raw.post("custody_tenant_raw");
+                        Ok(())
+                    })
+                };
+                let parts = [
+                    load("tenant_table_policy.v1.")?,
+                    load("tenant_policy_binding.v1.")?,
+                ];
+                *cache = Some(Store::durable_admitted(parts, self.accountant.clone())?);
+                drop(raw);
             } else {
                 if let Some(image) = &self.committed_image_startup {
                     entries.extend(image.config_source.load_image_custody_config()?);
@@ -93,9 +186,24 @@ impl Database {
                         .map(|(k, v)| (k.clone(), v.clone())),
                 );
             }
-            *cache = Some(Store::from_entries(entries)?);
+            if cache.is_none() {
+                *cache = Some(Store::from_entries(entries)?);
+            }
         }
-        f(cache.as_mut().expect("loaded custody metadata"))
+        let store = cache.as_mut().expect("loaded custody metadata");
+        if !store.is_durable() {
+            return f(store);
+        }
+        let read_root = match store.pinned_root() {
+            Some(pinned) => pinned.clone(),
+            None => root.ok_or_else(crate::custody::canonical::invalid)??,
+        };
+        store.set_read_root(Some(read_root));
+        let answer = f(store);
+        if let Some(store) = cache.as_mut() {
+            store.set_read_root(None);
+        }
+        answer
     }
 
     /// Measurement only; no mutation or production API.
@@ -110,17 +218,687 @@ impl Database {
             ))
         })
     }
-    pub(crate) fn custody_records(&self) -> Result<Vec<Record>> {
-        self.custody_records_in(&["tenant_".into(), "delivery_".into()])
+    /// Measurement only: `(hydrated delivery-journal records, decoded custody
+    /// records, resident delivery-journal records, resident delivery-journal
+    /// bytes)`. The first two are process-wide counters; the resident pair
+    /// observes this handle's cache without loading it.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_writer_work_for_test(&self) -> (u64, u64, u64, u64) {
+        let (hydrated, decoded) = crate::custody::store::work::read();
+        let (records, bytes) = self
+            .custody_cache
+            .lock()
+            .as_ref()
+            .map_or((0, 0), Store::resident_delivery_for_test);
+        (hydrated, decoded, records, bytes)
     }
-    pub(crate) fn custody_records_in(&self, selectors: &[String]) -> Result<Vec<Record>> {
-        self.with_custody_store(|store| {
-            let records = store.select(selectors);
+    /// Measurement only: capture the latest published writer root, held until
+    /// the returned value drops.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __hold_custody_root_for_test(&self) -> Result<HeldCustodyRootForTest> {
+        Ok(HeldCustodyRootForTest(self.latest_custody_root()?))
+    }
+    /// Measurement only: the keys one ordinary custody selection answers,
+    /// inside an operation whose captured root is `held` (or the operation's
+    /// own root when `None`).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_keys_for_test(
+        &self,
+        held: Option<&HeldCustodyRootForTest>,
+        selector: &str,
+    ) -> Result<Vec<String>> {
+        let read_memory = self.declared_reader_memory()?;
+        let _scope =
+            held.map(|held| self.enter_writer_read(Some(held.0.clone()), read_memory.clone()));
+        let records = self.custody_records_in(&[selector.to_owned()], read_memory)?;
+        records.iter().map(Record::key).collect()
+    }
+    /// Measurement only: the refusals one stored custody record produces on
+    /// the durable decode path and on the resident load path.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_decode_refusals_for_test(
+        key: &str,
+        bytes: &[u8],
+        durable_limit: Option<usize>,
+    ) -> (Option<Error>, Option<Error>) {
+        crate::custody::store::decode_refusals_for_test(key, bytes, durable_limit)
+    }
+    /// Measurement only: the committed bytes of one custody CONFIG key.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_record_bytes_for_test(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .load_config_value_raw(key)
+    }
+    /// Measurement only: commit a raw custody CONFIG write (`Some`) or delete
+    /// (`None`) through the ordinary commit path with custody validation
+    /// skipped, so storage, mirrors, group index and content identity all stay
+    /// consistent while the journal itself is damaged.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __tamper_custody_record_for_test(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.raw_custody_commit_for_test(key, value, true)
+    }
+    /// Measurement only: commit a raw custody CONFIG write or delete through
+    /// the ordinary commit path, with its ordinary custody validation.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __commit_custody_record_for_test(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.raw_custody_commit_for_test(key, value, false)
+    }
+    /// Measurement only: the manifest keys the ordinary pending-delivery read
+    /// answers, and how many pending-index entries it examined.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_pending_for_test(&self) -> Result<(Vec<String>, u64)> {
+        let before = crate::custody::store::work::pending_examined_total();
+        let answer = self.custody_pending_manifests(self.declared_reader_memory()?)?;
+        let keys = answer.iter().map(Record::key).collect::<Result<Vec<_>>>()?;
+        Ok((
+            keys,
+            crate::custody::store::work::pending_examined_total() - before,
+        ))
+    }
+    #[cfg(feature = "test-seams")]
+    /// Measurement only: commit raw custody CONFIG deletes and writes, in
+    /// order, in one transaction, with ordinary custody validation.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __commit_custody_records_for_test(
+        &self,
+        deletes: &[&str],
+        writes: &[(&str, Vec<u8>)],
+    ) -> Result<()> {
+        let tx = self.begin()?;
+        self.tx_mgr.with_write_set(tx, |ws| {
+            for key in deletes {
+                ws.config_deletes.push((*key).to_owned());
+            }
+            for (key, value) in writes {
+                ws.config_writes.push(((*key).to_owned(), value.clone()));
+            }
+        })?;
+        let committed = self.commit(tx);
+        *self.custody_cache.lock() = None;
+        committed
+    }
+    /// Measurement only: `(entries, key bytes)` this thread's last custody
+    /// closure memo held when it was destroyed.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __last_closure_memo_for_test() -> (usize, usize) {
+        crate::custody::store::last_memo_for_test()
+    }
+    /// Measurement only: submissions whose pending-delivery membership commit
+    /// maintenance has re-verified so far, process-wide.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_pending_rechecks_for_test() -> u64 {
+        crate::persistence::RedbPersistence::custody_pending_rechecked_for_test()
+    }
+    /// Measurement only: the bytes this thread's last custody retirement held
+    /// admitted for the ownership keys it moved into its write set.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __last_retired_custody_funding_for_test() -> usize {
+        LAST_RETIRED_FUNDING_FOR_TEST.with(std::cell::Cell::get)
+    }
+    /// Measurement only: what the reader memory of this thread's running
+    /// `__custody_caller_with_limit_for_test` holds admitted now.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_measured_held_for_test() -> Option<usize> {
+        MEASURED_READER_FOR_TEST.with(|reader| reader.borrow().as_ref().map(|memory| memory.held()))
+    }
+    #[cfg(feature = "test-seams")]
+    fn raw_custody_commit_for_test(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+        skip_validation: bool,
+    ) -> Result<()> {
+        let tx = self.begin()?;
+        self.tx_mgr.with_write_set(tx, |ws| match value {
+            Some(value) => ws.config_writes.push((key.to_owned(), value)),
+            None => ws.config_deletes.push(key.to_owned()),
+        })?;
+        SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.set(skip_validation));
+        let committed = self.commit(tx);
+        SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.set(false));
+        // A later reader starts from the committed (damaged) journal.
+        *self.custody_cache.lock() = None;
+        committed
+    }
+    /// Measurement only: validate this thread's next custody commits under a
+    /// standalone image limit instead of the writer accountant (`None` restores
+    /// the writer accountant).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __limit_custody_validation_for_test(limit: Option<usize>) {
+        CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(|cell| cell.set(limit));
+    }
+    /// Measurement only: `(bytes still admitted by this thread's last custody
+    /// validation memory, bytes its validated delta held admitted until
+    /// publication)`.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __last_custody_validation_for_test() -> (Option<usize>, usize) {
+        (
+            LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST
+                .with(|last| last.borrow().as_ref().map(|memory| memory.held())),
+            LAST_CUSTODY_RETAINED_BYTES_FOR_TEST.with(std::cell::Cell::get),
+        )
+    }
+    /// Measurement only: custody record decodes performed on the calling thread.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_thread_decodes_for_test() -> u64 {
+        crate::custody::store::work::thread_decoded()
+    }
+    /// Measurement only: decodes commit-time delta validation performed on
+    /// the calling thread.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_thread_validation_decodes_for_test() -> u64 {
+        crate::custody::store::work::thread_validation_decoded()
+    }
+    /// Measurement only: drop the custody group index completion marker.
+    /// Takes effect for roots captured after the next open.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __invalidate_custody_groups_for_test(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .invalidate_custody_groups_for_test()
+    }
+    /// Measurement only: the repair rebuild of the custody group index.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __rebuild_custody_index_for_test(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .rebuild_custody_index_for_test()
+    }
+    /// Measurement only: the full transaction-order repair. The store must be
+    /// closed and reopened before any other use.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __repair_transaction_order_for_test(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .repair_transaction_order_for_test()
+    }
+    /// Measurement only: build one durable custody store against a standalone
+    /// writer accountant of `limit` bytes: the ordinary form, or (`pinned`)
+    /// the detached received-unit form at the latest root. An unused store
+    /// must hold nothing; its first durable read creates the companion memo.
+    /// Returns the bytes that accountant held while the store lived and after
+    /// it dropped.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_memo_admission_for_test(
+        &self,
+        limit: usize,
+        pinned: bool,
+    ) -> Result<(usize, usize)> {
+        let accountant: crate::memory_accounting::AccountantHandle = Arc::new(
+            crate::memory_accounting::MemoryAccountant::with_budget(limit),
+        )
+        .into();
+        let mut store = if pinned {
+            Store::durable_pinned(self.latest_custody_root()?, accountant.clone())?
+        } else {
+            Store::durable(BTreeMap::new(), accountant.clone())?
+        };
+        let unused = accountant.usage().used;
+        if unused != 0 {
+            return Err(Error::Other((format!(
+                "an unused durable store holds {unused} bytes"
+            )).into()));
+        }
+        // The first durable read creates the memo.
+        store.ensure_companion_memo()?;
+        let during = accountant.usage().used;
+        drop(store);
+        Ok((during, accountant.usage().used))
+    }
+    /// Measurement only: the bytes one durable store's companion memo admits.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_memo_bytes_for_test() -> usize {
+        crate::custody::store::CompanionMemo::BYTES
+    }
+    /// Measurement only: drop this handle's custody store; the next custody
+    /// read builds a fresh one.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __drop_custody_store_for_test(&self) {
+        *self.custody_cache.lock() = None;
+    }
+    /// Measurement only: a standalone reader-style memory funded by its own
+    /// accountant of `limit` bytes; what that accountant still holds after the
+    /// memory drops is what the operation left admitted.
+    #[cfg(feature = "test-seams")]
+    fn measured_memory_for_test(
+        limit: usize,
+    ) -> (
+        crate::memory_accounting::AccountantHandle,
+        Arc<crate::read_image_memory::ImageMemory>,
+    ) {
+        let accountant: crate::memory_accounting::AccountantHandle = Arc::new(
+            crate::memory_accounting::MemoryAccountant::with_budget(limit),
+        )
+        .into();
+        let memory = crate::read_image_memory::ImageMemory::charging_for(
+            accountant.clone(),
+            "reader",
+            "custody_measurement",
+            "Raise the measurement limit.",
+        );
+        (accountant, memory)
+    }
+    /// Measurement only: report this thread's custody admission points (the
+    /// operation memory's admitted bytes at each) to `probe`.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __set_custody_admission_probe_for_test(probe: Option<fn(usize)>) {
+        crate::custody::store::set_admission_probe_for_test(probe);
+    }
+    /// Measurement only: visit one custody group by name under a standalone
+    /// memory of `limit` bytes. Answers its member count, or the refusal, and
+    /// the bytes still admitted afterwards.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __visit_custody_group_for_test(
+        &self,
+        group: &str,
+        limit: usize,
+    ) -> (Result<usize>, usize) {
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
+        let visited = self.with_custody_store(|store| store.visit_group_for_test(group, &memory));
+        drop(memory);
+        (visited, accountant.usage().used)
+    }
+    /// Measurement only: the pending-delivery read under a standalone memory
+    /// of `limit` bytes. Answers the manifest keys or the refusal, the pending
+    /// entries examined, and the bytes still admitted after the answer drops.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_pending_with_limit_for_test(
+        &self,
+        limit: usize,
+    ) -> (Result<Vec<String>>, u64, usize) {
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
+        let before = crate::custody::store::work::pending_examined_total();
+        let answer = self
+            .with_custody_store(|store| store.pending(memory.clone(), self))
+            .and_then(|answer| answer.iter().map(Record::key).collect::<Result<Vec<_>>>());
+        let examined = crate::custody::store::work::pending_examined_total() - before;
+        drop(memory);
+        (answer, examined, accountant.usage().used)
+    }
+    /// Measurement only: run commit-time custody validation of `writes` and
+    /// `deletes` against the latest root under a standalone memory of `limit`
+    /// bytes, without committing. Answers the outcome and the bytes still
+    /// admitted once the operation's memory drops.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __validate_custody_writes_for_test(
+        &self,
+        writes: &[(String, Vec<u8>)],
+        deletes: &[String],
+        limit: usize,
+    ) -> (Result<()>, usize) {
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
+        let validated = self.with_custody_store_at(CustodyRoot::Latest, |store| {
+            store
+                .validate_delta(writes, deletes, memory.clone(), self)
+                .map(drop)
+        });
+        drop(memory);
+        (validated, accountant.usage().used)
+    }
+    /// Measurement only: the canonical bytes of the record at `key` after one
+    /// named field change, signed fields untouched (`admission_owning_state`,
+    /// `admission_certificate`).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_mutated_record_for_test(&self, key: &str, mutation: &str) -> Result<Vec<u8>> {
+        let bytes = self
+            .__custody_record_bytes_for_test(key)?
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let mut record = crate::custody::records::decode(&bytes)?;
+        match (mutation, &mut record) {
+            ("admission_owning_state", Record::ObjectAdmission(admission)) => {
+                admission.owning_state.token[0] ^= 1;
+            }
+            ("admission_certificate", Record::ObjectAdmission(admission)) => {
+                admission.certificate[0] ^= 1;
+            }
+            _ => return Err(Error::Other((format!("no mutation {mutation} for {key}")).into())),
+        }
+        encode(&record)
+    }
+    /// Measurement only: one ordinary custody selection under a standalone
+    /// reader memory of `limit` bytes, at the operation's own captured root.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_keys_with_limit_for_test(
+        &self,
+        selector: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let (_accountant, memory) = Self::measured_memory_for_test(limit);
+        let answer =
+            self.with_custody_store(|store| store.select(&[selector.to_owned()], memory, self))?;
+        answer.iter().map(Record::key).collect()
+    }
+    /// Measurement only: build (or reuse) this handle's custody store and
+    /// answer `(its tenant mirror's writer admission, mirrored entries)`.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_tenant_mirror_for_test(&self) -> Result<(usize, usize)> {
+        self.with_custody_store(|store| Ok((store.tenant_mirror_charge(), store.records.len())))
+    }
+    /// Measurement only: report every labelled custody admission bracket on
+    /// this thread as `(label, phase, invoice bytes, operation bytes held)`;
+    /// phases are 0 before the reservation, 1 after the funded allocation
+    /// exists and 2 at a refusal.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __set_custody_bracket_probe_for_test(probe: Option<fn(&'static str, u8, usize, usize)>) {
+        crate::custody::store::set_bracket_probe_for_test(probe);
+    }
+    /// Measurement only: refuse the `occurrence`-th (1-based) custody
+    /// admission labelled `label` on this thread before it reserves. Answers
+    /// the previous setting, which is `None` once an injected refusal fired.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_refuse_at_for_test(
+        at: Option<(&'static str, usize)>,
+    ) -> Option<(&'static str, usize)> {
+        crate::custody::store::refuse_at_for_test(at)
+    }
+    /// Measurement only: one production custody read caller under a reader
+    /// memory of `limit` bytes. `caller` is `select` (`arg` a selector),
+    /// `authority`, `submission` (`arg` a submission id), `table` (`arg` a
+    /// table), `root` or `rows` (`arg` a stored manifest key whose root row
+    /// is read; resolved before the measured call) or `pending`. Answers the
+    /// answer's keys or the refusal, and the bytes still admitted once the
+    /// answer dropped.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_caller_with_limit_for_test(
+        &self,
+        caller: &str,
+        arg: &str,
+        limit: usize,
+    ) -> (Result<Vec<String>>, usize) {
+        let root = match caller {
+            "root" | "rows" => match self
+                .custody_records_in(&[arg.to_owned()], self.declared_reader_memory().unwrap())
+                .and_then(|records| match records.first() {
+                    Some(Record::Manifest(m)) => Ok(m.seal.root.clone()),
+                    _ => Err(crate::custody::canonical::invalid()),
+                }) {
+                Ok(root) => Some(root),
+                Err(error) => return (Err(error), 0),
+            },
+            _ => None,
+        };
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
+        MEASURED_READER_FOR_TEST.with(|reader| *reader.borrow_mut() = Some(memory.clone()));
+        let read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = memory.clone();
+        let answer = match caller {
+            "select" => self.custody_records_in(&[arg.to_owned()], read),
+            "authority" => self.custody_authority(read),
+            "submission" => match arg.parse() {
+                Ok(id) => self.custody_submission(id, read),
+                Err(_) => Err(crate::custody::canonical::invalid()),
+            },
+            "table" => self.custody_table(arg, read),
+            "root" => self.custody_root(root.as_ref().unwrap(), read),
+            "rows" => self.custody_rows(std::slice::from_ref(root.as_ref().unwrap()), read),
+            "pending" => self.custody_pending_manifests(read),
+            _ => Err(crate::custody::canonical::invalid()),
+        };
+        let keys = answer.and_then(|records| records.iter().map(Record::key).collect());
+        // What the caller's reader memory still holds once the answer dropped.
+        let held = memory.held();
+        MEASURED_READER_FOR_TEST.with(|reader| *reader.borrow_mut() = None);
+        drop(memory);
+        drop(accountant);
+        (keys, held)
+    }
+    /// Measurement only: the stored edge terminal at `key` with `elements`
+    /// small JSON values appended to its root key: a canonical record whose
+    /// decoded size far exceeds its encoding (its signature no longer holds).
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_inflated_terminal_for_test(
+        &self,
+        key: &str,
+        elements: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self
+            .__custody_record_bytes_for_test(key)?
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let mut record = crate::custody::records::decode(&bytes)?;
+        let Record::Terminal {
+            record: terminal, ..
+        } = &mut record
+        else {
+            return Err(Error::Other((format!("{key} is not a terminal")).into()));
+        };
+        terminal.root.key.rest.push((
+            "inflated".into(),
+            contextdb_core::Value::Json(serde_json::Value::Array(vec![
+                serde_json::Value::from(0);
+                elements
+            ])),
+        ));
+        encode(&record)
+    }
+    /// Measurement only: one durable probe (decode, canonical and key check,
+    /// signature) of `bytes` at `key` under a standalone memory of `limit`.
+    /// Answers the outcome and the bytes still admitted afterwards.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_probe_for_test(key: &str, bytes: &[u8], limit: usize) -> (Result<()>, usize) {
+        let (accountant, memory) = Self::measured_memory_for_test(limit);
+        let probed = crate::custody::store::probe_for_test(&memory, key, bytes);
+        drop(memory);
+        (probed, accountant.usage().used)
+    }
+    /// Measurement only: whether the committed custody group index is complete.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_groups_complete_for_test(&self) -> Result<bool> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .custody_groups_complete()
+    }
+    /// Measurement only: committed custody CONFIG keys under `prefix`
+    /// (for example `delivery_root.v1.`), counted without decoding values.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __custody_durable_key_count_for_test(&self, prefix: &str) -> Result<u64> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(0), |p| p.count_config_keys_with_prefix_for_test(prefix))
+    }
+    /// Measurement only: answer the same custody selections from a freshly
+    /// loaded resident journal and from the durable group index, as encoded
+    /// records. `None` when this store has no complete durable index.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn __custody_selection_parity_for_test(
+        &self,
+        root_table: &str,
+        root_keys: &[crate::sync_types::NaturalKey],
+    ) -> Result<Option<Vec<(String, Vec<Vec<u8>>, Vec<Vec<u8>>)>>> {
+        use crate::custody::{canonical::hex, records::RowRef};
+        let Some(persistence) = &self.persistence else {
+            return Ok(None);
+        };
+        if !persistence.custody_groups_complete()? {
+            return Ok(None);
+        }
+        let mut all = BTreeMap::new();
+        let mut tenant = BTreeMap::new();
+        for prefix in [
+            "tenant_table_policy.v1.",
+            "tenant_policy_binding.v1.",
+            "delivery_",
+        ] {
+            for (key, value) in persistence.load_config_values_raw_with_prefix(prefix)? {
+                if prefix.starts_with("tenant_") {
+                    tenant.insert(key.clone(), value.clone());
+                }
+                all.insert(key, value);
+            }
+        }
+        let mut resident = Store::from_entries(all)?;
+        let mut durable = Store::durable(tenant, self.accountant.clone())?;
+        durable.set_read_root(Some(self.latest_custody_root()?));
+        let read_memory = self.declared_reader_memory()?;
+        let memory = || {
+            crate::read_image_memory::ImageMemory::charging_reader(
+                self.accountant.clone(),
+                read_memory.clone(),
+            )
+        };
+        let encoded = |records: &[Record]| records.iter().map(encode).collect::<Result<Vec<_>>>();
+        let rows = root_keys
+            .iter()
+            .map(|key| RowRef {
+                table: root_table.to_owned(),
+                key: key.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut selectors = vec![
+            "delivery_".to_owned(),
+            "tenant_".to_owned(),
+            "delivery_root.v1.".to_owned(),
+            "@authority".to_owned(),
+            "@policies".to_owned(),
+        ];
+        for row in &rows {
+            selectors.push(format!("@row:{}", hex(&row.bytes())));
+            selectors.push(format!("@{}", crate::custody::store::root_group(row)));
+        }
+        for record in resident.select(&selectors[..1], memory(), self)?.iter() {
+            if let Record::Manifest(m) = record {
+                selectors.push(format!(
+                    "@{}",
+                    crate::custody::store::submission_group(m.id)
+                ));
+            }
+        }
+        let mut out = Vec::new();
+        for selector in &selectors {
+            let one = std::slice::from_ref(selector);
+            out.push((
+                selector.clone(),
+                encoded(&resident.select(one, memory(), self)?)?,
+                encoded(&durable.select(one, memory(), self)?)?,
+            ));
+        }
+        out.push((
+            "union".into(),
+            encoded(&resident.select(&selectors, memory(), self)?)?,
+            encoded(&durable.select(&selectors, memory(), self)?)?,
+        ));
+        out.push((
+            format!("table:{root_table}"),
+            encoded(&resident.select_table(root_table, memory(), self)?)?,
+            encoded(&durable.select_table(root_table, memory(), self)?)?,
+        ));
+        out.push((
+            "rows".into(),
+            encoded(&resident.select_rows(&rows, memory(), self)?)?,
+            encoded(&durable.select_rows(&rows, memory(), self)?)?,
+        ));
+        out.push((
+            "pending".into(),
+            encoded(&resident.pending(memory(), self)?)?,
+            encoded(&durable.pending(memory(), self)?)?,
+        ));
+        Ok(Some(out))
+    }
+    pub(crate) fn custody_records(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in_at(
+            CustodyRoot::Operation,
+            &["tenant_", "delivery_"],
+            read_memory.clone(),
+        )
+    }
+    pub(crate) fn custody_records_in(
+        &self,
+        selectors: &[String],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in_at(CustodyRoot::Operation, selectors, read_memory)
+    }
+    /// The operation memory of one custody read: its own control is admitted
+    /// to the reader before the shared owner exists.
+    fn custody_read_memory(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Arc<crate::read_image_memory::ImageMemory>> {
+        crate::read_image_memory::ImageMemory::operation_reader(
+            self.accountant.clone(),
+            read_memory,
+        )
+    }
+    fn custody_records_in_at<S: AsRef<str>>(
+        &self,
+        at: CustodyRoot,
+        selectors: &[S],
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = self.custody_read_memory(read_memory)?;
+        self.custody_select_at(at, memory, selectors)
+    }
+    fn custody_select_at<S: AsRef<str>>(
+        &self,
+        at: CustodyRoot,
+        memory: Arc<crate::read_image_memory::ImageMemory>,
+        selectors: &[S],
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.with_custody_store_at(at, |store| {
+            let records = store.select(selectors, memory.clone(), self)?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
     }
     fn verify_selected_custody_records(&self, store: &Store, records: &[Record]) -> Result<()> {
+        // A durable answer was decoded and verified from the persisted bytes.
+        if store.is_durable() {
+            return Ok(());
+        }
         if let Some(persistence) = &self.persistence {
             let checking = store.publications.load(Ordering::SeqCst) == 0;
             let keys = records
@@ -141,9 +919,14 @@ impl Database {
         }
         Ok(())
     }
-    pub(crate) fn custody_table(&self, table: &str) -> Result<Vec<Record>> {
+    pub(crate) fn custody_table(
+        &self,
+        table: &str,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = self.custody_read_memory(read_memory.clone())?;
         self.with_custody_store(|store| {
-            let records = store.select_table(table);
+            let records = store.select_table(table, memory.clone(), self)?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
@@ -151,48 +934,88 @@ impl Database {
     pub(crate) fn custody_rows(
         &self,
         rows: &[crate::custody::records::RowRef],
-    ) -> Result<Vec<Record>> {
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = self.custody_read_memory(read_memory.clone())?;
         self.with_custody_store(|store| {
-            let records = store.select_rows(rows)?;
+            let records = store.select_rows(rows, memory.clone(), self)?;
             self.verify_selected_custody_records(store, &records)?;
             Ok(records)
         })
     }
-    pub(crate) fn custody_authority(&self) -> Result<Vec<Record>> {
-        self.custody_records_in(&["@authority".into(), "@policies".into()])
+    pub(crate) fn custody_authority(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in_at(
+            CustodyRoot::Operation,
+            &["@authority", "@policies"],
+            read_memory.clone(),
+        )
     }
-    pub(crate) fn custody_submission(&self, submission: uuid::Uuid) -> Result<Vec<Record>> {
-        self.custody_records_in(&[format!(
-            "@{}",
-            crate::custody::store::submission_group(submission)
-        )])
+    pub(crate) fn custody_submission(
+        &self,
+        submission: uuid::Uuid,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        self.custody_records_in_at(
+            CustodyRoot::Operation,
+            &[crate::custody::store::Selector::submission(submission)?],
+            read_memory.clone(),
+        )
     }
     pub(crate) fn custody_root(
         &self,
         root: &crate::custody::records::RowRef,
-    ) -> Result<Vec<Record>> {
-        let roots =
-            self.custody_records_in(&[format!("@{}", crate::custody::store::root_group(root))])?;
-        let ids = roots
-            .iter()
-            .filter_map(|r| match r {
-                Record::Manifest(m) => Some(m.id),
-                Record::Terminal { record: t, .. } => Some(t.submission),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        self.custody_records_in(
-            &ids.into_iter()
-                .map(|id| format!("@{}", crate::custody::store::submission_group(id)))
-                .collect::<Vec<_>>(),
-        )
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        use crate::custody::store::{AdmittedVec, Selector, render_row_group};
+        // The root group's name, rendered into an admitted buffer.
+        let memory = self.custody_read_memory(read_memory.clone())?;
+        let mut group = AdmittedVec::<u8>::new(memory.clone(), "custody_root_group");
+        let roots = {
+            let name = render_row_group(&mut group, "@root:", root)?;
+            self.custody_select_at(CustodyRoot::Operation, memory.clone(), &[name])?
+        };
+        let mut ids = AdmittedVec::<uuid::Uuid>::new(memory.clone(), "custody_root_ids");
+        for record in roots.iter() {
+            match record {
+                Record::Manifest(m) => ids.push(m.id)?,
+                Record::Terminal { record: t, .. } => ids.push(t.submission)?,
+                _ => {}
+            }
+        }
+        drop(roots);
+        drop(group);
+        ids.as_mut_slice().sort_unstable();
+        ids.retain_first_of_runs(|a, b| a == b);
+        let mut selectors = AdmittedVec::<Selector>::with_exact(
+            memory.clone(),
+            "custody_root_selectors",
+            ids.len(),
+        )?;
+        for id in ids.as_slice() {
+            selectors.push_within(Selector::submission(*id)?)?;
+        }
+        drop(ids);
+        let answer_memory = self.custody_read_memory(read_memory)?;
+        self.custody_select_at(CustodyRoot::Operation, answer_memory, selectors.as_slice())
     }
-    pub(crate) fn custody_pending_manifests(&self) -> Result<Vec<Record>> {
-        self.with_custody_store(|store| Ok(store.pending()))
+    pub(crate) fn custody_pending_manifests(
+        &self,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<crate::custody::store::AdmittedRecords> {
+        let memory = self.custody_read_memory(read_memory)?;
+        self.with_custody_store(|store| store.pending(memory, self))
     }
     // Only complete adjudication may publish a batch bookmark.
-    pub(crate) fn finish_custody_push(&self, receipt: &SyncApplyReceipt) -> Result<()> {
-        self.commit_sync_apply_receipt_only(receipt)?;
+    pub(crate) fn finish_custody_push(
+        &self,
+        receipt: &SyncApplyReceipt,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        self.commit_sync_apply_receipt_only(receipt, vector_copy_owner, read_memory.clone())?;
         if self.persistence.is_none() {
             let key = Self::applied_push_watermark_node_incarnation_key(
                 &receipt.tenant_id,
@@ -221,9 +1044,16 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         ddl: Option<&crate::protocol::ReceivedDdlContext>,
         dependency_complete: bool,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<ApplyResult> {
         let frontier = self
-            .persisted_sync_applied_push_watermark_for_node_incarnation(tenant, edge, incarnation)?
+            .persisted_sync_applied_push_watermark_for_node_incarnation_with_read_memory(
+                tenant,
+                edge,
+                incarnation,
+                read_memory.clone(),
+            )?
             .unwrap_or(Lsn(0));
         self.apply_authenticated_received_changes_with_outcome(
             changes,
@@ -241,11 +1071,15 @@ impl Database {
             lineages,
             ddl,
             None,
+            vector_copy_owner,
+            read_memory.clone(),
         )
     }
     pub(crate) fn custody_row(
         &self,
         reference: &crate::custody::records::RowRef,
+
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Option<VersionedRow>> {
         // Custody digests cover every committed column, so a file-backed
         // writer's paged-out bodies are read back for the row it hands on.
@@ -254,6 +1088,7 @@ impl Database {
             &reference.key,
             self.snapshot(),
             &HashSet::new(),
+            read_memory.clone(),
         )?
         else {
             return Ok(None);
@@ -262,6 +1097,7 @@ impl Database {
             &reference.table,
             &row,
             &crate::database::ChangeProjection::unbounded(),
+            read_memory.clone(),
         )?;
         row.values.extend(shed);
         Ok(Some(row))
@@ -270,13 +1106,236 @@ impl Database {
     // A replacement or deletion ends ownership of the
     // previous committed manifest. Preserve its signed history and terminals;
     // current rows require a registration from their own writing transaction.
-    fn retire_changed_custody_roots(&self, ws: &mut WriteSet) -> Result<()> {
+    fn retire_changed_custody_roots(
+        &self,
+        ws: &mut WriteSet,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<crate::custody::store::CustodyCharge>> {
+        use crate::custody::records::RowRef;
+        use crate::custody::store::{AdmittedVec, Selector, render_row_group};
+        if ws.relational_deletes.is_empty() {
+            return Ok(None);
+        }
+        // A manifest names rows only of a delivery root table and the member
+        // tables that root declares. Deletes elsewhere own no custody record,
+        // so they read no custody state at all. Decided under the catalog's
+        // read guard, borrowing names; no set is built.
+        let delivery_table = |table: &str| -> bool {
+            let metas = self.relational_store.table_meta.read();
+            metas.iter().any(|(name, meta)| {
+                meta.delivery_manifest_tables
+                    .as_ref()
+                    .is_some_and(|members| name == table || members.iter().any(|m| m == table))
+            })
+        };
+        if !ws
+            .relational_deletes
+            .iter()
+            .any(|(table, _, _)| delivery_table(table))
+        {
+            return Ok(None);
+        }
+        let Some(root) = self.writer_read_root()? else {
+            return self
+                .retire_changed_custody_roots_resident(ws, snapshot, read_memory)
+                .map(|()| None);
+        };
+        // Retirement working memory: the writer's, with its control admitted.
+        let memory =
+            crate::read_image_memory::ImageMemory::operation_writer(self.accountant.clone())?;
+        let _errors = crate::custody::store::error_reserve(&memory)?;
+        let mut selectors = crate::custody::store::AdmittedKeys::<String, ()>::new(
+            memory.clone(),
+            "custody_retire_selectors",
+        );
+        let mut group = AdmittedVec::<u8>::new(memory.clone(), "custody_retire_group");
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+            root,
+            read_memory.clone(),
+        )?;
+        for (table, row_id, _) in &ws.relational_deletes {
+            if !delivery_table(table) {
+                continue;
+            }
+            // The deleted row, borrowed from the admitted source window.
+            let Some(window) =
+                contextdb_relational::source::visible_row(&source, table, *row_id, snapshot)?
+            else {
+                continue;
+            };
+            let row = window.value();
+            // The row's identity, admitted on the retirement memory for its
+            // short life: built, rendered into the group name, dropped.
+            let admitted = std::cell::Cell::new(0usize);
+            let admit = |bytes: usize| -> Result<()> {
+                crate::custody::store::bracket(
+                    "custody_retire_key",
+                    crate::custody::store::PROBE_PRE,
+                    bytes,
+                    memory.held(),
+                );
+                if crate::custody::store::refusal_injected("custody_retire_key") {
+                    return Err(crate::custody::store::injected_refusal(
+                        "custody_retire_key",
+                        bytes,
+                    ));
+                }
+                memory.reserve(bytes)?;
+                admitted.set(admitted.get() + bytes);
+                Ok(())
+            };
+            let key = self.with_owned_delivery_meta(table, |meta| {
+                crate::sync_types::natural_key_from_row_values_admitted(meta, &row.values, &admit)
+            })?;
+            let rendered = (|| -> Result<()> {
+                let Some(key) = key else {
+                    return Ok(());
+                };
+                admit(table.len())?;
+                let reference = RowRef {
+                    table: table.clone(),
+                    key,
+                };
+                let name = render_row_group(&mut group, "@row:", &reference)?;
+                selectors.insert_key(name)?;
+                Ok(())
+            })();
+            memory.release(admitted.get());
+            rendered?;
+        }
+        drop(source);
+        if selectors.len() == 0 {
+            return Ok(None);
+        }
+        let mut keys = crate::custody::store::KeyList::with_exact(
+            memory.clone(),
+            "custody_retire_selector_list",
+            selectors.len(),
+        )?;
+        for selector in selectors.keys() {
+            keys.push(selector)?;
+        }
+        drop(selectors);
+        let selected = self.custody_select_at(
+            CustodyRoot::Latest,
+            self.custody_read_memory(read_memory.clone())?,
+            keys.as_slice(),
+        )?;
+        drop(keys);
+        // Retired ownership keys, admitted as they are copied.
+        let mut retired =
+            crate::custody::store::KeyList::new(memory.clone(), "custody_retire_root_keys");
+        for record in selected.iter() {
+            let Record::Manifest(m) = record else {
+                continue;
+            };
+            let owned = self.custody_select_at(
+                CustodyRoot::Latest,
+                self.custody_read_memory(read_memory.clone())?,
+                &[Selector::submission(m.id)?],
+            )?;
+            if !owned.iter().any(|r| {
+                matches!(r, Record::Root { life, submission }
+                if *life == m.root_life && *submission == m.id)
+            }) {
+                continue;
+            }
+            // The ownership key, rendered from the life's finite encoding.
+            let key = crate::custody::store::render_root_key(&mut group, &m.root_life)?;
+            // A re-registration can replace the same local ownership key in
+            // this commit.
+            if ws
+                .config_writes
+                .iter()
+                .any(|(written, _)| written.as_str() == key)
+                || ws
+                    .config_deletes
+                    .iter()
+                    .any(|deleted| deleted.as_str() == key)
+                || retired.as_slice().iter().any(|held| held.as_str() == key)
+            {
+                continue;
+            }
+            retired.push(key)?;
+        }
+        drop(selected);
+        // The write set's delete list is the destination: its grown buffer
+        // and every key moved into it are admitted to `funding` before they
+        // exist there, and `funding` is held by the caller for as long as the
+        // write set lives (published, aborted or dropped).
+        if retired.len() == 0 {
+            return Ok(None);
+        }
+        let mut funding = crate::custody::store::CustodyCharge::new(memory.clone());
+        let needed = ws
+            .config_deletes
+            .len()
+            .checked_add(retired.len())
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        if ws.config_deletes.capacity() < needed {
+            let bytes = needed
+                .checked_mul(std::mem::size_of::<String>())
+                .and_then(|bytes| bytes.checked_add(crate::sync_types::held::ALLOCATION_BYTES))
+                .ok_or_else(crate::custody::canonical::invalid)?;
+            funding.admit_at("custody_retire_write_set", bytes)?;
+            let mut grown = Vec::with_capacity(needed);
+            if grown.capacity() > needed {
+                return Err(crate::custody::canonical::invalid());
+            }
+            grown.append(&mut ws.config_deletes);
+            ws.config_deletes = grown;
+            funding.post("custody_retire_write_set");
+        }
+        while let Some((key, debit)) = retired.pop() {
+            funding.adopt_debit(debit)?;
+            ws.config_deletes.push(key);
+        }
+        Ok(Some(funding))
+    }
+
+    /// The resident form, for a store without a durable writer root.
+    fn retire_changed_custody_roots_resident(
+        &self,
+        ws: &mut WriteSet,
+        snapshot: SnapshotId,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
         use crate::custody::{canonical::hex, records::RowRef};
         if ws.relational_deletes.is_empty() {
             return Ok(());
         }
+        // A manifest names rows only of a delivery root table and the member
+        // tables that root declares. Deletes elsewhere own no custody record,
+        // so they read no custody state at all.
+        let delivery_tables = {
+            let metas = self.relational_store.table_meta.read();
+            metas
+                .iter()
+                .filter_map(|(name, meta)| {
+                    meta.delivery_manifest_tables
+                        .as_ref()
+                        .map(|members| (name, members))
+                })
+                .flat_map(|(name, members)| {
+                    std::iter::once(name.clone()).chain(members.iter().cloned())
+                })
+                .collect::<HashSet<String>>()
+        };
+        if !ws
+            .relational_deletes
+            .iter()
+            .any(|(table, _, _)| delivery_tables.contains(table))
+        {
+            return Ok(());
+        }
         let mut selectors = BTreeSet::new();
-        for (table, rows) in self.deleted_row_snapshots_by_table(ws) {
+        for (table, rows) in
+            self.deleted_row_snapshots_by_table(ws, snapshot, read_memory.clone())?
+        {
+            if !delivery_tables.contains(&table) {
+                continue;
+            }
             let Some(meta) = self.table_meta(&table) else {
                 continue;
             };
@@ -298,7 +1357,12 @@ impl Database {
         if selectors.is_empty() {
             return Ok(());
         }
-        for record in self.custody_records_in(&selectors.into_iter().collect::<Vec<_>>())? {
+        let selected = self.custody_records_in_at(
+            CustodyRoot::Latest,
+            &selectors.into_iter().collect::<Vec<_>>(),
+            read_memory.clone(),
+        )?;
+        for record in selected.iter() {
             let Record::Manifest(m) = record else {
                 continue;
             };
@@ -307,7 +1371,14 @@ impl Database {
                 submission: m.id,
             };
             let key = root.key()?;
-            let owned = self.custody_submission(m.id)?;
+            let owned = self.custody_records_in_at(
+                CustodyRoot::Latest,
+                &[format!(
+                    "@{}",
+                    crate::custody::store::submission_group(m.id)
+                )],
+                read_memory.clone(),
+            )?;
             if !owned.iter().any(|r| {
                 matches!(r, Record::Root { life, submission }
                 if *life == m.root_life && *submission == m.id)
@@ -324,43 +1395,219 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn prepare_custody_commit(&self, ws: &mut WriteSet) -> Result<Option<CustodyDelta>> {
-        self.retire_changed_custody_roots(ws)?;
+    /// Only the detached ordinary terminal calls this producer: its original
+    /// is lent before source/peer guards and its commit boundary fixes the
+    /// published base. No mutable ordinary WriteSet or old custody debit is
+    /// used to price the independently allocated native delete targets.
+    fn retire_changed_custody_roots_in_prepared_write_set(
+        &self,
+        original: &OwnedMemoryReservation,
+        held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<()> {
+        use crate::custody::preparation::{BorrowedHex, OwnedPreparationValue};
+        use crate::custody::records::RowRef;
+        use crate::custody::canonical::{finite_bytes_owned, prepare_string_owned};
+        let count = held.read().relational_deletes.len();
+        if count == 0 { return Ok(()); }
+        let delivery_table = |table: &str| {
+            self.relational_store.table_meta.read().iter().any(|(name, meta)|
+                meta.delivery_manifest_tables.as_ref().is_some_and(|members|
+                    name == table || members.iter().any(|member| member == table)))
+        };
+        if !held.read().relational_deletes.iter().any(|(table, _, _)| delivery_table(table)) {
+            return Ok(());
+        }
+        let published = self.tx_mgr.capture_published_read();
+        let snapshot = published.snapshot;
+        let _read = self.enter_writer_read(writer_read::durable_root(published.handle)?, read_memory.clone());
+        let mut selectors = OwnedPreparationValue::<Vec<String>>::prepare_names(self, count)?;
+        for (table, row_id, _) in held.read().relational_deletes {
+            if !delivery_table(table) { continue; }
+            let mut row_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let Some(row) = self.committed_row_at_admitted(table, *row_id, snapshot,
+                &mut row_credit, read_memory.clone())? else { continue; };
+            self.with_owned_delivery_meta(table, |meta| {
+                let key_memory = std::cell::RefCell::new(
+                    crate::memory_accounting::reserve_preparation_from_original(original, 0,
+                        "delivery", "custody_retire_identity", "Reduce selected metadata or raise MEMORY_LIMIT.")?);
+                let key = crate::sync_types::natural_key_from_row_values_admitted(meta, &row.values, &|bytes|
+                    crate::memory_accounting::grow_preparation_from_original(&mut key_memory.borrow_mut(), bytes,
+                        "delivery", "custody_retire_identity", "Reduce selected metadata or raise MEMORY_LIMIT."))?;
+                let Some(key) = key else { return Ok(()); };
+                crate::memory_accounting::grow_preparation_from_original(&mut key_memory.borrow_mut(), table.len(),
+                    "delivery", "custody_retire_identity", "Reduce selected metadata or raise MEMORY_LIMIT.")?;
+                let reference = RowRef { table: crate::memory_accounting::preparation_copy_string(table)?, key };
+                let bytes = finite_bytes_owned(self, |encoder| { reference.encode_finite(encoder); Ok(()) })?;
+                let selector = bytes.with_value(|bytes|
+                    prepare_string_owned(self, format_args!("@row:{}", BorrowedHex(bytes))))?;
+                selector.with_value(|name| selectors.push_name(name))
+            })?;
+        }
+        selectors.sort_dedup_names()?;
+        if selectors.with_value(Vec::is_empty) { return Ok(()); }
+        let selected = selectors.with_value(|keys|
+            self.custody_records_in_at(CustodyRoot::Latest, keys.as_slice(), read_memory.clone()))?;
+        let capacity = selected.iter().filter(|record| matches!(record, Record::Manifest(_))).count();
+        let mut retired = OwnedPreparationValue::<Vec<String>>::prepare_names(self, capacity)?;
+        for record in selected.iter() {
+            let Record::Manifest(manifest) = record else { continue; };
+            let owned = self.custody_select_at(CustodyRoot::Latest,
+                self.custody_read_memory(read_memory.clone())?,
+                &[crate::custody::store::Selector::submission(manifest.id)?])?;
+            if !owned.iter().any(|record| matches!(record, Record::Root { life, submission }
+                if *life == manifest.root_life && *submission == manifest.id)) { continue; }
+            let bytes = finite_bytes_owned(self, |encoder| { manifest.root_life.encode_finite(encoder); Ok(()) })?;
+            let key = bytes.with_value(|bytes|
+                prepare_string_owned(self, format_args!("delivery_root.v1.{}", BorrowedHex(bytes))))?;
+            key.with_value(|key| {
+                if held.read().config_writes.iter().any(|(written, _)| written == key)
+                    || held.read().config_deletes.iter().any(|deleted| deleted == key)
+                    || retired.with_value(|keys| keys.contains(key)) { return Ok(()); }
+                retired.push_name(key)
+            })?;
+        }
+        // Legacy KeyList pops in reverse order. Preserve that source order,
+        // then copy each input to a separately admitted original target.
+        retired.with_value(|keys| held.with_tx_checkpoint(|held| {
+            for key in keys.iter().rev() {
+                let target = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::ConfigDeletes(std::slice::from_ref(key)))?;
+                let prepared = held.prepare_aux_splice(held.read().config_deletes.len(), &[], target)?;
+                held.publish_tx(prepared);
+            }
+            Ok(())
+        }))
+    }
+
+    /// Retire changed roots, then validate the commit's custody delta.
+    /// `retired` receives the funding of the ownership keys retirement moved
+    /// into `ws` (one per call); the caller declares it before the write set
+    /// so it is released only after the write set is dropped. Its own list
+    /// holds at most one entry per preparation of the commit (two when a
+    /// discard drain is present).
+    pub(super) fn prepare_custody_commit(
+        &self,
+        ws: &mut WriteSet,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        retired: &mut Vec<crate::custody::store::CustodyCharge>,
+    ) -> Result<Option<CustodyDelta>> {
+        #[cfg(feature = "test-seams")]
+        if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) {
+            return Ok(None);
+        }
+        let funding = self.retire_changed_custody_roots(
+            ws,
+            self.scoped_writer_root()
+                .map_or_else(|| self.snapshot_for_read(), |root| root.snapshot),
+            read_memory.clone(),
+        )?;
+        #[cfg(feature = "test-seams")]
+        LAST_RETIRED_FUNDING_FOR_TEST.with(|last| {
+            last.set(
+                funding
+                    .as_ref()
+                    .map_or(0, crate::custody::store::CustodyCharge::bytes),
+            )
+        });
+        // One funding per call: a commit that also drains discards prepares
+        // twice, each call on its own operation memory.
+        if let Some(funding) = funding {
+            retired.push(funding);
+        }
         if !ws.config_writes.iter().any(|(key, _)| owned_key(key))
             && !ws.config_deletes.iter().any(|key| owned_key(key))
         {
             return Ok(None);
         }
-        let (records, publication) = self.with_custody_store(|store| {
-            let records = store.validate_delta(&ws.config_writes, &ws.config_deletes)?;
-            Ok((
-                records,
-                crate::custody::store::Publication::begin(&store.publications),
-            ))
-        })?;
+        // Validation scratch is writer work for this commit, so it is admitted
+        // to the writer accountant rather than the reader that requested it.
+        let memory = crate::read_image_memory::ImageMemory::charging_for(
+            self.accountant.clone(),
+            "writer",
+            "validate_custody_commit",
+            "Reduce the custody records one commit touches or raise MEMORY_LIMIT.",
+        );
+        #[cfg(feature = "test-seams")]
+        let memory = match CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+            Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit)),
+            None => memory,
+        };
+        #[cfg(feature = "test-seams")]
+        LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST
+            .with(|last| *last.borrow_mut() = Some(memory.clone()));
+        self.prepare_custody_delta(&ws.config_writes, &ws.config_deletes, memory)
+    }
+
+    pub(super) fn prepare_custody_commit_in_prepared_write_set(
+        &self,
+        host: &EngineDatabaseTransactions,
+        original: &OwnedMemoryReservation,
+        held: &mut contextdb_tx::manager::EngineGuard<'_>,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Option<CustodyDelta>> {
+        crate::memory_accounting::validate_owned_original(original, &self.finalization.accountant, &host.funder)?;
+        #[cfg(feature = "test-seams")]
+        if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) { return Ok(None); }
+        held.with_tx_checkpoint(|held| {
+            self.retire_changed_custody_roots_in_prepared_write_set(original, held, read_memory)?;
+            if !held.read().config_writes.iter().any(|(key, _)| owned_key(key))
+                && !held.read().config_deletes.iter().any(|key| owned_key(key)) { return Ok(None); }
+            let projection = crate::memory_accounting::persistence_original_projection(original)?;
+            let memory = crate::read_image_memory::ImageMemory::operation_reader(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), projection.read_budget()?)?;
+            #[cfg(feature = "test-seams")]
+            let memory = match CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+                Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit)), None => memory,
+            };
+            #[cfg(feature = "test-seams")]
+            {
+                LAST_RETIRED_FUNDING_FOR_TEST.with(|last| last.set(0));
+                LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST.with(|last| *last.borrow_mut() = Some(memory.clone()));
+            }
+            self.prepare_custody_delta(held.read().config_writes, held.read().config_deletes, memory)
+        })
+    }
+
+    fn prepare_custody_delta(
+        &self,
+        writes: &[(String, Vec<u8>)],
+        deletes: &[String],
+        memory: Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<Option<CustodyDelta>> {
+        let (records, retained, tenant_growth, publication) =
+            self.with_custody_store_at(CustodyRoot::Latest, |store| {
+                let (records, retained, tenant_growth) =
+                    store.validate_delta(writes, deletes, memory, self)?;
+                Ok((
+                    records,
+                    retained,
+                    tenant_growth,
+                    crate::custody::store::Publication::begin(&store.publications),
+                ))
+            })?;
+        #[cfg(feature = "test-seams")]
+        LAST_CUSTODY_RETAINED_BYTES_FOR_TEST.with(|last| last.set(retained.bytes()));
         let mut bytes = BTreeMap::new();
         if self.persistence.is_none() {
-            for (key, record) in &records {
+            for (key, record) in records.iter() {
                 bytes.insert(key.clone(), record.as_ref().map(encode).transpose()?);
             }
         }
         Ok(Some(CustodyDelta {
             _publication: publication,
             records,
+            tenant_growth,
             bytes,
+            _retained: retained,
         }))
     }
     pub(super) fn publish_custody_delta(&self, delta: CustodyDelta) {
         let mut cache = self.custody_cache.lock();
         // A discard may have invalidated the old view while publishing its rows.
         if let Some(store) = cache.as_mut() {
-            for (key, record) in delta.records {
-                match record {
-                    Some(record) => store.insert(key, record),
-                    None => store.remove(&key),
-                }
+            store
+                .publish(delta.records, delta.tenant_growth)
                 .expect("prevalidated custody key/index delta");
-            }
         }
         if !delta.bytes.is_empty() {
             let mut memory = self.custody_metadata.lock();
@@ -373,4 +1620,135 @@ impl Database {
             }
         }
     }
+}
+
+// Prepared cache changes own native keys, decoded records and encoded memory
+// bytes independently; no mutation or naked delta escapes this owner.
+struct OwnedCustodyChange {
+    key: crate::custody::preparation::OwnedPreparationValue<String>,
+    record: Option<crate::custody::preparation::OwnedPreparationValue<Record>>,
+    bytes: Option<crate::custody::preparation::OwnedPreparationValue<Vec<u8>>>,
+}
+pub(super) struct OwnedCustodyDelta {
+    changes: crate::custody::preparation::OwnedPreparationValue<Vec<OwnedCustodyChange>>,
+    _publication: crate::custody::store::Publication,
+}
+fn custody_groups_owned(
+    db: &Database,
+    record: &Record,
+) -> Result<
+    crate::custody::preparation::OwnedPreparationValue<
+        Vec<crate::custody::preparation::OwnedPreparationValue<String>>,
+    >,
+> {
+    use crate::custody::{authority::*, canonical::*, preparation::*};
+    let count = match record {
+        Record::Manifest(m) => m.rows.len().checked_add(2).ok_or_else(invalid)?,
+        Record::Terminal { .. } => 3,
+        Record::MaterializedOwner(_) | Record::Binding(_) | Record::ObjectAdmission(_) => 2,
+        Record::CheckpointFrontier(_) | Record::CheckpointNode(_) | Record::EdgeCheckpoint(_) => 0,
+        _ => 1,
+    };
+    OwnedPreparationValue::try_produce(
+        db,
+        preparation_array_bytes::<OwnedPreparationValue<String>>(count)?,
+        || {
+            let mut groups = Vec::with_capacity(count);
+            let mut reference = |prefix: &str, r: &RowRef| -> Result<()> {
+                let bytes = finite_bytes_owned(db, |e| {
+                    r.encode_finite(e);
+                    Ok(())
+                })?;
+                groups.push(bytes.with_value(|bytes| {
+                    prepare_string_owned(db, format_args!("{prefix}:{}", BorrowedHex(bytes)))
+                })?);
+                Ok(())
+            };
+            let submission = match record {
+                Record::Manifest(m) => {
+                    reference("root", &m.seal.root)?;
+                    for row in &m.rows {
+                        reference("row", &row.reference)?;
+                    }
+                    Some(m.id)
+                }
+                Record::Terminal { record: t, .. } => {
+                    reference("root", &t.root)?;
+                    let digest = object_digest_finite(1, |e| t.bytes_finite(e), &t.signature)?;
+                    groups.push(prepare_string_owned(
+                        db,
+                        format_args!("object:{}", BorrowedHex(&digest)),
+                    )?);
+                    Some(t.submission)
+                }
+                Record::MaterializedOwner(o) => {
+                    reference("root", &o.source.reference)?;
+                    Some(o.submission)
+                }
+                Record::Root { submission, .. }
+                | Record::MemberOwner { submission, .. }
+                | Record::Diagnostic { submission, .. }
+                | Record::DiagnosticOwner { submission, .. }
+                | Record::SourceHistory { submission, .. }
+                | Record::PolicyProfile { submission, .. }
+                | Record::Order { submission, .. } => Some(*submission),
+                Record::Binding(b) => {
+                    groups.push(prepare_string_owned(db, format_args!("authority"))?);
+                    let digest = object_digest_finite(0, |e| b.bytes_finite(e), &b.signature)?;
+                    groups.push(prepare_string_owned(
+                        db,
+                        format_args!("object:{}", BorrowedHex(&digest)),
+                    )?);
+                    None
+                }
+                Record::ObjectAdmission(a) => {
+                    groups.push(prepare_string_owned(
+                        db,
+                        format_args!("object:{}", BorrowedHex(&a.object_digest)),
+                    )?);
+                    groups.push(prepare_string_owned(
+                        db,
+                        format_args!("certificate:{}", BorrowedHex(&a.certificate)),
+                    )?);
+                    None
+                }
+                Record::CheckpointFrontier(_)
+                | Record::CheckpointNode(_)
+                | Record::EdgeCheckpoint(_) => None,
+                Record::Policy(_) => {
+                    groups.push(prepare_string_owned(db, format_args!("policies"))?);
+                    None
+                }
+                Record::Control(_)
+                | Record::State(_)
+                | Record::Birth(_)
+                | Record::Certificate(_)
+                | Record::Destination(_) => {
+                    groups.push(prepare_string_owned(db, format_args!("authority"))?);
+                    None
+                }
+            };
+            if let Some(id) = submission {
+                groups.push(prepare_string_owned(db, format_args!("submission:{id}"))?);
+            }
+            if groups.len() != count || groups.capacity() != count {
+                return Err(invalid());
+            }
+            Ok(groups)
+        },
+    )
+}
+fn custody_record_matches_group(db: &Database, record: &Record, group: &str) -> Result<bool> {
+    custody_groups_owned(db, record)?
+        .with_value(|groups| Ok(groups.iter().any(|g| g.with_value(|g| g == group))))
+}
+// Each temporary carries only its own original read credit. Field order frees
+// the decoded/row payload before returning that credit, including unwind.
+struct SelectedCustodyRecord {
+    record: Record,
+    memory: Arc<crate::read_image_memory::ImageMemory>,
+}
+struct SelectedCustodyRow {
+    row: Option<VersionedRow>,
+    credit: contextdb_core::read_memory::ReadCredit,
 }

@@ -74,6 +74,7 @@ fn untouched_vector_schema_renders_and_syncs_with_the_previous_bytes() {
 
     let declaration = db
         .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes")
         .ddl
         .into_iter()
         .find_map(|change| match change {
@@ -146,7 +147,8 @@ async fn older_receiver_keeps_ordinary_tables_flowing_then_resumes_the_held_tabl
             TenantId::from(TENANT),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -165,7 +167,8 @@ async fn older_receiver_keeps_ordinary_tables_flowing_then_resumes_the_held_tabl
         broker.client_as(&receiver_node_id),
         TenantId::from(TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     server.set_peer_vector_schema_support_for_test(&receiver_node_id, false);
 
     client

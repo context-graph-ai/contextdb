@@ -12,7 +12,9 @@ fn signed_rename(author: &Database) -> (ChangeSet, Vec<WireDdlProvenance>, Strin
     author
         .execute("ALTER TABLE items RENAME COLUMN x TO y", &HashMap::new())
         .unwrap();
-    let changes = author.changes_since(before);
+    let changes = author
+        .changes_since(before)
+        .expect("read or construct the declared fixture result");
     assert_eq!(changes.ddl.len(), 1);
     assert!(matches!(
         &changes.ddl[0],
@@ -21,6 +23,10 @@ fn signed_rename(author: &Database) -> (ChangeSet, Vec<WireDdlProvenance>, Strin
     ));
     let identity = contextdb_engine::identity::FabricIdentity::generate();
     let node_id = identity.node_id();
+    let fixture_operation_reader_1 = author
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let provenance = author
         .outbound_ddl_provenance_for_test(
             &changes,
@@ -28,6 +34,7 @@ fn signed_rename(author: &Database) -> (ChangeSet, Vec<WireDdlProvenance>, Strin
             &node_id,
             INCARNATION,
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            fixture_operation_reader_1.clone(),
         )
         .unwrap();
     (changes, provenance, node_id)
@@ -39,12 +46,20 @@ fn receive(
     provenance: Vec<WireDdlProvenance>,
     node_id: &str,
 ) -> contextdb_core::Result<contextdb_engine::sync_types::ApplyResult> {
+    let fixture_operation_reader_2 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+
     receiver.apply_received_schema_for_test(
         changes,
         provenance,
         TenantId::from(TENANT),
         node_id,
         INCARNATION,
+        &mut fixture_operation_copy_2,
+        fixture_operation_reader_2.clone(),
     )
 }
 
@@ -65,14 +80,23 @@ fn a_signed_rename_cannot_be_satisfied_by_an_independent_final_column_name() {
         )
         .unwrap();
     let (changes, provenance, node_id) = signed_rename(&author);
-    let before = receiver.changes_since(contextdb_core::Lsn(0)).ddl;
+    let before = receiver
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read or construct the declared fixture result")
+        .ddl;
 
     let outcome = receive(&receiver, changes.clone(), provenance.clone(), &node_id);
     assert!(
         matches!(outcome, Err(Error::SchemaInvalid { .. })),
         "a rename with no source column must receive a typed schema refusal: {outcome:?}"
     );
-    assert_eq!(receiver.changes_since(contextdb_core::Lsn(0)).ddl, before);
+    assert_eq!(
+        receiver
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read or construct the declared fixture result")
+            .ddl,
+        before
+    );
     assert_eq!(receiver.table_meta("items").unwrap().columns[1].name, "y");
     let retry = receive(&receiver, changes, provenance, &node_id);
     assert!(matches!(retry, Err(Error::SchemaInvalid { .. })));
@@ -91,7 +115,10 @@ fn the_same_signed_rename_replays_once_by_its_recorded_identity() {
     }
     let (changes, provenance, node_id) = signed_rename(&author);
     let first = receive(&receiver, changes.clone(), provenance.clone(), &node_id).unwrap();
-    let after_first = receiver.changes_since(contextdb_core::Lsn(0)).ddl;
+    let after_first = receiver
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read or construct the declared fixture result")
+        .ddl;
     assert!(after_first.iter().any(|entry| matches!(
         entry,
         DdlChange::AlterTable { constraints, .. }
@@ -101,7 +128,10 @@ fn the_same_signed_rename_replays_once_by_its_recorded_identity() {
     assert_eq!(second.applied_rows, first.applied_rows);
     assert_eq!(second.new_lsn, first.new_lsn);
     assert_eq!(
-        receiver.changes_since(contextdb_core::Lsn(0)).ddl,
+        receiver
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read or construct the declared fixture result")
+            .ddl,
         after_first
     );
     assert_eq!(receiver.table_meta("items").unwrap().columns[1].name, "y");

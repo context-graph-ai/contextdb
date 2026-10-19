@@ -8,7 +8,7 @@ use contextdb_engine::database::{
     ReceivedSchemaApplyObservationForTest, ReceivedSchemaApplyObserverForTest,
 };
 use contextdb_engine::{Database, MaintenancePolicy};
-use redb::{TableDefinition, TableWriteOperationForTest};
+use redb::{TableDefinition, TableWriteForTest, TableWriteOperationForTest};
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -140,14 +140,32 @@ fn receiver(path: &std::path::Path) -> Arc<Database> {
     db
 }
 
+// The resident table (about 30 MB of vectors) is larger than the default
+// reader memory ceiling, and one statement answering all of it is refused by
+// the result-serving contract. Read it in primary-key windows instead; the
+// rows compared are the same.
 fn resident_rows(db: &Database) -> Vec<Vec<Value>> {
-    let rows = db
-        .execute(
-            "SELECT id, embedding FROM resident_vectors ORDER BY id",
-            &empty(),
-        )
-        .expect("resident data remains readable")
-        .rows;
+    const WINDOW: i64 = 500;
+    let mut rows = Vec::with_capacity(10_000);
+    let mut start = 0;
+    loop {
+        let window = db
+            .execute(
+                "SELECT id, embedding FROM resident_vectors \
+                 WHERE id >= $start AND id < $end ORDER BY id",
+                &HashMap::from([
+                    ("start".to_string(), Value::Int64(start)),
+                    ("end".to_string(), Value::Int64(start + WINDOW)),
+                ]),
+            )
+            .expect("resident data remains readable")
+            .rows;
+        if window.is_empty() {
+            break;
+        }
+        rows.extend(window);
+        start += WINDOW;
+    }
     assert_eq!(
         rows.len(),
         10_000,
@@ -246,7 +264,10 @@ async fn identical_schema_replay_does_zero_actual_artifact_work() {
         ("first", &first, &a, first_before),
         ("second", &second, &b, second_before),
     ] {
-        let expected = edge.changes_since(since).ddl;
+        let expected = edge
+            .changes_since(since)
+            .expect("read the declared changes")
+            .ddl;
         assert_eq!(expected.len(), 102);
         let exchange_start = hub.broker.recorded_exchanges().len();
         let pushed = ReceivedSchemaApplyObserverForTest::new();
@@ -317,30 +338,38 @@ async fn schema_replay_is_proportional_to_affected_tables() {
             )
             .unwrap();
     }
-    let entries = source.changes_since(since).ddl.len();
+    let entries = source
+        .changes_since(since)
+        .expect("read the declared changes")
+        .ddl
+        .len();
     assert_eq!(
         entries, 100,
         "one hundred distinct declarations, one per commit"
     );
+    let mut receiver_indexes = physical_index_tables(&receiver, &affected);
     let trace = ReceivedSchemaApplyObserverForTest::new();
     let scope = receiver.observe_received_schema_applies_for_test(&trace);
     let exchange_start = hub.broker.recorded_exchanges().len();
     push_phase(&client, "distinct-replay-push").await;
     drop(scope);
+    receiver_indexes.extend(physical_index_tables(&receiver, &affected));
     let observed = trace.observation().expect("actual received schema apply");
     cost_receipt("different-push", &observed);
     let contact_exchanges = sent_push_request_count_since(&hub, exchange_start);
     assert_eq!(contact_exchanges, entries as u64);
-    assert_affected_only(&observed, &affected, contact_exchanges);
+    assert_affected_only(&observed, &affected, &receiver_indexes, contact_exchanges);
     assert_eq!(observed.staged_rows_copied, 0);
     assert_eq!(observed.staged_vectors_copied, 0);
     assert_table_work_bound(&observed, entries);
+    let mut peer_indexes = physical_index_tables(&peer, &affected);
     let pull_trace = ReceivedSchemaApplyObserverForTest::new();
     let pull_scope = peer.observe_received_schema_applies_for_test(&pull_trace);
     pull_phase(&peer_client, "distinct-replay-peer-pull").await;
     drop(pull_scope);
+    peer_indexes.extend(physical_index_tables(&peer, &affected));
     let pulled = pull_trace.observation().expect("real pull schema apply");
-    assert_affected_only(&pulled, &affected, 0);
+    assert_affected_only(&pulled, &affected, &peer_indexes, 0);
     cost_receipt("different-pull", &pulled);
     assert_table_work_bound(&pulled, entries);
     pull_phase(&client, "distinct-reconcile-pull").await;
@@ -392,16 +421,18 @@ async fn affected_schema_closure_keeps_foreign_keys_propagation_and_triggers() {
     source
         .execute("ALTER TABLE closure_parent ADD COLUMN note TEXT", &empty())
         .expect("author affected parent alteration");
+    let affected = BTreeSet::from(["closure_parent".to_string(), "closure_child".to_string()]);
+    let mut indexes = physical_index_tables(&receiver, &affected);
     let observer = ReceivedSchemaApplyObserverForTest::new();
     let scope = receiver.observe_received_schema_applies_for_test(&observer);
     push_phase(&client, "closure-replay-push").await;
     drop(scope);
+    indexes.extend(physical_index_tables(&receiver, &affected));
     let observed = observer
         .observation()
         .expect("real dependency-closure apply");
-    let affected = BTreeSet::from(["closure_parent".to_string(), "closure_child".to_string()]);
     cost_receipt("dependency-closure", &observed);
-    assert_dependency_complete(&observed, &affected, 1);
+    assert_dependency_complete(&observed, &affected, &indexes, 1);
     assert!(
         receiver
             .list_triggers()
@@ -510,7 +541,10 @@ async fn ordinary_flow(kind: &str) {
             .unwrap();
     }
     phase("ordinary-authored");
-    let expected_ddl = source.changes_since(since).ddl;
+    let expected_ddl = source
+        .changes_since(since)
+        .expect("read the declared changes")
+        .ddl;
     if kind == "status" {
         phase("ordinary-pending-count-begin");
         let count = client.pending_push_change_count();
@@ -592,6 +626,7 @@ fn largest_affected_replay_preserves_existing_rows_vectors_and_trigger() {
         1,
         "one root alteration must include 99 FK dependents"
     );
+    let mut indexes = physical_index_tables(&receiver, &largest::affected_tables());
     let trace = ReceivedSchemaApplyObserverForTest::new();
     let scope = receiver.observe_received_schema_applies_for_test(&trace);
     phase("largest-receiver-apply-begin");
@@ -605,9 +640,13 @@ fn largest_affected_replay_preserves_existing_rows_vectors_and_trigger() {
         .expect("dependency-complete root alteration applies");
     phase("largest-receiver-apply-end");
     drop(scope);
+    indexes.extend(physical_index_tables(
+        &receiver,
+        &largest::affected_tables(),
+    ));
     let observation = trace.observation().expect("actual receiver stage reached");
     cost_receipt("largest", &observation);
-    assert_dependency_complete(&observation, &largest::affected_tables(), 0);
+    assert_dependency_complete(&observation, &largest::affected_tables(), &indexes, 0);
     assert!(
         observation.staged_rows_copied <= 100,
         "unrelated resident rows copied: {observation:?}"
@@ -766,20 +805,159 @@ fn trigger_fixture_initialization_is_a_positive_control() {
 #[test]
 fn affected_set_oracle_rejects_missing_dependents_and_unrelated_tables() {
     let affected = BTreeSet::from(["parent".to_string(), "child".to_string()]);
+    let owned_index = "__rel_index_owned".to_string();
+    let indexes = BTreeSet::from([owned_index.clone()]);
     let mut observation = ReceivedSchemaApplyObservationForTest::default();
     observation.durable_observer_attached = true;
     observation.staged_table_names = affected.clone();
-    assert_dependency_complete(&observation, &affected, 0);
+    assert_dependency_complete(&observation, &affected, &indexes, 0);
     observation.staged_table_names.remove("child");
     assert!(
-        std::panic::catch_unwind(|| assert_dependency_complete(&observation, &affected, 0))
-            .is_err()
+        std::panic::catch_unwind(|| assert_dependency_complete(
+            &observation,
+            &affected,
+            &indexes,
+            0
+        ))
+        .is_err()
     );
     observation.staged_table_names = affected.clone();
     observation.staged_table_names.insert("unrelated".into());
     assert!(
-        std::panic::catch_unwind(|| assert_dependency_complete(&observation, &affected, 0))
-            .is_err()
+        std::panic::catch_unwind(|| assert_dependency_complete(
+            &observation,
+            &affected,
+            &indexes,
+            0
+        ))
+        .is_err()
+    );
+    observation.staged_table_names = affected.clone();
+
+    // A historical root witness is accepted only for a relation or index an
+    // affected table owns, and its directory rewrites are bounded by it.
+    let witness = |key: &str| TableWriteForTest {
+        table: "__history_root_witness_v1".into(),
+        operation: TableWriteOperationForTest::Insert,
+        key: key.as_bytes().to_vec(),
+        value_bytes: 50,
+    };
+    let witness_directory = TableWriteForTest {
+        table: "__redb_user_table_directory".into(),
+        operation: TableWriteOperationForTest::DirectoryInsert,
+        key: b"__history_root_witness_v1".to_vec(),
+        value_bytes: 75,
+    };
+    let mut owned = observation.clone();
+    owned.artifact_writes.insert(witness("rel_parent"), 1);
+    owned.artifact_writes.insert(witness(&owned_index), 1);
+    owned.artifact_writes.insert(witness_directory.clone(), 2);
+    assert_dependency_complete(&owned, &affected, &indexes, 0);
+    for unrelated in 1..=3usize {
+        let mut leaked = owned.clone();
+        for n in 0..unrelated {
+            leaked
+                .artifact_writes
+                .insert(witness(&format!("__rel_index_unrelated_{n}")), 1);
+        }
+        assert!(
+            std::panic::catch_unwind(|| assert_dependency_complete(
+                &leaked, &affected, &indexes, 0
+            ))
+            .is_err(),
+            "{unrelated} unrelated index witness(es) are rejected"
+        );
+    }
+    let mut unrelated_relation = owned.clone();
+    unrelated_relation
+        .artifact_writes
+        .insert(witness("rel_unrelated"), 1);
+    assert!(
+        std::panic::catch_unwind(|| assert_dependency_complete(
+            &unrelated_relation,
+            &affected,
+            &indexes,
+            0
+        ))
+        .is_err()
+    );
+    let mut directory_without_witness = owned.clone();
+    directory_without_witness
+        .artifact_writes
+        .insert(witness_directory, 7);
+    assert!(
+        std::panic::catch_unwind(|| assert_dependency_complete(
+            &directory_without_witness,
+            &affected,
+            &indexes,
+            0
+        ))
+        .is_err(),
+        "witness directory rewrites beyond the witness work are rejected"
+    );
+
+    // A historical index commitment is accepted only for an affected table's
+    // (index, side), and its directory rewrites are bounded by it.
+    let commitment = |table: &str, side: &[u8]| {
+        let mut key = Vec::new();
+        for part in [table.as_bytes(), b"__pk_id".as_slice(), side] {
+            key.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            key.extend_from_slice(part);
+        }
+        TableWriteForTest {
+            table: "__historical_index_commitments".into(),
+            operation: TableWriteOperationForTest::Insert,
+            key,
+            value_bytes: 2048,
+        }
+    };
+    let commitment_directory = TableWriteForTest {
+        table: "__redb_user_table_directory".into(),
+        operation: TableWriteOperationForTest::DirectoryInsert,
+        key: b"__historical_index_commitments".to_vec(),
+        value_bytes: 75,
+    };
+    let mut committed = owned.clone();
+    committed
+        .artifact_writes
+        .insert(commitment("parent", b"P"), 1);
+    committed
+        .artifact_writes
+        .insert(commitment("parent", b"V"), 1);
+    committed
+        .artifact_writes
+        .insert(commitment_directory.clone(), 2);
+    assert_dependency_complete(&committed, &affected, &indexes, 0);
+    for (leak, reason) in [
+        (
+            commitment("unrelated", b"P"),
+            "an unrelated table's commitment",
+        ),
+        (commitment("parent", b"X"), "a malformed commitment side"),
+    ] {
+        let mut leaked = committed.clone();
+        leaked.artifact_writes.insert(leak, 1);
+        assert!(
+            std::panic::catch_unwind(|| assert_dependency_complete(
+                &leaked, &affected, &indexes, 0
+            ))
+            .is_err(),
+            "{reason} is rejected"
+        );
+    }
+    let mut directory_without_commitment = committed.clone();
+    directory_without_commitment
+        .artifact_writes
+        .insert(commitment_directory, 3);
+    assert!(
+        std::panic::catch_unwind(|| assert_dependency_complete(
+            &directory_without_commitment,
+            &affected,
+            &indexes,
+            0
+        ))
+        .is_err(),
+        "commitment directory rewrites beyond the commitment work are rejected"
     );
 }
 

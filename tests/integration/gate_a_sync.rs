@@ -294,7 +294,9 @@ fn a9_01_push_returns_rows_since_watermark() {
     );
 
     // All changes since LSN 0
-    let cs_all = edge.changes_since(Lsn(0));
+    let cs_all = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(
         cs_all.rows.len(),
         5,
@@ -347,7 +349,9 @@ fn a9_01_push_returns_rows_since_watermark() {
     );
 
     // Only second commit's changes
-    let cs_partial = edge.changes_since(lsn_after_commit_1);
+    let cs_partial = edge
+        .changes_since(lsn_after_commit_1)
+        .expect("read the declared changes");
     assert_eq!(
         cs_partial.rows.len(),
         3,
@@ -378,7 +382,9 @@ fn a9_01_push_returns_rows_since_watermark() {
     );
 
     // Nothing new at current LSN
-    let cs_empty = edge.changes_since(edge.current_lsn());
+    let cs_empty = edge
+        .changes_since(edge.current_lsn())
+        .expect("read the declared changes");
     assert!(
         cs_empty.rows.is_empty(),
         "changes_since(current_lsn) must return empty rows"
@@ -447,7 +453,9 @@ fn a9_02_pull_inserts_new_rows() {
     .unwrap();
     edge.commit(tx).unwrap();
 
-    let changeset = edge.changes_since(Lsn(0));
+    let changeset = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let result = server
         .apply_changes(
             changeset,
@@ -542,7 +550,9 @@ fn a9_03_pull_conflict_server_wins() {
         "server must have the row before apply"
     );
 
-    let changeset = edge.changes_since(Lsn(0));
+    let changeset = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let result = server
         .apply_changes(
             changeset,
@@ -638,7 +648,9 @@ fn a9_04_pull_conflict_latest_wins() {
         "fixture acceptance positions must be ordered for scenario 1"
     );
 
-    let changeset = edge1.changes_since(Lsn(0));
+    let changeset = edge1
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let arrivals = changeset
         .rows
         .iter()
@@ -716,7 +728,9 @@ fn a9_04_pull_conflict_latest_wins() {
         "fixture acceptance positions must be ordered for scenario 2"
     );
 
-    let changeset2 = edge2.changes_since(Lsn(0));
+    let changeset2 = edge2
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let arrivals2 = changeset2
         .rows
         .iter()
@@ -800,7 +814,9 @@ fn a9_05_pull_conflict_edge_wins() {
         Some("server-version")
     );
 
-    let changeset = edge.changes_since(Lsn(0));
+    let changeset = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let result = server
         .apply_changes(
             changeset,
@@ -926,7 +942,9 @@ fn a9_06_observations_never_conflict() {
     edge.commit(tx_e).unwrap();
 
     // First push: 3 new observations arrive
-    let cs = edge.changes_since(Lsn(0));
+    let cs = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let result1 = server
         .apply_changes(
             cs.clone(),
@@ -1019,7 +1037,9 @@ fn a9_07_watermark_advances_after_sync() {
     // Guard: server starts empty
     assert_eq!(server.scan("entities", server.snapshot()).unwrap().len(), 0);
 
-    let changeset = edge.changes_since(Lsn(0));
+    let changeset = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let _result = server
         .apply_changes(
             changeset,
@@ -1039,7 +1059,9 @@ fn a9_07_watermark_advances_after_sync() {
     );
 
     // Server can now serve these rows to other pullers
-    let server_cs = server.changes_since(Lsn(0));
+    let server_cs = server
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(
         server_cs.rows.len(),
         2,
@@ -1066,7 +1088,9 @@ fn a9_07_watermark_advances_after_sync() {
     );
 
     // Server's changes_since(current) returns empty
-    let server_cs_empty = server.changes_since(server.current_lsn());
+    let server_cs_empty = server
+        .changes_since(server.current_lsn())
+        .expect("read the declared changes");
     assert!(
         server_cs_empty.rows.is_empty(),
         "server changes_since(current_lsn) must return empty"
@@ -1097,7 +1121,7 @@ fn a9_08_sync_is_deterministic() {
             .unwrap();
         }
         db.commit(tx).unwrap();
-        changesets.push(db.changes_since(Lsn(0)));
+        changesets.push(db.changes_since(Lsn(0)).expect("read the declared changes"));
     }
 
     // Server 1: apply in order 0, 1, 2
@@ -1257,7 +1281,9 @@ fn a9_09_memory_to_memory_sync() {
         0
     );
 
-    let changeset = edge.changes_since(Lsn(0));
+    let changeset = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
 
     // Guard: changeset has all subsystems
     assert!(!changeset.rows.is_empty(), "changeset must contain rows");
@@ -1433,7 +1459,9 @@ fn a9_11_conflict_resolution_respects_state_machine() {
         "guard: edge must have higher LSN for LatestWins to select edge version"
     );
 
-    let changeset = edge.changes_since(Lsn(0));
+    let changeset = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let result = server
         .apply_changes(
             changeset,
@@ -1501,7 +1529,8 @@ fn a9_11a_scalar_only_latest_wins_sync_preserves_unchanged_state() {
     edge.commit(seed_tx).unwrap();
     server
         .apply_changes(
-            edge.changes_since(Lsn(0)),
+            edge.changes_since(Lsn(0))
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
         .unwrap();
@@ -1517,7 +1546,8 @@ fn a9_11a_scalar_only_latest_wins_sync_preserves_unchanged_state() {
 
     let applied = server
         .apply_changes(
-            edge.changes_since(source_watermark),
+            edge.changes_since(source_watermark)
+                .expect("read the declared changes"),
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
         .expect("scalar-only sync with an unchanged state must apply");
@@ -1703,7 +1733,9 @@ fn a9_12_edge_temporal_validity_syncs() {
     );
 
     // Sync the OPEN edge to server — verify BFS finds it (positive assertion)
-    let changeset_open = edge.changes_since(Lsn(0));
+    let changeset_open = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     server
         .apply_changes(
             changeset_open,
@@ -1733,7 +1765,9 @@ fn a9_12_edge_temporal_validity_syncs() {
         .unwrap();
     edge.commit(tx2).unwrap();
 
-    let changeset_closed = edge.changes_since(Lsn(0));
+    let changeset_closed = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     server
         .apply_changes(
             changeset_closed,
@@ -1821,7 +1855,9 @@ fn a9_13_apply_changes_concurrent_with_local_writes() {
         .unwrap();
 
     // While local tx is open, apply edge changes
-    let changeset = edge.changes_since(Lsn(0));
+    let changeset = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let result = server
         .apply_changes(
             changeset,
@@ -1899,7 +1935,8 @@ async fn a9_14_selective_sync_direction_filtering() {
             contextdb_core::TenantId::from("a9_14"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = Arc::clone(&server_task);
     tokio::spawn(async move { server_handle.run().await });
@@ -1909,7 +1946,8 @@ async fn a9_14_selective_sync_direction_filtering() {
         sync.client(),
         contextdb_core::TenantId::from("a9_14"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     let uuid_obs = Uuid::new_v4();
@@ -2090,7 +2128,9 @@ fn a9_15_archive_not_delete_status_transition_sync() {
     let lsn_after_insert = edge.current_lsn();
 
     // Sync initial insert to server
-    let initial_cs = edge.changes_since(Lsn(0));
+    let initial_cs = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     server
         .apply_changes(
             initial_cs,
@@ -2125,7 +2165,9 @@ fn a9_15_archive_not_delete_status_transition_sync() {
     edge.commit(tx2).unwrap();
 
     // Get changeset since the watermark (only the status transition)
-    let delta_cs = edge.changes_since(lsn_after_insert);
+    let delta_cs = edge
+        .changes_since(lsn_after_insert)
+        .expect("read the declared changes");
 
     // CRITICAL ASSERTION: The changeset must contain the row
     assert!(
@@ -2342,7 +2384,8 @@ async fn nt_01_authenticated_push_round_trip() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -2354,7 +2397,8 @@ async fn nt_01_authenticated_push_round_trip() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 3);
 
@@ -2487,7 +2531,8 @@ async fn nt_02_authenticated_pull_round_trip() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -2498,7 +2543,8 @@ async fn nt_02_authenticated_pull_round_trip() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let _result = client.pull_default().await.unwrap();
 
     // Table was created via DDL sync
@@ -2546,7 +2592,8 @@ async fn nt_03_bidirectional_authenticated_sync() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -2557,7 +2604,8 @@ async fn nt_03_bidirectional_authenticated_sync() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     // Edge has A, B
@@ -2697,7 +2745,8 @@ async fn nt_04_chunking_large_vector_payload() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -2708,7 +2757,8 @@ async fn nt_04_chunking_large_vector_payload() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 200);
 
@@ -2766,7 +2816,8 @@ async fn nt_05_reconnection_after_hub_restart() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_handle = server.clone();
@@ -2779,7 +2830,8 @@ async fn nt_05_reconnection_after_hub_restart() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     // Insert first batch
@@ -2850,7 +2902,8 @@ async fn nt_05_reconnection_after_hub_restart() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let restarted_handle = restarted.clone();
     tokio::spawn(async move { restarted_handle.run().await });
@@ -3028,7 +3081,8 @@ async fn nt_06_initial_sync_empty_edge() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -3039,7 +3093,8 @@ async fn nt_06_initial_sync_empty_edge() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let _result = client.pull_default().await.unwrap();
 
     // DDL synced — all 3 tables created
@@ -3165,7 +3220,9 @@ async fn nt_07_offline_accumulate_batch_sync() {
     );
 
     // Guard: changes_since(0) returns all 1000
-    let cs = edge_db.changes_since(Lsn(0));
+    let cs = edge_db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(
         cs.rows.len(),
         1000,
@@ -3180,7 +3237,8 @@ async fn nt_07_offline_accumulate_batch_sync() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -3191,7 +3249,8 @@ async fn nt_07_offline_accumulate_batch_sync() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 1000);
 
@@ -3202,7 +3261,9 @@ async fn nt_07_offline_accumulate_batch_sync() {
     assert_eq!(all.len(), 1000, "server must have all 1000 observations");
 
     // LSN ordering preserved — seq values must be in ascending order
-    let server_cs = server_db.changes_since(Lsn(0));
+    let server_cs = server_db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let seqs: Vec<i64> = server_cs
         .rows
         .iter()
@@ -3270,7 +3331,8 @@ async fn nt_08_ddl_sync_with_state_machine() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -3281,7 +3343,8 @@ async fn nt_08_ddl_sync_with_state_machine() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     // Table exists with state machine
@@ -3382,7 +3445,8 @@ async fn nt_09_cross_edge_embedding_clustering() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -3397,7 +3461,8 @@ async fn nt_09_cross_edge_embedding_clustering() {
             sync.client_for(&edge_identity),
             contextdb_core::TenantId::from("test_tenant"),
             edge_identity,
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         client.pull_default().await.unwrap();
 
         let obs_id = Uuid::new_v4();
@@ -3537,7 +3602,8 @@ async fn nt_10_invalidation_sync_round_trip() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -3548,7 +3614,8 @@ async fn nt_10_invalidation_sync_round_trip() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     let obs_id = Uuid::new_v4();
@@ -3890,7 +3957,11 @@ async fn nt_11_push_large_mixed_payload_chunked() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(edge_db.changes_since(Lsn(0)));
+        let wire = WireChangeSet::from(
+            edge_db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+        );
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -3907,7 +3978,8 @@ async fn nt_11_push_large_mixed_payload_chunked() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -3918,7 +3990,8 @@ async fn nt_11_push_large_mixed_payload_chunked() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let result = client.push().await.unwrap();
 
     assert_eq!(
@@ -4000,7 +4073,11 @@ async fn nt_12_push_single_oversized_text_blob() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(edge_db.changes_since(Lsn(0)));
+        let wire = WireChangeSet::from(
+            edge_db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+        );
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -4017,7 +4094,8 @@ async fn nt_12_push_single_oversized_text_blob() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -4028,7 +4106,8 @@ async fn nt_12_push_single_oversized_text_blob() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let result = client.push().await.unwrap();
 
     assert_eq!(result.applied_rows, 1, "the blob row must reach the server");
@@ -4097,7 +4176,11 @@ async fn nt_13_pull_large_dataset_chunked() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(server_db.changes_since(Lsn(0)));
+        let wire = WireChangeSet::from(
+            server_db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+        );
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -4120,7 +4203,8 @@ async fn nt_13_pull_large_dataset_chunked() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -4131,7 +4215,8 @@ async fn nt_13_pull_large_dataset_chunked() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     assert!(
@@ -4193,7 +4278,8 @@ async fn nt_14_large_bidirectional_vector_sync() {
             contextdb_core::TenantId::from("test_tenant"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
@@ -4204,7 +4290,8 @@ async fn nt_14_large_bidirectional_vector_sync() {
         sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     let tx_e = edge_db.begin_or_panic();
@@ -4294,7 +4381,11 @@ async fn nt_14_large_bidirectional_vector_sync() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(edge_db.changes_since(Lsn(0)));
+        let wire = WireChangeSet::from(
+            edge_db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+        );
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -4550,7 +4641,8 @@ async fn cp07_row_update_propagates_through_sync() {
             contextdb_core::TenantId::from("cp07"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let handle = tokio::spawn({
         let server = server.clone();
@@ -4563,7 +4655,8 @@ async fn cp07_row_update_propagates_through_sync() {
         sync.client(),
         contextdb_core::TenantId::from("cp07"),
         sync.edge_identity(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.push().await.unwrap();
 
     // Verify initial value on server
@@ -4655,7 +4748,8 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
                     fabric.client_as(&edge_identity.node_id()),
                     contextdb_core::TenantId::from("cp08"),
                     edge_identity,
-                );
+                )
+                .expect("construct the authenticated sync endpoint");
                 client.push().await
             }
         })
@@ -4676,7 +4770,8 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
             contextdb_core::TenantId::from("cp08"),
             sync.hub_identity().node_id(),
             sync.hub_identity(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_handle = tokio::spawn({
         let server = server.clone();
@@ -4835,7 +4930,8 @@ async fn exact_authored_refusal_lookup_retries_transient_transport_misses_only()
                 contextdb_core::TenantId::from(tenant),
                 sync.hub_identity().node_id(),
                 sync.hub_identity(),
-            ),
+            )
+            .expect("construct the authenticated sync endpoint"),
         );
         let handle = tokio::spawn({
             let server = server.clone();
@@ -4853,7 +4949,8 @@ async fn exact_authored_refusal_lookup_retries_transient_transport_misses_only()
             transport.clone(),
             contextdb_core::TenantId::from(tenant),
             sync.edge_identity(),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         let result = tokio::time::timeout(Duration::from_secs(30), client.push())
             .await
             .expect("a status exchange completes");
@@ -5019,7 +5116,9 @@ fn integrity_12_sync_delete_removes_vectors() {
         "deleted row must disappear after sync apply"
     );
     assert!(
-        db.live_vector_entry(target_row_id, db.snapshot()).is_none(),
+        db.live_vector_entry(target_row_id, db.snapshot())
+            .expect("read the actual fixture observation")
+            .is_none(),
         "sync delete must also remove the local vector entry"
     );
 }
@@ -5205,11 +5304,15 @@ fn sync_partition_heal_value_txid_lww_deterministic() {
         // single conflicting row under LatestWins.
         let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
         for _round in 0..2 {
-            let a_to_b = edge_a.changes_since(contextdb_core::Lsn(0));
+            let a_to_b = edge_a
+                .changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes");
             edge_b
                 .apply_changes(a_to_b, &policies)
                 .expect("apply edge_a → edge_b must succeed");
-            let b_to_a = edge_b.changes_since(contextdb_core::Lsn(0));
+            let b_to_a = edge_b
+                .changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes");
             edge_a
                 .apply_changes(b_to_a, &policies)
                 .expect("apply edge_b → edge_a must succeed");

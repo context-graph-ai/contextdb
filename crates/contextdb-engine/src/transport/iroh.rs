@@ -16,10 +16,11 @@
 use super::large_request_staging::stage_large_response;
 use super::large_request_staging::{
     CONTROL_SUBJECT as LARGE_REQUEST_CONTROL_SUBJECT,
-    FRAGMENT_BYTES as LARGE_REQUEST_FRAGMENT_BYTES, LargeRequestBegin, LargeRequestControl,
-    LargeRequestControlReply, LargeRequestFragment, LargeRequestProgress, StageOutcome,
-    accept_descriptor_fragment as accept_large_request_fragment,
-    begin_request as begin_large_request, fragment_count as large_request_fragment_count,
+    FRAGMENT_BYTES as LARGE_REQUEST_FRAGMENT_BYTES, LargeRequestAdmission, LargeRequestBegin,
+    LargeRequestControl, LargeRequestControlReply, LargeRequestFragment, LargeRequestProgress,
+    StageOutcome, accept_descriptor_fragment_admitted as accept_large_request_fragment_admitted,
+    begin_request_admitted as begin_large_request_admitted, decode_admission_refusal,
+    encode_admission_refusal, fragment_count as large_request_fragment_count,
     remove_completed_stage as remove_completed_large_request_stage,
 };
 use super::large_request_staging::{
@@ -70,7 +71,7 @@ pub const SYNC_ALPN: &[u8] = b"contextdb.sync.v6";
 /// Ceiling on one framed request or reply. Fitting sync requests keep this
 /// exact one-frame path. A larger opaque request uses the authenticated
 /// durable-fragment path below, while replies remain bounded by this ceiling.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = super::MAX_FRAME_BYTES;
 /// Safe defaults for the server-local pre-admission resource policy.
 const DEFAULT_PRE_ADMISSION_CONNECTIONS: usize = 128;
 const DEFAULT_PRE_ADMISSION_BYTES: usize = MAX_FRAME_BYTES;
@@ -115,6 +116,15 @@ const REPLY_LARGE_RESPONSE: u8 = 3;
 /// An explicit oversized-request progress envelope. Application replies keep
 /// `REPLY_OK` even when their bytes happen to resemble a control message.
 const REPLY_LARGE_REQUEST_PROGRESS: u8 = 4;
+/// A typed refusal or cancellation of a natively routed request: the payload
+/// is a `WireRefusal`, never a success body.
+const REPLY_TYPED_REFUSAL: u8 = 5;
+/// A success body answered by a native route. It classifies this reply as
+/// native; `REPLY_OK` stays the Legacy route's success status.
+const REPLY_NATIVE_OK: u8 = 6;
+/// The receiver refused the request before handling it; the reply carries the
+/// typed refusal and nothing was applied.
+const REPLY_ADMISSION_REFUSED: u8 = 7;
 /// Receipt sent on the request half of the same bidirectional stream only
 /// after the client has read the complete length-delimited reply.
 const REPLY_RECEIVED_ACK: u8 = 0xA5;
@@ -138,6 +148,11 @@ pub enum ProductionSmokeGateKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductionSmokeCheckpoint {
     RoutesReady,
+    /// One delivery request finished on the native route; `ok` is whether it
+    /// answered with outcomes rather than a typed refusal or error.
+    NativeDeliveryServed {
+        ok: bool,
+    },
     PushRequestPath {
         request_digest: [u8; blake3::OUT_LEN],
         chunked: bool,
@@ -192,6 +207,18 @@ fn production_smoke_routes_ready() {
         let _ = gate
             .checkpoints
             .send(ProductionSmokeCheckpoint::RoutesReady);
+    }
+}
+
+#[cfg(feature = "production-smoke-driver")]
+fn production_smoke_native_delivery(ok: bool) {
+    let Some(gate) = PRODUCTION_SMOKE_GATE.get() else {
+        return;
+    };
+    if gate.kind == ProductionSmokeGateKind::ObserveOnly {
+        let _ = gate
+            .checkpoints
+            .send(ProductionSmokeCheckpoint::NativeDeliveryServed { ok });
     }
 }
 
@@ -265,7 +292,81 @@ enum FrameReply {
     Payload(Vec<u8>),
     LargeResponseManifest(Vec<u8>),
     LargeRequestProgress(Vec<u8>),
+    TypedRefusal(Vec<u8>),
 }
+
+/// A reply frame whose bytes were admitted on the requesting reader before
+/// they were allocated.
+enum AdmittedFrameReply {
+    Payload(super::AdmittedWireVec),
+    LargeResponseManifest(super::AdmittedWireVec),
+    TypedRefusal(super::AdmittedWireVec),
+}
+
+/// The largest connection task frame spawned so far (fixed per-connection
+/// residue, ruling E2).
+#[cfg(any(test, feature = "test-seams"))]
+static CONNECTION_TASK_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The measured size of the per-connection task frame.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn connection_task_bytes_for_test() -> usize {
+    CONNECTION_TASK_BYTES.load(Ordering::SeqCst)
+}
+
+/// The declared bound of the fixed per-connection residue (ruling E2): the
+/// connection task frame, which holds the inline subject and terminal buffers.
+/// A test asserts the measured frame stays within it.
+#[cfg(test)]
+pub(crate) const MAX_CONNECTION_TASK_BYTES: usize = 64 * 1024;
+
+/// How the admitted client classified one reply, by its own status byte.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientReplyClass {
+    Native,
+    Legacy,
+    LegacyOversized,
+}
+
+#[cfg(test)]
+pub(crate) static CLIENT_REPLY_CLASSES: Mutex<Vec<ClientReplyClass>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn client_reply_class_probe(class: ClientReplyClass) {
+    CLIENT_REPLY_CLASSES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(class);
+}
+
+/// The outcome of each native terminal write, in order (true: acknowledged).
+#[cfg(test)]
+pub(crate) static TERMINAL_WRITES: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+/// Abort handles of the hub connection tasks accepted since the last abort.
+#[cfg(test)]
+static CONNECTION_TASKS: Mutex<Vec<tokio::task::AbortHandle>> = Mutex::new(Vec::new());
+
+/// Abort every hub connection task accepted since the last call, as a crash
+/// of the hub's serving task would; the endpoint stays up. Returns how many.
+#[cfg(test)]
+pub(crate) fn abort_connection_tasks_for_test() -> usize {
+    let handles = std::mem::take(
+        &mut *CONNECTION_TASKS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()),
+    );
+    for handle in &handles {
+        handle.abort();
+    }
+    handles.len()
+}
+
+/// A typed refusal names a kind and its details; nothing larger is one.
+const MAX_TYPED_REFUSAL_BYTES: usize = 16 * 1024;
 
 enum LargeResponseControlReply {
     Chunk(LargeResponseChunk),
@@ -636,6 +737,11 @@ struct SyncRouteLifecycle {
 #[derive(Default)]
 struct SyncRouteState {
     lifecycle: Mutex<SyncRouteLifecycle>,
+    /// Native routes served beside the Legacy route map, for one serve call.
+    /// The one native root served beside the Legacy route map, tagged with
+    /// the generation of the serve call that installed it.
+    native: Mutex<Option<(u64, super::ReadBoundStreamInstallation)>>,
+    native_generation: std::sync::atomic::AtomicU64,
     idle: Notify,
     reply_owners_cancelled: AtomicBool,
     reply_owner_cancelled: Notify,
@@ -646,6 +752,48 @@ struct SyncRouteState {
 }
 
 impl SyncRouteState {
+    /// Install `installation` as the native root and return its generation.
+    /// A root that is already live is never replaced; the newcomer is refused
+    /// and its installation is returned to the caller to drop.
+    fn install_native(
+        &self,
+        installation: super::ReadBoundStreamInstallation,
+    ) -> Result<u64, super::ReadBoundStreamInstallation> {
+        let mut native = self.native.lock().unwrap_or_else(|err| err.into_inner());
+        if native.is_some() {
+            return Err(installation);
+        }
+        let generation = self.native_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *native = Some((generation, installation));
+        Ok(generation)
+    }
+
+    /// Retire the native root only if it is still `generation`'s; the root's
+    /// charges are freed outside the lock.
+    fn clear_native(&self, generation: u64) {
+        let installation = {
+            let mut native = self.native.lock().unwrap_or_else(|err| err.into_inner());
+            match native.as_ref() {
+                Some((current, _)) if *current == generation => native.take(),
+                _ => None,
+            }
+        };
+        drop(installation);
+    }
+
+    /// The installed native root, when it routes `subject`.
+    fn native_route(
+        &self,
+        subject: &str,
+    ) -> Option<contextdb_core::read_memory::ReadShared<super::native_wire::NativeWireRoutes>> {
+        let native = self.native.lock().unwrap_or_else(|err| err.into_inner());
+        native
+            .as_ref()
+            .and_then(|(_, installation)| installation.native_routes())
+            .filter(|routes| routes.find(subject).is_some())
+            .cloned()
+    }
+
     fn begin_serving(&self, routes: Arc<HashMap<String, super::RequestHandler>>) {
         let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|err| err.into_inner());
         self.reply_owners_cancelled.store(false, Ordering::SeqCst);
@@ -1023,6 +1171,9 @@ struct DurableLargeRequestStage {
     root: PathBuf,
     lock: Arc<tokio::sync::Mutex<()>>,
     response_staging_budget: Option<u64>,
+    /// Funds assembling a complete oversized request, once the serving side
+    /// installs it.
+    admission: Arc<Mutex<Option<Arc<dyn LargeRequestAdmission>>>>,
     #[cfg(feature = "test-seams")]
     control: Arc<LargeRequestTestControlState>,
 }
@@ -2399,7 +2550,9 @@ impl IrohServer {
             })
             .await
             .map_err(|err| {
-                TransportError::Other(format!("response staging cleanup task failed: {err}"))
+                TransportError::Other(
+                    (format!("response staging cleanup task failed: {err}")).into(),
+                )
             })
             .and_then(|result| result);
             if let Err(err) = cleanup {
@@ -2426,6 +2579,7 @@ impl IrohServer {
                 root: stage_root,
                 lock: Arc::new(tokio::sync::Mutex::new(())),
                 response_staging_budget: policy.response_staging_bytes,
+                admission: Arc::new(Mutex::new(None)),
                 #[cfg(feature = "test-seams")]
                 control: Arc::new(LargeRequestTestControlState::default()),
             },
@@ -2480,6 +2634,22 @@ impl IrohServer {
             stage: self.large_request_stage.clone(),
             sync_routes: self.sync_routes.clone(),
         }
+    }
+
+    pub(crate) fn lineage_identity(&self) -> Arc<FabricIdentity> {
+        self.identity.clone()
+    }
+
+    /// Fund assembling every complete oversized request this endpoint serves.
+    pub(crate) fn install_large_request_admission(
+        &self,
+        admission: Arc<dyn LargeRequestAdmission>,
+    ) {
+        *self
+            .large_request_stage
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(admission);
     }
 
     pub(crate) fn lineage_signer(&self) -> LineageSigner {
@@ -2585,7 +2755,11 @@ impl IrohServer {
                         let sync_routes = sync_routes.clone();
                         let large_request_stage = large_request_stage.clone();
                         let pre_admission = pre_admission.clone();
-                        connection_tasks.spawn(async move {
+                        let connection_task = async move {
+                            // Declared first, dropped last: one release event
+                            // after everything the connection held is gone.
+                            #[cfg(test)]
+                            let _released = super::release_events::SignalOnDrop;
                             let _connection_permit = connection_permit;
                             let Ok(connection) = incoming.await else {
                                 return;
@@ -2636,7 +2810,19 @@ impl IrohServer {
                             // replies written by the handler are never cut off by an
                             // early local drop.
                             let _ = keepalive.closed().await;
-                        });
+                        };
+                        // The fixed per-connection residue (owner ruling E2): this
+                        // frame, which the runtime boxes once per accepted
+                        // connection, measured for its asserted bound.
+                        #[cfg(any(test, feature = "test-seams"))]
+                        CONNECTION_TASK_BYTES
+                            .fetch_max(std::mem::size_of_val(&connection_task), Ordering::SeqCst);
+                        let _connection_task = connection_tasks.spawn(connection_task);
+                        #[cfg(test)]
+                        CONNECTION_TASKS
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .push(_connection_task);
                     }
                     completed = connection_tasks.join_next(),
                         if !connection_tasks.is_empty() =>
@@ -2752,6 +2938,9 @@ pub async fn peer_request(
             )),
             FrameReply::LargeRequestProgress(_) => Err(TransportError::IncompleteReply(
                 "peer protocol received an unexpected oversized request progress reply".to_string(),
+            )),
+            FrameReply::TypedRefusal(_) => Err(TransportError::IncompleteReply(
+                "peer protocol received an unexpected typed refusal".to_string(),
             )),
         }
     })
@@ -3113,9 +3302,9 @@ impl IrohClientTransport {
         let transfer_digest = manifest.transfer_digest()?;
         let mut assembled = Vec::new();
         assembled.try_reserve_exact(total).map_err(|err| {
-            TransportError::Other(format!(
-                "cannot reserve {total} bytes for oversized response: {err}"
-            ))
+            TransportError::Other(
+                (format!("cannot reserve {total} bytes for oversized response: {err}")).into(),
+            )
         })?;
         for sequence in 0..manifest.total_chunks {
             let chunk_offset = usize::try_from(sequence)
@@ -3139,9 +3328,9 @@ impl IrohClientTransport {
                 sequence,
             })
             .map_err(|err| {
-                TransportError::Other(format!(
-                    "cannot encode oversized response chunk request: {err}"
-                ))
+                TransportError::Other(
+                    (format!("cannot encode oversized response chunk request: {err}")).into(),
+                )
             })?;
             let mut last_error = None;
             for attempt in 0..2 {
@@ -3206,6 +3395,11 @@ impl IrohClientTransport {
                                 .to_string(),
                         ))
                     }
+                    Ok(Ok(FrameReply::TypedRefusal(_))) => {
+                        last_error = Some(TransportError::IncompleteReply(
+                            "oversized response chunk used a typed refusal reply".to_string(),
+                        ))
+                    }
                     Ok(Err(err)) => last_error = Some(err),
                     Err(_) => last_error = Some(TransportError::Timeout),
                 }
@@ -3229,9 +3423,9 @@ impl IrohClientTransport {
             manifest: manifest.clone(),
         })
         .map_err(|err| {
-            TransportError::Other(format!(
-                "cannot encode oversized response completion: {err}"
-            ))
+            TransportError::Other(
+                (format!("cannot encode oversized response completion: {err}")).into(),
+            )
         })?;
         let mut last_error = None;
         for _ in 0..2 {
@@ -3260,9 +3454,9 @@ impl IrohClientTransport {
                         manifest: manifest.clone(),
                     })
                     .map_err(|err| {
-                        TransportError::Other(format!(
-                            "cannot encode oversized response release: {err}"
-                        ))
+                        TransportError::Other(
+                            (format!("cannot encode oversized response release: {err}")).into(),
+                        )
                     })?;
                     if let Ok(connection) = self.connected_state().await {
                         let _ = tokio::time::timeout(
@@ -3279,7 +3473,8 @@ impl IrohClientTransport {
                 }
                 Ok(Ok(FrameReply::Payload(_)))
                 | Ok(Ok(FrameReply::LargeResponseManifest(_)))
-                | Ok(Ok(FrameReply::LargeRequestProgress(_))) => {
+                | Ok(Ok(FrameReply::LargeRequestProgress(_)))
+                | Ok(Ok(FrameReply::TypedRefusal(_))) => {
                     last_error = Some(TransportError::IncompleteReply(
                         "oversized response completion acknowledgement is invalid".to_string(),
                     ))
@@ -3316,6 +3511,12 @@ impl IrohClientTransport {
             }
             FrameReply::LargeRequestProgress(_) => Err(TransportError::IncompleteReply(
                 "ordinary request received an oversized request progress reply".to_string(),
+            )),
+            // A Legacy caller has no typed channel; it keeps the status text.
+            FrameReply::TypedRefusal(bytes) => Err(TransportError::Status(
+                super::WireRefusal::decode(&bytes)
+                    .map(|refusal| refusal.into_error().to_string())
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
             )),
         }
     }
@@ -3400,25 +3601,167 @@ impl ClientTransport for IrohClientTransport {
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            match self.request_once(subject, &request_bytes, timeout).await {
-                Ok(reply) => {
-                    self.finish_reply(subject, &request_bytes, reply, timeout)
-                        .await
-                }
-                Err(TransportError::NoResponder) => Err(TransportError::NoResponder),
-                Err(TransportError::Status(detail)) => Err(TransportError::Status(detail)),
-                Err(TransportError::IndeterminateComplete(detail)) => {
-                    Err(TransportError::IndeterminateComplete(detail))
-                }
-                Err(_first) => {
-                    // One redial covers the hub-restart case; a second
-                    // failure is the real answer.
-                    let reply = self.request_once(subject, &request_bytes, timeout).await?;
-                    self.finish_reply(subject, &request_bytes, reply, timeout)
-                        .await
-                }
-            }
+            self.request_borrowed(subject, &request_bytes, timeout)
+                .await
         })
+    }
+
+    /// An admitted contiguous body is written from its own allocation: no
+    /// materialized copy. Every reply frame is admitted on the body's reader
+    /// from its length header before a byte of it is allocated, so a reader
+    /// too small for the reply refuses before reading it. A body above the
+    /// frame ceiling keeps the Legacy branch.
+    fn request_stream_admitted<'a>(
+        &'a self,
+        subject: &'a str,
+        body: super::BoundedWireBody,
+        timeout: Duration,
+    ) -> super::WireResult<super::DispatchedWireFuture<'a, super::BoundedWireReply>> {
+        if body
+            .native_contiguous_bytes()
+            .is_none_or(|bytes| bytes.len() > MAX_FRAME_BYTES)
+        {
+            return Ok(super::DispatchedWireFuture::legacy(
+                self.request_stream(subject, body, timeout),
+            ));
+        }
+        let owner = body.owner();
+        super::admit_wire_future(owner.clone(), async move {
+            let bytes = body
+                .native_contiguous_bytes()
+                .ok_or(TransportError::NoResponder)?;
+            let reply = match self
+                .request_once_admitted(subject, bytes, timeout, &owner)
+                .await
+            {
+                Ok(reply) => reply,
+                // The same retry policy as `request`: only a lost connection
+                // redials, once; a refusal, a status or a completed answer is
+                // final.
+                Err(first) if !redials(&first) => return Err(first),
+                Err(_first) => {
+                    self.request_once_admitted(subject, bytes, timeout, &owner)
+                        .await?
+                }
+            };
+            let reply = match reply {
+                AdmittedFrameReply::Payload(reply) => reply,
+                // A manifest only ever answers a Legacy route (a native
+                // route's replies are single-frame); it keeps today's eager
+                // assembly, classified Legacy.
+                AdmittedFrameReply::LargeResponseManifest(manifest) => {
+                    #[cfg(test)]
+                    client_reply_class_probe(ClientReplyClass::LegacyOversized);
+                    self.collect_large_response_admitted(subject, bytes, &manifest, timeout, &owner)
+                        .await?
+                }
+                // A typed refusal is the hub's answer, never retried.
+                AdmittedFrameReply::TypedRefusal(refusal) => {
+                    // Copy the bounded refusal into this admitted future's own
+                    // inline storage and release the paid frame first, so the
+                    // decoded strings never coexist with it.
+                    let mut inline = [0u8; MAX_TYPED_REFUSAL_BYTES];
+                    let length = refusal.bytes.len().min(inline.len());
+                    inline[..length].copy_from_slice(&refusal.bytes[..length]);
+                    drop(refusal);
+                    let Some(refusal) = super::WireRefusal::decode(&inline[..length]) else {
+                        return Err(invalid_reply());
+                    };
+                    return Err(super::WireError::Resource(refusal.into_error()));
+                }
+            };
+            drop(body);
+            Ok(super::BoundedWireReply::legacy(
+                super::BoundedWireBody::from_native_reply(reply),
+            ))
+        })
+        .map(super::DispatchedWireFuture::native)
+    }
+}
+
+impl IrohClientTransport {
+    /// One admitted exchange; a failed transport drops the connection so the
+    /// next request redials, while a reader refusal keeps it.
+    async fn request_once_admitted(
+        &self,
+        subject: &str,
+        request_bytes: &[u8],
+        timeout: Duration,
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> super::WireResult<AdmittedFrameReply> {
+        let connection = self.connected_state().await?;
+        let result = tokio::time::timeout(
+            timeout,
+            exchange_frame_admitted(&connection, subject, request_bytes, owner),
+        )
+        .await
+        .map_err(|_| super::WireError::Transport(TransportError::Timeout))
+        .and_then(|result| result);
+        if result.as_ref().err().is_some_and(redials) {
+            self.drop_state().await;
+        }
+        result
+    }
+
+    /// Reassemble an oversized reply only after its declared length is
+    /// admitted on `owner`; the assembled bytes adopt that exact invoice.
+    async fn collect_large_response_admitted(
+        &self,
+        subject: &str,
+        request_bytes: &[u8],
+        manifest: &super::AdmittedWireVec,
+        timeout: Duration,
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> super::WireResult<super::AdmittedWireVec> {
+        let manifest = LargeResponseManifest::decode(&manifest.bytes).ok_or_else(|| {
+            TransportError::IncompleteReply("oversized response manifest is invalid".to_string())
+        })?;
+        let total = usize::try_from(manifest.total_bytes).map_err(|_| {
+            TransportError::IncompleteReply(
+                "oversized response length cannot be represented".to_string(),
+            )
+        })?;
+        let credit = contextdb_core::read_memory::ReadCredit::try_new_owned(
+            owner.clone(),
+            total,
+            "sync_transport",
+            "materialize_reply",
+            "Raise the declared reader memory limit to receive this reply.",
+        )?;
+        let mut assembled = self
+            .collect_large_response(subject, request_bytes, manifest, timeout)
+            .await?;
+        assembled.shrink_to_fit();
+        super::AdmittedWireVec::from_prepaid(assembled, credit, owner.clone())
+    }
+}
+
+impl IrohClientTransport {
+    async fn request_borrowed(
+        &self,
+        subject: &str,
+        request_bytes: &[u8],
+        timeout: Duration,
+    ) -> TransportResult<Vec<u8>> {
+        match self.request_once(subject, request_bytes, timeout).await {
+            Ok(reply) => {
+                self.finish_reply(subject, request_bytes, reply, timeout)
+                    .await
+            }
+            Err(TransportError::NoResponder) => Err(TransportError::NoResponder),
+            Err(TransportError::Status(detail)) => Err(TransportError::Status(detail)),
+            Err(TransportError::IndeterminateComplete(detail)) => {
+                Err(TransportError::IndeterminateComplete(detail))
+            }
+            Err(TransportError::Refused(error)) => Err(TransportError::Refused(error)),
+            Err(_first) => {
+                // One redial covers the hub-restart case; a second
+                // failure is the real answer.
+                let reply = self.request_once(subject, request_bytes, timeout).await?;
+                self.finish_reply(subject, request_bytes, reply, timeout)
+                    .await
+            }
+        }
     }
 }
 
@@ -3436,6 +3779,32 @@ impl LazyBoundServerTransport {
 }
 
 impl ServerTransport for LazyBoundServerTransport {
+    fn serve_native_installation<'a>(
+        &'a self,
+        legacy: Vec<HandlerRegistration>,
+        bound: super::ReadBoundStreamInstallation,
+        stop: super::NativeStop,
+    ) -> super::WireResult<super::DispatchedWireFuture<'a, ()>> {
+        if bound.native_routes().is_none() {
+            return self.serve_read_bound_installation(legacy, bound, stop.flag());
+        }
+        Ok(super::DispatchedWireFuture::legacy(Box::pin(async move {
+            let server = self.bind_server().await?;
+            tracing::info!(
+                ticket = %server.ticket(),
+                node_id = %server.node_id(),
+                "sync endpoint bound; enroll edges with this ticket"
+            );
+            let transport = server.transport();
+            let result = match transport.serve_native_installation(legacy, bound, stop) {
+                Ok(serving) => serving.await,
+                Err(error) => Err(error),
+            };
+            server.close().await;
+            result
+        })))
+    }
+
     fn serve<'a>(
         &'a self,
         handlers: Vec<HandlerRegistration>,
@@ -3473,7 +3842,51 @@ struct IrohServerTransport {
     control: Arc<LargeRequestTestControlState>,
 }
 
+/// Retires one serve call's native root when that call ends by any path.
+struct NativeRootGuard<'a> {
+    routes: &'a SyncRoutes,
+    generation: u64,
+}
+impl Drop for NativeRootGuard<'_> {
+    fn drop(&mut self) {
+        self.routes.clear_native(self.generation);
+    }
+}
+
 impl ServerTransport for IrohServerTransport {
+    /// Native routes are served beside the Legacy route map on the same
+    /// accept loop and drain; stop is observed through its shared flag.
+    fn serve_native_installation<'a>(
+        &'a self,
+        legacy: Vec<HandlerRegistration>,
+        bound: super::ReadBoundStreamInstallation,
+        stop: super::NativeStop,
+    ) -> super::WireResult<super::DispatchedWireFuture<'a, ()>> {
+        let Some(routes) = bound.native_routes() else {
+            return self.serve_read_bound_installation(legacy, bound, stop.flag());
+        };
+        if !stop.is_funded_by(&routes.installation_owner()) {
+            return Err(TransportError::NoResponder.into());
+        }
+        let shutdown = stop.flag();
+        // Nothing is installed until the first poll. A future dropped unpolled
+        // drops `bound` with it; once installed, the guard retires exactly this
+        // generation on completion, error, cancellation or unwinding.
+        Ok(super::DispatchedWireFuture::legacy(Box::pin(async move {
+            let generation = self
+                .sync_routes
+                .install_native(bound)
+                .map_err(|_| TransportError::NoResponder)?;
+            let _root = NativeRootGuard {
+                routes: &self.sync_routes,
+                generation,
+            };
+            let result = self.serve(legacy, shutdown).await;
+            drop(stop);
+            result.map_err(super::WireError::Transport)
+        })))
+    }
+
     fn serve<'a>(
         &'a self,
         handlers: Vec<HandlerRegistration>,
@@ -3483,10 +3896,9 @@ impl ServerTransport for IrohServerTransport {
             let endpoint = {
                 let mut lease = self.endpoint.lock().await;
                 let endpoint = lease.take().ok_or_else(|| {
-                    TransportError::Other(
+                    TransportError::Other((
                         "a bound sync endpoint may be served only once; bind a new endpoint before restarting"
-                            .to_string(),
-                    )
+                            .to_string()).into())
                 })?;
                 self.serve_lifecycle.begin(endpoint)
             };
@@ -3597,6 +4009,9 @@ async fn serve_sync_connection(
     // of this connection — the hub attributes every exchange on it (push /
     // pull / status) to this node when recording last-contact.
     let remote_node_id = hex_node_id(&connection.remote_id());
+    // Shared by every reply writer on this connection, so a request clones a
+    // reference instead of the stage's root path.
+    let large_request_stage = Arc::new(large_request_stage);
     // A fragment is meaningful only after this authenticated connection has
     // presented its bounded descriptor. Durable resume lookup never consults
     // this cache: `BeginV1` reconstructs it from the stage manifest after a
@@ -3606,8 +4021,8 @@ async fn serve_sync_connection(
         let Ok((mut send, mut recv)) = connection.accept_bi().await else {
             return;
         };
-        let Ok((subject, payload, payload_permit)) =
-            read_request_frame(&mut recv, &pre_admission).await
+        let Ok((subject, payload, payload_permit, native_admission)) =
+            read_request_frame_routed(&mut recv, &pre_admission, &sync_routes).await
         else {
             return;
         };
@@ -3642,7 +4057,6 @@ async fn serve_sync_connection(
             }
         };
         drop(payload_permit);
-        let request_lease = Arc::new(request_lease);
         if subject == LARGE_RESPONSE_CONTROL_SUBJECT {
             let control: LargeResponseControl = match predecoded_response_control {
                 Some(control) => control,
@@ -3737,9 +4151,9 @@ async fn serve_sync_connection(
                         })
                         .await
                         .map_err(|err| {
-                            TransportError::Other(format!(
-                                "oversized response chunk task failed: {err}"
-                            ))
+                            TransportError::Other(
+                                (format!("oversized response chunk task failed: {err}")).into(),
+                            )
                         })
                         .and_then(|result| result)
                         .and_then(|chunk| {
@@ -3750,7 +4164,9 @@ async fn serve_sync_connection(
                                 Ok(LargeResponseControlReply::Chunk(chunk))
                             } else {
                                 Err(TransportError::Other(
-                                    "too many unfinished oversized response transfers".to_string(),
+                                    ("too many unfinished oversized response transfers"
+                                        .to_string())
+                                    .into(),
                                 ))
                             }
                         })
@@ -3764,20 +4180,21 @@ async fn serve_sync_connection(
                         let validation_root = stage_root.clone();
                         let validation_node = authenticated_node_id.clone();
                         let validation_manifest = manifest.clone();
-                        let validation = tokio::task::spawn_blocking(move || {
-                            validate_large_response_completion(
-                                &validation_root,
-                                &validation_node,
-                                &validation_manifest,
-                            )
-                        })
-                        .await
-                        .map_err(|err| {
-                            TransportError::Other(format!(
+                        let validation =
+                            tokio::task::spawn_blocking(move || {
+                                validate_large_response_completion(
+                                    &validation_root,
+                                    &validation_node,
+                                    &validation_manifest,
+                                )
+                            })
+                            .await
+                            .map_err(|err| {
+                                TransportError::Other((format!(
                                 "oversized response completion validation task failed: {err}"
-                            ))
-                        })
-                        .and_then(|result| result);
+                            )).into())
+                            })
+                            .and_then(|result| result);
                         match validation {
                             Err(err) => Err(err),
                             Ok(())
@@ -3787,7 +4204,9 @@ async fn serve_sync_connection(
                                 ) =>
                             {
                                 Err(TransportError::Other(
-                                    "too many unfinished oversized response transfers".to_string(),
+                                    ("too many unfinished oversized response transfers"
+                                        .to_string())
+                                    .into(),
                                 ))
                             }
                             Ok(()) => tokio::task::spawn_blocking(move || {
@@ -3799,9 +4218,10 @@ async fn serve_sync_connection(
                             })
                             .await
                             .map_err(|err| {
-                                TransportError::Other(format!(
-                                    "oversized response completion task failed: {err}"
-                                ))
+                                TransportError::Other(
+                                    (format!("oversized response completion task failed: {err}"))
+                                        .into(),
+                                )
                             })
                             .and_then(|result| result)
                             .and_then(|()| {
@@ -3834,9 +4254,9 @@ async fn serve_sync_connection(
                         })
                         .await
                         .map_err(|err| {
-                            TransportError::Other(format!(
-                                "oversized response release task failed: {err}"
-                            ))
+                            TransportError::Other(
+                                (format!("oversized response release task failed: {err}")).into(),
+                            )
                         })
                         .and_then(|result| result)
                         .map(|()| {
@@ -3854,15 +4274,16 @@ async fn serve_sync_connection(
                 Ok(LargeResponseControlReply::Chunk(chunk)) => {
                     match rmp_serde::to_vec_named(&chunk)
                         .map_err(|err| {
-                            TransportError::Other(format!(
-                                "cannot encode oversized response chunk: {err}"
-                            ))
+                            TransportError::Other(
+                                (format!("cannot encode oversized response chunk: {err}")).into(),
+                            )
                         })
                         .and_then(|bytes| {
                             if bytes.len() > MAX_RESPONSE_CHUNK_ENVELOPE_BYTES {
                                 Err(TransportError::Other(
-                                    "oversized response chunk envelope exceeds its ceiling"
-                                        .to_string(),
+                                    ("oversized response chunk envelope exceeds its ceiling"
+                                        .to_string())
+                                    .into(),
                                 ))
                             } else {
                                 Ok(bytes)
@@ -3938,7 +4359,9 @@ async fn serve_sync_connection(
             continue;
         }
         let routes = routes.expect("only an authenticated response continuation omits sync routes");
-        let (subject, payload, completed_stage) = if subject == LARGE_REQUEST_CONTROL_SUBJECT {
+        let (subject, payload, completed_stage, assembly_credit) = if subject
+            == LARGE_REQUEST_CONTROL_SUBJECT
+        {
             let control =
                 match tokio::task::spawn_blocking(move || LargeRequestControl::decode(&payload))
                     .await
@@ -4000,23 +4423,32 @@ async fn serve_sync_connection(
                 let authenticated_node_id = remote_node_id.clone();
                 let begin_for_stage = begin.clone();
                 let fragment_for_stage = fragment.clone();
+                let admission = large_request_stage
+                    .admission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
                 match tokio::task::spawn_blocking(move || match fragment_for_stage {
-                    Some(fragment) => accept_large_request_fragment(
+                    Some(fragment) => accept_large_request_fragment_admitted(
                         &stage_root,
                         &authenticated_node_id,
                         &begin_for_stage,
                         &fragment,
+                        admission.as_deref(),
                     ),
-                    None => {
-                        begin_large_request(&stage_root, &authenticated_node_id, &begin_for_stage)
-                    }
+                    None => begin_large_request_admitted(
+                        &stage_root,
+                        &authenticated_node_id,
+                        &begin_for_stage,
+                        admission.as_deref(),
+                    ),
                 })
                 .await
                 {
                     Ok(outcome) => outcome,
-                    Err(err) => Err(TransportError::Other(format!(
-                        "oversized request staging task failed: {err}"
-                    ))),
+                    Err(err) => Err(TransportError::Other(
+                        (format!("oversized request staging task failed: {err}")).into(),
+                    )),
                 }
             };
             #[cfg(feature = "test-seams")]
@@ -4085,9 +4517,18 @@ async fn serve_sync_connection(
                     subject,
                     payload,
                     completed_path,
+                    credit,
                 }) => {
                     request_descriptors.remove(&begin.transfer_digest);
-                    (subject, payload, Some(completed_path))
+                    (subject, payload, Some(completed_path), credit)
+                }
+                Err(TransportError::Refused(error)) => {
+                    // Nothing was handled and the stage is kept: the sender
+                    // learns the typed reason and may retry the same request.
+                    let refusal = encode_admission_refusal(&error);
+                    let _ =
+                        write_reply(&mut send, &mut recv, REPLY_ADMISSION_REFUSED, &refusal).await;
+                    continue;
                 }
                 Err(err) => {
                     let detail = err.to_string();
@@ -4098,26 +4539,66 @@ async fn serve_sync_connection(
                 }
             }
         } else {
-            (subject, payload, None)
+            (subject, payload, None, None)
         };
-        let request_digest = *blake3::hash(&payload).as_bytes();
+        let request_digest = match &native_admission {
+            Some(NativeAdmission::Native { body, .. }) => {
+                *blake3::hash(body.native_contiguous_bytes().unwrap_or_default()).as_bytes()
+            }
+            _ => *blake3::hash(&payload).as_bytes(),
+        };
         #[cfg(feature = "production-smoke-driver")]
         production_smoke_push_request_path(&subject, request_digest, completed_stage.is_some());
         #[cfg(feature = "test-seams")]
         large_request_stage.record_authenticated_status_probe_after_reset_for_test(&subject);
         #[cfg(feature = "test-seams")]
         large_request_stage.record_authenticated_pull_request_after_reset_for_test(&subject);
-        let Some(handler) = routes.get(&subject).cloned() else {
+        let handler = routes.get(&subject).cloned();
+        if native_admission.is_none() && handler.is_none() {
             let _ = write_reply(&mut send, &mut recv, REPLY_NO_HANDLER, subject.as_bytes()).await;
             if let Some(path) = completed_stage {
                 remove_stage_after_reply(&large_request_stage, path).await;
             }
             continue;
-        };
+        }
         #[cfg(feature = "test-seams")]
         if completed_stage.is_some() {
             large_request_stage.record_completed_handler_dispatch_for_test();
         }
+        // A request the native root admitted is served with every control it
+        // owns paid by its own operation; a refused one answers its typed
+        // refusal on its own stream.
+        let native_admission = match native_admission {
+            Some(NativeAdmission::Native {
+                routes,
+                operation,
+                body,
+                subject: paid_subject,
+            }) => {
+                serve_paid_native_request(
+                    (send, recv),
+                    request_lease,
+                    &sync_routes,
+                    &large_request_stage,
+                    &remote_node_id,
+                    request_digest,
+                    routes,
+                    operation,
+                    body,
+                    paid_subject,
+                )
+                .await;
+                continue;
+            }
+            Some(NativeAdmission::Refused(error)) => {
+                answer_native_refusal(&mut send, &mut recv, &error).await;
+                #[cfg(test)]
+                super::release_events::signal();
+                continue;
+            }
+            other => other,
+        };
+        let request_lease = Arc::new(request_lease);
         // The responder owns both stream halves; the handler may reply from a
         // spawned task (the push apply path does).
         let send_slot = Arc::new(tokio::sync::Mutex::new(Some((send, recv))));
@@ -4129,239 +4610,59 @@ async fn serve_sync_connection(
         let response_subject = subject.clone();
         let response_request_digest = request_digest;
         let response_node_id = remote_node_id.clone();
-        let responder: Responder = Box::new({
-            let send_slot = send_slot.clone();
-            let large_request_stage = large_request_stage.clone();
-            let completed_stage = completed_stage.clone();
-            let response_subject = response_subject.clone();
-            let response_node_id = response_node_id.clone();
-            let responder_request_lease = request_lease.clone();
-            let responder_sync_routes = sync_routes.clone();
-            move |response_bytes| {
-                let response_subject = response_subject.clone();
-                let response_node_id = response_node_id.clone();
-                Box::pin(async move {
-                    let cancellation = responder_sync_routes.clone();
-                    let reply = async move {
-                        // Keep admission charged until the peer has acknowledged
-                        // the reply. An unused underscore binding may be dropped
-                        // before the later awaits, which lets shutdown close the
-                        // endpoint after commit but before confirmation reaches
-                        // the edge.
-                        let request_lease = responder_request_lease;
-                        let oversized_response = response_bytes.len() > MAX_FRAME_BYTES;
-                        let response_transfer_reservation = if oversized_response {
-                            Some(
-                                responder_sync_routes
-                                    .reserve_response_transfer()
-                                    .ok_or_else(|| {
-                                        TransportError::Other(
-                                            "too many unfinished oversized response transfers"
-                                                .to_string(),
-                                        )
-                                    })?,
-                            )
-                        } else {
-                            None
-                        };
-                        let mut slot = send_slot.lock().await;
-                        let Some((mut send, mut recv)) = slot.take() else {
-                            return Err(TransportError::Other(
-                                "reply already sent on this stream".to_string(),
-                            ));
-                        };
-                        #[cfg(feature = "test-seams")]
-                        large_request_stage.record_authenticated_pull_reply_after_reset_for_test(
-                            &response_subject,
-                            response_bytes.len(),
-                        );
-                        #[cfg(feature = "test-seams")]
-                        if completed_stage.is_some()
-                            && large_request_stage.take_completed_reply_drop_for_test()
-                        {
-                            // Reset the actual reply stream instead of merely
-                            // withholding its bytes. The client observes a
-                            // deterministic transport failure and takes its
-                            // ordinary reconnect/reconciliation path.
-                            large_request_stage.record_injected_reply_reset_for_test();
-                            let _ = send.reset(0u32.into());
-                            if let Some(path) = completed_stage {
-                                remove_stage_after_reply(&large_request_stage, path).await;
-                            }
-                            return Err(TransportError::Unreachable(
-                                "sync endpoint closed before replying".to_string(),
-                            ));
-                        }
-                        let mut registered_response_transfer = None;
-                        let reply = if response_bytes.len() > MAX_FRAME_BYTES {
-                            let _guard = large_request_stage.lock.lock().await;
-                            let stage_root = large_request_stage.root.clone();
-                            let response_staging_budget =
-                                large_request_stage.response_staging_budget;
-                            let protected = responder_sync_routes.protected_response_paths();
-                            let subject = response_subject.clone();
-                            let node_id = response_node_id.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                stage_large_response_with_budget(
-                                    &stage_root,
-                                    &node_id,
-                                    &subject,
-                                    response_request_digest,
-                                    &response_bytes,
-                                    response_staging_budget,
-                                    &protected,
-                                )
-                            })
-                            .await
-                            {
-                                Ok(Ok(manifest)) => {
-                                    let encoded = manifest.encode()?;
-                                    let transfer_key =
-                                        (response_node_id.clone(), manifest.transfer_digest()?);
-                                    response_transfer_reservation
-                                        .expect("oversized response reserved before staging")
-                                        .activate(
-                                            transfer_key.clone(),
-                                            ResponseTransferPaths {
-                                                stage: response_stage_path(
-                                                    &large_request_stage.root,
-                                                    &manifest,
-                                                ),
-                                                completion: response_completion_path(
-                                                    &large_request_stage.root,
-                                                    &manifest,
-                                                ),
-                                            },
-                                        );
-                                    registered_response_transfer =
-                                        Some((transfer_key, manifest.clone()));
-                                    #[cfg(feature = "test-seams")]
-                                    large_request_stage.record_staged_response_for_test(&manifest);
-                                    Ok(encoded)
-                                }
-                                Ok(Err(err)) => Err(err),
-                                Err(err) => Err(TransportError::Other(format!(
-                                    "oversized response staging task failed: {err}"
-                                ))),
-                            }
-                        } else {
-                            Ok(response_bytes)
-                        };
-                        let (result, _receipt_consumed) = match reply {
-                            Ok(reply) if oversized_response => {
-                                let result =
-                                    write_reply(&mut send, &mut recv, REPLY_LARGE_RESPONSE, &reply)
-                                        .await;
-                                #[cfg(feature = "test-seams")]
-                                large_request_stage
-                                    .record_authenticated_pull_reply_trace_after_reset_for_test(
-                                        &response_subject,
-                                        &reply,
-                                        REPLY_LARGE_RESPONSE,
-                                        result.is_ok(),
-                                    );
-                                let consumed = result.is_ok();
-                                (result, consumed)
-                            }
-                            Ok(reply) => {
-                                let result =
-                                    write_reply(&mut send, &mut recv, REPLY_OK, &reply).await;
-                                #[cfg(feature = "test-seams")]
-                                large_request_stage
-                                    .record_authenticated_pull_reply_trace_after_reset_for_test(
-                                        &response_subject,
-                                        &reply,
-                                        REPLY_OK,
-                                        result.is_ok(),
-                                    );
-                                let consumed = result.is_ok();
-                                (result, consumed)
-                            }
-                            Err(err) => {
-                                let detail = err.to_string();
-                                let write_result = write_reply(
-                                    &mut send,
-                                    &mut recv,
-                                    REPLY_HANDLER_ERROR,
-                                    detail.as_bytes(),
-                                )
-                                .await;
-                                #[cfg(feature = "test-seams")]
-                                large_request_stage
-                                    .record_authenticated_pull_reply_trace_after_reset_for_test(
-                                        &response_subject,
-                                        detail.as_bytes(),
-                                        REPLY_HANDLER_ERROR,
-                                        write_result.is_ok(),
-                                    );
-                                let consumed = write_result.is_ok();
-                                (Err(err), consumed)
-                            }
-                        };
-                        #[cfg(feature = "test-seams")]
-                        responder_sync_routes.record_reply_receipt_for_test(_receipt_consumed);
-                        let reply_event = match &result {
-                            Ok(()) => "reply-acknowledged".to_string(),
-                            Err(err) => format!("reply-failed error={err}"),
-                        };
-                        append_test_shutdown_state(&responder_sync_routes, &reply_event);
-                        if result.is_err()
-                            && let Some((key, manifest)) = registered_response_transfer.as_ref()
-                            && responder_sync_routes.complete_response_transfer(key)
-                        {
-                            let _guard = large_request_stage.lock.lock().await;
-                            let stage_root = large_request_stage.root.clone();
-                            let authenticated_node_id = response_node_id.clone();
-                            let manifest = manifest.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                abandon_large_response(
-                                    &stage_root,
-                                    &authenticated_node_id,
-                                    &manifest,
-                                )
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(err)) => tracing::warn!(
-                                    error = %err,
-                                    "undelivered oversized response stage could not be removed"
-                                ),
-                                Err(err) => tracing::warn!(
-                                    error = %err,
-                                    "undelivered oversized response cleanup task failed"
-                                ),
-                            }
-                        }
-                        if let Some(path) = completed_stage {
-                            remove_stage_after_reply(&large_request_stage, path).await;
-                        }
-                        drop(request_lease);
-                        result
-                    };
-                    tokio::select! {
-                        result = reply => result,
-                        _ = cancellation.reply_owner_cancelled() => Err(
-                            TransportError::Unreachable(
-                                "sync endpoint closed before replying".to_string(),
-                            ),
-                        ),
-                    }
-                }) as TransportFuture<'static, ()>
+        // The assembled request's charge lasts until its handler returns.
+        let _assembly_credit = assembly_credit;
+        let writer = SyncReplyWriter {
+            parts: ReplyParts::Legacy {
+                send_slot: send_slot.clone(),
+                response_subject: response_subject.clone(),
+                response_node_id: response_node_id.clone(),
+                _request_lease: request_lease.clone(),
+            },
+            large_request_stage: large_request_stage.clone(),
+            completed_stage: completed_stage.clone(),
+            response_request_digest,
+            responder_sync_routes: sync_routes.clone(),
+        };
+        let dispatched = match (native_admission, handler) {
+            // A natively routed subject never reaches the Legacy route map.
+            (Some(admission), _) => {
+                serve_native_subject(&subject, admission, payload, writer, remote_node_id.clone())
+                    .await
             }
-        });
-        if let Err(err) = handler(IncomingRequest {
-            bytes: payload,
-            responder,
-            node_id: Some(remote_node_id.clone()),
-        })
-        .await
-        {
+            (None, Some(handler)) => {
+                let responder: Responder =
+                    Box::new(move |response_bytes| Box::pin(writer.write(response_bytes)));
+                handler(IncomingRequest {
+                    bytes: payload,
+                    responder,
+                    node_id: Some(remote_node_id.clone()),
+                })
+                .await
+                .map_err(super::WireError::Transport)
+            }
+            (None, None) => unreachable!("an unrouted subject answered REPLY_NO_HANDLER above"),
+        };
+        if let Err(err) = dispatched {
             let detail = err.to_string();
+            // Refusal and cancellation keep their kind and details on the wire.
+            let typed = match &err {
+                super::WireError::Resource(error) => {
+                    super::WireRefusal::from_error(error).and_then(|refusal| refusal.encode())
+                }
+                super::WireError::Transport(_) | super::WireError::Native(_) => None,
+            };
             let mut slot = send_slot.lock().await;
             if let Some((mut send, mut recv)) = slot.take() {
-                let sent =
-                    write_reply(&mut send, &mut recv, REPLY_HANDLER_ERROR, detail.as_bytes()).await;
+                let sent = match &typed {
+                    Some(refusal) => {
+                        write_reply(&mut send, &mut recv, REPLY_TYPED_REFUSAL, refusal).await
+                    }
+                    None => {
+                        write_reply(&mut send, &mut recv, REPLY_HANDLER_ERROR, detail.as_bytes())
+                            .await
+                    }
+                };
                 if sent.is_ok()
                     && let Some(path) = completed_stage
                 {
@@ -4372,6 +4673,733 @@ async fn serve_sync_connection(
         }
         drop(request_lease);
     }
+}
+
+/// What one reply writer owns. A Legacy request shares its stream slot with
+/// the drain registry and holds ordinary copies; a native request holds one
+/// block its own operation paid for before allocating it.
+enum ReplyParts {
+    Legacy {
+        send_slot: Arc<ReplyStreamSlot>,
+        response_subject: String,
+        response_node_id: String,
+        _request_lease: Arc<ActiveSyncRequest>,
+    },
+}
+
+impl ReplyParts {
+    fn slot(&self) -> &ReplyStreamSlot {
+        match self {
+            Self::Legacy { send_slot, .. } => send_slot,
+        }
+    }
+    fn subject(&self) -> &str {
+        match self {
+            Self::Legacy {
+                response_subject, ..
+            } => response_subject,
+        }
+    }
+    fn node_id(&self) -> &str {
+        match self {
+            Self::Legacy {
+                response_node_id, ..
+            } => response_node_id,
+        }
+    }
+}
+
+/// Everything one native request's reply owns, in one block its operation
+/// paid for before allocating it: the stream halves, the admission lease and
+/// the paid copy of the subject. Every holder (the
+/// serve loop, the reply writer, any later clone) keeps the block alive; the
+/// last one frees it, and only then does its invoice settle.
+pub(crate) struct NativeReplyControl {
+    streams: ReplyStreamSlot,
+    _lease: ActiveSyncRequest,
+    subject: super::AdmittedWireVec,
+}
+
+impl NativeReplyControl {
+    fn subject(&self) -> &str {
+        std::str::from_utf8(&self.subject.bytes).unwrap_or_default()
+    }
+}
+
+/// The exact block one native request pays for its reply control.
+#[cfg(test)]
+pub(crate) fn native_reply_control_bytes_for_test() -> usize {
+    contextdb_core::read_memory::ReadShared::<NativeReplyControl>::layout().size()
+}
+
+/// What the serve loop did with one native request's reply control.
+#[cfg(test)]
+pub(crate) enum NativeReplyEvent {
+    BeforeAdmission,
+    /// The subject and the body are admitted on the operation.
+    Admitted {
+        subject: usize,
+        body: usize,
+    },
+    BeforeCharge,
+    /// The control block and the request's paid edge copy are admitted.
+    Charged {
+        control: usize,
+        edge: usize,
+    },
+    /// A further holder of the live control, handed to the probe.
+    Hold(Box<dyn std::any::Any + Send>),
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::type_complexity,
+    reason = "a test probe; the closure type is its whole contract"
+)]
+pub(crate) static NATIVE_REPLY_PROBE: Mutex<Option<Box<dyn FnMut(NativeReplyEvent) + Send>>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+fn native_reply_probe(event: NativeReplyEvent) {
+    if let Some(probe) = NATIVE_REPLY_PROBE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_mut()
+    {
+        probe(event);
+    }
+}
+
+/// Answer a request that ended without a success body: a typed refusal keeps
+/// its kind and details; any other failure keeps its status text.
+async fn answer_native_refusal(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    error: &super::WireError,
+) {
+    #[cfg(test)]
+    super::native_pause::at(super::native_pause::Point::BeforeTerminal).await;
+    // A native terminal is encoded borrowed into this fixed buffer: a typed
+    // refusal keeps its kind and details, anything else answers its static
+    // class. Nothing here allocates.
+    if let super::WireError::Native(terminal) = error {
+        let mut encoded = [0u8; super::TERMINAL_BYTES];
+        let written = match super::encode_terminal(terminal, &mut encoded) {
+            Some(length) => {
+                write_reply_native(send, recv, REPLY_TYPED_REFUSAL, &encoded[..length]).await
+            }
+            None => {
+                write_reply_native(
+                    send,
+                    recv,
+                    REPLY_HANDLER_ERROR,
+                    super::terminal_class_of(terminal).as_bytes(),
+                )
+                .await
+            }
+        };
+        #[cfg(test)]
+        TERMINAL_WRITES
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(written.is_ok());
+        let _ = written;
+        return;
+    }
+    let typed = match error {
+        super::WireError::Resource(error) => {
+            super::WireRefusal::from_error(error).and_then(|refusal| refusal.encode())
+        }
+        super::WireError::Transport(_) | super::WireError::Native(_) => None,
+    };
+    let written = match &typed {
+        Some(refusal) => write_reply(send, recv, REPLY_TYPED_REFUSAL, refusal).await,
+        None => {
+            write_reply(
+                send,
+                recv,
+                REPLY_HANDLER_ERROR,
+                error.to_string().as_bytes(),
+            )
+            .await
+        }
+    };
+    #[cfg(test)]
+    TERMINAL_WRITES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(written.is_ok());
+    let _ = written;
+}
+
+/// Serve one request the native root admitted. Its operation pays, before
+/// each allocation, for the reply control block and for the request's copy
+/// of the authenticated edge. The request takes no
+/// place in the drain registry: a drain drops it here, closing its stream
+/// unanswered, exactly as the registry closes a Legacy reply that has not
+/// started.
+#[allow(clippy::too_many_arguments)] // The admitted request's parts stay explicit.
+async fn serve_paid_native_request(
+    (mut send, mut recv): (SendStream, RecvStream),
+    lease: ActiveSyncRequest,
+    sync_routes: &SyncRoutes,
+    large_request_stage: &Arc<DurableLargeRequestStage>,
+    node_id: &str,
+    request_digest: [u8; blake3::OUT_LEN],
+    routes: contextdb_core::read_memory::ReadShared<super::native_wire::NativeWireRoutes>,
+    operation: crate::owner_read::NativeReadRequest,
+    body: super::BoundedWireBody,
+    subject: super::AdmittedWireVec,
+) {
+    use super::native_wire::{NativeStreamResponder, admit_wire_future_with};
+    use contextdb_core::read_memory::ReadShared;
+    let owner = operation.owner();
+    #[cfg(test)]
+    native_reply_probe(NativeReplyEvent::BeforeCharge);
+    let admitted = super::admit_on(
+        &owner,
+        ReadShared::<NativeReplyControl>::layout().size(),
+        "reply_stream_controls",
+        "Raise the declared reader memory limit for sync delivery requests.",
+    )
+    .and_then(|invoice| {
+        let request_edge = super::AdmittedWireVec::copy_from(node_id.as_bytes(), owner.clone())?;
+        Ok((invoice, request_edge))
+    });
+    let (invoice, request_edge) = match admitted {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            drop(body);
+            drop(operation);
+            drop(subject);
+            answer_native_refusal(&mut send, &mut recv, &error).await;
+            tracing::error!(error = %error, "sync transport request failed");
+            #[cfg(test)]
+            super::release_events::signal();
+            return;
+        }
+    };
+    #[cfg(test)]
+    native_reply_probe(NativeReplyEvent::Charged {
+        control: invoice.bytes(),
+        edge: node_id.len(),
+    });
+    let Ok(control) = ReadShared::try_from_prepaid_native(
+        NativeReplyControl {
+            streams: AsyncMutex::new(Some((send, recv))),
+            _lease: lease,
+            subject,
+        },
+        invoice,
+    ) else {
+        return;
+    };
+    #[cfg(test)]
+    native_reply_probe(NativeReplyEvent::Hold(Box::new(control.clone())));
+    if sync_routes.reply_owners_cancelled.load(Ordering::SeqCst) {
+        drop(control.streams.lock().await.take());
+        return;
+    }
+    let writer = NativeReplyWriter {
+        control: control.clone(),
+        sync_routes: sync_routes.clone(),
+    };
+    let _ = (large_request_stage, request_digest);
+    let (request_edge, request_edge_credit) = request_edge.into_prepaid();
+    let dispatched = async {
+        let route = routes
+            .find(control.subject())
+            .ok_or(TransportError::NoResponder)?;
+        let node_id = String::from_utf8(request_edge)
+            .map_err(|_| TransportError::Other("authenticated edge is not UTF-8".into()))?;
+        let finish_owner = owner.clone();
+        // The writer is captured inline in the paid finish callback; the
+        // reply buffer moves into it with its invoice, which settles only
+        // after the write has freed the bytes.
+        let reply = NativeStreamResponder::try_new_with(owner.clone(), || {
+            Ok(move |body: super::BoundedWireBody| {
+                admit_wire_future_with(finish_owner, || {
+                    Ok(async move {
+                        // The paid reply moves whole into the writer: its
+                        // bytes and invoice stay together until the write
+                        // returns or this future is dropped.
+                        let reply = body
+                            .into_native_contiguous()
+                            .map_err(|_| TransportError::NoResponder)?;
+                        writer.write(reply).await
+                    })
+                })
+            })
+        })?;
+        route
+            .dispatch_native(
+                super::ReadBoundIncomingRequest {
+                    body,
+                    responder: super::ReadBoundResponder::Native(reply),
+                    node_id: Some(node_id),
+                },
+                operation,
+            )?
+            .await
+    };
+    let outcome = tokio::select! {
+        biased;
+        () = sync_routes.reply_owner_cancelled() => None,
+        result = dispatched => Some(result),
+    };
+    drop(request_edge_credit);
+    match outcome {
+        // Draining: the request's stream closes unanswered.
+        None => drop(control.streams.lock().await.take()),
+        Some(Ok(())) => {
+            #[cfg(feature = "production-smoke-driver")]
+            production_smoke_native_delivery(true);
+        }
+        Some(Err(error)) => {
+            #[cfg(feature = "production-smoke-driver")]
+            production_smoke_native_delivery(false);
+            let mut slot = control.streams.lock().await;
+            if let Some((mut send, mut recv)) = slot.take() {
+                answer_native_refusal(&mut send, &mut recv, &error).await;
+            }
+            drop(slot);
+            tracing::error!(error = %error, "sync transport request failed");
+        }
+    }
+    drop(control);
+    #[cfg(test)]
+    super::release_events::signal();
+}
+
+/// Writes one sync reply on the request's own stream: framing, oversize
+/// staging, peer receipt, drain cancellation and stage cleanup. A Legacy
+/// handler reaches it through a boxed `Responder`; a native route captures it
+/// inline in its paid finish callback.
+struct SyncReplyWriter {
+    parts: ReplyParts,
+    large_request_stage: Arc<DurableLargeRequestStage>,
+    completed_stage: Option<PathBuf>,
+    response_request_digest: [u8; blake3::OUT_LEN],
+    responder_sync_routes: SyncRoutes,
+}
+
+/// Inline size of the reply writer a native finish callback captures.
+#[cfg(test)]
+pub(crate) fn reply_writer_bytes_for_test() -> usize {
+    std::mem::size_of::<SyncReplyWriter>()
+}
+
+impl SyncReplyWriter {
+    async fn write(self, response_bytes: Vec<u8>) -> TransportResult<()> {
+        let Self {
+            parts,
+            large_request_stage,
+            completed_stage,
+            response_request_digest,
+            responder_sync_routes,
+        } = self;
+        let cancellation = responder_sync_routes.clone();
+        let reply = async move {
+            // Keep admission charged until the peer has acknowledged
+            // the reply. An unused underscore binding may be dropped
+            // before the later awaits, which lets shutdown close the
+            // endpoint after commit but before confirmation reaches
+            // the edge.
+            let request_lease = parts;
+            let send_slot = request_lease.slot();
+            let response_subject = request_lease.subject();
+            let response_node_id = request_lease.node_id();
+            let oversized_response = response_bytes.len() > MAX_FRAME_BYTES;
+            let response_transfer_reservation = if oversized_response {
+                Some(
+                    responder_sync_routes
+                        .reserve_response_transfer()
+                        .ok_or_else(|| {
+                            TransportError::Other(
+                                ("too many unfinished oversized response transfers".to_string())
+                                    .into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let mut slot = send_slot.lock().await;
+            let Some((mut send, mut recv)) = slot.take() else {
+                return Err(TransportError::Other(
+                    ("reply already sent on this stream".to_string()).into(),
+                ));
+            };
+            #[cfg(feature = "test-seams")]
+            large_request_stage.record_authenticated_pull_reply_after_reset_for_test(
+                response_subject,
+                response_bytes.len(),
+            );
+            #[cfg(feature = "test-seams")]
+            if completed_stage.is_some() && large_request_stage.take_completed_reply_drop_for_test()
+            {
+                // Reset the actual reply stream instead of merely
+                // withholding its bytes. The client observes a
+                // deterministic transport failure and takes its
+                // ordinary reconnect/reconciliation path.
+                large_request_stage.record_injected_reply_reset_for_test();
+                let _ = send.reset(0u32.into());
+                if let Some(path) = completed_stage {
+                    remove_stage_after_reply(&large_request_stage, path).await;
+                }
+                return Err(TransportError::Unreachable(
+                    "sync endpoint closed before replying".to_string(),
+                ));
+            }
+            let mut registered_response_transfer = None;
+            let reply = if response_bytes.len() > MAX_FRAME_BYTES {
+                let _guard = large_request_stage.lock.lock().await;
+                let stage_root = large_request_stage.root.clone();
+                let response_staging_budget = large_request_stage.response_staging_budget;
+                let protected = responder_sync_routes.protected_response_paths();
+                let subject = response_subject.to_owned();
+                let node_id = response_node_id.to_owned();
+                match tokio::task::spawn_blocking(move || {
+                    stage_large_response_with_budget(
+                        &stage_root,
+                        &node_id,
+                        &subject,
+                        response_request_digest,
+                        &response_bytes,
+                        response_staging_budget,
+                        &protected,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(manifest)) => {
+                        let encoded = manifest.encode()?;
+                        let transfer_key =
+                            (response_node_id.to_owned(), manifest.transfer_digest()?);
+                        response_transfer_reservation
+                            .expect("oversized response reserved before staging")
+                            .activate(
+                                transfer_key.clone(),
+                                ResponseTransferPaths {
+                                    stage: response_stage_path(
+                                        &large_request_stage.root,
+                                        &manifest,
+                                    ),
+                                    completion: response_completion_path(
+                                        &large_request_stage.root,
+                                        &manifest,
+                                    ),
+                                },
+                            );
+                        registered_response_transfer = Some((transfer_key, manifest.clone()));
+                        #[cfg(feature = "test-seams")]
+                        large_request_stage.record_staged_response_for_test(&manifest);
+                        Ok(encoded)
+                    }
+                    Ok(Err(err)) => Err(err),
+                    Err(err) => Err(TransportError::Other(
+                        (format!("oversized response staging task failed: {err}")).into(),
+                    )),
+                }
+            } else {
+                Ok(response_bytes)
+            };
+            let (result, _receipt_consumed) = match reply {
+                Ok(reply) if oversized_response => {
+                    let result =
+                        write_reply(&mut send, &mut recv, REPLY_LARGE_RESPONSE, &reply).await;
+                    #[cfg(feature = "test-seams")]
+                    large_request_stage.record_authenticated_pull_reply_trace_after_reset_for_test(
+                        response_subject,
+                        &reply,
+                        REPLY_LARGE_RESPONSE,
+                        result.is_ok(),
+                    );
+                    let consumed = result.is_ok();
+                    (result, consumed)
+                }
+                Ok(reply) => {
+                    let result = write_reply(&mut send, &mut recv, REPLY_OK, &reply).await;
+                    #[cfg(feature = "test-seams")]
+                    large_request_stage.record_authenticated_pull_reply_trace_after_reset_for_test(
+                        response_subject,
+                        &reply,
+                        REPLY_OK,
+                        result.is_ok(),
+                    );
+                    let consumed = result.is_ok();
+                    (result, consumed)
+                }
+                Err(err) => {
+                    let detail = err.to_string();
+                    let write_result =
+                        write_reply(&mut send, &mut recv, REPLY_HANDLER_ERROR, detail.as_bytes())
+                            .await;
+                    #[cfg(feature = "test-seams")]
+                    large_request_stage.record_authenticated_pull_reply_trace_after_reset_for_test(
+                        response_subject,
+                        detail.as_bytes(),
+                        REPLY_HANDLER_ERROR,
+                        write_result.is_ok(),
+                    );
+                    let consumed = write_result.is_ok();
+                    (Err(err), consumed)
+                }
+            };
+            #[cfg(feature = "test-seams")]
+            responder_sync_routes.record_reply_receipt_for_test(_receipt_consumed);
+            let reply_event = match &result {
+                Ok(()) => "reply-acknowledged".to_string(),
+                Err(err) => format!("reply-failed error={err}"),
+            };
+            append_test_shutdown_state(&responder_sync_routes, &reply_event);
+            if result.is_err()
+                && let Some((key, manifest)) = registered_response_transfer.as_ref()
+                && responder_sync_routes.complete_response_transfer(key)
+            {
+                let _guard = large_request_stage.lock.lock().await;
+                let stage_root = large_request_stage.root.clone();
+                let authenticated_node_id = response_node_id.to_owned();
+                let manifest = manifest.clone();
+                match tokio::task::spawn_blocking(move || {
+                    abandon_large_response(&stage_root, &authenticated_node_id, &manifest)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::warn!(
+                        error = %err,
+                        "undelivered oversized response stage could not be removed"
+                    ),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "undelivered oversized response cleanup task failed"
+                    ),
+                }
+            }
+            if let Some(path) = completed_stage {
+                remove_stage_after_reply(&large_request_stage, path).await;
+            }
+            drop(slot);
+            drop(request_lease);
+            result
+        };
+        tokio::select! {
+            result = reply => result,
+            _ = cancellation.reply_owner_cancelled() => Err(
+                TransportError::Unreachable(
+                    "sync endpoint closed before replying".to_string(),
+                ),
+            ),
+        }
+    }
+}
+
+/// A request on a natively routed subject, received after the installed
+/// provider chose its route. A Native body was read straight into an
+/// allocation admitted on the original operation; a Legacy selection keeps the
+/// frame's ordinary pre-admitted payload and the provider's exact capability.
+enum NativeAdmission {
+    Native {
+        routes: contextdb_core::read_memory::ReadShared<super::native_wire::NativeWireRoutes>,
+        operation: crate::owner_read::NativeReadRequest,
+        body: super::BoundedWireBody,
+        /// The subject, copied into storage the operation paid for.
+        subject: super::AdmittedWireVec,
+    },
+    Legacy {
+        routes: contextdb_core::read_memory::ReadShared<super::native_wire::NativeWireRoutes>,
+        acquired: crate::vector_read_memory::RequestReadOwner,
+    },
+    /// The provider or the body allocation refused before any body byte was
+    /// held; the declared body was consumed without allocating.
+    Refused(super::WireError),
+}
+
+/// Read one request frame. For a subject the native root serves, the provider
+/// is consulted once, after the subject and length and before any body byte is
+/// read, and a Native body lands in its admitted allocation with no copy.
+async fn read_request_frame_routed(
+    recv: &mut iroh::endpoint::RecvStream,
+    pre_admission: &PreAdmissionGuardrails,
+    sync_routes: &SyncRoutes,
+) -> super::WireResult<(
+    String,
+    Vec<u8>,
+    OwnedSemaphorePermit,
+    Option<NativeAdmission>,
+)> {
+    use super::native_wire::NativeReadStreamBegin;
+    let mut subject_len = [0u8; 2];
+    read_exact_with_progress(recv, &mut subject_len, pre_admission.request_read_idle).await?;
+    let subject_length = u16::from_be_bytes(subject_len) as usize;
+    // A subject longer than the native bound cannot name a native route; it is
+    // read for the Legacy route map as before.
+    if subject_length > super::MAX_NATIVE_SUBJECT_BYTES {
+        let mut subject_bytes = vec![0u8; subject_length];
+        read_exact_with_progress(recv, &mut subject_bytes, pre_admission.request_read_idle).await?;
+        let subject = String::from_utf8(subject_bytes)
+            .map_err(|err| TransportError::IncompleteReply(err.to_string()))?;
+        let (payload, permit) =
+            read_pre_admission_payload(recv, MAX_FRAME_BYTES, pre_admission).await?;
+        return Ok((subject, payload, permit, None));
+    }
+    // Read into this fixed inline array, part of the connection task's own
+    // frame: no per-request heap allocation before a route is chosen.
+    let mut subject_inline = [0u8; super::MAX_NATIVE_SUBJECT_BYTES];
+    let subject_scratch = &mut subject_inline[..subject_length];
+    read_exact_with_progress(recv, subject_scratch, pre_admission.request_read_idle).await?;
+    let subject_scratch = &subject_inline[..subject_length];
+    let subject_text = std::str::from_utf8(subject_scratch)
+        .map_err(|err| TransportError::IncompleteReply(err.to_string()))?;
+    let Some(routes) = sync_routes.native_route(subject_text) else {
+        let subject = subject_text.to_owned();
+        let (payload, permit) =
+            read_pre_admission_payload(recv, MAX_FRAME_BYTES, pre_admission).await?;
+        return Ok((subject, payload, permit, None));
+    };
+    let mut len_bytes = [0u8; 4];
+    read_exact_with_progress(recv, &mut len_bytes, pre_admission.request_read_idle).await?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(TransportError::IncompleteReply(format!(
+            "frame of {len} bytes exceeds the {MAX_FRAME_BYTES}-byte ceiling"
+        ))
+        .into());
+    }
+    let permit = pre_admission.try_reserve_payload(len)?;
+    let idle = pre_admission.request_read_idle;
+    // A refusal before the body is held still consumes the declared bytes from
+    // this stream, without allocating, so the typed refusal can be answered.
+    let begun = match routes
+        .find(subject_text)
+        .ok_or(TransportError::NoResponder)
+        .map_err(super::WireError::from)
+        .and_then(|route| route.begin_request())
+    {
+        Ok(begun) => begun,
+        Err(error) => {
+            discard_exact(recv, len, idle).await?;
+            let refusal = NativeAdmission::Refused(error);
+            return Ok((String::new(), Vec::new(), permit, Some(refusal)));
+        }
+    };
+    match begun {
+        NativeReadStreamBegin::Native { operation, .. } => {
+            // The subject and the body land in storage the operation paid for
+            // before either allocation; a refusal holds neither.
+            #[cfg(test)]
+            native_reply_probe(NativeReplyEvent::BeforeAdmission);
+            let admitted = super::AdmittedWireVec::copy_from(subject_scratch, operation.owner())
+                .and_then(|subject| {
+                    super::AdmittedWireVec::allocate(len, operation.owner())
+                        .map(|body| (subject, body))
+                });
+            let (subject, mut body) = match admitted {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    drop(operation);
+                    discard_exact(recv, len, idle).await?;
+                    let refusal = NativeAdmission::Refused(error);
+                    return Ok((String::new(), Vec::new(), permit, Some(refusal)));
+                }
+            };
+            #[cfg(test)]
+            native_reply_probe(NativeReplyEvent::Admitted {
+                subject: subject.bytes.len(),
+                body: len,
+            });
+            #[cfg(test)]
+            super::native_pause::at(super::native_pause::Point::AfterAdmission).await;
+            read_exact_with_progress(recv, &mut body.bytes, idle).await?;
+            let body = super::BoundedWireBody::from_native_reply(body);
+            Ok((
+                String::new(),
+                Vec::new(),
+                permit,
+                Some(NativeAdmission::Native {
+                    routes,
+                    operation,
+                    body,
+                    subject,
+                }),
+            ))
+        }
+        NativeReadStreamBegin::Legacy(acquired) => {
+            let subject = subject_text.to_owned();
+            let mut payload = vec![0u8; len];
+            read_exact_with_progress(recv, &mut payload, idle).await?;
+            Ok((
+                subject,
+                payload,
+                permit,
+                Some(NativeAdmission::Legacy { routes, acquired }),
+            ))
+        }
+    }
+}
+
+/// Read and drop `len` request bytes through one fixed stack scratch.
+async fn discard_exact(
+    recv: &mut iroh::endpoint::RecvStream,
+    len: usize,
+    idle: Duration,
+) -> TransportResult<()> {
+    let mut scratch = [0u8; 4096];
+    let mut left = len;
+    while left > 0 {
+        let step = left.min(scratch.len());
+        read_exact_with_progress(recv, &mut scratch[..step], idle).await?;
+        left -= step;
+    }
+    Ok(())
+}
+
+/// Dispatch one natively routed request whose provider selected the Legacy
+/// route: the frame's ordinary payload is admitted on the provider's exact
+/// capability and the reply writer is reached through a boxed responder.
+async fn serve_native_subject(
+    subject: &str,
+    admission: NativeAdmission,
+    payload: Vec<u8>,
+    writer: SyncReplyWriter,
+    node_id: String,
+) -> super::WireResult<()> {
+    let future = match admission {
+        NativeAdmission::Native { .. } | NativeAdmission::Refused(_) => {
+            return Err(TransportError::NoResponder.into());
+        }
+        NativeAdmission::Legacy { routes, acquired } => {
+            let route = routes.find(subject).ok_or(TransportError::NoResponder)?;
+            let crate::vector_read_memory::RequestReadRoute::Legacy(reader) =
+                acquired.share().into_route()
+            else {
+                return Err(TransportError::NoResponder.into());
+            };
+            let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(reader);
+            let body = super::BoundedWireBody::from_legacy_reply(payload, owner)?;
+            let finish: super::StreamResponder = Box::new(move |body| {
+                Box::pin(async move {
+                    let (bytes, credit) = body
+                        .into_native_contiguous()
+                        .map_err(|_| TransportError::NoResponder)?
+                        .into_prepaid();
+                    let written = writer.write(bytes).await;
+                    drop(credit);
+                    written.map_err(super::WireError::Transport)
+                })
+            });
+            route.dispatch_legacy(
+                super::ReadBoundIncomingRequest {
+                    body,
+                    responder: super::ReadBoundResponder::Legacy(finish),
+                    node_id: Some(node_id),
+                },
+                acquired,
+            )?
+        }
+    };
+    future.await
 }
 
 fn decode_large_response_control_frame(bytes: &[u8]) -> TransportResult<LargeResponseControl> {
@@ -4618,12 +5646,13 @@ async fn exchange_frame(
     if let Some(subject) = subject {
         let subject_bytes = subject.as_bytes();
         let subject_len = u16::try_from(subject_bytes.len())
-            .map_err(|_| TransportError::Other("channel name too long".to_string()))?;
+            .map_err(|_| TransportError::Other(("channel name too long".to_string()).into()))?;
         write_all(&mut send, &subject_len.to_be_bytes()).await?;
         write_all(&mut send, subject_bytes).await?;
     }
-    let payload_len = u32::try_from(payload.len())
-        .map_err(|_| TransportError::Other("request exceeds the frame ceiling".to_string()))?;
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        TransportError::Other(("request exceeds the frame ceiling".to_string()).into())
+    })?;
     write_all(&mut send, &payload_len.to_be_bytes()).await?;
     write_all(&mut send, payload).await?;
     let mut status = [0u8; 1];
@@ -4643,16 +5672,132 @@ async fn exchange_frame(
         }
     }
     match status[0] {
-        REPLY_OK => Ok(FrameReply::Payload(reply)),
+        REPLY_OK | REPLY_NATIVE_OK => Ok(FrameReply::Payload(reply)),
         REPLY_LARGE_RESPONSE => Ok(FrameReply::LargeResponseManifest(reply)),
         REPLY_LARGE_REQUEST_PROGRESS => Ok(FrameReply::LargeRequestProgress(reply)),
+        REPLY_TYPED_REFUSAL => Ok(FrameReply::TypedRefusal(reply)),
         REPLY_NO_HANDLER => Err(TransportError::NoResponder),
         REPLY_HANDLER_ERROR => Err(TransportError::Status(
             String::from_utf8_lossy(&reply).into_owned(),
         )),
-        other => Err(TransportError::Other(format!(
-            "unknown reply status byte {other}"
-        ))),
+        REPLY_ADMISSION_REFUSED => Err(TransportError::Refused(decode_admission_refusal(&reply))),
+        other => Err(TransportError::Other(
+            (format!("unknown reply status byte {other}")).into(),
+        )),
+    }
+}
+
+/// The admitted exchange's failure for a lost or failing connection: a static
+/// class, built without allocating while any request frame is live.
+fn connection_lost() -> super::WireError {
+    super::NativeTerminal::Class(super::terminal_class::CONNECTION_LOST).into()
+}
+
+/// The admitted exchange's failure for a reply that breaks the protocol.
+fn invalid_reply() -> super::WireError {
+    super::NativeTerminal::Class(super::terminal_class::INVALID_REPLY).into()
+}
+
+/// Whether an admitted exchange failure may be retried on a fresh connection.
+fn redials(error: &super::WireError) -> bool {
+    match error {
+        super::WireError::Native(super::NativeTerminal::Class(class)) => {
+            *class == super::terminal_class::CONNECTION_LOST
+        }
+        super::WireError::Transport(
+            TransportError::NoResponder
+            | TransportError::Status(_)
+            | TransportError::IndeterminateComplete(_),
+        ) => false,
+        super::WireError::Transport(_) => true,
+        super::WireError::Resource(_) | super::WireError::Native(_) => false,
+    }
+}
+
+/// `exchange_frame` for an admitted request: the reply's length header is
+/// admitted on `owner` before its bytes are allocated or read. A refusal
+/// leaves the reply unread and unacknowledged.
+async fn exchange_frame_admitted(
+    connection: &Connection,
+    subject: &str,
+    payload: &[u8],
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
+) -> super::WireResult<AdmittedFrameReply> {
+    let (mut send, mut recv) = connection.open_bi().await.map_err(|_| connection_lost())?;
+    let subject_bytes = subject.as_bytes();
+    let subject_len = u16::try_from(subject_bytes.len()).map_err(|_| {
+        super::WireError::from(super::NativeTerminal::Class(super::terminal_class::ENCODE))
+    })?;
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        super::WireError::from(super::NativeTerminal::Class(super::terminal_class::ENCODE))
+    })?;
+    for part in [
+        &subject_len.to_be_bytes()[..],
+        subject_bytes,
+        &payload_len.to_be_bytes()[..],
+        payload,
+    ] {
+        send.write_all(part).await.map_err(|_| connection_lost())?;
+    }
+    let mut status = [0u8; 1];
+    recv.read_exact(&mut status)
+        .await
+        .map_err(|_| connection_lost())?;
+    let mut len_bytes = [0u8; 4];
+    recv.read_exact(&mut len_bytes)
+        .await
+        .map_err(|_| connection_lost())?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    let ceiling = if status[0] == REPLY_TYPED_REFUSAL {
+        MAX_TYPED_REFUSAL_BYTES
+    } else {
+        MAX_FRAME_BYTES
+    };
+    if len > ceiling {
+        return Err(invalid_reply());
+    }
+    let mut reply = super::AdmittedWireVec::allocate(len, owner.clone())?;
+    recv.read_exact(&mut reply.bytes)
+        .await
+        .map_err(|_| connection_lost())?;
+    send.write_all(&[REPLY_RECEIVED_ACK])
+        .await
+        .map_err(|_| connection_lost())?;
+    send.finish().map_err(|_| connection_lost())?;
+    match send.stopped().await {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => return Err(connection_lost()),
+    }
+    match status[0] {
+        REPLY_NATIVE_OK => {
+            #[cfg(test)]
+            client_reply_class_probe(ClientReplyClass::Native);
+            Ok(AdmittedFrameReply::Payload(reply))
+        }
+        REPLY_OK => {
+            #[cfg(test)]
+            client_reply_class_probe(ClientReplyClass::Legacy);
+            Ok(AdmittedFrameReply::Payload(reply))
+        }
+        REPLY_LARGE_RESPONSE => Ok(AdmittedFrameReply::LargeResponseManifest(reply)),
+        REPLY_TYPED_REFUSAL => Ok(AdmittedFrameReply::TypedRefusal(reply)),
+        REPLY_ADMISSION_REFUSED => {
+            Err(TransportError::Refused(decode_admission_refusal(&reply.bytes)).into())
+        }
+        REPLY_NO_HANDLER => Err(TransportError::NoResponder.into()),
+        REPLY_HANDLER_ERROR => {
+            // The status text is copied, bounded, into inline storage and the
+            // paid frame released before the text's own string is built.
+            let mut inline = [0u8; MAX_TYPED_REFUSAL_BYTES];
+            let length = reply.bytes.len().min(inline.len());
+            inline[..length].copy_from_slice(&reply.bytes[..length]);
+            drop(reply);
+            Err(
+                TransportError::Status(String::from_utf8_lossy(&inline[..length]).into_owned())
+                    .into(),
+            )
+        }
+        _ => Err(invalid_reply()),
     }
 }
 
@@ -4680,7 +5825,11 @@ async fn exchange_large_request(
     .map_err(|_| {
         TransportError::IndeterminateComplete("oversized request begin timed out".to_string())
     })?
-    .map_err(|err| TransportError::IndeterminateComplete(err.to_string()))?;
+    .map_err(|err| match err {
+        // A refusal is the receiver's definite answer: nothing was handled.
+        refused @ TransportError::Refused(_) => refused,
+        err => TransportError::IndeterminateComplete(err.to_string()),
+    })?;
     let next_missing = match begin_reply {
         FrameReply::LargeRequestProgress(reply) => match LargeRequestControlReply::decode(&reply) {
             Some(LargeRequestControlReply::BeginProgressV1(progress)) => {
@@ -4722,9 +5871,9 @@ async fn exchange_large_request(
         )?;
         let encoded =
             LargeRequestControl::FragmentV1(rmp_serde::from_slice(&encoded).map_err(|err| {
-                TransportError::Other(format!(
-                    "cannot decode encoded oversized request fragment: {err}"
-                ))
+                TransportError::Other(
+                    (format!("cannot decode encoded oversized request fragment: {err}")).into(),
+                )
             })?)
             .encode()?;
         let reply = await_large_request_fragment_reply(
@@ -4745,7 +5894,7 @@ async fn exchange_large_request(
                             begin.total_fragments,
                             Some(u32::try_from(sequence + 1).map_err(|_| {
                                 TransportError::Other(
-                                    "oversized request has too many fragments".to_string(),
+                                    ("oversized request has too many fragments".to_string()).into(),
                                 )
                             })?),
                         )?;
@@ -4783,7 +5932,7 @@ async fn exchange_large_request(
         ));
     }
     Err(TransportError::Other(
-        "oversized request contained no fragments".to_string(),
+        ("oversized request contained no fragments".to_string()).into(),
     ))
 }
 
@@ -4802,12 +5951,11 @@ async fn await_large_request_fragment_reply(
             .await
             .map_err(|_| TransportError::Timeout)?
     };
-    reply.map_err(|err| {
-        if final_fragment {
-            TransportError::IndeterminateComplete(err.to_string())
-        } else {
-            err
-        }
+    reply.map_err(|err| match err {
+        // A refusal is the receiver's definite answer: nothing was handled.
+        refused @ TransportError::Refused(_) => refused,
+        err if final_fragment => TransportError::IndeterminateComplete(err.to_string()),
+        err => err,
     })
 }
 
@@ -4857,21 +6005,6 @@ async fn remove_stage_after_reply(stage: &DurableLargeRequestStage, path: PathBu
             );
         }
     }
-}
-
-async fn read_request_frame(
-    recv: &mut iroh::endpoint::RecvStream,
-    pre_admission: &PreAdmissionGuardrails,
-) -> TransportResult<(String, Vec<u8>, OwnedSemaphorePermit)> {
-    let mut subject_len = [0u8; 2];
-    read_exact_with_progress(recv, &mut subject_len, pre_admission.request_read_idle).await?;
-    let mut subject_bytes = vec![0u8; u16::from_be_bytes(subject_len) as usize];
-    read_exact_with_progress(recv, &mut subject_bytes, pre_admission.request_read_idle).await?;
-    let subject = String::from_utf8(subject_bytes)
-        .map_err(|err| TransportError::IncompleteReply(err.to_string()))?;
-    let (payload, payload_permit) =
-        read_pre_admission_payload(recv, MAX_FRAME_BYTES, pre_admission).await?;
-    Ok((subject, payload, payload_permit))
 }
 
 async fn read_pre_admission_payload(
@@ -4992,8 +6125,9 @@ async fn write_reply(
     payload: &[u8],
 ) -> TransportResult<()> {
     write_all(send, &[status]).await?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| TransportError::Other("reply exceeds the frame ceiling".to_string()))?;
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        TransportError::Other(("reply exceeds the frame ceiling".to_string()).into())
+    })?;
     write_all(send, &len.to_be_bytes()).await?;
     write_all(send, payload).await?;
     send.finish()
@@ -5007,12 +6141,12 @@ async fn write_reply(
         })?;
         if receipt[0] != REPLY_RECEIVED_ACK {
             return Err(TransportError::Other(
-                "sync peer returned an invalid reply receipt".to_string(),
+                ("sync peer returned an invalid reply receipt".to_string()).into(),
             ));
         }
         recv.read_to_end(0).await.map_err(|err| match err {
             iroh::endpoint::ReadToEndError::TooLong => TransportError::Other(
-                "sync peer sent trailing bytes after the reply receipt".to_string(),
+                ("sync peer sent trailing bytes after the reply receipt".to_string()).into(),
             ),
             iroh::endpoint::ReadToEndError::Read(_) => TransportError::Unreachable(
                 "sync endpoint connection lost before the reply receipt stream finished"
@@ -5025,6 +6159,83 @@ async fn write_reply(
     .map_err(|_| TransportError::Timeout)??;
     Ok(())
 }
+
+/// `write_reply` for the native route: the same framing and receipt, with
+/// failures as static reasons, so a failing native reply allocates nothing.
+async fn write_reply_native(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    status: u8,
+    payload: &[u8],
+) -> std::result::Result<(), &'static str> {
+    const LOST: &str = super::terminal_class::CONNECTION_LOST;
+    let len = u32::try_from(payload.len()).map_err(|_| "reply exceeds the frame ceiling")?;
+    send.write_all(&[status]).await.map_err(|_| LOST)?;
+    send.write_all(&len.to_be_bytes()).await.map_err(|_| LOST)?;
+    send.write_all(payload).await.map_err(|_| LOST)?;
+    send.finish().map_err(|_| LOST)?;
+    #[cfg(test)]
+    if status == REPLY_NATIVE_OK {
+        super::native_pause::at(super::native_pause::Point::BeforeReceipt).await;
+    }
+    tokio::time::timeout(REPLY_RECEIPT_TIMEOUT, async {
+        let mut receipt = [0u8; 1];
+        recv.read_exact(&mut receipt).await.map_err(|_| LOST)?;
+        if receipt[0] != REPLY_RECEIVED_ACK {
+            return Err("sync peer returned an invalid reply receipt");
+        }
+        recv.read_to_end(0).await.map_err(|_| LOST)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| "sync peer did not acknowledge the reply in time")?
+}
+
+/// The reply writer of a natively routed request. It owns the paid reply
+/// buffer, bytes and invoice together, until the write returns or its future
+/// is dropped; it holds the request's paid control block for the stream.
+struct NativeReplyWriter {
+    control: contextdb_core::read_memory::ReadShared<NativeReplyControl>,
+    sync_routes: SyncRoutes,
+}
+
+impl NativeReplyWriter {
+    async fn write(self, reply: super::AdmittedWireVec) -> super::WireResult<()> {
+        let Self {
+            control,
+            sync_routes,
+        } = self;
+        let mut slot = control.streams.lock().await;
+        let Some((mut send, mut recv)) = slot.take() else {
+            return Err(
+                super::NativeTerminal::Class(super::terminal_class::CONNECTION_LOST).into(),
+            );
+        };
+        let written = write_reply_native(&mut send, &mut recv, REPLY_NATIVE_OK, &reply.bytes).await;
+        // The reply buffer drops here, before its control block's last holder.
+        drop(reply);
+        drop(slot);
+        #[cfg(feature = "test-seams")]
+        sync_routes.record_reply_receipt_for_test(written.is_ok());
+        append_test_shutdown_state(
+            &sync_routes,
+            if written.is_ok() {
+                "reply-acknowledged"
+            } else {
+                "reply-failed"
+            },
+        );
+        drop(sync_routes);
+        written.map_err(|reason| {
+            tracing::debug!(reason, "native reply write failed");
+            super::NativeTerminal::Class(super::terminal_class::CONNECTION_LOST).into()
+        })
+    }
+}
+
+// Private receive primitives. The approved responder/handler boundary is
+// not wired here: see the candidate's interface-gaps.md. These factories
+// never turn the existing large-control or eager paths into a native claim.
 
 #[cfg(test)]
 mod sticky_port_tests {

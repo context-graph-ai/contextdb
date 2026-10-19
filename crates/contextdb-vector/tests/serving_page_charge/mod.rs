@@ -9,6 +9,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../fixtures/read_owner_test_support.rs"]
+mod read_owner_test_support;
+
 use contextdb_core::{
     Error, Lsn, RowId, SnapshotId, TxId, VectorEntry, VectorIndexRef, VectorPartitionKey,
     VectorQuantization, VectorSearchMode,
@@ -21,7 +24,8 @@ use contextdb_vector::hnsw::{
 use contextdb_vector::mem::BoundedHnswOutcome;
 use contextdb_vector::store::{LoadedVectorGraphGeneration, VectorGraphGeneration};
 use contextdb_vector::{
-    MemVectorExecutor, MemoryBudget, VectorIndexLayout, VectorPartitionRef, VectorStore,
+    MemVectorExecutor, MemoryBudget, VectorCopyAdmission, VectorIndexLayout, VectorPartitionRef,
+    VectorStore,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
@@ -150,12 +154,12 @@ impl MemoryBudget for Budget {
             let available = limit.saturating_sub(used);
             if bytes > available {
                 return Err(Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.to_string(),
-                    operation: operation.to_string(),
+                    subsystem: subsystem.to_string().into(),
+                    operation: operation.to_string().into(),
                     requested_bytes: bytes,
                     available_bytes: available,
                     budget_limit_bytes: limit,
-                    hint: hint.to_string(),
+                    hint: hint.to_string().into(),
                 });
             }
             if self
@@ -182,12 +186,60 @@ impl MemoryBudget for Budget {
 
 pub struct TestStore {
     vector: Arc<VectorStore>,
+    body_owner: Arc<Budget>,
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
-        self.vector.apply_inserts(ws.vector_inserts.clone());
-        self.vector.apply_deletes(ws.vector_deletes.clone());
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
+        let executing_owner = read_owner_test_support::budget(read_memory);
+        // Capture the exact committed body before this fixture publishes inserts.
+        let mut before_owner = VectorCopyAdmission::new(executing_owner.clone());
+        before_owner.reserve(
+            ws.vector_deletes
+                .len()
+                .saturating_mul(std::mem::size_of::<(VectorIndexRef, RowId, TxId, TxId, Lsn)>())
+                .saturating_add(
+                    ws.vector_deletes
+                        .iter()
+                        .map(|(index, _, _)| index.table.len().saturating_add(index.column.len()))
+                        .sum::<usize>(),
+                ),
+        )?;
+        let mut deletes = Vec::with_capacity(ws.vector_deletes.len());
+        for (index, row, tx) in &ws.vector_deletes {
+            let before = self
+                .vector
+                .live_entry_for_row(
+                    index,
+                    *row,
+                    contextdb_core::SnapshotId(tx.0),
+                    &mut before_owner,
+                )?
+                .expect("the fixture deletes an existing committed body");
+            deletes.push((index.clone(), *row, *tx, before.created_tx, before.lsn));
+        }
+
+        let bytes = ws
+            .vector_inserts
+            .iter()
+            .map(|entry| entry.vector.len() * std::mem::size_of::<f32>())
+            .sum();
+        self.body_owner
+            .try_allocate_for(bytes, "test", "caller_vector_body", "test")?;
+        let result = self.vector.apply_inserts(
+            ws.vector_inserts.clone(),
+            VectorCopyAdmission::new(executing_owner.clone()),
+        );
+        if result.is_err() {
+            self.body_owner.release(bytes);
+        }
+        result?;
+        self.vector
+            .apply_deletes(deletes, VectorCopyAdmission::new(executing_owner.clone()))?;
         Ok(())
     }
 
@@ -223,7 +275,7 @@ impl ReadOnlyVectorGraphPageReader for Reader {
             .bytes
             .get(offset..offset.saturating_add(len))
             .map(<[u8]>::to_vec)
-            .ok_or_else(|| Error::Other("page out of range".to_string()));
+            .ok_or_else(|| Error::Other("page out of range".to_string().into()));
         FILLED.with(|filled| filled.set(Some(offset)));
         page
     }
@@ -349,14 +401,41 @@ pub fn fixture() -> Fixture {
         1,
     );
     store
-        .register_index_with_layout(index.clone(), layout.clone())
+        .register_index_with_layout(
+            index.clone(),
+            layout.clone(),
+            budget.clone(),
+            &mut VectorCopyAdmission::new(budget.clone()),
+        )
         .unwrap();
     let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         vector: store.clone(),
+        body_owner: budget.clone(),
     }));
     let exec =
         MemVectorExecutor::new_with_accountant(store.clone(), tx_mgr.clone(), hnsw, budget.clone());
-    store.apply_inserts_with_accountant(entries.clone(), Some(budget.as_ref()));
+    budget
+        .try_allocate_for(
+            entries
+                .iter()
+                .map(|entry| entry.vector.len() * std::mem::size_of::<f32>())
+                .sum(),
+            "test",
+            "caller_vector_body",
+            "test",
+        )
+        .unwrap();
+    store
+        .apply_inserts_with_accountant(
+            entries.clone(),
+            Some(budget.as_ref()),
+            VectorCopyAdmission::new(Arc::new(Budget {
+                limit: AtomicUsize::new(usize::MAX),
+                used: AtomicUsize::new(0),
+                underflows: AtomicUsize::new(0),
+            })),
+        )
+        .unwrap();
 
     let policy = layout.resolve_policy(POPULATION, 10);
     let built = HnswIndex::from_vector_entries_with_policy(
@@ -527,6 +606,7 @@ pub fn search(
                     }
                 }
             },
+            &mut VectorCopyAdmission::new(fixture.budget.clone()),
         )
         .expect("the graph search answers");
     BEFORE_READ.with(|slot| slot.borrow_mut().take());

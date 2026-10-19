@@ -1,0 +1,8 @@
+# trybuild harnesses in this crate share target/tests/trybuild/contextdb-core.
+# Serialize their processes so one fixture cannot replace another's manifest.
+[test-groups.core-compile-fixtures]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(contextdb-core) & (binary(read_contract_compile) | binary(txid_newtype_tests) | binary(error_non_exhaustive_tests))'
+test-group = 'core-compile-fixtures'

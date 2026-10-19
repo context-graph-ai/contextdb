@@ -898,6 +898,7 @@ fn owner_identity_authentication_failure_is_terminal_without_direct_fallback_or_
 struct KernelCancellationState {
     armed: bool,
     entered: Option<ReadKernelSourceEvent>,
+    source_events: Vec<ReadKernelSourceEvent>,
     kernel_token: Option<OwnerReadCancellation>,
     released: bool,
     operation_finished: bool,
@@ -955,6 +956,26 @@ impl KernelCancellationGate {
         state.armed = false;
     }
 
+    fn completed_source_items_at_trigger(&self) -> u64 {
+        let state = self.state.lock().expect("kernel cancellation gate lock");
+        let entered = state.entered.expect("typed trigger was reached");
+        assert_eq!(state.source_events.last(), Some(&entered));
+        // The final callback is BEFORE the item cancelled at N-1. Every
+        // earlier callback in this successful prefix completed one source item.
+        let prefix = &state.source_events[..state.source_events.len() - 1];
+        let categories = [ReadKernelSource::TableRow, ReadKernelSource::IndexEntry,
+            ReadKernelSource::SortCandidate, ReadKernelSource::GraphEdge,
+            ReadKernelSource::BruteForceVectorCandidate, ReadKernelSource::HnswCandidate,
+            ReadKernelSource::RankCandidate, ReadKernelSource::AccessRow];
+        let completed_by_category: Vec<_> = categories.iter().map(|source| {
+            (*source, u64::try_from(prefix.iter().filter(|event| event.source == *source).count()).unwrap())
+        }).collect();
+        let total = completed_by_category.iter().map(|(_, completed)| *completed).sum();
+        assert_eq!(total, u64::try_from(prefix.len()).unwrap(),
+            "every completed observed source belongs to the reconciled categories");
+        total
+    }
+
     fn assert_kernel_reported_cancellation(&self) {
         assert!(
             self.state
@@ -976,6 +997,8 @@ impl ReadKernelTestObserver for KernelCancellationGate {
         if !state.armed {
             return;
         }
+        assert!(state.entered.is_none(), "no source attempt follows the cancellation trigger");
+        state.source_events.push(event);
         if event.source == ReadKernelSource::TableRow
             && event.completed_items == cancellation_batch_rows().saturating_sub(1)
             && state.entered.is_none()
@@ -1052,6 +1075,12 @@ fn cancel_execute_inside_kernel(
     // that lands would race the cancellation delivery this test exists to prove.
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
+    assert_eq!(
+        session.route_resources_for_test().expect("source state at acknowledgment")
+            .bounded_source_items_completed,
+        blocked.as_ref().expect("source state at trigger").bounded_source_items_completed,
+        "exactly zero additional source work before releasing the acknowledged kernel",
+    );
     gate.release();
     let outcome = worker.join();
     assert_eq!(event.operation, ReadSessionOperation::Execute);
@@ -1062,21 +1091,21 @@ fn cancel_execute_inside_kernel(
         cancellation_batch_rows().saturating_sub(1)
     );
     assert!(!cancelled_before_request);
+    let source_items_at_trigger = blocked
+        .expect("inspect the blocked execute source")
+        .bounded_source_items_completed;
     assert_eq!(
-        blocked
-            .expect("inspect the blocked execute source")
-            .bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "the cancellation gate must be beyond the backend adapter and after one real row",
+        source_items_at_trigger - before_source_rows,
+        gate.completed_source_items_at_trigger(),
+        "aggregate source delta equals the complete observed successful source prefix",
     );
     assert_cancelled(outcome.expect("cancelled execute worker joins"));
     let after = session
         .route_resources_for_test()
         .expect("inspect execute source after cancellation");
     assert_eq!(
-        after.bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "the cancelled kernel must not touch the second row",
+        after.bounded_source_items_completed, source_items_at_trigger,
+        "the cancelled kernel must perform no source work after cancellation acknowledgment",
     );
     assert_one_selected_backend_operation(before, after, route);
     assert!(
@@ -1122,6 +1151,12 @@ fn cancel_cursor_open_inside_kernel(
     // that lands would race the cancellation delivery this test exists to prove.
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
+    assert_eq!(
+        session.route_resources_for_test().expect("source state at acknowledgment")
+            .bounded_source_items_completed,
+        blocked.as_ref().expect("source state at trigger").bounded_source_items_completed,
+        "exactly zero additional source work before releasing the acknowledged kernel",
+    );
     gate.release();
     let outcome = worker.join();
     assert_eq!(event.operation, ReadSessionOperation::CursorOpen);
@@ -1132,20 +1167,21 @@ fn cancel_cursor_open_inside_kernel(
         cancellation_batch_rows().saturating_sub(1)
     );
     assert!(!cancelled_before_request);
+    let source_items_at_trigger = blocked
+        .expect("inspect the blocked cursor-open source")
+        .bounded_source_items_completed;
     assert_eq!(
-        blocked
-            .expect("inspect the blocked cursor-open source")
-            .bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
+        source_items_at_trigger - before_source_rows,
+        gate.completed_source_items_at_trigger(),
+        "aggregate source delta equals the complete observed successful source prefix",
     );
     assert_cancelled(outcome.expect("cancelled cursor-open worker joins"));
     let after = session
         .route_resources_for_test()
         .expect("inspect cursor-open source after cancellation");
     assert_eq!(
-        after.bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "cursor open must not touch the second row after cancellation",
+        after.bounded_source_items_completed, source_items_at_trigger,
+        "cursor open must perform no source work after cancellation acknowledgment",
     );
     assert_one_selected_backend_operation(before, after, route);
     assert!(identical_token_observed);
@@ -1221,6 +1257,12 @@ fn cancel_cursor_fetch_inside_kernel(
     // that lands would race the cancellation delivery this test exists to prove.
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
+    assert_eq!(
+        session.route_resources_for_test().expect("source state at acknowledgment")
+            .bounded_source_items_completed,
+        blocked.as_ref().expect("source state at trigger").bounded_source_items_completed,
+        "exactly zero additional source work before releasing the acknowledged kernel",
+    );
     gate.release();
     let outcome = worker.join();
     assert_eq!(event.operation, ReadSessionOperation::CursorFetch);
@@ -1231,11 +1273,13 @@ fn cancel_cursor_fetch_inside_kernel(
         cancellation_batch_rows().saturating_sub(1)
     );
     assert!(!cancelled_before_request);
+    let source_items_at_trigger = blocked
+        .expect("inspect the blocked cursor-fetch source")
+        .bounded_source_items_completed;
     assert_eq!(
-        blocked
-            .expect("inspect the blocked cursor-fetch source")
-            .bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
+        source_items_at_trigger - before_source_rows,
+        gate.completed_source_items_at_trigger(),
+        "aggregate source delta equals the complete observed successful source prefix",
     );
     let (mut cursor, cancelled_fetch) = outcome.expect("cancelled cursor-fetch worker joins");
     assert_cancelled(cancelled_fetch);
@@ -1243,9 +1287,8 @@ fn cancel_cursor_fetch_inside_kernel(
         .route_resources_for_test()
         .expect("inspect cursor-fetch source after cancellation");
     assert_eq!(
-        after.bounded_source_items_completed,
-        before_source_rows.saturating_add(cancellation_batch_rows().saturating_sub(1)),
-        "cursor fetch must not touch the second requested row after cancellation",
+        after.bounded_source_items_completed, source_items_at_trigger,
+        "cursor fetch must perform no source work after cancellation acknowledgment",
     );
     assert_one_selected_backend_operation(before, after, route);
     assert!(identical_token_observed);
@@ -1417,9 +1460,9 @@ fn spawn_owner_process(
     path: &std::path::Path,
     runtime_root: &std::path::Path,
     nonce: &str,
-) -> Child {
+) -> OwnerProcess {
     let executable = std::env::current_exe().expect("current integration-test executable");
-    let mut child = Command::new(executable)
+    let child = Command::new(executable)
         .arg("--exact")
         .arg(crate::child_test_filter(
             module_path!(),
@@ -1434,18 +1477,62 @@ fn spawn_owner_process(
         .stdout(Stdio::piped())
         .spawn()
         .expect("start the independent writable owner");
-    let stdout = child.stdout.take().expect("child owner stdout");
-    let mut lines = BufReader::new(stdout).lines();
+    let mut owner = OwnerProcess {
+        child,
+        stdout_drain: None,
+    };
+    let stdout = owner.child.stdout.take().expect("child owner stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut line = String::new();
     loop {
-        let line = lines
-            .next()
-            .expect("child owner writes a readiness line")
+        line.clear();
+        let bytes = stdout
+            .read_line(&mut line)
             .expect("read child owner output");
-        if line == format!("contextdb-route-owner-ready:{nonce}") {
+        assert_ne!(bytes, 0, "child owner writes a readiness line");
+        if line.trim_end() == format!("contextdb-route-owner-ready:{nonce}") {
             break;
         }
     }
-    child
+    owner.stdout_drain = Some(std::thread::spawn(move || {
+        std::io::copy(&mut stdout, &mut std::io::sink())
+    }));
+    owner
+}
+
+struct OwnerProcess {
+    child: Child,
+    stdout_drain: Option<std::thread::JoinHandle<std::io::Result<u64>>>,
+}
+
+impl OwnerProcess {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.join_stdout()?;
+        Ok(status)
+    }
+
+    fn join_stdout(&mut self) -> std::io::Result<()> {
+        let Some(stdout_drain) = self.stdout_drain.take() else {
+            return Ok(());
+        };
+        stdout_drain
+            .join()
+            .map_err(|_| std::io::Error::other("child owner stdout drainer panicked"))??;
+        Ok(())
+    }
+}
+
+impl Drop for OwnerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = self.join_stdout();
+    }
 }
 
 #[test]

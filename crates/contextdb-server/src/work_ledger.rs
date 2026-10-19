@@ -61,27 +61,41 @@ pub const CREATE_WORK_NODE_CONTACTS: &str = "CREATE TABLE work_node_contacts (\
 /// created before this table declared `HISTORY CURRENT ONLY SYNC OFF` is
 /// reconciled via the same `ALTER TABLE` an operator would type.
 pub fn install_node_contacts_schema(db: &contextdb_engine::Database) -> Result<(), Error> {
+    let read_memory = db.declared_reader_memory()?;
+    install_node_contacts_schema_with_read_memory(db, read_memory)
+}
+
+pub fn install_node_contacts_schema_with_read_memory(
+    db: &contextdb_engine::Database,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> Result<(), Error> {
     if !db
         .table_names()
         .iter()
         .any(|name| name == WORK_NODE_CONTACTS_TABLE)
     {
-        db.execute(CREATE_WORK_NODE_CONTACTS, &HashMap::new())?;
+        db.execute_with_read_memory(
+            CREATE_WORK_NODE_CONTACTS,
+            &HashMap::new(),
+            read_memory.clone(),
+        )?;
         return Ok(());
     }
     let Some(meta) = db.table_meta(WORK_NODE_CONTACTS_TABLE) else {
         return Ok(());
     };
     if meta.sync_direction != Some(contextdb_core::SyncDirection::None) {
-        db.execute(
+        db.execute_with_read_memory(
             "ALTER TABLE work_node_contacts SET SYNC OFF",
             &HashMap::new(),
+            read_memory.clone(),
         )?;
     }
     if meta.history_policy != Some(contextdb_core::HistoryPolicy::CurrentOnly) {
-        db.execute(
+        db.execute_with_read_memory(
             "ALTER TABLE work_node_contacts SET HISTORY CURRENT ONLY",
             &HashMap::new(),
+            read_memory.clone(),
         )?;
     }
     Ok(())
@@ -100,15 +114,26 @@ pub fn record_node_contact(
     node_id: &str,
     now_ms: i64,
 ) -> Result<(), Error> {
-    install_node_contacts_schema(db)?;
+    let read_memory = db.declared_reader_memory()?;
+    record_node_contact_with_read_memory(db, read_memory, node_id, now_ms)
+}
+
+pub fn record_node_contact_with_read_memory(
+    db: &contextdb_engine::Database,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    node_id: &str,
+    now_ms: i64,
+) -> Result<(), Error> {
+    install_node_contacts_schema_with_read_memory(db, read_memory.clone())?;
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));
     params.insert("last_contact_ms".to_string(), Value::Timestamp(now_ms));
-    db.execute(
+    db.execute_with_read_memory(
         "INSERT INTO work_node_contacts (node_id, last_contact_ms) \
          VALUES ($node_id, $last_contact_ms) ON CONFLICT (node_id) DO UPDATE SET \
          last_contact_ms = $last_contact_ms",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
@@ -244,13 +269,36 @@ pub async fn claim_job(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Result<ClaimOutcome, Error> {
-    match ledger::insert_claim(
+    let read_memory = client.db().declared_reader_memory()?;
+    claim_job_with_read_memory(
+        client,
+        read_memory,
+        job_id,
+        attempt,
+        node_id,
+        lease_deadline_ms,
+        now_ms,
+    )
+    .await
+}
+
+pub async fn claim_job_with_read_memory(
+    client: &SyncClient,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    job_id: &str,
+    attempt: i64,
+    node_id: &str,
+    lease_deadline_ms: i64,
+    now_ms: i64,
+) -> Result<ClaimOutcome, Error> {
+    match ledger::insert_claim_with_read_memory(
         client.db(),
         job_id,
         attempt,
         node_id,
         lease_deadline_ms,
         now_ms,
+        read_memory.clone(),
     )? {
         ClaimInsert::AlreadyHeld { holder } if holder != node_id => {
             return Ok(ClaimOutcome::Lost {
@@ -261,7 +309,7 @@ pub async fn claim_job(
     }
 
     let claim_key = format!("{job_id}#{attempt}");
-    match client.push().await {
+    match client.push_with_read_memory(read_memory.clone()).await {
         Ok(result) => {
             let refused = result.conflicts.iter().any(|conflict| {
                 conflict.natural_key.column == "claim_key"
@@ -274,7 +322,18 @@ pub async fn claim_job(
             // to the hub's winner, then read who actually holds it — the
             // refusal alone cannot distinguish "someone else won" from "my
             // own earlier win was re-delivered".
-            if let Err(err) = client.pull_default().await {
+            if let Err(err) = client
+                .pull_default_with_read_memory(read_memory.clone())
+                .await
+            {
+                if matches!(
+                    &err,
+                    Error::ReadFailure(_)
+                        | Error::ReadCancelled
+                        | Error::MemoryBudgetExceeded { .. }
+                ) {
+                    return Err(err);
+                }
                 // The refusal already established that some claim row holds
                 // this key; only the pull could have shown that row is this
                 // node's own re-delivered win. Without it the local row is
@@ -288,13 +347,23 @@ pub async fn claim_job(
                 );
                 return Ok(ClaimOutcome::Lost { holder: None });
             }
-            match ledger::claim_holder(client.db(), job_id, attempt)? {
+            match ledger::claim_holder_with_read_memory(
+                client.db(),
+                job_id,
+                attempt,
+                read_memory.clone(),
+            )? {
                 Some(holder) if holder == node_id => Ok(ClaimOutcome::Won { synced: true }),
                 holder => Ok(ClaimOutcome::Lost { holder }),
             }
         }
         // An unreachable hub is the offline mode: the local primary key was
         // the arbiter, the claim rides the next successful push.
+        Err(
+            err @ (Error::ReadFailure(_)
+            | Error::ReadCancelled
+            | Error::MemoryBudgetExceeded { .. }),
+        ) => Err(err),
         Err(_) => Ok(ClaimOutcome::Won { synced: false }),
     }
 }
@@ -304,12 +373,17 @@ pub async fn claim_job(
 /// failures into a terminal `Failed` verdict only at the attempt ceiling) —
 /// the defer-own-submission rule needs "has this job EVER failed an
 /// attempt", regardless of how many attempts remain.
-fn job_has_failure_rows(db: &contextdb_engine::Database, job_id: &str) -> Result<bool, Error> {
+fn job_has_failure_rows(
+    db: &contextdb_engine::Database,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    job_id: &str,
+) -> Result<bool, Error> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), Value::Text(job_id.to_string()));
-    let result = db.execute(
+    let result = db.execute_with_read_memory(
         "SELECT failure_key FROM work_failures WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     Ok(!result.rows.is_empty())
 }
@@ -321,6 +395,7 @@ fn job_has_failure_rows(db: &contextdb_engine::Database, job_id: &str) -> Result
 /// failure releases the job for immediate self-reclaim, deadline or not).
 fn defers_own_submission(
     db: &contextdb_engine::Database,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     config: &WorkerConfig,
     job: &JobSnapshot,
     now_ms: i64,
@@ -337,7 +412,7 @@ fn defers_own_submission(
     if now_ms >= deadline_ms {
         return Ok(false);
     }
-    Ok(!job_has_failure_rows(db, &job.job_id)?)
+    Ok(!job_has_failure_rows(db, read_memory.clone(), &job.job_id)?)
 }
 
 /// Decode a `work_inputs.payload` hex string back to bytes. Mirrors the
@@ -347,10 +422,10 @@ fn defers_own_submission(
 /// table directly and decodes with the identical convention.
 fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
     if !encoded.len().is_multiple_of(2) {
-        return Err(Error::Other(format!(
+        return Err(Error::Other((format!(
             "work ledger: malformed payload encoding (odd length {})",
             encoded.len()
-        )));
+        )).into()));
     }
     let mut out = Vec::with_capacity(encoded.len() / 2);
     let bytes = encoded.as_bytes();
@@ -360,9 +435,8 @@ fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
         match (hi, lo) {
             (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
             _ => {
-                return Err(Error::Other(
-                    "work ledger: malformed payload encoding (non-hex byte)".to_string(),
-                ));
+                return Err(Error::Other((
+                    "work ledger: malformed payload encoding (non-hex byte)".to_string()).into()));
             }
         }
     }
@@ -376,41 +450,43 @@ fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
 /// must be read directly.
 fn read_ledger_input_rows(
     db: &contextdb_engine::Database,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     job_id: &str,
 ) -> Result<HashMap<i64, Vec<u8>>, Error> {
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), Value::Text(job_id.to_string()));
-    let result = db.execute(
+    let result = db.execute_with_read_memory(
         "SELECT seq, payload FROM work_inputs WHERE job_id = $job_id",
         &params,
+        read_memory.clone(),
     )?;
     let seq_idx = result
         .columns
         .iter()
         .position(|c| c == "seq")
-        .ok_or_else(|| Error::Other("work_inputs: missing column seq".to_string()))?;
+        .ok_or_else(|| Error::Other(("work_inputs: missing column seq".to_string()).into()))?;
     let payload_idx = result
         .columns
         .iter()
         .position(|c| c == "payload")
-        .ok_or_else(|| Error::Other("work_inputs: missing column payload".to_string()))?;
+        .ok_or_else(|| Error::Other(("work_inputs: missing column payload".to_string()).into()))?;
     let mut out = HashMap::new();
     for row in &result.rows {
         let seq = match &row[seq_idx] {
             Value::Int64(n) => *n,
             Value::Timestamp(n) => *n,
             other => {
-                return Err(Error::Other(format!(
+                return Err(Error::Other((format!(
                     "work_inputs: seq must be a number, found {other:?}"
-                )));
+                )).into()));
             }
         };
         let payload = match &row[payload_idx] {
             Value::Text(s) => decode_hex_payload(s)?,
             other => {
-                return Err(Error::Other(format!(
+                return Err(Error::Other((format!(
                     "work_inputs: payload must be TEXT, found {other:?}"
-                )));
+                )).into()));
             }
         };
         out.insert(seq, payload);
@@ -429,6 +505,7 @@ fn read_ledger_input_rows(
 /// the result in the job's own input-sequence order.
 async fn resolve_blob_job_inputs(
     db: &contextdb_engine::Database,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     job: &JobSnapshot,
     blob_store: &crate::blob_resolver::BlobStore,
 ) -> Result<ExecutionInputs, Error> {
@@ -442,34 +519,42 @@ async fn resolve_blob_job_inputs(
                 .get("hash")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    Error::Other(format!(
+                    Error::Other((format!(
                         "work ledger: blob_ref input on job {} carries no hash detail",
                         job.job_id
-                    ))
+                    )).into())
                 })?;
             let hash = ledger::BlobHash::from_hex(hash_hex)?;
-            let ticket =
-                contextdb_engine::peer_directory::lookup_peer_ticket(db, &job.submitter_node_id)?
-                    .ok_or_else(|| {
-                    Error::Other(format!(
-                        "work ledger: no peer_directory ticket enrolled for submitter {}",
-                        job.submitter_node_id
-                    ))
-                })?;
+            let ticket = contextdb_engine::peer_directory::lookup_peer_ticket_with_read_memory(
+                db,
+                &job.submitter_node_id,
+                read_memory.clone(),
+            )?
+            .ok_or_else(|| {
+                Error::Other((format!(
+                    "work ledger: no peer_directory ticket enrolled for submitter {}",
+                    job.submitter_node_id
+                )).into())
+            })?;
             let mut sink: Vec<u8> = Vec::new();
             blob_store
-                .resolve_blob_ref(&hash, &ticket, &mut sink)
+                .resolve_blob_ref_with_read_memory(read_memory.clone(), &hash, &ticket, &mut sink)
                 .await
-                .map_err(|err| {
-                    Error::Other(format!(
+                .map_err(|err| match err {
+                    crate::blob_resolver::ResolveError::LedgerRead(err) => err,
+                    err => Error::Other((format!(
                         "work ledger: blob_ref resolve failed for job {}: {err}",
                         job.job_id
-                    ))
+                    )).into()),
                 })?;
             assembled.push((idx as i64, sink));
         } else {
             if ledger_rows.is_none() {
-                ledger_rows = Some(read_ledger_input_rows(db, &job.job_id)?);
+                ledger_rows = Some(read_ledger_input_rows(
+                    db,
+                    read_memory.clone(),
+                    &job.job_id,
+                )?);
             }
             let bytes = ledger_rows
                 .as_ref()
@@ -493,18 +578,34 @@ pub async fn poll_and_execute_once(
     executor: Arc<dyn WorkExecutor>,
     now_ms: i64,
 ) -> Result<PollOutcome, Error> {
-    let _ = client.pull_default().await;
+    let read_memory = client.db().declared_reader_memory()?;
+    poll_and_execute_once_with_read_memory(client, read_memory, config, executor, now_ms).await
+}
+
+pub async fn poll_and_execute_once_with_read_memory(
+    client: &SyncClient,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    config: &WorkerConfig,
+    executor: Arc<dyn WorkExecutor>,
+    now_ms: i64,
+) -> Result<PollOutcome, Error> {
+    tolerate_offline_sync(
+        client
+            .pull_default_with_read_memory(read_memory.clone())
+            .await,
+    )?;
     let db = client.db();
-    let jobs = ledger::claimable_jobs(
+    let jobs = ledger::claimable_jobs_with_read_memory(
         db,
         &config.node_id,
         &config.advertised_tags,
         &config.movement_policy,
         now_ms,
+        read_memory.clone(),
     )?;
     let mut jobs_to_try = Vec::with_capacity(jobs.len());
     for job in jobs {
-        if defers_own_submission(db, config, &job, now_ms)? {
+        if defers_own_submission(db, read_memory.clone(), config, &job, now_ms)? {
             continue;
         }
         jobs_to_try.push(job);
@@ -522,8 +623,14 @@ pub async fn poll_and_execute_once(
         // A canonical node's rows are already home — there is nothing to
         // re-deliver and no hub to dial (writes_are_canonical).
         if !config.writes_are_canonical
-            && let Err(err) = client.push().await
+            && let Err(err) = client.push_with_read_memory(read_memory.clone()).await
         {
+            if matches!(
+                &err,
+                Error::ReadFailure(_) | Error::ReadCancelled | Error::MemoryBudgetExceeded { .. }
+            ) {
+                return Err(err);
+            }
             tracing::debug!(
                 node_id = %config.node_id,
                 error = %err,
@@ -535,10 +642,11 @@ pub async fn poll_and_execute_once(
 
     let mut lost_any = false;
     for job in jobs_to_try {
-        let attempt = ledger::next_attempt(db, &job.job_id)?;
+        let attempt = ledger::next_attempt_with_read_memory(db, &job.job_id, read_memory.clone())?;
         let lease_deadline_ms = now_ms + config.lease_duration_ms;
-        match claim_job(
+        match claim_job_with_read_memory(
             client,
+            read_memory.clone(),
             &job.job_id,
             attempt,
             &config.node_id,
@@ -556,31 +664,47 @@ pub async fn poll_and_execute_once(
 
         // A claim is a licence to TRY, never to skip the durable-state
         // check: the job may already be done or cancelled.
-        if ledger::should_abandon(db, &job.job_id, attempt, &config.node_id, now_ms)? {
+        if ledger::should_abandon_with_read_memory(
+            db,
+            &job.job_id,
+            attempt,
+            &config.node_id,
+            now_ms,
+            read_memory.clone(),
+        )? {
             return Ok(PollOutcome::Abandoned { job_id: job.job_id });
         }
 
-        let inputs = match ledger::materialize_inputs(
+        let inputs = match ledger::materialize_inputs_with_read_memory(
             db,
             &job.job_id,
             &config.node_id,
             &config.movement_policy,
+            read_memory.clone(),
         ) {
             Ok(inputs) => inputs,
             Err(Error::InputRequiresBlobResolver { .. }) if config.blob_store.is_some() => {
                 let blob_store = config.blob_store.as_ref().expect("checked Some above");
-                match resolve_blob_job_inputs(db, &job, blob_store).await {
+                match resolve_blob_job_inputs(db, read_memory.clone(), &job, blob_store).await {
                     Ok(inputs) => inputs,
+                    Err(
+                        err @ (Error::ReadFailure(_)
+                        | Error::ReadCancelled
+                        | Error::MemoryBudgetExceeded { .. }),
+                    ) => return Err(err),
                     Err(err) => {
-                        ledger::record_failure(
+                        ledger::record_failure_with_read_memory(
                             db,
                             &job.job_id,
                             attempt,
                             &config.node_id,
                             &format!("input materialization failed: {err}"),
                             now_ms,
+                            read_memory.clone(),
                         )?;
-                        let _ = client.push().await;
+                        tolerate_offline_sync(
+                            client.push_with_read_memory(read_memory.clone()).await,
+                        )?;
                         return Ok(PollOutcome::Failed {
                             job_id: job.job_id,
                             attempt,
@@ -588,16 +712,22 @@ pub async fn poll_and_execute_once(
                     }
                 }
             }
+            Err(
+                err @ (Error::ReadFailure(_)
+                | Error::ReadCancelled
+                | Error::MemoryBudgetExceeded { .. }),
+            ) => return Err(err),
             Err(err) => {
-                ledger::record_failure(
+                ledger::record_failure_with_read_memory(
                     db,
                     &job.job_id,
                     attempt,
                     &config.node_id,
                     &format!("input materialization failed: {err}"),
                     now_ms,
+                    read_memory.clone(),
                 )?;
-                let _ = client.push().await;
+                tolerate_offline_sync(client.push_with_read_memory(read_memory.clone()).await)?;
                 return Ok(PollOutcome::Failed {
                     job_id: job.job_id,
                     attempt,
@@ -641,8 +771,12 @@ pub async fn poll_and_execute_once(
         // from one with nothing to observe.
         let job_for_exec = job.clone();
         let executor_for_exec = Arc::clone(&executor);
+        let read_memory_for_exec = read_memory.clone();
         let executor_task = tokio::task::spawn_blocking(move || {
-            executor_for_exec.execute(&job_for_exec, &inputs, &check)
+            let verdict = executor_for_exec.execute(&job_for_exec, &inputs, &check);
+            drop(inputs);
+            drop(read_memory_for_exec);
+            verdict
         });
         tokio::pin!(executor_task);
         let mut warned_in_execution_pull_failure = false;
@@ -657,9 +791,10 @@ pub async fn poll_and_execute_once(
                     });
                 }
                 _ = &mut execution_pull => {
-                    if let Err(err) = client.pull_default().await
-                        && !warned_in_execution_pull_failure
+                    if let Err(err) = client.pull_default_with_read_memory(read_memory.clone()).await
                     {
+                        if matches!(&err, Error::ReadFailure(_) | Error::ReadCancelled | Error::MemoryBudgetExceeded { .. }) { return Err(err); }
+                        if !warned_in_execution_pull_failure {
                         warned_in_execution_pull_failure = true;
                         tracing::warn!(
                             node_id = %config.node_id,
@@ -668,6 +803,7 @@ pub async fn poll_and_execute_once(
                             "in-execution pull failed; will keep executing and stop \
                              warning for the rest of this attempt"
                         );
+                        }
                     }
                     execution_pull.as_mut().reset(
                         tokio::time::Instant::now()
@@ -675,14 +811,17 @@ pub async fn poll_and_execute_once(
                     );
                 }
                 Some(reply_tx) = abandon_check_rx.recv() => {
-                    let should_abandon = ledger::should_abandon(
-                        client.db(),
-                        &job_id_for_check,
-                        attempt,
-                        &node_for_check,
-                        now_ms,
-                    )
-                    .unwrap_or(true);
+                    let should_abandon = match ledger::should_abandon_with_read_memory(client.db(), &job_id_for_check, attempt, &node_for_check, now_ms, read_memory.clone()) {
+                        Ok(abandon) => abandon,
+                        Err(err @ (Error::ReadFailure(_) | Error::ReadCancelled | Error::MemoryBudgetExceeded { .. })) => {
+                            // Closing the reply uses the callback's existing cooperative
+                            // stop path. Return the original refusal before any durable
+                            // result, failure, or abandonment is recorded.
+                            drop(reply_tx);
+                            return Err(err);
+                        }
+                        Err(_) => true,
+                    };
                     let _ = reply_tx.send(should_abandon);
                 }
             }
@@ -690,7 +829,7 @@ pub async fn poll_and_execute_once(
 
         return match verdict {
             ExecutionVerdict::Completed(output) => {
-                ledger::record_result(
+                ledger::record_result_with_read_memory(
                     db,
                     &job.job_id,
                     attempt,
@@ -698,16 +837,25 @@ pub async fn poll_and_execute_once(
                     &output.output,
                     output.receipt,
                     now_ms,
+                    read_memory.clone(),
                 )?;
-                let _ = client.push().await;
+                tolerate_offline_sync(client.push_with_read_memory(read_memory.clone()).await)?;
                 Ok(PollOutcome::Executed {
                     job_id: job.job_id,
                     attempt,
                 })
             }
             ExecutionVerdict::Failed(error) => {
-                ledger::record_failure(db, &job.job_id, attempt, &config.node_id, &error, now_ms)?;
-                let _ = client.push().await;
+                ledger::record_failure_with_read_memory(
+                    db,
+                    &job.job_id,
+                    attempt,
+                    &config.node_id,
+                    &error,
+                    now_ms,
+                    read_memory.clone(),
+                )?;
+                tolerate_offline_sync(client.push_with_read_memory(read_memory.clone()).await)?;
                 Ok(PollOutcome::Failed {
                     job_id: job.job_id,
                     attempt,
@@ -716,7 +864,7 @@ pub async fn poll_and_execute_once(
             ExecutionVerdict::Abandoned => {
                 // No rows to write; push whatever else is pending (for
                 // example a cancellation observed locally) and move on.
-                let _ = client.push().await;
+                tolerate_offline_sync(client.push_with_read_memory(read_memory.clone()).await)?;
                 Ok(PollOutcome::Abandoned { job_id: job.job_id })
             }
         };
@@ -727,6 +875,19 @@ pub async fn poll_and_execute_once(
     } else {
         PollOutcome::NoMatchingWork
     })
+}
+
+fn tolerate_offline_sync(
+    result: Result<contextdb_engine::sync_types::ApplyResult, Error>,
+) -> Result<(), Error> {
+    match result {
+        Err(
+            err @ (Error::ReadFailure(_)
+            | Error::ReadCancelled
+            | Error::MemoryBudgetExceeded { .. }),
+        ) => Err(err),
+        _ => Ok(()),
+    }
 }
 
 fn wall_now_ms() -> i64 {
@@ -747,12 +908,33 @@ pub async fn run_worker_loop(
     poll_interval: Duration,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Error> {
-    ledger::advertise_capability(
+    run_worker_loop_with_read_budget_provider(
+        client,
+        client.db().declared_read_request_provider(),
+        config,
+        executor,
+        poll_interval,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_worker_loop_with_read_budget_provider(
+    client: &SyncClient,
+    read_budgets: Arc<dyn contextdb_engine::vector_read_memory::ReadRequestBudgetProvider>,
+    config: &WorkerConfig,
+    executor: Arc<dyn WorkExecutor>,
+    poll_interval: Duration,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Error> {
+    let read_memory = read_budgets.request_budget()?;
+    ledger::advertise_capability_with_read_memory(
         client.db(),
         &config.node_id,
         WORKER_LOOP_CAPABILITY,
         &config.advertised_tags,
         wall_now_ms(),
+        read_memory.clone(),
     )?;
     // The startup push can miss a hub that is not yet reachable; it is not
     // swallowed silently — a miss is surfaced, and the standing poll loop below
@@ -761,15 +943,23 @@ pub async fn run_worker_loop(
     // hub over this same db) skips the push outright — its advertisement is
     // already in the canonical store, and there is no dialable hub to miss.
     if !config.writes_are_canonical
-        && let Err(err) = client.push().await
+        && let Err(err) = client.push_with_read_memory(read_memory.clone()).await
     {
+        if matches!(
+            &err,
+            Error::ReadFailure(_) | Error::ReadCancelled | Error::MemoryBudgetExceeded { .. }
+        ) {
+            return Err(err);
+        }
         tracing::debug!(
             node_id = %config.node_id,
             error = %err,
             "worker startup capability push missed; will re-push on the poll cadence"
         );
     }
+    drop(read_memory);
     while !shutdown.load(Ordering::SeqCst) {
+        let read_memory = read_budgets.request_budget()?;
         // Keep this node's advertisement CURRENT, not merely re-delivered:
         // re-advertise (upsert) on the poll cadence so `advertised_at` tracks
         // liveness. A consumer edge has no hub-local last-contact clock
@@ -780,14 +970,23 @@ pub async fn run_worker_loop(
         // TTL. The upsert keeps a single row (capability_key primary key), and
         // work_capabilities' LatestWins sync propagates the refresh to the hub
         // and onward to every consumer edge on its next pull.
-        ledger::advertise_capability(
+        ledger::advertise_capability_with_read_memory(
             client.db(),
             &config.node_id,
             WORKER_LOOP_CAPABILITY,
             &config.advertised_tags,
             wall_now_ms(),
+            read_memory.clone(),
         )?;
-        poll_and_execute_once(client, config, Arc::clone(&executor), wall_now_ms()).await?;
+        poll_and_execute_once_with_read_memory(
+            client,
+            read_memory.clone(),
+            config,
+            Arc::clone(&executor),
+            wall_now_ms(),
+        )
+        .await?;
+        drop(read_memory);
         tokio::time::sleep(poll_interval).await;
     }
     Ok(())

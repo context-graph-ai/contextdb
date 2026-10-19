@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 use uuid::Uuid;
@@ -299,7 +299,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
     )?;
 
     let edge_db = Arc::new(Database::open(&edge_path).map_err(|e| e.to_string())?);
-    let client = custody_client(&edge_db, &hub, &edge_identity);
+    let client = custody_client(&edge_db, &hub, &edge_identity)?;
     custody_within(client.push(), "initial authenticated exchange").await?;
     if edge_db.retention_sync_peer().as_deref() != Some(hub.node_id.as_str()) {
         return Err("normal exchange did not enroll the edge with this hub".into());
@@ -407,7 +407,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
         3,
         "complete binding survives reopen; mismatching expectation changes nothing",
     )?;
-    let client = custody_client(&edge_db, &hub, &edge_identity);
+    let client = custody_client(&edge_db, &hub, &edge_identity)?;
 
     // 4. Check the mismatching door before the member table exists.
     edge_db
@@ -528,7 +528,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
     run_snapshot_export(&args.cli, &hub_path, &backup)?;
     let mut killed_hub =
         CustodyHub::start(&hub_path, &hub_identity, CheckpointMode::AfterApply).await?;
-    let interrupted = custody_client(&edge_db, &killed_hub, &edge_identity);
+    let interrupted = custody_client(&edge_db, &killed_hub, &edge_identity)?;
     commit_custody_unit(&edge_db, root_three, "lost-ack-root", &[])?;
     let fourth_lsn = edge_db.current_lsn();
     require_custody_counts(&edge_db, 1, 1, 1)?;
@@ -602,7 +602,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
     if restarted.node_id != binding.hub_node_id() {
         return Err("same-state restart changed the hub's node identity".into());
     }
-    let recovered = custody_client(&edge_db, &restarted, &edge_identity);
+    let recovered = custody_client(&edge_db, &restarted, &edge_identity)?;
     let fetched = custody_within(
         recovered.fetch_delivery_outcomes(None),
         "lost-ack outcome fetch",
@@ -719,7 +719,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
     {
         return Err("pre-outcome backup unexpectedly contains the fourth unit".into());
     }
-    let restore_client = custody_client(&edge_db, &restored, &edge_identity);
+    let restore_client = custody_client(&edge_db, &restored, &edge_identity)?;
     custody_within(
         restore_client.pull_default(),
         "restore authority discovery through pull's status probe",
@@ -850,7 +850,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
     require_root_outcomes_erased(&hub_before_purge, &hub_after_purge, &root_one_key)?;
     let mut purged_hub =
         CustodyHub::start(&restored_path, &restored_identity, CheckpointMode::Observe).await?;
-    let purge_client = custody_client(&edge_db, &purged_hub, &edge_identity);
+    let purge_client = custody_client(&edge_db, &purged_hub, &edge_identity)?;
     custody_within(purge_client.pull_default(), "purge reconnect").await?;
     let after_purge_fetch = custody_within(
         purge_client.fetch_delivery_outcomes(None),
@@ -960,7 +960,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
     }
     let mut discard_hub =
         CustodyHub::start(&restored_path, &restored_identity, CheckpointMode::Observe).await?;
-    let discard_client = custody_client(&edge_db, &discard_hub, &edge_identity);
+    let discard_client = custody_client(&edge_db, &discard_hub, &edge_identity)?;
     if discard_client
         .pending_push_change_count()
         .map_err(|e| e.to_string())?
@@ -1025,12 +1025,17 @@ fn custody_expectation() -> Result<ApplicationTablePolicyExpectation, String> {
         .map_err(|e| e.to_string())
 }
 
-fn custody_client(db: &Arc<Database>, hub: &CustodyHub, identity: &Path) -> SyncClient {
+fn custody_client(
+    db: &Arc<Database>,
+    hub: &CustodyHub,
+    identity: &Path,
+) -> Result<SyncClient, String> {
     SyncClient::new(
         db.clone(),
         &peer_dial_spec(&hub.ticket, identity),
         TenantId::from(CUSTODY_TENANT),
     )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))
 }
 
 async fn custody_within<T>(
@@ -1788,7 +1793,8 @@ async fn run_hub(args: HubArgs) -> Result<(), String> {
         database.clone(),
         &endpoint,
         TenantId::from(args.tenant_id.as_str()),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke server: {e}"))?;
     let reported_db = args.db.display().to_string();
     std::thread::spawn(move || {
         while let Ok(checkpoint) = checkpoints.recv() {
@@ -1807,6 +1813,10 @@ async fn run_hub(args: HubArgs) -> Result<(), String> {
                     "transfer_digest": hex(&transfer_digest),
                     "sequence": sequence,
                     "next_missing": next_missing,
+                }),
+                ProductionSmokeCheckpoint::NativeDeliveryServed { ok } => json!({
+                    "event": "native_delivery_served",
+                    "ok": ok,
                 }),
                 ProductionSmokeCheckpoint::PushRequestPath {
                     request_digest,
@@ -1837,13 +1847,18 @@ async fn run_hub(args: HubArgs) -> Result<(), String> {
         }
     });
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal = shutdown.clone();
+    // The verifier hub serves delivery on the native route (file-backed
+    // stores), with every other subject on its Legacy handler, so the
+    // two-process journeys exercise native delivery under default budgets.
+    let stop = server
+        .native_stop(Arc::new(AtomicBool::new(false)))
+        .map_err(|error| format!("cannot prepare native delivery: {error}"))?;
+    let signal = stop.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        signal.store(true, Ordering::SeqCst);
+        signal.request_stop();
     });
-    server.run_until(shutdown).await;
+    server.run_until_stopped(stop).await;
     endpoint.close().await;
     database
         .close()
@@ -1903,7 +1918,8 @@ async fn run_ddl_source(args: DdlSourceArgs) -> Result<(), String> {
         database.clone(),
         &dial,
         TenantId::from(args.tenant_id.as_str()),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     match args.phase {
         DdlPhase::AuthorPush => {
             print_ddl_vector(&database, "authored_ddl_vector")?;
@@ -1961,7 +1977,9 @@ async fn run_ddl_source(args: DdlSourceArgs) -> Result<(), String> {
 }
 
 fn print_ddl_vector(database: &Database, event: &str) -> Result<(), String> {
-    let authored = database.changes_since(contextdb_core::Lsn(0));
+    let authored = database
+        .changes_since(contextdb_core::Lsn(0))
+        .map_err(|e| format!("cannot read smoke changes: {e}"))?;
     let (kinds, ddl_lsn) = exact_fixture_ddl_vector(&authored)?;
     println!(
         "{}",
@@ -2029,12 +2047,16 @@ fn print_refused_ddl_state(database: &Database) -> Result<(), String> {
     let canonical = Database::open_memory();
     contextdb_server::work_ledger::install_node_contacts_schema(&canonical)
         .map_err(|_| "cannot construct canonical transport schema".to_string())?;
-    let canonical_changes = canonical.changes_since(contextdb_core::Lsn(0));
+    let canonical_changes = canonical
+        .changes_since(contextdb_core::Lsn(0))
+        .map_err(|e| format!("cannot read smoke changes: {e}"))?;
     let canonical_meta = canonical
         .table_meta(CONTACT_TABLE)
         .ok_or_else(|| "canonical transport schema has no table metadata".to_string())?;
 
-    let changes = database.changes_since(contextdb_core::Lsn(0));
+    let changes = database
+        .changes_since(contextdb_core::Lsn(0))
+        .map_err(|e| format!("cannot read smoke changes: {e}"))?;
     validate_refused_ddl_state(
         &table_names,
         database.list_triggers().len(),
@@ -2103,7 +2125,8 @@ async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
         database.clone(),
         &dial,
         TenantId::from(args.tenant_id.as_str()),
-    );
+    )
+    .map_err(|e| format!("cannot construct smoke client: {e}"))?;
     if matches!(args.phase, OversizedPhase::BootstrapAndSeed) {
         let fixture_table = match args.fixture {
             RequestFixture::Ordinary => "smoke_ordinary",
@@ -2200,13 +2223,14 @@ async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
                 "applied_rows": result.applied_rows,
             })
         ),
-        Err(_) => {
+        Err(error) => {
             println!(
                 "{}",
                 json!({
                     "event": "oversized_push_unconfirmed",
                     "source_lsn": source_lsn,
                     "push_watermark_after": client.push_watermark().0,
+                    "error": error.to_string(),
                 })
             );
             std::io::stdout().flush().map_err(|_| "stdout failed")?;
@@ -2214,7 +2238,7 @@ async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
             database
                 .close()
                 .map_err(|_| "cannot close oversized source database".to_string())?;
-            return Err("oversized push was not confirmed".to_string());
+            return Err(format!("oversized push was not confirmed: {error}"));
         }
     }
     client.shutdown().await;
@@ -2649,7 +2673,9 @@ mod ddl_vector_tests {
                 &HashMap::new(),
             )
             .unwrap();
-        let mut changes = database.changes_since(Lsn(0));
+        let mut changes = database
+            .changes_since(Lsn(0))
+            .expect("read transport schema changes");
         let canonical_ddl = changes.ddl.clone();
         let canonical_meta = database.table_meta("work_node_contacts").unwrap();
         let DdlChange::CreateTable { columns, .. } = &mut changes.ddl[0] else {

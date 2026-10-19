@@ -1,6 +1,9 @@
-new
 db
-transfer_receipts
-schema_sync_holdbacks
+native_stop
+new
+new_with_read_budget_provider
 run
 run_until
+run_until_stopped
+schema_sync_holdbacks
+transfer_receipts

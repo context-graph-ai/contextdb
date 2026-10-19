@@ -1,3 +1,5 @@
+#[path = "../../contextdb-tx/tests/support/read_memory.rs"]
+mod test_read_memory;
 use contextdb_core::{Direction, EdgeType, Error, GraphExecutor, RowId, Value};
 use contextdb_graph::{GraphStore, MemGraphExecutor};
 use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
@@ -10,7 +12,11 @@ struct TestStore {
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
         self.graph.apply_inserts(ws.adj_inserts.clone());
         self.graph.apply_deletes(ws.adj_deletes.clone());
         Ok(())
@@ -41,9 +47,21 @@ fn connect(
     edge_type: &str,
 ) {
     let tx = tx_mgr.begin();
-    exec.insert_edge(tx, source, target, edge_type.to_string(), HashMap::new())
+    exec.insert_edge(
+        tx,
+        source,
+        target,
+        edge_type.to_string(),
+        HashMap::new(),
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .unwrap();
+    tx_mgr
+        .commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
-    tx_mgr.commit(tx).unwrap();
 }
 
 #[test]
@@ -56,7 +74,15 @@ fn bfs_depth_bound_on_chain() {
     }
 
     let r = exec
-        .bfs(nodes[0], None, Direction::Outgoing, 1, 3, tx_mgr.snapshot())
+        .bfs(
+            nodes[0],
+            None,
+            Direction::Outgoing,
+            1,
+            3,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
     assert_eq!(r.nodes.len(), 3);
 }
@@ -73,7 +99,15 @@ fn bfs_cycle_no_duplicates() {
     connect(&tx_mgr, &exec, c, a, "R");
 
     let r = exec
-        .bfs(a, None, Direction::Outgoing, 1, 5, tx_mgr.snapshot())
+        .bfs(
+            a,
+            None,
+            Direction::Outgoing,
+            1,
+            5,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
     assert_eq!(r.nodes.len(), 2);
 }
@@ -89,11 +123,29 @@ fn bfs_respects_mvcc_snapshot() {
     let snap1 = tx_mgr.snapshot();
     connect(&tx_mgr, &exec, b, c, "R");
 
-    let old = exec.bfs(a, None, Direction::Outgoing, 1, 5, snap1).unwrap();
+    let old = exec
+        .bfs(
+            a,
+            None,
+            Direction::Outgoing,
+            1,
+            5,
+            snap1,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
     assert_eq!(old.nodes.len(), 1);
 
     let new = exec
-        .bfs(a, None, Direction::Outgoing, 1, 5, tx_mgr.snapshot())
+        .bfs(
+            a,
+            None,
+            Direction::Outgoing,
+            1,
+            5,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
     assert_eq!(new.nodes.len(), 2);
 }
@@ -109,7 +161,15 @@ fn accepts_max_depth_one() {
     connect(&tx_mgr, &exec, b, c, "R");
 
     let r = exec
-        .bfs(a, None, Direction::Outgoing, 1, 1, tx_mgr.snapshot())
+        .bfs(
+            a,
+            None,
+            Direction::Outgoing,
+            1,
+            1,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
     assert_eq!(r.nodes.len(), 1);
 }
@@ -127,13 +187,33 @@ fn bfs_visited_limit_error() {
 
     let tx = tx_mgr.begin();
     for _ in 0..101 {
-        exec.insert_edge(tx, root, Uuid::new_v4(), "R".to_string(), HashMap::new())
-            .unwrap();
+        exec.insert_edge(
+            tx,
+            root,
+            Uuid::new_v4(),
+            "R".to_string(),
+            HashMap::new(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
     }
-    tx_mgr.commit(tx).unwrap();
+    tx_mgr
+        .commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
 
     let err = exec
-        .bfs(root, None, Direction::Outgoing, 1, 1, tx_mgr.snapshot())
+        .bfs(
+            root,
+            None,
+            Direction::Outgoing,
+            1,
+            1,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::BfsVisitedExceeded(100)));
 }
@@ -149,12 +229,24 @@ fn direction_incoming_and_both() {
     connect(&tx_mgr, &exec, c, b, "R");
 
     let incoming = exec
-        .neighbors(b, None, Direction::Incoming, tx_mgr.snapshot())
+        .neighbors(
+            b,
+            None,
+            Direction::Incoming,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
     assert_eq!(incoming.len(), 2);
 
     let both = exec
-        .neighbors(b, None, Direction::Both, tx_mgr.snapshot())
+        .neighbors(
+            b,
+            None,
+            Direction::Both,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
     assert_eq!(both.len(), 2);
 }
@@ -166,7 +258,15 @@ fn edge_type_filtering_and_empty_graph() {
     let b = Uuid::new_v4();
 
     let empty = exec
-        .bfs(a, None, Direction::Outgoing, 1, 1, tx_mgr.snapshot())
+        .bfs(
+            a,
+            None,
+            Direction::Outgoing,
+            1,
+            1,
+            tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
         .unwrap();
     assert!(empty.nodes.is_empty());
 
@@ -181,6 +281,7 @@ fn edge_type_filtering_and_empty_graph() {
             1,
             1,
             tx_mgr.snapshot(),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
         )
         .unwrap();
     assert!(r.nodes.is_empty());

@@ -158,7 +158,7 @@ async fn build_fixture(size: usize, iteration: u64) -> BenchFixture {
     let endpoint = IrohServer::bind(&bind_spec(&holder_key))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    holder.serve_on(&endpoint).expect("serve holder blobs");
     let ticket = endpoint.ticket();
 
     let consumer_db = Arc::new(Database::open_memory());

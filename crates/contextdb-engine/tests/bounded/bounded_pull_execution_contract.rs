@@ -279,55 +279,39 @@ fn bounded_limits_are_data_derived_exact_and_return_typed_refusals() {
         one_past_memory.memory,
     );
 
-    // A read's local memory ceiling is not a substitute for the database-wide
-    // accountant.  The same dynamic result must fit both charges, and a
-    // refused second charge must roll back the first rather than leak capacity.
+    // Reader owners fund each operation independently of the writer accountant.
+    // The adapter returns an unowned public answer after operation-end refund.
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let dual_charge = Database::open_memory_with_accountant(Arc::clone(&accountant));
     seed_relational(&dual_charge, "dual_charge_rows", 37, 19);
     let dual_sql = "SELECT id, payload FROM dual_charge_rows WHERE id < 7 ORDER BY id";
-    let baseline = accountant.usage().used;
-    let dual_profile = bounded_success(
-        &dual_charge,
-        &request(dual_sql, HashMap::new(), roomy_limits(), &clock),
-    );
-    assert!(dual_profile.telemetry.peak_temporary_bytes > 0);
-    let dual_peak_bytes = usize::try_from(dual_profile.telemetry.peak_temporary_bytes)
-        .expect("profiled temporary bytes fit the database accountant's native size");
-    accountant
-        .set_budget(Some(baseline.saturating_add(dual_peak_bytes)))
-        .expect("exact database-wide headroom");
-    assert!(
-        bounded_success(
+    let writer_baseline = accountant.usage().used;
+    let reader = dual_charge.declared_read_memory_for_test();
+    let baseline = reader.retained_bytes_for_test();
+    let probe = Arc::new(SourceLoopPoisonProbe::new(clock.clone(), reader.clone(), 0));
+    let mut dual_request = request(dual_sql, HashMap::new(), roomy_limits(), &clock);
+    dual_request.probe = Some(probe.clone());
+    let dual_profile = bounded_success(&dual_charge, &dual_request);
+    let peak = dual_profile.telemetry.peak_temporary_bytes;
+    assert!(peak > 0);
+    assert!(probe.peak_temporary_accounted_bytes() >= peak);
+    assert_eq!(reader.retained_bytes_for_test(), baseline);
+    assert_eq!(accountant.usage().used, writer_baseline);
+    drop(dual_profile);
+    assert_eq!(reader.retained_bytes_for_test(), baseline);
+    let mut short = roomy_limits();
+    short.memory = peak - 1;
+    assert_limit(
+        bounded::execute(
             &dual_charge,
-            &request(dual_sql, HashMap::new(), roomy_limits(), &clock),
+            &request(dual_sql, HashMap::new(), short, &clock),
         )
-        .telemetry
-        .peak_temporary_bytes
-            <= dual_profile.telemetry.peak_temporary_bytes
+        .expect_err("one-byte-short reader admission refuses before retaining the answer"),
+        ReadFailureLimit::Memory,
+        short.memory,
     );
-    accountant
-        .set_budget(Some(
-            baseline.saturating_add(dual_peak_bytes).saturating_sub(1),
-        ))
-        .expect("one-byte-short database-wide headroom");
-    let limit = baseline.saturating_add(dual_peak_bytes).saturating_sub(1);
-    let error = dual_charge
-        .read_session(roomy_limits())
-        .unwrap()
-        .execute(dual_sql, &HashMap::new())
-        .expect_err("a per-read success may not overdraw database-wide memory");
-    assert!(
-        matches!(error, contextdb_core::Error::MemoryBudgetExceeded {
-        budget_limit_bytes, requested_bytes, available_bytes, ..
-    } if budget_limit_bytes == limit && requested_bytes > available_bytes),
-        "the STORE budget that actually refused is preserved: {error:?}"
-    );
-    assert_eq!(
-        accountant.usage().used,
-        baseline,
-        "refusal releases all temporary state"
-    );
+    assert_eq!(reader.retained_bytes_for_test(), baseline);
+    assert_eq!(accountant.usage().used, writer_baseline);
 }
 
 /// LIMIT stops the table source, while an unindexed sort cannot pretend it can
@@ -1023,13 +1007,16 @@ fn assert_scoped_candidate_limits(
         shared_work_limit,
     );
 
-    let source_peak = profile
+    // The work-refusal probe above warms durable pages. Price the memory
+    // refusal in that same state, rather than using the earlier cold profile.
+    let memory_profile = bounded_success(db, &request(sql, params.clone(), roomy_limits(), clock));
+    let source_peak = memory_profile
         .telemetry
         .source_peak_temporary_bytes
         .get(&source)
         .copied()
         .unwrap_or_default();
-    let access_peak = profile
+    let access_peak = memory_profile
         .telemetry
         .source_peak_temporary_bytes
         .get(&bounded::TestWorkSource::AccessControl)
@@ -1482,7 +1469,11 @@ fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
         })
         .expect("sealed source observer wraps a real prebuilt HNSW search");
     let trace = db
-        .__debug_last_query_vector_trace_for_test()
+        .__debug_last_query_vector_trace_for_test(
+            db.declared_reader_memory()
+                .expect("admit the trace observation reader"),
+        )
+        .expect("admit the trace observation copy")
         .expect("observed HNSW query publishes its trace");
     let observed_events = observer.events.load(Ordering::SeqCst);
     assert!(trace.used_hnsw);
@@ -1504,7 +1495,7 @@ fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
 
 struct SourceLoopPoisonProbe {
     clock: ManualClock,
-    accountant: Arc<MemoryAccountant>,
+    reader: Arc<contextdb_engine::vector_read_memory::DeclaredReadMemory>,
     baseline_accounted_bytes: usize,
     poison_before_work_at: Option<u64>,
     poison_reservation_above: Option<u64>,
@@ -1513,6 +1504,7 @@ struct SourceLoopPoisonProbe {
     work_calls: AtomicU64,
     source_touches: Mutex<BTreeMap<bounded::TestSourceTouch, u64>>,
     peak_temporary_accounted_bytes: AtomicU64,
+    peak_request_owned_bytes: AtomicU64,
     cancellation_calls: AtomicU64,
     cancelled: AtomicBool,
 }
@@ -1520,13 +1512,13 @@ struct SourceLoopPoisonProbe {
 impl SourceLoopPoisonProbe {
     fn new(
         clock: ManualClock,
-        accountant: Arc<MemoryAccountant>,
-        baseline_accounted_bytes: usize,
+        reader: Arc<contextdb_engine::vector_read_memory::DeclaredReadMemory>,
+        _baseline_accounted_bytes: usize,
     ) -> Self {
         Self {
             clock,
-            accountant,
-            baseline_accounted_bytes,
+            baseline_accounted_bytes: reader.retained_bytes_for_test() as usize,
+            reader,
             poison_before_work_at: None,
             poison_reservation_above: None,
             poison_source_after: None,
@@ -1534,6 +1526,7 @@ impl SourceLoopPoisonProbe {
             work_calls: AtomicU64::new(0),
             source_touches: Mutex::new(BTreeMap::new()),
             peak_temporary_accounted_bytes: AtomicU64::new(0),
+            peak_request_owned_bytes: AtomicU64::new(0),
             cancellation_calls: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
         }
@@ -1637,17 +1630,16 @@ impl bounded::ExecutionProbe for SourceLoopPoisonProbe {
         _reserved_bytes: u64,
         held_temporary_bytes: u64,
     ) {
-        let actually_accounted = self
-            .accountant
-            .usage()
-            .used
-            .saturating_sub(self.baseline_accounted_bytes) as u64;
+        let actually_accounted = self.reader.retained_bytes_for_test();
         assert!(
             actually_accounted >= held_temporary_bytes,
-            "the bounded request's claimed temporary state is reserved in the database accountant"
+            "the bounded request's claimed temporary state is reserved in the reader owner: accounted={actually_accounted}, held={held_temporary_bytes}, baseline={}",
+            self.baseline_accounted_bytes
         );
         self.peak_temporary_accounted_bytes
             .fetch_max(actually_accounted, Ordering::SeqCst);
+        self.peak_request_owned_bytes
+            .fetch_max(held_temporary_bytes, Ordering::SeqCst);
     }
 
     fn cancellation_observed(&self, _completed_work: u64) {
@@ -1663,7 +1655,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     let profile_clock = ManualClock::default();
     let profile_probe = Arc::new(SourceLoopPoisonProbe::new(
         profile_clock.clone(),
-        Arc::clone(accountant),
+        case.db.declared_read_memory_for_test(),
         baseline,
     ));
     let mut profile_request = request(
@@ -1675,7 +1667,11 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     profile_request.probe = Some(profile_probe.clone());
     let profile = bounded_success(case.db, &profile_request);
     let exact_work = profile_probe.work_units();
-    let exact_memory = profile_probe.peak_temporary_accounted_bytes();
+    let exact_memory = profile_probe
+        .peak_request_owned_bytes
+        .load(Ordering::SeqCst);
+    let accountant_peak = profile_probe.peak_temporary_accounted_bytes();
+    assert!(accountant_peak >= exact_memory);
     let source_items = profile_probe.source_items(case.touch);
     assert!(exact_work > 0, "{} performs real charged work", case.name);
     assert!(
@@ -1718,7 +1714,12 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         );
         let trace = case
             .db
-            .__debug_last_query_vector_trace_for_test()
+            .__debug_last_query_vector_trace_for_test(
+                case.db
+                    .declared_reader_memory()
+                    .expect("admit the trace observation reader"),
+            )
+            .expect("admit the trace observation copy")
             .expect("the HNSW source publishes its ordinary debug trace");
         assert!(
             source_items >= trace.hnsw_candidate_count as u64,
@@ -1741,7 +1742,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     let one_less_work_probe = Arc::new(
         SourceLoopPoisonProbe::new(
             one_less_work_clock.clone(),
-            Arc::clone(accountant),
+            case.db.declared_read_memory_for_test(),
             baseline,
         )
         .poison_before_work_at(exact_work - 1)
@@ -1784,7 +1785,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     let one_less_memory_probe = Arc::new(
         SourceLoopPoisonProbe::new(
             one_less_memory_clock.clone(),
-            Arc::clone(accountant),
+            case.db.declared_read_memory_for_test(),
             baseline,
         )
         .poison_reservation_above(exact_memory - 1),
@@ -1814,7 +1815,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     let exact_active_clock = ManualClock::default();
     let exact_active_probe = Arc::new(SourceLoopPoisonProbe::new(
         exact_active_clock.clone(),
-        Arc::clone(accountant),
+        case.db.declared_read_memory_for_test(),
         baseline,
     ));
     let mut exact_active_limits = roomy_limits();
@@ -1831,7 +1832,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     let one_less_active_probe = Arc::new(
         SourceLoopPoisonProbe::new(
             one_less_active_clock.clone(),
-            Arc::clone(accountant),
+            case.db.declared_read_memory_for_test(),
             baseline,
         )
         .poison_before_work_at(exact_work - 1),
@@ -1855,9 +1856,13 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     let cancellation_clock = ManualClock::default();
     let cancellation = OwnerReadCancellation::new();
     let cancellation_probe = Arc::new(
-        SourceLoopPoisonProbe::new(cancellation_clock.clone(), Arc::clone(accountant), baseline)
-            .cancel_on_first_touch(case.touch, cancellation.clone())
-            .poison_source_after(case.touch, 1),
+        SourceLoopPoisonProbe::new(
+            cancellation_clock.clone(),
+            case.db.declared_read_memory_for_test(),
+            baseline,
+        )
+        .cancel_on_first_touch(case.touch, cancellation.clone())
+        .poison_source_after(case.touch, 1),
     );
     let mut cancellation_request =
         request(case.sql, case.params, roomy_limits(), &cancellation_clock);
@@ -1953,7 +1958,11 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
         .expect("prebuild persistent HNSW state outside the bounded request");
     assert!(db.__debug_last_query_vector_used_hnsw_for_test());
     let hnsw_trace = db
-        .__debug_last_query_vector_trace_for_test()
+        .__debug_last_query_vector_trace_for_test(
+            db.declared_reader_memory()
+                .expect("admit the trace observation reader"),
+        )
+        .expect("admit the trace observation copy")
         .expect("the ordinary prebuild publishes the graph it actually searched");
     assert_eq!(hnsw_trace.index, matrix_hnsw_index);
     assert!(hnsw_trace.used_hnsw);
@@ -2071,7 +2080,7 @@ fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() 
     )
     .expect("insert the version visible to the held snapshot");
     let old_snapshot = db.snapshot();
-    let _old_pin = db.pin_snapshot(old_snapshot);
+    let _old_pin = db.pin_snapshot(old_snapshot).unwrap();
     for version in 1..STORED_VERSIONS {
         db.execute(
             "UPDATE mostly_dead_vectors SET embedding = $embedding WHERE id = 1",
@@ -2082,9 +2091,17 @@ fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() 
         )
         .expect("append a real superseding vector version");
     }
+    let mut vector_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the vector observation reader"),
+    );
+
     assert_eq!(
         db.vector_store_for_test()
-            .entries_for_index(&VectorIndexRef::new("mostly_dead_vectors", "embedding"))
+            .entries_for_index(
+                &VectorIndexRef::new("mostly_dead_vectors", "embedding"),
+                &mut vector_observation_owner_1
+            )
             .expect("inspect the physical vector history")
             .len(),
         STORED_VERSIONS as usize,
@@ -2099,7 +2116,7 @@ fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() 
     let direct_clock = ManualClock::default();
     let direct_probe = Arc::new(SourceLoopPoisonProbe::new(
         direct_clock.clone(),
-        Arc::clone(&accountant),
+        db.declared_read_memory_for_test(),
         baseline,
     ));
     let mut direct_request = request(sql, bound.clone(), roomy_limits(), &direct_clock);
@@ -2149,7 +2166,7 @@ fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() 
     let cursor_clock = ManualClock::default();
     let cursor_probe = Arc::new(SourceLoopPoisonProbe::new(
         cursor_clock.clone(),
-        Arc::clone(&accountant),
+        db.declared_read_memory_for_test(),
         baseline,
     ));
     let mut cursor_limits = roomy_limits();
@@ -2808,7 +2825,7 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
     );
 }
 
-/// Every terminal cursor path releases both database-accounted source state
+/// Every terminal cursor path releases reader-accounted source state
 /// and the snapshot registration that protects a future row version.
 #[test]
 fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
@@ -2821,7 +2838,8 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
     let mut limits = roomy_limits();
     limits.result_rows = 2;
     limits.cursor_page_rows = 2;
-    let baseline_memory = accountant.usage().used;
+    let reader = memory_db.declared_read_memory_for_test();
+    let baseline_memory = reader.retained_bytes_for_test();
     let mut memory_cursor = bounded::open_cursor(
         Arc::clone(&memory_db),
         &request(
@@ -2833,19 +2851,26 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
     )
     .expect("open cursor with retained source state");
     assert!(memory_cursor.first_page.has_more);
-    let memory_while_open = accountant.usage().used;
+    drop(memory_cursor.first_page);
+    let memory_while_open = reader.retained_bytes_for_test();
     assert!(
         memory_while_open > baseline_memory,
-        "retained cursor state is visible in the database accountant"
+        "retained cursor state is visible in the reader owner"
     );
     memory_cursor
         .cursor
         .close()
         .expect("close memory-accounted cursor");
+    let closed_receipt_bytes = reader.retained_bytes_for_test() - baseline_memory;
+    assert!(
+        closed_receipt_bytes > 0 && closed_receipt_bytes < memory_while_open - baseline_memory,
+        "close releases continuation state and retains one admitted terminal receipt"
+    );
+    drop(memory_cursor.cursor);
     assert_eq!(
-        accountant.usage().used,
+        reader.retained_bytes_for_test(),
         baseline_memory,
-        "close returns every retained byte to the database accountant"
+        "dropping the cursor refunds its final observation"
     );
     let mut exhausted_cursor = bounded::open_cursor(
         Arc::clone(&memory_db),
@@ -2858,6 +2883,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
     )
     .expect("open cursor for exhaustion release");
     let mut has_more = exhausted_cursor.first_page.has_more;
+    drop(exhausted_cursor.first_page);
     while has_more {
         let page = exhausted_cursor
             .cursor
@@ -2865,10 +2891,20 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .expect("drain cursor to genuine exhaustion");
         has_more = page.page.has_more;
     }
+    exhausted_cursor
+        .cursor
+        .close()
+        .expect("release the exhausted cursor's columns");
     assert_eq!(
-        accountant.usage().used,
+        reader.retained_bytes_for_test() - baseline_memory,
+        closed_receipt_bytes,
+        "the same query retains exactly one observation after close"
+    );
+    drop(exhausted_cursor.cursor);
+    assert_eq!(
+        reader.retained_bytes_for_test(),
         baseline_memory,
-        "the terminal page auto-releases every retained byte"
+        "dropping the exhausted cursor refunds its final observation"
     );
 
     memory_db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -2889,7 +2925,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             )
             .expect("insert snapshot cursor row");
     }
-    let snapshot_baseline_memory = accountant.usage().used;
+    let snapshot_baseline_memory = reader.retained_bytes_for_test();
     let mut snapshot_cursor = bounded::open_cursor(
         Arc::clone(&memory_db),
         &request(
@@ -2901,9 +2937,10 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
     )
     .expect("open snapshot-pinning cursor");
     assert!(snapshot_cursor.first_page.has_more);
+    drop(snapshot_cursor.first_page);
     assert!(
-        accountant.usage().used > snapshot_baseline_memory,
-        "the live snapshot cursor keeps its retained bytes in the database accountant"
+        reader.retained_bytes_for_test() > snapshot_baseline_memory,
+        "the live snapshot cursor keeps its retained bytes in the reader owner"
     );
     memory_db
         .execute(
@@ -2926,8 +2963,8 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         memory_db.__physical_version_count_for_test("cursor_snapshot_rows"),
         7
     );
-    let used_before_exhaustion = accountant.usage().used;
-    let mut has_more = snapshot_cursor.first_page.has_more;
+    let used_before_exhaustion = reader.retained_bytes_for_test();
+    let mut has_more = true;
     while has_more {
         let page = snapshot_cursor
             .cursor
@@ -2935,16 +2972,23 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .expect("drain cursor with the superseded row still in its future");
         has_more = page.page.has_more;
     }
-    let used_after_exhaustion = accountant.usage().used;
+    let used_after_exhaustion = reader.retained_bytes_for_test();
     assert!(
         used_after_exhaustion < used_before_exhaustion,
         "has_more=false releases retained cursor bytes without an explicit close"
     );
+    drop(snapshot_cursor.cursor);
+    assert_eq!(
+        reader.retained_bytes_for_test(),
+        snapshot_baseline_memory,
+        "dropping the terminal snapshot cursor refunds its one observation"
+    );
+    let writer_before_compaction = accountant.usage().used;
     let after_exhaustion = memory_db
         .compact_currency_versions()
         .expect("compact immediately after exhaustion releases the snapshot pin");
     assert_eq!(after_exhaustion.pruned_versions, 1);
-    assert!(accountant.usage().used < used_after_exhaustion);
+    assert!(accountant.usage().used < writer_before_compaction);
     assert_eq!(
         memory_db.__physical_version_count_for_test("cursor_snapshot_rows"),
         6
@@ -2992,7 +3036,8 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         memory_db.__physical_version_count_for_test("cursor_expiry_rows"),
         7
     );
-    let used_before_expiry = accountant.usage().used;
+    drop(expiry_cursor.first_page);
+    let used_before_expiry = reader.retained_bytes_for_test();
     expiry_clock.advance(11);
     assert_cursor_expired(
         expiry_cursor
@@ -3001,16 +3046,17 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .expect_err("idle expiry releases the retained cursor state"),
         CursorExpiryKind::Idle,
     );
-    let used_after_expiry = accountant.usage().used;
+    let used_after_expiry = reader.retained_bytes_for_test();
     assert!(
         used_after_expiry < used_before_expiry,
-        "expiry returns retained cursor bytes to the database accountant"
+        "expiry returns retained cursor bytes to the reader owner"
     );
+    let writer_before_expiry_compaction = accountant.usage().used;
     let after_expiry = memory_db
         .compact_currency_versions()
         .expect("compact immediately after expiry releases the snapshot pin");
     assert_eq!(after_expiry.pruned_versions, 1);
-    assert!(accountant.usage().used < used_after_expiry);
+    assert!(accountant.usage().used < writer_before_expiry_compaction);
     assert_eq!(
         memory_db.__physical_version_count_for_test("cursor_expiry_rows"),
         6
@@ -3020,5 +3066,11 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .cursor
             .fetch(NonZeroUsize::new(2), OwnerReadCancellation::new())
             .expect_err("an expired cursor has no continuation to reuse"),
+    );
+    drop(expiry_cursor.cursor);
+    assert_eq!(
+        reader.retained_bytes_for_test(),
+        snapshot_baseline_memory,
+        "dropping the expired cursor refunds its terminal observation"
     );
 }

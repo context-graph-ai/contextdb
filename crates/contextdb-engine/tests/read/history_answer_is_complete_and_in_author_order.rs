@@ -129,7 +129,7 @@ fn table_order(changes: &DirectChangeState) -> Vec<String> {
         .collect()
 }
 
-fn assert_reported_as_damage(
+pub(crate) fn assert_reported_as_damage(
     result: Result<DirectChangeState, DirectFileReaderError>,
     damage: &str,
 ) {
@@ -150,7 +150,9 @@ fn assert_reported_as_damage(
     }
 }
 
-fn damaged_history(damage: HistoryDamage) -> Result<DirectChangeState, DirectFileReaderError> {
+pub(crate) fn damaged_history(
+    damage: HistoryDamage,
+) -> Result<DirectChangeState, DirectFileReaderError> {
     let root = tempfile::tempdir().expect("history damage directory");
     let path = root.path().join("history.db");
     seed(&path);

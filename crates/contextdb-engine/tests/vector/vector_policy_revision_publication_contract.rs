@@ -194,6 +194,30 @@ fn alter_hnsw(db: &Database, members: &str) {
     .expect("declared HNSW policy updates atomically");
 }
 
+fn captured_topology(db: &Database) -> u64 {
+    db.inspect_captured_vector_suffix_for_test(
+        &partition(),
+        db.snapshot(),
+        db.declared_reader_memory()
+            .expect("admit the captured-topology reader"),
+        &mut || Ok(()),
+    )
+    .expect("inspect the current operation-owned captured source")
+    .expect("the complete maintained route has a captured serving source")
+    .topology_digest
+}
+
+fn append_unchanged_captured_suffix(db: &Database) {
+    db.execute(
+        "UPDATE revision_docs SET embedding = $embedding WHERE id = $id",
+        &params([
+            ("id", Value::Uuid(Uuid::from_u128(0x6111))),
+            ("embedding", Value::Vector(axis(0))),
+        ]),
+    )
+    .expect("rewrite one unchanged vector into the captured suffix");
+}
+
 #[test]
 fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication() {
     let root = TempDir::new().expect("temporary durable revision store");
@@ -201,9 +225,17 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
     let db = Arc::new(Database::open(&path).expect("open durable revision fixture"));
     create_current_control(&db);
     let serving_serial = assert_current_control(&db);
-    let serving_topology = db
-        .__debug_vector_hnsw_topology_digest_for_test(index())
-        .expect("current complete graph has a topology digest");
+    append_unchanged_captured_suffix(&db);
+    assert_eq!(
+        indexed_query(&db),
+        vec![
+            Uuid::from_u128(0x6111),
+            Uuid::from_u128(0x6112),
+            Uuid::from_u128(0x6113),
+        ],
+        "the same-value suffix mutation preserves the complete serving answer"
+    );
+    let serving_topology = captured_topology(&db);
 
     // The control above has already executed real caller-driven
     // maintenance and an INDEXED search before this new SQL.
@@ -240,9 +272,9 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
         "AUTO_INDEX_AT changes query routing, never HNSW topology"
     );
     assert_eq!(
-        db.__debug_vector_hnsw_topology_digest_for_test(index()),
-        Some(serving_topology),
-        "AUTO_INDEX_AT changes query routing, never HNSW topology"
+        captured_topology(&db),
+        serving_topology,
+        "AUTO_INDEX_AT changes query routing, never the captured serving topology"
     );
 
     alter_hnsw(&db, "EF_SEARCH = 2");
@@ -524,7 +556,16 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
                 "AUTO_INDEX_AT 1000 HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200)"
             )
         );
-        let layout = db.vector_store_for_test().index_layout(&index()).unwrap();
+        let vector_fixture_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_1 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
+        let layout = db
+            .vector_store_for_test()
+            .index_layout(&index(), &mut vector_fixture_copy_1)
+            .unwrap();
         assert_eq!(layout.policy_revision, column.vector_policy_revision);
         let at_larger_population = layout.resolve_policy(5_001, 1);
         let adaptive =
@@ -568,8 +609,16 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
             db = Database::open(&path).unwrap();
             db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
             assert_eq!(db.table_meta("revision_docs").unwrap(), declared);
+            let vector_fixture_reader_2 = db
+                .declared_reader_memory()
+                .expect("admit the vector fixture reader");
+            let mut vector_fixture_copy_2 =
+                contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
             assert_eq!(
-                db.vector_store_for_test().index_layout(&index()).unwrap(),
+                db.vector_store_for_test()
+                    .index_layout(&index(), &mut vector_fixture_copy_2)
+                    .unwrap(),
                 layout
             );
             assert_eq!(indexed_query(&db).len(), 3);
@@ -659,7 +708,15 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
     let db = Database::open_memory();
     create_current_control(&db);
     let store = db.vector_store_for_test();
-    let expected = store.index_layout(&index()).unwrap();
+    let vector_fixture_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_3 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_3.clone());
+
+    let expected = store
+        .index_layout(&index(), &mut vector_fixture_copy_3)
+        .unwrap();
     let metadata = db.table_meta("revision_docs").unwrap();
     for field in [
         "auto_index_at",
@@ -669,6 +726,15 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
         "policy_revision",
     ] {
         let mut stale = expected.clone();
+        let vector_fixture_reader_4 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_4 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_4.clone());
+        let vector_fixture_retained_4 = store
+            .retained_column_copy_owner(&index(), &vector_fixture_copy_4)
+            .expect("borrow the existing retained column owner");
+
         match field {
             "auto_index_at" => stale.auto_index_at = Some(1_000),
             "hnsw_m" => stale.hnsw_m = Some(16),
@@ -677,7 +743,14 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
             "policy_revision" => stale.policy_revision += 1,
             _ => unreachable!(),
         }
-        store.register_index_with_layout(index(), stale).unwrap();
+        store
+            .register_index_with_layout(
+                index(),
+                stale,
+                vector_fixture_retained_4.accountant_for_test().clone(),
+                &mut vector_fixture_copy_4,
+            )
+            .unwrap();
         let error = db
             .execute(
                 "INSERT INTO revision_docs (id, scope_id, embedding) VALUES ($id, $scope, $vector)",
@@ -692,8 +765,22 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
             matches!(&error, Error::Other(message) if message.starts_with("registered vector layout does not match the durable declaration")),
             "{field}: {error:?}"
         );
+        let vector_fixture_reader_5 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_5 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_5.clone());
+        let vector_fixture_retained_5 = store
+            .retained_column_copy_owner(&index(), &vector_fixture_copy_5)
+            .expect("borrow the existing retained column owner");
+
         store
-            .register_index_with_layout(index(), expected.clone())
+            .register_index_with_layout(
+                index(),
+                expected.clone(),
+                vector_fixture_retained_5.accountant_for_test().clone(),
+                &mut vector_fixture_copy_5,
+            )
             .unwrap();
         assert_eq!(db.table_meta("revision_docs").unwrap(), metadata);
         assert_eq!(
@@ -703,9 +790,20 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
                 .len(),
             3
         );
+        let vector_fixture_reader_6 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_6 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_6.clone());
+
         assert_eq!(
             store
-                .partition_info(&index(), &partition().partition_key)
+                .partition_info(
+                    &index(),
+                    &partition().partition_key,
+                    &mut vector_fixture_copy_6
+                )
+                .unwrap()
                 .unwrap()
                 .live_rows,
             3
@@ -753,7 +851,16 @@ fn restoring_explicit_defaults_abandons_an_inflight_revision_without_a_redundant
         panic!("replacement did not reach graph preparation: {error}");
     }
     alter_hnsw(&db, "M = 16, EF_CONSTRUCTION = 200");
-    let desired = db.vector_store_for_test().index_layout(&index()).unwrap();
+    let vector_fixture_reader_7 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_7 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_7.clone());
+
+    let desired = db
+        .vector_store_for_test()
+        .index_layout(&index(), &mut vector_fixture_copy_7)
+        .unwrap();
     assert_eq!(
         (desired.hnsw_m, desired.hnsw_ef_construction),
         (Some(16), Some(200))

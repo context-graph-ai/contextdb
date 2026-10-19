@@ -150,15 +150,20 @@ fn schema_author() -> &'static contextdb_engine::identity::FabricIdentity {
 }
 
 fn schema_replay_unit(author: &Database, changes: ChangeSet) -> SchemaReplayUnit {
-    let ddl_provenance = author
-        .outbound_ddl_provenance_for_test(
+    let ddl_provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &changes,
             &TenantId::from(SCHEMA_TENANT),
             &schema_author().node_id(),
             SCHEMA_SOURCE_INCARNATION,
             &|bytes| Ok(schema_author().sign_for_test(bytes)),
+            seam_read_memory,
         )
-        .expect("source produces canonical DDL provenance for the exact schema unit");
+    }
+    .expect("source produces canonical DDL provenance for the exact schema unit");
     SchemaReplayUnit {
         changes,
         ddl_provenance,
@@ -166,13 +171,22 @@ fn schema_replay_unit(author: &Database, changes: ChangeSet) -> SchemaReplayUnit
 }
 
 fn apply_received_schema(db: &Database, unit: SchemaReplayUnit) {
-    db.apply_received_schema_for_test(
-        unit.changes,
-        unit.ddl_provenance,
-        TenantId::from(SCHEMA_TENANT),
-        SCHEMA_SOURCE,
-        SCHEMA_SOURCE_INCARNATION,
-    )
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.apply_received_schema_for_test(
+            unit.changes,
+            unit.ddl_provenance,
+            TenantId::from(SCHEMA_TENANT),
+            SCHEMA_SOURCE,
+            SCHEMA_SOURCE_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
     .expect("authenticated dependency-complete received schema applies");
 }
 
@@ -734,7 +748,9 @@ fn schema_replay_does_not_interrupt_active_readers() {
     fixture::seed_working_set(&path);
     let author = Database::open_memory();
     declare_replay_schema(&author);
-    let initial = author.changes_since(Lsn(0));
+    let initial = author
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(initial.ddl.len(), 102);
     let initial = schema_replay_unit(&author, initial);
     let receiver = writer(&path, &runtime);
@@ -768,7 +784,9 @@ fn schema_replay_does_not_interrupt_active_readers() {
             )
             .unwrap();
     }
-    let migration = author.changes_since(since);
+    let migration = author
+        .changes_since(since)
+        .expect("read the declared changes");
     assert_eq!(
         migration.ddl.len(),
         100,
@@ -915,9 +933,14 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
         },
     )
     .unwrap();
-    let reader =
-        ReadSession::with_runtime_directory_for_test(&runtime, || ReadSession::open(&path))
-            .unwrap();
+    let reader = ReadSession::with_runtime_directory_for_test(&runtime, || {
+        let mut options = roomy();
+        // This fixture synchronizes at a source barrier; the writer, not
+        // elapsed kernel time, controls when the reader may continue.
+        options.limits.active_ms = u64::MAX;
+        ReadSession::open_with_options(&path, options)
+    })
+    .unwrap();
     assert_eq!(
         reader.route(),
         contextdb_core::read_contract::ReadRoute::Owner

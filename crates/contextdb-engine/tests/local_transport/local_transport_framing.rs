@@ -93,12 +93,14 @@ fn local_frame_fixture_encodes_and_decodes_exactly() {
 
 #[test]
 fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".into()],
-        rows: vec![vec![Value::Text("a real answer".into())]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".into()];
+        query_fixture.rows = vec![vec![Value::Text("a real answer".into())]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode a valid query result");
     let frame = frame_for_ordinary_response(&LocalResponse::TerminalSuccess {
@@ -114,6 +116,7 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
         maximum: MAX_FRAME_BYTES,
         calls: 0,
     };
+    let required_frame_memory = u64::try_from(frame.len() - std::mem::size_of::<u32>()).unwrap();
     let budget_error = boundary
         .receive_frame(
             LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
@@ -123,7 +126,10 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
         .expect_err("a valid answer exceeds the caller's one-byte memory ceiling");
     assert_eq!(
         budget_error,
-        LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling: 1 })
+        LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+            ceiling: 1,
+            required: Some(required_frame_memory)
+        })
     );
 
     let malformed = encode_payload_frame(&[0xff]).expect("frame invalid response bytes");
@@ -148,12 +154,14 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
 async fn a_live_response_decode_keeps_memory_refusals_separate_from_corrupt_bytes() {
     use std::io::Write;
 
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".into()],
-        rows: vec![vec![Value::Text("a real answer".into())]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".into()];
+        query_fixture.rows = vec![vec![Value::Text("a real answer".into())]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode a valid query result");
     let valid_frame = frame_for_ordinary_response(&LocalResponse::TerminalSuccess {
@@ -168,10 +176,15 @@ async fn a_live_response_decode_keeps_memory_refusals_separate_from_corrupt_byte
     });
     let clock = ManualDeadlineClock::at(0);
 
+    let required_frame_memory =
+        u64::try_from(valid_frame.len() - std::mem::size_of::<u32>()).unwrap();
     for (frame, expected) in [
         (
             valid_frame,
-            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling: 1 }),
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                ceiling: 1,
+                required: Some(required_frame_memory),
+            }),
         ),
         (
             malformed_frame,
@@ -270,12 +283,14 @@ fn four_mebibytes_is_admitted_through_the_allocation_limited_reader_seam() {
 
 #[test]
 fn ordinary_result_chunks_stay_unpublished_until_terminal_success() {
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode a valid canonical ordinary result");
     assert!(canonical.len() >= 3);
@@ -356,12 +371,14 @@ fn ordinary_result_chunks_stay_unpublished_until_terminal_success() {
 
 #[test]
 fn canonical_result_crosses_frames_and_publishes_only_the_exact_terminal_assembly() {
-    let result = QueryResult {
-        columns: vec!["payload".to_owned()],
-        rows: vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let result = {
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["payload".to_owned()];
+        query_fixture.rows = vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     };
     let canonical = encode_query_result(&result).expect("encode the route-neutral result");
     assert!(canonical.len() > MAX_FRAME_BYTES);
@@ -604,12 +621,14 @@ impl CompactCanonicalContainer {
 fn compact_canonical_result(
     container: CompactCanonicalContainer,
 ) -> (Vec<u8>, CanonicalQueryResult) {
-    let mut result = QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let mut result = {
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     };
     match container {
         CompactCanonicalContainer::ColumnsAndValues => {
@@ -684,20 +703,24 @@ fn frame_for_ordinary_response(response: &LocalResponse) -> Vec<u8> {
 
 #[test]
 fn canonical_preflight_capability_is_exact_one_shot_and_consumed_at_actual_decode_entry() {
-    let canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode valid canonical causal fixture");
-    let different_canonical = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 1,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let different_canonical = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 1;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode distinct valid canonical causal fixture");
     let same_bytes_different_storage = canonical.clone();
@@ -831,12 +854,14 @@ fn canonical_preflight_capability_is_exact_one_shot_and_consumed_at_actual_decod
 
 #[test]
 fn malformed_assembled_canonical_result_is_discarded_before_actual_decode() {
-    let mut malformed = encode_query_result(&QueryResult {
-        columns: vec!["value".to_owned()],
-        rows: vec![vec![Value::Null]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let mut malformed = encode_query_result(&{
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["value".to_owned()];
+        query_fixture.rows = vec![vec![Value::Null]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     })
     .expect("encode canonical fixture before truncating it");
     malformed
@@ -1001,6 +1026,7 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
     let mut receiver = OrdinaryResultReceiver::new();
     let expected_error = LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
         ceiling: EFFECTIVE_MEMORY_CEILING,
+        required: None,
     });
     OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
     assert!(

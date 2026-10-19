@@ -130,6 +130,43 @@ fn ssa_seed_fixture_journey() {
     assert_eq!(after, 2);
 }
 
+/// Writable open restores identity bounds without replaying any history family.
+fn assert_open_reads_only_bounds(
+    work: &contextdb_engine::writer_query_test_seams::WriterHistoryWork,
+) {
+    assert_eq!(
+        (
+            work.row_versions,
+            work.index_rebuild_inputs,
+            work.graph_versions,
+            work.change_log_entries,
+            work.commit_index_entries,
+            work.vector_memberships
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "open must not replay this table or its siblings: {work:?}"
+    );
+    assert_eq!(
+        (
+            work.ddl_occurrences,
+            work.sidecar_entries,
+            work.sidecar_decodes,
+            work.selection_entries
+        ),
+        (0, [0; 8], [0; 8], 0),
+        "open must not enumerate durable declarations or sidecars: {work:?}"
+    );
+    assert!(
+        work.commit_bound_keys > 0,
+        "a populated open observes real commit bounds: {work:?}"
+    );
+    #[cfg(feature = "test-seams")]
+    assert!(
+        work.allocator_regions_loaded > 0,
+        "open observes real allocator metadata: {work:?}"
+    );
+}
+
 #[test]
 fn ssa_open_locality_journey() {
     let tmp = TempDir::new().unwrap();
@@ -166,8 +203,67 @@ fn ssa_open_locality_journey() {
         .unwrap();
         db.close().unwrap();
     }
-    let reopened = Database::open(&path).unwrap();
-    assert_eq!(reopened.__open_index_maintenance_visits(), 13);
+    let (opened, work) =
+        contextdb_engine::writer_query_test_seams::observe(|| Database::open(&path));
+    let reopened = opened.unwrap();
+    assert_open_reads_only_bounds(&work.history);
+    for (sql, expected) in [
+        (
+            "SELECT id FROM t WHERE col = 1",
+            vec![vec![Value::Uuid(uuid(11))]],
+        ),
+        (
+            "SELECT id FROM sib WHERE x = 1",
+            vec![vec![Value::Uuid(uuid(21))]],
+        ),
+        (
+            "SELECT id FROM other WHERE x = 1 AND y = 2",
+            vec![vec![Value::Uuid(uuid(30))]],
+        ),
+    ] {
+        assert_eq!(
+            reopened.execute(sql, &HashMap::new()).unwrap().rows,
+            expected
+        );
+    }
+    assert_eq!(
+        reopened
+            .execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..3)
+            .map(|i| vec![Value::Uuid(uuid(10 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reopened
+            .execute("SELECT id, x FROM sib ORDER BY x", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..2)
+            .map(|i| vec![Value::Uuid(uuid(20 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reopened
+            .change_log_since(contextdb_core::Lsn(0))
+            .unwrap()
+            .len(),
+        6,
+        "positive durable population excludes an empty-store zero-work pass"
+    );
+    let prior = reopened.snapshot();
+    let prior_lsn = reopened.current_lsn();
+    insert_t(&reopened, uuid(13), 3);
+    assert!(reopened.snapshot().0 > prior.0);
+    assert!(reopened.current_lsn().0 > prior_lsn.0);
+    assert_eq!(
+        reopened
+            .execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(13))]]
+    );
 }
 
 #[test]

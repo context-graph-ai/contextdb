@@ -17,58 +17,63 @@ pub fn format_query_result_with_empty_headers(
 /// One builder for every machine surface that publishes rows — an ordinary
 /// result and a cursor page alike — so the two can never render the same row
 /// differently.
-pub fn rows_as_objects(columns: &[String], rows: &[Vec<Value>]) -> Vec<serde_json::Value> {
-    rows.iter()
-        .map(|row| {
-            let object: serde_json::Map<String, serde_json::Value> = columns
-                .iter()
-                .enumerate()
-                .map(|(index, column)| {
-                    let cell = row
-                        .get(index)
-                        .map(value_to_json)
-                        .unwrap_or(serde_json::Value::Null);
-                    (column.clone(), cell)
-                })
-                .collect();
-            serde_json::Value::Object(object)
-        })
-        .collect()
+pub fn rows_as_objects<'a>(columns: &'a [String], rows: &'a [Vec<Value>]) -> RowsAsObjects<'a> {
+    RowsAsObjects { columns, rows }
 }
 
-/// Serialize a query result as a JSON array of objects (column name → value),
-/// one object per row.
-pub fn format_query_result_json(result: &QueryResult) -> String {
-    let rows = rows_as_objects(&result.columns, &result.rows);
-    serde_json::to_string(&serde_json::Value::Array(rows)).unwrap_or_else(|_| "[]".to_string())
+/// A serialization view over admitted answers; cells are never deep copied.
+pub struct RowsAsObjects<'a> {
+    columns: &'a [String],
+    rows: &'a [Vec<Value>],
 }
-
-/// Map a cell to a clean, stable `serde_json::Value`. Deliberately independent
-/// of `Value`'s own (enum-tagged, JSON-as-string) Serialize impl so the output
-/// stays flat and predictable.
-fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int64(i) => serde_json::Value::from(*i),
-        Value::Float64(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
-        Value::Uuid(u) => serde_json::Value::String(u.to_string()),
-        Value::Timestamp(ts) => serde_json::Value::from(*ts),
-        Value::Json(j) => j.clone(),
-        Value::Vector(vec) => serde_json::Value::Array(
-            vec.iter()
-                .map(|f| {
-                    serde_json::Number::from_f64(*f as f64)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
-                })
-                .collect(),
-        ),
-        Value::TxId(tx) => serde_json::Value::from(tx.0),
+impl serde::Serialize for RowsAsObjects<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.rows.len()))?;
+        for row in self.rows {
+            seq.serialize_element(&ObjectRow {
+                columns: self.columns,
+                row,
+            })?;
+        }
+        seq.end()
     }
+}
+struct ObjectRow<'a> {
+    columns: &'a [String],
+    row: &'a [Value],
+}
+impl serde::Serialize for ObjectRow<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.columns.len()))?;
+        for (index, column) in self.columns.iter().enumerate() {
+            map.serialize_entry(column, &JsonCell(self.row.get(index)))?;
+        }
+        map.end()
+    }
+}
+struct JsonCell<'a>(Option<&'a Value>);
+impl serde::Serialize for JsonCell<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            None | Some(Value::Null) => serializer.serialize_none(),
+            Some(Value::Bool(value)) => value.serialize(serializer),
+            Some(Value::Int64(value) | Value::Timestamp(value)) => value.serialize(serializer),
+            Some(Value::Float64(value)) => value.serialize(serializer),
+            Some(Value::Text(value)) => value.serialize(serializer),
+            Some(Value::Uuid(value)) => serializer.collect_str(value),
+            Some(Value::Json(value)) => value.serialize(serializer),
+            Some(Value::Vector(value)) => value.serialize(serializer),
+            Some(Value::TxId(value)) => value.0.serialize(serializer),
+        }
+    }
+}
+
+/// Serialize the existing admitted rows directly to their public JSON shape.
+pub fn format_query_result_json(result: &QueryResult) -> String {
+    serde_json::to_string(&rows_as_objects(&result.columns, &result.rows))
+        .unwrap_or_else(|_| "[]".to_string())
 }
 
 fn render_table(columns: &[String], data: &[Vec<Value>], show_empty_headers: bool) -> String {

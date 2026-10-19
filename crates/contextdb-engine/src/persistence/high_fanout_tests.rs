@@ -151,12 +151,12 @@ fn assert_image(db: &redb::Database, family: LogicalFamily, records: &[ContentId
     assert_eq!(count, nodes.len(), "all canonical chunks are present");
 }
 
-fn apply(db: &redb::Database, mutations: &[ContentIdentityMutation]) {
+fn apply(db: &ProofFixtureDatabase, mutations: &[ContentIdentityMutation]) {
     let write = db.begin_write().unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         mutations,
-        &mut ProofAdmission::unaccounted(),
+        &mut db.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -165,18 +165,37 @@ fn apply(db: &redb::Database, mutations: &[ContentIdentityMutation]) {
 #[test]
 fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compaction() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = redb::Database::create(dir.path().join("canonical.db")).unwrap();
+    let mut db = ProofFixtureDatabase::create(dir.path().join("canonical.db")).unwrap();
     let write = db.begin_write().unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
+    let schema_fixture = crate::Database::open_memory();
+    schema_fixture
+        .execute(
+            "CREATE TABLE fixture (id INTEGER PRIMARY KEY)",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+    let schema_meta = schema_fixture.table_meta("fixture").unwrap();
     for family in LogicalFamily::ALL {
         let records = (0..4096u64)
             .map(|i| {
-                ContentIdentityMutation::put(
-                    family,
-                    i.to_be_bytes().to_vec(),
-                    (i * 7).to_be_bytes().to_vec(),
-                )
+                if family == SCHEMA_RECORD_FAMILY {
+                    let name = format!("fixture_{i:016x}");
+                    schema_mutations(&name, &schema_meta).unwrap().remove(0)
+                } else if family == LogicalFamily::Configuration {
+                    ContentIdentityMutation::put(
+                        family,
+                        format!("fixture_{i:016x}").into_bytes(),
+                        (i * 7).to_be_bytes().to_vec(),
+                    )
+                } else {
+                    ContentIdentityMutation::put(
+                        family,
+                        i.to_be_bytes().to_vec(),
+                        (i * 7).to_be_bytes().to_vec(),
+                    )
+                }
             })
             .collect::<Vec<_>>();
         let mut live = Vec::new();
@@ -211,7 +230,7 @@ fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compact
 #[test]
 fn large_ordered_keys_split_by_bytes_and_rejoin_after_boundary_deletions() {
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("large.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("large.db")).unwrap();
     let write = db.begin_write().unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
@@ -286,7 +305,7 @@ fn large_ordered_keys_split_by_bytes_and_rejoin_after_boundary_deletions() {
 #[test]
 fn wide_separator_reference_corruption_is_rejected_before_a_posting_is_used() {
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("damaged-key.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("damaged-key.db")).unwrap();
     let write = db.begin_write().unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
@@ -350,7 +369,8 @@ fn remove_then_put_coalesces_to_the_same_physical_work_as_a_value_update() {
     let mut results = Vec::new();
     for with_remove in [false, true] {
         let db =
-            redb::Database::create(dir.path().join(format!("coalesce-{with_remove}.db"))).unwrap();
+            ProofFixtureDatabase::create(dir.path().join(format!("coalesce-{with_remove}.db")))
+                .unwrap();
         let write = db.begin_write().unwrap();
         RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
         write.commit().unwrap();
@@ -390,7 +410,7 @@ fn remove_then_put_coalesces_to_the_same_physical_work_as_a_value_update() {
 #[test]
 fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identically() {
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("oversized.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("oversized.db")).unwrap();
     let write = db.begin_write().unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
@@ -473,7 +493,7 @@ fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identic
 #[test]
 fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
     let dir = tempfile::tempdir().unwrap();
-    let db = redb::Database::create(dir.path().join("oversized-damage.db")).unwrap();
+    let db = ProofFixtureDatabase::create(dir.path().join("oversized-damage.db")).unwrap();
     let write = db.begin_write().unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();

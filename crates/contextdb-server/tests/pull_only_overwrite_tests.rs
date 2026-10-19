@@ -77,11 +77,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
     declare_hub(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -121,7 +120,8 @@ async fn pull_only_local_edit_is_replaced_by_hub_value() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     let outbound = within(client.push())
         .await

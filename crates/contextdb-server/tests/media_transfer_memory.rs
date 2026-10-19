@@ -126,7 +126,9 @@ async fn resolver_peak_memory_stays_bounded_for_a_large_blob() {
     let endpoint = within(IrohServer::bind(&bind_spec(&holder_key)))
         .await
         .expect("bind holder");
-    holder.serve_on(&endpoint);
+    holder
+        .serve_on(&endpoint)
+        .expect("serve blob store fixture");
     let ticket = endpoint.ticket();
 
     let mut sink = DiscardingHashSink::new();

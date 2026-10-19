@@ -83,11 +83,14 @@ fn setup_chunked_mixed_push(rt: &tokio::runtime::Runtime) -> PushFixture {
     edge_db.commit(tx).unwrap();
 
     let tenant = format!("sync-pr-push-{}", Uuid::new_v4());
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        server_db.clone(),
-        fabric.server_as("sync-pr-push-hub"),
-        contextdb_core::TenantId::from(&tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_for_test(
+            server_db.clone(),
+            fabric.server_as("sync-pr-push-hub"),
+            contextdb_core::TenantId::from(&tenant),
+        )
+        .expect("construct sync server"),
+    );
     let server_handle = rt.spawn({
         let server = server.clone();
         async move { server.run().await }
@@ -108,7 +111,8 @@ fn setup_chunked_mixed_push(rt: &tokio::runtime::Runtime) -> PushFixture {
             edge_db,
             fabric.client_as("sync-pr-push-edge"),
             contextdb_core::TenantId::from(&tenant),
-        ),
+        )
+        .expect("construct sync client"),
         server_db,
         server_task: server_handle,
     }
@@ -135,11 +139,14 @@ fn setup_chunked_large_pull(rt: &tokio::runtime::Runtime) -> PullFixture {
     server_db.commit(tx).unwrap();
 
     let tenant = format!("sync-pr-pull-{}", Uuid::new_v4());
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        server_db,
-        fabric.server_as("sync-pr-pull-hub"),
-        contextdb_core::TenantId::from(&tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_for_test(
+            server_db,
+            fabric.server_as("sync-pr-pull-hub"),
+            contextdb_core::TenantId::from(&tenant),
+        )
+        .expect("construct sync server"),
+    );
     let server_handle = rt.spawn({
         let server = server.clone();
         async move { server.run().await }
@@ -160,7 +167,8 @@ fn setup_chunked_large_pull(rt: &tokio::runtime::Runtime) -> PullFixture {
             edge_db.clone(),
             fabric.client_as("sync-pr-pull-edge"),
             contextdb_core::TenantId::from(&tenant),
-        ),
+        )
+        .expect("construct sync client"),
         edge_db,
         server_task: server_handle,
     }
@@ -207,11 +215,14 @@ fn setup_multi_edge_converge(rt: &tokio::runtime::Runtime) -> MultiEdgeFixture {
     edge_b_db.commit(tx_b).unwrap();
 
     let tenant = format!("sync-pr-multiedge-{}", Uuid::new_v4());
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        server_db,
-        fabric.server_as("sync-pr-multiedge-hub"),
-        contextdb_core::TenantId::from(&tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_for_test(
+            server_db,
+            fabric.server_as("sync-pr-multiedge-hub"),
+            contextdb_core::TenantId::from(&tenant),
+        )
+        .expect("construct sync server"),
+    );
     let server_handle = rt.spawn({
         let server = server.clone();
         async move { server.run().await }
@@ -232,17 +243,20 @@ fn setup_multi_edge_converge(rt: &tokio::runtime::Runtime) -> MultiEdgeFixture {
             edge_a_db,
             fabric.client_as("sync-pr-edge-a"),
             contextdb_core::TenantId::from(&tenant),
-        ),
+        )
+        .expect("construct sync client"),
         edge_b: SyncClient::with_authenticated_transport_for_test(
             edge_b_db,
             fabric.client_as("sync-pr-edge-b"),
             contextdb_core::TenantId::from(&tenant),
-        ),
+        )
+        .expect("construct sync client"),
         verifier: SyncClient::with_authenticated_transport_for_test(
             verifier_db.clone(),
             fabric.client_as("sync-pr-verifier"),
             contextdb_core::TenantId::from(&tenant),
-        ),
+        )
+        .expect("construct sync client"),
         verifier_db,
         server_task: server_handle,
     }

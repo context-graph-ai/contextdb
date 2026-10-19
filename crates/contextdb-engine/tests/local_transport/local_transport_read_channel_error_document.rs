@@ -72,7 +72,9 @@ fn one_answer_per_named_class() -> Vec<Error> {
         },
         Error::NotFound("no such snapshot".to_owned()),
         Error::RecursiveCteNotSupported,
-        Error::WindowFunctionNotSupported,
+        Error::WindowFunctionNotSupported {
+            form: "fixture window form".to_owned(),
+        },
         Error::StoredProcNotSupported,
         Error::SubqueryNotSupported,
         Error::FullTextSearchNotSupported,
@@ -193,12 +195,12 @@ fn one_answer_per_named_class() -> Vec<Error> {
             path: std::path::PathBuf::from("/store/widgets.db"),
         },
         Error::MemoryBudgetExceeded {
-            subsystem: "vector".to_owned(),
-            operation: "candidate materialization".to_owned(),
+            subsystem: "vector".to_owned().into(),
+            operation: "candidate materialization".to_owned().into(),
             requested_bytes: 4_096,
             available_bytes: 128,
             budget_limit_bytes: 8_192,
-            hint: "raise the read memory ceiling".to_owned(),
+            hint: "raise the read memory ceiling".to_owned().into(),
         },
         Error::DiskBudgetExceeded {
             operation: "checkpoint".to_owned(),
@@ -206,7 +208,7 @@ fn one_answer_per_named_class() -> Vec<Error> {
             budget_limit_bytes: 2_048,
             hint: "raise the disk budget".to_owned(),
         },
-        Error::Other("the owner could not say more".to_owned()),
+        Error::Other("the owner could not say more".to_owned().into()),
     ]
 }
 
@@ -343,12 +345,12 @@ fn the_document_has_literal_bytes_for_each_body_shape() {
     );
     assert_eq!(
         document_bytes(&Error::MemoryBudgetExceeded {
-            subsystem: "v".to_owned(),
-            operation: "o".to_owned(),
+            subsystem: "v".to_owned().into(),
+            operation: "o".to_owned().into(),
             requested_bytes: 4_096,
             available_bytes: 128,
             budget_limit_bytes: 8_192,
-            hint: "h".to_owned(),
+            hint: "h".to_owned().into(),
         }),
         vec![
             TAG_MEMORY_BUDGET_EXCEEDED as u8,
@@ -368,7 +370,7 @@ fn the_document_has_literal_bytes_for_each_body_shape() {
         ],
     );
     assert_eq!(
-        document_bytes(&Error::SyncError("boom".to_owned())),
+        document_bytes(&Error::SyncError("boom".to_owned().into())),
         vec![
             TAG_UNKNOWN as u8,
             9,
@@ -663,7 +665,7 @@ fn every_class_encodes_under_the_grammar_its_tag_declares() {
 /// because the thing being decoded happens to be an error.
 #[test]
 fn a_document_is_admitted_against_the_ceiling_the_caller_declared() {
-    let long = Error::Other("w".repeat(4_096));
+    let long = Error::Other("w".repeat(4_096).into());
     let carried = LocalEngineFailure::from_error(&long);
     assert_eq!(
         carried.clone().into_error(ceiling()).to_string(),
@@ -701,12 +703,12 @@ fn representative_failures_carry_the_same_class_and_fields_across_routes() {
         // A read that went past what it declared.
         Error::BfsVisitedExceeded(4_096),
         Error::MemoryBudgetExceeded {
-            subsystem: "vector".to_owned(),
-            operation: "candidate materialization".to_owned(),
+            subsystem: "vector".to_owned().into(),
+            operation: "candidate materialization".to_owned().into(),
             requested_bytes: 4_096,
             available_bytes: 128,
             budget_limit_bytes: 8_192,
-            hint: "raise the read memory ceiling".to_owned(),
+            hint: "raise the read memory ceiling".to_owned().into(),
         },
         Error::ReadFailure(
             ReadFailure::new(

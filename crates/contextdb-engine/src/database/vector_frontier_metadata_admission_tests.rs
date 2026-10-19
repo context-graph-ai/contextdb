@@ -48,6 +48,12 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
         VectorIndexRef::new("metadata_items", "v"),
         VectorPartitionKey::unpartitioned(),
     );
+    if matches!(metadata, ColdMetadata::Journal) {
+        // Frontier counting needs an uncovered producer change, not a covered
+        // journal key that legitimately belongs to post-publication cleanup.
+        db.execute("UPDATE metadata_items SET v = '[0,1,0]'", &HashMap::new())
+            .unwrap();
+    }
     let serving = db
         .vector_store
         .partition_graph_generation_status(&partition)
@@ -81,7 +87,8 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
         })
         .unwrap();
     let mut journal_key = catalog_key.clone();
-    journal_key.extend_from_slice(&1u64.to_be_bytes());
+    journal_key.extend_from_slice(&db.current_lsn().0.to_be_bytes());
+    journal_key.extend_from_slice(&0u64.to_be_bytes());
     let (definition, malformed_key) = match metadata {
         ColdMetadata::Catalog => (CATALOGS, catalog_key.as_slice()),
         ColdMetadata::Membership => (MEMBERSHIPS, membership_key.as_slice()),
@@ -96,6 +103,30 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
                     .insert(catalog_key.as_slice(), catalog_bytes.as_slice())
                     .unwrap();
             }
+            // Snapshot export omits rebuildable generations. Install the complete
+            // producer records before damaging the selected metadata extent.
+            db.persistence
+                .as_ref()
+                .unwrap()
+                .with_db(|source| {
+                    let read = source.begin_read().unwrap();
+                    for name in [
+                        "vector_partition_base_generations",
+                        "vector_partition_change_generations",
+                        "vector_paged_generation_pages",
+                    ] {
+                        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name);
+                        if let Ok(source_table) = read.open_table(definition) {
+                            let mut target = write.open_table(definition).unwrap();
+                            for entry in source_table.iter().unwrap() {
+                                let (key, value) = entry.unwrap();
+                                target.insert(key.value(), value.value()).unwrap();
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
             // Invalid bytes have no bounded logical descriptor to price. The
             // physical owner must be refused before metadata validation sees it.
             let malformed = vec![0xff; MALFORMED_METADATA_BYTES];
@@ -111,7 +142,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
     persistence.close();
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let mut context = db.maintenance_context();
     context.persistence = Some(Arc::clone(&persistence));
     let baseline = db.accountant.usage().used;
@@ -124,12 +155,16 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
     db.accountant.set_budget(Some(limit)).unwrap();
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
     let error = match metadata {
         ColdMetadata::Membership => {
             // Exercise the durable fallback frontier loader with the same
             // preparation guard used by persist_built_vector_partition.
             vector_source_page_admission::with_preparation_source_page_admission(
-                Arc::clone(&db.accountant),
+                db.accountant.clone(),
                 || {
                     persistence.vector_partition_maintenance_entry_counts(
                         &partition,
@@ -140,8 +175,25 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
             )
             .unwrap_err()
         }
-        ColdMetadata::Catalog | ColdMetadata::Journal => context
-            .persist_built_vector_partition(&partition)
+        ColdMetadata::Journal => {
+            // The current resident selector can build without reading this
+            // journal. Exercise the guarded durable frontier count itself,
+            // as the adequate-budget corruption control below already does.
+            vector_source_page_admission::with_preparation_source_page_admission(
+                db.accountant.clone(),
+                || {
+                    persistence.vector_partition_uncovered_tombstone_entry_count(
+                        &partition,
+                        original_catalog.base.covered_lsn,
+                        db.tx_mgr.current_lsn(),
+                        |_| Ok(()),
+                    )
+                },
+            )
+            .unwrap_err()
+        }
+        ColdMetadata::Catalog => context
+            .persist_built_vector_partition(&partition, fixture_operation_reader_1.clone())
             .unwrap_err(),
     };
     assert!(
@@ -182,7 +234,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
     // With adequate source admission the unchanged malformed bytes reach the
     // bounded decoder and remain corruption, rather than a hidden short count.
     let decode = vector_source_page_admission::with_preparation_source_page_admission(
-        Arc::clone(&db.accountant),
+        db.accountant.clone(),
         || match metadata {
             ColdMetadata::Catalog => persistence
                 .load_vector_partition_generation_descriptors_for(
@@ -338,7 +390,7 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     drop(persistence);
     // No cached or write-buffer page can mask the physical source extent.
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let mut context = db.maintenance_context();
     context.persistence = Some(Arc::clone(&persistence));
     let baseline = db.accountant.usage().used;
@@ -351,8 +403,14 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
 
-    let outcome = context.retry_vector_journal_truncations().unwrap();
+    let outcome = context
+        .retry_vector_journal_truncations(fixture_operation_reader_2.clone())
+        .unwrap();
     let details = outcome
         .first_failure_details
         .expect("a refused physical retry probe retains an actionable partition failure");
@@ -367,9 +425,20 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     assert!(details.available_bytes.unwrap() <= headroom as u64);
     assert_eq!(details.budget_limit_bytes, Some(limit as u64));
     assert!(details.message.contains("graph is durable"));
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     assert_eq!(
         db.vector_store
-            .partition_info(&partition.index, &partition.partition_key)
+            .partition_info(
+                &partition.index,
+                &partition.partition_key,
+                &mut vector_fixture_copy_1
+            )
+            .unwrap()
             .unwrap()
             .maintenance_failure_details,
         Some(details)
@@ -410,13 +479,13 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     );
     assert!(
         vector_source_page_admission::with_preparation_source_page_admission(
-            Arc::clone(&db.accountant),
+            db.accountant.clone(),
             || persistence.vector_partition_has_covered_journal_records(&catalog),
         )
         .unwrap()
     );
     let decode = vector_source_page_admission::with_preparation_source_page_admission(
-        Arc::clone(&db.accountant),
+        db.accountant.clone(),
         || {
             persistence.vector_partition_uncovered_tombstone_entry_count(
                 &partition,
@@ -453,7 +522,7 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     persistence.close();
     drop(persistence);
     db.close().unwrap();
-    let accountant = Arc::clone(&db.accountant);
+    let accountant = db.accountant.clone();
     drop(db);
     assert_eq!(accountant.usage().used, 0);
     assert_eq!(accountant.underflow_count_for_test(), 0);
@@ -539,7 +608,7 @@ fn wide_text_partition_metadata_refuses_before_cold_catalog_lookup() {
     persistence.close();
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
+    persistence.attach_memory_accountant(db.accountant.clone());
     let mut context = db.maintenance_context();
     context.persistence = Some(Arc::clone(&persistence));
 
@@ -559,8 +628,13 @@ fn wide_text_partition_metadata_refuses_before_cold_catalog_lookup() {
         observed.fetch_add(1, Ordering::SeqCst);
     }));
     db.accountant.set_budget(Some(baseline + headroom)).unwrap();
+    let fixture_operation_reader_3 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     let error = context
-        .persist_built_vector_partition(&partition)
+        .persist_built_vector_partition(&partition, fixture_operation_reader_3.clone())
         .unwrap_err();
     assert!(
         matches!(&error, Error::MemoryBudgetExceeded {

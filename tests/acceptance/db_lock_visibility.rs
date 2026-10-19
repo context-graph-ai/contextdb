@@ -6,7 +6,6 @@ use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 use contextdb_tx::WriteSet;
 use std::collections::HashMap;
 use std::env;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -411,10 +410,12 @@ fn t19_09_closed_handle_rejects_normal_reads() {
         matches!(&err, Error::Other(msg) if msg.contains("closed")),
         "expected closed-handle error, got: {err:?}"
     );
-    let changes = std::panic::catch_unwind(AssertUnwindSafe(|| db.changes_since(Lsn(0))));
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect_err("closed changes_since refuses stale state");
     assert!(
-        changes.is_err(),
-        "closed changes_since must not serve stale in-memory state"
+        matches!(changes, Error::Other(ref message) if message.contains("closed")),
+        "closed changes_since returns the typed closed-handle error: {changes:?}"
     );
 
     let _reopened = Database::open(&path).expect("released path can be reopened");
@@ -436,7 +437,7 @@ impl DatabasePlugin for CrossHandleClosedReadPlugin {
             Ok(rows) => Err(Error::Other(format!(
                 "closed cross-handle scan unexpectedly returned {} rows",
                 rows.len()
-            ))),
+            ).into())),
             Err(err) => Err(err),
         }
     }

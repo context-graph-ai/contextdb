@@ -1,4 +1,5 @@
 use crate::memory_budget::MemoryBudget;
+use crate::store::VectorMembershipProvenance;
 use contextdb_core::{Lsn, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuantization};
 use parking_lot::Mutex;
 use std::ops::Deref;
@@ -9,6 +10,8 @@ const HNSW_HEADER_BYTES: usize = 12;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredVectorEntry {
+    pub membership: VectorMembershipProvenance,
+    pub canonical_deleted_tx: Option<TxId>,
     pub row_id: RowId,
     pub vector: StoredVector,
     pub created_tx: TxId,
@@ -19,6 +22,13 @@ pub(crate) struct StoredVectorEntry {
 impl StoredVectorEntry {
     pub fn from_vector_entry(entry: VectorEntry, quantization: VectorQuantization) -> Self {
         Self {
+            membership: VectorMembershipProvenance::new(
+                entry.created_tx,
+                entry.lsn,
+                entry.created_tx,
+                entry.deleted_tx,
+            ),
+            canonical_deleted_tx: entry.deleted_tx,
             row_id: entry.row_id,
             vector: StoredVector::from_f32(&entry.vector, quantization),
             created_tx: entry.created_tx,
@@ -29,6 +39,13 @@ impl StoredVectorEntry {
 
     pub fn from_vector_entry_ref(entry: &VectorEntry, quantization: VectorQuantization) -> Self {
         Self {
+            membership: VectorMembershipProvenance::new(
+                entry.created_tx,
+                entry.lsn,
+                entry.created_tx,
+                entry.deleted_tx,
+            ),
+            canonical_deleted_tx: entry.deleted_tx,
             row_id: entry.row_id,
             vector: StoredVector::from_f32(&entry.vector, quantization),
             created_tx: entry.created_tx,
@@ -54,8 +71,11 @@ impl StoredVectorEntry {
 
     /// Legacy void moves retain the body-only caller admission protocol even
     /// when their source was promoted by a previous fallible open.
+    #[allow(dead_code)] // Keep an owned-copy path for callers that retain stored entries.
     pub(crate) fn owned_copy(&self) -> Self {
         Self {
+            membership: self.membership,
+            canonical_deleted_tx: self.canonical_deleted_tx,
             row_id: self.row_id,
             vector: self.vector.owned_copy(),
             created_tx: self.created_tx,
@@ -65,7 +85,11 @@ impl StoredVectorEntry {
     }
 
     pub fn visible_at(&self, snapshot: contextdb_core::SnapshotId) -> bool {
-        self.created_tx.0 <= snapshot.0 && self.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+        self.membership.visible_from.0 <= snapshot.0
+            && self
+                .membership
+                .deleted_tx
+                .is_none_or(|tx| tx.0 > snapshot.0)
     }
 }
 
@@ -90,6 +114,8 @@ struct RawPayloadCharge {
     header_accountant: Option<Arc<dyn MemoryBudget>>,
     live_body_bytes: Arc<AtomicUsize>,
     live_header_bytes: Arc<AtomicUsize>,
+    _body_control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _header_control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
 impl Drop for RawPayloadCharge {
@@ -185,8 +211,14 @@ impl<T> SharedVectorPayload<T> {
             if let Some(charge) = charge.as_mut() {
                 let header_bytes = shared_payload_header_bytes();
                 charge.header_bytes = header_bytes;
-                charge.header_accountant = header_accountant
-                    .filter(|accountant| !Arc::ptr_eq(&charge.accountant, accountant));
+                charge.header_accountant = header_accountant.filter(|accountant| {
+                    !crate::memory_budget::same_funder(
+                        charge.accountant.as_ref(),
+                        accountant.as_ref(),
+                    )
+                });
+                charge._header_control_invoice = charge.header_accountant.as_ref()
+                    .and_then(|owner| owner.control_invoice());
                 charge
                     .live_header_bytes
                     .fetch_add(header_bytes, Ordering::SeqCst);
@@ -233,6 +265,8 @@ impl<T> SharedVectorPayload<T> {
             *charge = Some(RawPayloadCharge {
                 body_bytes,
                 header_bytes,
+                _body_control_invoice: accountant.control_invoice(),
+                _header_control_invoice: None,
                 accountant,
                 header_accountant: None,
                 live_body_bytes,
@@ -294,7 +328,20 @@ pub fn stored_vector_value(vector: &[f32], quantization: VectorQuantization) -> 
     match quantization {
         VectorQuantization::F32 => vector.to_vec(),
         VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
-            StoredVector::from_f32(vector, quantization).to_f32()
+            // A row-value projection needs the floats, not a retained stored
+            // payload. Use the same grid and dequantizer directly so this
+            // copy allocates only its final float vector.
+            let levels = if quantization == VectorQuantization::SQ8 { 255.0 } else { 15.0 };
+            let (min, max) = vector_min_max(vector);
+            let range = max - min;
+            vector.iter().map(|value| {
+                let q = if range <= f32::EPSILON {
+                    0
+                } else {
+                    (((*value - min) / range) * levels).round().clamp(0.0, levels) as u8
+                };
+                dequantize(q, levels, min, max)
+            }).collect()
         }
     }
 }
@@ -312,6 +359,7 @@ pub fn stored_vector_resident_bytes(dimension: usize, quantization: VectorQuanti
 }
 
 impl StoredVector {
+    #[allow(dead_code)] // Keep the stored-vector copy path beside its entry counterpart.
     fn owned_copy(&self) -> Self {
         match self {
             Self::F32(payload) => Self::F32(payload.to_vec().into()),
@@ -601,13 +649,22 @@ impl StoredVector {
                 payload,
             } => (*len, *min, *max, &payload[..]),
         };
-        let mut bytes = Vec::with_capacity(HNSW_HEADER_BYTES + payload.len());
-        bytes.extend_from_slice(&(len as u32).to_le_bytes());
-        bytes.extend_from_slice(&min.to_le_bytes());
-        bytes.extend_from_slice(&max.to_le_bytes());
-        bytes.extend_from_slice(payload);
-        bytes
+        encode_hnsw_quantized_payload(len, min, max, payload)
     }
+}
+
+pub(crate) fn encode_hnsw_quantized_payload(
+    len: usize,
+    min: f32,
+    max: f32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HNSW_HEADER_BYTES + payload.len());
+    bytes.extend_from_slice(&(len as u32).to_le_bytes());
+    bytes.extend_from_slice(&min.to_le_bytes());
+    bytes.extend_from_slice(&max.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
 }
 
 #[derive(Debug, Clone, Copy)]

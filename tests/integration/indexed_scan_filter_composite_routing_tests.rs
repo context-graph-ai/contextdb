@@ -1626,7 +1626,9 @@ fn sync1_peer_routes_identical_winner() {
     let primary = is04_query(&source);
     let peer = Database::open_memory();
     peer.apply_changes(
-        source.changes_since(Lsn(0)),
+        source
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();

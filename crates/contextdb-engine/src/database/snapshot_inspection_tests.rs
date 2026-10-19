@@ -38,12 +38,32 @@ fn snapshot_inspection_reads_physical_history_without_touching_the_artifact() {
     db.close().expect("close source");
 
     let artifact_before = std::fs::read(&artifact_path).expect("read artifact before inspection");
-    let inspector = SnapshotInspector::open(&artifact_path).expect("open private copy");
+    let inspection_fixture_parent_1 =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            contextdb_engine::OwnerReadConfig::default()
+                .limits
+                .limits
+                .memory,
+        );
+
+    let inspector = SnapshotInspector::open(
+        &artifact_path,
+        inspection_fixture_parent_1
+            .child()
+            .expect("admit the inspection reader"),
+        inspection_fixture_parent_1.clone(),
+    )
+    .expect("open private copy");
+    let fixture_operation_reader_1 = inspection_fixture_parent_1
+        .child()
+        .expect("admit the actual fixture reader");
+
     let report = inspector
         .inspect_key(
             "notes",
             &NaturalKey::single("id".to_string(), Value::Int64(7)),
             &["body".to_string()],
+            fixture_operation_reader_1.clone(),
         )
         .expect("inspect key");
     assert_eq!(report.total_retained_versions, 2);
@@ -99,13 +119,32 @@ fn snapshot_inspection_omits_large_values_and_reports_blob_state_without_bytes()
         .expect("install complete blob through repository fixture");
     db.export_snapshot(&artifact_path).expect("export snapshot");
     db.close().expect("close source");
+    let inspection_fixture_parent_2 =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            contextdb_engine::OwnerReadConfig::default()
+                .limits
+                .limits
+                .memory,
+        );
 
-    let inspector = SnapshotInspector::open(&artifact_path).expect("open private copy");
+    let inspector = SnapshotInspector::open(
+        &artifact_path,
+        inspection_fixture_parent_2
+            .child()
+            .expect("admit the inspection reader"),
+        inspection_fixture_parent_2.clone(),
+    )
+    .expect("open private copy");
+    let fixture_operation_reader_2 = inspection_fixture_parent_2
+        .child()
+        .expect("admit the actual fixture reader");
+
     let key = inspector
         .inspect_key(
             "notes",
             &NaturalKey::single("id".to_string(), Value::Int64(9)),
             &["body".to_string()],
+            fixture_operation_reader_2.clone(),
         )
         .expect("inspect bounded key");
     let body = key.retained_versions[0]
@@ -165,19 +204,60 @@ fn sync_apply_state_digest_is_deterministic_and_changes_with_durable_state() {
     db.export_snapshot(&second_after_path)
         .expect("second populated export");
     db.close().expect("close source");
+    let inspection_fixture_parent_3 =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            contextdb_engine::OwnerReadConfig::default()
+                .limits
+                .limits
+                .memory,
+        );
 
-    let before = SnapshotInspector::open(&before_path)
-        .expect("open before")
-        .inspect_sync_apply_state()
-        .expect("inspect before");
-    let first = SnapshotInspector::open(&first_after_path)
-        .expect("open first export")
-        .inspect_sync_apply_state()
-        .expect("inspect first copy");
-    let second = SnapshotInspector::open(&second_after_path)
-        .expect("open second export")
-        .inspect_sync_apply_state()
-        .expect("inspect second copy");
+    let before = SnapshotInspector::open(
+        &before_path,
+        inspection_fixture_parent_3
+            .child()
+            .expect("admit the inspection reader"),
+        inspection_fixture_parent_3.clone(),
+    )
+    .expect("open before")
+    .inspect_sync_apply_state()
+    .expect("inspect before");
+    let inspection_fixture_parent_4 =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            contextdb_engine::OwnerReadConfig::default()
+                .limits
+                .limits
+                .memory,
+        );
+
+    let first = SnapshotInspector::open(
+        &first_after_path,
+        inspection_fixture_parent_4
+            .child()
+            .expect("admit the inspection reader"),
+        inspection_fixture_parent_4.clone(),
+    )
+    .expect("open first export")
+    .inspect_sync_apply_state()
+    .expect("inspect first copy");
+    let inspection_fixture_parent_5 =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            contextdb_engine::OwnerReadConfig::default()
+                .limits
+                .limits
+                .memory,
+        );
+
+    let second = SnapshotInspector::open(
+        &second_after_path,
+        inspection_fixture_parent_5
+            .child()
+            .expect("admit the inspection reader"),
+        inspection_fixture_parent_5.clone(),
+    )
+    .expect("open second export")
+    .inspect_sync_apply_state()
+    .expect("inspect second copy");
 
     assert_ne!(before.digest, first.digest);
     assert_eq!(
@@ -222,8 +302,22 @@ fn snapshot_export_preserves_trigger_audit_retention_stamps_exactly() {
         .expect("read source trigger-audit stamps");
     assert_eq!(source_stamps.len(), 1, "fixture writes one retention stamp");
     db.export_snapshot(&artifact_path).expect("export snapshot");
+    let inspection_fixture_parent_6 =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            contextdb_engine::OwnerReadConfig::default()
+                .limits
+                .limits
+                .memory,
+        );
 
-    let inspector = SnapshotInspector::open(&artifact_path).expect("open snapshot copy");
+    let inspector = SnapshotInspector::open(
+        &artifact_path,
+        inspection_fixture_parent_6
+            .child()
+            .expect("admit the inspection reader"),
+        inspection_fixture_parent_6.clone(),
+    )
+    .expect("open snapshot copy");
     let artifact_stamps = inspector
         .database
         .persistence

@@ -1,7 +1,6 @@
 #![allow(clippy::needless_range_loop)] // Existing compatibility and test seam shape.
 use super::*;
 use crate::database::CursorIdleWindow;
-use crate::memory_accounting::OwnedMemoryReservation;
 use crate::plugin::QueryOutcome;
 use crate::read_contract::CanonicalQueryResult;
 use bincode::enc::write::Writer;
@@ -9,6 +8,7 @@ use contextdb_core::read_contract::{
     CursorExpiryKind, OwnerLimitExceededDetail, ReadFailureDetail, ReadFailureKind,
     ReadFailureLimit, RequiredBytesSetting, StatementRemedy,
 };
+use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
 use contextdb_planner::{ProjectColumn, SortKey};
 use contextdb_relational::mem::{BoundedOrderedRowCursor, BoundedPhysicalCursor};
 use serde::Serialize;
@@ -18,6 +18,13 @@ use std::fmt::Write as _;
 use std::ops::Bound;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+#[cfg(any(test, feature = "test-seams"))]
+mod vector_search_receipt;
+
+mod grouped_count;
+mod control_memory;
+use control_memory::{ControlArc, ControlWeak, QueryVectorDecode, NativeKernelBudget};
 
 // One public continuation fetch may replay several internal kernel pages.
 // Their work and deadlines belong to the same caller request.
@@ -58,6 +65,66 @@ pub(crate) fn with_cursor_replay_budget<T>(
     });
     let _restore = Restore(CURSOR_REPLAY_BUDGET.with(|slot| slot.replace(Some(budget))));
     operation()
+}
+
+std::thread_local! {
+    static CAPTURE_CURSOR_OPEN_CONTEXT: Cell<bool> = const { Cell::new(false) };
+    static CURSOR_OPEN_CONTEXT: std::cell::RefCell<Option<ControlArc<RequestContext>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct CursorOpenObservation(ControlArc<RequestContext>);
+impl CursorOpenObservation {
+    pub(crate) fn into_observation(
+        self,
+    ) -> std::result::Result<Option<CursorObservation>, BoundedExecutionError> {
+        let (mut observation, overflow) = self.0.take_final_observation();
+        if overflow {
+            return Err(Error::Other(("bounded rows-examined counter overflow".to_string()).into()).into());
+        }
+        // A failed open published no page to its caller, including when first
+        // page preparation succeeded before registration later refused.
+        if let Some(observation) = observation.as_mut() {
+            for group in &mut Arc::get_mut(&mut observation.trace)
+                .expect("failed-open receipt is private until release")
+                .groups
+            {
+                group.returned_rows = 0;
+            }
+        }
+        Ok(observation)
+    }
+}
+
+pub(crate) fn with_cursor_open_work<T>(
+    operation: impl FnOnce() -> T,
+) -> (
+    T,
+    std::result::Result<u64, BoundedExecutionError>,
+    Option<CursorOpenObservation>,
+) {
+    struct Restore(Option<ControlArc<RequestContext>>, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURSOR_OPEN_CONTEXT.with(|slot| *slot.borrow_mut() = self.0.take());
+            CAPTURE_CURSOR_OPEN_CONTEXT.with(|slot| slot.set(self.1));
+        }
+    }
+    let _restore = Restore(
+        CURSOR_OPEN_CONTEXT.with(|slot| slot.replace(None)),
+        CAPTURE_CURSOR_OPEN_CONTEXT.with(|slot| slot.replace(true)),
+    );
+    let result = operation();
+    let examined = CURSOR_OPEN_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(Ok(0), |context| context.cumulative_rows_examined())
+    });
+    let observation = CURSOR_OPEN_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|context| CursorOpenObservation(context.clone()))
+    });
+    (result, examined, observation)
 }
 
 pub(crate) fn cursor_replay_work_available() -> bool {
@@ -117,12 +184,34 @@ fn charge_cursor_replay(units: u64) -> std::result::Result<(), BoundedExecutionE
     Ok(())
 }
 
+#[derive(Clone)]
+enum RequestCancellation {
+    Legacy(OwnerReadCancellation),
+    Native(contextdb_core::read_contract::NativeReadCancellation),
+}
+impl RequestCancellation {
+    fn is_cancelled(&self) -> bool {
+        match self { Self::Legacy(token) => token.is_cancelled(), Self::Native(token) => token.is_cancelled() }
+    }
+    fn cancel(&self) {
+        match self { Self::Legacy(token) => token.cancel(), Self::Native(token) => token.cancel() }
+    }
+}
+
 struct RequestState {
     started_ms: u64,
-    cancellation: OwnerReadCancellation,
+    cancellation: RequestCancellation,
     telemetry: BoundedExecutionTelemetry,
     touches: BTreeMap<BoundedSourceTouch, u64>,
-    memory: OwnedMemoryReservation,
+    completed_rows_examined: u64,
+    groups: Vec<GroupObserver>,
+    group_observer_bytes: usize,
+    // Unique until terminal release: changes are admitted before group work.
+    final_observation: Option<CursorObservation>,
+    group_publication_generation: u64,
+    /// Next private descriptor ordinal; retained inline with the request.
+    next_group_descriptor: u64,
+    memory: ReadCredit,
     membership_bytes: usize,
     // What the answer being assembled holds right now, and how much work had
     // been done when its progress was last reported. These describe the
@@ -154,16 +243,89 @@ enum ReadResumption {
     AcrossFetches,
 }
 
+/// Identity assigned to the window descriptor, independent of any SQL column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GroupDescriptorId(u64);
+
+/// A stable slot in this statement's observation owner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GroupBinding(usize);
+
+struct GroupObserver {
+    descriptor: GroupDescriptorId,
+    key: Vec<Value>,
+    disclosure: crate::database::GroupDisclosure,
+    unpublished_rows: u64,
+}
+
+/// Actual group returns from one kernel page, never a count inferred from rows.
+/// Copies of an observation share this receipt, making withdrawal idempotent.
+pub(crate) struct GroupPageReturns {
+    generation: u64,
+    rows: Box<[Option<GroupBinding>]>,
+    _charge: Arc<SourcePageCharge>,
+}
+
+/// Clears unpublished return attribution on every error/cancellation exit.
+struct GroupPublicationAttempt<'a>(&'a RequestContext);
+impl Drop for GroupPublicationAttempt<'_> {
+    fn drop(&mut self) {
+        self.0.discard_group_returns();
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TraceMemoryOwner(
+    pub(super) Arc<dyn ReadMemoryBudget>,
+    Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
+);
+impl TraceMemoryOwner {
+    pub(super) fn new(owner: Arc<dyn ReadMemoryBudget>) -> Self {
+        let invoice = owner.control_invoice();
+        Self(owner, invoice)
+    }
+}
+impl contextdb_vector::MemoryBudget for TraceMemoryOwner {
+    fn try_allocate_for(&self, bytes: usize, _: &str, _: &str, _: &str) -> Result<()> {
+        self.0.try_reserve(
+            bytes,
+            "vector_search",
+            "trace",
+            "Reduce query scope or raise the reader memory limit.",
+        )
+    }
+    fn release(&self, bytes: usize) {
+        self.0.release(bytes);
+    }
+}
+struct PrepaidTraceCredit {
+    owner: Arc<dyn contextdb_vector::MemoryBudget>,
+    credit: ReadCredit,
+}
+impl contextdb_vector::PrepaidVectorCopyCharge for PrepaidTraceCredit {
+    fn accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> {
+        self.owner.clone()
+    }
+    fn retained_bytes(&self) -> usize {
+        self.credit.bytes()
+    }
+    fn transfer(self: Box<Self>) {
+        self.credit.transfer();
+    }
+}
+
 struct RequestContext {
     limits: ReadLimits,
+    fixed_control_bytes: usize,
+    native_operation: Option<crate::owner_read::NativeReadRequest>,
+    vector_decode_budget: ControlArc<WeakSourceDecodeBudget>,
+    vector_copies: Mutex<contextdb_vector::VectorCopyAdmission>,
+    /// The first validated vector capture fixes intent and roots across fetches.
+    vector_read_capture:
+        Mutex<Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>>>,
     /// How this read ends when an operator runs out of budget mid-answer:
     /// refused, or paused for the next fetch.
     resumption: ReadResumption,
-    /// The store-side reservation a door that declared NO ceilings holds for a
-    /// traversal's frontier, grown as the drain resolves starts. `None` for a
-    /// read that named its own ceilings: that read's frontier is governed by
-    /// the ceiling it named, and it holds nothing the store accounts for.
-    store_frontier: Mutex<Option<OwnedMemoryReservation>>,
     /// The transaction this read is running inside, decided ONCE where the
     /// read is entered. A caller holding an explicit transaction handle is not
     /// the session's transaction, so asking the store for "the active one"
@@ -176,49 +338,220 @@ struct RequestContext {
     /// (`SourcePageCharge`) and gives these bytes back when its last holder
     /// drops it, so the read's memory ceiling counts them for exactly as long
     /// as they exist.
-    live_source_pages: Arc<std::sync::atomic::AtomicUsize>,
-    /// The accountant this read's charges are made against; a live page's
-    /// charge is held here.
-    page_accountant: Arc<crate::memory_accounting::MemoryAccountant>,
-    #[cfg(feature = "test-seams")]
+    live_source_pages: ControlArc<std::sync::atomic::AtomicUsize>,
+    /// The caller-supplied budget retained by this executing request.
+    reader_budget: Arc<dyn ReadMemoryBudget>,
+    native_budget_control: Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
+    /// Bound-range sizes of tied index candidates, probed once per request so
+    /// preflight, ordering and build choose the same index.
+    index_ranges: crate::executor::IndexRangeMemo,
+    #[cfg(any(test, feature = "test-seams"))]
     probe: Mutex<Option<Arc<dyn BoundedExecutionProbe>>>,
 }
 
 /// The charge one storage page carries for as long as it lives outside the
 /// store's page cache. Dropping it -- which happens when the last holder of
-/// the page drops it -- returns the bytes to the accountant and to the read
-/// that admitted the page.
-struct SourcePageCharge {
-    accountant: Arc<crate::memory_accounting::MemoryAccountant>,
-    live: Arc<std::sync::atomic::AtomicUsize>,
+/// the page drops it -- returns the bytes to the declared owner and to the read
+/// that admitted the page. The vector load transfer callback carries one for
+/// its own allocation, which can likewise outlive the call that admitted it.
+pub(crate) struct SourcePageCharge {
+    _credit: ReadCredit,
+    live: ControlArc<std::sync::atomic::AtomicUsize>,
     bytes: usize,
 }
 
 impl Drop for SourcePageCharge {
     fn drop(&mut self) {
-        self.accountant.release(self.bytes);
         self.live
             .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
+/// Active preparation for a committed reader uses the bounded kernel's
+/// existing cancellation and deadline checks and its declared request owner.
+#[derive(Clone)]
+pub(crate) struct ReadOpenContext(ControlArc<RequestContext>);
+
+/// An operation retained by this request cannot hold a strong request back-reference.
+/// Upgrading uses the same cancellation, deadline and aggregate work state.
+pub(crate) struct VectorReadCheckpoint(ControlWeak<RequestContext>);
+
+impl VectorReadCheckpoint {
+    pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
+        self.0
+            .upgrade()
+            .ok_or(Error::ReadCancelled)?
+            .checkpoint()
+            .map_err(ReadOpenContext::engine_error)
+    }
+
+    pub(crate) fn belongs_to(&self, context: &ReadOpenContext) -> bool {
+        ControlWeak::ptr_eq(&self.0, &ControlArc::downgrade(&context.0))
+    }
+}
+
+impl ReadOpenContext {
+    // Wrap the actual executing request. Constructing a second RequestContext
+    // would reset its cancellation, active deadline and aggregate work.
+    fn from_request(context: &ControlArc<RequestContext>) -> Self {
+        Self(context.clone())
+    }
+
+    pub(crate) fn new(
+        read_memory: Arc<dyn ReadMemoryBudget>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: OwnerReadCancellation,
+    ) -> contextdb_core::Result<Self> {
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_work_probe::note_commit_directory_open_funding(&read_memory);
+        RequestContext::new(
+            read_memory,
+            limits,
+            ReadResumption::OneShot,
+            clock,
+            cancellation,
+            None,
+            #[cfg(any(test, feature = "test-seams"))]
+            None,
+        )
+        .map(Self)
+        .map_err(Self::engine_error)
+    }
+
+    pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
+        self.0.checkpoint().map_err(Self::engine_error)
+    }
+
+    pub(crate) fn read_memory(&self) -> Arc<dyn ReadMemoryBudget> {
+        self.0.reader_budget.clone()
+    }
+
+    /// Cancel this read as its caller would, for proofs that stop it at an
+    /// exact point.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn cancel_for_test(&self) {
+        let cancellation = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancellation
+            .clone();
+        cancellation.cancel();
+    }
+
+    pub(crate) fn vector_checkpoint(&self) -> VectorReadCheckpoint {
+        VectorReadCheckpoint(ControlArc::downgrade(&self.0))
+    }
+
+    pub(crate) fn vector_read_capture(
+        &self,
+    ) -> Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>> {
+        self.0
+            .vector_read_capture
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn retain_vector_read_capture(
+        &self,
+        capture: Arc<crate::persistence::vector_membership_source::VectorReadOperation>,
+    ) -> contextdb_core::Result<()> {
+        let mut slot = self
+            .0
+            .vector_read_capture
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|prior| !Arc::ptr_eq(prior, &capture))
+        {
+            return Err(Error::StoreCorrupted {
+                path: "vector_partition_memberships".into(),
+                reason: "request attempted to replace its immutable vector capture".into(),
+            });
+        }
+        *slot = Some(capture);
+        Ok(())
+    }
+
+    fn engine_error(error: BoundedExecutionError) -> Error {
+        match error {
+            BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+            BoundedExecutionError::Cancelled => Error::ReadCancelled,
+            BoundedExecutionError::Engine(error) => error,
+            BoundedExecutionError::Unimplemented => {
+                Error::Other("bounded read preparation is not implemented".into())
+            }
+        }
+    }
+}
+
 impl RequestContext {
     fn new(
-        db: &dyn ReadExecutionTarget,
+        reader_budget: Arc<dyn ReadMemoryBudget>,
         limits: ReadLimits,
         resumption: ReadResumption,
         clock: Arc<dyn DeadlineClock>,
         cancellation: OwnerReadCancellation,
         transaction: Option<TxId>,
-        #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
-    ) -> std::result::Result<Arc<Self>, BoundedExecutionError> {
+        #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    ) -> std::result::Result<ControlArc<Self>, BoundedExecutionError> {
+        Self::new_with_cancellation(reader_budget, limits, resumption, clock,
+            RequestCancellation::Legacy(cancellation), transaction, None, None,
+            #[cfg(any(test, feature = "test-seams"))] probe)
+    }
+
+    fn new_with_cancellation(
+        reader_budget: Arc<dyn ReadMemoryBudget>, limits: ReadLimits,
+        resumption: ReadResumption, clock: Arc<dyn DeadlineClock>,
+        cancellation: RequestCancellation, transaction: Option<TxId>,
+        native_operation: Option<crate::owner_read::NativeReadRequest>,
+        original_started_ms: Option<u64>,
+        #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    ) -> std::result::Result<ControlArc<Self>, BoundedExecutionError> {
         Self::check_effective_limits(&limits)?;
-        let started_ms = clock.now_ms();
-        let page_accountant = db.bounded_read_accountant();
-        Ok(Arc::new(Self {
+        let started_ms = original_started_ms.unwrap_or_else(|| clock.now_ms());
+        let counter_bytes = ControlArc::<std::sync::atomic::AtomicUsize>::control_bytes()?;
+        let adapter_bytes = checked_size_add(
+            ControlArc::<WeakSourceDecodeBudget>::control_bytes()?,
+            ControlArc::<crate::vector_read_memory::ReaderVectorBudget>::control_bytes()?,
+            "vector adapter controls")?;
+        let native_adapter_bytes = if native_operation.is_some() {
+            ControlArc::<NativeKernelBudget>::control_bytes()?
+        } else { 0 };
+        let fixed_control_bytes = checked_size_add(native_adapter_bytes, checked_size_add(
+            checked_size_add(ControlArc::<Self>::control_bytes()?, counter_bytes,
+                "request fixed controls")?, adapter_bytes, "request fixed controls")?, "native request controls")?;
+        if u64::try_from(fixed_control_bytes).unwrap_or(u64::MAX) > limits.memory {
+            return Err(Self::limit_failure(ReadFailureLimit::Memory, limits.memory));
+        }
+        let funding_owner = native_operation.as_ref().map(|operation| operation.owner())
+            .unwrap_or_else(|| contextdb_core::read_memory::ReadMemoryOwner::from_legacy(reader_budget.clone()));
+        let counter_invoice = ControlArc::<std::sync::atomic::AtomicUsize>::admit_owned(funding_owner.clone())?;
+        let weak_invoice = ControlArc::<WeakSourceDecodeBudget>::admit_owned(funding_owner.clone())?;
+        let vector_invoice = ControlArc::<crate::vector_read_memory::ReaderVectorBudget>::admit_owned(funding_owner.clone())?;
+        let request_invoice = ControlArc::<Self>::admit_owned(funding_owner.clone())?;
+        let ledger = ReadCredit::from_prepaid_owned(funding_owner, 0);
+        let native_budget_control = reader_budget.control_invoice();
+        let live_source_pages = ControlArc::from_prepaid(
+            std::sync::atomic::AtomicUsize::new(0), counter_invoice);
+        let context = ControlArc::cyclic_from_prepaid(request_invoice, |context| {
+            let vector_decode_budget = ControlArc::from_prepaid(
+                WeakSourceDecodeBudget(context.clone(), weak_invoice.clone()), weak_invoice);
+            let copies = crate::vector_read_memory::admission_prepaid(
+                (*vector_decode_budget).clone(), vector_decode_budget.original_invoice(), vector_invoice);
+            Self {
+            fixed_control_bytes,
+            native_operation,
+            vector_decode_budget: vector_decode_budget.clone(),
+            index_ranges: Default::default(),
+            vector_read_capture: Mutex::new(None),
+            vector_copies: Mutex::new(copies),
             limits,
             resumption,
-            store_frontier: Mutex::new(None),
             transaction,
             clock,
             state: Mutex::new(RequestState {
@@ -226,7 +559,13 @@ impl RequestContext {
                 cancellation,
                 telemetry: BoundedExecutionTelemetry::default(),
                 touches: BTreeMap::new(),
-                memory: OwnedMemoryReservation::new(Arc::clone(&page_accountant)),
+                completed_rows_examined: 0,
+                groups: Vec::new(),
+                group_observer_bytes: 0,
+                final_observation: None,
+                group_publication_generation: 0,
+                next_group_descriptor: 0,
+                memory: ledger,
                 membership_bytes: 0,
                 rows_so_far: 0,
                 bytes_so_far: 0,
@@ -234,11 +573,572 @@ impl RequestContext {
                 reported_rows: 0,
                 release_fault: None,
             }),
-            live_source_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            page_accountant,
-            #[cfg(feature = "test-seams")]
+            live_source_pages,
+            reader_budget,
+            native_budget_control,
+            #[cfg(any(test, feature = "test-seams"))]
             probe: Mutex::new(probe),
-        }))
+        }});
+        context.replace_final_trace(0, |_| {})?;
+        Ok(context)
+    }
+
+    /// Keep a private, already admitted terminal carrier. It is never shared
+    /// while work can still change its counters; page snapshots remain immutable.
+    fn replace_final_trace(
+        &self,
+        payload_bytes: usize,
+        update: impl FnOnce(&mut QueryTrace),
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        if !matches!(self.resumption, ReadResumption::AcrossFetches) {
+            return Ok(());
+        }
+        let bytes = checked_size_add(
+            checked_size_mul(
+                checked_size_add(
+                    std::mem::size_of::<QueryTrace>(),
+                    payload_bytes,
+                    "terminal trace",
+                )?,
+                2,
+                "terminal trace copies",
+            )?,
+            std::mem::size_of::<SourcePageCharge>() + 4 * std::mem::size_of::<usize>(),
+            "terminal trace owners",
+        )?;
+        self.reserve(BoundedWorkSource::TableScan, bytes)?;
+        let credit = self.state().memory.try_split_off(bytes)?;
+        self.live_source_pages
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        let charge = Arc::new(SourcePageCharge {
+            _credit: credit,
+            live: self.live_source_pages.clone(),
+            bytes,
+        });
+        let mut state = self.state();
+        let mut trace = state
+            .final_observation
+            .as_ref()
+            .map_or_else(QueryTrace::default, |receipt| (*receipt.trace).clone());
+        update(&mut trace);
+        state.final_observation = Some(CursorObservation {
+            trace: Arc::new(trace),
+            rows_examined: 0,
+            charge: Some(charge),
+            group_page_returns: None,
+        });
+        Ok(())
+    }
+
+    fn prepare_final_observation_work(&self) -> std::result::Result<(), BoundedExecutionError> {
+        let payload = {
+            let state = self.state();
+            let Some(receipt) = state.final_observation.as_ref() else {
+                return Ok(());
+            };
+            if receipt
+                .charge
+                .as_ref()
+                .is_none_or(|charge| Arc::strong_count(charge) == 1)
+            {
+                return Ok(());
+            }
+            query_trace_capacity_bytes(&receipt.trace)?
+        };
+        self.replace_final_trace(payload, |_| {})
+    }
+
+    fn final_observation_snapshot(
+        &self,
+    ) -> std::result::Result<CursorObservation, BoundedExecutionError> {
+        let examined = self.cumulative_rows_examined()?;
+        let mut state = self.state();
+        let RequestState {
+            final_observation,
+            groups,
+            ..
+        } = &mut *state;
+        let receipt = final_observation
+            .as_mut()
+            .expect("admitted terminal carrier");
+        let trace =
+            Arc::get_mut(&mut receipt.trace).expect("terminal receipt is private until release");
+        for (disclosure, group) in trace.groups.iter_mut().zip(groups.iter()) {
+            disclosure.examined_entries = group.disclosure.examined_entries;
+            disclosure.returned_rows = group.disclosure.returned_rows;
+            disclosure.route = group.disclosure.route;
+        }
+        // The carrier admission funds this one immutable outward trace copy.
+        Ok(CursorObservation {
+            trace: Arc::new(trace.clone()),
+            rows_examined: examined,
+            charge: receipt.charge.clone(),
+            group_page_returns: None,
+        })
+    }
+
+    fn bind_final_trace(
+        &self,
+        source: &QueryTrace,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let payload = checked_size_add(
+            query_trace_capacity_bytes(source)?,
+            self.group_snapshot_bytes()?,
+            "terminal trace",
+        )?;
+        self.replace_final_trace(payload, |trace| {
+            let groups = std::mem::take(&mut trace.groups);
+            *trace = source.clone();
+            trace.groups = groups;
+        })
+    }
+
+    fn bind_final_vector(
+        &self,
+        vector: &VectorSearchDisclosure,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let current = {
+            let state = self.state();
+            let Some(receipt) = state.final_observation.as_ref() else {
+                return Ok(());
+            };
+            query_trace_capacity_bytes(&receipt.trace)?
+        };
+        let payload = checked_size_add(
+            current,
+            vector_search_disclosure_capacity_bytes(vector)?,
+            "terminal vector trace",
+        )?;
+        self.replace_final_trace(payload, |trace| trace.vector_search = Some(vector.clone()))
+    }
+
+    /// Move the unique admitted carrier; only inline counters change here.
+    /// No allocation or memory admission is allowed at a terminal boundary.
+    fn take_final_observation(&self) -> (Option<CursorObservation>, bool) {
+        let mut state = self.state();
+        let examined = Self::examined_touches(&state).and_then(|touches| {
+            state
+                .completed_rows_examined
+                .checked_add(touches)
+                .ok_or_else(|| {
+                    Error::Other(("bounded rows-examined counter overflow".to_string()).into()).into()
+                })
+        });
+        let mut receipt = state.final_observation.take();
+        let overflow = examined.is_err();
+        if let Some(receipt) = receipt.as_mut() {
+            if let Ok(examined) = examined {
+                receipt.rows_examined = examined;
+            }
+            let trace = Arc::get_mut(&mut receipt.trace)
+                .expect("terminal receipt is private until release");
+            for (disclosure, group) in trace.groups.iter_mut().zip(&state.groups) {
+                disclosure.examined_entries = group.disclosure.examined_entries;
+                disclosure.returned_rows = group.disclosure.returned_rows;
+                disclosure.route = group.disclosure.route;
+            }
+        }
+        (receipt, overflow)
+    }
+
+    /// Allocate one identity when a window descriptor is created in this request.
+    fn new_group_descriptor(
+        &self,
+    ) -> std::result::Result<GroupDescriptorId, BoundedExecutionError> {
+        let mut state = self.state();
+        let descriptor = GroupDescriptorId(state.next_group_descriptor);
+        state.next_group_descriptor = state
+            .next_group_descriptor
+            .checked_add(1)
+            .ok_or_else(|| Error::PlanError("group descriptor ordinal overflow".to_string()))?;
+        Ok(descriptor)
+    }
+
+    fn bind_group(
+        &self,
+        descriptor: GroupDescriptorId,
+        key: &[Value],
+        partition_key: &str,
+        route: crate::database::GroupRoute,
+    ) -> std::result::Result<GroupBinding, BoundedExecutionError> {
+        {
+            let state = self.state();
+            if let Some(slot) = state
+                .groups
+                .iter()
+                .position(|group| group.descriptor == descriptor && group.key.as_slice() == key)
+            {
+                return Ok(GroupBinding(slot));
+            }
+        }
+        let (old_capacity, new_len) =
+            {
+                let state = self.state();
+                (
+                    state.groups.capacity(),
+                    state.groups.len().checked_add(1).ok_or_else(|| {
+                        Error::Other(("group observation slot overflow".to_string()).into())
+                    })?,
+                )
+            };
+        let container = checked_size_mul(
+            new_len.saturating_sub(old_capacity),
+            std::mem::size_of::<GroupObserver>(),
+            "group observation slots",
+        )?;
+        let payload = checked_size_add(
+            planned_values_clone_bytes(key)?,
+            partition_key.len(),
+            "group observation identity",
+        )?;
+        let planned = checked_size_add(container, payload, "group observation")?;
+        self.reserve(BoundedWorkSource::TableScan, planned)?;
+        let group = GroupObserver {
+            descriptor,
+            key: key.to_vec(),
+            disclosure: crate::database::GroupDisclosure {
+                ordinal: u64::try_from(new_len - 1)
+                    .map_err(|_| Error::Other(("group ordinal overflow".to_string()).into()))?,
+                partition_key: partition_key.to_owned(),
+                examined_entries: 0,
+                returned_rows: 0,
+                route,
+            },
+            unpublished_rows: 0,
+        };
+        let actual_payload = checked_size_add(
+            values_capacity_allocation_bytes(&group.key)?,
+            group.disclosure.partition_key.capacity(),
+            "group observation identity",
+        )?;
+        let (slot, actual_container) = {
+            let mut state = self.state();
+            let additional = new_len - state.groups.len();
+            if state.groups.try_reserve_exact(additional).is_err() {
+                drop(state);
+                self.release(planned)?;
+                return Err(Error::Other(("group observation allocation failed".to_string()).into()).into());
+            }
+            drop(state);
+            if matches!(self.resumption, ReadResumption::AcrossFetches) {
+                let current = {
+                    let state = self.state();
+                    query_trace_capacity_bytes(
+                        &state
+                            .final_observation
+                            .as_ref()
+                            .expect("admitted terminal carrier")
+                            .trace,
+                    )?
+                };
+                let additional = checked_size_add(
+                    std::mem::size_of::<crate::database::GroupDisclosure>(),
+                    group.disclosure.partition_key.len(),
+                    "terminal group binding",
+                )?;
+                self.replace_final_trace(
+                    checked_size_add(current, additional, "terminal groups")?,
+                    |trace| {
+                        let mut groups =
+                            Box::<[crate::database::GroupDisclosure]>::new_uninit_slice(new_len);
+                        for (target, prior) in groups.iter_mut().zip(trace.groups.iter()) {
+                            target.write(prior.clone());
+                        }
+                        groups[new_len - 1].write(group.disclosure.clone());
+                        // SAFETY: prior bindings and the new binding initialize every slot.
+                        trace.groups = unsafe { groups.assume_init() };
+                    },
+                )?;
+            }
+            let mut state = self.state();
+            let slot = state.groups.len();
+            let actual_container = checked_size_mul(
+                state.groups.capacity() - old_capacity,
+                std::mem::size_of::<GroupObserver>(),
+                "group observation slots",
+            )?;
+            state.groups.push(group);
+            (slot, actual_container)
+        };
+        let actual = checked_size_add(actual_container, actual_payload, "group observation")?;
+        reconcile_new_reservation(self, BoundedWorkSource::TableScan, planned, actual)?;
+        let mut state = self.state();
+        state.group_observer_bytes = checked_size_add(
+            state.group_observer_bytes,
+            actual,
+            "group observation owner",
+        )?;
+        Ok(GroupBinding(slot))
+    }
+
+    /// Attribute real kernel touch deltas before propagating any operation error.
+    fn with_group_work<T>(
+        &self,
+        binding: GroupBinding,
+        operation: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
+    ) -> std::result::Result<T, BoundedExecutionError> {
+        let before = self.cumulative_rows_examined()?;
+        let outcome = operation();
+        let delta = self
+            .cumulative_rows_examined()?
+            .checked_sub(before)
+            .ok_or_else(|| Error::Other(("group observation work counter underflow".to_string()).into()))?;
+        let mut state = self.state();
+        let group = state
+            .groups
+            .get_mut(binding.0)
+            .ok_or_else(|| Error::Other(("unknown group observation binding".to_string()).into()))?;
+        group.disclosure.examined_entries = group
+            .disclosure
+            .examined_entries
+            .checked_add(delta)
+            .ok_or_else(|| Error::Other(("group observation work counter overflow".to_string()).into()))?;
+        outcome
+    }
+
+    // One admitted source touch is consumed by one borrowed physical input.
+    // Failed or unidentified inputs keep their work in the global telemetry.
+
+
+
+
+
+
+    fn stage_group_return(
+        &self,
+        binding: GroupBinding,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let mut state = self.state();
+        let group = state
+            .groups
+            .get_mut(binding.0)
+            .ok_or_else(|| Error::Other(("unknown group observation binding".to_string()).into()))?;
+        group.unpublished_rows = group
+            .unpublished_rows
+            .checked_add(1)
+            .ok_or_else(|| Error::Other(("group observation return counter overflow".to_string()).into()))?;
+        Ok(())
+    }
+
+    fn unstage_group_return(
+        &self,
+        binding: GroupBinding,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let mut state = self.state();
+        let group = state
+            .groups
+            .get_mut(binding.0)
+            .ok_or_else(|| Error::Other(("unknown group observation binding".to_string()).into()))?;
+        group.unpublished_rows = group.unpublished_rows.checked_sub(1).ok_or_else(|| {
+            Error::Other(("group observation return counter underflow".to_string()).into())
+        })?;
+        Ok(())
+    }
+
+    fn prepare_group_page_returns(
+        &self,
+        rows: &[(usize, Option<GroupBinding>)],
+    ) -> std::result::Result<Option<Arc<GroupPageReturns>>, BoundedExecutionError> {
+        let state = self.state();
+        if state.groups.is_empty() {
+            if rows.iter().any(|(_, binding)| binding.is_some()) {
+                return Err(Error::Other(("page binding has no group observer".to_string()).into()).into());
+            }
+            return Ok(None);
+        }
+        let generation = state
+            .group_publication_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Other(("group publication generation overflow".to_string()).into()))?;
+        for (_, binding) in rows {
+            if binding.is_some_and(|binding| binding.0 >= state.groups.len()) {
+                return Err(
+                    Error::Other(("page contains an unknown group binding".to_string()).into()).into(),
+                );
+            }
+        }
+        for (index, group) in state.groups.iter().enumerate() {
+            let actual = rows
+                .iter()
+                .filter(|(_, binding)| *binding == Some(GroupBinding(index)))
+                .count();
+            let actual = u64::try_from(actual)
+                .map_err(|_| Error::Other(("group page row count exceeds u64".to_string()).into()))?;
+            if actual != group.unpublished_rows {
+                return Err(Error::Other((
+                    "page bindings and staged group returns diverged".to_string()).into())
+                .into());
+            }
+        }
+        drop(state);
+        let len = rows.len();
+        let bytes = checked_size_add(
+            checked_size_mul(
+                len,
+                std::mem::size_of::<Option<GroupBinding>>(),
+                "group page bindings",
+            )?,
+            std::mem::size_of::<GroupPageReturns>()
+                + std::mem::size_of::<SourcePageCharge>()
+                + 4 * std::mem::size_of::<usize>(),
+            "group page return owners",
+        )?;
+        self.reserve(BoundedWorkSource::TableScan, bytes)?;
+        let credit = self.state().memory.try_split_off(bytes)?;
+        self.live_source_pages
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        let charge = Arc::new(SourcePageCharge {
+            _credit: credit,
+            live: self.live_source_pages.clone(),
+            bytes,
+        });
+        let mut storage = Box::<[Option<GroupBinding>]>::new_uninit_slice(len);
+        for (slot, (_, binding)) in storage.iter_mut().zip(rows) {
+            slot.write(*binding);
+        }
+        // SAFETY: every exact slice slot was initialized from its actual page row.
+        let rows = unsafe { storage.assume_init() };
+        Ok(Some(Arc::new(GroupPageReturns {
+            generation,
+            rows,
+            _charge: charge,
+        })))
+    }
+
+    fn publish_group_returns(&self) -> std::result::Result<(), BoundedExecutionError> {
+        let mut state = self.state();
+        let generation = state
+            .group_publication_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Other(("group publication generation overflow".to_string()).into()))?;
+        // Validate every counter before changing any published counter.
+        for group in &state.groups {
+            group
+                .disclosure
+                .returned_rows
+                .checked_add(group.unpublished_rows)
+                .ok_or_else(|| {
+                    Error::Other(("group observation return counter overflow".to_string()).into())
+                })?;
+        }
+        for group in &mut state.groups {
+            group.disclosure.returned_rows += group.unpublished_rows;
+            group.unpublished_rows = 0;
+        }
+        state.group_publication_generation = generation;
+        Ok(())
+    }
+
+    fn discard_group_returns(&self) {
+        for group in &mut self.state().groups {
+            group.unpublished_rows = 0;
+        }
+    }
+
+    fn groups_match(
+        &self,
+        prior: &[crate::database::GroupDisclosure],
+        include_unpublished: bool,
+    ) -> std::result::Result<bool, BoundedExecutionError> {
+        let state = self.state();
+        if state.groups.len() != prior.len() {
+            return Ok(false);
+        }
+        for (group, prior) in state.groups.iter().zip(prior) {
+            let returned = group
+                .disclosure
+                .returned_rows
+                .checked_add(if include_unpublished {
+                    group.unpublished_rows
+                } else {
+                    0
+                })
+                .ok_or_else(|| {
+                    Error::Other(("group observation return counter overflow".to_string()).into())
+                })?;
+            if group.disclosure.partition_key != prior.partition_key
+                || group.disclosure.route != prior.route
+                || group.disclosure.examined_entries != prior.examined_entries
+                || returned != prior.returned_rows
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn group_snapshot_bytes(&self) -> std::result::Result<usize, BoundedExecutionError> {
+        let state = self.state();
+        let mut bytes = checked_size_mul(
+            state.groups.len(),
+            std::mem::size_of::<crate::database::GroupDisclosure>(),
+            "group trace slots",
+        )?;
+        for group in &state.groups {
+            bytes = checked_size_add(
+                bytes,
+                group.disclosure.partition_key.len(),
+                "group trace keys",
+            )?;
+        }
+        Ok(bytes)
+    }
+
+    // The caller reserves the exact slice and key payloads before allocation.
+    fn group_snapshot(
+        &self,
+        include_unpublished: bool,
+    ) -> std::result::Result<Box<[crate::database::GroupDisclosure]>, BoundedExecutionError> {
+        let state = self.state();
+        if state.groups.is_empty() {
+            return Ok(Box::default());
+        }
+        let mut storage =
+            Box::<[crate::database::GroupDisclosure]>::new_uninit_slice(state.groups.len());
+        // Initialize every slot with an allocation-free placeholder first, so
+        // an unwind while cloning a key drops all previously cloned strings.
+        for slot in &mut storage {
+            slot.write(crate::database::GroupDisclosure {
+                partition_key: String::new(),
+                ordinal: 0,
+                examined_entries: 0,
+                returned_rows: 0,
+                route: crate::database::GroupRoute::Sort,
+            });
+        }
+        // SAFETY: every element above was initialized exactly once.
+        let mut groups = unsafe { storage.assume_init() };
+        for (disclosure, group) in groups.iter_mut().zip(&state.groups) {
+            *disclosure = group.disclosure.clone();
+            if include_unpublished {
+                disclosure.returned_rows = disclosure
+                    .returned_rows
+                    .checked_add(group.unpublished_rows)
+                    .ok_or_else(|| {
+                        Error::Other(("group observation return counter overflow".to_string()).into())
+                    })?;
+            }
+        }
+        Ok(groups)
+    }
+
+    fn refresh_group_trace(
+        &self,
+        trace: &mut QueryTrace,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        if self.groups_match(&trace.groups, true)? {
+            return Ok(());
+        }
+        let planned = self.group_snapshot_bytes()?;
+        self.reserve(BoundedWorkSource::TableScan, planned)?;
+        let groups = self.group_snapshot(true)?;
+        let actual = group_disclosure_capacity_bytes(&groups)?;
+        reconcile_new_reservation(self, BoundedWorkSource::TableScan, planned, actual)?;
+        let old = std::mem::replace(&mut trace.groups, groups);
+        let old_bytes = group_disclosure_capacity_bytes(&old)?;
+        drop(old);
+        self.release(old_bytes)?;
+        Ok(())
     }
 
     /// Check the limits this read will actually enforce.
@@ -278,6 +1178,84 @@ impl RequestContext {
         Ok(())
     }
 
+    fn with_vector_copies<T, E>(
+        &self,
+        operation: impl FnOnce(&mut contextdb_vector::VectorCopyAdmission)
+            -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where E: From<Error>,
+    {
+        self.with_vector_copies_for_step(true, operation)
+    }
+
+    fn with_vector_copies_for_step<T, E>(
+        &self,
+        decoding: bool,
+        operation: impl FnOnce(&mut contextdb_vector::VectorCopyAdmission)
+            -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where E: From<Error>,
+    {
+        let mut owner = self.vector_copies.lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Keep exactly the old vector-call creation boundary. Root controls
+        // are admitted once on this request; child controls use the same weak
+        // adapter and therefore its cancellation, deadline and memory ledger.
+        let mut live = None;
+        let decode = if decoding && crate::read_image_memory::active_owner().is_err() {
+            let bytes = QueryVectorDecode::fixed_bytes().map_err(E::from)?;
+            let mut charge = self.admit_live_charge(BoundedWorkSource::VectorCandidates,
+                bytes, "vector_decode_controls")
+                .map_err(|error| E::from(ReadOpenContext::engine_error(error)))?;
+            let original = charge._credit.try_split_off(bytes).map_err(E::from)?;
+            live = Some(charge);
+            Some(QueryVectorDecode::from_prepaid((*self.vector_decode_budget).clone(), original)
+                .map_err(E::from)?)
+        } else { None };
+        let _decode = decode.as_ref().map(|decode| decode.enter());
+        let _live = &live;
+        operation(&mut owner)
+    }
+
+    /// This request's sizer for index candidates that tie on their declaration.
+    fn index_range_sizes<'a>(
+        &'a self,
+        db: &'a dyn ReadExecutionTarget,
+        snapshot: SnapshotId,
+    ) -> crate::executor::IndexRangeSizes<'a> {
+        crate::executor::IndexRangeSizes::new(
+            db,
+            snapshot,
+            self.reader_budget.clone(),
+            &self.index_ranges,
+            self,
+        )
+    }
+
+    /// Count the index entries this request's range probes read as examined,
+    /// and return the refusal a probe met: a probe stops at the request's
+    /// work limit, deadline, cancellation or memory limit, and the request
+    /// fails with that refusal before it reads anything else.
+    fn note_index_range_probes(&self) -> std::result::Result<(), BoundedExecutionError> {
+        if let Some(refusal) = self.index_ranges.take_refusal() {
+            return Err(refusal);
+        }
+        // The probes walked index entries, so they count exactly as the
+        // entries an index scan walks do, in this read's own examined count.
+        let entries = self.index_ranges.take_entries_read();
+        if entries != 0 {
+            let mut state = self.state();
+            let walked = state
+                .touches
+                .entry(BoundedSourceTouch::IndexEntry)
+                .or_default();
+            *walked = walked.checked_add(entries).ok_or_else(|| {
+                Error::Other(("bounded rows-examined counter overflow".to_string()).into())
+            })?;
+        }
+        Ok(())
+    }
+
     fn state(&self) -> MutexGuard<'_, RequestState> {
         match self.state.lock() {
             Ok(state) => state,
@@ -288,17 +1266,21 @@ impl RequestContext {
     fn begin_fetch(
         &self,
         cancellation: OwnerReadCancellation,
-        #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+        #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         let mut state = self.state();
         let held = u64::try_from(state.memory.bytes())
             .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
         state.started_ms = self.clock.now_ms();
-        state.cancellation = cancellation;
+        state.cancellation = RequestCancellation::Legacy(cancellation);
         state.telemetry = BoundedExecutionTelemetry {
             peak_temporary_bytes: held,
             ..BoundedExecutionTelemetry::default()
         };
+        state.completed_rows_examined = state
+            .completed_rows_examined
+            .checked_add(Self::examined_touches(&state)?)
+            .ok_or_else(|| Error::Other(("bounded rows-examined counter overflow".to_string()).into()))?;
         state.touches.clear();
         // A page is its own read as far as a waiting caller is concerned: it
         // starts with no rows, no bytes, and nothing reported.
@@ -306,7 +1288,7 @@ impl RequestContext {
         state.bytes_so_far = 0;
         state.reported_work = 0;
         state.reported_rows = 0;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             let mut current = match self.probe.lock() {
                 Ok(current) => current,
@@ -317,7 +1299,7 @@ impl RequestContext {
         Ok(())
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     fn probe(&self) -> Option<Arc<dyn BoundedExecutionProbe>> {
         match self.probe.lock() {
             Ok(probe) => probe.clone(),
@@ -440,6 +1422,19 @@ impl RequestContext {
         ))
     }
 
+    /// The read's own declared memory ceiling refused this charge: answered in
+    /// the read vocabulary (owner limit, memory), as the dev contract requires.
+    /// A refusal of the database's standing budget is not this one; it keeps
+    /// the store's own typed refusal from the store's credit.
+    fn memory_limit_failure(
+        &self,
+        _held: usize,
+        _requested: usize,
+        _operation: &'static str,
+    ) -> BoundedExecutionError {
+        Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory)
+    }
+
     /// Whatever must stop the request before it does more work: a parked
     /// release fault first, because it means the live charge no longer
     /// describes what the request holds, then cancellation.
@@ -466,6 +1461,70 @@ impl RequestContext {
         }
     }
 
+    /// Move `bytes` of this request's load credit to `destination`, the owner
+    /// that keeps a cold-loaded vector graph after this request ends. The
+    /// destination admits first, with no lock of this request held, because
+    /// admitting can reclaim vector caches; this request's credit is then split
+    /// off and given back in one step, so the graph is never unfunded. The
+    /// search that calls this holds `vector_copies`, so it is never touched
+    /// here, and the move must hold past cancellation and the statement
+    /// ceiling, so it never reserves.
+    fn transfer_graph_credit(
+        &self,
+        destination: &crate::memory_accounting::MemoryAccountant,
+        bytes: usize,
+    ) -> contextdb_core::Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        self.observe_graph_credit_transfer(
+            GraphCreditTransferPhase::BeforeDestination,
+            destination,
+            bytes,
+        );
+        destination.transfer_vector_load_reservation(bytes, || {
+            #[cfg(any(test, feature = "test-seams"))]
+            self.observe_graph_credit_transfer(
+                GraphCreditTransferPhase::DestinationAdmitted,
+                destination,
+                bytes,
+            );
+            let split = {
+                let mut state = self.state();
+                state.memory.try_split_off(bytes)?
+            };
+            drop(split);
+            #[cfg(any(test, feature = "test-seams"))]
+            self.observe_graph_credit_transfer(
+                GraphCreditTransferPhase::SourceSplit,
+                destination,
+                bytes,
+            );
+            Ok(())
+        })
+    }
+
+    /// Report where one graph credit move stands to this read's probe. It
+    /// reads this request's credit under a brief `state` lock and the
+    /// destination's usage, and calls the probe with no lock of this request
+    /// held; it never touches `vector_copies`.
+    #[cfg(any(test, feature = "test-seams"))]
+    fn observe_graph_credit_transfer(
+        &self,
+        phase: GraphCreditTransferPhase,
+        destination: &crate::memory_accounting::MemoryAccountant,
+        bytes: usize,
+    ) {
+        let Some(probe) = self.probe() else {
+            return;
+        };
+        let request_credit = self.state().memory.bytes();
+        probe.graph_credit_transfer(GraphCreditTransferCut {
+            phase,
+            bytes,
+            request_credit,
+            destination_used: destination.usage().used,
+        });
+    }
+
     /// The terminal answer for a caller that withdrew its read while the
     /// snapshot registration was parked behind an in-flight removal pass.
     fn withdrawn_failure(&self) -> BoundedExecutionError {
@@ -486,9 +1545,9 @@ impl RequestContext {
         )]
         let completed = state.telemetry.work_units;
         drop(state);
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = (first_observation, completed);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if first_observation && let Some(probe) = self.probe() {
             probe.cancellation_observed(completed);
         }
@@ -497,7 +1556,7 @@ impl RequestContext {
 
     fn elapsed_since(&self, started_ms: u64) -> std::result::Result<u64, BoundedExecutionError> {
         self.clock.now_ms().checked_sub(started_ms).ok_or_else(|| {
-            Error::Other("bounded deadline clock moved backwards".to_string()).into()
+            Error::Other(("bounded deadline clock moved backwards".to_string()).into()).into()
         })
     }
 
@@ -516,21 +1575,7 @@ impl RequestContext {
         Ok(())
     }
 
-    fn publication_scope(
-        &self,
-        snapshot_lsn: Lsn,
-        tables: BTreeSet<String>,
-    ) -> ReadPublicationScope {
-        let state = self.state();
-        ReadPublicationScope::bounded(
-            snapshot_lsn,
-            tables,
-            self.limits,
-            Arc::clone(&self.clock),
-            state.cancellation.clone(),
-            state.started_ms,
-        )
-    }
+
 
     fn registration_budget(&self) -> crate::database::ReadRegistrationBudget {
         let started_ms = self.state().started_ms;
@@ -548,6 +1593,17 @@ impl RequestContext {
     /// second unit of candidate work.
     fn checkpoint(&self) -> std::result::Result<(), BoundedExecutionError> {
         self.check_final_boundary()
+    }
+
+    /// Report native directory, body and navigation steps separately from logical work.
+    /// Their page admission remains governed by the source memory budget.
+    fn native_source_touch(&self) -> std::result::Result<(), BoundedExecutionError> {
+        self.checkpoint()?;
+        contextdb_core::find_attribution::count("bounded_native_source_touches", 1);
+        let mut state = self.state();
+        state.telemetry.native_source_touches =
+            state.telemetry.native_source_touches.saturating_add(1);
+        Ok(())
     }
 
     /// Count one thing the read looked at, without charging for looking.
@@ -589,10 +1645,15 @@ impl RequestContext {
                 state.started_ms,
             )
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = completed_source;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
+            let _funding = crate::read_work_probe::observe_funding(
+                crate::read_work_probe::funding_owner_name(&self.reader_budget),
+                crate::read_work_probe::funding_owner_id(&self.reader_budget),
+                self.state().memory.bytes(),
+            );
             probe.before_source_touch(touch, completed_source);
         }
         if self.elapsed_since(started_ms)? > self.limits.active_ms {
@@ -605,7 +1666,7 @@ impl RequestContext {
             return Err(cancelled);
         }
         self.note_touch(touch);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_probe::note_bounded_source_touch();
             crate::read_probe::note_session_source_touch();
@@ -648,9 +1709,9 @@ impl RequestContext {
             )
         };
 
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = (completed_work, completed_source);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.before_work(source, completed_work);
         }
@@ -660,8 +1721,13 @@ impl RequestContext {
                 self.limits.active_ms,
             ));
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
+            let _funding = crate::read_work_probe::observe_funding(
+                crate::read_work_probe::funding_owner_name(&self.reader_budget),
+                crate::read_work_probe::funding_owner_id(&self.reader_budget),
+                self.state().memory.bytes(),
+            );
             probe.before_source_touch(touch, completed_source);
         }
         if let Some(cancelled) = self.pending_failure() {
@@ -687,7 +1753,7 @@ impl RequestContext {
                 .checked_add(1)
                 .ok_or_else(|| Self::limit_failure(ReadFailureLimit::Work, self.limits.work))?;
         }
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_probe::note_bounded_source_touch();
             crate::read_probe::note_session_source_touch();
@@ -727,9 +1793,9 @@ impl RequestContext {
             }
             (state.telemetry.work_units, state.started_ms)
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = completed_work;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.before_work(source, completed_work);
         }
@@ -765,6 +1831,16 @@ impl RequestContext {
             return Ok(());
         }
         self.check_final_boundary()?;
+        self.reserve_metadata(source, requested)
+    }
+
+    // Final cancellation observations own the same bounded memory as successful
+    // observations, but are emitted after the request's cancellation boundary.
+    fn reserve_metadata(
+        &self,
+        source: BoundedWorkSource,
+        requested: usize,
+    ) -> std::result::Result<(), BoundedExecutionError> {
         let requested_u64 = u64::try_from(requested)
             .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
         #[allow(
@@ -779,16 +1855,17 @@ impl RequestContext {
                 .checked_add(requested_u64)
                 .is_none_or(|after| after > self.limits.memory)
             {
-                return Err(Self::limit_failure(
-                    ReadFailureLimit::Memory,
-                    self.limits.memory,
+                return Err(self.memory_limit_failure(
+                    usize::try_from(held).unwrap_or(usize::MAX),
+                    requested,
+                    source.reservation_operation(),
                 ));
             }
             held
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = held;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.before_temporary_reservation(source, requested_u64, held);
         }
@@ -821,13 +1898,36 @@ impl RequestContext {
                 .or_insert(held_after);
             held_after
         };
-        #[cfg(not(feature = "test-seams"))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _ = held_after;
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = self.probe() {
             probe.after_temporary_reservation(source, requested_u64, held_after);
         }
         Ok(())
+    }
+
+    /// The source adapter has already admitted move bytes into state.memory.
+    /// Detaching its refund owner makes the pending row responsible for them.
+    fn admit_source_row(
+        &self,
+        source: BoundedWorkSource,
+        admission: crate::read_image_memory::RowReadAdmission<'_>,
+    ) -> std::result::Result<usize, BoundedExecutionError> {
+        match admission {
+            crate::read_image_memory::RowReadAdmission::Copy(bytes) => {
+                self.reserve(source, bytes)?;
+                Ok(bytes)
+            }
+            crate::read_image_memory::RowReadAdmission::Move(memory) => {
+                let bytes = memory.retained_payload_bytes();
+                let credit = memory.take_retained_credit(bytes)?;
+                // SourceDecodeBudget already recorded these exact bytes in
+                // this request ledger. Transfer refund responsibility only.
+                credit.transfer();
+                Ok(bytes)
+            }
+        }
     }
 
     fn release(&self, bytes: usize) -> std::result::Result<(), BoundedExecutionError> {
@@ -837,23 +1937,76 @@ impl RequestContext {
             .map_err(BoundedExecutionError::from)
     }
 
+    /// The final result adopts already admitted payload credit from this
+    /// request. This transfers ownership once without re-admitting the bytes.
+    fn own_vector_trace(
+        &self,
+        trace: contextdb_vector::mem::BoundedVectorSearchTrace,
+    ) -> std::result::Result<contextdb_vector::OwnedVectorSearchTrace, BoundedExecutionError> {
+        let bytes = trace.retained_bytes();
+        let credit = self.state().memory.try_split_off(bytes)?;
+        let owner: Arc<dyn contextdb_vector::MemoryBudget> =
+            Arc::new(TraceMemoryOwner::new(Arc::clone(&self.reader_budget)));
+        Ok(trace.into_owned(owner.clone(), PrepaidTraceCredit { owner, credit })?)
+    }
+
+    fn transfer_answer(
+        &self,
+        result: &mut crate::database::OwnedQueryResult,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let mut bytes = strings_capacity_bytes(&result.columns, "answer columns")?;
+        bytes = checked_size_add(
+            bytes,
+            checked_size_mul(
+                result.rows.capacity(),
+                std::mem::size_of::<Vec<Value>>(),
+                "answer row container",
+            )?,
+            "answer payload",
+        )?;
+        for row in &result.rows {
+            bytes = checked_size_add(bytes, values_capacity_allocation_bytes(row)?, "answer rows")?;
+        }
+        bytes = checked_size_add(
+            bytes,
+            query_trace_capacity_bytes(&result.trace)?,
+            "answer trace",
+        )?;
+        let credit = self.state().memory.try_split_off(bytes)?;
+        result.answer_charge = crate::read_image_memory::AnswerCharge::holding_reader(credit)?;
+        Ok(())
+    }
+
     /// What this read holds against its memory ceiling: its own reservation
     /// plus the storage pages it read that are still alive outside the page
     /// cache.
     fn held_memory_bytes(&self, state: &RequestState) -> usize {
-        state.memory.bytes().saturating_add(
+        state.memory.bytes().saturating_add(self.fixed_control_bytes).saturating_add(
             self.live_source_pages
                 .load(std::sync::atomic::Ordering::SeqCst),
         )
     }
 
     /// Admit one storage page before its buffer is allocated, against the
-    /// same ceiling and the same accountant every other charge of this read
+    /// same ceiling and the same owner every other charge of this read
     /// uses, and hand back the charge the page will carry.
     fn admit_source_page(
         &self,
         source: BoundedWorkSource,
         bytes: usize,
+    ) -> std::result::Result<SourcePageCharge, BoundedExecutionError> {
+        self.admit_live_charge(source, bytes, "read_storage_page")
+    }
+
+    /// Admit `bytes` for an allocation that can outlive the call admitting it,
+    /// before it exists. The charge it hands back stays in this read's held
+    /// memory, and on the declared owner, until its last holder drops it;
+    /// `operation` names the allocation in a refusal.
+    fn admit_live_charge(
+        &self,
+        source: BoundedWorkSource,
+        bytes: usize,
+        operation: &'static str,
     ) -> std::result::Result<SourcePageCharge, BoundedExecutionError> {
         self.check_final_boundary()?;
         let mut state = self.state();
@@ -863,19 +2016,16 @@ impl RequestContext {
             .and_then(|after| u64::try_from(after).ok())
             .is_some_and(|after| after <= self.limits.memory);
         if !within {
-            return Err(Self::limit_failure(
-                ReadFailureLimit::Memory,
-                self.limits.memory,
-            ));
+            return Err(self.memory_limit_failure(held, bytes, operation));
         }
-        self.page_accountant
-            .try_allocate_for(
-                bytes,
-                "bounded_read",
-                "read_storage_page",
-                "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.",
-            )
-            .map_err(BoundedExecutionError::from)?;
+        let credit = ReadCredit::try_new(
+            Arc::clone(&self.reader_budget),
+            bytes,
+            "bounded_read",
+            operation,
+            "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.",
+        )
+        .map_err(BoundedExecutionError::from)?;
         self.live_source_pages
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
         let held_after = u64::try_from(held.saturating_add(bytes)).unwrap_or(u64::MAX);
@@ -887,11 +2037,13 @@ impl RequestContext {
             .and_modify(|peak| *peak = (*peak).max(held_after))
             .or_insert(held_after);
         Ok(SourcePageCharge {
-            accountant: Arc::clone(&self.page_accountant),
-            live: Arc::clone(&self.live_source_pages),
+            _credit: credit,
+            live: self.live_source_pages.clone(),
             bytes,
         })
     }
+
+
 
     /// Run one row-source call with every storage page it has to read
     /// admitted against this read's memory before the page buffer exists.
@@ -909,38 +2061,7 @@ impl RequestContext {
     /// keep -- one larger than the cache -- keeps its charge until the last
     /// thing holding it (this call, a retained scan, a cursor) drops it. Pages
     /// served from the cache allocate nothing and are not charged.
-    fn with_source_page_admission<T>(
-        self: &Arc<Self>,
-        source: BoundedWorkSource,
-        read: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
-    ) -> std::result::Result<T, BoundedExecutionError> {
-        let refusal = Arc::new(parking_lot::Mutex::new(None::<BoundedExecutionError>));
-        let admission = {
-            let context = Arc::clone(self);
-            let refusal = Arc::clone(&refusal);
-            Arc::new(
-                move |bytes: usize| match context.admit_source_page(source, bytes) {
-                    Ok(charge) => Ok(Box::new(charge) as redb::ReadPageCharge),
-                    Err(error) => {
-                        *refusal.lock() = Some(error);
-                        Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
-                    }
-                },
-            )
-                as Arc<dyn Fn(usize) -> std::io::Result<redb::ReadPageCharge> + Send + Sync>
-        };
-        let result = redb::with_read_page_charge(admission, read);
-        // The storage layer reports a refused page as an I/O failure; the
-        // caller is owed the memory refusal that caused it.
-        if let Some(refusal) = refusal.lock().take() {
-            return Err(refusal);
-        }
-        result
-    }
 
-    fn transfer_vector_load_reservation(&self, bytes: usize) -> Result<()> {
-        self.state().memory.try_transfer_to_store(bytes)
-    }
 
     fn set_encoded_bytes(&self, bytes: u64) {
         self.state().telemetry.encoded_bytes = bytes;
@@ -1021,6 +2142,20 @@ impl RequestContext {
     /// it read, index entries it walked, adjacency entries it inspected.
     fn rows_examined(&self) -> std::result::Result<u64, BoundedExecutionError> {
         let state = self.state();
+        Self::examined_touches(&state)
+    }
+
+    fn cumulative_rows_examined(&self) -> std::result::Result<u64, BoundedExecutionError> {
+        let state = self.state();
+        state
+            .completed_rows_examined
+            .checked_add(Self::examined_touches(&state)?)
+            .ok_or_else(|| {
+                Error::Other(("bounded rows-examined counter overflow".to_string()).into()).into()
+            })
+    }
+
+    fn examined_touches(state: &RequestState) -> std::result::Result<u64, BoundedExecutionError> {
         [
             BoundedSourceTouch::TableRow,
             BoundedSourceTouch::IndexEntry,
@@ -1030,50 +2165,11 @@ impl RequestContext {
         .try_fold(0u64, |sum, touch| {
             sum.checked_add(state.touches.get(&touch).copied().unwrap_or(0))
         })
-        .ok_or_else(|| Error::Other("bounded rows-examined counter overflow".to_string()).into())
-    }
-
-    /// Let this read hold the store's frontier reservation. Called only by a
-    /// door that declared no ceilings; every other read leaves it unset and
-    /// holds nothing the store accounts for.
-    fn enable_store_frontier(&self, accountant: Arc<crate::memory_accounting::MemoryAccountant>) {
-        *self
-            .store_frontier
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(OwnedMemoryReservation::new(accountant));
-    }
-
-    /// Charge the store for one more resolved start's worth of frontier.
-    ///
-    /// Grown as the drain resolves starts, never estimated ahead of them: a
-    /// traversal that resolves NO start pays nothing and cannot be refused for
-    /// a frontier it never built, and one that resolves many pays for all of
-    /// them, which is what the established door charges after resolving its
-    /// own.
-    fn charge_store_frontier(
-        &self,
-        bytes: usize,
-    ) -> std::result::Result<(), BoundedExecutionError> {
-        let mut held = self
-            .store_frontier
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(reservation) = held.as_mut() else {
-            return Ok(());
-        };
-        reservation
-            .try_grow_for(
-                bytes,
-                "bfs_frontier",
-                "graph_bfs",
-                "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
-            )
-            .map_err(BoundedExecutionError::from)
+        .ok_or_else(|| Error::Other(("bounded rows-examined counter overflow".to_string()).into()).into())
     }
 
     /// Whether this read named any ceiling of its own. A read that named none
-    /// is governed by what the store declares instead.
+    /// is governed by its caller-supplied owner budget.
     fn declares_no_ceilings(&self) -> bool {
         self.limits.memory == u64::MAX
     }
@@ -1106,13 +2202,34 @@ enum ProgressReport {
 }
 
 struct ReservedBytes<'a> {
-    context: &'a Arc<RequestContext>,
+    context: &'a ControlArc<RequestContext>,
     bytes: usize,
 }
 
 impl<'a> ReservedBytes<'a> {
-    fn new(context: &'a Arc<RequestContext>, bytes: usize) -> Self {
+    fn new(context: &'a ControlArc<RequestContext>, bytes: usize) -> Self {
         Self { context, bytes }
+    }
+
+    /// One authorization call holds only its largest inspected row, with
+    /// cleanup on success, refusal and cancellation through this guard.
+    fn charge_access_row(
+        &mut self,
+        bytes: usize,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.context.charge(
+            BoundedWorkSource::AccessControl,
+            BoundedSourceTouch::AccessRow,
+        )?;
+        let extra = bytes.saturating_sub(self.bytes);
+        if extra != 0 {
+            self.context
+                .reserve(BoundedWorkSource::AccessControl, extra)?;
+            self.bytes += extra;
+        }
+        self.context
+            .attribute_live_memory(BoundedWorkSource::AccessControl);
+        Ok(())
     }
 
     /// Give the bytes back where an accounting underflow can still be
@@ -1129,13 +2246,13 @@ impl<'a> ReservedBytes<'a> {
 /// handing the row on to the state that carries the charge from there is the
 /// one exit that keeps them.
 struct RetainedRow<'a> {
-    context: &'a Arc<RequestContext>,
+    context: &'a ControlArc<RequestContext>,
     row: PulledRow,
     charged: bool,
 }
 
 impl<'a> RetainedRow<'a> {
-    fn new(context: &'a Arc<RequestContext>, row: PulledRow) -> Self {
+    fn new(context: &'a ControlArc<RequestContext>, row: PulledRow) -> Self {
         Self {
             context,
             row,
@@ -1148,6 +2265,8 @@ impl<'a> RetainedRow<'a> {
     fn release(mut self) -> std::result::Result<(), BoundedExecutionError> {
         self.charged = false;
         let bytes = std::mem::take(&mut self.row.retained_bytes);
+        drop(std::mem::take(&mut self.row.values));
+        let _ = self.row.window.take();
         self.context.release(bytes)
     }
 
@@ -1157,8 +2276,10 @@ impl<'a> RetainedRow<'a> {
         std::mem::replace(
             &mut self.row,
             PulledRow {
+                window: None,
                 values: Vec::new(),
                 retained_bytes: 0,
+                group_binding: None,
             },
         )
     }
@@ -1184,6 +2305,8 @@ impl Drop for RetainedRow<'_> {
             return;
         }
         let bytes = std::mem::take(&mut self.row.retained_bytes);
+        drop(std::mem::take(&mut self.row.values));
+        let _ = self.row.window.take();
         if bytes != 0 {
             self.context.release_parked(bytes);
         }
@@ -1213,26 +2336,34 @@ struct PullNode {
 }
 
 struct PulledRow {
+    /// One specification per SELECT scope; Project consumes this typed namespace.
+    /// Kept inline so no SQL identifier can address or shadow its value.
+    window: Option<WindowRankValues>,
     values: Vec<Value>,
     retained_bytes: usize,
+    group_binding: Option<GroupBinding>,
 }
 
 impl PulledRow {
     fn release(
         self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
-        context.release(self.retained_bytes)
+        let bytes = self.retained_bytes;
+        drop(self);
+        context.release(bytes)
     }
 }
 
 #[allow(clippy::large_enum_variant)]
 enum PullKind {
-    Scan(ScanState),
-    Graph(GraphState),
-    Vector(VectorState),
+    Scan(Box<ScanState>),
+    Graph(Box<GraphState>),
+    // Admit this fixed native control separately from each recursive plan frame.
+    Vector(Box<VectorState>),
     Project(ProjectState),
     Sort(SortState),
+    Window(WindowState),
     Limit(LimitState),
     Filter(FilterState),
     Distinct(DistinctState),
@@ -1315,9 +2446,93 @@ mod plan_layer_frame_size {
     }
 }
 
-/// Historical membership allocations live with their cursor and count against
-/// both this request and its engine until the last owned node is released.
-struct MembershipBudget(Arc<RequestContext>);
+/// The request owns these tokens, so the adapter uses a weak back-reference.
+/// The request's reservation settles all remaining credit when it dies; a
+/// token destroyed earlier releases through the same live request.
+struct WeakSourceDecodeBudget(ControlWeak<RequestContext>, contextdb_core::read_memory::ReadShared<ReadCredit>);
+impl std::fmt::Debug for WeakSourceDecodeBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RequestVectorBudget")
+    }
+}
+impl contextdb_core::read_memory::ReadMemoryBudget for WeakSourceDecodeBudget {
+    fn control_invoice(&self) -> Option<contextdb_core::read_memory::ReadShared<ReadCredit>> {
+        Some(self.1.clone())
+    }
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        let context = self
+            .0
+            .upgrade()
+            .ok_or_else(|| Error::Other("the requesting reader has ended".into()))?;
+        contextdb_core::read_memory::ReadMemoryBudget::try_reserve(
+            &SourceDecodeBudget {
+                context,
+                source: BoundedWorkSource::VectorCandidates,
+            },
+            bytes,
+            subsystem,
+            operation,
+            hint,
+        )
+    }
+    fn release(&self, bytes: usize) {
+        if let Some(context) = self.0.upgrade() {
+            context.release_parked(bytes);
+        }
+    }
+}
+
+/// Decoded source records belong to the requesting read. Admission shares
+/// its aggregate memory and cancellation boundary; each window releases its
+/// temporary charge.
+struct SourceDecodeBudget {
+    context: ControlArc<RequestContext>,
+    source: BoundedWorkSource,
+}
+
+impl std::fmt::Debug for SourceDecodeBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceDecodeBudget")
+    }
+}
+
+impl contextdb_core::read_memory::ReadMemoryBudget for SourceDecodeBudget {
+    #[cfg(any(test, feature = "test-seams"))]
+    fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
+        Some(&self.context.reader_budget)
+    }
+
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        _: &'static str,
+        _: &'static str,
+        _: &'static str,
+    ) -> Result<()> {
+        self.context
+            .reserve(self.source, bytes)
+            .map_err(|error| match error {
+                BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+                BoundedExecutionError::Cancelled => Error::ReadCancelled,
+                BoundedExecutionError::Engine(error) => error,
+                BoundedExecutionError::Unimplemented => {
+                    Error::Other("unsupported source allocation".into())
+                }
+            })
+    }
+
+    fn release(&self, bytes: usize) {
+        self.context.release_parked(bytes);
+    }
+}
+
+struct MembershipBudget(ControlArc<RequestContext>);
 
 impl std::fmt::Debug for MembershipBudget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1365,7 +2580,7 @@ fn capture_scan_membership(
     table: &str,
     snapshot: SnapshotId,
     mode: &mut ScanMode,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(), BoundedExecutionError> {
     if matches!(mode, ScanMode::Physical { .. } | ScanMode::Empty) {
         return Ok(());
@@ -1379,7 +2594,7 @@ fn capture_scan_membership(
     )?;
     context.state().membership_bytes +=
         std::mem::size_of::<MembershipBudget>() + 2 * std::mem::size_of::<usize>();
-    let budget = Arc::new(MembershipBudget(Arc::clone(context)));
+    let budget = Arc::new(MembershipBudget(context.clone()));
     let touch = || {
         context.charge(
             BoundedWorkSource::IndexRange,
@@ -1406,7 +2621,18 @@ fn capture_scan_membership(
     }
 }
 
+enum PhysicalPartitionColumn {
+    RowId,
+    Schema(usize),
+}
+
+struct SourceInputGroup {
+    descriptor: GroupDescriptorId,
+    positions: Vec<PhysicalPartitionColumn>,
+}
+
 struct ScanState {
+    source_group: Option<SourceInputGroup>,
     identities_only: bool,
     /// Whether this candidate source's own index range already keeps the read
     /// inside every restriction its reader carries, so the row gate has
@@ -1436,7 +2662,7 @@ struct ScanState {
     snapshot: SnapshotId,
     mode: ScanMode,
     cursor_key_bytes: usize,
-    residual_pick: Option<IndexPick>,
+    residual_pick: Option<Box<IndexPick>>,
     /// Set when an exact whole-key probe over a single-column AUTOMATIC index
     /// was re-planned onto the authenticated ordered route. The source is an
     /// ordinary index run now, but the STATEMENT is still one that names the
@@ -1449,6 +2675,7 @@ struct ScanState {
     /// original" merely by having passed it -- the store is asked instead.
     committed_source_offers_every_row: bool,
     pending_row: Option<(VersionedRow, usize, BoundedWorkSource)>,
+    pending_vector_copy: Option<Box<contextdb_vector::VectorCopyAdmission>>,
     /// Whether the row in hand came from the committed source. An ordered
     /// read hands committed and staged rows back interleaved, so which one is
     /// in hand is recorded rather than inferred from how far the walk has got.
@@ -1539,8 +2766,30 @@ fn ordered_merge_keys_capacity_bytes(
 
 /// The open transaction this scan is reading inside, and how far through its
 /// staged rows the scan has got.
+struct OrderedStatementPosition {
+    index: String,
+    cursor: BoundedOrderedRowCursor,
+    after: Option<(IndexKey, RowId)>,
+}
+
+fn staged_run_bound_bytes(bound: &Bound<IndexKey>) -> usize {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => key
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DirectedValue>())
+            .saturating_add(
+                key.iter()
+                    .map(|value| match value {
+                        DirectedValue::Asc(value) => value.0.estimated_bytes(),
+                        DirectedValue::Desc(value) => value.0.estimated_bytes(),
+                    })
+                    .sum::<usize>(),
+            ),
+        Bound::Unbounded => 0,
+    }
+}
+
 struct ScanTransactionOverlay {
-    tx: TxId,
     overlay: crate::executor::TransactionTableOverlay,
     predicate_deleted: Vec<RowId>,
     committed_predicates_resolved: bool,
@@ -1550,7 +2799,9 @@ struct ScanTransactionOverlay {
     /// leaves the reinserted row -- which is what this set is for.
     restaged_over_committed: std::collections::HashSet<RowId>,
     /// How many of the staged rows have been published.
-    published: usize,
+    published: Option<usize>,
+    ordered_staged: Option<OrderedStatementPosition>,
+    staged_key_bytes: usize,
     /// Set once the committed source is exhausted and the staged rows start.
     committed_exhausted: bool,
 }
@@ -1561,7 +2812,12 @@ impl ScanTransactionOverlay {
     /// values, or it restaged the row and its own version is published
     /// instead.
     fn hides_committed(&mut self, table: &str, row: &VersionedRow) -> bool {
-        if self.overlay.staged_identities.contains(&row.row_id) {
+        if self
+            .overlay
+            .staged_rows
+            .as_ref()
+            .is_some_and(|rows| rows.contains(&row.row_id))
+        {
             // Recorded whether or not the row is also hidden: what makes a
             // staged row publishable is that its original exists here at all.
             let _ = self.restaged_over_committed.insert(row.row_id);
@@ -1583,7 +2839,7 @@ enum ScanMode {
         cursor: BoundedPhysicalCursor,
     },
     Index {
-        pick: IndexPick,
+        pick: Box<IndexPick>,
         column: String,
         direction: contextdb_core::SortDirection,
         cursor: BoundedOrderedRowCursor,
@@ -1616,6 +2872,7 @@ struct OrderedIndexScan {
 }
 
 struct GraphState {
+    _row_edge_guard: Option<crate::database::GraphCursorReadGuard>,
     start_alias: String,
     steps: Vec<GraphStepPlan>,
     filter: Option<Expr>,
@@ -1635,32 +2892,38 @@ struct GraphState {
     /// is the whole point of a bounded read. `Some` for a read that declared
     /// none, which keeps the ceiling it always had.
     visited_cap: Option<usize>,
-    /// What one resolved start costs the STORE's frontier budget, charged as
-    /// each start is resolved rather than estimated ahead of them. Zero for a
-    /// read that declared its own ceilings.
-    frontier_unit_bytes: usize,
-    /// Whether this traversal is the single hop that the other door answers
-    /// with an adjacency probe. A probe reports one row per NEIGHBOUR reached,
-    /// so the nodes already reported out of the adjacency being walked are
-    /// remembered here for as long as that one adjacency is being walked.
+    /// Whether this traversal is a single hop walked out of named starts. It
+    /// reports one row per matching edge. The one edge an undirected hop sees
+    /// twice is a loop on its own start, once leaving and once arriving, so the
+    /// types of the loops already reported out of the adjacency being walked
+    /// are remembered here for as long as that one adjacency is being walked.
     single_step_probe: bool,
-    probe_seen: Vec<uuid::Uuid>,
+    probe_loops: Vec<EdgeType>,
     probe_seen_container_bytes: usize,
     seen_starts: Vec<uuid::Uuid>,
     seen_start_container_bytes: usize,
-    seen_edges: Vec<(uuid::Uuid, uuid::Uuid)>,
-    seen_edge_container_bytes: usize,
-    /// The paths this traversal has already answered or already continued,
-    /// keyed the way the other door keys them: by the nodes the pattern's
-    /// target aliases are bound to, never by where the walk began. Two starts
-    /// that arrive at the same nodes are ONE answer, and the continuation out
-    /// of those nodes is walked once.
+    /// The paths this traversal has already answered or already continued. In
+    /// a longer match they are keyed by the nodes the pattern's target aliases
+    /// are bound to, never by where the walk began: two starts that arrive at
+    /// the same nodes are ONE answer, and the continuation out of those nodes
+    /// is walked once. A single hop is not kept here: each matching edge out
+    /// of its distinct starts is its own answer.
     seen_paths: Vec<Vec<uuid::Uuid>>,
     seen_path_container_bytes: usize,
     frontier: Vec<GraphPathState>,
     frontier_container_bytes: usize,
     row_memory: AmortizedRowMemory,
     active: Option<GraphActiveState>,
+    /// Every start's first-step walk, open together and merged by depth and
+    /// then start order, so a target is first reached at its shallowest depth
+    /// across all starts and a tie goes to the earlier start. Used only when
+    /// the first step's length varies; `None` until the starts are resolved.
+    start_walks: Option<std::collections::BinaryHeap<GraphStartWalk>>,
+    start_walk_container_bytes: usize,
+    /// The node the merge chose from the active walk and that walk's start
+    /// rank. Once the node is handled, the walk goes back to the merge.
+    chosen: Option<contextdb_graph::mem::BoundedTraversalNode>,
+    active_rank: Option<usize>,
 }
 
 /// Memory this traversal has been admitted for and not yet handed to a row.
@@ -1686,7 +2949,7 @@ const AMORTIZED_ROW_MEMORY_BLOCK_CEILING: usize = 8 * 1024;
 impl AmortizedRowMemory {
     fn take(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
         bytes: usize,
     ) -> std::result::Result<(), BoundedExecutionError> {
         if self.available < bytes {
@@ -1714,7 +2977,7 @@ impl AmortizedRowMemory {
 
     fn release(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         let held = std::mem::take(&mut self.available);
         self.block = 0;
@@ -1732,7 +2995,53 @@ struct GraphPathState {
 
 struct GraphActiveState {
     path: GraphPathState,
-    cursor: contextdb_graph::mem::BoundedBfsCursor,
+    cursor: crate::database::EngineGraphBfsCursor,
+}
+
+/// One start's first-step walk while every start's walk is merged: its rank
+/// in start order, its path and cursor, and the next node it reports.
+struct GraphStartWalk {
+    rank: usize,
+    active: GraphActiveState,
+    next: contextdb_graph::mem::BoundedTraversalNode,
+}
+
+impl GraphStartWalk {
+    fn order(&self) -> (u32, usize) {
+        (self.next.node.depth, self.rank)
+    }
+}
+
+// The merge is a max-heap, so the walk with the shallowest next node, and on
+// a tie the earliest start, is the greatest.
+impl Ord for GraphStartWalk {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.order().cmp(&self.order())
+    }
+}
+
+impl PartialOrd for GraphStartWalk {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for GraphStartWalk {
+    fn eq(&self, other: &Self) -> bool {
+        self.order() == other.order()
+    }
+}
+
+impl Eq for GraphStartWalk {}
+
+/// What draining a candidate scan's verified identities came to.
+enum CandidateDrain {
+    /// This scan cannot be drained by identity; read it row by row.
+    Unsupported,
+    /// Every identity the filter names was read.
+    Drained,
+    /// The bounded probe reached its cap before the range ended.
+    Capped,
 }
 
 enum VectorPreparation {
@@ -1744,25 +3053,31 @@ enum VectorPreparation {
 }
 
 enum VectorCandidateSource {
-    Brute(contextdb_vector::mem::BoundedBruteForceCursor),
+    Brute(Box<contextdb_vector::mem::BoundedBruteForceCursor>),
 }
 
 /// Own the request charge for one vector candidate partitioning until graph
 /// execution finishes with it or exact execution transfers it into its cursor.
 struct RetainedVectorCandidateGroups {
     groups: Option<contextdb_vector::mem::BoundedVectorCandidateGroups>,
-    context: Arc<RequestContext>,
+    context: ControlArc<RequestContext>,
 }
 
 impl RetainedVectorCandidateGroups {
     fn new(
         groups: contextdb_vector::mem::BoundedVectorCandidateGroups,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> Self {
         Self {
             groups: Some(groups),
-            context: Arc::clone(context),
+            context: context.clone(),
         }
+    }
+
+    fn get_mut(&mut self) -> &mut contextdb_vector::mem::BoundedVectorCandidateGroups {
+        self.groups
+            .as_mut()
+            .expect("candidate groups are present until transferred")
     }
 
     fn get(&self) -> &contextdb_vector::mem::BoundedVectorCandidateGroups {
@@ -1786,6 +3101,24 @@ impl Drop for RetainedVectorCandidateGroups {
     }
 }
 
+// A stack keeper during one exact pull; it never escapes or adds a Box.
+// All exact stepping finishes inside next_unobserved before it publishes a row.
+struct DeferredExactTrace {
+    trace: Option<contextdb_vector::mem::BoundedVectorSearchTrace>,
+    aggregate: usize,
+    groups: Option<contextdb_vector::mem::BoundedVectorCandidateGroups>,
+    context: ControlArc<RequestContext>,
+}
+impl Drop for DeferredExactTrace {
+    fn drop(&mut self) {
+        if let Some(trace) = self.trace.take() {
+            let bytes = trace.retained_bytes();
+            drop(trace);
+            self.context.release_parked(bytes);
+        }
+    }
+}
+
 struct RankedVectorRow {
     row_id: RowId,
     rank: f32,
@@ -1794,13 +3127,17 @@ struct RankedVectorRow {
 }
 
 struct VectorState {
+    #[cfg(any(test, feature = "test-seams"))]
+    receipt: vector_search_receipt::SearchReceiptState,
     table: String,
     index: VectorIndexRef,
     query: Vec<f32>,
     _query_bytes: usize,
+    output_projection: Vec<usize>,
     k: usize,
     candidate_k: usize,
     partition_prefixes: Option<Vec<VectorPartitionKey>>,
+    partition_prefix_bytes: usize,
     /// The one resolved route contract for this operation. SQL overrides are
     /// resolved against the durable column declaration before the pull state
     /// is created, so a resumed bounded read cannot reinterpret the mode.
@@ -1825,6 +3162,19 @@ struct VectorState {
     candidate_filter: bool,
     candidate_ids: Vec<u64>,
     candidate_bytes: usize,
+    /// The statement's filter as a check one row at a time: the predicate of
+    /// a plain scan of this table, with the table's declaration for its
+    /// authorization. `None` where the candidates are anything else.
+    row_filter: Option<Box<(Expr, Option<TableMeta>)>>,
+    prepaid_construction: usize,
+    /// The row checks this statement may spend (see `row_check_allowance`),
+    /// once known, and those spent so far: index entries a bounded probe
+    /// read, then each row checked.
+    row_check_allowance: Option<usize>,
+    row_checks: Cell<usize>,
+    /// The probe could not establish a small candidate set within half the
+    /// allowance: the filter is checked on each row the search reaches.
+    row_checked: bool,
     source: Option<VectorCandidateSource>,
     scores: Vec<(RowId, f32)>,
     score_bytes: usize,
@@ -1843,18 +3193,12 @@ struct VectorState {
     output: VecDeque<PulledRow>,
     output_container_bytes: usize,
     used_hnsw: bool,
-    disclosure: Option<VectorSearchDisclosure>,
     /// What this handle's own open transaction changes about the vectors this
     /// search can see. `None` whenever no transaction is open or it has
     /// touched nothing about this index -- which is every read of a committed
     /// file and every read by a handle that is not mid-write.
-    vector_overlay: Option<super::TransactionVectorOverlay>,
+    vector_overlay: Option<Box<super::TransactionVectorOverlay>>,
     overlay_bytes: usize,
-    /// The store-wide reservation this search holds while it reads the
-    /// transaction's own vectors, released when the search is done with them.
-    /// The request's own ceiling is charged separately and governs this
-    /// request; this one is what the STORE's limit governs.
-    _overlay_reservation: Option<Box<dyn Send + Sync>>,
 }
 
 struct ProjectState {
@@ -1886,12 +3230,181 @@ struct SortState {
     /// bytes themselves move: where a row is admitted into the buffer, and
     /// where it leaves.
     buffered_bytes: usize,
+    container_bytes: usize,
+    /// Set only below a ranked window whose rank filter caps every branch.
+    rank_limit: Option<SortRankLimit>,
+}
+
+/// The highest rank any branch of a ranked window's filter can pass. A row
+/// ranked past it within its partition can never be shown, so the sort may
+/// give it up; the rows it keeps rank exactly as they would in the full sort.
+#[derive(Clone, Copy)]
+struct SortRankLimit {
+    limit: usize,
+    /// The leading sort keys are the window's partition columns, ascending.
+    partition_len: usize,
 }
 
 struct SortEntry {
     keys: Vec<Value>,
     key_bytes: usize,
     row: PulledRow,
+}
+
+/// Window order: each key in its direction. The stable sorts that use it
+/// keep rows with equal keys in arrival order.
+fn sort_entry_order(keys: &[SortKey], left: &SortEntry, right: &SortEntry) -> Ordering {
+    for (index, key) in keys.iter().enumerate() {
+        let ordering = compare_sort_values(&left.keys[index], &right.keys[index], key.direction);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+struct WindowState {
+    prepaid_construction: usize,
+    descriptor: GroupDescriptorId,
+    group_binding: Option<GroupBinding>,
+    ceiling: Option<u64>,
+    input: Box<PullNode>,
+    binding: WindowBindingId,
+    partition_positions: Vec<usize>,
+    partition: Option<Vec<Value>>,
+    partition_bytes: usize,
+    rank: i64,
+    pending: Option<PulledRow>,
+}
+
+impl WindowState {
+    fn next(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
+        if self
+            .ceiling
+            .is_some_and(|ceiling| self.rank as u64 >= ceiling)
+        {
+            return Ok(None);
+        }
+        if self.pending.is_none() {
+            if let Some(ceiling) = self.ceiling {
+                let remaining = ceiling
+                    .checked_sub(self.rank as u64)
+                    .ok_or_else(|| Error::Other(("window prefix demand underflow".to_string()).into()))?;
+                if let PullKind::Scan(scan) = &mut self.input.kind
+                    && let ScanMode::Ordered { cursor, .. } = &mut scan.mode
+                {
+                    // A maintained overlay needs only the next committed
+                    // comparator head, irrespective of remaining rank demand.
+                    cursor.source_set_prefix_quota(Some(if scan.transaction.is_some() {
+                        1
+                    } else {
+                        remaining
+                    }));
+                }
+            }
+            self.pending = match self.group_binding {
+                Some(binding) if self.ceiling.is_some() => {
+                    context.with_group_work(binding, || self.input.next(db, context))?
+                }
+                _ => self.input.next(db, context)?,
+            };
+        }
+        let Some(row) = self.pending.as_ref() else {
+            return Ok(None);
+        };
+        context.check_final_boundary()?;
+        // Resolve positions once during binding; comparing a partition never
+        // allocates a temporary copy of its payload or a named-column map.
+        let value_at = |position: &usize| {
+            row.values
+                .get(*position)
+                .ok_or_else(|| Error::PlanError("window partition value is missing".to_string()))
+        };
+        let changed = match self.partition.as_ref() {
+            None => true,
+            Some(previous) => self.partition_positions.iter().zip(previous).try_fold(
+                false,
+                |changed, (position, previous)| -> Result<bool> {
+                    Ok(changed
+                        || compare_sort_values(value_at(position)?, previous, SortDirection::Asc)
+                            != Ordering::Equal)
+                },
+            )?,
+        };
+        if changed {
+            let planned = self.partition_positions.iter().try_fold(
+                checked_size_add(
+                    std::mem::size_of::<Vec<Value>>(),
+                    checked_size_mul(
+                        self.partition_positions.len(),
+                        std::mem::size_of::<Value>(),
+                        "window partition",
+                    )?,
+                    "window partition",
+                )?,
+                |bytes, position| {
+                    checked_size_add(
+                        bytes,
+                        planned_value_clone_bytes(value_at(position)?)?,
+                        "window partition",
+                    )
+                },
+            )?;
+            context.reserve(BoundedWorkSource::UnindexedSort, planned)?;
+            let mut partition_charge = ReservedBytes::new(context, planned);
+            let mut partition = Vec::new();
+            partition
+                .try_reserve_exact(self.partition_positions.len())
+                .map_err(|_| {
+                    Error::Other(("bounded window partition allocation failed".to_string()).into())
+                })?;
+            for position in &self.partition_positions {
+                partition.push(value_at(position)?.clone());
+            }
+            let actual = values_retained_bytes(&partition)?;
+            // Release the temporary guard before reconciliation takes ownership.
+            partition_charge.bytes = 0;
+            reconcile_new_reservation(context, BoundedWorkSource::UnindexedSort, planned, actual)?;
+            // Both partition allocations stay funded while binding can clone
+            // the next identity. On refusal the local allocation drops before
+            // its guard refunds it, leaving the old partition and pending row.
+            partition_charge.bytes = actual;
+            let group_binding = context.bind_group(
+                self.descriptor,
+                &partition,
+                "<redacted>",
+                if self.ceiling.is_some() {
+                    crate::database::GroupRoute::Index
+                } else {
+                    crate::database::GroupRoute::Sort
+                },
+            )?;
+            let old_partition = self.partition.replace(partition);
+            let old_partition_bytes = std::mem::replace(&mut self.partition_bytes, actual);
+            partition_charge.bytes = 0;
+            self.group_binding = Some(group_binding);
+            self.rank = 0;
+            // Replacement transfers the new charge to this continuation;
+            // refund the previous charge only after its allocation is gone.
+            drop(old_partition);
+            context.release(old_partition_bytes)?;
+        }
+        self.rank = self
+            .rank
+            .checked_add(1)
+            .ok_or_else(|| Error::Other(("window rank counter overflow".to_string()).into()))?;
+        let mut row = self
+            .pending
+            .take()
+            .ok_or_else(|| Error::Other(("window lost its ranked row".to_string()).into()))?;
+        row.window = Some(WindowRankValues::new(self.binding, self.rank));
+        row.group_binding = self.group_binding;
+        Ok(Some(row))
+    }
 }
 
 struct LimitState {
@@ -1935,6 +3448,7 @@ struct StaticState {
 }
 
 struct UnionState {
+    prepaid_construction: usize,
     inputs: Vec<PullNode>,
     input: usize,
     all: bool,
@@ -1947,14 +3461,13 @@ impl PullNode {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         match &mut self.kind {
             PullKind::Scan(state) => state.next(db, context),
             PullKind::Graph(state) => state.next(db, context),
             PullKind::Vector(state) => {
-                let next = state.next(db, context);
-                self.trace.vector_search = state.disclosure.clone();
+                let next = state.next(db, context, &mut self.trace);
                 if state.used_hnsw {
                     // Runs on every row, so it has to say the same thing the
                     // second time it runs as the first. A catch-all that
@@ -1974,6 +3487,7 @@ impl PullNode {
             }
             PullKind::Project(state) => state.next(db, context),
             PullKind::Sort(state) => state.next(db, context),
+            PullKind::Window(state) => state.next(db, context),
             PullKind::Limit(state) => state.next(db, context),
             PullKind::Filter(state) => state.next(db, context),
             PullKind::Distinct(state) => state.next(db, context),
@@ -2003,6 +3517,13 @@ impl PullNode {
                 self.trace.physical_plan
             }
             PullKind::Project(state) => state.input.published_plan(),
+            PullKind::Window(state) => {
+                if state.ceiling.is_some() {
+                    state.input.published_plan()
+                } else {
+                    "Sort"
+                }
+            }
             PullKind::Limit(state) => state.input.published_plan(),
             PullKind::Filter(state) => state.input.published_plan(),
             PullKind::Distinct(state) => state.input.published_plan(),
@@ -2033,6 +3554,7 @@ impl PullNode {
             PullKind::Vector(_) => self.trace.vector_search.as_ref(),
             PullKind::Project(state) => state.input.published_vector_search(),
             PullKind::Sort(state) => state.input.published_vector_search(),
+            PullKind::Window(state) => state.input.published_vector_search(),
             PullKind::Limit(state) => state.input.published_vector_search(),
             PullKind::Filter(state) => state.input.published_vector_search(),
             PullKind::Distinct(state) => state.input.published_vector_search(),
@@ -2062,6 +3584,7 @@ impl PullNode {
                         .or_else(|| state.input.has_more_hint())
                 }
             }
+            PullKind::Window(state) => state.input.has_more_hint(),
             PullKind::Sort(state) if state.prepared => Some(!state.rows.is_empty()),
             PullKind::Sort(state) if state.pending.is_some() || !state.rows.is_empty() => {
                 Some(true)
@@ -2132,9 +3655,9 @@ impl PullNode {
 }
 
 fn bounded_size_error(operation: &str) -> BoundedExecutionError {
-    Error::Other(format!(
+    Error::Other((format!(
         "bounded {operation} memory size exceeds the native address space"
-    ))
+    )).into())
     .into()
 }
 
@@ -2166,7 +3689,7 @@ fn decimal_digits_u64(mut value: u64) -> usize {
 }
 
 fn reconcile_new_reservation(
-    context: &Arc<RequestContext>,
+    context: &RequestContext,
     source: BoundedWorkSource,
     planned: usize,
     actual: usize,
@@ -2196,7 +3719,7 @@ fn strings_capacity_bytes(
 
 fn clone_strings_with_reservation(
     source: &[String],
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
     operation: &str,
 ) -> std::result::Result<(Vec<String>, usize), BoundedExecutionError> {
     let planned = source.iter().try_fold(
@@ -2204,22 +3727,32 @@ fn clone_strings_with_reservation(
         |bytes, value| checked_size_add(bytes, value.len(), operation),
     )?;
     context.reserve(BoundedWorkSource::TableScan, planned)?;
+    // Declared before the payload so every partial string and the container
+    // are destroyed before an error refunds their admitted allocation.
+    let mut reservation = ReservedBytes::new(context, planned);
     let mut values = Vec::new();
     if values.try_reserve_exact(source.len()).is_err() {
-        context.release(planned)?;
-        return Err(Error::Other(format!("bounded {operation} allocation failed")).into());
+        return Err(Error::Other((format!("bounded {operation} allocation failed")).into()).into());
     }
     for source_value in source {
         let mut value = String::new();
         if value.try_reserve_exact(source_value.len()).is_err() {
-            context.release(planned)?;
-            return Err(Error::Other(format!("bounded {operation} allocation failed")).into());
+            return Err(Error::Other((format!("bounded {operation} allocation failed")).into()).into());
         }
         value.push_str(source_value);
         values.push(value);
     }
     let actual = strings_capacity_bytes(&values, operation)?;
-    reconcile_new_reservation(context, BoundedWorkSource::TableScan, planned, actual)?;
+    if actual > planned {
+        context.reserve(BoundedWorkSource::TableScan, actual - planned)?;
+        reservation.bytes = actual;
+    } else if planned > actual {
+        context.release(planned - actual)?;
+        reservation.bytes = actual;
+    }
+    // The returned payload now carries this reservation in its caller's
+    // accounting; successful handoff must not refund its live allocation.
+    reservation.bytes = 0;
     Ok((values, actual))
 }
 
@@ -2309,6 +3842,8 @@ fn literal_capacity_bytes(literal: &Literal) -> std::result::Result<usize, Bound
 fn expr_capacity_bytes(expr: &Expr) -> std::result::Result<usize, BoundedExecutionError> {
     let boxed_expr = std::mem::size_of::<Expr>();
     match expr {
+        Expr::RowNumber(window) => window_capacity_bytes(window),
+        Expr::WindowRank(_) => Ok(0),
         Expr::Column(column) => checked_size_add(
             optional_string_capacity(&column.table),
             column.column.capacity(),
@@ -2489,6 +4024,18 @@ fn select_body_capacity_bytes(
     bytes = checked_size_add(
         bytes,
         checked_size_mul(
+            body.group_by.capacity(),
+            std::mem::size_of::<Expr>(),
+            "subquery grouping",
+        )?,
+        "subquery",
+    )?;
+    for item in &body.group_by {
+        bytes = checked_size_add(bytes, expr_capacity_bytes(item)?, "subquery grouping")?;
+    }
+    bytes = checked_size_add(
+        bytes,
+        checked_size_mul(
             body.order_by.capacity(),
             std::mem::size_of::<contextdb_parser::ast::OrderByItem>(),
             "subquery ordering",
@@ -2622,6 +4169,15 @@ fn physical_plan_capacity_bytes(
 ) -> std::result::Result<usize, BoundedExecutionError> {
     let boxed_plan = std::mem::size_of::<PhysicalPlan>();
     match plan {
+        PhysicalPlan::WindowRank { input, window, .. } => checked_size_add(
+            checked_size_add(
+                boxed_plan,
+                physical_plan_capacity_bytes(input)?,
+                "window input",
+            )?,
+            window_capacity_bytes(window)?,
+            "window plan",
+        ),
         PhysicalPlan::Scan {
             table,
             alias,
@@ -2747,6 +4303,23 @@ fn physical_plan_capacity_bytes(
             )?,
             project_columns_capacity_bytes(columns)?,
             "projection plan",
+        ),
+        PhysicalPlan::GroupedCount {
+            input,
+            group_by,
+            columns,
+        } => checked_size_add(
+            checked_size_add(
+                boxed_plan,
+                physical_plan_capacity_bytes(input)?,
+                "grouped count input plan",
+            )?,
+            checked_size_add(
+                grouped_count::group_by_capacity_bytes(group_by)?,
+                project_columns_capacity_bytes(columns)?,
+                "grouped count plan",
+            )?,
+            "grouped count plan",
         ),
         PhysicalPlan::Distinct { input } | PhysicalPlan::Limit { input, .. } => checked_size_add(
             boxed_plan,
@@ -3079,7 +4652,7 @@ fn value_capacity_bytes(value: &Value) -> std::result::Result<usize, BoundedExec
             std::mem::size_of::<f32>(),
             "value vector capacity",
         ),
-        Value::Json(value) => json_capacity_bytes(value),
+        Value::Json(value) => Ok(contextdb_core::types::json_retained_heap_bytes(value)),
         Value::Null
         | Value::Bool(_)
         | Value::Int64(_)
@@ -3087,40 +4660,6 @@ fn value_capacity_bytes(value: &Value) -> std::result::Result<usize, BoundedExec
         | Value::Uuid(_)
         | Value::Timestamp(_)
         | Value::TxId(_) => Ok(0),
-    }
-}
-
-fn json_capacity_bytes(
-    value: &serde_json::Value,
-) -> std::result::Result<usize, BoundedExecutionError> {
-    match value {
-        serde_json::Value::String(value) => Ok(value.capacity()),
-        serde_json::Value::Array(values) => {
-            let mut bytes = checked_size_mul(
-                values.capacity(),
-                std::mem::size_of::<serde_json::Value>(),
-                "JSON array capacity",
-            )?;
-            for value in values {
-                bytes = checked_size_add(bytes, json_capacity_bytes(value)?, "JSON array")?;
-            }
-            Ok(bytes)
-        }
-        serde_json::Value::Object(values) => {
-            let mut bytes = checked_size_mul(
-                values.len(),
-                std::mem::size_of::<(String, serde_json::Value)>(),
-                "JSON object entries",
-            )?;
-            for (key, value) in values {
-                bytes = checked_size_add(bytes, key.capacity(), "JSON object key")?;
-                bytes = checked_size_add(bytes, json_capacity_bytes(value)?, "JSON object")?;
-            }
-            Ok(bytes)
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            Ok(0)
-        }
     }
 }
 
@@ -3135,10 +4674,14 @@ fn bound_value_capacity_bytes(
     }
 }
 
-fn index_pick_capacity_bytes(
+pub(crate) fn index_pick_capacity_bytes(
     pick: &IndexPick,
 ) -> std::result::Result<usize, BoundedExecutionError> {
-    let mut bytes = pick.name.capacity();
+    let mut bytes = checked_size_add(
+        std::mem::size_of::<IndexPick>(),
+        pick.name.capacity(),
+        "owned index pick",
+    )?;
     bytes = checked_size_add(
         bytes,
         checked_size_mul(
@@ -3172,6 +4715,29 @@ fn index_pick_capacity_bytes(
             index_predicate_shape_capacity_bytes(shape)?,
             "index suffix shape",
         )?;
+    }
+    if let Some((lower, upper)) = &pick.trailing_range {
+        for bound in [lower, upper] {
+            if let Bound::Included(key) | Bound::Excluded(key) = bound {
+                bytes = checked_size_add(
+                    bytes,
+                    checked_size_mul(
+                        key.capacity(),
+                        std::mem::size_of::<DirectedValue>(),
+                        "index trailing range",
+                    )?,
+                    "index trailing range",
+                )?;
+                for value in key {
+                    let value = match value {
+                        DirectedValue::Asc(TotalOrdAsc(value))
+                        | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                    };
+                    bytes =
+                        checked_size_add(bytes, value.estimated_bytes(), "index trailing range")?;
+                }
+            }
+        }
     }
     if let Some(tuples) = pick.tuple_prefix() {
         for tuple in tuples {
@@ -3274,10 +4840,36 @@ fn vector_search_disclosure_capacity_bytes(
     Ok(bytes)
 }
 
-fn query_trace_capacity_bytes(
+fn group_disclosure_capacity_bytes(
+    groups: &[crate::database::GroupDisclosure],
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let mut bytes = checked_size_mul(
+        groups.len(),
+        std::mem::size_of::<crate::database::GroupDisclosure>(),
+        "trace groups",
+    )?;
+    for group in groups {
+        bytes = checked_size_add(bytes, group.partition_key.capacity(), "trace group key")?;
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn query_trace_capacity_bytes(
     trace: &QueryTrace,
 ) -> std::result::Result<usize, BoundedExecutionError> {
     let mut bytes = trace.index_used.as_ref().map_or(0, String::capacity);
+    bytes = checked_size_add(
+        bytes,
+        checked_size_mul(
+            trace.groups.len(),
+            std::mem::size_of::<crate::database::GroupDisclosure>(),
+            "trace groups",
+        )?,
+        "query trace",
+    )?;
+    for group in &trace.groups {
+        bytes = checked_size_add(bytes, group.partition_key.capacity(), "trace group key")?;
+    }
     if trace.predicates_pushed.spilled() {
         bytes = checked_size_add(
             bytes,
@@ -3321,6 +4913,49 @@ fn query_trace_capacity_bytes(
             vector_search_disclosure_capacity_bytes(disclosure)?,
             "query trace",
         )?;
+    }
+    if let Some(count) = trace.maintained_count.as_ref() {
+        use crate::maintained_counts::MaintainedCountDisclosure::*;
+        let (table, columns, lists, list_capacity) = match count.as_ref() {
+            Used { table, columns } | DeclaredNotServed { table, columns } => {
+                (table, columns, &[][..], 0)
+            }
+            NotDeclared {
+                table,
+                columns,
+                already_declared,
+            } => (
+                table,
+                columns,
+                already_declared.as_slice(),
+                already_declared.capacity(),
+            ),
+        };
+        bytes = checked_size_add(bytes, std::mem::size_of_val(count.as_ref()), "trace count")?;
+        bytes = checked_size_add(bytes, table.capacity(), "trace count table")?;
+        bytes = checked_size_add(
+            bytes,
+            checked_size_mul(
+                list_capacity,
+                std::mem::size_of::<Vec<(String, contextdb_core::SortDirection)>>(),
+                "trace count lists",
+            )?,
+            "trace count",
+        )?;
+        for columns in std::iter::once(columns).chain(lists.iter()) {
+            bytes = checked_size_add(
+                bytes,
+                checked_size_mul(
+                    columns.capacity(),
+                    std::mem::size_of::<(String, contextdb_core::SortDirection)>(),
+                    "trace count columns",
+                )?,
+                "trace count",
+            )?;
+            for (name, _) in columns {
+                bytes = checked_size_add(bytes, name.capacity(), "trace count name")?;
+            }
+        }
     }
     Ok(bytes)
 }
@@ -3389,7 +5024,7 @@ fn boxed_pull_bytes(input: &PullNode) -> std::result::Result<usize, BoundedExecu
 /// same walk the settlement uses, so a named part can never disagree with it:
 /// `named` lists the parts a caller can ask about by name and `unnamed` is
 /// whatever is left, so the parts always add up to the total.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContinuationBytes {
     pub total: usize,
@@ -3397,7 +5032,7 @@ pub struct ContinuationBytes {
     pub unnamed: usize,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl ContinuationBytes {
     /// What the part by this name holds, or zero when this read holds no such
     /// part. A caller asking about a part a read does not have is asking a
@@ -3412,10 +5047,10 @@ impl ContinuationBytes {
 
 /// The name of the term every index run a list predicate still owes is
 /// counted under.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub const PENDING_INDEX_RUNS: &str = "pending index runs";
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn continuation_bytes_breakdown(
     node: &PullNode,
 ) -> std::result::Result<ContinuationBytes, BoundedExecutionError> {
@@ -3447,7 +5082,7 @@ fn continuation_bytes_breakdown(
 /// Walk every source in the tree and add up the parts by name. The scan arm
 /// reads the same fields the settlement reads, so a part named here is the
 /// part the settlement counted.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn collect_continuation_parts(
     node: &PullNode,
     pending_runs: &mut usize,
@@ -3482,7 +5117,7 @@ fn collect_continuation_parts(
 
 /// Every node this one reads from. One place says what a source's children
 /// are, so a walk over the tree cannot miss a branch the settlement counts.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn pull_node_inputs(kind: &PullKind) -> Vec<&PullNode> {
     match kind {
         PullKind::Graph(state) => state.start_candidates.as_deref().into_iter().collect(),
@@ -3492,12 +5127,21 @@ fn pull_node_inputs(kind: &PullKind) -> Vec<&PullNode> {
         },
         PullKind::Project(state) => vec![state.input.as_ref()],
         PullKind::Sort(state) => vec![state.input.as_ref()],
+        PullKind::Window(state) => vec![state.input.as_ref()],
         PullKind::Limit(state) => vec![state.input.as_ref()],
         PullKind::Filter(state) => vec![state.input.as_ref()],
         PullKind::Distinct(state) => vec![state.input.as_ref()],
         PullKind::Join(state) => vec![state.left.as_ref(), state.right.as_ref()],
         PullKind::Union(state) => state.inputs.iter().collect(),
         PullKind::Scan(_) | PullKind::Static(_) => Vec::new(),
+    }
+}
+
+fn completed_vector_control_bytes(node: &PullNode) -> usize {
+    match &node.kind {
+        PullKind::Vector(_) => size_of::<VectorState>(),
+        PullKind::Project(state) => completed_vector_control_bytes(&state.input),
+        _ => 0,
     }
 }
 
@@ -3511,7 +5155,7 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
     let state_bytes = match &node.kind {
         PullKind::Scan(state) => {
             let mut state_bytes = checked_size_add(
-                state.table.capacity(),
+                checked_size_add(size_of::<ScanState>(), state.table.capacity(), "scan control")?,
                 table_meta_capacity_bytes(&state.meta)?,
                 "scan continuation",
             )?;
@@ -3520,6 +5164,17 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                 strings_capacity_bytes(&state.schema_columns, "scan schema columns")?,
                 "scan continuation",
             )?;
+            if let Some(source) = state.source_group.as_ref() {
+                state_bytes = checked_size_add(
+                    state_bytes,
+                    checked_size_mul(
+                        source.positions.capacity(),
+                        std::mem::size_of::<PhysicalPartitionColumn>(),
+                        "source group positions",
+                    )?,
+                    "scan observation",
+                )?;
+            }
             if let Some(filter) = state.filter.as_ref() {
                 state_bytes =
                     checked_size_add(state_bytes, expr_capacity_bytes(filter)?, "scan filter")?;
@@ -3632,7 +5287,6 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
             // keeps, so asking costs the same however deep the walk has got.
             for growing in [
                 state.seen_start_container_bytes,
-                state.seen_edge_container_bytes,
                 state.seen_path_container_bytes,
                 state.probe_seen_container_bytes,
                 state.frontier_container_bytes,
@@ -3641,6 +5295,8 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                     .edge_source
                     .as_ref()
                     .map_or(0, |source| source.retained_bytes()),
+                state.start_walk_container_bytes,
+                state.chosen.as_ref().map_or(0, |node| node.reserved_bytes),
             ] {
                 state_bytes = checked_size_add(state_bytes, growing, "graph continuation")?;
             }
@@ -3656,11 +5312,26 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                     "graph traversal path",
                 )?;
             }
-            state_bytes
+            // Every start walk waiting in the merge holds its cursor, its path
+            // and the next node it has already read.
+            for walk in state.start_walks.iter().flatten() {
+                for held in [
+                    walk.active.cursor.retained_bytes(),
+                    walk.active.path.retained_bytes,
+                    walk.next.reserved_bytes,
+                ] {
+                    state_bytes = checked_size_add(state_bytes, held, "graph start walk")?;
+                }
+            }
+            checked_size_add(state_bytes, size_of::<GraphState>(), "graph control")?
         }
         PullKind::Vector(state) => {
             let mut state_bytes = checked_size_add(
-                state.table.capacity(),
+                checked_size_add(
+                    size_of::<VectorState>(),
+                    state.table.capacity(),
+                    "vector control",
+                )?,
                 checked_size_add(
                     state.index.table.capacity(),
                     state.index.column.capacity(),
@@ -3668,9 +5339,17 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                 )?,
                 "vector continuation",
             )?;
+            state_bytes = checked_size_add(state_bytes,
+                checked_size_mul(state.output_projection.capacity(), size_of::<usize>(), "vector projection")?,
+                "vector projection")?;
             state_bytes = checked_size_add(
                 state_bytes,
                 optional_string_capacity(&state.sort_key),
+                "vector continuation",
+            )?;
+            state_bytes = checked_size_add(
+                state_bytes,
+                state.partition_prefix_bytes,
                 "vector continuation",
             )?;
             if let VectorPreparation::Candidates(Some(candidates)) = &state.preparation {
@@ -3701,7 +5380,7 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                 state.ranked_container_bytes,
                 state.output_container_bytes,
                 state.source.as_ref().map_or(0, |source| match source {
-                    VectorCandidateSource::Brute(cursor) => cursor.retained_bytes(),
+                    VectorCandidateSource::Brute(cursor) => cursor.retained_bytes() + size_of::<contextdb_vector::mem::BoundedBruteForceCursor>(),
                 }),
             ] {
                 state_bytes = checked_size_add(state_bytes, growing, "vector continuation")?;
@@ -3759,6 +5438,7 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
             // the bookkeeping would grow with the answer still to be
             // delivered. Counted for the same reason a traversal's frontier
             // is: what a settlement cannot see, it gives away.
+            state_bytes = checked_size_add(state_bytes, state.container_bytes, "sort container")?;
             state_bytes =
                 checked_size_add(state_bytes, state.buffered_bytes, "sort buffered rows")?;
             if let Some(pending) = state.pending.as_ref() {
@@ -3766,6 +5446,23 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                     checked_size_add(state_bytes, pending.retained_bytes, "sort pending row")?;
             }
             state_bytes
+        }
+        PullKind::Window(state) => {
+            let position_bytes = checked_size_mul(
+                state.partition_positions.capacity(),
+                std::mem::size_of::<usize>(),
+                "window positions",
+            )?;
+            let held = checked_size_add(
+                boxed_pull_bytes(&state.input)?,
+                checked_size_add(state.partition_bytes, position_bytes, "window bindings")?,
+                "window continuation",
+            )?;
+            checked_size_add(
+                held,
+                state.pending.as_ref().map_or(0, |row| row.retained_bytes),
+                "window pending",
+            )?
         }
         PullKind::Limit(state) => boxed_pull_bytes(&state.input)?,
         PullKind::Filter(state) => checked_size_add(
@@ -3849,7 +5546,12 @@ fn expr_nodes(expr: &Expr) -> std::result::Result<usize, BoundedExecutionError> 
         })?,
         Expr::InSubquery { .. } => 0,
         Expr::RowVectorSource { key, .. } => expr_nodes(key)?,
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => 0,
+        Expr::RowNumber(window) => checked_size_add(
+            window.partition_by.len(),
+            window.order_by.len(),
+            "window column nodes",
+        )?,
+        Expr::WindowRank(_) | Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => 0,
     };
     checked_size_add(children, 1, "expression nodes")
 }
@@ -3947,6 +5649,104 @@ fn expression_temporary_bytes<'a>(
     )
 }
 
+// A direct projection allocates the selected value clones, not two copies
+// of every input field. Charge each occurrence plus Vec collection growth.
+fn projection_temporary_bytes(
+    row: &Vec<Value>,
+    columns: &[String],
+    params: &HashMap<String, Value>,
+    projected: &[ProjectColumn],
+) -> std::result::Result<usize, BoundedExecutionError> {
+    if !projected
+        .iter()
+        .all(|column| matches!(column.expr, Expr::Column(_)))
+    {
+        return expression_temporary_bytes(
+            row,
+            params,
+            projected.iter().map(|column| &column.expr),
+        );
+    }
+    let capacity = if projected.is_empty() {
+        0
+    } else {
+        projected
+            .len()
+            .max(4)
+            .checked_next_power_of_two()
+            .ok_or_else(|| bounded_size_error("projection slots"))?
+    };
+    // Collect may grow from the preceding capacity while retaining its old
+    // buffer. This includes that temporary overlap before evaluating anything.
+    let slots = capacity
+        .checked_add(capacity / 2)
+        .ok_or_else(|| bounded_size_error("projection slots"))?;
+    let mut bytes = checked_size_add(
+        std::mem::size_of::<Vec<Value>>(),
+        checked_size_mul(slots, std::mem::size_of::<Value>(), "projection slots")?,
+        "projection output",
+    )?;
+    for column in projected {
+        let Expr::Column(name) = &column.expr else {
+            unreachable!()
+        };
+        let position = match resolve_query_result_column(columns, name) {
+            QueryResultColumn::Found(position) => position,
+            resolution => return Err(query_result_column_error(name, &resolution).into()),
+        };
+        let value = row
+            .get(position)
+            .ok_or_else(|| Error::PlanError("projection value is missing".to_string()))?;
+        bytes = checked_size_add(
+            bytes,
+            planned_value_clone_bytes(value)?,
+            "projection clones",
+        )?;
+    }
+    Ok(bytes)
+}
+
+// Direct column keys can repeat arbitrarily in a window specification. Fund
+// every retained clone before evaluation, rather than estimating multiplicity
+// from the input row's size. Other expressions retain their existing workspace.
+fn sort_key_temporary_bytes(
+    row: &Vec<Value>,
+    columns: &[String],
+    params: &HashMap<String, Value>,
+    keys: &[SortKey],
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let mut exact = checked_size_mul(keys.len(), std::mem::size_of::<Value>(), "sort keys")?;
+    let mut direct = true;
+    for key in keys {
+        match &key.expr {
+            Expr::Column(column) => match resolve_query_result_column(columns, column) {
+                QueryResultColumn::Found(position) => {
+                    let value = row
+                        .get(position)
+                        .ok_or_else(|| Error::PlanError("sort key value is missing".to_string()))?;
+                    exact = checked_size_add(
+                        exact,
+                        planned_value_clone_bytes(value)?,
+                        "sort key clones",
+                    )?;
+                }
+                resolution => return Err(query_result_column_error(column, &resolution).into()),
+            },
+            Expr::WindowRank(_) => {}
+            _ => direct = false,
+        }
+    }
+    if direct {
+        Ok(exact)
+    } else {
+        checked_size_add(
+            exact,
+            expression_temporary_bytes(row, params, keys.iter().map(|key| &key.expr))?,
+            "sort evaluation",
+        )
+    }
+}
+
 struct CheckedCountingWriter<'a> {
     bytes: &'a Cell<usize>,
 }
@@ -3957,15 +5757,14 @@ impl Writer for CheckedCountingWriter<'_> {
             self.bytes
                 .get()
                 .checked_add(bytes.len())
-                .ok_or(bincode::error::EncodeError::Other(
-                    "bounded canonical size overflow",
-                ))?;
+                .ok_or(bincode::error::EncodeError::Other((
+                    "bounded canonical size overflow").into()))?;
         self.bytes.set(next);
         Ok(())
     }
 }
 
-fn serialized_size<T: Serialize + ?Sized>(
+pub(super) fn serialized_size<T: Serialize + ?Sized>(
     value: &T,
 ) -> std::result::Result<usize, BoundedExecutionError> {
     let bytes = Cell::new(0usize);
@@ -3974,7 +5773,7 @@ fn serialized_size<T: Serialize + ?Sized>(
         CheckedCountingWriter { bytes: &bytes },
         bincode::config::standard(),
     )
-    .map_err(|_| Error::Other("canonical read encoding failed".to_string()))?;
+    .map_err(|_| Error::Other(("canonical read encoding failed".to_string()).into()))?;
     Ok(bytes.get())
 }
 
@@ -3983,12 +5782,15 @@ fn encoded_row_key(
     size: usize,
 ) -> std::result::Result<Vec<u8>, BoundedExecutionError> {
     let mut key = vec![0u8; size];
-    let written =
-        bincode::serde::encode_into_slice(row, key.as_mut_slice(), bincode::config::standard())
-            .map_err(|_| Error::Other("bounded row-key encoding failed".to_string()))?;
+    let written = bincode::serde::encode_into_slice(
+        contextdb_core::SqlEqualityKey(row),
+        key.as_mut_slice(),
+        bincode::config::standard(),
+    )
+    .map_err(|_| Error::Other(("bounded row-key encoding failed".to_string()).into()))?;
     if written != size {
         return Err(
-            Error::Other("bounded row-key size changed during encoding".to_string()).into(),
+            Error::Other(("bounded row-key size changed during encoding".to_string()).into()).into(),
         );
     }
     Ok(key)
@@ -4064,7 +5866,9 @@ fn borrowed_scalar_exact_eq(left: BorrowedScalar<'_>, right: BorrowedScalar<'_>)
         (BorrowedScalar::Null, BorrowedScalar::Null) => true,
         (BorrowedScalar::Bool(left), BorrowedScalar::Bool(right)) => left == right,
         (BorrowedScalar::Int64(left), BorrowedScalar::Int64(right)) => left == right,
-        (BorrowedScalar::Float64(left), BorrowedScalar::Float64(right)) => left == right,
+        (BorrowedScalar::Float64(left), BorrowedScalar::Float64(right)) => {
+            contextdb_core::float8_cmp(left, right).is_eq()
+        }
         (BorrowedScalar::Text(left), BorrowedScalar::Text(right)) => left == right,
         (BorrowedScalar::Uuid(left), BorrowedScalar::Uuid(right)) => left == right,
         (BorrowedScalar::Timestamp(left), BorrowedScalar::Timestamp(right)) => left == right,
@@ -4084,17 +5888,17 @@ fn borrowed_scalar_cmp(
     match (left, right) {
         (BorrowedScalar::Int64(left), BorrowedScalar::Int64(right)) => Some(left.cmp(&right)),
         (BorrowedScalar::Float64(left), BorrowedScalar::Float64(right)) => {
-            Some(left.total_cmp(&right))
+            Some(contextdb_core::float8_cmp(left, right))
         }
         (BorrowedScalar::Text(left), BorrowedScalar::Text(right)) => Some(left.cmp(right)),
         (BorrowedScalar::Timestamp(left), BorrowedScalar::Timestamp(right)) => {
             Some(left.cmp(&right))
         }
         (BorrowedScalar::Int64(left), BorrowedScalar::Float64(right)) => {
-            Some((left as f64).total_cmp(&right))
+            Some(contextdb_core::float8_cmp(left as f64, right))
         }
         (BorrowedScalar::Float64(left), BorrowedScalar::Int64(right)) => {
-            Some(left.total_cmp(&(right as f64)))
+            Some(contextdb_core::float8_cmp(left, right as f64))
         }
         (BorrowedScalar::Timestamp(left), BorrowedScalar::Int64(right)) => Some(left.cmp(&right)),
         (BorrowedScalar::Int64(left), BorrowedScalar::Timestamp(right)) => Some(left.cmp(&right)),
@@ -4302,6 +6106,37 @@ fn bounded_eval_scalar_in_row<'a>(
         Expr::BinaryOp { left, op, right } => {
             let left = bounded_eval_scalar_in_row(row, left, params)?;
             let right = bounded_eval_scalar_in_row(row, right, params)?;
+            if matches!(op, BinOp::And | BinOp::Or) {
+                let left = if left.is_null() {
+                    None
+                } else {
+                    Some(borrowed_scalar_truth(left))
+                };
+                let right = if right.is_null() {
+                    None
+                } else {
+                    Some(borrowed_scalar_truth(right))
+                };
+                let truth = match op {
+                    BinOp::And => match (left, right) {
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    },
+                    BinOp::Or => match (left, right) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    },
+                    _ => unreachable!(),
+                };
+                return Ok(truth
+                    .map(BorrowedScalar::Bool)
+                    .unwrap_or(BorrowedScalar::Null));
+            }
+            if left.is_null() || right.is_null() {
+                return Ok(BorrowedScalar::Null);
+            }
             let value = match op {
                 BinOp::Eq => {
                     !left.is_null() && !right.is_null() && borrowed_scalar_sql_eq(left, right)
@@ -4327,7 +6162,11 @@ fn bounded_eval_scalar_in_row<'a>(
         Expr::UnaryOp { op, operand } => {
             let value = bounded_eval_scalar_in_row(row, operand, params)?;
             match op {
-                UnaryOp::Not => Ok(BorrowedScalar::Bool(!borrowed_scalar_truth(value))),
+                UnaryOp::Not => Ok(if value.is_null() {
+                    BorrowedScalar::Null
+                } else {
+                    BorrowedScalar::Bool(!borrowed_scalar_truth(value))
+                }),
                 UnaryOp::Neg => match value {
                     BorrowedScalar::Int64(value) => value
                         .checked_neg()
@@ -4367,22 +6206,25 @@ fn bounded_eval_scalar_in_row<'a>(
             negated,
         } => {
             let needle = bounded_eval_scalar_in_row(row, expr, params)?;
-            let mut matched = false;
-            for item in list {
-                if matched {
-                    break;
-                }
-                let candidate = bounded_eval_scalar_in_row(row, item, params)?;
-                matched = borrowed_scalar_cmp(needle, candidate) == Some(std::cmp::Ordering::Equal)
-                    || (!needle.is_null()
-                        && !candidate.is_null()
-                        && borrowed_scalar_exact_eq(needle, candidate));
+            if needle.is_null() {
+                return Ok(BorrowedScalar::Null);
             }
-            Ok(BorrowedScalar::Bool(if *negated {
-                !matched
+            let mut saw_unknown = false;
+            for item in list {
+                let candidate = bounded_eval_scalar_in_row(row, item, params)?;
+                if candidate.is_null() {
+                    saw_unknown = true;
+                } else if borrowed_scalar_cmp(needle, candidate) == Some(std::cmp::Ordering::Equal)
+                    || borrowed_scalar_exact_eq(needle, candidate)
+                {
+                    return Ok(BorrowedScalar::Bool(!*negated));
+                }
+            }
+            Ok(if saw_unknown {
+                BorrowedScalar::Null
             } else {
-                matched
-            }))
+                BorrowedScalar::Bool(*negated)
+            })
         }
         Expr::Like {
             expr,
@@ -4392,6 +6234,9 @@ fn bounded_eval_scalar_in_row<'a>(
             let value = bounded_eval_scalar_in_row(row, expr, params)?;
             let pattern = bounded_eval_scalar_in_row(row, pattern, params)?;
             let matched = match (value, pattern) {
+                (BorrowedScalar::Null, _) | (_, BorrowedScalar::Null) => {
+                    return Ok(BorrowedScalar::Null);
+                }
                 (BorrowedScalar::Text(value), BorrowedScalar::Text(pattern)) => {
                     bounded_like_matches(value, pattern)
                 }
@@ -4542,10 +6387,9 @@ fn bounded_eval_bool_expr(
                         Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
                     ),
                     BinOp::And | BinOp::Or => {
-                        return Err(Error::Other(
+                        return Err(Error::Other((
                             "bounded boolean evaluator reached a non-comparison operator"
-                                .to_string(),
-                        ));
+                                .to_string()).into()));
                     }
                 };
                 Ok(Some(result))
@@ -4600,16 +6444,18 @@ fn bounded_eval_bool_expr(
             if needle.is_null() {
                 return Ok(None);
             }
-            let mut matched = false;
+            let mut saw_unknown = false;
             for item in list {
-                if matched {
-                    break;
-                }
                 let candidate = bounded_eval_scalar_in_row(row, item, params)?;
-                matched = borrowed_scalar_cmp(needle, candidate) == Some(std::cmp::Ordering::Equal)
-                    || (!candidate.is_null() && borrowed_scalar_exact_eq(needle, candidate));
+                if candidate.is_null() {
+                    saw_unknown = true;
+                } else if borrowed_scalar_cmp(needle, candidate) == Some(std::cmp::Ordering::Equal)
+                    || borrowed_scalar_exact_eq(needle, candidate)
+                {
+                    return Ok(Some(!*negated));
+                }
             }
-            Ok(Some(if *negated { !matched } else { matched }))
+            Ok(if saw_unknown { None } else { Some(*negated) })
         }
         Expr::InSubquery { .. } => Err(Error::PlanError(
             "IN (subquery) must be resolved before execution".to_string(),
@@ -4622,12 +6468,13 @@ fn bounded_eval_bool_expr(
             let left = bounded_eval_scalar_in_row(row, expr, params)?;
             let right = bounded_eval_scalar_in_row(row, pattern, params)?;
             let matched = match (left, right) {
+                (BorrowedScalar::Null, _) | (_, BorrowedScalar::Null) => None,
                 (BorrowedScalar::Text(value), BorrowedScalar::Text(pattern)) => {
-                    bounded_like_matches(value, pattern)
+                    Some(bounded_like_matches(value, pattern))
                 }
-                _ => false,
+                _ => Some(false),
             };
-            Ok(Some(if *negated { !matched } else { matched }))
+            Ok(matched.map(|matched| matched != *negated))
         }
         Expr::IsNull { expr, negated } => {
             let is_null = bounded_eval_scalar_in_row(row, expr, params)?.is_null();
@@ -4662,20 +6509,25 @@ impl ScanState {
     fn drain_verified_vector_candidate_identities(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
         candidate_ids: &mut Vec<u64>,
         candidate_bytes: &mut usize,
-    ) -> std::result::Result<bool, BoundedExecutionError> {
+        probe: Option<(&Cell<usize>, usize)>,
+    ) -> std::result::Result<CandidateDrain, BoundedExecutionError> {
         if !self.identities_only
             || !self.vector_candidate_source
             || self.pending_row.is_some()
             || self.transaction.is_some()
         {
-            return Ok(false);
+            return Ok(CandidateDrain::Unsupported);
         }
         let ScanMode::Index { cursor, pick, .. } = &mut self.mode else {
-            return Ok(false);
+            return Ok(CandidateDrain::Unsupported);
         };
+        // A bounded probe reads at most `cap` entries, each counted before it
+        // is read; the entry after the cap is never read to learn whether
+        // the range had ended.
+        let capped = Cell::new(false);
         let _attribution = contextdb_core::find_attribution::stage("candidate_drain");
         loop {
             let visited = db.bounded_visit_verified_ordered_identities(
@@ -4684,6 +6536,13 @@ impl ScanState {
                 self.snapshot,
                 cursor,
                 &mut || {
+                    if let Some((spent, cap)) = probe {
+                        if spent.get() >= cap {
+                            capped.set(true);
+                            return Err(BoundedExecutionError::Cancelled);
+                        }
+                        spent.set(spent.get() + 1);
+                    }
                     context.charge(
                         BoundedWorkSource::IndexRange,
                         BoundedSourceTouch::IndexEntry,
@@ -4702,12 +6561,19 @@ impl ScanState {
                     candidate_ids.push(row_id.0);
                     Ok(())
                 },
-            )?;
+                context.source_read_memory(BoundedWorkSource::IndexRange),
+            );
+            let visited = match visited {
+                Err(BoundedExecutionError::Cancelled) if capped.get() => {
+                    return Ok(CandidateDrain::Capped);
+                }
+                visited => visited?,
+            };
             if !visited {
-                return Ok(false);
+                return Ok(CandidateDrain::Unsupported);
             }
             if cursor.is_exhausted() {
-                return Ok(true);
+                return Ok(CandidateDrain::Drained);
             }
         }
     }
@@ -4723,36 +6589,84 @@ impl ScanState {
     fn next_staged_row(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<(VersionedRow, usize)>, BoundedExecutionError> {
         let Some(state) = self.transaction.as_mut() else {
             return Ok(None);
         };
         state.committed_exhausted = true;
         loop {
-            let Some(position) = state.overlay.staged_positions.get(state.published).copied()
-            else {
-                state.predicate_deleted = Vec::new();
+            let staged = if let Some(rows) = state.overlay.staged_rows.as_ref() {
+                if let Some(ordered) = state.ordered_staged.as_mut() {
+                    loop {
+                        let (start, end, prefix_len) = ordered.cursor.source_run_bounds();
+                        let scratch = staged_run_bound_bytes(start)
+                            .saturating_add(staged_run_bound_bytes(end))
+                            .saturating_add(state.staged_key_bytes)
+                            .saturating_add(128);
+                        context.reserve(BoundedWorkSource::TableScan, scratch)?;
+                        let next = rows.next_ordered_in_run(
+                            &ordered.index,
+                            ordered.cursor.source_reverse(),
+                            ordered.after.as_ref(),
+                            start,
+                            end,
+                            prefix_len,
+                        );
+                        context.release(scratch)?;
+                        if let Some((key, row)) = next {
+                            break Some((Some(key), None, row));
+                        }
+                        ordered.after = None;
+                        if !ordered.cursor.source_finish_run() {
+                            break None;
+                        }
+                    }
+                } else {
+                    rows.next_unordered(state.published)
+                        .map(|(sequence, row)| (None, Some(sequence), row))
+                }
+            } else {
+                None
+            };
+            let Some((key, sequence, staged)) = staged else {
                 let held = std::mem::take(&mut state.overlay.bytes);
+                state.ordered_staged = None;
                 context.release(held)?;
+                context.release(std::mem::take(&mut state.staged_key_bytes))?;
                 return Ok(None);
             };
-            state.published = state.published.saturating_add(1);
-            let reserved = Cell::new(0_usize);
-            let staged = db.transaction_staged_row(
-                state.tx,
-                position,
-                &mut || context.charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow),
-                &mut |bytes| {
-                    context.reserve(BoundedWorkSource::TableScan, bytes)?;
-                    reserved.set(bytes);
-                    Ok(())
-                },
-            )?;
-            let Some(row) = staged else {
-                continue;
-            };
-            #[cfg(feature = "test-seams")]
+            context.charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow)?;
+            if let Some(source) = &self.source_group {
+                context.observe_physical_group(source, &self.schema_columns, staged)?;
+            }
+            let reserved = Cell::new(staged.estimated_bytes());
+            context.reserve(BoundedWorkSource::TableScan, reserved.get())?;
+            if let Some(key) = key {
+                let bytes = key
+                    .0
+                    .iter()
+                    .map(|v| match v {
+                        DirectedValue::Asc(v) => v.0.estimated_bytes(),
+                        DirectedValue::Desc(v) => v.0.estimated_bytes(),
+                    })
+                    .sum::<usize>()
+                    .saturating_add(
+                        key.0
+                            .len()
+                            .saturating_mul(std::mem::size_of::<DirectedValue>()),
+                    )
+                    .saturating_add(32);
+                context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                if let Some(ordered) = &mut state.ordered_staged {
+                    ordered.after = Some(key.clone());
+                }
+                context.release(state.staged_key_bytes)?;
+                state.staged_key_bytes = bytes;
+            }
+            state.published = sequence;
+            let row = staged.clone();
+            #[cfg(any(test, feature = "test-seams"))]
             if self.vector_candidate_source {
                 db.note_vector_candidate_materialized();
             }
@@ -4777,6 +6691,7 @@ impl ScanState {
                     let existing =
                         context.with_source_page_admission(BoundedWorkSource::TableScan, || {
                             db.bounded_row_by_identity(
+                                context.source_read_memory(BoundedWorkSource::TableScan),
                                 None,
                                 &self.table,
                                 row.row_id,
@@ -4788,7 +6703,8 @@ impl ScanState {
                                     )
                                 },
                                 &mut |bytes| {
-                                    context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                                    let bytes = context
+                                        .admit_source_row(BoundedWorkSource::TableScan, bytes)?;
                                     probe.set(bytes);
                                     Ok(())
                                 },
@@ -4796,10 +6712,12 @@ impl ScanState {
                         })?;
                     // The probe asks only whether the original is there; the
                     // copy it made is handed straight back.
-                    context.release(probe.get())?;
                     had_committed = existing.is_some();
+                    drop(existing);
+                    context.release(probe.get())?;
                 }
                 if !had_committed {
+                    drop(row);
                     context.release(reserved.get())?;
                     continue;
                 }
@@ -4808,27 +6726,84 @@ impl ScanState {
         }
     }
 
-    /// Read the transaction's staged rows once and put them in this read's
-    /// order, so the walk below can fold them into the committed run. Each is
-    /// charged exactly as it is on the unordered route -- this only changes
-    /// WHEN they are read, not what they cost.
+    /// Keep one matching staged head in the committed cursor's run and order.
+    /// An index that does not cover every frozen row uses the admitted sorted
+    /// fallback, preserving rows staged before that index was declared.
     fn materialize_ordered_staged(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         match self.ordered_merge.as_ref() {
             Some(merge) if merge.staged.is_none() => {}
+            Some(merge)
+                if merge.staged.as_ref().is_some_and(VecDeque::is_empty)
+                    && self
+                        .transaction
+                        .as_ref()
+                        .is_some_and(|tx| tx.ordered_staged.is_some()) =>
+            {
+                if let Some(staged) = self.next_staged_row(db, context)? {
+                    let merge = self.ordered_merge.as_mut().expect("ordered merge is held");
+                    merge.held_bytes = merge.held_bytes.saturating_add(staged.1);
+                    merge
+                        .staged
+                        .as_mut()
+                        .expect("ordered merge is initialized")
+                        .push_back(staged);
+                }
+                return Ok(());
+            }
             _ => return Ok(()),
         }
+        let mut maintained_order = false;
+        if let (Some(transaction), ScanMode::Ordered { cursor, .. }) =
+            (&mut self.transaction, &self.mode)
+            && let Some(index) = cursor.index_name()
+            && transaction
+                .overlay
+                .staged_rows
+                .as_ref()
+                .is_some_and(|rows| rows.has_index_for(index, &self.meta))
+        {
+            let (start, end, _) = cursor.source_run_bounds();
+            let control = std::mem::size_of::<OrderedStatementPosition>()
+                .saturating_add(index.len())
+                .saturating_add(staged_run_bound_bytes(start))
+                .saturating_add(staged_run_bound_bytes(end))
+                .saturating_add(cursor.pending_run_bytes().saturating_mul(2));
+            context.reserve(BoundedWorkSource::TableScan, control)?;
+            transaction.overlay.bytes = transaction.overlay.bytes.saturating_add(control);
+            transaction.ordered_staged = Some(OrderedStatementPosition {
+                index: index.to_owned(),
+                cursor: cursor.clone(),
+                after: None,
+            });
+            maintained_order = true;
+        }
         let mut rows = Vec::new();
-        while let Some(staged) = self.next_staged_row(db, context)? {
-            rows.push(staged);
+        if maintained_order {
+            if let Some(staged) = self.next_staged_row(db, context)? {
+                rows.push(staged);
+            }
+        } else {
+            while let Some(staged) = self.next_staged_row(db, context)? {
+                rows.push(staged);
+            }
         }
         let Some(merge) = self.ordered_merge.as_mut() else {
             return Ok(());
         };
-        rows.sort_by(|left, right| compare_ordered_merge_rows(&left.0, &right.0, &merge.keys));
+        // newest_event_merges_staged_order_without_sort observes the real
+        // bounded-kernel overlay sort, as well as the eager executor's sort.
+        // Only staged rows the maintained index does not order are sorted. A
+        // transaction that staged no rows for this table, such as one that
+        // only deleted committed rows, has nothing here and sorts nothing.
+        if !maintained_order && !rows.is_empty() {
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_query_test_seams::note_staged_sort(rows.len());
+            rows.sort_by(|left, right| compare_ordered_merge_rows(&left.0, &right.0, &merge.keys));
+        }
         merge.held_bytes = rows.iter().map(|(_, bytes)| *bytes).sum();
         merge.staged = Some(rows.into());
         Ok(())
@@ -4874,10 +6849,13 @@ impl ScanState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
-        self.materialize_ordered_staged(db, context)?;
         loop {
+            if self.pending_row.is_none() {
+                self.pending_vector_copy = None;
+            }
+            self.materialize_ordered_staged(db, context)?;
             if self.pending_row.is_none()
                 && let Some(merge) = self.ordered_merge.as_mut()
                 && let Some(held) = merge.deferred.take()
@@ -4889,21 +6867,47 @@ impl ScanState {
                 let reserved = Cell::new(0usize);
                 let (row, source) = match &mut self.mode {
                     ScanMode::Physical { cursor } => {
+                        let receipt = Cell::new(false);
                         let pulled = context.with_source_page_admission(
                             BoundedWorkSource::TableScan,
                             || {
                                 db.bounded_physical_table_row_next(
+                                    context.source_read_memory(BoundedWorkSource::TableScan),
                                     self.table.as_str(),
                                     self.snapshot,
                                     cursor,
                                     &mut || {
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
+                                        )?;
+                                        receipt.set(true);
+                                        Ok(())
+                                    },
+                                    &mut |row| {
                                         context.charge(
                                             BoundedWorkSource::TableScan,
                                             BoundedSourceTouch::TableRow,
-                                        )
+                                        )?;
+                                        if !receipt.replace(false) {
+                                            return Err(Error::Other((
+                                                "physical input has no admitted work receipt"
+                                                    .to_string()).into())
+                                            .into());
+                                        }
+                                        if let Some(source) = &self.source_group {
+                                            context.observe_physical_group(
+                                                source,
+                                                &self.schema_columns,
+                                                row,
+                                            )?;
+                                        }
+                                        Ok(())
                                     },
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::TableScan,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -4918,12 +6922,23 @@ impl ScanState {
                         cursor,
                         ..
                     } => {
+                        let receipt = Cell::new(false);
                         let old_key_bytes = cursor.retained_key_bytes();
                         let old_key_generation = cursor.key_generation();
+                        let index_columns = self
+                            .meta
+                            .indexes
+                            .iter()
+                            .find(|index| Some(index.name.as_str()) == cursor.index_name())
+                            .map(|index| index.columns.as_slice())
+                            .ok_or_else(|| {
+                                Error::Other(("source index declaration is missing".to_string()).into())
+                            })?;
                         let pulled = context.with_source_page_admission(
                             BoundedWorkSource::IndexRange,
                             || {
-                                db.bounded_ordered_table_row_next(
+                                db.bounded_ordered_table_row_next_observed(
+                                    context.source_read_memory(BoundedWorkSource::IndexRange),
                                     &self.table,
                                     column,
                                     *direction,
@@ -4931,13 +6946,39 @@ impl ScanState {
                                     cursor,
                                     &mut || context.check_final_boundary(),
                                     &mut || {
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
+                                        )?;
+                                        receipt.set(true);
+                                        Ok(())
+                                    },
+                                    &mut |key, row_id| {
                                         context.charge(
                                             BoundedWorkSource::IndexRange,
                                             BoundedSourceTouch::IndexEntry,
-                                        )
+                                        )?;
+                                        if !receipt.replace(false) {
+                                            return Err(Error::Other((
+                                                "index input has no admitted work receipt"
+                                                    .to_string()).into())
+                                            .into());
+                                        }
+                                        if let Some(source) = &self.source_group {
+                                            context.observe_index_group(
+                                                source,
+                                                &self.schema_columns,
+                                                index_columns,
+                                                key,
+                                                row_id,
+                                            )?;
+                                        }
+                                        Ok(())
                                     },
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::IndexRange,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -4950,10 +6991,9 @@ impl ScanState {
                                 .get()
                                 .checked_sub(cursor.retained_key_bytes())
                                 .ok_or_else(|| {
-                                    Error::Other(
+                                    Error::Other((
                                         "bounded ordered row charge omitted its cursor key"
-                                            .to_string(),
-                                    )
+                                            .to_string()).into())
                                 })?;
                             reserved.set(row_bytes);
                             self.cursor_key_bytes = cursor.retained_key_bytes();
@@ -4966,12 +7006,23 @@ impl ScanState {
                         cursor,
                         ..
                     } => {
+                        let receipt = Cell::new(false);
                         let old_key_bytes = cursor.retained_key_bytes();
                         let old_key_generation = cursor.key_generation();
+                        let index_columns = self
+                            .meta
+                            .indexes
+                            .iter()
+                            .find(|index| Some(index.name.as_str()) == cursor.index_name())
+                            .map(|index| index.columns.as_slice())
+                            .ok_or_else(|| {
+                                Error::Other(("source index declaration is missing".to_string()).into())
+                            })?;
                         let pulled = context.with_source_page_admission(
                             BoundedWorkSource::IndexRange,
                             || {
-                                db.bounded_ordered_table_row_next(
+                                db.bounded_ordered_table_row_next_observed(
+                                    context.source_read_memory(BoundedWorkSource::IndexRange),
                                     &self.table,
                                     column,
                                     *direction,
@@ -4979,13 +7030,39 @@ impl ScanState {
                                     cursor,
                                     &mut || context.check_final_boundary(),
                                     &mut || {
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
+                                        )?;
+                                        receipt.set(true);
+                                        Ok(())
+                                    },
+                                    &mut |key, row_id| {
                                         context.charge(
                                             BoundedWorkSource::IndexRange,
                                             BoundedSourceTouch::IndexEntry,
-                                        )
+                                        )?;
+                                        if !receipt.replace(false) {
+                                            return Err(Error::Other((
+                                                "index input has no admitted work receipt"
+                                                    .to_string()).into())
+                                            .into());
+                                        }
+                                        if let Some(source) = &self.source_group {
+                                            context.observe_index_group(
+                                                source,
+                                                &self.schema_columns,
+                                                index_columns,
+                                                key,
+                                                row_id,
+                                            )?;
+                                        }
+                                        Ok(())
                                     },
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::IndexRange,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -4998,10 +7075,9 @@ impl ScanState {
                                 .get()
                                 .checked_sub(cursor.retained_key_bytes())
                                 .ok_or_else(|| {
-                                    Error::Other(
+                                    Error::Other((
                                         "bounded index row charge omitted its cursor key"
-                                            .to_string(),
-                                    )
+                                            .to_string()).into())
                                 })?;
                             reserved.set(row_bytes);
                             self.cursor_key_bytes = cursor.retained_key_bytes();
@@ -5013,10 +7089,16 @@ impl ScanState {
                             BoundedWorkSource::IndexRange,
                             || {
                                 db.bounded_exact_index_row_next(
+                                    context.source_read_memory(BoundedWorkSource::IndexRange),
                                     &self.table,
                                     index,
                                     self.snapshot,
                                     cursor,
+                                    &mut || {
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::StorageStep,
+                                        )
+                                    },
                                     &mut || {
                                         context.charge(
                                             BoundedWorkSource::IndexRange,
@@ -5028,7 +7110,10 @@ impl ScanState {
                                     },
                                     &mut |bytes| context.release(bytes),
                                     &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        let bytes = context.admit_source_row(
+                                            BoundedWorkSource::IndexRange,
+                                            bytes,
+                                        )?;
                                         reserved.set(bytes);
                                         Ok(())
                                     },
@@ -5040,13 +7125,69 @@ impl ScanState {
                     }
                     ScanMode::Empty => return Ok(None),
                 };
+                let row = if let Some(identity) = row {
+                    let identity_source = matches!(&self.mode,
+                        ScanMode::Ordered { cursor, .. } if cursor.source_identities_only());
+                    if identity_source && identity.values.is_empty() {
+                        // Suppression is decided on identity before selected
+                        // body work. Hidden postings never consume a rank.
+                        if self
+                            .transaction
+                            .as_mut()
+                            .is_some_and(|state| state.hides_committed(&self.table, &identity))
+                        {
+                            context.release(reserved.get())?;
+                            continue;
+                        }
+                        let identity_bytes = reserved.get();
+                        let selected_bytes = Cell::new(0);
+                        let selected = context.with_source_page_admission(source, || {
+                            db.bounded_row_by_identity(
+                                context.source_read_memory(source),
+                                None,
+                                &self.table,
+                                identity.row_id,
+                                self.snapshot,
+                                &mut || context.charge(source, BoundedSourceTouch::TableRow),
+                                &mut |bytes| {
+                                    let bytes = context.admit_source_row(source, bytes)?;
+                                    selected_bytes.set(bytes);
+                                    Ok(())
+                                },
+                            )
+                        })?;
+                        context.release(identity_bytes)?;
+                        reserved.set(selected_bytes.get());
+                        if selected.is_none() {
+                            return Err(Error::StoreCorrupted {
+                                path: db.bounded_store_path(),
+                                reason: "authenticated current posting has no visible row"
+                                    .to_string(),
+                            }
+                            .into());
+                        }
+                        selected
+                    } else {
+                        Some(identity)
+                    }
+                } else {
+                    None
+                };
                 // The source charged its retained-representation estimate
                 // before it cloned. This read holds exactly one copy of what
                 // came back, so the reservation becomes what that copy costs.
                 let row = match row {
                     Some(row) => {
                         let held = pulled_row_retained_bytes(&row)?;
-                        reconcile_new_reservation(context, source, reserved.get(), held)?;
+                        if held > reserved.get() {
+                            if let Err(error) = context.reserve(source, held - reserved.get()) {
+                                drop(row);
+                                context.release(reserved.get())?;
+                                return Err(error);
+                            }
+                        } else if reserved.get() > held {
+                            context.release(reserved.get() - held)?;
+                        }
                         reserved.set(held);
                         Some(row)
                     }
@@ -5084,7 +7225,7 @@ impl ScanState {
                     }
                     continue;
                 };
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 if self.vector_candidate_source && !self.identities_only {
                     db.note_vector_candidate_materialized();
                 }
@@ -5097,11 +7238,19 @@ impl ScanState {
                 self.fold_in_earlier_staged_row();
             }
             if !self.supplement_columns.is_empty() {
+                if self.pending_vector_copy.is_none() {
+                    self.pending_vector_copy = Some(Box::new(
+                        crate::vector_read_memory::admission(Arc::new(SourceDecodeBudget {
+                            context: context.clone(),
+                            source: BoundedWorkSource::TableScan,
+                        })),
+                    ));
+                }
                 let (row_identity, row_lsn) = self
                     .pending_row
                     .as_ref()
                     .map(|(row, _, _)| (row.row_id, row.lsn))
-                    .ok_or_else(|| Error::Other("bounded scan lost its row".to_string()))?;
+                    .ok_or_else(|| Error::Other(("bounded scan lost its row".to_string()).into()))?;
                 let mut filled = Vec::new();
                 for column in &self.supplement_columns {
                     if !self.pending_row.as_ref().is_some_and(|(row, _, _)| {
@@ -5116,6 +7265,10 @@ impl ScanState {
                         row_identity,
                         row_lsn,
                         self.snapshot,
+                        self.pending_vector_copy
+                            .as_deref_mut()
+                            .expect("pending vector owner"),
+                        Arc::clone(&context.reader_budget),
                     )? {
                         filled.push((column.clone(), Value::Vector(vector)));
                     }
@@ -5131,11 +7284,11 @@ impl ScanState {
                 .pending_row
                 .as_ref()
                 .map(|(_, bytes, source)| (*bytes, *source))
-                .ok_or_else(|| Error::Other("bounded scan lost its pending row".to_string()))?;
+                .ok_or_else(|| Error::Other(("bounded scan lost its pending row".to_string()).into()))?;
             let row = &self
                 .pending_row
                 .as_ref()
-                .ok_or_else(|| Error::Other("bounded scan lost its pending row".to_string()))?
+                .ok_or_else(|| Error::Other(("bounded scan lost its pending row".to_string()).into()))?
                 .0;
             // A row this handle's own transaction staged is not committed and
             // never will be at this snapshot, so the committed-visibility rule
@@ -5151,7 +7304,7 @@ impl ScanState {
             };
             if from_committed && !row.visible_at(self.snapshot) {
                 let (_, bytes, _) = self.pending_row.take().ok_or_else(|| {
-                    Error::Other("bounded scan lost an invisible row".to_string())
+                    Error::Other(("bounded scan lost an invisible row".to_string()).into())
                 })?;
                 context.release(bytes)?;
                 continue;
@@ -5161,7 +7314,7 @@ impl ScanState {
                 && state.hides_committed(&self.table, row)
             {
                 let (_, bytes, _) = self.pending_row.take().ok_or_else(|| {
-                    Error::Other("bounded scan lost a row its transaction hides".to_string())
+                    Error::Other(("bounded scan lost a row its transaction hides".to_string()).into())
                 })?;
                 context.release(bytes)?;
                 continue;
@@ -5171,15 +7324,15 @@ impl ScanState {
                 None
             } else {
                 match &self.mode {
-                    ScanMode::Index { pick, .. } => Some(pick),
-                    _ => self.residual_pick.as_ref(),
+                    ScanMode::Index { pick, .. } => Some(pick.as_ref()),
+                    _ => self.residual_pick.as_deref(),
                 }
             };
             if let Some(pick) = index_pick {
                 let key = contextdb_relational::index_key_for_row(&pick.columns, &row.values);
                 if !index_key_matches_pick(&key, pick) {
                     let (_, bytes, _) = self.pending_row.take().ok_or_else(|| {
-                        Error::Other("bounded index scan lost a rejected row".to_string())
+                        Error::Other(("bounded index scan lost a rejected row".to_string()).into())
                     })?;
                     context.release(bytes)?;
                     continue;
@@ -5200,7 +7353,12 @@ impl ScanState {
                 ScanMode::Exact { index, .. } => Some(index.as_str()),
                 _ => self.authenticated_exact_index.as_deref(),
             };
-            let names_one_row = match (exact_index, index_pick) {
+            // The statement decides whether it names one row, on every target and source; only a
+            // source that carries its keys with no statement filter is asked about itself.
+            let statement_pins = self.filter.as_ref().map(|filter| {
+                crate::executor::statement_names_one_row(&self.meta, filter, &self.params)
+            });
+            let names_one_row = statement_pins.unwrap_or_else(|| match (exact_index, index_pick) {
                 // An exact-lookup source asked a whole key: it is already
                 // reading the row that key names.
                 (Some(index), _) => db.read_index_names_one_row(
@@ -5216,7 +7374,7 @@ impl ScanState {
                     &self.params,
                 ),
                 _ => false,
-            };
+            });
             let mut charge_access = |_candidate_bytes: usize| {
                 context.charge(
                     BoundedWorkSource::AccessControl,
@@ -5240,6 +7398,22 @@ impl ScanState {
             if candidate_range_answers_gate {
                 note_vector_candidate_identity("candidate range answers the gate")?;
             } else if names_one_row {
+                // Only a row that matches the complete statement can be the row it names; any
+                // other row is not an answer at all, so it is skipped before the refusing gate.
+                if let Some(filter) = self.filter.as_ref()
+                    && !(self.identities_only && from_committed)
+                {
+                    context.check_final_boundary()?;
+                    let matched = bounded_row_matches(row, filter, &self.params);
+                    context.check_final_boundary()?;
+                    if !matched? {
+                        let (_, bytes, _) = self.pending_row.take().ok_or_else(|| {
+                            Error::Other(("bounded scan lost a filtered row".to_string()).into())
+                        })?;
+                        context.release(bytes)?;
+                        continue;
+                    }
+                }
                 refused = db.bounded_read_denial_for_row(
                     // The request's transaction, not this scan's row
                     // overlay: a transaction that staged only a GRANT row has
@@ -5251,6 +7425,7 @@ impl ScanState {
                     row,
                     self.snapshot,
                     &mut charge_access,
+                    context.source_read_memory(BoundedWorkSource::AccessControl),
                 )?;
             } else {
                 hidden = !db.bounded_read_allowed_for_row(
@@ -5264,11 +7439,12 @@ impl ScanState {
                     row,
                     self.snapshot,
                     &mut charge_access,
+                    context.source_read_memory(BoundedWorkSource::AccessControl),
                 )?;
             }
             if hidden || refused.is_some() {
                 let (_, bytes, _) = self.pending_row.take().ok_or_else(|| {
-                    Error::Other("bounded scan lost a row the gate withheld".to_string())
+                    Error::Other(("bounded scan lost a row the gate withheld".to_string()).into())
                 })?;
                 context.release(bytes)?;
                 if let Some(denial) = refused {
@@ -5285,7 +7461,7 @@ impl ScanState {
                 context.check_final_boundary()?;
                 if !matched? {
                     let (_, bytes, _) = self.pending_row.take().ok_or_else(|| {
-                        Error::Other("bounded scan lost a filtered row".to_string())
+                        Error::Other(("bounded scan lost a filtered row".to_string()).into())
                     })?;
                     context.release(bytes)?;
                     continue;
@@ -5293,7 +7469,7 @@ impl ScanState {
             }
 
             let row_id = i64::try_from(row.row_id.0).map_err(|_| {
-                Error::Other("bounded row identifier exceeds SQL INTEGER".to_string())
+                Error::Other(("bounded row identifier exceeds SQL INTEGER".to_string()).into())
             })?;
             let row_id_value = Value::Int64(row_id);
             let output_capacity = self
@@ -5301,30 +7477,39 @@ impl ScanState {
                 .len()
                 .checked_add(1)
                 .ok_or_else(|| bounded_size_error("scan projection"))?;
-            let projected_values = self
-                .schema_columns
-                .iter()
-                .map(|column| row.values.get(column).map_or(&Value::Null, |value| value));
-            let planned_output_bytes = value_refs_retained_bytes(
-                std::iter::once(&row_id_value).chain(projected_values),
-                output_capacity,
+            let planned_output_bytes = checked_size_add(
+                std::mem::size_of::<Vec<Value>>(),
+                checked_size_mul(
+                    output_capacity,
+                    std::mem::size_of::<Value>(),
+                    "scan projection slots",
+                )?,
+                "scan projection",
+            )?;
+            let vector_credit = self
+                .pending_vector_copy
+                .as_ref()
+                .map_or(0, |owner| owner.retained_bytes());
+            let funded_output_bytes = checked_size_add(
+                checked_size_add(source_bytes, vector_credit, "source projection credit")?,
+                planned_output_bytes,
+                "projection credit",
             )?;
             context.reserve(source, planned_output_bytes)?;
             let mut values = Vec::new();
             if values.try_reserve_exact(output_capacity).is_err() {
                 context.release(planned_output_bytes)?;
                 return Err(
-                    Error::Other("bounded scan projection allocation failed".to_string()).into(),
+                    Error::Other(("bounded scan projection allocation failed".to_string()).into()).into(),
                 );
             }
             let (source_row, retained_source_bytes, _) = self
                 .pending_row
                 .take()
-                .ok_or_else(|| Error::Other("bounded scan lost its projected row".to_string()))?;
+                .ok_or_else(|| Error::Other(("bounded scan lost its projected row".to_string()).into()))?;
             if source_bytes != retained_source_bytes {
-                return Err(Error::Other(
-                    "bounded scan source charge changed before release".to_string(),
-                )
+                return Err(Error::Other((
+                    "bounded scan source charge changed before release".to_string()).into())
                 .into());
             }
             // The output row takes the source row's values rather than copies
@@ -5340,8 +7525,20 @@ impl ScanState {
             );
             drop(source_values);
             let output_bytes = values_retained_bytes(&values)?;
-            reconcile_new_reservation(context, source, planned_output_bytes, output_bytes)?;
-            context.release(retained_source_bytes)?;
+            if let Some(owner) = self.pending_vector_copy.take() {
+                (*owner).transfer();
+            }
+            // The old HashMap, discarded fields and source owner are gone;
+            // reconcile all transferred credit only now.
+            if output_bytes > funded_output_bytes {
+                if let Err(error) = context.reserve(source, output_bytes - funded_output_bytes) {
+                    drop(values);
+                    context.release(funded_output_bytes)?;
+                    return Err(error);
+                }
+            } else if funded_output_bytes > output_bytes {
+                context.release(funded_output_bytes - output_bytes)?;
+            }
             if let ScanMode::Physical { cursor } = &mut self.mode {
                 // The emitted anchor is what a later pull re-anchors against
                 // after maintenance compacts the vector; an emitted row is
@@ -5350,8 +7547,10 @@ impl ScanState {
                 cursor.note_emitted();
             }
             return Ok(Some(PulledRow {
+                window: None,
                 values,
                 retained_bytes: output_bytes,
+                group_binding: None,
             }));
         }
     }
@@ -5389,64 +7588,51 @@ impl GraphState {
     fn next_unpinned_edge(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<(uuid::Uuid, uuid::Uuid)>, BoundedExecutionError> {
         loop {
             let Some(source) = self.edge_source.as_mut() else {
                 return Ok(None);
             };
             let first_step = self.steps.first().ok_or_else(|| {
-                Error::Other("bounded graph plan has no traversal step".to_string())
+                Error::Other(("bounded graph plan has no traversal step".to_string()).into())
             })?;
             let edge_types =
                 (!first_step.edge_types.is_empty()).then_some(first_step.edge_types.as_slice());
-            let edge = db.bounded_graph_edge_next(
-                source,
-                edge_types,
-                context.transaction(),
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::GraphTraversal,
-                        BoundedSourceTouch::GraphEdge,
-                    )
-                },
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::AccessControl,
-                        BoundedSourceTouch::AccessRow,
-                    )?;
-                    context.attribute_live_memory(BoundedWorkSource::AccessControl);
-                    Ok(())
-                },
-                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
-                &mut |bytes| context.release(bytes),
-                &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
-            )?;
+            let edge = {
+                let mut access_memory = ReservedBytes::new(context, 0);
+                db.bounded_graph_edge_next(
+                    source,
+                    edge_types,
+                    context.transaction(),
+                    // Borrow this request only for the synchronous pull. Fence
+                    // chunks check its deadline/cancellation without charging
+                    // another edge or retaining the request in the cursor.
+                    &|| context.checkpoint().map_err(ReadOpenContext::engine_error),
+                    &mut || {
+                        context.charge(
+                            BoundedWorkSource::GraphTraversal,
+                            BoundedSourceTouch::GraphEdge,
+                        )
+                    },
+                    &mut |bytes| access_memory.charge_access_row(bytes),
+                    &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
+                    &mut |bytes| context.release(bytes),
+                    &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
+                    context.source_read_memory(BoundedWorkSource::GraphTraversal),
+                )
+            }?;
             let Some(edge) = edge else {
                 let source = self.edge_source.take().ok_or_else(|| {
-                    Error::Other("bounded graph lost its exhausted edge source".to_string())
+                    Error::Other(("bounded graph lost its exhausted edge source".to_string()).into())
                 })?;
                 context.release(source.retained_bytes())?;
                 return Ok(None);
             };
             if self.single_step_unpinned {
-                match self.seen_edges.binary_search(&edge) {
-                    Ok(_) => continue,
-                    Err(position) => {
-                        let added = reserve_vector_slot(
-                            context,
-                            BoundedWorkSource::GraphTraversal,
-                            &mut self.seen_edges,
-                            "graph edge deduplication",
-                        )?;
-                        self.seen_edge_container_bytes = self
-                            .seen_edge_container_bytes
-                            .checked_add(added)
-                            .ok_or_else(|| bounded_size_error("graph edge deduplication"))?;
-                        self.seen_edges.insert(position, edge);
-                        return Ok(Some(edge));
-                    }
-                }
+                // A single hop answers once per matching edge, and the scan
+                // reports each edge once, so every edge it reports is a row.
+                return Ok(Some(edge));
             }
             let start = edge.0;
             match self.seen_starts.binary_search(&start) {
@@ -5472,58 +7658,82 @@ impl GraphState {
     fn next_start(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<uuid::Uuid>, BoundedExecutionError> {
-        let start = self.resolve_next_start(db, context)?;
-        if start.is_some() {
-            // One more resolved start, charged to the store as it is resolved.
-            context.charge_store_frontier(self.frontier_unit_bytes)?;
-        }
-        Ok(start)
+        self.resolve_next_start(db, context)
     }
 
     fn resolve_next_start(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<uuid::Uuid>, BoundedExecutionError> {
-        if let Some(start) = self.starts.pop_front() {
-            return Ok(Some(start));
-        }
-        if let Some(candidates) = self.start_candidates.as_mut() {
-            loop {
-                let Some(row) = candidates.next(db, context)? else {
-                    self.start_candidates = None;
-                    break;
-                };
-                let start = row.values.iter().find_map(|value| match value {
-                    Value::Uuid(id) => Some(Ok(*id)),
-                    Value::Text(text) => Some(uuid::Uuid::parse_str(text).map_err(|_| {
-                        Error::Other(format!(
-                            "bounded graph start candidate is not a UUID: {text}"
-                        ))
-                    })),
-                    _ => None,
-                });
-                row.release(context)?;
-                if let Some(start) = start {
-                    return start.map(Some).map_err(BoundedExecutionError::from);
+        // A start named twice is one start: its walk, and every row out of it,
+        // happens once.
+        loop {
+            let start = if let Some(start) = self.starts.pop_front() {
+                start
+            } else if let Some(start) = self.next_candidate_start(db, context)? {
+                start
+            } else {
+                return Ok(self.next_unpinned_edge(db, context)?.map(|edge| edge.0));
+            };
+            match self.seen_starts.binary_search(&start) {
+                Ok(_) => continue,
+                Err(position) => {
+                    let added = reserve_vector_slot(
+                        context,
+                        BoundedWorkSource::GraphTraversal,
+                        &mut self.seen_starts,
+                        "graph start deduplication",
+                    )?;
+                    self.seen_start_container_bytes = self
+                        .seen_start_container_bytes
+                        .checked_add(added)
+                        .ok_or_else(|| bounded_size_error("graph start deduplication"))?;
+                    self.seen_starts.insert(position, start);
+                    return Ok(Some(start));
                 }
             }
         }
-        Ok(self.next_unpinned_edge(db, context)?.map(|edge| edge.0))
+    }
+
+    fn next_candidate_start(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<Option<uuid::Uuid>, BoundedExecutionError> {
+        let Some(candidates) = self.start_candidates.as_mut() else {
+            return Ok(None);
+        };
+        loop {
+            let Some(row) = candidates.next(db, context)? else {
+                self.start_candidates = None;
+                return Ok(None);
+            };
+            let start = row.values.iter().find_map(|value| match value {
+                Value::Uuid(id) => Some(Ok(*id)),
+                Value::Text(text) => Some(uuid::Uuid::parse_str(text).map_err(|_| {
+                    Error::Other((format!(
+                        "bounded graph start candidate is not a UUID: {text}"
+                    )).into())
+                })),
+                _ => None,
+            });
+            row.release(context)?;
+            if let Some(start) = start {
+                return start.map(Some).map_err(BoundedExecutionError::from);
+            }
+        }
     }
 
     fn next_unpinned_single_step(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         loop {
             let Some((start, target)) = self.next_unpinned_edge(db, context)? else {
-                context.release(self.seen_edge_container_bytes)?;
-                self.seen_edge_container_bytes = 0;
-                self.seen_edges = Vec::new();
                 self.row_memory.release(context)?;
                 return Ok(None);
             };
@@ -5550,7 +7760,7 @@ impl GraphState {
             if bindings.try_reserve(binding_capacity).is_err() {
                 self.row_memory.give_back(planned_binding_bytes)?;
                 return Err(
-                    Error::Other("bounded graph binding allocation failed".to_string()).into(),
+                    Error::Other(("bounded graph binding allocation failed".to_string()).into()).into(),
                 );
             }
             bindings.insert(self.start_alias.clone(), start);
@@ -5582,11 +7792,14 @@ impl GraphState {
                 self.row_memory
                     .give_back(planned_binding_bytes - actual_binding_bytes)?;
             }
+            let mut predicate_bytes = 0usize;
+            let mut predicate_access_bytes = 0usize;
+            let mut predicate_failure = None;
             let matches = self
                 .filter
                 .as_ref()
                 .map(|filter| {
-                    db.graph_filter_matches_bindings(
+                    db.graph_filter_matches_bindings_with_work(
                         filter,
                         &self.params,
                         // The reader's own transaction: a WHERE on node
@@ -5598,9 +7811,43 @@ impl GraphState {
                         context.transaction(),
                         self.snapshot,
                         &bindings,
+                        &mut |work| {
+                            let result = match work {
+                                GraphPredicateWork::Checkpoint => context.charge(
+                                    BoundedWorkSource::GraphTraversal,
+                                    BoundedSourceTouch::AccessRow,
+                                ),
+                                GraphPredicateWork::AccessRow(bytes) => context
+                                    .charge(
+                                        BoundedWorkSource::AccessControl,
+                                        BoundedSourceTouch::AccessRow,
+                                    )
+                                    .and_then(|()| {
+                                        let extra = bytes.saturating_sub(predicate_access_bytes);
+                                        context.reserve(BoundedWorkSource::AccessControl, extra)?;
+                                        predicate_access_bytes = predicate_access_bytes.max(bytes);
+                                        predicate_bytes = predicate_bytes.saturating_add(extra);
+                                        Ok(())
+                                    }),
+                            };
+                            if let Err(error) = result {
+                                predicate_failure = Some(error);
+                                return Err(Error::ReadCancelled);
+                            }
+                            Ok(())
+                        },
+                        Arc::new(SourceDecodeBudget {
+                            context: context.clone(),
+                            source: BoundedWorkSource::GraphTraversal,
+                        }),
                     )
                 })
                 .transpose();
+            context.release(predicate_bytes)?;
+            if let Some(error) = predicate_failure {
+                self.row_memory.give_back(actual_binding_bytes)?;
+                return Err(error);
+            }
             let matches = match matches {
                 Ok(Some(matches)) => matches,
                 Ok(None) => true,
@@ -5628,7 +7875,7 @@ impl GraphState {
             if projected.try_reserve_exact(planned_values).is_err() {
                 self.row_memory.give_back(planned_output_bytes)?;
                 return Err(
-                    Error::Other("bounded graph projection allocation failed".to_string()).into(),
+                    Error::Other(("bounded graph projection allocation failed".to_string()).into()).into(),
                 );
             }
             projected.push(Value::Uuid(start));
@@ -5649,8 +7896,10 @@ impl GraphState {
                     .give_back(planned_output_bytes - output_bytes)?;
             }
             return Ok(Some(PulledRow {
+                window: None,
                 values: projected,
                 retained_bytes: output_bytes,
+                group_binding: None,
             }));
         }
     }
@@ -5658,7 +7907,7 @@ impl GraphState {
     fn initial_path(
         &self,
         start: uuid::Uuid,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<GraphPathState, BoundedExecutionError> {
         let capacity = self
             .steps
@@ -5674,7 +7923,7 @@ impl GraphState {
         let mut bindings = Vec::new();
         if bindings.try_reserve_exact(capacity).is_err() {
             context.release(planned_bytes)?;
-            return Err(Error::Other("bounded graph path allocation failed".to_string()).into());
+            return Err(Error::Other(("bounded graph path allocation failed".to_string()).into()).into());
         }
         bindings.push(start);
         let retained_bytes = checked_size_mul(
@@ -5700,11 +7949,25 @@ impl GraphState {
     fn open_active(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
         path: GraphPathState,
     ) -> std::result::Result<(), BoundedExecutionError> {
+        if let Some(active) = self.open_walk(db, context, path)? {
+            self.active = Some(active);
+        }
+        Ok(())
+    }
+
+    /// Open the walk out of one path's node for its step. `None` when there is
+    /// nothing to walk, with the path's charge given back.
+    fn open_walk(
+        &self,
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+        path: GraphPathState,
+    ) -> std::result::Result<Option<GraphActiveState>, BoundedExecutionError> {
         let step = self.steps.get(path.step_index).ok_or_else(|| {
-            Error::Other("bounded graph continuation has no traversal step".to_string())
+            Error::Other(("bounded graph continuation has no traversal step".to_string()).into())
         })?;
         let edge_types = (!step.edge_types.is_empty()).then_some(step.edge_types.as_slice());
         let direction = if self.probes_backwards_from_target {
@@ -5712,59 +7975,309 @@ impl GraphState {
         } else {
             step.direction
         };
-        let cursor = db.bounded_graph_bfs_cursor(
-            context.transaction(),
-            path.node,
-            edge_types,
-            direction,
-            step.min_depth,
-            step.max_depth,
-            self.snapshot,
+        let cursor = {
+            let mut access_memory = ReservedBytes::new(context, 0);
+            db.bounded_graph_bfs_cursor(
+                context.transaction(),
+                path.node,
+                edge_types,
+                direction,
+                step.min_depth,
+                step.max_depth,
+                self.snapshot,
+                &mut |bytes| access_memory.charge_access_row(bytes),
+                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
+                &mut |bytes| context.release_parked(bytes),
+                context.source_read_memory(BoundedWorkSource::GraphTraversal),
+            )
+        }?;
+        let Some(mut cursor) = cursor else {
+            context.release(path.retained_bytes)?;
+            return Ok(None);
+        };
+        if self.single_step_probe {
+            cursor.preserve_single_hop_bindings()?;
+        }
+        Ok(Some(GraphActiveState { path, cursor }))
+    }
+
+    /// Read the next node a walk reports, charged as every traversal read is.
+    fn advance_walk(
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+        cursor: &mut crate::database::EngineGraphBfsCursor,
+        visited_cap: Option<usize>,
+    ) -> std::result::Result<
+        Option<contextdb_graph::mem::BoundedTraversalNode>,
+        BoundedExecutionError,
+    > {
+        let mut access_memory = ReservedBytes::new(context, 0);
+        db.bounded_graph_bfs_next(
+            cursor,
             &mut || {
                 context.charge(
-                    BoundedWorkSource::AccessControl,
-                    BoundedSourceTouch::AccessRow,
-                )?;
-                context.attribute_live_memory(BoundedWorkSource::AccessControl);
-                Ok(())
+                    BoundedWorkSource::GraphTraversal,
+                    BoundedSourceTouch::GraphEdge,
+                )
+            },
+            // A path clone is traversal work, not an edge touch, so it is
+            // charged without a source touch and `rows_examined` keeps its
+            // meaning.
+            &mut || context.charge_operator(BoundedWorkSource::GraphTraversal),
+            &mut |bytes| access_memory.charge_access_row(bytes),
+            &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
+            &mut |bytes| context.release_parked(bytes),
+            // Stepping over one staged edge is a source touch like reading
+            // one committed adjacency entry, and the one name copied out of
+            // the transaction is reserved on the same channel that releases
+            // it.
+            &mut || {
+                context.charge(
+                    BoundedWorkSource::GraphTraversal,
+                    BoundedSourceTouch::GraphEdge,
+                )
             },
             &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
             &mut |bytes| context.release_parked(bytes),
-        )?;
-        let Some(cursor) = cursor else {
-            context.release(path.retained_bytes)?;
-            return Ok(());
-        };
-        self.active = Some(GraphActiveState { path, cursor });
+            &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
+            visited_cap,
+            context.transaction(),
+            context.source_read_memory(BoundedWorkSource::GraphTraversal),
+        )
+    }
+
+    /// Whether the first step's length varies, so starts can reach one target
+    /// at different depths and their walks are merged.
+    fn merges_starts(&self) -> bool {
+        self.steps
+            .first()
+            .is_some_and(|step| step.min_depth < step.max_depth)
+    }
+
+    /// Resolve every start and open each one's first-step walk with its first
+    /// node in hand. The starts are ranked as given, or ascending by id when
+    /// the pattern names none.
+    fn open_start_walks(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let unnamed = self.edge_source.is_some();
+        let mut starts: Vec<uuid::Uuid> = Vec::new();
+        let mut starts_bytes = 0usize;
+        loop {
+            let start = match self.next_start(db, context) {
+                Ok(Some(start)) => start,
+                Ok(None) => break,
+                Err(error) => {
+                    context.release(starts_bytes)?;
+                    return Err(error);
+                }
+            };
+            let added = match reserve_vector_slot(
+                context,
+                BoundedWorkSource::GraphTraversal,
+                &mut starts,
+                "graph starts",
+            ) {
+                Ok(added) => added,
+                Err(error) => {
+                    context.release(starts_bytes)?;
+                    return Err(error);
+                }
+            };
+            starts_bytes = checked_size_add(starts_bytes, added, "graph starts")?;
+            starts.push(start);
+        }
+        if unnamed {
+            starts.sort_unstable();
+        }
+        let mut walks: Vec<GraphStartWalk> = Vec::new();
+        let mut walks_bytes = 0usize;
+        for (rank, start) in starts.iter().copied().enumerate() {
+            let opened = self
+                .initial_path(start, context)
+                .and_then(|path| self.open_walk(db, context, path));
+            let mut active = match opened {
+                Ok(Some(active)) => active,
+                Ok(None) => continue,
+                Err(error) => {
+                    Self::dispose_walks(context, walks, walks_bytes);
+                    context.release_parked(starts_bytes);
+                    return Err(error);
+                }
+            };
+            let next = match Self::advance_walk(db, context, &mut active.cursor, self.visited_cap) {
+                Ok(Some(next)) => next,
+                Ok(None) => {
+                    context.release(active.cursor.into_retained_bytes())?;
+                    context.release(active.path.retained_bytes)?;
+                    continue;
+                }
+                Err(error) => {
+                    context.release_parked(active.cursor.into_retained_bytes());
+                    context.release_parked(active.path.retained_bytes);
+                    Self::dispose_walks(context, walks, walks_bytes);
+                    context.release_parked(starts_bytes);
+                    return Err(error);
+                }
+            };
+            let added = match reserve_vector_slot(
+                context,
+                BoundedWorkSource::GraphTraversal,
+                &mut walks,
+                "graph start walks",
+            ) {
+                Ok(added) => added,
+                Err(error) => {
+                    context.release_parked(next.reserved_bytes);
+                    context.release_parked(active.cursor.into_retained_bytes());
+                    context.release_parked(active.path.retained_bytes);
+                    Self::dispose_walks(context, walks, walks_bytes);
+                    context.release_parked(starts_bytes);
+                    return Err(error);
+                }
+            };
+            walks_bytes = checked_size_add(walks_bytes, added, "graph start walks")?;
+            walks.push(GraphStartWalk { rank, active, next });
+        }
+        drop(starts);
+        context.release(starts_bytes)?;
+        // The heap keeps the vector's allocation, and a walk only ever goes
+        // back after it was taken out, so it never grows past what was charged.
+        self.start_walk_container_bytes = walks_bytes;
+        self.start_walks = Some(std::collections::BinaryHeap::from(walks));
         Ok(())
     }
 
-    /// Forget the neighbours a finished probe reported, and give back what
+    /// Make the merge's next walk the active one: the walk whose next node is
+    /// shallowest, the earlier start on a tie. The first call opens them.
+    fn take_start_walk(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        if self.start_walks.is_none() {
+            self.open_start_walks(db, context)?;
+        }
+        if let Some(walk) = self.start_walks.as_mut().and_then(|walks| walks.pop()) {
+            self.active = Some(walk.active);
+            self.chosen = Some(walk.next);
+            self.active_rank = Some(walk.rank);
+        }
+        Ok(())
+    }
+
+    /// Put the active walk back into the merge once its chosen node has been
+    /// handled, with the next node it reports, or close it when it has none.
+    fn return_chosen_walk(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let Some(rank) = self.active_rank.take() else {
+            return Ok(());
+        };
+        let mut active = self
+            .active
+            .take()
+            .ok_or_else(|| Error::Other(("bounded graph lost its merged start walk".to_string()).into()))?;
+        match Self::advance_walk(db, context, &mut active.cursor, self.visited_cap) {
+            Ok(Some(next)) => {
+                let walks = self.start_walks.as_mut().ok_or_else(|| {
+                    Error::Other(("bounded graph lost its start walk merge".to_string()).into())
+                })?;
+                walks.push(GraphStartWalk { rank, active, next });
+                Ok(())
+            }
+            Ok(None) => {
+                context.release(active.cursor.into_retained_bytes())?;
+                context.release(active.path.retained_bytes)?;
+                self.release_probe_seen(context)
+            }
+            Err(error) => {
+                context.release_parked(active.cursor.into_retained_bytes());
+                context.release_parked(active.path.retained_bytes);
+                self.dispose_start_walks(context);
+                Err(error)
+            }
+        }
+    }
+
+    /// Give back everything the merge holds, for a traversal that is failing.
+    fn dispose_start_walks(&mut self, context: &ControlArc<RequestContext>) {
+        if let Some(walks) = self.start_walks.as_mut() {
+            let walks = std::mem::take(walks);
+            let held = std::mem::take(&mut self.start_walk_container_bytes);
+            Self::dispose_walks(context, walks, held);
+        }
+        if let Some(chosen) = self.chosen.take() {
+            context.release_parked(chosen.reserved_bytes);
+        }
+    }
+
+    fn dispose_walks(
+        context: &ControlArc<RequestContext>,
+        walks: impl IntoIterator<Item = GraphStartWalk>,
+        container_bytes: usize,
+    ) {
+        for walk in walks {
+            context.release_parked(walk.next.reserved_bytes);
+            context.release_parked(walk.active.cursor.into_retained_bytes());
+            context.release_parked(walk.active.path.retained_bytes);
+        }
+        context.release_parked(container_bytes);
+    }
+
+    /// Forget the loops a finished probe reported, and give back what
     /// remembering them was charged for.
     fn release_probe_seen(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         let held = std::mem::take(&mut self.probe_seen_container_bytes);
-        self.probe_seen = Vec::new();
+        self.probe_loops = Vec::new();
         context.release(held)
     }
 
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
+        let _decisions = self._row_edge_guard.as_ref().map(|capture| capture.enter());
         if self.single_step_unpinned {
             return self.next_unpinned_single_step(db, context);
         }
         loop {
+            // A merged start walk whose chosen node has been handled goes back
+            // to the merge with its next node before anything else is read.
+            if self.active_rank.is_some() && self.chosen.is_none() {
+                self.return_chosen_walk(db, context)?;
+            }
             if self.active.is_none() {
-                let path = if let Some(path) = self.frontier.pop() {
-                    path
+                if self.merges_starts() {
+                    // Every start's first step is read, shallowest first, before
+                    // any later step continues, as one start's walk always was.
+                    self.take_start_walk(db, context)?;
+                }
+                let path = if self.active.is_some() {
+                    None
+                } else if let Some(path) = self.frontier.pop() {
+                    Some(path)
+                } else if self.merges_starts() {
+                    None
                 } else if let Some(start) = self.next_start(db, context)? {
-                    self.initial_path(start, context)?
+                    Some(self.initial_path(start, context)?)
                 } else {
+                    None
+                };
+                if let Some(path) = path {
+                    self.open_active(db, context, path)?;
+                    if self.active.is_none() {
+                        continue;
+                    }
+                } else if self.active.is_none() {
                     context.release(self.frontier_container_bytes)?;
                     self.frontier_container_bytes = 0;
                     self.frontier = Vec::new();
@@ -5774,56 +8287,23 @@ impl GraphState {
                     context.release(self.seen_path_container_bytes)?;
                     self.seen_path_container_bytes = 0;
                     self.seen_paths = Vec::new();
+                    if self.start_walks.is_some() {
+                        context.release(self.start_walk_container_bytes)?;
+                        self.start_walk_container_bytes = 0;
+                        self.start_walks = Some(std::collections::BinaryHeap::new());
+                    }
                     self.release_probe_seen(context)?;
                     return Ok(None);
-                };
-                self.open_active(db, context, path)?;
-                if self.active.is_none() {
-                    continue;
                 }
             }
 
             let active = self.active.as_mut().ok_or_else(|| {
-                Error::Other("bounded graph lost its active continuation".to_string())
+                Error::Other(("bounded graph lost its active continuation".to_string()).into())
             })?;
-            let next = db.bounded_graph_bfs_next(
-                &mut active.cursor,
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::GraphTraversal,
-                        BoundedSourceTouch::GraphEdge,
-                    )
-                },
-                // A path clone is traversal work, not an edge touch, so it is
-                // charged without a source touch and `rows_examined` keeps its
-                // meaning.
-                &mut || context.charge_operator(BoundedWorkSource::GraphTraversal),
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::AccessControl,
-                        BoundedSourceTouch::AccessRow,
-                    )?;
-                    context.attribute_live_memory(BoundedWorkSource::AccessControl);
-                    Ok(())
-                },
-                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
-                &mut |bytes| context.release_parked(bytes),
-                // Stepping over one staged edge is a source touch like reading
-                // one committed adjacency entry, and the one name copied out of
-                // the transaction is reserved on the same channel that releases
-                // it.
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::GraphTraversal,
-                        BoundedSourceTouch::GraphEdge,
-                    )
-                },
-                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
-                &mut |bytes| context.release_parked(bytes),
-                &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
-                self.visited_cap,
-                context.transaction(),
-            );
+            let next = match self.chosen.take() {
+                Some(chosen) => Ok(Some(chosen)),
+                None => Self::advance_walk(db, context, &mut active.cursor, self.visited_cap),
+            };
             // A continuation that is abandoned keeps its charge until the
             // caller gives it back, so a refusal or cancellation from the
             // traversal has to dispose of the cursor before it propagates.
@@ -5834,12 +8314,13 @@ impl GraphState {
                         context.release_parked(active.cursor.into_retained_bytes());
                         context.release_parked(active.path.retained_bytes);
                     }
+                    self.dispose_start_walks(context);
                     return Err(error);
                 }
             };
             let Some(node) = next else {
                 let active = self.active.take().ok_or_else(|| {
-                    Error::Other("bounded graph lost its exhausted continuation".to_string())
+                    Error::Other(("bounded graph lost its exhausted continuation".to_string()).into())
                 })?;
                 context.release(active.cursor.into_retained_bytes())?;
                 context.release(active.path.retained_bytes)?;
@@ -5852,16 +8333,54 @@ impl GraphState {
             // The traversal reserved these bytes for this one projected row
             // and released nothing; every exit below returns them.
             let node_reservation = ReservedBytes::new(context, node.reserved_bytes);
-            // A single hop answers with one row per NEIGHBOUR, not one row per
-            // edge that arrives at it: a node reachable both ways round an
-            // undirected hop is one answer, not two. That is the rule the
-            // other door applies to the same statement, in
-            // `graph_adjacency_probe_counted`, and it is applied here over the
-            // one adjacency being walked so the two doors publish the same
-            // rows. The entry was still read, so it is still examined.
-            if self.single_step_probe {
-                match self.probe_seen.binary_search(&node.node.id) {
+            // The physical adjacency cursor already suppresses the reverse
+            // copy of a self-loop while preserving each distinct row owner.
+            // Answers are keyed by the pattern's target bindings, including
+            // single-hop probes that reach one neighbour from both directions.
+            // The existing admitted path-key set owns each distinct answer.
+            if !self.single_step_probe {
+                let key = {
+                    let active = self.active.as_ref().ok_or_else(|| {
+                        Error::Other(("bounded graph lost its emitted path".to_string()).into())
+                    })?;
+                    let key_len = active
+                        .path
+                        .step_index
+                        .checked_add(1)
+                        .ok_or_else(|| bounded_size_error("graph path deduplication"))?;
+                    let key_bytes = match checked_size_mul(
+                        key_len,
+                        std::mem::size_of::<uuid::Uuid>(),
+                        "graph path deduplication",
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            node_reservation.release()?;
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) =
+                        context.reserve(BoundedWorkSource::GraphTraversal, key_bytes)
+                    {
+                        node_reservation.release()?;
+                        return Err(error);
+                    }
+                    let mut key: Vec<uuid::Uuid> = Vec::new();
+                    if key.try_reserve_exact(key_len).is_err() {
+                        context.release(key_bytes)?;
+                        node_reservation.release()?;
+                        return Err(Error::Other((
+                            "bounded graph path deduplication allocation failed".to_string()).into())
+                        .into());
+                    }
+                    key.extend(active.path.bindings.iter().skip(1).copied());
+                    key.push(node.node.id);
+                    (key, key_bytes)
+                };
+                let (key, key_bytes) = key;
+                match self.seen_paths.binary_search(&key) {
                     Ok(_) => {
+                        context.release(key_bytes)?;
                         node_reservation.release()?;
                         continue;
                     }
@@ -5869,115 +8388,42 @@ impl GraphState {
                         let added = match reserve_vector_slot(
                             context,
                             BoundedWorkSource::GraphTraversal,
-                            &mut self.probe_seen,
-                            "graph probe deduplication",
+                            &mut self.seen_paths,
+                            "graph path deduplication",
                         ) {
                             Ok(added) => added,
                             Err(error) => {
+                                context.release(key_bytes)?;
                                 node_reservation.release()?;
                                 return Err(error);
                             }
                         };
-                        let Some(total) = self.probe_seen_container_bytes.checked_add(added) else {
+                        let total = self
+                            .seen_path_container_bytes
+                            .checked_add(added)
+                            .and_then(|bytes| bytes.checked_add(key_bytes));
+                        let Some(total) = total else {
                             node_reservation.release()?;
-                            return Err(bounded_size_error("graph probe deduplication"));
+                            return Err(bounded_size_error("graph path deduplication"));
                         };
-                        self.probe_seen_container_bytes = total;
-                        self.probe_seen.insert(position, node.node.id);
+                        self.seen_path_container_bytes = total;
+                        self.seen_paths.insert(position, key);
                     }
-                }
-            }
-            // Two starts that arrive at the same nodes are ONE answer, and the
-            // walk out of those nodes is made once: the rule the other door
-            // applies between steps in `dedupe_graph_frontier`, keyed on what
-            // the pattern's target aliases are bound to and never on where the
-            // walk began. Without it the same decision is reported once per
-            // route that reaches it, so a statement asking which decisions a
-            // detection reaches gets one row per detection rather than one row
-            // per decision.
-            let key = {
-                let active = self.active.as_ref().ok_or_else(|| {
-                    Error::Other("bounded graph lost its emitted path".to_string())
-                })?;
-                let key_len = active
-                    .path
-                    .step_index
-                    .checked_add(1)
-                    .ok_or_else(|| bounded_size_error("graph path deduplication"))?;
-                let key_bytes = match checked_size_mul(
-                    key_len,
-                    std::mem::size_of::<uuid::Uuid>(),
-                    "graph path deduplication",
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        node_reservation.release()?;
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = context.reserve(BoundedWorkSource::GraphTraversal, key_bytes) {
-                    node_reservation.release()?;
-                    return Err(error);
-                }
-                let mut key: Vec<uuid::Uuid> = Vec::new();
-                if key.try_reserve_exact(key_len).is_err() {
-                    context.release(key_bytes)?;
-                    node_reservation.release()?;
-                    return Err(Error::Other(
-                        "bounded graph path deduplication allocation failed".to_string(),
-                    )
-                    .into());
-                }
-                key.extend(active.path.bindings.iter().skip(1).copied());
-                key.push(node.node.id);
-                (key, key_bytes)
-            };
-            let (key, key_bytes) = key;
-            match self.seen_paths.binary_search(&key) {
-                Ok(_) => {
-                    context.release(key_bytes)?;
-                    node_reservation.release()?;
-                    continue;
-                }
-                Err(position) => {
-                    let added = match reserve_vector_slot(
-                        context,
-                        BoundedWorkSource::GraphTraversal,
-                        &mut self.seen_paths,
-                        "graph path deduplication",
-                    ) {
-                        Ok(added) => added,
-                        Err(error) => {
-                            context.release(key_bytes)?;
-                            node_reservation.release()?;
-                            return Err(error);
-                        }
-                    };
-                    let total = self
-                        .seen_path_container_bytes
-                        .checked_add(added)
-                        .and_then(|bytes| bytes.checked_add(key_bytes));
-                    let Some(total) = total else {
-                        node_reservation.release()?;
-                        return Err(bounded_size_error("graph path deduplication"));
-                    };
-                    self.seen_path_container_bytes = total;
-                    self.seen_paths.insert(position, key);
                 }
             }
             let active = self
                 .active
                 .as_ref()
-                .ok_or_else(|| Error::Other("bounded graph lost its emitted path".to_string()))?;
+                .ok_or_else(|| Error::Other(("bounded graph lost its emitted path".to_string()).into()))?;
             let step_index = active.path.step_index;
             let total_depth = active
                 .path
                 .total_depth
                 .checked_add(node.node.depth)
-                .ok_or_else(|| Error::Other("bounded graph total depth overflow".to_string()))?;
+                .ok_or_else(|| Error::Other(("bounded graph total depth overflow".to_string()).into()))?;
             let final_step = step_index
                 .checked_add(1)
-                .ok_or_else(|| Error::Other("bounded graph step position overflow".to_string()))?
+                .ok_or_else(|| Error::Other(("bounded graph step position overflow".to_string()).into()))?
                 == self.steps.len();
             if !final_step {
                 let planned_bytes = active.path.retained_bytes;
@@ -5988,9 +8434,8 @@ impl GraphState {
                     .is_err()
                 {
                     context.release(planned_bytes)?;
-                    return Err(Error::Other(
-                        "bounded graph continuation allocation failed".to_string(),
-                    )
+                    return Err(Error::Other((
+                        "bounded graph continuation allocation failed".to_string()).into())
                     .into());
                 }
                 bindings.extend(active.path.bindings.iter().copied());
@@ -6011,7 +8456,7 @@ impl GraphState {
                     node: node.node.id,
                     total_depth,
                     step_index: step_index.checked_add(1).ok_or_else(|| {
-                        Error::Other("bounded graph step position overflow".to_string())
+                        Error::Other(("bounded graph step position overflow".to_string()).into())
                     })?,
                     retained_bytes,
                 };
@@ -6063,11 +8508,11 @@ impl GraphState {
             if bindings.try_reserve(binding_capacity).is_err() {
                 context.release(planned_binding_bytes)?;
                 return Err(
-                    Error::Other("bounded graph binding allocation failed".to_string()).into(),
+                    Error::Other(("bounded graph binding allocation failed".to_string()).into()).into(),
                 );
             }
             let start = active.path.bindings.first().copied().ok_or_else(|| {
-                Error::Other("bounded graph path has no start binding".to_string())
+                Error::Other(("bounded graph path has no start binding".to_string()).into())
             })?;
             if self.probes_backwards_from_target {
                 // Walked backwards out of the pinned end, so what the walk
@@ -6079,7 +8524,7 @@ impl GraphState {
                     .first()
                     .map(|step| step.target_alias.clone())
                     .ok_or_else(|| {
-                        Error::Other("bounded graph backwards probe has no step".to_string())
+                        Error::Other(("bounded graph backwards probe has no step".to_string()).into())
                     })?;
                 bindings.insert(self.start_alias.clone(), node.node.id);
                 bindings.insert(target_alias, start);
@@ -6117,11 +8562,14 @@ impl GraphState {
                 planned_binding_bytes,
                 actual_binding_bytes,
             )?;
+            let mut predicate_bytes = 0usize;
+            let mut predicate_access_bytes = 0usize;
+            let mut predicate_failure = None;
             let matches = self
                 .filter
                 .as_ref()
                 .map(|filter| {
-                    db.graph_filter_matches_bindings(
+                    db.graph_filter_matches_bindings_with_work(
                         filter,
                         &self.params,
                         // The reader's own transaction: a WHERE on node
@@ -6133,9 +8581,43 @@ impl GraphState {
                         context.transaction(),
                         self.snapshot,
                         &bindings,
+                        &mut |work| {
+                            let result = match work {
+                                GraphPredicateWork::Checkpoint => context.charge(
+                                    BoundedWorkSource::GraphTraversal,
+                                    BoundedSourceTouch::AccessRow,
+                                ),
+                                GraphPredicateWork::AccessRow(bytes) => context
+                                    .charge(
+                                        BoundedWorkSource::AccessControl,
+                                        BoundedSourceTouch::AccessRow,
+                                    )
+                                    .and_then(|()| {
+                                        let extra = bytes.saturating_sub(predicate_access_bytes);
+                                        context.reserve(BoundedWorkSource::AccessControl, extra)?;
+                                        predicate_access_bytes = predicate_access_bytes.max(bytes);
+                                        predicate_bytes = predicate_bytes.saturating_add(extra);
+                                        Ok(())
+                                    }),
+                            };
+                            if let Err(error) = result {
+                                predicate_failure = Some(error);
+                                return Err(Error::ReadCancelled);
+                            }
+                            Ok(())
+                        },
+                        Arc::new(SourceDecodeBudget {
+                            context: context.clone(),
+                            source: BoundedWorkSource::GraphTraversal,
+                        }),
                     )
                 })
                 .transpose();
+            context.release(predicate_bytes)?;
+            if let Some(error) = predicate_failure {
+                context.release(actual_binding_bytes)?;
+                return Err(error);
+            }
             let matches = match matches {
                 Ok(Some(matches)) => matches,
                 Ok(None) => true,
@@ -6165,7 +8647,7 @@ impl GraphState {
             if projected.try_reserve_exact(projected_capacity).is_err() {
                 context.release(planned_output_bytes)?;
                 return Err(
-                    Error::Other("bounded graph projection allocation failed".to_string()).into(),
+                    Error::Other(("bounded graph projection allocation failed".to_string()).into()).into(),
                 );
             }
             if self.probes_backwards_from_target {
@@ -6191,8 +8673,10 @@ impl GraphState {
             )?;
             node_reservation.release()?;
             return Ok(Some(PulledRow {
+                window: None,
                 values: projected,
                 retained_bytes: output_bytes,
+                group_binding: None,
             }));
         }
     }
@@ -6203,6 +8687,11 @@ impl GraphState {
             || !self.starts.is_empty()
             || self.start_candidates.is_some()
             || self.edge_source.is_some()
+            || self.chosen.is_some()
+            || self
+                .start_walks
+                .as_ref()
+                .is_some_and(|walks| !walks.is_empty())
         {
             None
         } else {
@@ -6291,12 +8780,12 @@ fn bounded_graph_static_starts(
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct BoundedHnswProbeObserver {
     probe: Arc<dyn BoundedExecutionProbe>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl contextdb_vector::hnsw::HnswCandidateObserver for BoundedHnswProbeObserver {
     fn before_candidate_distance(&self, event: contextdb_vector::hnsw::HnswCandidateDistanceEvent) {
         self.probe.before_hnsw_candidate_distance(event);
@@ -6312,7 +8801,7 @@ impl contextdb_vector::hnsw::HnswCandidateObserver for BoundedHnswProbeObserver 
 const AMORTIZED_GROWTH_FLOOR: usize = 4;
 
 fn reserve_vector_slot<T>(
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
     source: BoundedWorkSource,
     values: &mut Vec<T>,
     operation: &str,
@@ -6334,8 +8823,11 @@ fn reserve_vector_slot<T>(
     context.reserve(source, bytes)?;
     if values.try_reserve_exact(additional).is_err() {
         context.release(bytes)?;
-        return Err(Error::Other(format!("bounded {operation} allocation failed")).into());
+        return Err(Error::Other((format!("bounded {operation} allocation failed")).into()).into());
     }
+    #[cfg(any(test, feature = "test-seams"))]
+    crate::vector_read_memory::note_reader_container_allocation_for_test(
+        bytes, values.as_ptr() as usize, values.capacity(), std::mem::size_of::<T>());
     let actual = match checked_size_mul(values.capacity(), std::mem::size_of::<T>(), operation) {
         Ok(actual) => actual,
         Err(error) => {
@@ -6355,7 +8847,7 @@ fn reserve_vector_slot<T>(
         None => {
             context.release(bytes)?;
             return Err(
-                Error::Other(format!("bounded {operation} capacity moved backwards")).into(),
+                Error::Other((format!("bounded {operation} capacity moved backwards")).into()).into(),
             );
         }
     };
@@ -6387,12 +8879,33 @@ fn vector_candidate_identity(columns: &[String]) -> Option<VectorCandidateIdenti
 }
 
 impl VectorState {
-    fn with_partition_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+    fn with_partition_scope<T>(
+        &self,
+        context: &ControlArc<RequestContext>,
+        operation: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
+    ) -> std::result::Result<T, BoundedExecutionError> {
         let operation = || match self.sort_key.as_ref() {
             Some(_) => contextdb_vector::mem::with_search_policy_limit(self.k, operation),
             None => operation(),
         };
         match self.partition_prefixes.as_ref() {
+            Some(prefixes) if self.partition_prefix_bytes != 0 => {
+                // The vector scope API owns a clone for the duration of its
+                // consumer. Fund that overlapping allocation before cloning;
+                // the statement's retained copy stays charged independently.
+                context.reserve(
+                    BoundedWorkSource::VectorCandidates,
+                    self.partition_prefix_bytes,
+                )?;
+                let clone_charge = ReservedBytes::new(context, self.partition_prefix_bytes);
+                let result = contextdb_vector::mem::with_selected_partition_prefixes(
+                    &self.index,
+                    prefixes.clone(),
+                    operation,
+                );
+                clone_charge.release()?;
+                result
+            }
             Some(prefixes) => contextdb_vector::mem::with_selected_partition_prefixes(
                 &self.index,
                 prefixes.clone(),
@@ -6405,27 +8918,37 @@ impl VectorState {
     fn record_disclosure(
         &mut self,
         db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+        published_trace: &mut QueryTrace,
         aggregate_allowed_vectors: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         trace: &contextdb_vector::mem::BoundedVectorSearchTrace,
     ) -> std::result::Result<(), BoundedExecutionError> {
-        let disclosure = db.completed_vector_search_disclosure(
-            self.index.clone(),
-            self.k,
-            self.restricted_candidates,
-            self.candidate_plan.as_deref(),
-            self.requested_search_mode,
-            &self.query_expr,
-            self.snapshot,
-            &self.params,
-            aggregate_allowed_vectors,
-            groups,
-            trace.partition_routes(),
-            trace.used_hnsw(),
-            trace.fallback_reason(),
-            trace.budget_receipt(),
-        )?;
-        self.disclosure = Some(disclosure);
+        let disclosure = context.with_vector_copies(|vector_copy_owner| {
+            db.completed_vector_search_disclosure(
+                self.index.clone(),
+                self.k,
+                self.restricted_candidates,
+                self.candidate_plan.as_deref(),
+                self.requested_search_mode,
+                &self.query_expr,
+                self.snapshot,
+                &self.params,
+                aggregate_allowed_vectors,
+                groups,
+                trace.partition_routes(),
+                trace.used_hnsw(),
+                trace.fallback_reason(),
+                trace.budget_receipt(),
+                vector_copy_owner,
+                context.reader_budget.clone(),
+            )
+        })?;
+        context.bind_final_vector(&disclosure)?;
+        // The node's existing trace already owns this inline result slot.
+        // Publish into that slot directly instead of retaining another full
+        // disclosure in the vector state and cloning it on every pulled row.
+        published_trace.vector_search = Some(disclosure);
         Ok(())
     }
 
@@ -6471,12 +8994,19 @@ impl VectorState {
     fn materialize_scored_row(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
         row_id: RowId,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
+        let mut vector_copy_owner =
+            crate::vector_read_memory::admission(Arc::new(SourceDecodeBudget {
+                context: context.clone(),
+                source: BoundedWorkSource::TableScan,
+            }));
         let mut retained = 0usize;
+        context.charge_operator(BoundedWorkSource::TableScan)?;
         let row = context.with_source_page_admission(BoundedWorkSource::TableScan, || {
             db.bounded_row_by_identity(
+                context.source_read_memory(BoundedWorkSource::TableScan),
                 context.transaction(),
                 &self.table,
                 row_id,
@@ -6489,10 +9019,10 @@ impl VectorState {
                 // other door resolves the same row through the version index
                 // (`RelationalStore::row_by_id`) and counts nothing, and
                 // `rows_examined` is one figure both doors owe the same answer to.
-                &mut || context.charge_operator(BoundedWorkSource::TableScan),
+                &mut || context.native_source_touch(),
                 &mut |bytes| {
-                    retained = bytes;
-                    context.reserve(BoundedWorkSource::TableScan, bytes)
+                    retained = context.admit_source_row(BoundedWorkSource::TableScan, bytes)?;
+                    Ok(())
                 },
             )
         })?;
@@ -6500,6 +9030,7 @@ impl VectorState {
             return Ok(None);
         };
         let Some(meta) = db.table_meta(&self.table) else {
+            drop(row);
             context.release(retained)?;
             return Ok(None);
         };
@@ -6521,6 +9052,7 @@ impl VectorState {
                 context.attribute_live_memory(BoundedWorkSource::AccessControl);
                 Ok(())
             },
+            context.source_read_memory(BoundedWorkSource::AccessControl),
         )?;
         // The gate decides what this reader MAY see; it does not decide what
         // the statement ASKED for. On the identity route nothing has read this
@@ -6547,6 +9079,7 @@ impl VectorState {
             if let Some(index) = self.identity_source_index.as_deref()
                 && context.transaction().is_none()
             {
+                drop(row);
                 context.release(retained)?;
                 return Err(Error::StoreCorrupted {
                     path: db.bounded_store_path(),
@@ -6579,33 +9112,43 @@ impl VectorState {
                 row.row_id,
                 row.lsn,
                 self.snapshot,
+                &mut vector_copy_owner,
+                Arc::clone(&context.reader_budget),
             )? {
                 row.values.insert(column.clone(), Value::Vector(vector));
             }
         }
         let row_id_value =
             Value::Int64(i64::try_from(row.row_id.0).map_err(|_| {
-                Error::Other("bounded row identifier exceeds SQL INTEGER".to_string())
+                Error::Other(("bounded row identifier exceeds SQL INTEGER".to_string()).into())
             })?);
         let capacity = self
             .schema_columns
             .len()
             .checked_add(1)
             .ok_or_else(|| bounded_size_error("vector row projection"))?;
-        let planned = value_refs_retained_bytes(
-            std::iter::once(&row_id_value).chain(
-                self.schema_columns
-                    .iter()
-                    .map(|column| row.values.get(column).unwrap_or(&Value::Null)),
-            ),
-            capacity,
+        let planned = checked_size_add(
+            std::mem::size_of::<Vec<Value>>(),
+            checked_size_mul(
+                capacity,
+                std::mem::size_of::<Value>(),
+                "vector projection slots",
+            )?,
+            "vector projection",
+        )?;
+        let vector_credit = vector_copy_owner.retained_bytes();
+        let funded = checked_size_add(
+            checked_size_add(retained, vector_credit, "vector source credit")?,
+            planned,
+            "vector projection credit",
         )?;
         context.reserve(BoundedWorkSource::TableScan, planned)?;
         let mut values = Vec::new();
         if values.try_reserve_exact(capacity).is_err() {
+            drop(row);
             context.release(planned)?;
             context.release(retained)?;
-            return Err(Error::Other("bounded vector row allocation failed".to_string()).into());
+            return Err(Error::Other(("bounded vector row allocation failed".to_string()).into()).into());
         }
         // The source row is released below, so its values are moved into the
         // output rather than copied: a copy would hold every value twice.
@@ -6618,12 +9161,23 @@ impl VectorState {
         );
         drop(source_values);
         let actual = values_retained_bytes(&values)?;
-        reconcile_new_reservation(context, BoundedWorkSource::TableScan, planned, actual)?;
-        // The source copy has been projected and is no longer held.
-        context.release(retained)?;
+        vector_copy_owner.transfer();
+        if actual > funded {
+            if let Err(error) = context.reserve(BoundedWorkSource::TableScan, actual - funded) {
+                drop(values);
+                context.release(funded)?;
+                return Err(error);
+            }
+        } else if funded > actual {
+            context.release(funded - actual)?;
+        }
+        // Payload credit moved into this output; only dead map/field credit
+        // was returned by reconciliation above.
         Ok(Some(PulledRow {
+            window: None,
             values,
             retained_bytes: actual,
+            group_binding: None,
         }))
     }
 
@@ -6662,7 +9216,7 @@ impl VectorState {
     /// published under.
     fn admit_move_sources(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         if !self.candidate_filter {
             return Ok(());
@@ -6713,7 +9267,7 @@ impl VectorState {
     /// Keep one scored candidate, admitted before the slot that holds it.
     fn keep_score(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
         row_id: RowId,
         score: f32,
     ) -> std::result::Result<(), BoundedExecutionError> {
@@ -6734,7 +9288,7 @@ impl VectorState {
     fn staged_row_admitted(
         &self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
         row_id: RowId,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         if !self.candidate_admits(row_id) {
@@ -6744,14 +9298,16 @@ impl VectorState {
         let row =
             context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
                 db.bounded_row_by_identity(
+                    context.source_read_memory(BoundedWorkSource::VectorCandidates),
                     context.transaction(),
                     &self.table,
                     row_id,
                     self.snapshot,
                     &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
                     &mut |bytes| {
-                        retained = bytes;
-                        context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                        retained =
+                            context.admit_source_row(BoundedWorkSource::VectorCandidates, bytes)?;
+                        Ok(())
                     },
                 )
             })?;
@@ -6772,6 +9328,7 @@ impl VectorState {
                 row,
                 self.snapshot,
                 &mut |_| context.charge_operator(BoundedWorkSource::AccessControl),
+                context.source_read_memory(BoundedWorkSource::AccessControl),
             )
         })();
         drop(row);
@@ -6789,7 +9346,7 @@ impl VectorState {
     fn score_staged_vectors(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         if self.vector_overlay.is_none() {
             return Ok(());
@@ -6815,16 +9372,20 @@ impl VectorState {
                     BoundedWorkSource::VectorCandidates,
                     BoundedSourceTouch::BruteForceVectorCandidate,
                 )?;
-                let score = db.bounded_score_committed_vector_row(
-                    &self.index,
-                    from,
-                    self.snapshot,
-                    &self.query,
-                    &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-                    &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-                    &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
-                    &mut |bytes| context.release_parked(bytes),
-                );
+                let score = context.with_vector_copies(|vector_copy_owner| {
+                    db.bounded_score_committed_vector_row(
+                        &self.index,
+                        from,
+                        self.snapshot,
+                        parameter_query_vector(&self.query_expr, &self.params).unwrap_or(&self.query),
+                        &mut || context.native_source_touch(),
+                        &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                        &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
+                        &mut |bytes| context.release_parked(bytes),
+                        vector_copy_owner,
+                        context.reader_budget.clone(),
+                    )
+                });
                 if let Some(score) = score? {
                     self.keep_score(context, to, score)?;
                 }
@@ -6835,10 +9396,10 @@ impl VectorState {
         moved_result?;
         let mut staged = 0usize;
         loop {
-            let Some(position) = self
+            let Some(capability) = self
                 .vector_overlay
                 .as_ref()
-                .and_then(|overlay| overlay.staged_positions.get(staged).copied())
+                .and_then(|overlay| overlay.staged_vectors.get(staged).cloned())
             else {
                 return Ok(());
             };
@@ -6846,7 +9407,7 @@ impl VectorState {
             let mut retained = 0usize;
             let entry = db.transaction_staged_vector(
                 tx,
-                position,
+                &capability,
                 &mut || {
                     context.charge(
                         BoundedWorkSource::VectorCandidates,
@@ -6863,7 +9424,7 @@ impl VectorState {
             };
             let scored = self
                 .staged_row_admitted(db, context, row_id)?
-                .then(|| contextdb_vector::cosine_similarity(&vector, &self.query));
+                .then(|| contextdb_vector::cosine_similarity(&vector, parameter_query_vector(&self.query_expr, &self.params).unwrap_or(&self.query)));
             drop(vector);
             context.release(retained)?;
             if let Some(score) = scored {
@@ -6875,17 +9436,135 @@ impl VectorState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
+        published_trace: &mut QueryTrace,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            self.receipt.begin();
+            let before = vector_search_receipt::exact_candidates(context);
+            let observer = self.receipt.observer();
+            let insertion_observer = self.receipt.insertion_observer();
+            // The graph walk/build is synchronous on this request worker.
+            // Restore its prior TLS observer before returning across a fetch.
+            let result = match observer {
+                Some(observer) => {
+                    contextdb_vector::hnsw::with_additional_hnsw_build_observer(observer, || {
+                        match insertion_observer {
+                            Some(observer) => {
+                                contextdb_vector::hnsw::with_additional_hnsw_insert_observer(
+                                    observer,
+                                    || self.next_unobserved(db, context, published_trace),
+                                )
+                            }
+                            None => self.next_unobserved(db, context, published_trace),
+                        }
+                    })
+                }
+                None => self.next_unobserved(db, context, published_trace),
+            };
+            let terminal = result
+                .as_ref()
+                .err()
+                .is_some_and(|error| !context.refusal_pauses_this_fetch(error));
+            let completed = matches!(
+                self.preparation,
+                VectorPreparation::Output | VectorPreparation::Exhausted
+            );
+            self.receipt.finish_step(
+                vector_search_receipt::exact_candidates(context).saturating_sub(before),
+                published_trace.vector_search.as_ref(),
+                completed || terminal,
+            );
+            result
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        self.next_unobserved(db, context, published_trace)
+    }
+
+    /// The probe did not establish a small candidate set: drop what it
+    /// read and search with the filter checked on each row reached.
+    fn enter_row_checked(
+        &mut self,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.row_checked = true;
+        self.candidate_ids = Vec::new();
+        context.release(std::mem::take(&mut self.candidate_bytes))?;
+        self.preparation = VectorPreparation::Search;
+        Ok(())
+    }
+
+    fn next_unobserved(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        context: &ControlArc<RequestContext>,
+        published_trace: &mut QueryTrace,
+    ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
+        let mut deferred_exact: Option<DeferredExactTrace> = None;
         loop {
             match self.preparation {
                 VectorPreparation::Candidates(_) => {
+                    // A filter the search could check row by row is first
+                    // probed for a small exact candidate set: at most half the
+                    // statement's row checks, each counted before it is read.
+                    let probe_cap =
+                        if !matches!(self.preparation, VectorPreparation::Candidates(Some(_))) {
+                            None
+                        } else {
+                            match (&self.row_filter, self.row_check_allowance) {
+                                (Some(_), Some(allowance)) => Some(allowance / 2),
+                                (Some(_), None)
+                                    if self.search_mode
+                                        != contextdb_core::VectorSearchMode::Exact =>
+                                {
+                                    let allowance = {
+                                        let groups = self.with_partition_scope(context, || {
+                                            context.with_vector_copies(|vector_copy_owner| {
+                                                db.bounded_vector_candidate_groups(
+                                                    &self.index,
+                                                    None,
+                                                    self.snapshot,
+                                                    &mut || context.native_source_touch(),
+                                                    &mut || {
+                                                        context.charge_operator(
+                                                            BoundedWorkSource::VectorCandidates,
+                                                        )
+                                                    },
+                                                    &mut |bytes| {
+                                                        context.reserve(
+                                                            BoundedWorkSource::VectorCandidates,
+                                                            bytes,
+                                                        )
+                                                    },
+                                                    &mut |bytes| context.release_parked(bytes),
+                                                    vector_copy_owner,
+                                                    context.reader_budget.clone(),
+                                                )
+                                            })
+                                        })?;
+                                        let groups =
+                                            RetainedVectorCandidateGroups::new(groups, context);
+                                        context.with_vector_copies(|vector_copy_owner| {
+                                            db.bounded_vector_row_check_allowance(
+                                                &self.index,
+                                                self.k,
+                                                groups.get(),
+                                                vector_copy_owner,
+                                            )
+                                        })?
+                                    };
+                                    self.row_check_allowance = allowance;
+                                    allowance.map(|allowance| allowance / 2)
+                                }
+                                _ => None,
+                            }
+                        };
                     let candidate = match &mut self.preparation {
                         VectorPreparation::Candidates(candidate) => candidate,
                         _ => {
-                            return Err(Error::Other(
-                                "bounded vector candidate state changed unexpectedly".to_string(),
-                            )
+                            return Err(Error::Other((
+                                "bounded vector candidate state changed unexpectedly".to_string()).into())
                             .into());
                         }
                     };
@@ -6893,17 +9572,31 @@ impl VectorState {
                         self.preparation = VectorPreparation::Search;
                         continue;
                     };
-                    if let PullKind::Scan(scan) = &mut root.kind
-                        && scan.drain_verified_vector_candidate_identities(
+                    if let PullKind::Scan(scan) = &mut root.kind {
+                        match scan.drain_verified_vector_candidate_identities(
                             db,
                             context,
                             &mut self.candidate_ids,
                             &mut self.candidate_bytes,
-                        )?
+                            probe_cap.map(|cap| (&self.row_checks, cap)),
+                        )? {
+                            CandidateDrain::Drained => {
+                                self.candidate_ids.sort_unstable();
+                                self.candidate_ids.dedup();
+                                self.preparation = VectorPreparation::Search;
+                                continue;
+                            }
+                            CandidateDrain::Capped => {
+                                self.enter_row_checked(context)?;
+                                continue;
+                            }
+                            CandidateDrain::Unsupported => {}
+                        }
+                    }
+                    if let Some(cap) = probe_cap
+                        && self.row_checks.get() >= cap
                     {
-                        self.candidate_ids.sort_unstable();
-                        self.candidate_ids.dedup();
-                        self.preparation = VectorPreparation::Search;
+                        self.enter_row_checked(context)?;
                         continue;
                     }
                     // How this candidate set names the rows it picked. A plan
@@ -6917,22 +9610,24 @@ impl VectorState {
                     // smaller question to fall back on: the narrowing is the
                     // whole question.
                     let identity = vector_candidate_identity(&root.columns).ok_or_else(|| {
-                        Error::Other(
+                        Error::Other((
                             "bounded vector candidate plan must name its rows by row_id or id"
-                                .to_string(),
-                        )
+                                .to_string()).into())
                     })?;
-                    match root.next(db, context)? {
+                    let row = root.next(db, context)?;
+                    if probe_cap.is_some() && row.is_some() {
+                        self.row_checks.set(self.row_checks.get() + 1);
+                    }
+                    match row {
                         Some(row) => {
                             let resolved = match identity {
                                 VectorCandidateIdentity::RowId(position) => {
                                     match row.values.get(position) {
                                         Some(Value::Int64(row_id)) => {
                                             Some(u64::try_from(*row_id).map_err(|_| {
-                                                Error::Other(
+                                                Error::Other((
                                                     "bounded vector candidate row_id is negative"
-                                                        .to_string(),
-                                                )
+                                                        .to_string()).into())
                                             })?)
                                         }
                                         _ => None,
@@ -6960,6 +9655,7 @@ impl VectorState {
                                                 "id",
                                                 key,
                                                 self.snapshot,
+                                                context.reader_budget.clone(),
                                             )?
                                             .map(|row_id| row_id.0)
                                         }
@@ -6994,6 +9690,7 @@ impl VectorState {
                     }
                 }
                 VectorPreparation::Search => {
+                    db.clear_last_vector_search_trace();
                     // A move re-keys a score AFTER the source has yielded it,
                     // so a row whose moved-to identity the statement asked for
                     // has to survive the source's own filtering under the
@@ -7003,32 +9700,47 @@ impl VectorState {
                     // statement's own list, on the identity it is published
                     // under.
                     self.admit_move_sources(context)?;
-                    let candidates = self
-                        .candidate_filter
+                    let candidates = (self.candidate_filter && !self.row_checked)
                         .then_some(self.candidate_ids.as_slice());
-                    let groups = self.with_partition_scope(|| {
-                        db.bounded_vector_candidate_groups(
-                            &self.index,
-                            candidates,
-                            self.snapshot,
-                            &mut || context.checkpoint(),
-                            &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-                            &mut |bytes| {
-                                context.reserve(BoundedWorkSource::VectorCandidates, bytes)
-                            },
-                            &mut |bytes| context.release_parked(bytes),
-                        )
+                    let groups = self.with_partition_scope(context, || {
+                        context.with_vector_copies(|vector_copy_owner| {
+                            vector_copy_owner.with_raw_only_sources(
+                                self.search_mode == contextdb_core::VectorSearchMode::Exact
+                                    || self.force_exact_for_relational_fallback,
+                                |vector_copy_owner| db.bounded_vector_candidate_groups(
+                                &self.index,
+                                candidates,
+                                self.snapshot,
+                                &mut || context.native_source_touch(),
+                                &mut || {
+                                    context.charge_operator(BoundedWorkSource::VectorCandidates)
+                                },
+                                &mut |bytes| {
+                                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                },
+                                &mut |bytes| context.release_parked(bytes),
+                                vector_copy_owner,
+                                context.reader_budget.clone(),
+                            ))
+                        })
                     })?;
                     let mut groups = RetainedVectorCandidateGroups::new(groups, context);
+                    if self.row_checked {
+                        groups.get_mut().mark_row_checked();
+                    }
                     let aggregate_allowed_count = groups.get().aggregate_allowed_count();
-                    self.candidate_k = db
-                        .bounded_vector_candidate_k(
-                            &self.index,
-                            self.k,
-                            self.sort_key.as_deref(),
-                            groups.get(),
-                            &mut || context.checkpoint(),
-                        )?
+                    self.candidate_k = context
+                        .with_vector_copies(|vector_copy_owner| {
+                            db.bounded_vector_candidate_k(
+                                &self.index,
+                                self.k,
+                                self.sort_key.as_deref(),
+                                groups.get(),
+                                &mut || context.native_source_touch(),
+                                vector_copy_owner,
+                                context.reader_budget.clone(),
+                            )
+                        })?
                         .saturating_add(
                             self.vector_overlay
                                 .as_ref()
@@ -7041,49 +9753,73 @@ impl VectorState {
                                 max_visited_nodes: remaining_graph_work,
                                 max_vector_evaluations: remaining_graph_work,
                             };
-                        let hnsw_search = || {
-                            let accountant = db.bounded_read_accountant();
-                            let transfer_context = Arc::clone(context);
-                            let transfer = Arc::new(move |bytes| {
-                                transfer_context.transfer_vector_load_reservation(bytes)
-                            });
-                            crate::memory_accounting::with_vector_load_reservation_transfer(
-                                &accountant,
-                                transfer,
-                                || {
-                                    db.bounded_hnsw_vector_search(
-                                        &self.index,
-                                        &self.query,
-                                        self.candidate_k,
-                                        groups.get(),
-                                        if self.force_exact_for_relational_fallback {
-                                            contextdb_core::VectorSearchMode::Exact
-                                        } else {
-                                            self.search_mode
-                                        },
-                                        allowed_search_limits,
-                                        &mut || context.checkpoint(),
-                                        &mut || {
-                                            context.charge(
-                                                BoundedWorkSource::VectorCandidates,
-                                                BoundedSourceTouch::BruteForceVectorCandidate,
-                                            )
-                                        },
-                                        &mut || {
-                                            context.charge_operator(
-                                                BoundedWorkSource::VectorCandidates,
-                                            )
-                                        },
-                                        &mut |bytes| {
-                                            context
-                                                .reserve(BoundedWorkSource::VectorCandidates, bytes)
-                                        },
-                                        &mut |bytes| context.release_parked(bytes),
-                                    )
-                                },
-                            )
+                        // Funded before the search starts, so a cold graph load
+                        // inside it can hand its credit to the graph's owner.
+                        let load_transfer = funded_graph_credit_transfer(context)?;
+                        // The walk's own checks: one per point it may evaluate,
+                        // never reduced by what the bounded probe before it
+                        // read under its separate half allowance.
+                        let row_check_allowance = self.row_check_allowance;
+                        let mut row_check = |row_id: RowId| match self.row_filter.as_deref() {
+                            Some((filter, meta)) => {
+                                self.row_checks.set(self.row_checks.get() + 1);
+                                vector_row_passes(
+                                    db,
+                                    context,
+                                    &self.table,
+                                    filter,
+                                    meta.as_ref(),
+                                    &self.params,
+                                    self.snapshot,
+                                    row_id,
+                                )
+                            }
+                            None => Ok(true),
                         };
-                        #[cfg(feature = "test-seams")]
+                        let mut hnsw_search = || {
+                            context.with_vector_copies(|vector_copy_owner| {
+                                db.bounded_hnsw_vector_search(
+                                    &self.index,
+                                    parameter_query_vector(&self.query_expr, &self.params).unwrap_or(&self.query),
+                                    self.candidate_k,
+                                    groups.get(),
+                                    if self.force_exact_for_relational_fallback {
+                                        contextdb_core::VectorSearchMode::Exact
+                                    } else {
+                                        self.search_mode
+                                    },
+                                    &reader_memory_refusal,
+                                    allowed_search_limits,
+                                    &mut || context.native_source_touch(),
+                                    &mut || {
+                                        context.charge(
+                                            BoundedWorkSource::VectorCandidates,
+                                            BoundedSourceTouch::BruteForceVectorCandidate,
+                                        )
+                                    },
+                                    &mut || {
+                                        context.charge_operator(BoundedWorkSource::VectorCandidates)
+                                    },
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                    },
+                                    &mut |bytes| context.release_parked(bytes),
+                                    vector_copy_owner,
+                                    context.reader_budget.clone(),
+                                    Arc::clone(&load_transfer.value),
+                                    match (self.row_checked, row_check_allowance) {
+                                        (true, Some(allowance)) => {
+                                            Some(contextdb_vector::mem::RowCheck {
+                                                allowance,
+                                                check: &mut row_check,
+                                            })
+                                        }
+                                        _ => None,
+                                    },
+                                )
+                            })
+                        };
+                        #[cfg(any(test, feature = "test-seams"))]
                         let searched = if let Some(probe) = context.probe() {
                             contextdb_vector::hnsw::with_hnsw_candidate_observer(
                                 Arc::new(BoundedHnswProbeObserver { probe }),
@@ -7092,7 +9828,7 @@ impl VectorState {
                         } else {
                             hnsw_search()
                         }?;
-                        #[cfg(not(feature = "test-seams"))]
+                        #[cfg(not(any(test, feature = "test-seams")))]
                         let searched = hnsw_search()?;
                         searched
                     };
@@ -7123,18 +9859,20 @@ impl VectorState {
                                 self.score_staged_vectors(db, context).and_then(|()| {
                                     self.record_disclosure(
                                         db,
+                                        context,
+                                        published_trace,
                                         aggregate_allowed_count,
                                         groups.get(),
                                         &trace,
                                     )
                                 })
                             {
-                                context.release(trace.retained_bytes())?;
+                                let trace_bytes = trace.retained_bytes();
+                                drop(trace);
+                                context.release(trace_bytes)?;
                                 return Err(error);
                             }
-                            let trace_bytes = trace.retained_bytes();
-                            let trace = trace.into_trace();
-                            context.release(trace_bytes)?;
+                            let trace = context.own_vector_trace(trace)?;
                             db.publish_vector_search_trace(trace);
                             self.preparation = VectorPreparation::Materialize;
                             continue;
@@ -7151,22 +9889,46 @@ impl VectorState {
                             if self.force_exact_for_relational_fallback {
                                 trace.override_exact_reason("filtered_route_exact");
                             }
+                            // Cursor terminal observations retain their early
+                            // disclosure, including cancellation/error receipts.
+                            let can_defer = self.force_exact_for_relational_fallback
+                                && { context.state().final_observation.is_none() };
+                            if can_defer {
+                                // Raw-only groups have no graph holders to lose.
+                                // Preserve their original metadata until the scan
+                                // ends, then build the required result disclosure.
+                                deferred_exact = Some(DeferredExactTrace {
+                                    trace: Some(trace), aggregate: aggregate_allowed_count,
+                                    groups: Some(groups.get().disclosure_metadata()),
+                                    context: context.clone(),
+                                });
+                            } else {
                             if let Err(error) = self.record_disclosure(
                                 db,
+                                context,
+                                published_trace,
                                 aggregate_allowed_count,
                                 groups.get(),
                                 &trace,
                             ) {
-                                context.release(trace.retained_bytes())?;
+                                let trace_bytes = trace.retained_bytes();
+                                drop(trace);
+                                context.release(trace_bytes)?;
                                 return Err(error);
                             }
-                            let trace_bytes = trace.retained_bytes();
-                            let trace = trace.into_trace();
-                            context.release(trace_bytes)?;
+                            let trace = context.own_vector_trace(trace)?;
                             db.publish_vector_search_trace(trace);
+                            }
                         }
                         super::BoundedVectorSearchOutcome::Unavailable
                         | super::BoundedVectorSearchOutcome::Incomplete => {}
+                        super::BoundedVectorSearchOutcome::Disconnected(partition) => {
+                            return Err(Error::VectorIndexedPartitionDisconnected {
+                                index: self.index.clone(),
+                                partition: partition as u64,
+                            }
+                            .into());
+                        }
                     }
                     if self.search_mode == contextdb_core::VectorSearchMode::Indexed {
                         return Err(Error::VectorIndexedRouteUnavailable {
@@ -7190,37 +9952,44 @@ impl VectorState {
                             .vector_overlay
                             .as_ref()
                             .map_or(0, |overlay| overlay.searchable_entry_count);
-                        db.bounded_vector_entry_count(&self.index, self.snapshot)
+                        context
+                            .with_vector_copies(|owner| {
+                                db.bounded_vector_entry_count(&self.index, self.snapshot, owner)
+                            })?
                             .saturating_add(staged_entries)
                             .max(self.candidate_k)
                     } else {
                         self.candidate_k
                     };
-                    let cursor = db.bounded_brute_force_vector_cursor(
-                        self.index.clone(),
-                        &self.query,
-                        exact_candidate_k,
-                        groups.take(),
-                        &mut || context.checkpoint(),
-                        &mut |bytes| {
-                            context
-                                .reserve(BoundedWorkSource::VectorCandidates, bytes)
-                                .map_err(|error| match error {
-                                    BoundedExecutionError::Engine(
-                                        Error::MemoryBudgetExceeded {
-                                            available_bytes, ..
-                                        },
-                                    ) => Error::VectorExactSearchBudgetExceeded {
-                                        index: self.index.clone(),
-                                        required_bytes: bytes as u64,
-                                        available_bytes: available_bytes as u64,
-                                    }
-                                    .into(),
-                                    other => other,
-                                })
-                        },
-                        &mut |bytes| context.release_parked(bytes),
-                    )?;
+                    let cursor = context.with_vector_copies(|vector_copy_owner| {
+                        db.bounded_brute_force_vector_cursor(
+                            self.index.clone(),
+                            parameter_query_vector(&self.query_expr, &self.params).unwrap_or(&self.query),
+                            exact_candidate_k,
+                            groups.take(),
+                            &mut || context.native_source_touch(),
+                            &mut |bytes| {
+                                context
+                                    .reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                    .map_err(|error| match error {
+                                        BoundedExecutionError::Engine(
+                                            Error::MemoryBudgetExceeded {
+                                                available_bytes, ..
+                                            },
+                                        ) => Error::VectorExactSearchBudgetExceeded {
+                                            index: self.index.clone(),
+                                            required_bytes: bytes as u64,
+                                            available_bytes: available_bytes as u64,
+                                        }
+                                        .into(),
+                                        other => other,
+                                    })
+                            },
+                            &mut |bytes| context.release_parked(bytes),
+                            vector_copy_owner,
+                            context.reader_budget.clone(),
+                        )
+                    })?;
                     // Automatic exhaustive work, and an exact comparison over a
                     // committed image, answer inside the memory they have by
                     // reading one stored body at a time where a whole partition
@@ -7234,39 +10003,79 @@ impl VectorState {
                     } else {
                         cursor
                     };
-                    self.source = Some(VectorCandidateSource::Brute(cursor));
+                    let mut cursor = cursor;
+                    cursor.release_query_copy(|bytes| context.release_parked(bytes));
+                    context.reserve(BoundedWorkSource::VectorCandidates,
+                        size_of::<contextdb_vector::mem::BoundedBruteForceCursor>())?;
+                    self.source = Some(VectorCandidateSource::Brute(Box::new(cursor)));
                     self.preparation = VectorPreparation::Materialize;
                     continue;
                 }
                 VectorPreparation::Materialize if self.source.is_some() => {
-                    let step = match self.source.as_mut() {
-                        Some(VectorCandidateSource::Brute(cursor)) => db
-                            .bounded_brute_force_vector_step(
-                                cursor,
-                                &mut || context.checkpoint(),
-                                &mut || {
-                                    context.observe_precharged_touch(
-                                        BoundedSourceTouch::BruteForceVectorCandidate,
-                                    )
-                                },
-                                &mut || {
-                                    context.charge(
-                                        BoundedWorkSource::VectorCandidates,
-                                        BoundedSourceTouch::BruteForceVectorCandidate,
-                                    )
-                                },
-                                &mut || {
-                                    context.charge_operator(BoundedWorkSource::VectorCandidates)
-                                },
-                                &mut |bytes| {
-                                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
-                                },
-                                &mut |bytes| context.release_parked(bytes),
-                            ),
-                        None => {
-                            return Err(Error::Other(
-                                "bounded vector lost its candidate source".to_string(),
+                    // A filter checked row by row is asked about each row the
+                    // exhaustive comparison scores, before it competes.
+                    let mut brute_row_check = |row_id: RowId| match self.row_filter.as_deref() {
+                        Some((filter, meta)) => {
+                            self.row_checks.set(self.row_checks.get() + 1);
+                            vector_row_passes(
+                                db,
+                                context,
+                                &self.table,
+                                filter,
+                                meta.as_ref(),
+                                &self.params,
+                                self.snapshot,
+                                row_id,
                             )
+                        }
+                        None => Ok(true),
+                    };
+                    let step = match self.source.as_mut() {
+                        Some(VectorCandidateSource::Brute(cursor)) => {
+                            // Scalar row checks and score publication use their
+                            // own existing source owner; do not construct an
+                            // unused vector decoder/accountant alongside them.
+                            context.with_vector_copies_for_step(cursor.needs_vector_decode(), |vector_copy_owner| {
+                                db.bounded_brute_force_vector_step(
+                                    cursor,
+                                    parameter_query_vector(&self.query_expr, &self.params).unwrap_or(&self.query),
+                                    self.row_checked.then_some(
+                                        &mut brute_row_check
+                                            as &mut dyn FnMut(
+                                                RowId,
+                                            )
+                                                -> std::result::Result<
+                                                bool,
+                                                BoundedExecutionError,
+                                            >,
+                                    ),
+                                    &mut || context.native_source_touch(),
+                                    &mut || {
+                                        context.observe_precharged_touch(
+                                            BoundedSourceTouch::BruteForceVectorCandidate,
+                                        )
+                                    },
+                                    &mut || {
+                                        context.charge(
+                                            BoundedWorkSource::VectorCandidates,
+                                            BoundedSourceTouch::BruteForceVectorCandidate,
+                                        )
+                                    },
+                                    &mut || {
+                                        context.charge_operator(BoundedWorkSource::VectorCandidates)
+                                    },
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                    },
+                                    &mut |bytes| context.release_parked(bytes),
+                                    vector_copy_owner,
+                                    context.reader_budget.clone(),
+                                )
+                            })
+                        }
+                        None => {
+                            return Err(Error::Other((
+                                "bounded vector lost its candidate source".to_string()).into())
                             .into());
                         }
                     };
@@ -7276,7 +10085,7 @@ impl VectorState {
                         Ok(step) => step,
                         Err(error) => {
                             if let Some(VectorCandidateSource::Brute(cursor)) = self.source.take() {
-                                context.release_parked(cursor.into_retained_bytes());
+                                context.release_parked(cursor.into_retained_bytes() + size_of::<contextdb_vector::mem::BoundedBruteForceCursor>());
                             }
                             return Err(error);
                         }
@@ -7293,13 +10102,22 @@ impl VectorState {
                         contextdb_vector::mem::BoundedVectorStep::Exhausted => {
                             let Some(VectorCandidateSource::Brute(cursor)) = self.source.take()
                             else {
-                                return Err(Error::Other(
+                                return Err(Error::Other((
                                     "bounded vector lost its exhausted brute-force cursor"
-                                        .to_string(),
-                                )
+                                        .to_string()).into())
                                 .into());
                             };
-                            context.release(cursor.into_retained_bytes())?;
+                            if let Some(mut deferred) = deferred_exact.take() {
+                                let (groups, scan_bytes) = cursor.into_disclosure_groups(deferred.groups.take().unwrap());
+                                context.release(scan_bytes + size_of::<contextdb_vector::mem::BoundedBruteForceCursor>())?;
+                                let groups = RetainedVectorCandidateGroups::new(groups, context);
+                                self.record_disclosure(db, context, published_trace,
+                                    deferred.aggregate, groups.get(), deferred.trace.as_ref().unwrap())?;
+                                let trace = context.own_vector_trace(deferred.trace.take().unwrap())?;
+                                db.publish_vector_search_trace(trace);
+                            } else {
+                                context.release(cursor.into_retained_bytes() + size_of::<contextdb_vector::mem::BoundedBruteForceCursor>())?;
+                            }
                             // The committed entries are done. The vectors this
                             // transaction staged are part of its own answer and
                             // come next, each charged the way a committed entry
@@ -7324,7 +10142,7 @@ impl VectorState {
                         continue;
                     };
                     self.materialized = self.materialized.checked_add(1).ok_or_else(|| {
-                        Error::Other("bounded vector materialization overflow".to_string())
+                        Error::Other(("bounded vector materialization overflow".to_string()).into())
                     })?;
                     let Some(row) = self.materialize_scored_row(db, context, row_id)? else {
                         continue;
@@ -7361,9 +10179,8 @@ impl VectorState {
                         if anchor.try_reserve(anchor_capacity).is_err() {
                             context.release(anchor_bytes)?;
                             row.release()?;
-                            return Err(Error::Other(
-                                "bounded rank-anchor allocation failed".to_string(),
-                            )
+                            return Err(Error::Other((
+                                "bounded rank-anchor allocation failed".to_string()).into())
                             .into());
                         }
                         anchor.extend(
@@ -7404,6 +10221,7 @@ impl VectorState {
                             return Err(error);
                         }
                         let ranked = db.bounded_rank_candidate(
+                            context.source_read_memory(BoundedWorkSource::RankCandidates),
                             &self.index,
                             sort_key,
                             row_id,
@@ -7457,9 +10275,8 @@ impl VectorState {
                     if row.values.try_reserve_exact(1).is_err() {
                         context.release(reserve_bytes)?;
                         row.release()?;
-                        return Err(Error::Other(
-                            "bounded vector output allocation failed".to_string(),
-                        )
+                        return Err(Error::Other((
+                            "bounded vector output allocation failed".to_string()).into())
                         .into());
                     }
                     let new_capacity = row.values.capacity();
@@ -7508,8 +10325,27 @@ impl VectorState {
                     continue;
                 }
                 VectorPreparation::Output => {
-                    if let Some(row) = self.output.pop_front() {
-                        return Ok(Some(row));
+                    if !self.output.is_empty() {
+                        if !self.output_projection.is_empty() {
+                            context.check_final_boundary()?;
+                            let slots = checked_size_add(size_of::<Vec<Value>>(),
+                                checked_size_mul(self.output_projection.len(), size_of::<Value>(), "vector projection")?,
+                                "vector projection")?;
+                            context.reserve(BoundedWorkSource::TableScan, slots)?;
+                            let mut row = self.output.pop_front().expect("checked vector output");
+                            let mut values = Vec::with_capacity(self.output_projection.len());
+                            for &position in &self.output_projection {
+                                values.push(std::mem::replace(&mut row.values[position], Value::Null));
+                            }
+                            let retained_bytes = values_retained_bytes(&values)?;
+                            let previous = row.retained_bytes;
+                            let group_binding = row.group_binding;
+                            drop(row);
+                            context.release(checked_size_add(previous, slots, "projected row transfer")?
+                                .checked_sub(retained_bytes).ok_or_else(|| bounded_size_error("projected row transfer"))?)?;
+                            return Ok(Some(PulledRow { window: None, values, retained_bytes, group_binding }));
+                        }
+                        return Ok(self.output.pop_front());
                     }
                     context.release(self.output_container_bytes)?;
                     self.output_container_bytes = 0;
@@ -7531,7 +10367,7 @@ impl VectorState {
     /// final sort would have kept.
     fn drop_rows_out_of_contention(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         let contention_ceiling = self.k.saturating_mul(2).max(self.k.saturating_add(1));
         if self.ranked_rows.len() < contention_ceiling {
@@ -7560,11 +10396,11 @@ impl VectorState {
 
     fn release_ranked_rows_past_limit(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         while self.ranked_rows.len() > self.k {
             let removed = self.ranked_rows.pop().ok_or_else(|| {
-                Error::Other("bounded vector truncation lost its tail row".to_string())
+                Error::Other(("bounded vector truncation lost its tail row".to_string()).into())
             })?;
             removed.row.release(context)?;
         }
@@ -7573,7 +10409,7 @@ impl VectorState {
 
     fn finish_materialization(
         &mut self,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         self.sort_ranked_rows_into_answer_order();
         self.release_ranked_rows_past_limit(context)?;
@@ -7587,7 +10423,7 @@ impl VectorState {
         if output.try_reserve_exact(self.ranked_rows.len()).is_err() {
             context.release(planned_output_bytes)?;
             return Err(
-                Error::Other("bounded vector output-queue allocation failed".to_string()).into(),
+                Error::Other(("bounded vector output-queue allocation failed".to_string()).into()).into(),
             );
         }
         let output_bytes = checked_size_mul(
@@ -7620,8 +10456,11 @@ impl VectorState {
         self.vector_overlay = None;
         context.release(self.overlay_bytes)?;
         self.overlay_bytes = 0;
-        // The store gets its share back at the same moment the request does.
-        self._overlay_reservation = None;
+        // Partition keys remain owned until the vector source and graph have
+        // consumed their scope. Destroy them before refunding their charge.
+        self.partition_prefixes = None;
+        context.release(self.partition_prefix_bytes)?;
+        self.partition_prefix_bytes = 0;
         Ok(())
     }
 
@@ -7647,7 +10486,7 @@ impl ProjectState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         if self.aggregate {
             if self.aggregate_done {
@@ -7667,9 +10506,8 @@ impl ProjectState {
                 let mut running = Vec::new();
                 if running.try_reserve_exact(self.columns.len()).is_err() {
                     context.release(state_bytes)?;
-                    return Err(Error::Other(
-                        "bounded aggregate accumulator allocation failed".to_string(),
-                    )
+                    return Err(Error::Other((
+                        "bounded aggregate accumulator allocation failed".to_string()).into())
                     .into());
                 }
                 for column in &self.columns {
@@ -7709,7 +10547,7 @@ impl ProjectState {
                 }
                 let Some(row) = self.pending.as_ref() else {
                     let running = self.aggregates.as_ref().ok_or_else(|| {
-                        Error::Other("bounded aggregate lost its accumulators".to_string())
+                        Error::Other(("bounded aggregate lost its accumulators".to_string()).into())
                     })?;
                     let planned_output_bytes = checked_size_add(
                         std::mem::size_of::<Vec<Value>>(),
@@ -7724,9 +10562,8 @@ impl ProjectState {
                     let mut output = Vec::new();
                     if output.try_reserve_exact(running.len()).is_err() {
                         context.release(planned_output_bytes)?;
-                        return Err(Error::Other(
-                            "bounded aggregate output allocation failed".to_string(),
-                        )
+                        return Err(Error::Other((
+                            "bounded aggregate output allocation failed".to_string()).into())
                         .into());
                     }
                     let mut output_bytes = match values_retained_bytes(&output) {
@@ -7770,8 +10607,10 @@ impl ProjectState {
                     self.aggregate_state_bytes = 0;
                     self.aggregate_done = true;
                     return Ok(Some(PulledRow {
+                        window: None,
                         values: output,
                         retained_bytes: output_bytes,
+                        group_binding: None,
                     }));
                 };
 
@@ -7796,7 +10635,7 @@ impl ProjectState {
                 context.reserve(BoundedWorkSource::TableScan, temporary_bytes)?;
                 let folded = (|| {
                     let running = self.aggregates.as_mut().ok_or_else(|| {
-                        Error::Other("bounded aggregate lost its accumulators".to_string())
+                        Error::Other(("bounded aggregate lost its accumulators".to_string()).into())
                     })?;
                     for (column, state) in self.columns.iter().zip(running.iter_mut()) {
                         let Expr::FunctionCall { args, .. } = &column.expr else {
@@ -7806,11 +10645,12 @@ impl ProjectState {
                             AggregateInput::Row => state.admit(AggregateItem::Row)?,
                             AggregateInput::Nothing => state.admit(AggregateItem::Nothing)?,
                             AggregateInput::Value(argument) => {
-                                let value = eval_query_result_expr(
+                                let value = eval_query_result_expr_with_window(
                                     argument,
                                     &row.values,
                                     &self.input.columns,
                                     &self.params,
+                                    row.window,
                                 )?;
                                 state.admit(AggregateItem::Value(&value))?;
                             }
@@ -7823,14 +10663,14 @@ impl ProjectState {
                     Ok(()) => {}
                     Err(error) => {
                         let row = self.pending.take().ok_or_else(|| {
-                            Error::Other("bounded aggregate lost its input row".to_string())
+                            Error::Other(("bounded aggregate lost its input row".to_string()).into())
                         })?;
                         row.release(context)?;
                         return Err(error.into());
                     }
                 }
                 let row = self.pending.take().ok_or_else(|| {
-                    Error::Other("bounded aggregate lost its input row".to_string())
+                    Error::Other(("bounded aggregate lost its input row".to_string()).into())
                 })?;
                 row.release(context)?;
             }
@@ -7842,17 +10682,24 @@ impl ProjectState {
         let Some(row) = self.pending.as_ref() else {
             return Ok(None);
         };
-        let temporary_bytes = expression_temporary_bytes(
+        let temporary_bytes = projection_temporary_bytes(
             &row.values,
+            &self.input.columns,
             &self.params,
-            self.columns.iter().map(|column| &column.expr),
+            &self.columns,
         )?;
         context.reserve(BoundedWorkSource::TableScan, temporary_bytes)?;
         let output = self
             .columns
             .iter()
             .map(|column| {
-                eval_project_expr(&column.expr, &row.values, &self.input.columns, &self.params)
+                eval_project_expr_with_window(
+                    &column.expr,
+                    &row.values,
+                    &self.input.columns,
+                    &self.params,
+                    row.window,
+                )
             })
             .collect::<Result<Vec<_>>>();
         let output = match output {
@@ -7860,7 +10707,7 @@ impl ProjectState {
             Err(error) => {
                 context.release(temporary_bytes)?;
                 let row = self.pending.take().ok_or_else(|| {
-                    Error::Other("bounded projection lost its input row".to_string())
+                    Error::Other(("bounded projection lost its input row".to_string()).into())
                 })?;
                 row.release(context)?;
                 return Err(error.into());
@@ -7882,11 +10729,14 @@ impl ProjectState {
         let input = self
             .pending
             .take()
-            .ok_or_else(|| Error::Other("bounded projection lost its input row".to_string()))?;
+            .ok_or_else(|| Error::Other(("bounded projection lost its input row".to_string()).into()))?;
+        let group_binding = input.group_binding;
         input.release(context)?;
         Ok(Some(PulledRow {
+            window: None,
             values: output,
             retained_bytes: output_bytes,
+            group_binding,
         }))
     }
 }
@@ -7895,7 +10745,7 @@ impl SortState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         if !self.prepared {
             loop {
@@ -7909,19 +10759,11 @@ impl SortState {
                         "sort scratch",
                     )?;
                     context.reserve(BoundedWorkSource::UnindexedSort, sort_scratch_bytes)?;
-                    self.rows.sort_by(|left, right| {
-                        for (index, key) in self.keys.iter().enumerate() {
-                            let ordering = compare_sort_values(
-                                &left.keys[index],
-                                &right.keys[index],
-                                key.direction,
-                            );
-                            if ordering != Ordering::Equal {
-                                return ordering;
-                            }
-                        }
-                        Ordering::Equal
-                    });
+                    self.rows
+                        .sort_by(|left, right| sort_entry_order(&self.keys, left, right));
+                    if let Some(limit) = self.rank_limit {
+                        self.release_ranks_past(limit, context)?;
+                    }
                     self.rows.reverse();
                     context.release(sort_scratch_bytes)?;
                     self.prepared = true;
@@ -7931,21 +10773,23 @@ impl SortState {
                     BoundedWorkSource::UnindexedSort,
                     BoundedSourceTouch::SortCandidate,
                 )?;
-                let temporary_bytes = expression_temporary_bytes(
+                let temporary_bytes = sort_key_temporary_bytes(
                     &row.values,
+                    &self.input.columns,
                     &self.params,
-                    self.keys.iter().map(|key| &key.expr),
+                    &self.keys,
                 )?;
                 context.reserve(BoundedWorkSource::UnindexedSort, temporary_bytes)?;
                 let values = self
                     .keys
                     .iter()
                     .map(|key| {
-                        eval_query_result_expr(
+                        eval_query_result_expr_with_window(
                             &key.expr,
                             &row.values,
                             &self.input.columns,
                             &self.params,
+                            row.window,
                         )
                     })
                     .collect::<Result<Vec<_>>>();
@@ -7954,24 +10798,53 @@ impl SortState {
                     Err(error) => {
                         context.release(temporary_bytes)?;
                         let row = self.pending.take().ok_or_else(|| {
-                            Error::Other("bounded sort lost its candidate".to_string())
+                            Error::Other(("bounded sort lost its candidate".to_string()).into())
                         })?;
                         row.release(context)?;
                         return Err(error.into());
                     }
                 };
-                let key_bytes = checked_size_add(
-                    values_retained_bytes(&values)?,
-                    std::mem::size_of::<SortEntry>(),
-                    "sort candidate",
-                )?;
+                let key_bytes = values_retained_bytes(&values)?;
                 if let Err(error) = context.reserve(BoundedWorkSource::UnindexedSort, key_bytes) {
                     context.release(temporary_bytes)?;
                     return Err(error);
                 }
                 context.release(temporary_bytes)?;
+                let mut key_charge = ReservedBytes::new(context, key_bytes);
+                if let Some(limit) = self.rank_limit {
+                    if limit.limit == 0 {
+                        // The rank filter passes no row at all.
+                        drop(values);
+                        drop(key_charge);
+                        let row = self.pending.take().ok_or_else(|| {
+                            Error::Other(("bounded sort lost its candidate".to_string()).into())
+                        })?;
+                        row.release(context)?;
+                        continue;
+                    }
+                    if self.rows.len() == self.rows.capacity() && self.rows.len() > limit.limit {
+                        // Before the buffer grows, give up the rows the rank
+                        // filter can never pass. It grows only if more than
+                        // half stays full, which is never sooner than the
+                        // full sort's buffer would have grown.
+                        self.compact_ranks_past(limit, context)?;
+                        if self.rows.len() > self.rows.capacity() / 2 {
+                            let growth = double_sort_rows(context, &mut self.rows)?;
+                            self.container_bytes =
+                                checked_size_add(self.container_bytes, growth, "sort container")?;
+                        }
+                    }
+                }
+                let growth = reserve_vector_slot(
+                    context,
+                    BoundedWorkSource::UnindexedSort,
+                    &mut self.rows,
+                    "sort rows",
+                )?;
+                self.container_bytes =
+                    checked_size_add(self.container_bytes, growth, "sort container")?;
                 let row = self.pending.take().ok_or_else(|| {
-                    Error::Other("bounded sort lost its admitted candidate".to_string())
+                    Error::Other(("bounded sort lost its admitted candidate".to_string()).into())
                 })?;
                 self.buffered_bytes = self
                     .buffered_bytes
@@ -7983,6 +10856,7 @@ impl SortState {
                     key_bytes,
                     row,
                 });
+                key_charge.bytes = 0;
             }
         }
         if self.rows.is_empty() {
@@ -7998,18 +10872,127 @@ impl SortState {
         };
         self.buffered_bytes = self
             .buffered_bytes
-            .saturating_sub(entry.key_bytes)
-            .saturating_sub(entry.row.retained_bytes);
+            .checked_sub(entry.key_bytes)
+            .and_then(|bytes| bytes.checked_sub(entry.row.retained_bytes))
+            .ok_or_else(|| Error::Other(("bounded sort retained bytes underflow".to_string()).into()))?;
         context.release(entry.key_bytes)?;
         Ok(Some(entry.row))
     }
+
+    /// Sort the buffer in window order and give up every row ranked past the
+    /// limit within its partition. The scratch is funded as the final sort
+    /// funds its own, for no more rows than the full sort would hold then.
+    fn compact_ranks_past(
+        &mut self,
+        limit: SortRankLimit,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let scratch = checked_size_mul(
+            self.rows.len(),
+            std::mem::size_of::<SortEntry>(),
+            "sort scratch",
+        )?;
+        context.reserve(BoundedWorkSource::UnindexedSort, scratch)?;
+        self.rows
+            .sort_by(|left, right| sort_entry_order(&self.keys, left, right));
+        self.release_ranks_past(limit, context)?;
+        context.release(scratch)
+    }
+
+    /// In a buffer already in window order, keep each partition's first
+    /// `limit` rows in place and release the rest: the rank filter can pass
+    /// none of them, and the kept rows keep the ranks the full sort gives them.
+    fn release_ranks_past(
+        &mut self,
+        limit: SortRankLimit,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let mut kept = 0usize;
+        let mut rank = 0usize;
+        for read in 0..self.rows.len() {
+            let same_partition = kept > 0
+                && self.rows[read].keys[..limit.partition_len]
+                    .iter()
+                    .zip(&self.rows[kept - 1].keys[..limit.partition_len])
+                    .all(|(left, right)| {
+                        compare_sort_values(left, right, SortDirection::Asc) == Ordering::Equal
+                    });
+            rank = if same_partition { rank + 1 } else { 1 };
+            if rank <= limit.limit {
+                self.rows.swap(kept, read);
+                kept += 1;
+            }
+        }
+        for released in self.rows.drain(kept..) {
+            self.buffered_bytes = self
+                .buffered_bytes
+                .checked_sub(released.key_bytes)
+                .and_then(|held| held.checked_sub(released.row.retained_bytes))
+                .ok_or_else(|| Error::Other(("bounded sort retained bytes underflow".to_string()).into()))?;
+            let key_bytes = released.key_bytes;
+            drop(released.keys);
+            context.release(key_bytes)?;
+            released.row.release(context)?;
+        }
+        Ok(())
+    }
+}
+
+/// Double the sort buffer's capacity, funded first, by the rule
+/// `reserve_vector_slot` follows when the buffer is full.
+fn double_sort_rows(
+    context: &ControlArc<RequestContext>,
+    rows: &mut Vec<SortEntry>,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let previous_capacity = rows.capacity();
+    let target = previous_capacity
+        .saturating_mul(2)
+        .max(AMORTIZED_GROWTH_FLOOR);
+    let additional = target.saturating_sub(previous_capacity).max(1);
+    let bytes = checked_size_mul(additional, std::mem::size_of::<SortEntry>(), "sort rows")?;
+    context.reserve(BoundedWorkSource::UnindexedSort, bytes)?;
+    if rows
+        .try_reserve_exact(target.saturating_sub(rows.len()))
+        .is_err()
+    {
+        context.release(bytes)?;
+        return Err(Error::Other(("bounded sort rows allocation failed".to_string()).into()).into());
+    }
+    let delta = checked_size_mul(
+        rows.capacity(),
+        std::mem::size_of::<SortEntry>(),
+        "sort rows",
+    )
+    .and_then(|actual| {
+        checked_size_mul(
+            previous_capacity,
+            std::mem::size_of::<SortEntry>(),
+            "sort rows",
+        )
+        .map(|prior| actual.checked_sub(prior))
+    });
+    let delta = match delta {
+        Ok(Some(delta)) => delta,
+        Ok(None) => {
+            context.release(bytes)?;
+            return Err(
+                Error::Other(("bounded sort rows capacity moved backwards".to_string()).into()).into(),
+            );
+        }
+        Err(error) => {
+            context.release(bytes)?;
+            return Err(error);
+        }
+    };
+    reconcile_new_reservation(context, BoundedWorkSource::UnindexedSort, bytes, delta)?;
+    Ok(delta)
 }
 
 impl LimitState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         if self.emitted >= self.count {
             return Ok(None);
@@ -8019,7 +11002,7 @@ impl LimitState {
             self.emitted = self
                 .emitted
                 .checked_add(1)
-                .ok_or_else(|| Error::Other("bounded LIMIT counter overflow".to_string()))?;
+                .ok_or_else(|| Error::Other(("bounded LIMIT counter overflow".to_string()).into()))?;
         }
         Ok(row)
     }
@@ -8029,7 +11012,7 @@ impl FilterState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         loop {
             if self.pending.is_none() {
@@ -8044,18 +11027,22 @@ impl FilterState {
                 std::iter::once(&self.predicate),
             )?;
             context.reserve(BoundedWorkSource::TableScan, temporary_bytes)?;
-            let matches = query_result_row_matches(
-                &row.values,
-                &self.input.columns,
-                &self.predicate,
-                &self.params,
-            );
+            let matches = eval_bool_expr(&self.predicate, &|inner| {
+                eval_query_result_expr_with_window(
+                    inner,
+                    &row.values,
+                    &self.input.columns,
+                    &self.params,
+                    row.window,
+                )
+            })
+            .map(|truth| truth.unwrap_or(false));
             context.release(temporary_bytes)?;
             let matches = match matches {
                 Ok(matches) => matches,
                 Err(error) => {
                     let row = self.pending.take().ok_or_else(|| {
-                        Error::Other("bounded filter lost its input row".to_string())
+                        Error::Other(("bounded filter lost its input row".to_string()).into())
                     })?;
                     row.release(context)?;
                     return Err(error.into());
@@ -8063,13 +11050,13 @@ impl FilterState {
             };
             if matches {
                 return self.pending.take().map(Some).ok_or_else(|| {
-                    Error::Other("bounded filter lost its match".to_string()).into()
+                    Error::Other(("bounded filter lost its match".to_string()).into()).into()
                 });
             }
             let row = self
                 .pending
                 .take()
-                .ok_or_else(|| Error::Other("bounded filter lost its rejected row".to_string()))?;
+                .ok_or_else(|| Error::Other(("bounded filter lost its rejected row".to_string()).into()))?;
             row.release(context)?;
         }
     }
@@ -8079,7 +11066,7 @@ impl DistinctState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         loop {
             if self.pending.is_none() {
@@ -8092,7 +11079,7 @@ impl DistinctState {
                 return Ok(None);
             };
             context.charge_operator(BoundedWorkSource::UnindexedSort)?;
-            let encoded_bytes = serialized_size(&row.values)?;
+            let encoded_bytes = serialized_size(&contextdb_core::SqlEqualityKey(&row.values))?;
             let retained = checked_size_add(
                 encoded_bytes,
                 checked_size_add(
@@ -8108,7 +11095,7 @@ impl DistinctState {
                 Err(error) => {
                     context.release(retained)?;
                     let row = self.pending.take().ok_or_else(|| {
-                        Error::Other("bounded DISTINCT lost its input row".to_string())
+                        Error::Other(("bounded DISTINCT lost its input row".to_string()).into())
                     })?;
                     row.release(context)?;
                     return Err(error);
@@ -8117,7 +11104,7 @@ impl DistinctState {
             if self.seen.contains(&key) {
                 context.release(retained)?;
                 let row = self.pending.take().ok_or_else(|| {
-                    Error::Other("bounded DISTINCT lost its duplicate".to_string())
+                    Error::Other(("bounded DISTINCT lost its duplicate".to_string()).into())
                 })?;
                 row.release(context)?;
                 continue;
@@ -8131,7 +11118,7 @@ impl DistinctState {
                 .pending
                 .take()
                 .map(Some)
-                .ok_or_else(|| Error::Other("bounded DISTINCT lost its row".to_string()).into());
+                .ok_or_else(|| Error::Other(("bounded DISTINCT lost its row".to_string()).into()).into());
         }
     }
 }
@@ -8140,7 +11127,7 @@ impl JoinState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         if !self.right_prepared {
             loop {
@@ -8156,7 +11143,7 @@ impl JoinState {
                 let mut row = self
                     .right_pending
                     .take()
-                    .ok_or_else(|| Error::Other("bounded join lost its right input".to_string()))?;
+                    .ok_or_else(|| Error::Other(("bounded join lost its right input".to_string()).into()))?;
                 row.retained_bytes = row
                     .retained_bytes
                     .checked_add(entry_bytes)
@@ -8181,12 +11168,12 @@ impl JoinState {
             while self.right_position < self.right_rows.len() {
                 context.charge_operator(BoundedWorkSource::UnindexedSort)?;
                 let right = self.right_rows.get(self.right_position).ok_or_else(|| {
-                    Error::Other("bounded join lost its admitted right pair".to_string())
+                    Error::Other(("bounded join lost its admitted right pair".to_string()).into())
                 })?;
                 let left = self
                     .left_row
                     .as_ref()
-                    .ok_or_else(|| Error::Other("bounded join lost its left input".to_string()))?;
+                    .ok_or_else(|| Error::Other(("bounded join lost its left input".to_string()).into()))?;
                 let output_bytes = value_refs_retained_bytes(
                     left.values.iter().chain(right.values.iter()),
                     left.values
@@ -8224,12 +11211,14 @@ impl JoinState {
                 self.right_position = self
                     .right_position
                     .checked_add(1)
-                    .ok_or_else(|| Error::Other("bounded join position overflow".to_string()))?;
+                    .ok_or_else(|| Error::Other(("bounded join position overflow".to_string()).into()))?;
                 if matches {
                     self.matched = true;
                     return Ok(Some(PulledRow {
+                        window: None,
                         values: combined,
                         retained_bytes: output_bytes,
+                        group_binding: None,
                     }));
                 }
                 context.release(output_bytes)?;
@@ -8237,7 +11226,7 @@ impl JoinState {
 
             if !self.matched && matches!(self.join_type, contextdb_planner::JoinType::Left) {
                 let left = self.left_row.as_mut().ok_or_else(|| {
-                    Error::Other("bounded join lost its unmatched row".to_string())
+                    Error::Other(("bounded join lost its unmatched row".to_string()).into())
                 })?;
                 let old_capacity = left.values.capacity();
                 let required_len = left
@@ -8264,18 +11253,16 @@ impl JoinState {
                     .is_err()
                 {
                     context.release(planned_growth)?;
-                    return Err(Error::Other(
-                        "bounded left join NULL extension allocation failed".to_string(),
-                    )
+                    return Err(Error::Other((
+                        "bounded left join NULL extension allocation failed".to_string()).into())
                     .into());
                 }
                 let actual_slots = match left.values.capacity().checked_sub(old_capacity) {
                     Some(slots) => slots,
                     None => {
                         context.release(planned_growth)?;
-                        return Err(Error::Other(
-                            "bounded left join capacity moved backwards".to_string(),
-                        )
+                        return Err(Error::Other((
+                            "bounded left join capacity moved backwards".to_string()).into())
                         .into());
                     }
                 };
@@ -8311,7 +11298,7 @@ impl JoinState {
             let left = self
                 .left_row
                 .take()
-                .ok_or_else(|| Error::Other("bounded join lost its completed row".to_string()))?;
+                .ok_or_else(|| Error::Other(("bounded join lost its completed row".to_string()).into()))?;
             left.release(context)?;
         }
     }
@@ -8321,7 +11308,7 @@ impl UnionState {
     fn next(
         &mut self,
         db: &dyn ReadExecutionTarget,
-        context: &Arc<RequestContext>,
+        context: &ControlArc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         loop {
             if self.pending.is_none() {
@@ -8334,7 +11321,7 @@ impl UnionState {
                 self.pending = input.next(db, context)?;
                 if self.pending.is_none() {
                     self.input = self.input.checked_add(1).ok_or_else(|| {
-                        Error::Other("bounded UNION input position overflow".to_string())
+                        Error::Other(("bounded UNION input position overflow".to_string()).into())
                     })?;
                     continue;
                 }
@@ -8345,13 +11332,13 @@ impl UnionState {
                     .pending
                     .take()
                     .map(Some)
-                    .ok_or_else(|| Error::Other("bounded UNION lost its row".to_string()).into());
+                    .ok_or_else(|| Error::Other(("bounded UNION lost its row".to_string()).into()).into());
             }
             let row = self
                 .pending
                 .as_ref()
-                .ok_or_else(|| Error::Other("bounded UNION lost its pending row".to_string()))?;
-            let encoded_bytes = serialized_size(&row.values)?;
+                .ok_or_else(|| Error::Other(("bounded UNION lost its pending row".to_string()).into()))?;
+            let encoded_bytes = serialized_size(&contextdb_core::SqlEqualityKey(&row.values))?;
             let retained = checked_size_add(
                 encoded_bytes,
                 checked_size_add(
@@ -8367,7 +11354,7 @@ impl UnionState {
                 Err(error) => {
                     context.release(retained)?;
                     let row = self.pending.take().ok_or_else(|| {
-                        Error::Other("bounded UNION lost its input row".to_string())
+                        Error::Other(("bounded UNION lost its input row".to_string()).into())
                     })?;
                     row.release(context)?;
                     return Err(error);
@@ -8378,7 +11365,7 @@ impl UnionState {
                 let row = self
                     .pending
                     .take()
-                    .ok_or_else(|| Error::Other("bounded UNION lost its duplicate".to_string()))?;
+                    .ok_or_else(|| Error::Other(("bounded UNION lost its duplicate".to_string()).into()))?;
                 row.release(context)?;
                 continue;
             }
@@ -8391,7 +11378,7 @@ impl UnionState {
                 .pending
                 .take()
                 .map(Some)
-                .ok_or_else(|| Error::Other("bounded UNION lost its row".to_string()).into());
+                .ok_or_else(|| Error::Other(("bounded UNION lost its row".to_string()).into()).into());
         }
     }
 }
@@ -8408,6 +11395,7 @@ fn ensure_supported_plan(plan: &PhysicalPlan) -> std::result::Result<(), Bounded
         PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::WindowRank { input, .. }
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::MaterializeCte { input, .. } => ensure_supported_plan(input),
@@ -8431,12 +11419,21 @@ fn ensure_supported_plan(plan: &PhysicalPlan) -> std::result::Result<(), Bounded
             candidates.as_deref().map_or(Ok(()), ensure_supported_plan)
         }
         PhysicalPlan::IndexScan { .. } | PhysicalPlan::CteRef { .. } => Ok(()),
+        PhysicalPlan::GroupedCount { input, .. } => match input.as_ref() {
+            PhysicalPlan::Scan { .. } => Ok(()),
+            _ => Err(Error::PlanError(
+                "bounded execution accepts read-only SELECT plans".to_string(),
+            )
+            .into()),
+        },
         // A store answering questions about itself: no rows read, nothing
         // changed, and classified a READ, so a reading session runs it.
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
+        | PhysicalPlan::ShowContentSize
         | PhysicalPlan::ShowMaintenancePollInterval
         | PhysicalPlan::ShowVectorServingCache
+        | PhysicalPlan::ShowStorageCompaction
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }
@@ -8473,7 +11470,7 @@ fn bounded_resolve_in_subqueries(
     params: &Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
     ctes: &[Cte],
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<Expr, BoundedExecutionError> {
     let Some(database) = db.as_database_for_subquery_plan() else {
         // Only the in-process target can plan a subquery; any other target
@@ -8538,7 +11535,7 @@ fn bounded_resolve_graph_start_nodes(
     params: &Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
     start_alias: &str,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<Option<super::GraphStartResolution>, BoundedExecutionError> {
     let Some(database) = db.as_database_for_subquery_plan() else {
         return Ok(None);
@@ -8596,8 +11593,152 @@ fn bounded_resolve_graph_start_nodes(
         snapshot,
         start_alias,
         &mut read,
+        Arc::new(SourceDecodeBudget {
+            context: context.clone(),
+            source: BoundedWorkSource::GraphTraversal,
+        }),
     )
     .map(Some)
+}
+
+/// Validate the complete declared inputs before building a kernel, including
+/// sources whose join/candidate branch execution can subsequently bypass.
+fn preflight_plan_indexes(
+    db: &dyn ReadExecutionTarget,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    snapshot: SnapshotId,
+    context: &ControlArc<RequestContext>,
+) -> std::result::Result<(), BoundedExecutionError> {
+    let memory = context.reader_budget.clone();
+    if db.ordered_prefix_snapshot_is_current(snapshot, memory.clone())? {
+        return Ok(());
+    }
+    let preflight = |table: &str, index: &str| {
+        context.with_source_page_admission(BoundedWorkSource::IndexRange, || {
+            db.preflight_historical_index(table, index, snapshot, memory.clone(), &mut || {
+                context.charge_operator(BoundedWorkSource::IndexRange)
+            })
+        })
+    };
+    match plan {
+        PhysicalPlan::Limit { count: 0, .. } => Ok(()),
+        PhysicalPlan::Scan { table, filter, .. } => {
+            let ranges = context.index_range_sizes(db, snapshot);
+            if let Some(filter) = filter.as_ref()
+                && let Some(meta) = db.table_meta(table)
+                && let Some(pick) =
+                    analyze_filter_for_index(table, &meta, filter, params, Some(&ranges)).pick
+            {
+                context.note_index_range_probes()?;
+                preflight(table, &pick.name)?;
+            }
+            context.note_index_range_probes()?;
+            Ok(())
+        }
+        PhysicalPlan::IndexScan { table, index, .. } => preflight(table, index),
+        PhysicalPlan::Sort { input, keys } => {
+            let ranges = context.index_range_sizes(db, snapshot);
+            let ordered = ordered_scan(db, input, keys, params, Some(&ranges));
+            context.note_index_range_probes()?;
+            if let Some((table, _, ordered)) = ordered {
+                preflight(table, &ordered.index)?;
+            }
+            preflight_plan_indexes(db, input, params, snapshot, context)
+        }
+        PhysicalPlan::WindowRank { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::GroupedCount { input, .. } => {
+            preflight_plan_indexes(db, input, params, snapshot, context)
+        }
+        PhysicalPlan::Join { left, right, .. } => {
+            preflight_plan_indexes(db, left, params, snapshot, context)?;
+            preflight_plan_indexes(db, right, params, snapshot, context)
+        }
+        PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
+            for input in inputs {
+                preflight_plan_indexes(db, input, params, snapshot, context)?;
+            }
+            Ok(())
+        }
+        PhysicalPlan::GraphBfs {
+            start_candidates, ..
+        } => {
+            db.preflight_historical_graph(snapshot, context.reader_budget.clone(), &mut || {
+                context.charge_operator(BoundedWorkSource::GraphTraversal)
+            })?;
+            if let Some(input) = start_candidates {
+                preflight_plan_indexes(db, input, params, snapshot, context)?;
+            }
+            Ok(())
+        }
+        PhysicalPlan::VectorSearch { candidates, .. }
+        | PhysicalPlan::HnswSearch { candidates, .. } => {
+            if let Some(candidates) = candidates {
+                preflight_plan_indexes(db, candidates, params, snapshot, context)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// The guard is thread-local and lives only while this request is executing.
+// Cursor fetches re-enter beneath the cursor's existing immutable writer root.
+fn enter_vector_read(
+    db: &dyn ReadExecutionTarget,
+    snapshot: SnapshotId,
+    context: &ControlArc<RequestContext>,
+    required: bool,
+) -> std::result::Result<
+    Option<crate::persistence::vector_membership_source::VectorReadScope>,
+    BoundedExecutionError,
+> {
+    if !required {
+        return Ok(None);
+    }
+    context
+        .with_vector_copies(|copies| {
+            db.vector_read_preflight(
+                snapshot,
+                context.reader_budget.clone(),
+                copies,
+                Some(ReadOpenContext::from_request(context)),
+            )
+        })
+        .map_err(BoundedExecutionError::from)
+}
+
+// Include branches that execution can bypass after deriving empty candidates.
+fn plan_needs_vector_read(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::Limit { count: 0, .. } => false,
+        PhysicalPlan::VectorSearch { k, .. } | PhysicalPlan::HnswSearch { k, .. } => *k != 0,
+        PhysicalPlan::WindowRank { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::GroupedCount { input, .. }
+        | PhysicalPlan::Sort { input, .. } => plan_needs_vector_read(input),
+        PhysicalPlan::Join { left, right, .. } => {
+            plan_needs_vector_read(left) || plan_needs_vector_read(right)
+        }
+        PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
+            inputs.iter().any(plan_needs_vector_read)
+        }
+        PhysicalPlan::GraphBfs {
+            start_candidates, ..
+        } => start_candidates
+            .as_deref()
+            .is_some_and(plan_needs_vector_read),
+        _ => false,
+    }
 }
 
 fn build_kernel(
@@ -8605,9 +11746,119 @@ fn build_kernel(
     plan: &PhysicalPlan,
     params: Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
+    preflight_plan_indexes(db, plan, &params, snapshot, context)?;
     build_kernel_with_ctes(db, plan, params, snapshot, &HashMap::new(), context).map(|node| *node)
+}
+
+/// The writer transaction's view of one maintained prefix count: the committed
+/// total, less the committed rows this transaction hides (deletes by identity,
+/// or restages) whose committed values are under the prefix, plus its own
+/// staged rows under the prefix.
+///
+/// The work is one bounded committed-row read per staged row and per staged
+/// deletion of this table, and one touch per staged row: what the transaction
+/// itself staged, never the table's history. A deletion staged by VALUE cannot
+/// say which committed rows it hides without reading them, so that shape
+/// returns `None` and the caller counts the index range exactly instead.
+#[allow(clippy::too_many_arguments)]
+fn in_transaction_prefix_count(
+    db: &dyn ReadExecutionTarget,
+    tx: TxId,
+    table: &str,
+    columns: &[(String, contextdb_core::SortDirection)],
+    prefix: &IndexKey,
+    committed: u64,
+    snapshot: SnapshotId,
+    context: &ControlArc<RequestContext>,
+) -> std::result::Result<Option<u64>, BoundedExecutionError> {
+    let overlay = db.transaction_table_overlay(
+        tx,
+        table,
+        context.source_read_memory(BoundedWorkSource::IndexRange),
+    )?;
+    if overlay.is_empty() {
+        return Ok(Some(committed));
+    }
+    if overlay
+        .delete_predicates
+        .iter()
+        .any(|predicate| predicate.table == table)
+    {
+        return Ok(None);
+    }
+    // The overlay's own controls are charged by the credit it carries.
+    let under_prefix = |row: &VersionedRow| {
+        columns.iter().zip(prefix.iter()).all(|((column, _), key)| {
+            let wanted = match key {
+                DirectedValue::Asc(TotalOrdAsc(value)) => value,
+                DirectedValue::Desc(TotalOrdDesc(value)) => value,
+            };
+            // Index-key equality, not `==`: a staged row is under the key
+            // exactly when its posting would be.
+            contextdb_core::index_key_value_eq(
+                row.values.get(column).unwrap_or(&Value::Null),
+                wanted,
+            )
+        })
+    };
+    // Every committed row the transaction may hide, once: deleted by identity,
+    // or restaged under the same identity by an update. The identities are
+    // walked where they already live, one probe at a time, so nothing held
+    // here grows with what the transaction staged.
+    let restaged = overlay
+        .staged_rows
+        .iter()
+        .flat_map(|staged| staged.rows())
+        .map(|row| row.row_id)
+        .filter(|row_id| !overlay.deleted.contains(row_id));
+    let mut count = i128::from(committed);
+    for row_id in overlay.deleted.iter().copied().chain(restaged) {
+        let probe = Cell::new(0_usize);
+        let original = context.with_source_page_admission(BoundedWorkSource::IndexRange, || {
+            db.bounded_row_by_identity(
+                context.source_read_memory(BoundedWorkSource::IndexRange),
+                None,
+                table,
+                row_id,
+                snapshot,
+                &mut || {
+                    context.charge(
+                        BoundedWorkSource::IndexRange,
+                        BoundedSourceTouch::IndexEntry,
+                    )
+                },
+                &mut |bytes| {
+                    let bytes = context.admit_source_row(BoundedWorkSource::IndexRange, bytes)?;
+                    probe.set(bytes);
+                    Ok(())
+                },
+            )
+        })?;
+        if original.as_ref().is_some_and(&under_prefix) {
+            count -= 1;
+        }
+        drop(original);
+        context.release(probe.get())?;
+    }
+    if let Some(staged) = overlay.staged_rows.as_ref() {
+        for row in staged.rows() {
+            context.charge(
+                BoundedWorkSource::IndexRange,
+                BoundedSourceTouch::IndexEntry,
+            )?;
+            if under_prefix(row) {
+                count += 1;
+            }
+        }
+    }
+    drop(overlay);
+    let count = u64::try_from(count).map_err(|_| {
+        BoundedExecutionError::from(Error::Other((
+            "transaction count fell below zero".to_string()).into()))
+    })?;
+    Ok(Some(count))
 }
 
 /// Serve a `COUNT(*)` over an exact index prefix from the maintained count,
@@ -8619,15 +11870,20 @@ fn build_kernel(
 /// ordinary index-range aggregate the caller builds next is what carries the
 /// disclosure. Both answers are exact; only their cost differs, and this is
 /// what lets a consumer see which one it got.
+///
+/// Inside the writer's own transaction the stored count is the committed
+/// total, so the answer is that total adjusted by what the transaction staged
+/// in this table: [`in_transaction_prefix_count`].
 fn build_authenticated_index_count(
     db: &dyn ReadExecutionTarget,
     input: &PhysicalPlan,
     columns: &[ProjectColumn],
     params: &HashMap<String, Value>,
-    context: &Arc<RequestContext>,
+    snapshot: SnapshotId,
+    context: &ControlArc<RequestContext>,
     disclosure: &mut Option<crate::maintained_counts::MaintainedCountDisclosure>,
 ) -> std::result::Result<Option<Box<PullNode>>, BoundedExecutionError> {
-    if context.transaction().is_some() || columns.len() != 1 {
+    if columns.len() != 1 {
         return Ok(None);
     }
     let Expr::FunctionCall { name, args } = &columns[0].expr else {
@@ -8652,7 +11908,14 @@ fn build_authenticated_index_count(
     let Some(meta) = db.table_meta(table) else {
         return Err(Error::TableNotFound(table.clone()).into());
     };
-    let analysis = analyze_filter_for_index(table, &meta, filter, params);
+    let analysis = analyze_filter_for_index(
+        table,
+        &meta,
+        filter,
+        params,
+        Some(&context.index_range_sizes(db, snapshot)),
+    );
+    context.note_index_range_probes()?;
     let Some(pick) = analysis.pick else {
         return Ok(None);
     };
@@ -8732,12 +11995,27 @@ fn build_authenticated_index_count(
         );
         return Ok(None);
     }
-    let Some(count) = db.authenticated_relational_index_prefix_count(
+    let committed = db.authenticated_relational_index_prefix_count(
         table,
         &pick.columns[..prefix.len()],
         &prefix,
-    )?
-    else {
+        snapshot,
+        context.source_read_memory(BoundedWorkSource::IndexRange),
+    )?;
+    let served = match (committed, context.transaction()) {
+        (Some(committed), Some(tx)) => in_transaction_prefix_count(
+            db,
+            tx,
+            table,
+            &pick.columns[..prefix.len()],
+            &prefix,
+            committed,
+            snapshot,
+            context,
+        )?,
+        (committed, _) => committed,
+    };
+    let Some(count) = served else {
         // The shape was eligible and the answer is still exact — the ordinary
         // index-range aggregate the caller builds next opens the same exact
         // prefix range and counts live postings.
@@ -8781,11 +12059,1033 @@ fn build_authenticated_index_count(
         },
         kind: PullKind::Static(StaticState {
             rows: VecDeque::from([PulledRow {
+                window: None,
                 values,
                 retained_bytes,
+                group_binding: None,
             }]),
         }),
     })))
+}
+
+/// One finite partition and its independent visible rank demand.
+struct RankedPrefixGroup {
+    key: Vec<Value>,
+    ceiling: u64,
+}
+
+fn ranked_prefix_shape(
+    input: &PhysicalPlan,
+) -> Option<(
+    &PhysicalPlan,
+    &[ProjectColumn],
+    &contextdb_parser::RowNumberWindow,
+    WindowBindingId,
+)> {
+    let input = match input {
+        PhysicalPlan::MaterializeCte { input, .. } => input.as_ref(),
+        other => other,
+    };
+    let PhysicalPlan::Project { input, columns } = input else {
+        return None;
+    };
+    if projection_aggregates(columns) {
+        return None;
+    }
+    let PhysicalPlan::WindowRank {
+        input,
+        window,
+        binding,
+    } = input.as_ref()
+    else {
+        return None;
+    };
+    if !matches!(input.as_ref(), PhysicalPlan::Scan { .. }) || window.partition_by.is_empty() {
+        return None;
+    }
+    // Project is an alias binding boundary. No projection, limit, distinct or
+    // join below the window is crossed by this lowering.
+    if columns
+        .iter()
+        .any(|column| !matches!(column.expr, Expr::Column(_) | Expr::WindowRank(_)))
+    {
+        return None;
+    }
+    Some((input, columns, window, *binding))
+}
+
+fn ranked_prefix_constant(expr: &Expr, params: &HashMap<String, Value>) -> Result<Option<Value>> {
+    match expr {
+        Expr::Literal(literal) => super::literal_to_value(literal).map(Some),
+        Expr::Parameter(name) => Ok(params.get(name).cloned()),
+        _ => Ok(None),
+    }
+}
+
+fn ranked_prefix_project_expr<'a>(
+    reference: &contextdb_parser::ColumnRef,
+    columns: &'a [ProjectColumn],
+) -> Option<&'a Expr> {
+    let mut matched = None;
+    for column in columns {
+        let name = column.alias.as_deref().or(match &column.expr {
+            Expr::Column(source) => Some(source.column.as_str()),
+            _ => None,
+        });
+        if name == Some(reference.column.as_str()) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(&column.expr);
+        }
+    }
+    matched
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranked_prefix_conjunction(
+    predicate: &Expr,
+    columns: &[ProjectColumn],
+    window: &contextdb_parser::RowNumberWindow,
+    binding: WindowBindingId,
+    meta: &TableMeta,
+    params: &HashMap<String, Value>,
+    key: &mut [Option<Value>],
+    ceiling: &mut Option<u64>,
+    dead: &mut bool,
+) -> Result<bool> {
+    if let Expr::BinaryOp {
+        left,
+        op: BinOp::And,
+        right,
+    } = predicate
+    {
+        return Ok(ranked_prefix_conjunction(
+            left, columns, window, binding, meta, params, key, ceiling, dead,
+        )? && ranked_prefix_conjunction(
+            right, columns, window, binding, meta, params, key, ceiling, dead,
+        )?);
+    }
+    let Expr::BinaryOp { left, op, right } = predicate else {
+        return Ok(false);
+    };
+    let (reference, constant, operation) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(reference), constant) => (reference, constant, *op),
+        (constant, Expr::Column(reference)) => (
+            reference,
+            constant,
+            match op {
+                BinOp::Eq => BinOp::Eq,
+                BinOp::Gte => BinOp::Lte,
+                _ => return Ok(false),
+            },
+        ),
+        _ => return Ok(false),
+    };
+    let Some(expression) = ranked_prefix_project_expr(reference, columns) else {
+        return Ok(false);
+    };
+    let Some(value) = ranked_prefix_constant(constant, params)? else {
+        return Ok(false);
+    };
+    if let Expr::WindowRank(found) = expression {
+        if *found != binding || operation != BinOp::Lte {
+            return Ok(false);
+        }
+        let bound = match value {
+            Value::Null => {
+                *dead = true;
+                return Ok(true);
+            }
+            Value::Int64(bound) => {
+                if bound <= 0 {
+                    0
+                } else {
+                    bound as u64
+                }
+            }
+            // Keep the existing scalar comparison for non-integral bounds.
+            _ => return Ok(false),
+        };
+        *ceiling = Some(ceiling.map_or(bound, |existing| existing.min(bound)));
+        return Ok(true);
+    }
+    let Expr::Column(source) = expression else {
+        return Ok(false);
+    };
+    if operation != BinOp::Eq {
+        return Ok(false);
+    }
+    let Some(position) = window
+        .partition_by
+        .iter()
+        .position(|column| column == source)
+    else {
+        return Ok(false);
+    };
+    let Some(declared) = meta
+        .columns
+        .iter()
+        .find(|column| column.name == source.column)
+    else {
+        return Ok(false);
+    };
+    if matches!(value, Value::Null) {
+        *dead = true;
+        return Ok(true);
+    }
+    let value = match super::partition_key_literal(&declared.column_type, &value) {
+        super::PartitionKeyLiteral::Exact(value) => value,
+        super::PartitionKeyLiteral::NoPartition => {
+            *dead = true;
+            return Ok(true);
+        }
+        super::PartitionKeyLiteral::Unresolved | super::PartitionKeyLiteral::Unbound => {
+            return Ok(false);
+        }
+    };
+    if let Some(previous) = &key[position] {
+        if super::compare_values(previous, &value) != Some(Ordering::Equal) {
+            *dead = true;
+        }
+    } else {
+        key[position] = Some(value);
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranked_prefix_branches(
+    predicate: &Expr,
+    columns: &[ProjectColumn],
+    window: &contextdb_parser::RowNumberWindow,
+    binding: WindowBindingId,
+    meta: &TableMeta,
+    params: &HashMap<String, Value>,
+    groups: &mut Vec<RankedPrefixGroup>,
+) -> Result<bool> {
+    if let Expr::BinaryOp {
+        left,
+        op: BinOp::Or,
+        right,
+    } = predicate
+    {
+        return Ok(
+            ranked_prefix_branches(left, columns, window, binding, meta, params, groups)?
+                && ranked_prefix_branches(right, columns, window, binding, meta, params, groups)?,
+        );
+    }
+    let mut key = vec![None; window.partition_by.len()];
+    let mut ceiling = None;
+    let mut dead = false;
+    if !ranked_prefix_conjunction(
+        predicate,
+        columns,
+        window,
+        binding,
+        meta,
+        params,
+        &mut key,
+        &mut ceiling,
+        &mut dead,
+    )? {
+        return Ok(false);
+    }
+    if dead {
+        return Ok(true);
+    }
+    let Some(ceiling) = ceiling else {
+        return Ok(false);
+    };
+    if key.iter().any(Option::is_none) {
+        return Ok(false);
+    }
+    if ceiling == 0 {
+        return Ok(true);
+    }
+    let key: Vec<Value> = key.into_iter().flatten().collect();
+    if let Some(previous) = groups.iter_mut().find(|group| {
+        group
+            .key
+            .iter()
+            .zip(&key)
+            .all(|(left, right)| super::compare_values(left, right) == Some(Ordering::Equal))
+    }) {
+        previous.ceiling = previous.ceiling.max(ceiling);
+    } else {
+        groups.push(RankedPrefixGroup { key, ceiling });
+    }
+    Ok(true)
+}
+
+/// Visit every conjunct of an AND tree.
+fn rank_filter_conjuncts<'a>(expr: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
+    if let Expr::BinaryOp {
+        left,
+        op: BinOp::And,
+        right,
+    } = expr
+    {
+        rank_filter_conjuncts(left, visit);
+        rank_filter_conjuncts(right, visit);
+        return;
+    }
+    visit(expr);
+}
+
+/// Visit every branch of an OR tree, stopping at the first `false`.
+fn rank_filter_branches<'a>(expr: &'a Expr, visit: &mut dyn FnMut(&'a Expr) -> bool) -> bool {
+    if let Expr::BinaryOp {
+        left,
+        op: BinOp::Or,
+        right,
+    } = expr
+    {
+        return rank_filter_branches(left, visit) && rank_filter_branches(right, visit);
+    }
+    visit(expr)
+}
+
+/// The rank cap one conjunct states: `rank <= c` or `c >= rank` with an
+/// integer `c` (a negative `c` caps at 0), or NULL, which no rank satisfies.
+/// Any other conjunct states no cap.
+fn rank_filter_cap(
+    conjunct: &Expr,
+    columns: &[ProjectColumn],
+    binding: WindowBindingId,
+    params: &HashMap<String, Value>,
+) -> Option<u64> {
+    let Expr::BinaryOp { left, op, right } = conjunct else {
+        return None;
+    };
+    let (reference, constant) = match (left.as_ref(), op, right.as_ref()) {
+        (Expr::Column(reference), BinOp::Lte, constant)
+        | (constant, BinOp::Gte, Expr::Column(reference)) => (reference, constant),
+        _ => return None,
+    };
+    let Expr::WindowRank(found) = ranked_prefix_project_expr(reference, columns)? else {
+        return None;
+    };
+    if *found != binding {
+        return None;
+    }
+    let bound = match constant {
+        Expr::Literal(contextdb_parser::Literal::Null) => return Some(0),
+        Expr::Literal(contextdb_parser::Literal::Integer(bound)) => *bound,
+        Expr::Parameter(name) => match params.get(name)? {
+            Value::Null => return Some(0),
+            Value::Int64(bound) => *bound,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(u64::try_from(bound).unwrap_or(0))
+}
+
+/// The highest rank the rank filter can pass, proven without allocating:
+/// every OR branch must cap the rank, and the filter's cap is the largest
+/// branch cap. `None` when any branch leaves the rank uncapped.
+fn rank_filter_limit(
+    predicate: &Expr,
+    columns: &[ProjectColumn],
+    binding: WindowBindingId,
+    params: &HashMap<String, Value>,
+) -> Option<u64> {
+    let mut limit = 0u64;
+    let capped = rank_filter_branches(predicate, &mut |branch| {
+        let mut cap: Option<u64> = None;
+        rank_filter_conjuncts(branch, &mut |conjunct| {
+            if let Some(bound) = rank_filter_cap(conjunct, columns, binding, params) {
+                cap = Some(cap.map_or(bound, |cap| cap.min(bound)));
+            }
+        });
+        let Some(cap) = cap else {
+            return false;
+        };
+        limit = limit.max(cap);
+        true
+    });
+    capped.then_some(limit)
+}
+
+/// A value the filter reads without any way to fail: a column the filter's
+/// input resolves, any literal, or a bound parameter.
+fn rank_filter_operand_cannot_raise(
+    expr: &Expr,
+    input_columns: &[String],
+    params: &HashMap<String, Value>,
+) -> bool {
+    match expr {
+        Expr::Column(column) => matches!(
+            resolve_query_result_column(input_columns, column),
+            QueryResultColumn::Found(_)
+        ),
+        Expr::Literal(_) => true,
+        Expr::Parameter(name) => params.contains_key(name),
+        _ => false,
+    }
+}
+
+/// Whether the filter evaluates on every row without raising: AND, OR and NOT
+/// of comparisons, IN lists and IS NULL over operands that cannot raise, and
+/// TRUE or FALSE. A row the cap gives up is never shown to the filter, so any
+/// other shape, which might raise on exactly that row, keeps the full sort.
+fn rank_filter_cannot_raise(
+    expr: &Expr,
+    input_columns: &[String],
+    params: &HashMap<String, Value>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And | BinOp::Or,
+            right,
+        } => {
+            rank_filter_cannot_raise(left, input_columns, params)
+                && rank_filter_cannot_raise(right, input_columns, params)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rank_filter_operand_cannot_raise(left, input_columns, params)
+                && rank_filter_operand_cannot_raise(right, input_columns, params)
+        }
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            operand,
+        } => rank_filter_cannot_raise(operand, input_columns, params),
+        Expr::InList { expr, list, .. } => {
+            rank_filter_operand_cannot_raise(expr, input_columns, params)
+                && list
+                    .iter()
+                    .all(|item| rank_filter_operand_cannot_raise(item, input_columns, params))
+        }
+        Expr::IsNull { expr, .. } => rank_filter_operand_cannot_raise(expr, input_columns, params),
+        Expr::Literal(contextdb_parser::Literal::Bool(_)) => true,
+        _ => false,
+    }
+}
+
+/// Below a rank filter that caps every branch, the general ranked route's
+/// sort keeps only each partition's rows within the cap. Any other filter, or
+/// a window the index route serves, keeps the full sort.
+fn limit_ranked_sort(
+    plan: &PhysicalPlan,
+    predicate: &Expr,
+    params: &HashMap<String, Value>,
+    built: &mut PullNode,
+) {
+    let Some((_, columns, window, binding)) = ranked_prefix_shape(plan) else {
+        return;
+    };
+    // The filter must be unable to raise on any row, because the rows the cap
+    // gives up are never evaluated. Checked against the columns the filter
+    // itself evaluates over.
+    if !rank_filter_cannot_raise(predicate, &built.columns, params) {
+        return;
+    }
+    let PullKind::Project(project) = &mut built.kind else {
+        return;
+    };
+    let PullKind::Window(ranked) = &mut project.input.kind else {
+        return;
+    };
+    if ranked.binding != binding || ranked.ceiling.is_some() {
+        return;
+    }
+    let PullKind::Sort(sort) = &mut ranked.input.kind else {
+        return;
+    };
+    if sort.rank_limit.is_some() || sort.prepared || sort.pending.is_some() || !sort.rows.is_empty()
+    {
+        return;
+    }
+    // A cap of 0 would hand the filter no row at all; the full sort keeps
+    // every evaluation the filter makes today.
+    let Some(limit) =
+        rank_filter_limit(predicate, columns, binding, params).filter(|limit| *limit > 0)
+    else {
+        return;
+    };
+    sort.rank_limit = Some(SortRankLimit {
+        limit: usize::try_from(limit).unwrap_or(usize::MAX),
+        partition_len: window.partition_by.len(),
+    });
+}
+
+/// Test the finite source scope independently of timestamp restrictions.
+/// Unsupported predicates preserve the ordinary rank-then-filter plan.
+fn ranked_prefix_inner_scope(
+    predicate: &Expr,
+    window: &contextdb_parser::RowNumberWindow,
+    key: &[Value],
+    params: &HashMap<String, Value>,
+) -> Result<Option<bool>> {
+    match predicate {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let (Some(left), Some(right)) = (
+                ranked_prefix_inner_scope(left, window, key, params)?,
+                ranked_prefix_inner_scope(right, window, key, params)?,
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(left && right))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let Expr::Column(column) = expr.as_ref() else {
+                return Ok(None);
+            };
+            let Some(position) = window
+                .partition_by
+                .iter()
+                .position(|partition| partition == column)
+            else {
+                return Ok(None);
+            };
+            let mut matched = false;
+            for item in list {
+                let Some(value) = ranked_prefix_constant(item, params)? else {
+                    return Ok(None);
+                };
+                matched |= super::compare_values(&key[position], &value) == Some(Ordering::Equal);
+            }
+            Ok(Some(matched))
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            let (column, constant) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(column), constant) | (constant, Expr::Column(column)) => {
+                    (column, constant)
+                }
+                _ => return Ok(None),
+            };
+            let Some(position) = window
+                .partition_by
+                .iter()
+                .position(|partition| partition == column)
+            else {
+                return Ok(None);
+            };
+            let Some(value) = ranked_prefix_constant(constant, params)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                super::compare_values(&key[position], &value) == Some(Ordering::Equal),
+            ))
+        }
+        Expr::IsNull { expr, .. } if matches!(expr.as_ref(), Expr::Column(_)) => Ok(Some(true)),
+        _ => Ok(None),
+    }
+}
+
+fn ranked_prefix_null_restriction(
+    predicate: &Expr,
+) -> Option<(&contextdb_parser::ColumnRef, bool)> {
+    match predicate {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => ranked_prefix_null_restriction(left).or_else(|| ranked_prefix_null_restriction(right)),
+        Expr::IsNull { expr, negated } => match expr.as_ref() {
+            Expr::Column(column) => Some((column, *negated)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The inner partition scope was already intersected with this selected key.
+/// Replace its finite IN selector with this one seek while retaining every
+/// other predicate on the source.
+fn ranked_prefix_group_filter(
+    expr: &Expr,
+    window: &contextdb_parser::RowNumberWindow,
+    key: &[Value],
+) -> Result<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => Ok(Expr::BinaryOp {
+            left: Box::new(ranked_prefix_group_filter(left, window, key)?),
+            op: BinOp::And,
+            right: Box::new(ranked_prefix_group_filter(right, window, key)?),
+        }),
+        original @ Expr::InList {
+            expr,
+            negated: false,
+            ..
+        } => {
+            if let Expr::Column(column) = expr.as_ref()
+                && let Some(position) = window
+                    .partition_by
+                    .iter()
+                    .position(|partition| partition.column == column.column)
+            {
+                return Ok(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(column.clone())),
+                    op: BinOp::Eq,
+                    right: Box::new(super::value_to_literal(key[position].clone())?),
+                });
+            }
+            Ok(original.clone())
+        }
+        _ => Ok(expr.clone()),
+    }
+}
+
+fn build_ranked_prefix(
+    db: &dyn ReadExecutionTarget,
+    input: &PhysicalPlan,
+    predicate: &Expr,
+    params: Arc<HashMap<String, Value>>,
+    snapshot: SnapshotId,
+    context: &ControlArc<RequestContext>,
+) -> std::result::Result<Option<Box<PullNode>>, BoundedExecutionError> {
+    let Some((scan, columns, window, binding)) = ranked_prefix_shape(input) else {
+        return Ok(None);
+    };
+    if !db.ordered_prefix_snapshot_is_current(
+        snapshot,
+        context.source_read_memory(BoundedWorkSource::IndexRange),
+    )? {
+        return Ok(None);
+    }
+    let PhysicalPlan::Scan { table, filter, .. } = scan else {
+        return Ok(None);
+    };
+    let Some(inner_filter) = filter.as_ref() else {
+        return Ok(None);
+    };
+    // Selector normalization can produce an empty answer without constructing
+    // a scan. It still reads this table and must pass the scan's access gate.
+    db.assert_table_read_allowed(table)?;
+    let meta = db
+        .table_meta(table)
+        .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+    if window.partition_by.iter().any(|partition| {
+        !meta.columns.iter().any(|column| {
+            column.name == partition.column
+                && matches!(
+                    column.column_type,
+                    ColumnType::Uuid
+                        | ColumnType::Integer
+                        | ColumnType::Timestamp
+                        | ColumnType::TxId
+                        | ColumnType::Boolean
+                        | ColumnType::Text
+                )
+        })
+    }) {
+        return Ok(None);
+    }
+    // The admitted scratch ceiling covers every syntactic branch, typed
+    // literal clone and temporary plan. No store population affects it.
+    let atoms = expr_nodes(predicate)?.saturating_add(expr_nodes(inner_filter)?);
+    let scratch = checked_size_add(
+        checked_size_mul(
+            atoms,
+            checked_size_add(
+                std::mem::size_of::<PullNode>(),
+                checked_size_mul(
+                    window.partition_by.len().saturating_add(1),
+                    std::mem::size_of::<Value>() * 4,
+                    "ranked selectors",
+                )?,
+                "ranked selectors",
+            )?,
+            "ranked selectors",
+        )?,
+        checked_size_mul(
+            checked_size_add(
+                expr_capacity_bytes(predicate)?,
+                physical_plan_capacity_bytes(input)?,
+                "ranked selector payload",
+            )?,
+            atoms.saturating_add(1),
+            "ranked selector payload",
+        )?,
+        "ranked selectors",
+    )?;
+    fn parameter_clone_bytes(
+        expr: &Expr,
+        params: &HashMap<String, Value>,
+    ) -> std::result::Result<usize, BoundedExecutionError> {
+        match expr {
+            Expr::Parameter(name) => params.get(name).map_or(Ok(0), planned_value_clone_bytes),
+            Expr::BinaryOp { left, right, .. } => checked_size_add(
+                parameter_clone_bytes(left, params)?,
+                parameter_clone_bytes(right, params)?,
+                "selector parameters",
+            ),
+            Expr::InList { expr, list, .. } => {
+                list.iter()
+                    .try_fold(parameter_clone_bytes(expr, params)?, |bytes, item| {
+                        checked_size_add(
+                            bytes,
+                            parameter_clone_bytes(item, params)?,
+                            "selector parameters",
+                        )
+                    })
+            }
+            Expr::IsNull { expr, .. } | Expr::UnaryOp { operand: expr, .. } => {
+                parameter_clone_bytes(expr, params)
+            }
+            _ => Ok(0),
+        }
+    }
+    let scratch = checked_size_add(
+        scratch,
+        checked_size_mul(
+            checked_size_add(
+                parameter_clone_bytes(predicate, &params)?,
+                parameter_clone_bytes(inner_filter, &params)?,
+                "selector parameters",
+            )?,
+            atoms
+                .checked_add(1)
+                .ok_or_else(|| bounded_size_error("selector count"))?,
+            "selector parameters",
+        )?,
+        "selector scratch",
+    )?;
+    context.reserve(BoundedWorkSource::IndexRange, scratch)?;
+    let mut scratch_charge = ReservedBytes::new(context, scratch);
+    let mut groups = Vec::new();
+    if !ranked_prefix_branches(
+        predicate,
+        columns,
+        window,
+        binding,
+        &meta,
+        &params,
+        &mut groups,
+    )? {
+        return Ok(None);
+    }
+    groups.sort_by(|left, right| {
+        left.key
+            .iter()
+            .zip(&right.key)
+            .map(|(left, right)| compare_sort_values(left, right, SortDirection::Asc))
+            .find(|order| *order != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    });
+    let keys: Vec<SortKey> = window
+        .order_by
+        .iter()
+        .map(|key| SortKey {
+            expr: Expr::Column(key.column.clone()),
+            direction: key.direction,
+        })
+        .collect();
+    let mut prepared = Vec::new();
+    for group in groups {
+        let Some(in_scope) = ranked_prefix_inner_scope(inner_filter, window, &group.key, &params)?
+        else {
+            return Ok(None);
+        };
+        if !in_scope {
+            continue;
+        }
+        let mut group_filter = ranked_prefix_group_filter(inner_filter, window, &group.key)?;
+        for (column, value) in window.partition_by.iter().zip(&group.key) {
+            group_filter = Expr::BinaryOp {
+                left: Box::new(group_filter),
+                op: BinOp::And,
+                right: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(column.clone())),
+                    op: BinOp::Eq,
+                    right: Box::new(super::value_to_literal(value.clone())?),
+                }),
+            };
+        }
+        let mut group_scan = scan.clone();
+        if let PhysicalPlan::Scan { filter, .. } = &mut group_scan {
+            *filter = Some(group_filter);
+        }
+        let ranges = context.index_range_sizes(db, snapshot);
+        let ordered = ordered_scan(db, &group_scan, &keys, &params, Some(&ranges));
+        context.note_index_range_probes()?;
+        let Some((_, filter, ordered)) = ordered else {
+            return Ok(None);
+        };
+        if ordered.reverse {
+            return Ok(None);
+        }
+        let Some(declaration) = meta
+            .indexes
+            .iter()
+            .find(|index| index.name == ordered.index)
+        else {
+            return Ok(None);
+        };
+        if !window
+            .partition_by
+            .iter()
+            .zip(&declaration.columns)
+            .all(|(partition, (column, _))| partition.column == *column)
+        {
+            return Ok(None);
+        }
+        // Every source restriction must be represented by the selected key
+        // range. Reject row-body residuals before configuring prefix demand.
+        let Some(pick) = ordered.predicate_pick.as_ref() else {
+            return Ok(None);
+        };
+        let pick = db.coerce_pick_shape_to_column_type(table, pick)?;
+        if pick.pushed_columns.len() < window.partition_by.len() {
+            return Ok(None);
+        }
+        let null_restriction = ranked_prefix_null_restriction(inner_filter);
+        if let Some((column, _)) = null_restriction
+            && (declaration
+                .columns
+                .get(group.key.len())
+                .is_none_or(|(indexed, _)| *indexed != column.column)
+                || declaration.columns[group.key.len() + 1..]
+                    .iter()
+                    .any(|(_, direction)| *direction != contextdb_core::SortDirection::Asc))
+        {
+            return Ok(None);
+        }
+        fn represented(
+            expr: &Expr,
+            pushed: &[String],
+            null_restriction: Option<(&contextdb_parser::ColumnRef, bool)>,
+        ) -> bool {
+            match expr {
+                Expr::BinaryOp {
+                    left,
+                    op: BinOp::And,
+                    right,
+                } => {
+                    represented(left, pushed, null_restriction)
+                        && represented(right, pushed, null_restriction)
+                }
+                Expr::BinaryOp {
+                    left,
+                    op: BinOp::Eq,
+                    right,
+                } => {
+                    matches!(left.as_ref(),Expr::Column(column) if pushed.contains(&column.column))
+                        || matches!(right.as_ref(),Expr::Column(column) if pushed.contains(&column.column))
+                }
+                Expr::InList {
+                    expr,
+                    negated: false,
+                    ..
+                } => {
+                    matches!(expr.as_ref(),Expr::Column(column) if pushed.contains(&column.column))
+                }
+                Expr::IsNull { expr, negated } => {
+                    matches!((expr.as_ref(),null_restriction), (Expr::Column(column),Some((restricted,expected))) if column.column == restricted.column && *negated == expected)
+                }
+                _ => false,
+            }
+        }
+        if !filter.is_some_and(|filter| represented(filter, &pick.pushed_columns, null_restriction))
+        {
+            return Ok(None);
+        }
+        let mut source = Box::new(build_scan(
+            db,
+            table,
+            filter,
+            Arc::clone(&params),
+            snapshot,
+            Some(ordered),
+            None,
+            context,
+        )?);
+        let PullKind::Scan(state) = &mut source.kind else {
+            return Ok(None);
+        };
+        if let Some(transaction) = &state.transaction
+            && !transaction
+                .overlay
+                .staged_rows
+                .as_ref()
+                .is_none_or(|rows| rows.has_index_for(&declaration.name, &meta))
+        {
+            return Ok(None);
+        }
+        let ScanMode::Ordered { cursor, .. } = &mut state.mode else {
+            return Ok(None);
+        };
+        if let Some((_, non_null)) = null_restriction {
+            let mut prefix: IndexKey = group
+                .key
+                .iter()
+                .zip(&declaration.columns)
+                .map(|(value, (_, direction))| match direction {
+                    contextdb_core::SortDirection::Asc => {
+                        DirectedValue::Asc(TotalOrdAsc(value.clone()))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        DirectedValue::Desc(TotalOrdDesc(value.clone()))
+                    }
+                })
+                .collect();
+            let group_prefix = prefix.clone();
+            let null_direction = declaration.columns[group.key.len()].1;
+            prefix.push(match null_direction {
+                contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(Value::Null)),
+                contextdb_core::SortDirection::Desc => {
+                    DirectedValue::Desc(TotalOrdDesc(Value::Null))
+                }
+            });
+            let endpoint_len = prefix.len();
+            let (start, end) = if non_null {
+                match null_direction {
+                    contextdb_core::SortDirection::Desc => {
+                        // Skip the entire NULL timestamp region, including all
+                        // requested ascending tie components at their NULL-high edge.
+                        prefix.resize_with(declaration.columns.len(), || {
+                            DirectedValue::Asc(TotalOrdAsc(Value::Null))
+                        });
+                        (Bound::Excluded(prefix), Bound::Included(group_prefix))
+                    }
+                    contextdb_core::SortDirection::Asc => {
+                        (Bound::Included(group_prefix), Bound::Excluded(prefix))
+                    }
+                }
+            } else {
+                let mut high = prefix.clone();
+                high.resize_with(declaration.columns.len(), || {
+                    DirectedValue::Asc(TotalOrdAsc(Value::Null))
+                });
+                (Bound::Included(prefix), Bound::Included(high))
+            };
+            *cursor = BoundedOrderedRowCursor::for_index(declaration.name.clone(), false)
+                .seeking_run_with_prefix_len(start, end, endpoint_len);
+        }
+        let (start, end, prefix_len) = cursor.source_run_bounds();
+        let bound_has_group = |bound: &Bound<IndexKey>| match bound {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                key.len() >= group.key.len()
+                    && key.iter().zip(&group.key).all(|(component, value)| {
+                        let component = match component {
+                            DirectedValue::Asc(value) => &value.0,
+                            DirectedValue::Desc(value) => &value.0,
+                        };
+                        super::compare_values(component, value) == Some(Ordering::Equal)
+                    })
+            }
+            Bound::Unbounded => false,
+        };
+        if prefix_len < group.key.len()
+            || !bound_has_group(&start.as_ref().map(|key| key.to_vec()))
+            || !bound_has_group(&end.as_ref().map(|key| key.to_vec()))
+        {
+            return Ok(None);
+        }
+        let (start, _, _) = cursor.source_run_bounds();
+        if matches!(start, Bound::Excluded(key) if key.len() < declaration.columns.len() && matches!(key.last(), Some(DirectedValue::Desc(TotalOrdDesc(Value::Null)))) && declaration.columns[key.len()..].iter().any(|(_,direction)| *direction != contextdb_core::SortDirection::Asc))
+        {
+            return Ok(None);
+        }
+        cursor.select_identities_only();
+        cursor.source_set_prefix_quota(Some(if state.transaction.is_some() {
+            1
+        } else {
+            group.ceiling
+        }));
+        let positions = window
+            .partition_by
+            .iter()
+            .map(
+                |column| match resolve_query_result_column(&source.columns, column) {
+                    QueryResultColumn::Found(position) => Ok(position),
+                    resolution => Err(query_result_column_error(column, &resolution)),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        prepared.push((source, group, positions));
+    }
+    // All eligibility checks finish before publishing any observer binding.
+    let descriptor = context.new_group_descriptor()?;
+    let mut nodes = Vec::new();
+    let mut trace = QueryTrace::scan();
+    for (source, group, positions) in prepared {
+        let group_binding = context.bind_group(
+            descriptor,
+            &group.key,
+            "<redacted>",
+            crate::database::GroupRoute::Index,
+        )?;
+        let partition_bytes = values_retained_bytes(&group.key)?;
+        let ranked = Box::new(PullNode {
+            columns: source.columns.clone(),
+            trace: source.trace.clone(),
+            kind: PullKind::Window(WindowState {
+                prepaid_construction: 0,
+                descriptor,
+                group_binding: Some(group_binding),
+                ceiling: Some(group.ceiling),
+                input: source,
+                binding,
+                partition_positions: positions,
+                partition: Some(group.key),
+                partition_bytes,
+                rank: 0,
+                pending: None,
+            }),
+        });
+        let projected = PullNode {
+            columns: project_output_columns(columns),
+            trace: ranked.trace.clone(),
+            kind: PullKind::Project(ProjectState {
+                input: ranked,
+                columns: columns.to_vec(),
+                params: Arc::clone(&params),
+                aggregate_done: false,
+                aggregate: false,
+                pending: None,
+                aggregates: None,
+                aggregate_state_bytes: 0,
+            }),
+        };
+        trace = projected.trace.clone();
+        nodes.push(projected);
+    }
+    trace.sort_elided = true;
+    let mut node = Box::new(PullNode {
+        columns: project_output_columns(columns),
+        trace,
+        kind: PullKind::Union(UnionState {
+            prepaid_construction: 0,
+            inputs: nodes,
+            input: 0,
+            all: true,
+            seen: HashSet::new(),
+            seen_bytes: 0,
+            pending: None,
+        }),
+    });
+    let retained = pull_continuation_bytes(&node)?;
+    if retained > scratch_charge.bytes {
+        return Err(Error::Other((
+            "ranked prefix retained bytes exceed admitted construction".to_string()).into())
+        .into());
+    }
+    if let PullKind::Union(union) = &mut node.kind {
+        union.prepaid_construction = retained;
+    }
+    scratch_charge.bytes -= retained;
+    scratch_charge.release()?;
+    Ok(Some(node))
 }
 
 /// Build recursive plan nodes behind their eventual owning pointer.
@@ -8803,9 +13103,233 @@ fn build_kernel_with_ctes<'plan>(
     params: Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
     ctes: &HashMap<&'plan str, &'plan PhysicalPlan>,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<Box<PullNode>, BoundedExecutionError> {
     match plan {
+        PhysicalPlan::WindowRank {
+            input,
+            window,
+            binding,
+        } => {
+            let mut built =
+                build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
+            let descriptor = context.new_group_descriptor()?;
+            let mut source_group_bytes = 0;
+            let mut key_construction_charge = ReservedBytes::new(context, 0);
+            let mut keys = Vec::new();
+            let key_count = checked_size_add(
+                window.partition_by.len(),
+                window.order_by.len(),
+                "window keys",
+            )?;
+            let mut references = window
+                .partition_by
+                .iter()
+                .chain(window.order_by.iter().map(|key| &key.column));
+            let key_bytes = references.try_fold(
+                checked_size_mul(key_count, std::mem::size_of::<SortKey>(), "window keys")?,
+                |bytes, column| {
+                    checked_size_add(
+                        bytes,
+                        checked_size_add(
+                            column.column.len(),
+                            column.table.as_ref().map_or(0, String::len),
+                            "window column",
+                        )?,
+                        "window keys",
+                    )
+                },
+            )?;
+            context.reserve(BoundedWorkSource::UnindexedSort, key_bytes)?;
+            key_construction_charge.bytes = key_bytes;
+            keys.try_reserve_exact(key_count)
+                .map_err(|_| Error::Other(("bounded window key allocation failed".to_string()).into()))?;
+            for column in &window.partition_by {
+                keys.push(SortKey {
+                    expr: Expr::Column(column.clone()),
+                    direction: SortDirection::Asc,
+                });
+            }
+            for key in &window.order_by {
+                keys.push(SortKey {
+                    expr: Expr::Column(key.column.clone()),
+                    direction: key.direction,
+                });
+            }
+            let position_bytes = checked_size_mul(
+                window.partition_by.len(),
+                std::mem::size_of::<usize>(),
+                "window positions",
+            )?;
+            context.reserve(BoundedWorkSource::UnindexedSort, position_bytes)?;
+            let mut position_construction_charge = ReservedBytes::new(context, position_bytes);
+            let mut partition_positions = Vec::new();
+            partition_positions
+                .try_reserve_exact(window.partition_by.len())
+                .map_err(|_| {
+                    Error::Other(("bounded window binding allocation failed".to_string()).into())
+                })?;
+            // Resolve all references before execution, including an empty source.
+            for (key_number, key) in keys.iter().enumerate() {
+                if let Expr::Column(column) = &key.expr {
+                    match resolve_query_result_column(&built.columns, column) {
+                        QueryResultColumn::Found(position) => {
+                            if key_number < window.partition_by.len() {
+                                partition_positions.push(position);
+                            }
+                        }
+                        resolution => {
+                            return Err(query_result_column_error(column, &resolution).into());
+                        }
+                    }
+                }
+            }
+            if let PullKind::Scan(scan) = &mut built.kind
+                && matches!(
+                    scan.mode,
+                    ScanMode::Physical { .. } | ScanMode::Ordered { .. } | ScanMode::Index { .. }
+                )
+                && window.partition_by.iter().all(|partition| {
+                    partition.column == "row_id"
+                        || scan.meta.columns.iter().any(|column| {
+                            column.name == partition.column
+                                && matches!(
+                                    column.column_type,
+                                    ColumnType::Uuid
+                                        | ColumnType::Integer
+                                        | ColumnType::Timestamp
+                                        | ColumnType::TxId
+                                        | ColumnType::Boolean
+                                        | ColumnType::Text
+                                )
+                        })
+                })
+            {
+                let source_position_bytes = checked_size_mul(
+                    window.partition_by.len(),
+                    std::mem::size_of::<PhysicalPartitionColumn>(),
+                    "source group column bindings",
+                )?;
+                context.reserve(BoundedWorkSource::TableScan, source_position_bytes)?;
+                let mut source_charge = ReservedBytes::new(context, source_position_bytes);
+                let mut positions = Vec::new();
+                positions
+                    .try_reserve_exact(partition_positions.len())
+                    .map_err(|_| {
+                        Error::Other(("source group positions allocation failed".to_string()).into())
+                    })?;
+                for partition in &window.partition_by {
+                    positions.push(if partition.column == "row_id" {
+                        PhysicalPartitionColumn::RowId
+                    } else {
+                        PhysicalPartitionColumn::Schema(
+                            scan.schema_columns
+                                .iter()
+                                .position(|name| name == &partition.column)
+                                .ok_or_else(|| {
+                                    Error::PlanError(
+                                        "physical group column binding is missing".to_string(),
+                                    )
+                                })?,
+                        )
+                    });
+                }
+                source_group_bytes = checked_size_mul(
+                    positions.capacity(),
+                    std::mem::size_of::<PhysicalPartitionColumn>(),
+                    "source group positions",
+                )?;
+                if source_group_bytes > source_position_bytes {
+                    context.reserve(
+                        BoundedWorkSource::TableScan,
+                        source_group_bytes - source_position_bytes,
+                    )?;
+                } else if source_position_bytes > source_group_bytes {
+                    context.release(source_position_bytes - source_group_bytes)?;
+                }
+                source_charge.bytes = 0;
+                scan.source_group = Some(SourceInputGroup {
+                    descriptor,
+                    positions,
+                });
+            }
+            let actual = sort_keys_capacity_bytes(&keys)?;
+            if actual > key_bytes {
+                context.reserve(BoundedWorkSource::UnindexedSort, actual - key_bytes)?;
+            } else if key_bytes > actual {
+                context.release(key_bytes - actual)?;
+            }
+            key_construction_charge.bytes = actual;
+            // Each guard precedes its payload so later construction failures
+            // destroy the funded allocation before returning its credit.
+            let mut column_construction_charge = ReservedBytes::new(context, 0);
+            let (columns, column_bytes) =
+                clone_strings_with_reservation(&built.columns, context, "window schema")?;
+            column_construction_charge.bytes = column_bytes;
+            let mut sort_column_construction_charge = ReservedBytes::new(context, 0);
+            let (sort_columns, sort_column_bytes) =
+                clone_strings_with_reservation(&columns, context, "window sort schema")?;
+            sort_column_construction_charge.bytes = sort_column_bytes;
+            let trace = built.trace.clone();
+            let node_bytes =
+                checked_size_mul(2, std::mem::size_of::<PullNode>(), "window operators")?;
+            context.reserve(BoundedWorkSource::UnindexedSort, node_bytes)?;
+            let mut node_construction_charge = ReservedBytes::new(context, node_bytes);
+            let sorted = Box::new(PullNode {
+                columns: sort_columns,
+                trace: trace.clone(),
+                kind: PullKind::Sort(SortState {
+                    input: built,
+                    keys,
+                    params,
+                    rows: Vec::new(),
+                    prepared: false,
+                    pending: None,
+                    buffered_bytes: 0,
+                    container_bytes: 0,
+                    rank_limit: None,
+                }),
+            });
+            let node = Box::new(PullNode {
+                columns,
+                trace,
+                kind: PullKind::Window(WindowState {
+                    input: sorted,
+                    prepaid_construction: checked_size_add(
+                        checked_size_add(
+                            checked_size_add(actual, column_bytes, "window construction")?,
+                            source_group_bytes,
+                            "window source observation",
+                        )?,
+                        checked_size_add(
+                            checked_size_add(
+                                sort_column_bytes,
+                                position_bytes,
+                                "window construction",
+                            )?,
+                            node_bytes,
+                            "window construction",
+                        )?,
+                        "window construction",
+                    )?,
+                    descriptor,
+                    group_binding: None,
+                    ceiling: None,
+                    binding: *binding,
+                    partition_positions,
+                    partition: None,
+                    partition_bytes: 0,
+                    rank: 0,
+                    pending: None,
+                }),
+            });
+            key_construction_charge.bytes = 0;
+            column_construction_charge.bytes = 0;
+            sort_column_construction_charge.bytes = 0;
+            position_construction_charge.bytes = 0;
+            node_construction_charge.bytes = 0;
+            Ok(node)
+        }
         PhysicalPlan::Scan { table, filter, .. } => build_scan(
             db,
             table,
@@ -8817,6 +13341,13 @@ fn build_kernel_with_ctes<'plan>(
             context,
         )
         .map(Box::new),
+        PhysicalPlan::GroupedCount {
+            input,
+            group_by,
+            columns,
+        } => grouped_count::build_grouped_count(
+            db, input, group_by, columns, params, snapshot, context,
+        ),
         // Read-classified statements about the store itself. They walk no
         // source, so the whole answer arrives at once -- and every row of it
         // is charged on the way in, so a store with a great many vector
@@ -8824,8 +13355,10 @@ fn build_kernel_with_ctes<'plan>(
         // many rows.
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
+        | PhysicalPlan::ShowContentSize
         | PhysicalPlan::ShowMaintenancePollInterval
         | PhysicalPlan::ShowVectorServingCache
+        | PhysicalPlan::ShowStorageCompaction
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }
@@ -8841,13 +13374,48 @@ fn build_kernel_with_ctes<'plan>(
                 input,
                 columns,
                 &params,
+                snapshot,
                 context,
                 &mut maintained_count,
             )? {
                 return Ok(count);
             }
-            let input =
+            let mut input =
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
+            // A direct, unique column projection needs no second pull frame or
+            // duplicate trace. Keep the source's trace and move selected values
+            // at its output boundary; general expressions retain ProjectState.
+            let direct = matches!(&input.kind, PullKind::Vector(state) if state.output_projection.is_empty())
+                && !columns.is_empty()
+                && columns.iter().enumerate().all(|(at, projected)| {
+                    let Expr::Column(column) = &projected.expr else { return false; };
+                    let QueryResultColumn::Found(position) = resolve_query_result_column(&input.columns, column)
+                        else { return false; };
+                    // An alias can hide vector hydration demand. Keep that case
+                    // on the existing projection path.
+                    if projected.alias.as_deref().unwrap_or(column.column.as_str()) != input.columns[position] {
+                        return false;
+                    }
+                    !columns[..at].iter().any(|previous| matches!(&previous.expr,
+                        Expr::Column(other) if matches!(resolve_query_result_column(&input.columns, other),
+                            QueryResultColumn::Found(prior) if prior == position)))
+                });
+            if direct {
+                let bytes = checked_size_mul(columns.len(), size_of::<usize>(), "vector projection")?;
+                context.reserve(BoundedWorkSource::VectorCandidates, bytes)?;
+                let mut positions = Vec::with_capacity(columns.len());
+                for projected in columns {
+                    let Expr::Column(column) = &projected.expr else { unreachable!() };
+                    let QueryResultColumn::Found(position) = resolve_query_result_column(&input.columns, column)
+                        else { unreachable!() };
+                    positions.push(position);
+                }
+                let PullKind::Vector(state) = &mut input.kind else { unreachable!() };
+                state.output_projection = positions;
+                state.prepaid_construction = checked_size_add(state.prepaid_construction, bytes, "vector projection")?;
+                input.columns = project_output_columns(columns);
+                return Ok(input);
+            }
             let mut trace = input.trace.clone();
             // The count this aggregate is about to compute exactly is the one
             // a declaration would have served in O(1); say so on the trace the
@@ -8889,6 +13457,45 @@ fn build_kernel_with_ctes<'plan>(
             }))
         }
         PhysicalPlan::Sort { input, keys } => {
+            if let PhysicalPlan::Filter {
+                input: selected,
+                predicate,
+            } = input.as_ref()
+                && let Some((_, columns, window, binding)) = ranked_prefix_shape(selected)
+            {
+                let matches = keys.len() == window.partition_by.len() + 1
+                    && keys.iter().enumerate().all(|(position, key)| {
+                        if key.direction != SortDirection::Asc {
+                            return false;
+                        }
+                        let Expr::Column(reference) = &key.expr else {
+                            return false;
+                        };
+                        match ranked_prefix_project_expr(reference, columns) {
+                            Some(Expr::Column(column)) if position < window.partition_by.len() => {
+                                *column == window.partition_by[position]
+                            }
+                            Some(Expr::WindowRank(found))
+                                if position == window.partition_by.len() =>
+                            {
+                                *found == binding
+                            }
+                            _ => false,
+                        }
+                    });
+                if matches
+                    && let Some(prefix) = build_ranked_prefix(
+                        db,
+                        selected,
+                        predicate,
+                        Arc::clone(&params),
+                        snapshot,
+                        context,
+                    )?
+                {
+                    return Ok(prefix);
+                }
+            }
             // An ordered index run is the committed rows in order and nothing
             // else, so with a transaction open the rows it staged have to be
             // put where they belong. The scan does that as it walks, which is
@@ -8897,7 +13504,10 @@ fn build_kernel_with_ctes<'plan>(
             // Asked once, so the two places below cannot disagree about
             // whether a transaction is open.
             let inside_transaction = context.transaction().is_some();
-            if let Some((table, filter, ordered)) = ordered_scan(db, input, keys, &params) {
+            let ranges = context.index_range_sizes(db, snapshot);
+            let ordered = ordered_scan(db, input, keys, &params, Some(&ranges));
+            context.note_index_range_probes()?;
+            if let Some((table, filter, ordered)) = ordered {
                 return build_scan(
                     db,
                     table,
@@ -8936,17 +13546,25 @@ fn build_kernel_with_ctes<'plan>(
                     prepared: false,
                     pending: None,
                     buffered_bytes: 0,
+                    container_bytes: 0,
+                    rank_limit: None,
                 }),
             }))
         }
         PhysicalPlan::Filter { input, predicate } => {
-            let input =
+            if let Some(prefix) =
+                build_ranked_prefix(db, input, predicate, Arc::clone(&params), snapshot, context)?
+            {
+                return Ok(prefix);
+            }
+            let mut built =
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
+            limit_ranked_sort(input, predicate, &params, &mut built);
             Ok(Box::new(PullNode {
-                columns: input.columns.clone(),
-                trace: input.trace.clone(),
+                columns: built.columns.clone(),
+                trace: built.trace.clone(),
                 kind: PullKind::Filter(FilterState {
-                    input,
+                    input: built,
                     predicate: predicate.clone(),
                     params,
                     pending: None,
@@ -8991,6 +13609,7 @@ fn build_kernel_with_ctes<'plan>(
                 columns,
                 trace,
                 kind: PullKind::Union(UnionState {
+                    prepaid_construction: 0,
                     inputs: built,
                     input: 0,
                     all: *all,
@@ -9062,9 +13681,14 @@ fn build_kernel_with_ctes<'plan>(
             filter,
             ..
         } => {
+            let row_edge_guard = db.graph_cursor_read_guard(
+                context.transaction(),
+                context.source_read_memory(BoundedWorkSource::GraphTraversal),
+            )?;
+            let _decisions = row_edge_guard.as_ref().map(|capture| capture.enter());
             let Some(step) = steps.first() else {
                 return Err(
-                    Error::Other("bounded graph plan has no traversal step".to_string()).into(),
+                    Error::Other(("bounded graph plan has no traversal step".to_string()).into()).into(),
                 );
             };
             let resolved_filter = filter
@@ -9119,20 +13743,14 @@ fn build_kernel_with_ctes<'plan>(
                                 // executor draws this line for the same
                                 // statement; the kernel asks it the same way.
                                 if let Some(database) = db.as_database_for_subquery_plan() {
+                                    let mut access_memory = ReservedBytes::new(context, 0);
                                     database.bounded_assert_graph_anchor_nodes_readable(
                                         context.transaction(),
                                         &starts,
                                         snapshot,
-                                        |_bytes| {
-                                            context.charge(
-                                                BoundedWorkSource::AccessControl,
-                                                BoundedSourceTouch::AccessRow,
-                                            )?;
-                                            context.attribute_live_memory(
-                                                BoundedWorkSource::AccessControl,
-                                            );
-                                            Ok::<(), BoundedExecutionError>(())
-                                        },
+                                        |bytes| access_memory.charge_access_row(bytes),
+                                        context
+                                            .source_read_memory(BoundedWorkSource::GraphTraversal),
                                     )?;
                                 }
                                 predicates_pushed
@@ -9255,7 +13873,8 @@ fn build_kernel_with_ctes<'plan>(
             Ok(Box::new(PullNode {
                 columns,
                 trace,
-                kind: PullKind::Graph(GraphState {
+                kind: PullKind::Graph(Box::new(GraphState {
+                    _row_edge_guard: row_edge_guard,
                     start_alias: start_alias.clone(),
                     steps: steps.clone(),
                     filter: resolved_filter,
@@ -9265,26 +13884,24 @@ fn build_kernel_with_ctes<'plan>(
                     start_candidates: candidate_root,
                     edge_source,
                     visited_cap: db.bounded_legacy_visited_cap(context.declares_no_ceilings()),
-                    frontier_unit_bytes: crate::executor::estimate_bfs_working_bytes(
-                        &[()],
-                        steps.as_slice(),
-                    ),
                     single_step_unpinned: single_step && unpinned_start,
                     probes_backwards_from_target: backwards_target.is_some(),
                     single_step_probe: single_step,
-                    probe_seen: Vec::new(),
+                    probe_loops: Vec::new(),
                     probe_seen_container_bytes: 0,
                     seen_starts: Vec::new(),
                     seen_start_container_bytes: 0,
-                    seen_edges: Vec::new(),
-                    seen_edge_container_bytes: 0,
                     seen_paths: Vec::new(),
                     seen_path_container_bytes: 0,
                     frontier: Vec::new(),
                     frontier_container_bytes: 0,
                     row_memory: AmortizedRowMemory::default(),
                     active: None,
-                }),
+                    start_walks: None,
+                    start_walk_container_bytes: 0,
+                    chosen: None,
+                    active_rank: None,
+                })),
             }))
         }
         PhysicalPlan::VectorSearch {
@@ -9345,9 +13962,9 @@ fn build_kernel_with_ctes<'plan>(
             .map(Box::new),
         PhysicalPlan::CteRef { name } => {
             let input = ctes.get(name.as_str()).copied().ok_or_else(|| {
-                Error::Other(format!(
+                Error::Other((format!(
                     "bounded CTE reference `{name}` has no materialized input"
-                ))
+                )).into())
             })?;
             build_kernel_with_ctes(db, input, params, snapshot, ctes, context)
         }
@@ -9364,7 +13981,7 @@ fn resolve_candidate_delete_membership(
     table: &str,
     snapshot: SnapshotId,
     tx: &mut ScanTransactionOverlay,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<bool, BoundedExecutionError> {
     let store = db.relational_membership_store();
     let indexes = store.indexes.read();
@@ -9467,7 +14084,7 @@ fn resolve_candidate_delete_membership(
 
 // Proof-only: why one vector candidate source did or did not become
 // identity-only. Production never reads it.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 std::thread_local! {
     static VECTOR_CANDIDATE_IDENTITY_DECISION: std::cell::RefCell<Vec<&'static str>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -9497,14 +14114,14 @@ fn predicate_is_answerable_from_one_row(expr: &Expr) -> bool {
 fn note_vector_candidate_identity(
     reason: &'static str,
 ) -> std::result::Result<(), BoundedExecutionError> {
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     VECTOR_CANDIDATE_IDENTITY_DECISION.with(|slot| slot.borrow_mut().push(reason));
     let _ = reason;
     Ok(())
 }
 
 /// Take and clear what this thread's vector candidate sources decided.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn take_vector_candidate_identity_decisions_for_test() -> Vec<&'static str> {
     VECTOR_CANDIDATE_IDENTITY_DECISION.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
@@ -9517,7 +14134,7 @@ fn select_vector_candidate_identity_source(
     db: &dyn ReadExecutionTarget,
     root: &mut PullNode,
     access_filter: bool,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(), BoundedExecutionError> {
     let PullKind::Scan(state) = &mut root.kind else {
         return note_vector_candidate_identity("candidate source is not a scan");
@@ -9545,8 +14162,8 @@ fn select_vector_candidate_identity_source(
         return note_vector_candidate_identity("candidate source carries no predicate");
     };
     let pick = match &state.mode {
-        ScanMode::Index { pick, .. } => pick,
-        ScanMode::Exact { .. } => match state.residual_pick.as_ref() {
+        ScanMode::Index { pick, .. } => pick.as_ref(),
+        ScanMode::Exact { .. } => match state.residual_pick.as_deref() {
             Some(pick) => pick,
             None => return note_vector_candidate_identity("exact source has no residual pick"),
         },
@@ -9646,7 +14263,7 @@ fn select_vector_candidate_identity_source(
                 })
         })
     }
-    // SQL comparisons that need coercion, NULL/NaN exclusion or residual
+    // SQL comparisons that need coercion, NULL exclusion or residual
     // expression evaluation retain their charged row reads.
     fn covered(expr: &Expr, state: &ScanState, pick: &IndexPick) -> bool {
         if let Expr::BinaryOp {
@@ -9697,8 +14314,9 @@ fn select_vector_candidate_identity_source(
             ..
         } = expr
         {
-            // The total index order includes NULL and NaN, which SQL ordered
-            // comparisons exclude. NULL is the physical tail in ascending
+            // The total index order includes NULL, which SQL ordered
+            // comparisons exclude, and a REAL range stays on the row-checking
+            // route. NULL is the physical tail in ascending
             // order and the physical head in descending order, so a lower
             // SQL bound (`>` / `>=`) reaches it in either direction. Keep
             // nullable lower-bound ranges on the row-checking route.
@@ -9759,9 +14377,9 @@ fn select_vector_candidate_identity_source(
         };
         let index = index.clone();
         let (column, direction) = pick.columns.first().cloned().ok_or_else(|| {
-            Error::Other(format!(
+            Error::Other((format!(
                 "exact automatic index {index} has no leading column"
-            ))
+            )).into())
         })?;
         // Admitted before the runs are built, and handed back as soon as they
         // exist: what the cursor ends up holding is charged by the continuation
@@ -9782,7 +14400,7 @@ fn select_vector_candidate_identity_source(
         state.residual_pick = None;
         state.authenticated_exact_index = Some(index);
         state.mode = ScanMode::Index {
-            pick,
+            pick: Box::new(pick),
             column,
             direction,
             cursor,
@@ -9828,14 +14446,19 @@ fn select_vector_candidate_identity_source(
 /// `None` whenever any of that is not proved -- a non-boolean residual, a
 /// probe that did not fit, a partition holding a row the filter rejects. The
 /// caller then keeps the scan, which proves its candidates window by window.
+struct WholePartitionAdmission {
+    keys: Vec<VectorPartitionKey>,
+    retained_bytes: usize,
+}
+
 fn candidate_runs_admit_whole_partitions(
     db: &dyn ReadExecutionTarget,
     root: &PullNode,
     meta: &TableMeta,
     partition_keys: &[String],
     scope: Option<&[VectorPartitionKey]>,
-    context: &Arc<RequestContext>,
-) -> std::result::Result<Option<Vec<VectorPartitionKey>>, BoundedExecutionError> {
+    context: &ControlArc<RequestContext>,
+) -> std::result::Result<Option<WholePartitionAdmission>, BoundedExecutionError> {
     let PullKind::Scan(state) = &root.kind else {
         return Ok(None);
     };
@@ -9848,104 +14471,502 @@ fn candidate_runs_admit_whole_partitions(
     let leading = partition_keys.len();
     if leading == 0
         || pick.pushed_columns.len() < leading
+        || pick.columns.len() < pick.pushed_columns.len()
+        || 1usize.saturating_add(pick.suffix_shapes.len()) < pick.pushed_columns.len()
+        || pick.trailing_range.is_some()
+        || pick.prefix_empty
         || !pick.pushed_columns[..leading]
             .iter()
             .all(|column| partition_keys.contains(column))
+        || !partition_keys
+            .iter()
+            .all(|key| pick.pushed_columns[..leading].contains(key))
         || !matches!(pick.tuple_arity(), 0) && pick.tuple_arity() != leading
     {
         return Ok(None);
     }
-    let shapes = std::iter::once(&pick.shape)
-        .chain(&pick.suffix_shapes)
-        .collect::<Vec<_>>();
-    // What each boolean suffix column admits, and what it rejects.
-    let mut admitted = Vec::with_capacity(shapes.len() - leading);
-    let mut rejected = Vec::with_capacity(shapes.len() - leading);
-    for (shape, (column, _)) in shapes.iter().zip(&pick.columns).skip(leading) {
+    let shape_at = |position: usize| {
+        if position == 0 {
+            &pick.shape
+        } else {
+            &pick.suffix_shapes[position - 1]
+        }
+    };
+    if (0..leading).any(|position| super::finite_shape_values(shape_at(position)).is_none()) {
+        return Ok(None);
+    }
+    // Validate every suffix before allocating the proof batch. Its complete
+    // domain is fixed by the declared boolean type, including NULL only when
+    // nullable; the visitors below derive both sides of that domain directly.
+    for position in leading..pick.pushed_columns.len() {
+        let shape = shape_at(position);
         let Some(values) = super::finite_shape_values(shape) else {
             return Ok(None);
         };
+        let (column, _) = &pick.columns[position];
         let Some(declared) = meta
             .columns
             .iter()
-            .find(|candidate| &candidate.name == column)
+            .find(|candidate| candidate.name == *column)
         else {
             return Ok(None);
         };
         if declared.column_type != ColumnType::Boolean {
             return Ok(None);
         }
-        let mut domain = vec![Value::Bool(false), Value::Bool(true)];
-        if declared.nullable {
-            domain.push(Value::Null);
+        if values.iter().any(|value| {
+            !(matches!(value, Value::Bool(_)) || declared.nullable && matches!(value, Value::Null))
+        }) {
+            return Ok(None);
         }
-        let admits = |candidate: &Value| values.iter().any(|value| value == candidate);
-        rejected.push(
-            domain
-                .iter()
-                .filter(|candidate| !admits(candidate))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        admitted.push(
-            domain
-                .into_iter()
-                .filter(|candidate| admits(candidate))
-                .collect::<Vec<_>>(),
-        );
     }
+
+    let boolean_domain = |nullable: bool| -> &[Value] {
+        static REQUIRED: [Value; 2] = [Value::Bool(false), Value::Bool(true)];
+        static NULLABLE: [Value; 3] = [Value::Bool(false), Value::Bool(true), Value::Null];
+        if nullable { &NULLABLE } else { &REQUIRED }
+    };
+    let suffix_domain = |position: usize| -> &[Value] {
+        let column = &pick.columns[position].0;
+        let declared = meta
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == *column)
+            .expect("boolean suffix metadata was validated");
+        boolean_domain(declared.nullable)
+    };
+    let suffix_admits = |position: usize, candidate: &Value| {
+        super::finite_shape_values(shape_at(position))
+            .expect("finite boolean suffix was validated")
+            .iter()
+            .any(|value| value == candidate)
+    };
+
+    let partition_count = if let Some(tuples) = pick.tuple_prefix() {
+        tuples.len()
+    } else {
+        (0..leading).try_fold(1usize, |count, position| {
+            let values = super::finite_shape_values(shape_at(position)).ok_or_else(|| {
+                Error::Other(("finite partition prefix lost its shape".to_string()).into())
+            })?;
+            checked_size_mul(count, values.len(), "candidate partition count")
+        })?
+    };
+    let mut rejected_per_partition = 0usize;
+    let mut admitted_heads = 1usize;
+    for position in leading..pick.pushed_columns.len() {
+        let domain = suffix_domain(position);
+        let admitted_count = domain
+            .iter()
+            .filter(|value| suffix_admits(position, value))
+            .count();
+        let rejected_count = domain.len() - admitted_count;
+        rejected_per_partition = checked_size_add(
+            rejected_per_partition,
+            checked_size_mul(
+                admitted_heads,
+                rejected_count,
+                "candidate rejected prefixes",
+            )?,
+            "candidate rejected prefixes",
+        )?;
+        admitted_heads = checked_size_mul(
+            admitted_heads,
+            admitted_count,
+            "candidate admitted prefixes",
+        )?;
+    }
+    let prefix_count = checked_size_mul(
+        partition_count,
+        rejected_per_partition,
+        "candidate proof prefixes",
+    )?;
+
+    // Admit the complete allocation peak before any owned key exists: both
+    // output containers, every key/prefix slot and cloned payload, plus the
+    // two scratch tuples that overlap while a partition key is formed.
+    let key_slots = checked_size_mul(
+        partition_count,
+        std::mem::size_of::<VectorPartitionKey>(),
+        "candidate partition keys",
+    )?;
+    let component_slots = checked_size_mul(
+        checked_size_mul(partition_count, leading, "candidate partition components")?,
+        std::mem::size_of::<contextdb_core::VectorPartitionComponent>(),
+        "candidate partition components",
+    )?;
+    let prefix_headers = checked_size_mul(
+        prefix_count,
+        std::mem::size_of::<IndexKey>(),
+        "candidate proof prefixes",
+    )?;
+    let prefix_value_slots =
+        (leading..pick.pushed_columns.len()).try_fold(0usize, |bytes, position| {
+            let domain = suffix_domain(position);
+            let admitted_before = (leading..position).try_fold(1usize, |count, earlier| {
+                checked_size_mul(
+                    count,
+                    suffix_domain(earlier)
+                        .iter()
+                        .filter(|value| suffix_admits(earlier, value))
+                        .count(),
+                    "candidate proof prefixes",
+                )
+            })?;
+            let rejected_here = domain
+                .iter()
+                .filter(|value| !suffix_admits(position, value))
+                .count();
+            let keys_here = checked_size_mul(
+                partition_count,
+                checked_size_mul(admitted_before, rejected_here, "candidate proof prefixes")?,
+                "candidate proof prefixes",
+            )?;
+            checked_size_add(
+                bytes,
+                checked_size_mul(
+                    checked_size_mul(keys_here, position + 1, "candidate proof key slots")?,
+                    std::mem::size_of::<DirectedValue>(),
+                    "candidate proof key slots",
+                )?,
+                "candidate proof key slots",
+            )
+        })?;
+    let scratch_slots = checked_size_mul(
+        leading.saturating_mul(2),
+        std::mem::size_of::<Value>(),
+        "candidate partition scratch",
+    )?;
+    let directed_scratch_slots = checked_size_mul(
+        pick.pushed_columns.len(),
+        std::mem::size_of::<DirectedValue>(),
+        "candidate proof scratch",
+    )?;
+    let planned_without_payload = [
+        key_slots,
+        component_slots,
+        prefix_headers,
+        prefix_value_slots,
+        scratch_slots,
+        directed_scratch_slots,
+    ]
+    .into_iter()
+    .try_fold(0usize, |bytes, part| {
+        checked_size_add(bytes, part, "candidate coverage buffers")
+    })?;
+    let mut leading_payload_per_all_runs = 0usize;
+    if let Some(tuples) = pick.tuple_prefix() {
+        for tuple in tuples {
+            if tuple.len() != leading {
+                return Ok(None);
+            }
+            for value in tuple {
+                leading_payload_per_all_runs = checked_size_add(
+                    leading_payload_per_all_runs,
+                    value_capacity_bytes(value)?,
+                    "candidate partition payload",
+                )?;
+            }
+        }
+    } else {
+        for position in 0..leading {
+            let values = super::finite_shape_values(shape_at(position)).ok_or_else(|| {
+                Error::Other(("finite partition prefix lost its values".to_string()).into())
+            })?;
+            let repeats = if values.is_empty() {
+                0
+            } else {
+                partition_count / values.len()
+            };
+            let dimension_payload = values.iter().try_fold(0usize, |bytes, value| {
+                checked_size_add(
+                    bytes,
+                    value_capacity_bytes(value)?,
+                    "candidate partition payload",
+                )
+            })?;
+            leading_payload_per_all_runs = checked_size_add(
+                leading_payload_per_all_runs,
+                checked_size_mul(repeats, dimension_payload, "candidate partition payload")?,
+                "candidate partition payload",
+            )?;
+        }
+    }
+    let payload_copies_per_partition = checked_size_add(
+        1,
+        rejected_per_partition,
+        "candidate partition payload copies",
+    )?;
+    let maximum_partition_payload = if let Some(tuples) = pick.tuple_prefix() {
+        tuples.iter().try_fold(0usize, |largest, tuple| {
+            let bytes = tuple.iter().try_fold(0usize, |bytes, value| {
+                checked_size_add(
+                    bytes,
+                    value_capacity_bytes(value)?,
+                    "candidate partition scratch",
+                )
+            })?;
+            Ok::<usize, BoundedExecutionError>(largest.max(bytes))
+        })?
+    } else {
+        (0..leading).try_fold(0usize, |bytes, position| {
+            let values = super::finite_shape_values(shape_at(position)).ok_or_else(|| {
+                Error::Other(("finite partition prefix lost its values".to_string()).into())
+            })?;
+            let mut largest = 0usize;
+            for value in values {
+                largest = largest.max(value_capacity_bytes(value)?);
+            }
+            checked_size_add(bytes, largest, "candidate partition scratch")
+        })?
+    };
+    let planned_payload = checked_size_add(
+        checked_size_mul(
+            leading_payload_per_all_runs,
+            payload_copies_per_partition,
+            "candidate coverage payload",
+        )?,
+        checked_size_mul(maximum_partition_payload, 3, "candidate partition scratch")?,
+        "candidate coverage payload",
+    )?;
+    let planned = checked_size_add(
+        planned_without_payload,
+        planned_payload,
+        "candidate coverage buffers",
+    )?;
+    context.reserve(BoundedWorkSource::IndexRange, planned)?;
+    let mut coverage_charge = ReservedBytes::new(context, planned);
+    // These guards must outlive every buffer they fund.  That makes every
+    // early return and error unwind free the physical allocation before its
+    // exact reservation is refunded.
+    let mut prefix_charge = ReservedBytes::new(context, 0);
+    let mut key_charge = ReservedBytes::new(context, 0);
+
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(partition_count)
+        .map_err(|_| Error::Other(("bounded candidate partition allocation failed".to_string()).into()))?;
+    let mut prefixes = Vec::new();
+    prefixes
+        .try_reserve_exact(prefix_count)
+        .map_err(|_| Error::Other(("bounded candidate prefix allocation failed".to_string()).into()))?;
+    let mut leading_values = Vec::new();
+    leading_values.try_reserve_exact(leading).map_err(|_| {
+        Error::Other(("bounded candidate prefix scratch allocation failed".to_string()).into())
+    })?;
+    let mut ordered_values = Vec::new();
+    ordered_values
+        .try_reserve_exact(leading)
+        .map_err(|_| Error::Other(("bounded candidate key scratch allocation failed".to_string()).into()))?;
+
     let directed = |value: &Value, direction: contextdb_core::SortDirection| match direction {
         contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value.clone())),
         contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value.clone())),
     };
-    let mut partitions = BTreeSet::<IndexKey>::new();
-    for (start, _) in super::expanded_index_runs(pick)? {
-        let Bound::Included(key) = start else {
-            return Ok(None);
-        };
-        partitions.insert(key[..leading].to_vec());
-    }
-    // Every prefix the filter rejects inside a named partition: an admitted
-    // value on each earlier suffix column, then a rejected value on this one.
-    let mut probes = Vec::new();
-    for position in 0..rejected.len() {
-        let mut heads = vec![Vec::<DirectedValue>::new()];
-        for (earlier, values) in admitted.iter().enumerate().take(position) {
-            let direction = pick.columns[leading + earlier].1;
-            heads = heads
-                .into_iter()
-                .flat_map(|head| {
-                    values.iter().map(move |value| {
-                        let mut next = head.clone();
-                        next.push(directed(value, direction));
-                        next
-                    })
-                })
-                .collect();
-        }
-        let direction = pick.columns[leading + position].1;
-        for head in heads {
-            for value in &rejected[position] {
-                let mut probe = head.clone();
-                probe.push(directed(value, direction));
-                probes.push(probe);
+    fn visit_suffix_rejections<F>(
+        pick: &IndexPick,
+        meta: &TableMeta,
+        position: usize,
+        target: usize,
+        prefix: &mut IndexKey,
+        visit: &mut F,
+    ) -> std::result::Result<(), BoundedExecutionError>
+    where
+        F: FnMut(&IndexKey) -> std::result::Result<(), BoundedExecutionError>,
+    {
+        let shape_at = |position: usize| {
+            if position == 0 {
+                &pick.shape
+            } else {
+                &pick.suffix_shapes[position - 1]
             }
+        };
+        let (column, direction) = &pick.columns[position];
+        let nullable = meta
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == *column)
+            .expect("boolean suffix metadata was validated")
+            .nullable;
+        let domain: &[Value] = if nullable {
+            static VALUES: [Value; 3] = [Value::Bool(false), Value::Bool(true), Value::Null];
+            &VALUES
+        } else {
+            static VALUES: [Value; 2] = [Value::Bool(false), Value::Bool(true)];
+            &VALUES
+        };
+        let admitted = |candidate: &Value| {
+            super::finite_shape_values(shape_at(position))
+                .expect("finite boolean suffix was validated")
+                .iter()
+                .any(|value| value == candidate)
+        };
+        for value in domain
+            .iter()
+            .filter(|value| admitted(value) == (position < target))
+        {
+            prefix.push(match direction {
+                contextdb_core::SortDirection::Asc => {
+                    DirectedValue::Asc(TotalOrdAsc(value.clone()))
+                }
+                contextdb_core::SortDirection::Desc => {
+                    DirectedValue::Desc(TotalOrdDesc(value.clone()))
+                }
+            });
+            if position == target {
+                visit(prefix)?;
+            } else {
+                visit_suffix_rejections(pick, meta, position + 1, target, prefix, visit)?;
+            }
+            prefix.pop();
         }
+        Ok(())
     }
-    // Every rejected prefix of every named partition, proved empty together:
-    // one pool and one batch of authenticated pages for the statement.
-    let mut prefixes = Vec::with_capacity(partitions.len().saturating_mul(probes.len()));
-    for partition in &partitions {
-        for probe in &probes {
-            let mut prefix = partition.clone();
-            prefix.extend(probe.iter().cloned());
-            prefixes.push(prefix);
+    let invalid_partition = Cell::new(false);
+    let mut admit_partition = |values: &[Value]| -> std::result::Result<(), BoundedExecutionError> {
+        if values.len() != leading {
+            return Err(Error::Other(("candidate partition tuple arity changed".to_string()).into()).into());
         }
+        ordered_values.clear();
+        for partition_key in partition_keys {
+            let Some(position) = pick.pushed_columns[..leading]
+                .iter()
+                .position(|column| column == partition_key)
+            else {
+                return Err(
+                    Error::Other(("candidate partition column disappeared".to_string()).into()).into(),
+                );
+            };
+            ordered_values.push(values[position].clone());
+        }
+        let Some(key) = VectorPartitionKey::from_values(&ordered_values) else {
+            invalid_partition.set(true);
+            return Ok(());
+        };
+        if scope.is_some_and(|scope| !scope.contains(&key)) {
+            invalid_partition.set(true);
+            return Ok(());
+        }
+        keys.push(key);
+        let mut partition_prefix = IndexKey::new();
+        partition_prefix
+            .try_reserve_exact(pick.pushed_columns.len())
+            .map_err(|_| {
+                Error::Other(("bounded candidate proof-key allocation failed".to_string()).into())
+            })?;
+        for (value, (_, direction)) in values.iter().zip(&pick.columns) {
+            partition_prefix.push(directed(value, *direction));
+        }
+        for target in leading..pick.pushed_columns.len() {
+            visit_suffix_rejections(
+                pick,
+                meta,
+                leading,
+                target,
+                &mut partition_prefix,
+                &mut |prefix| {
+                    prefixes.push(prefix.clone());
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    };
+    fn visit_leading_shapes<F>(
+        pick: &IndexPick,
+        leading: usize,
+        position: usize,
+        values: &mut Vec<Value>,
+        visit: &mut F,
+    ) -> std::result::Result<(), BoundedExecutionError>
+    where
+        F: FnMut(&[Value]) -> std::result::Result<(), BoundedExecutionError>,
+    {
+        if position == leading {
+            return visit(values);
+        }
+        let shape = if position == 0 {
+            &pick.shape
+        } else {
+            &pick.suffix_shapes[position - 1]
+        };
+        let choices = super::finite_shape_values(shape)
+            .ok_or_else(|| Error::Other(("finite partition prefix lost its shape".to_string()).into()))?;
+        for value in choices {
+            values.push(value.clone());
+            visit_leading_shapes(pick, leading, position + 1, values, visit)?;
+            values.pop();
+        }
+        Ok(())
     }
+    if let Some(tuples) = pick.tuple_prefix() {
+        for tuple in tuples {
+            admit_partition(tuple)?;
+        }
+    } else {
+        visit_leading_shapes(pick, leading, 0, &mut leading_values, &mut admit_partition)?;
+    }
+    drop(ordered_values);
+    drop(leading_values);
+    if invalid_partition.get() {
+        return Ok(None);
+    }
+
+    let prefix_bytes = prefixes.iter().try_fold(
+        checked_size_mul(
+            prefixes.capacity(),
+            std::mem::size_of::<IndexKey>(),
+            "candidate proof prefixes",
+        )?,
+        |bytes, prefix| {
+            prefix.iter().try_fold(
+                checked_size_add(
+                    bytes,
+                    checked_size_mul(
+                        prefix.capacity(),
+                        std::mem::size_of::<DirectedValue>(),
+                        "candidate proof key",
+                    )?,
+                    "candidate proof key",
+                )?,
+                |bytes, value| {
+                    let value = match value {
+                        DirectedValue::Asc(TotalOrdAsc(value))
+                        | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                    };
+                    checked_size_add(
+                        bytes,
+                        value_capacity_bytes(value)?,
+                        "candidate proof payload",
+                    )
+                },
+            )
+        },
+    )?;
+    let key_bytes = keys.iter().try_fold(
+        checked_size_mul(
+            keys.capacity(),
+            std::mem::size_of::<VectorPartitionKey>(),
+            "candidate partition keys",
+        )?,
+        |bytes, key| {
+            checked_size_add(
+                bytes,
+                key.estimated_bytes()
+                    .saturating_sub(std::mem::size_of::<VectorPartitionKey>()),
+                "candidate partition payload",
+            )
+        },
+    )?;
+    let actual = checked_size_add(prefix_bytes, key_bytes, "candidate coverage buffers")?;
+    coverage_charge.bytes = 0;
+    reconcile_new_reservation(context, BoundedWorkSource::IndexRange, planned, actual)?;
+    prefix_charge.bytes = prefix_bytes;
+    key_charge.bytes = key_bytes;
     if !prefixes.is_empty() {
         let empty = db.bounded_verified_index_prefixes_are_empty(
             &state.table,
             &pick.name,
+            state.snapshot,
             &prefixes,
             &mut || context.checkpoint(),
             &mut || {
@@ -9954,44 +14975,112 @@ fn candidate_runs_admit_whole_partitions(
                     BoundedSourceTouch::IndexEntry,
                 )
             },
+            &mut || context.native_source_touch(),
+            context.source_read_memory(BoundedWorkSource::IndexRange),
         )?;
         if empty != Some(true) {
             return Ok(None);
         }
     }
-    let positions = partition_keys
-        .iter()
-        .map(|key| {
-            pick.pushed_columns[..leading]
-                .iter()
-                .position(|column| column == key)
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(positions) = positions else {
-        return Ok(None);
-    };
-    let mut keys = Vec::with_capacity(partitions.len());
-    for partition in &partitions {
-        let values = positions
-            .iter()
-            .map(|position| match &partition[*position] {
-                DirectedValue::Asc(TotalOrdAsc(value))
-                | DirectedValue::Desc(TotalOrdDesc(value)) => value.clone(),
-            })
-            .collect::<Vec<_>>();
-        let Some(key) = VectorPartitionKey::from_values(&values) else {
-            return Ok(None);
-        };
-        // The partitions searched are never wider than the statement's own
-        // partition scope.
-        if scope.is_some_and(|scope| !scope.contains(&key)) {
-            return Ok(None);
-        }
-        keys.push(key);
-    }
-    keys.sort();
+    drop(prefixes);
+    prefix_charge.release()?;
+    keys.sort_unstable();
     keys.dedup();
-    Ok(Some(keys))
+    key_charge.bytes = 0;
+    Ok(Some(WholePartitionAdmission {
+        keys,
+        retained_bytes: key_bytes,
+    }))
+}
+
+/// Where one cold vector graph load's credit move stands. Test observation
+/// only.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphCreditTransferPhase {
+    /// The request still holds the load credit; nothing is admitted yet.
+    BeforeDestination,
+    /// The destination has admitted the bytes; the request's credit is not
+    /// split yet.
+    DestinationAdmitted,
+    /// The request's credit has been split off and given back.
+    SourceSplit,
+}
+
+/// One observation of a graph credit move: the bytes moving, what this
+/// request's credit holds, and what the destination owner has in use.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphCreditTransferCut {
+    pub phase: GraphCreditTransferPhase,
+    pub bytes: usize,
+    pub request_credit: usize,
+    pub destination_used: usize,
+}
+
+/// The callback a cold vector graph load uses to hand its load credit to the
+/// graph's owner. It owns `funding`, the charge for its own allocation, until
+/// its last clone drops. The prototype and the funded callback are both built
+/// here, so they share one closure type and one layout.
+fn graph_credit_transfer(
+    context: ControlArc<RequestContext>,
+    funding: SourcePageCharge,
+) -> impl Fn(&crate::memory_accounting::MemoryAccountant, usize) -> contextdb_core::Result<()>
++ Send
++ Sync
++ 'static {
+    move |destination: &crate::memory_accounting::MemoryAccountant, bytes: usize| {
+        let _funding = &funding;
+        context.transfer_graph_credit(destination, bytes)
+    }
+}
+
+/// Whether a refusal is this reader's own memory limit. An AUTO search that
+/// cannot afford its graph answers with the exact scan only for this refusal;
+/// a work, time, cancellation or any other failure still ends the read.
+fn reader_memory_refusal(error: &BoundedExecutionError) -> bool {
+    matches!(
+        error,
+        BoundedExecutionError::Refused(failure)
+            if matches!(
+                failure.detail(),
+                ReadFailureDetail::OwnerLimitExceeded(detail)
+                    if detail.limit == ReadFailureLimit::Memory
+            )
+    )
+}
+
+/// The transfer callback, charged to this request before it is allocated. A
+/// stack prototype with an empty charge gives the closure's exact layout; the
+/// allocation is that layout behind the `Arc` header. The callback carries a
+/// live charge for exactly those bytes, so this read's ceiling keeps counting
+/// them for as long as the callback lives.
+fn funded_graph_credit_transfer(
+    context: &ControlArc<RequestContext>,
+) -> std::result::Result<crate::local_transport::query_funding::Funded<super::VectorLoadReservationTransfer>, BoundedExecutionError> {
+    let prototype = graph_credit_transfer(
+        context.clone(),
+        SourcePageCharge {
+            _credit: ReadCredit::new(Arc::clone(&context.reader_budget)),
+            live: context.live_source_pages.clone(),
+            bytes: 0,
+        },
+    );
+    let bytes = std::alloc::Layout::new::<[usize; 2]>()
+        .extend(std::alloc::Layout::for_value(&prototype))
+        .map(|(layout, _)| layout.pad_to_align().size())
+        .map_err(|_| Error::Other(("vector load transfer layout overflows".to_string()).into()))?;
+    drop(prototype);
+    let mut funding = context.admit_live_charge(
+        BoundedWorkSource::VectorCandidates, bytes, "fund_vector_load_transfer")?;
+    let credit = funding._credit.try_split_off(bytes)?;
+    let transfer: super::VectorLoadReservationTransfer =
+        Arc::new(graph_credit_transfer(context.clone(), funding));
+    // All raw aliases are consumed by the synchronous search/TLS scope.
+    // This keeper remains outside that scope through return and unwind.
+    Ok(crate::local_transport::query_funding::Funded { value: transfer, credit: Some(credit) })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10008,7 +15097,7 @@ fn build_vector_kernel<'plan>(
     params: Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
     ctes: &HashMap<&'plan str, &'plan PhysicalPlan>,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
     db.assert_table_read_allowed(table)?;
     let index = VectorIndexRef::new(table.to_string(), column.to_string());
@@ -10018,10 +15107,17 @@ fn build_vector_kernel<'plan>(
     }
     let schema = db.bounded_vector_schema_read_many(schema_indexes);
     db.assert_vector_index_exists_under_schema_read(&index)?;
+    // Parameters are already owned and funded by this reader and retained in
+    // VectorState for its entire lifetime. Borrow their vector body rather than
+    // allocating a second continuation copy before the scorer makes its copy.
     let (query, query_vector_source, query_bytes) =
-        bounded_query_vector(db, query_expr, &params, snapshot, context)?;
+        if parameter_query_vector(query_expr, &params).is_some() {
+            (Vec::new(), None, 0)
+        } else {
+            bounded_query_vector(db, query_expr, &params, snapshot, context)?
+        };
     let k = usize::try_from(requested_k).map_err(|_| {
-        Error::Other("bounded vector LIMIT exceeds the native address space".to_string())
+        Error::Other(("bounded vector LIMIT exceeds the native address space".to_string()).into())
     })?;
     let candidate_k = k;
     let access_filter = db.bounded_read_requires_candidate_filter(table)?;
@@ -10059,29 +15155,9 @@ fn build_vector_kernel<'plan>(
         }
         .into());
     }
-    if search_mode == contextdb_core::VectorSearchMode::Auto
-        && !complete_relational_route
-        && crate::memory_accounting::ScopedMemoryReservation::try_new_for(
-            &db.bounded_read_accountant(),
-            db.bounded_vector_entry_count(&index, snapshot)
-                .saturating_mul(std::mem::size_of::<(RowId, f32)>()),
-            "vector_search",
-            "preflight_filtered_exact_scores",
-            "Add a relational index for the filter, reduce vector volume, or raise MEMORY_LIMIT.",
-        )
-        .is_err()
-    {
-        return Err(Error::VectorFilteredRouteUnavailable {
-            index: index.clone(),
-            predicate_columns: super::vector_candidate_refusal_columns(
-                db,
-                &index,
-                access_candidates.as_ref(),
-                access_filter,
-            ),
-        }
-        .into());
-    }
+    // AUTO's relational fallback streams a fixed top-k, not a score array
+    // proportional to the table. Its real cursor, predicate, score and output
+    // admissions below decide whether the complete answer fits this request.
     let directory_candidates = access_filter && route.directory_route;
     let unrestricted = !access_filter
         && (partition_scope
@@ -10094,7 +15170,18 @@ fn build_vector_kernel<'plan>(
     } else {
         access_candidates.as_ref()
     };
-    let mut candidate_root = candidate_plan
+    let forced_exact = search_mode == contextdb_core::VectorSearchMode::Auto && !complete_relational_route;
+    let streamed_filter = (forced_exact && !access_filter && context.transaction().is_none())
+        .then(|| candidate_plan.and_then(|plan| vector_row_filter(plan, table))).flatten();
+    let stream_plain_filter = streamed_filter.is_some();
+    let row_filter = if let Some(filter) = streamed_filter {
+        Some(Box::new((filter, None)))
+    } else {
+        (context.transaction().is_none() && !directory_candidates)
+            .then(|| candidate_plan.and_then(|plan| vector_row_filter(plan, table))).flatten()
+            .map(|filter| Box::new((filter, Some(meta.clone()))))
+    };
+    let mut candidate_root = candidate_plan.filter(|_| !stream_plain_filter)
         .map(|candidate| {
             build_kernel_with_ctes(db, candidate, Arc::clone(&params), snapshot, ctes, context)
         })
@@ -10114,6 +15201,10 @@ fn build_vector_kernel<'plan>(
     // The row gate and the statement's own predicate still judge every row
     // that is published, and the scan's index still names any row that
     // contradicts it (`materialize_scored_row`).
+    // This guard is deliberately declared before `whole_partitions`: an
+    // identity-note failure drops the returned keys first, then refunds the
+    // credit that was transferred out of the candidate proof.
+    let mut whole_partition_charge = ReservedBytes::new(context, 0);
     let whole_partitions = match (
         candidate_root.as_ref(),
         vector_column.partition_key_columns.as_deref(),
@@ -10132,6 +15223,9 @@ fn build_vector_kernel<'plan>(
         }
         _ => None,
     };
+    whole_partition_charge.bytes = whole_partitions
+        .as_ref()
+        .map_or(0, |admission| admission.retained_bytes);
     let candidate_root_was_kept = whole_partitions.is_none();
     if !candidate_root_was_kept {
         note_vector_candidate_identity("candidate runs admit whole partitions")?;
@@ -10140,16 +15234,37 @@ fn build_vector_kernel<'plan>(
     // What this handle's own transaction has done to these vectors, decided
     // once here rather than asked per entry. Charged before it is held, like
     // the row overlay a scan takes.
+    let mut overlay_bytes = 0;
     let vector_overlay = match context.transaction() {
-        Some(tx) => db
-            .transaction_vector_overlay(tx, &index)?
-            .into_option_if_not_empty(),
+        Some(tx) => {
+            let overlay = db.transaction_vector_overlay(tx, &index, &mut |bytes| {
+                context.reserve(BoundedWorkSource::VectorCandidates, bytes)?;
+                overlay_bytes = bytes;
+                Ok(())
+            });
+            match overlay {
+                Ok(overlay) => overlay.into_option_if_not_empty(),
+                Err(error) => {
+                    context.release(overlay_bytes)?;
+                    return Err(error);
+                }
+            }
+        }
         None => None,
     };
-    let overlay_bytes = vector_overlay.as_ref().map_or(0, |overlay| overlay.bytes);
-    if overlay_bytes > 0 {
-        context.reserve(BoundedWorkSource::VectorCandidates, overlay_bytes)?;
-    }
+    let vector_overlay = match vector_overlay {
+        Some(overlay) => {
+            let bytes = size_of::<super::TransactionVectorOverlay>();
+            context.reserve(BoundedWorkSource::VectorCandidates, bytes)?;
+            overlay_bytes = checked_size_add(overlay_bytes, bytes, "vector overlay control")?;
+            Some(Box::new(overlay))
+        }
+        None => {
+            context.release(overlay_bytes)?;
+            overlay_bytes = 0;
+            None
+        }
+    };
     let mut candidate_ids = Vec::new();
     let mut candidate_bytes = 0usize;
     if directory_candidates {
@@ -10168,14 +15283,16 @@ fn build_vector_kernel<'plan>(
             let row =
                 context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
                     db.bounded_row_by_identity(
+                        context.source_read_memory(BoundedWorkSource::VectorCandidates),
                         context.transaction(),
                         table,
                         row_id,
                         snapshot,
-                        &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                        &mut || context.native_source_touch(),
                         &mut |bytes| {
-                            retained = bytes;
-                            context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                            retained = context
+                                .admit_source_row(BoundedWorkSource::VectorCandidates, bytes)?;
+                            Ok(())
                         },
                     )
                 })?;
@@ -10204,6 +15321,7 @@ fn build_vector_kernel<'plan>(
                         context.attribute_live_memory(BoundedWorkSource::AccessControl);
                         Ok(())
                     },
+                    context.source_read_memory(BoundedWorkSource::AccessControl),
                 )? {
                     candidate_bytes += reserve_vector_slot(
                         context,
@@ -10220,14 +15338,18 @@ fn build_vector_kernel<'plan>(
             result
         };
         let mut collect = || {
-            db.bounded_vector_visit_visible_ids(
-                &index,
-                snapshot,
-                &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-                &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
-                &mut |bytes| context.release_parked(bytes),
-                &mut admit,
-            )
+            context.with_vector_copies(|vector_copy_owner| {
+                db.bounded_vector_visit_visible_ids(
+                    &index,
+                    snapshot,
+                    &mut || context.native_source_touch(),
+                    &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
+                    &mut |bytes| context.release_parked(bytes),
+                    &mut admit,
+                    vector_copy_owner,
+                    context.reader_budget.clone(),
+                )
+            })
         };
         if let Some(prefixes) = partition_scope
             .as_ref()
@@ -10267,22 +15389,8 @@ fn build_vector_kernel<'plan>(
         None if unrestricted => Some(QueryTrace::scan()),
         None => None,
     };
-    // Taken before a single vector is read, and named for the work it belongs
-    // to: a store whose limit stops this tells the operator WHICH work it
-    // stopped, rather than reporting the read's own ceiling for a limit that
-    // is not the read's.
-    let overlay_reservation = match vector_overlay.as_ref() {
-        Some(overlay) => {
-            match db.bounded_vector_overlay_reservation(&index, overlay.searchable_entry_count) {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    context.release(overlay_bytes)?;
-                    return Err(error.into());
-                }
-            }
-        }
-        None => None,
-    };
+    // The overlay owns its real store-wide container admission. Vector
+    // payload clones are admitted when touched by the existing kernel.
     // With an overlay in play the source must hand up enough extra committed
     // candidates for every removed, moved, or staged delta to have its say.
     // Stopping at the statement's LIMIT can lose the replacement for a row
@@ -10309,23 +15417,35 @@ fn build_vector_kernel<'plan>(
     let restricted_candidates =
         candidates.is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table));
     let trace = vector_search_trace_with_source(operator, candidate_trace, query_vector_source);
+    context.reserve(
+        BoundedWorkSource::VectorCandidates,
+        size_of::<VectorState>(),
+    )?;
     Ok(PullNode {
         columns,
         trace,
-        kind: PullKind::Vector(VectorState {
+        kind: PullKind::Vector(Box::new(VectorState {
+            #[cfg(any(test, feature = "test-seams"))]
+            receipt: vector_search_receipt::SearchReceiptState::Unstarted,
             supplement_columns: Vec::new(),
             table: table.to_string(),
             index,
             query,
             _query_bytes: query_bytes,
+            output_projection: Vec::new(),
             k,
             candidate_k,
             partition_prefixes: match whole_partitions {
-                Some(partitions) => Some(partitions),
+                Some(admission) => Some(admission.keys),
                 None => partition_scope
                     .as_ref()
                     .and_then(super::VectorPartitionScope::resolved_prefixes)
                     .map(<[VectorPartitionKey]>::to_vec),
+            },
+            partition_prefix_bytes: {
+                let bytes = whole_partition_charge.bytes;
+                whole_partition_charge.bytes = 0;
+                bytes
             },
             search_mode,
             force_exact_for_relational_fallback: search_mode
@@ -10340,11 +15460,17 @@ fn build_vector_kernel<'plan>(
             snapshot,
             _schema: schema,
             identity_source_index,
-            preparation: VectorPreparation::Candidates(candidate_root),
+            preparation: if stream_plain_filter { VectorPreparation::Search }
+                else { VectorPreparation::Candidates(candidate_root) },
             candidate_filter: (candidate_plan.is_some() && candidate_root_was_kept)
                 || directory_candidates,
             candidate_ids,
             candidate_bytes,
+            row_filter,
+            prepaid_construction: size_of::<VectorState>(),
+            row_check_allowance: None,
+            row_checks: Cell::new(0),
+            row_checked: stream_plain_filter,
             source: None,
             scores: Vec::new(),
             score_bytes: 0,
@@ -10355,24 +15481,101 @@ fn build_vector_kernel<'plan>(
             output: VecDeque::new(),
             output_container_bytes: 0,
             used_hnsw: false,
-            disclosure: None,
             vector_overlay,
             overlay_bytes,
-            _overlay_reservation: overlay_reservation,
-        }),
+        })),
     })
+}
+
+/// The predicate of a candidate plan that is a plain scan of `table`, under
+/// any projections: the one shape whose rows a search can check one at a
+/// time with exactly the statement's own filter.
+fn vector_row_filter(plan: &PhysicalPlan, table: &str) -> Option<Expr> {
+    let mut plan = plan;
+    while let PhysicalPlan::Project { input, .. } = plan {
+        plan = input;
+    }
+    match plan {
+        PhysicalPlan::Scan {
+            table: scanned,
+            filter: Some(filter),
+            ..
+        } if scanned == table && predicate_is_answerable_from_one_row(filter) => {
+            Some(filter.clone())
+        },
+        _ => None,
+    }
+}
+
+/// Whether one row passes the statement's filter and authorization, read by
+/// identity at the statement's snapshot. Its one row read is charged as an
+/// examined row before it is read.
+#[allow(clippy::too_many_arguments)]
+fn vector_row_passes(
+    db: &dyn ReadExecutionTarget,
+    context: &ControlArc<RequestContext>,
+    table: &str,
+    filter: &Expr,
+    meta: Option<&TableMeta>,
+    params: &HashMap<String, Value>,
+    snapshot: SnapshotId,
+    row_id: RowId,
+) -> std::result::Result<bool, BoundedExecutionError> {
+    context.charge(
+        BoundedWorkSource::VectorCandidates,
+        BoundedSourceTouch::TableRow,
+    )?;
+    let mut retained = 0;
+    let passes = context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
+        db.visit_bounded_row_by_identity(
+            context.source_read_memory(BoundedWorkSource::VectorCandidates),
+            context.transaction(), table, row_id, snapshot,
+            &mut || context.native_source_touch(),
+            &mut |bytes| {
+                retained = context.admit_source_row(BoundedWorkSource::VectorCandidates, bytes)?;
+                Ok(())
+            },
+            &mut |row| {
+                let Some(row) = row else { return Ok(false); };
+        if super::eval_bool_expr(filter, &|inner| super::eval_expr_value(row, inner, params))?
+            != Some(true)
+        {
+            return Ok(false);
+        }
+        let Some(meta) = meta else { return Ok(true); };
+        db.bounded_read_allowed_for_row(
+            context.transaction(),
+            table,
+            meta,
+            row,
+            snapshot,
+            &mut |_| {
+                context.charge(
+                    BoundedWorkSource::AccessControl,
+                    BoundedSourceTouch::AccessRow,
+                )?;
+                context.attribute_live_memory(BoundedWorkSource::AccessControl);
+                Ok(())
+            },
+            context.source_read_memory(BoundedWorkSource::AccessControl),
+        )
+            },
+        )
+    });
+    context.release(retained)?;
+    passes
 }
 
 fn reserve_query_vector_clone(
     source: &[f32],
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(Vec<f32>, usize), BoundedExecutionError> {
     let planned = checked_size_mul(source.len(), std::mem::size_of::<f32>(), "query vector")?;
     context.reserve(BoundedWorkSource::VectorCandidates, planned)?;
     let mut vector = Vec::new();
     if vector.try_reserve_exact(source.len()).is_err() {
         context.release(planned)?;
-        return Err(Error::Other("bounded query-vector allocation failed".to_string()).into());
+        return Err(Error::Other(("bounded query-vector allocation failed".to_string()).into()).into());
     }
     vector.extend_from_slice(source);
     let actual = match checked_size_mul(
@@ -10397,13 +15600,13 @@ fn reserve_query_vector_clone(
 
 fn bounded_text_query_vector(
     text: &str,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(Vec<f32>, usize), BoundedExecutionError> {
     let trimmed = text.trim();
     let inner = trimmed
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
-        .ok_or_else(|| Error::Other(format!("invalid VECTOR literal '{text}'")))?;
+        .ok_or_else(|| Error::Other((format!("invalid VECTOR literal '{text}'")).into()))?;
     let component_count = if inner.trim().is_empty() {
         0
     } else {
@@ -10414,7 +15617,7 @@ fn bounded_text_query_vector(
     let mut vector = Vec::new();
     if vector.try_reserve_exact(component_count).is_err() {
         context.release(planned)?;
-        return Err(Error::Other("bounded query-vector allocation failed".to_string()).into());
+        return Err(Error::Other(("bounded query-vector allocation failed".to_string()).into()).into());
     }
     if component_count != 0 {
         for part in inner.split(',') {
@@ -10422,10 +15625,10 @@ fn bounded_text_query_vector(
                 Ok(value) => value,
                 Err(error) => {
                     context.release(planned)?;
-                    return Err(Error::Other(format!(
+                    return Err(Error::Other((format!(
                         "invalid VECTOR component '{}': {error}",
                         part.trim()
-                    ))
+                    )).into())
                     .into());
                 }
             };
@@ -10449,7 +15652,7 @@ fn bounded_text_query_vector(
 fn bounded_query_vector_from_value(
     value: &Value,
     params: &HashMap<String, Value>,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(Vec<f32>, usize), BoundedExecutionError> {
     bounded_query_vector_from_scalar(BorrowedScalar::from_value(value), params, context)
 }
@@ -10457,7 +15660,7 @@ fn bounded_query_vector_from_value(
 fn bounded_query_vector_from_scalar(
     value: BorrowedScalar<'_>,
     params: &HashMap<String, Value>,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(Vec<f32>, usize), BoundedExecutionError> {
     match value {
         BorrowedScalar::Vector(vector) => reserve_query_vector_clone(vector, context),
@@ -10475,7 +15678,7 @@ fn bounded_query_vector_from_scalar(
 fn bounded_query_vector_from_text(
     text: &str,
     params: &HashMap<String, Value>,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(Vec<f32>, usize), BoundedExecutionError> {
     if text.trim_start().starts_with('[') {
         return bounded_text_query_vector(text, context);
@@ -10486,12 +15689,27 @@ fn bounded_query_vector_from_text(
     }
 }
 
+// Only direct vector parameters can be borrowed here. Text decoding and
+// ROW_VECTOR keep their existing separately admitted owned result.
+fn parameter_query_vector<'a>(expr: &Expr, params: &'a HashMap<String, Value>) -> Option<&'a [f32]> {
+    let name = match expr {
+        Expr::Parameter(name) => name,
+        Expr::Column(column) => &column.column,
+        Expr::CosineDistance { right, .. } => return parameter_query_vector(right, params),
+        _ => return None,
+    };
+    match params.get(name) {
+        Some(Value::Vector(vector)) => Some(vector),
+        _ => None,
+    }
+}
+
 fn bounded_query_vector(
     db: &dyn ReadExecutionTarget,
     expr: &Expr,
     params: &HashMap<String, Value>,
     snapshot: SnapshotId,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<(Vec<f32>, Option<VectorIndexRef>, usize), BoundedExecutionError> {
     match expr {
         Expr::RowVectorSource { table, column, key } => {
@@ -10541,11 +15759,23 @@ fn bounded_query_vector(
             // session staged is the row this read is about.
             let tx = context.transaction();
             let row_id = db
-                .row_id_for_natural_key_in_tx(tx, table, &key_column, &key, snapshot)?
+                .row_id_for_natural_key_in_tx(
+                    tx,
+                    table,
+                    &key_column,
+                    &key,
+                    snapshot,
+                    context.source_read_memory(BoundedWorkSource::VectorCandidates),
+                )?
                 .ok_or_else(|| Error::PersistedRowVectorRowMissing {
                     index: source_index.clone(),
                     key: key_label.clone(),
                 })?;
+            let mut vector_copy_owner =
+                crate::vector_read_memory::admission(Arc::new(SourceDecodeBudget {
+                    context: context.clone(),
+                    source: BoundedWorkSource::VectorCandidates,
+                }));
             let resolved = db.with_bounded_row_vector(
                 &source_index,
                 row_id,
@@ -10563,7 +15793,15 @@ fn bounded_query_vector(
                     db.validate_vector_under_schema_read(&source_index, vector.len())?;
                     reserve_query_vector_clone(vector, context)
                 },
+                &mut vector_copy_owner,
+                Arc::new(SourceDecodeBudget {
+                    context: context.clone(),
+                    source: BoundedWorkSource::VectorCandidates,
+                }),
             )?;
+            // The helper's temporary source body is gone; the returned clone
+            // has its separate, existing query-vector reservation.
+            drop(vector_copy_owner);
             let (vector, retained_bytes) =
                 resolved.ok_or_else(|| Error::PersistedRowVectorCellNull {
                     index: source_index.clone(),
@@ -10625,12 +15863,16 @@ fn empty_node() -> PullNode {
 fn scan_transaction_overlay(
     db: &dyn ReadExecutionTarget,
     table: &str,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<Option<ScanTransactionOverlay>, BoundedExecutionError> {
     let Some(tx) = context.transaction() else {
         return Ok(None);
     };
-    let overlay = db.transaction_table_overlay(tx, table)?;
+    let overlay = db.transaction_table_overlay(
+        tx,
+        table,
+        context.source_read_memory(BoundedWorkSource::TableScan),
+    )?;
     if overlay.is_empty() {
         return Ok(None);
     }
@@ -10638,10 +15880,11 @@ fn scan_transaction_overlay(
     Ok(Some(ScanTransactionOverlay {
         predicate_deleted: Vec::new(),
         committed_predicates_resolved: false,
-        tx,
         overlay,
         restaged_over_committed: std::collections::HashSet::new(),
-        published: 0,
+        published: None,
+        ordered_staged: None,
+        staged_key_bytes: 0,
         committed_exhausted: false,
     }))
 }
@@ -10660,7 +15903,7 @@ fn build_scan(
     // filter has nothing to ask with, so without this it would walk the whole
     // table where the executor reads one run of an index.
     chosen_pick: Option<IndexPick>,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
     // The name `dual` answers as a one-row, zero-column constant source only
     // while no table carries it. An operator who creates a table called `dual`
@@ -10671,8 +15914,10 @@ fn build_scan(
             trace: QueryTrace::scan(),
             kind: PullKind::Static(StaticState {
                 rows: VecDeque::from([PulledRow {
+                    window: None,
                     values: Vec::new(),
                     retained_bytes: 0,
+                    group_binding: None,
                 }]),
             }),
         });
@@ -10699,15 +15944,16 @@ fn build_scan(
     // query first turns `a IN (SELECT ...)` into a list of literals, and a
     // shape the writer never wrote then looks indexable -- so the two doors
     // disagree about whether the statement uses an index at all.
+    let ranges = context.index_range_sizes(db, snapshot);
     let filter_analysis =
-        filter.map(|filter| analyze_filter_for_index(table, &meta, filter, &params));
+        filter.map(|filter| analyze_filter_for_index(table, &meta, filter, &params, Some(&ranges)));
+    context.note_index_range_probes()?;
     // A predicate that can match nothing -- contradictory equalities on the
-    // same column, a NULL or NaN bound where a value is required, a literal
+    // same column, a NULL bound where a value is required, a literal
     // that cannot even be read as the column's type -- answers zero rows
     // having read none. The executor decides this before it touches the store
     // (`executor.rs:6912`); a read that instead drops the unusable pick walks
-    // the whole table, charges the reader for every row of it, and for NaN
-    // hands back a row the other door never returns.
+    // the whole table and charges the reader for every row of it.
     let coerced_filter_pick = filter_analysis
         .as_ref()
         .and_then(|analysis| analysis.pick.clone())
@@ -10726,6 +15972,7 @@ fn build_scan(
     let mut ordered_merge_keys = None;
     let mut exact_pick: Option<IndexPick> = None;
     let mut empty_pick: Option<IndexPick> = None;
+    let empty_ordered = ordered.is_some();
     let mut mode = if filter_matches_nothing {
         considered.extend(
             filter_analysis
@@ -10857,7 +16104,7 @@ fn build_scan(
             })
         }) {
             let (column, direction) = pick.columns.first().cloned().ok_or_else(|| {
-                Error::Other(format!("bounded index {} has no leading column", pick.name))
+                Error::Other((format!("bounded index {} has no leading column", pick.name)).into())
             })?;
             // Admitted before the runs are built, so a list too long for the
             // ceiling is refused rather than allocated and then discovered.
@@ -10892,7 +16139,7 @@ fn build_scan(
             };
             ScanMode::Index {
                 cursor,
-                pick,
+                pick: Box::new(pick),
                 column,
                 direction,
             }
@@ -10906,6 +16153,22 @@ fn build_scan(
             cursor: db.bounded_physical_table_cursor(table)?,
         }
     };
+    let selected_index = match &mode {
+        ScanMode::Index { pick, .. } => Some(pick.name.as_str()),
+        ScanMode::Ordered { cursor, .. } => cursor.index_name(),
+        ScanMode::Exact { index, .. } => Some(index.as_str()),
+        ScanMode::Empty => empty_pick.as_ref().map(|pick| pick.name.as_str()),
+        ScanMode::Physical { .. } => None,
+    };
+    if let Some(index) = selected_index {
+        db.preflight_historical_index(
+            table,
+            index,
+            snapshot,
+            context.source_read_memory(BoundedWorkSource::IndexRange),
+            &mut || context.charge_operator(BoundedWorkSource::IndexRange),
+        )?;
+    }
     capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
     // An ordered walk with a transaction open folds the transaction's own
@@ -10974,6 +16237,7 @@ fn build_scan(
                 let pick = empty_pick.as_ref().expect("empty scan pick");
                 QueryTrace {
                     physical_plan: "IndexScan",
+                    sort_elided: empty_ordered,
                     index_used: Some(pick.name.clone()),
                     predicates_pushed: pick
                         .pushed_columns
@@ -10990,7 +16254,8 @@ fn build_scan(
                 ..QueryTrace::scan()
             },
         },
-        kind: PullKind::Scan(ScanState {
+        kind: PullKind::Scan(Box::new(ScanState {
+            source_group: None,
             identities_only: false,
             gate_answered_by_candidate_range: false,
             vector_candidate_source: false,
@@ -11002,15 +16267,16 @@ fn build_scan(
             snapshot,
             mode,
             cursor_key_bytes: 0,
-            residual_pick: ordered_pick.or(exact_pick),
+            residual_pick: ordered_pick.or(exact_pick).map(Box::new),
             authenticated_exact_index: None,
             committed_source_offers_every_row: offers_every_committed_row,
             pending_row: None,
+            pending_vector_copy: None,
             supplement_columns: Vec::new(),
             pending_from_committed: true,
             ordered_merge,
             transaction,
-        }),
+        })),
     })
 }
 
@@ -11072,6 +16338,25 @@ fn declare_supplemented_columns(
     }
 }
 
+fn adopt_kernel_construction(
+    node: &mut PullNode,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let mut credit = match &mut node.kind {
+        PullKind::Window(window) => std::mem::take(&mut window.prepaid_construction),
+        PullKind::Vector(vector) => std::mem::take(&mut vector.prepaid_construction),
+        PullKind::Union(union) => std::mem::take(&mut union.prepaid_construction),
+        _ => 0,
+    };
+    for child in pull_node_inputs_mut(&mut node.kind) {
+        credit = checked_size_add(
+            credit,
+            adopt_kernel_construction(child)?,
+            "kernel construction credit",
+        )?;
+    }
+    Ok(credit)
+}
+
 /// Every column name an expression reads from a row. The vector-distance
 /// operator is skipped: it is answered by the index, not by the row's value.
 fn collect_expr_columns(expr: &Expr, into: &mut std::collections::BTreeSet<String>) {
@@ -11115,6 +16400,7 @@ fn pull_node_inputs_mut(kind: &mut PullKind) -> Vec<&mut PullNode> {
         },
         PullKind::Project(state) => vec![state.input.as_mut()],
         PullKind::Sort(state) => vec![state.input.as_mut()],
+        PullKind::Window(state) => vec![state.input.as_mut()],
         PullKind::Limit(state) => vec![state.input.as_mut()],
         PullKind::Filter(state) => vec![state.input.as_mut()],
         PullKind::Distinct(state) => vec![state.input.as_mut()],
@@ -11128,7 +16414,7 @@ fn pull_node_inputs_mut(kind: &mut PullKind) -> Vec<&mut PullNode> {
 fn build_store_state(
     db: &dyn ReadExecutionTarget,
     plan: &PhysicalPlan,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
     // `SHOW MEMORY_LIMIT` / `SHOW DISK_LIMIT` are the operator's one way to see
     // and then raise a budget that is already exhausted -- the same recovery
@@ -11143,7 +16429,44 @@ fn build_store_state(
         plan,
         PhysicalPlan::ShowMemoryLimit | PhysicalPlan::ShowDiskLimit
     );
-    let answered = db.store_state_answer(plan)?;
+    let answered = if matches!(plan, PhysicalPlan::ShowContentSize) {
+        let read_memory: Arc<dyn ReadMemoryBudget> = Arc::new(SourceDecodeBudget {
+            context: context.clone(),
+            source: BoundedWorkSource::TableScan,
+        });
+        let mut before_table = || {
+            context
+                .charge(BoundedWorkSource::TableScan, BoundedSourceTouch::IndexEntry)
+                .map_err(|error| match error {
+                    BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+                    BoundedExecutionError::Cancelled => Error::ReadCancelled,
+                    BoundedExecutionError::Engine(error) => error,
+                    BoundedExecutionError::Unimplemented => {
+                        Error::Other("unsupported content-size source work".into())
+                    }
+                })
+        };
+        db.content_size_answer(read_memory, &mut before_table)?
+    } else {
+        context.with_vector_copies(|vector_copy_owner| {
+            db.store_state_answer(
+                plan,
+                vector_copy_owner,
+                Arc::new(SourceDecodeBudget {
+                    context: context.clone(),
+                    source: BoundedWorkSource::TableScan,
+                }),
+            )
+        })?
+    };
+    // The payload moves into this node; the credits that fund it stay held
+    // until the node owns every row, exactly as long as the answer lived.
+    let crate::database::OwnedQueryResult {
+        result: answered,
+        answer_charge: _answer_charge,
+        vector_copy_charge: _vector_copy_charge,
+        retained_read_memory: _retained_read_memory,
+    } = answered;
     let mut rows = VecDeque::new();
     for values in answered.rows {
         // A row this function never reserved must never be released either:
@@ -11159,8 +16482,10 @@ fn build_store_state(
             retained_bytes
         };
         rows.push_back(PulledRow {
+            window: None,
             values,
             retained_bytes,
+            group_binding: None,
         });
     }
     Ok(PullNode {
@@ -11177,7 +16502,7 @@ fn build_direct_index_scan(
     range: &contextdb_planner::ScanRange,
     params: Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
     db.assert_table_read_allowed(table)?;
     let meta = db
@@ -11195,7 +16520,7 @@ fn build_direct_index_scan(
         .columns
         .first()
         .cloned()
-        .ok_or_else(|| Error::Other(format!("bounded index {index} has no leading column")))?;
+        .ok_or_else(|| Error::Other((format!("bounded index {index} has no leading column")).into()))?;
     let shape = if let Some(value) = range.equality.as_ref() {
         IndexPredicateShape::Equality(value.clone())
     } else {
@@ -11213,6 +16538,7 @@ fn build_direct_index_scan(
             pushed_column: leading_column.clone(),
             pushed_columns: vec![leading_column.clone()],
             suffix_shapes: Vec::new(),
+            trailing_range: None,
             tuple_prefix: None,
             prefix_empty: false,
             probe_values_normalized: false,
@@ -11233,11 +16559,11 @@ fn build_direct_index_scan(
     // stays a residual the physical walk applies to every row it sees.
     let ordered = declaration.kind == contextdb_core::IndexKind::UserDeclared
         || declaration.columns.len() > 1;
-    let residual_pick = (!ordered).then(|| pick.clone());
+    let residual_pick = (!ordered).then(|| Box::new(pick.clone()));
     let mut mode = if ordered {
         let (run_start, run_end, prefix_len) = declared_index_run(&pick, direction, false);
         ScanMode::Index {
-            pick,
+            pick: Box::new(pick),
             column: leading_column,
             direction,
             cursor: BoundedOrderedRowCursor::for_index(index.to_string(), false)
@@ -11248,6 +16574,13 @@ fn build_direct_index_scan(
             cursor: db.bounded_physical_table_cursor(table)?,
         }
     };
+    db.preflight_historical_index(
+        table,
+        index,
+        snapshot,
+        context.source_read_memory(BoundedWorkSource::IndexRange),
+        &mut || context.charge_operator(BoundedWorkSource::IndexRange),
+    )?;
     capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
     let mut columns = vec!["row_id".to_string()];
@@ -11259,7 +16592,8 @@ fn build_direct_index_scan(
             index_used: Some(index.to_string()),
             ..Default::default()
         },
-        kind: PullKind::Scan(ScanState {
+        kind: PullKind::Scan(Box::new(ScanState {
+            source_group: None,
             identities_only: false,
             gate_answered_by_candidate_range: false,
             vector_candidate_source: false,
@@ -11275,11 +16609,12 @@ fn build_direct_index_scan(
             authenticated_exact_index: None,
             committed_source_offers_every_row: offers_every_committed_row,
             pending_row: None,
+            pending_vector_copy: None,
             supplement_columns: Vec::new(),
             pending_from_committed: true,
             ordered_merge: None,
             transaction,
-        }),
+        })),
     })
 }
 
@@ -11288,6 +16623,7 @@ fn ordered_scan<'a>(
     input: &'a PhysicalPlan,
     keys: &'a [SortKey],
     params: &HashMap<String, Value>,
+    ranges: Option<&crate::executor::IndexRangeSizes<'_>>,
 ) -> Option<(&'a str, Option<&'a Expr>, OrderedIndexScan)> {
     let PhysicalPlan::Scan { table, filter, .. } = input else {
         return None;
@@ -11297,16 +16633,19 @@ fn ordered_scan<'a>(
     // leading equality prefix leaves the following index column ordered, so
     // it asks the same prefix rule as the eager executor instead of falling
     // through to a buffered sort.
-    let decl = crate::executor::sort_elision_index_decl(db, input, keys).or_else(|| {
+    let automatic_ordered = db.automatic_indexes_are_ordered();
+    let decl = crate::executor::bounded_sort_elision_index_decl(db, input, keys).or_else(|| {
         let filter = filter.as_ref()?;
         let meta = db.table_meta(table)?;
-        let pick = crate::executor::analyze_filter_for_index_with_sort(
+        let pick = crate::executor::analyze_filter_for_index_with_capability(
             table,
             &meta,
             filter,
             params,
             Some(keys),
             true,
+            automatic_ordered,
+            ranges,
         )
         .pick?;
         meta.indexes
@@ -11347,13 +16686,15 @@ fn ordered_scan<'a>(
     // otherwise turns a selective ordered query into a full ordered scan.
     let sort_analysis = filter.as_ref().and_then(|filter| {
         let meta = db.table_meta(table)?;
-        Some(crate::executor::analyze_filter_for_index_with_sort(
+        Some(crate::executor::analyze_filter_for_index_with_capability(
             table,
             &meta,
             filter,
             params,
             Some(keys),
             true,
+            automatic_ordered,
+            ranges,
         ))
     });
     let predicate_pick = sort_analysis
@@ -11388,7 +16729,7 @@ fn ordered_scan<'a>(
 /// on the leading indexed component. A shape that names no run — an exclusion,
 /// or a prefix already known to be empty — declares none, and the source walks
 /// as it would with no predicate at all.
-fn declared_index_run(
+pub(super) fn declared_index_run(
     pick: &IndexPick,
     direction: contextdb_core::SortDirection,
     reverse: bool,
@@ -11422,7 +16763,16 @@ fn declared_index_run(
         IndexPredicateShape::Equality(_) | IndexPredicateShape::IsNull => {
             let mut runs = crate::executor::expanded_index_runs(pick).unwrap_or_default();
             if let Some((start, end)) = runs.pop() {
-                (start, end, 1 + pick.suffix_shapes.len())
+                let prefix_len = if pick.trailing_range.is_some() {
+                    let len = |bound: &Bound<IndexKey>| match bound {
+                        Bound::Included(key) | Bound::Excluded(key) => key.len(),
+                        Bound::Unbounded => 0,
+                    };
+                    len(&start).min(len(&end))
+                } else {
+                    1 + pick.suffix_shapes.len()
+                };
+                (start, end, prefix_len)
             } else {
                 (Bound::Unbounded, Bound::Unbounded, 0)
             }
@@ -11572,7 +16922,7 @@ fn bound_allows_upper(value: &Value, bound: &std::ops::Bound<Value>) -> bool {
 
 fn pull(
     db: &dyn ReadExecutionTarget,
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
     root: &mut PullNode,
 ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
     root.next(db, context)
@@ -11586,7 +16936,7 @@ fn planned_value_clone_bytes(value: &Value) -> std::result::Result<usize, Bounde
             std::mem::size_of::<f32>(),
             "canonical vector clone",
         ),
-        Value::Json(value) => planned_json_clone_bytes(value),
+        Value::Json(value) => Ok(crate::read_image_memory::json_clone_heap_bytes(value)),
         Value::Null
         | Value::Bool(_)
         | Value::Int64(_)
@@ -11594,48 +16944,6 @@ fn planned_value_clone_bytes(value: &Value) -> std::result::Result<usize, Bounde
         | Value::Uuid(_)
         | Value::Timestamp(_)
         | Value::TxId(_) => Ok(0),
-    }
-}
-
-fn planned_json_clone_bytes(
-    value: &serde_json::Value,
-) -> std::result::Result<usize, BoundedExecutionError> {
-    match value {
-        serde_json::Value::String(value) => Ok(value.len()),
-        serde_json::Value::Array(values) => {
-            let mut bytes = checked_size_mul(
-                values.len(),
-                std::mem::size_of::<serde_json::Value>(),
-                "canonical JSON clone",
-            )?;
-            for value in values {
-                bytes = checked_size_add(
-                    bytes,
-                    planned_json_clone_bytes(value)?,
-                    "canonical JSON clone",
-                )?;
-            }
-            Ok(bytes)
-        }
-        serde_json::Value::Object(values) => {
-            let mut bytes = checked_size_mul(
-                values.len(),
-                std::mem::size_of::<(String, serde_json::Value)>(),
-                "canonical JSON clone",
-            )?;
-            for (key, value) in values {
-                bytes = checked_size_add(bytes, key.len(), "canonical JSON clone")?;
-                bytes = checked_size_add(
-                    bytes,
-                    planned_json_clone_bytes(value)?,
-                    "canonical JSON clone",
-                )?;
-            }
-            Ok(bytes)
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            Ok(0)
-        }
     }
 }
 
@@ -11720,6 +17028,18 @@ fn planned_query_clone_bytes(
             "canonical considered-index reason",
         )?;
     }
+    bytes = checked_size_add(
+        bytes,
+        checked_size_mul(
+            result.trace.groups.len(),
+            std::mem::size_of::<crate::database::GroupDisclosure>(),
+            "canonical group slots",
+        )?,
+        "canonical trace",
+    )?;
+    for group in &result.trace.groups {
+        bytes = checked_size_add(bytes, group.partition_key.len(), "canonical group key")?;
+    }
     if let Some(source) = result.trace.query_vector_source.as_ref() {
         bytes = checked_size_add(bytes, source.table.len(), "canonical vector source")?;
         bytes = checked_size_add(bytes, source.column.len(), "canonical vector source")?;
@@ -11742,7 +17062,7 @@ fn planned_query_clone_bytes(
 }
 
 #[allow(dead_code)]
-fn canonical_query_capacity_bytes(
+pub(crate) fn canonical_query_capacity_bytes(
     result: &CanonicalQueryResult,
 ) -> std::result::Result<usize, BoundedExecutionError> {
     let mut bytes = checked_size_add(
@@ -11801,6 +17121,18 @@ fn canonical_query_capacity_bytes(
             "canonical trace rejection",
         )?;
     }
+    bytes = checked_size_add(
+        bytes,
+        checked_size_mul(
+            result.trace.groups.len(),
+            std::mem::size_of::<crate::database::GroupDisclosure>(),
+            "canonical group slots",
+        )?,
+        "canonical trace",
+    )?;
+    for group in &result.trace.groups {
+        bytes = checked_size_add(bytes, group.partition_key.capacity(), "canonical group key")?;
+    }
     if let Some(source) = result.trace.query_vector_source.as_ref() {
         bytes = checked_size_add(bytes, source.table.capacity(), "canonical vector source")?;
         bytes = checked_size_add(bytes, source.column.capacity(), "canonical vector source")?;
@@ -11816,12 +17148,12 @@ fn canonical_query_capacity_bytes(
 }
 
 fn encoded_query_size(
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
     result: &QueryResult,
 ) -> std::result::Result<u64, BoundedExecutionError> {
     for row in &result.rows {
         if row.len() != result.columns.len() {
-            return Err(Error::Other("canonical query row arity is invalid".to_string()).into());
+            return Err(Error::Other(("canonical query row arity is invalid".to_string()).into()).into());
         }
     }
     // Measured, not copied. The encoder writes into a counter that keeps
@@ -11838,11 +17170,14 @@ fn encoded_query_size(
 }
 
 fn encoded_page_size(
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
     page: &CursorPage,
+    _observation: &CursorObservation,
 ) -> std::result::Result<u64, BoundedExecutionError> {
     page.validate()
-        .map_err(|error| Error::Other(error.to_string()))?;
+        .map_err(|error| Error::Other((error.to_string()).into()))?;
+    // The declared page ceiling measures the public page. Channel trace
+    // bytes keep their separate admission and telemetry charge.
     let measured = serialized_size(page)?;
     u64::try_from(measured).map_err(|_| {
         RequestContext::limit_failure(
@@ -11920,7 +17255,7 @@ fn result_container_bytes(
 /// the charge is re-stated a logarithmic number of times over a long result
 /// rather than once per row.
 fn grow_result_containers(
-    context: &Arc<RequestContext>,
+    context: &ControlArc<RequestContext>,
     rows: &mut Vec<Vec<Value>>,
     charges: &mut Vec<usize>,
     held_bytes: &mut usize,
@@ -11941,14 +17276,18 @@ fn grow_result_containers(
         .is_err()
     {
         context.release(growth)?;
-        return Err(Error::Other("bounded result-row allocation failed".to_string()).into());
+        return Err(Error::Other(("bounded result-row allocation failed".to_string()).into()).into());
     }
+    // The rows allocation has already grown in the caller. Keep its admitted
+    // credit and record it even if the parallel charge ledger cannot grow.
+    // The caller can destroy both containers before request cleanup, or retry
+    // without losing existing rows, payloads or their charge bookkeeping.
+    *held_bytes = planned;
     if charges
         .try_reserve_exact(target.saturating_sub(charges.len()))
         .is_err()
     {
-        context.release(growth)?;
-        return Err(Error::Other("bounded result-charge allocation failed".to_string()).into());
+        return Err(Error::Other(("bounded result-charge allocation failed".to_string()).into()).into());
     }
     let actual = result_container_bytes(rows.capacity(), charges.capacity())?;
     match actual.cmp(&planned) {
@@ -12015,59 +17354,141 @@ pub(crate) fn drain_chosen_plan(
     tx: Option<TxId>,
     snapshot: SnapshotId,
     clock: Arc<dyn DeadlineClock>,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
-) -> std::result::Result<QueryResult, BoundedExecutionError> {
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    read_memory: Arc<dyn ReadMemoryBudget>,
+) -> std::result::Result<crate::database::OwnedQueryResult, BoundedExecutionError> {
+    // These fixed control answers remain available when the operator has
+    // exhausted the store budget, including the kernel's scaffolding. They
+    // share the same recovery exemption as their uncharged static row.
+    if matches!(
+        plan,
+        PhysicalPlan::ShowMemoryLimit | PhysicalPlan::ShowDiskLimit
+    ) {
+        return db
+            .store_state_answer(
+                plan,
+                &mut crate::vector_read_memory::admission(read_memory.clone()),
+                read_memory.clone(),
+            )
+            .map_err(BoundedExecutionError::from);
+    }
     let _release_proofs = StatementProofReuse { db };
     let context = RequestContext::new(
-        db,
+        Arc::clone(&read_memory),
         uncapped_ceilings(),
         ReadResumption::OneShot,
         clock,
         OwnerReadCancellation::new(),
         tx,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     )?;
-    // This door declared no ceilings, so a traversal's frontier is the store's
-    // to govern: the read holds that reservation and grows it as each start is
-    // resolved, never pricing a frontier before it exists.
-    context.enable_store_frontier(db.bounded_read_accountant());
+    let _vector_read = enter_vector_read(db, snapshot, &context, plan_needs_vector_read(plan))?;
     let params = Arc::new(params.clone());
     let mut root = build_kernel(db, plan, Arc::clone(&params), snapshot, &context)?;
+    let prepaid = adopt_kernel_construction(&mut root)?;
+    let root_bytes = boxed_pull_bytes(&root)?;
+    // The adopted credit funds the live root until it is destroyed, including
+    // a failed admission of the remaining continuation bytes.
+    if root_bytes > prepaid {
+        context.reserve(BoundedWorkSource::TableScan, root_bytes - prepaid)?;
+    } else if prepaid > root_bytes {
+        context.release(prepaid - root_bytes)?;
+    }
+
     // The answer's own column list is the demand every source below is filled
     // against; each node adds what its expressions name on the way down.
     {
         let named: std::collections::BTreeSet<String> = root.columns.iter().cloned().collect();
         declare_supplemented_columns(db, &mut root, &named);
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::database::Database::observe_pull_kernel_entered_for_test();
-    let mut result = QueryResult {
-        columns: root.columns.clone(),
+    let (result_columns, result_column_bytes) =
+        clone_strings_with_reservation(&root.columns, &context, "result columns")?;
+    let planned_trace_bytes = query_trace_capacity_bytes(&root.trace)?;
+    context.reserve(BoundedWorkSource::TableScan, planned_trace_bytes)?;
+    let result_trace = root.trace.clone();
+    {
+        let admitted_bytes = planned_trace_bytes;
+        let retained_bytes = query_trace_capacity_bytes(&result_trace)?;
+        if retained_bytes > admitted_bytes {
+            context.reserve(
+                BoundedWorkSource::TableScan,
+                retained_bytes - admitted_bytes,
+            )?;
+        } else if admitted_bytes > retained_bytes {
+            context.release(admitted_bytes - retained_bytes)?;
+        }
+    }
+    let mut result = crate::database::OwnedQueryResult::new(QueryResult {
+        columns: result_columns,
         rows: Vec::new(),
         rows_affected: 0,
-        trace: root.trace.clone(),
+        trace: result_trace,
         cascade: None,
-    };
+    });
     let internal_row_id = result.columns.iter().position(|column| column == "row_id");
     if let Some(position) = internal_row_id {
         result.columns.remove(position);
     }
+    {
+        let admitted_bytes = result_column_bytes;
+        let retained_bytes = strings_capacity_bytes(&result.columns, "result columns")?;
+        if retained_bytes > admitted_bytes {
+            context.reserve(
+                BoundedWorkSource::TableScan,
+                retained_bytes - admitted_bytes,
+            )?;
+        } else if admitted_bytes > retained_bytes {
+            context.release(admitted_bytes - retained_bytes)?;
+        }
+    }
+    let mut retained_rows = Vec::<usize>::new();
+    let mut held_container_bytes = 0usize;
     while let Some(mut row) = pull(db, &context, &mut root)? {
         if let Some(position) = internal_row_id
             && position < row.values.len()
         {
             row.values.remove(position);
         }
+        if let Some(binding) = row.group_binding {
+            context.stage_group_return(binding)?;
+        }
+        grow_result_containers(
+            &context,
+            &mut result.rows,
+            &mut retained_rows,
+            &mut held_container_bytes,
+        )?;
+        retained_rows.push(row.retained_bytes);
         result.rows.push(row.values);
-        context.release(row.retained_bytes)?;
     }
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::database::Database::observe_pull_kernel_drained_for_test();
     result.trace.physical_plan = root.published_plan();
     result.trace.vector_search = root.published_vector_search().cloned();
     result.trace.rows_examined = context.rows_examined()?;
+    context.refresh_group_trace(&mut result.trace)?;
+    context.check_final_boundary()?;
+    context.transfer_answer(&mut result)?;
+    context.publish_group_returns()?;
+    // The ledger is scratch. Destroy it before the request refunds its
+    // remaining scratch credit; answer payload credit now has its own owner.
+    drop(retained_rows);
+    drop(root);
     Ok(result)
+}
+
+// These answers contain committed metadata and atomically copied progress,
+// never a query's row bodies or an in-flight native graph.
+fn inspection_reads_committed_state(plan: &PhysicalPlan) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::ShowMemoryLimit
+            | PhysicalPlan::ShowVectorIndexes
+            | PhysicalPlan::ShowVectorPartitions { .. }
+    )
 }
 
 fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
@@ -12098,8 +17519,10 @@ fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
             }
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::GroupedCount { input, .. }
             | PhysicalPlan::Distinct { input }
             | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::WindowRank { input, .. }
             | PhysicalPlan::Limit { input, .. }
             | PhysicalPlan::MaterializeCte { input, .. } => collect(input, tables),
             PhysicalPlan::Join { left, right, .. } => {
@@ -12136,14 +17559,129 @@ fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
     tables
 }
 
+/// Scalar DATA reads need no mutable vector graph. Vector ORDER BY may use
+/// an indexed graph unless EXACT was selected explicitly, including in CTEs
+/// and scalar subqueries. This follows the planner's vector-order predicate.
+fn statement_needs_vector_graph(statement: &contextdb_parser::ast::Statement) -> bool {
+    use contextdb_parser::ast::{
+        Cte, Expr, SelectBody, SortDirection, Statement, VectorSearchMode,
+    };
+    fn expr(value: &Expr) -> bool {
+        match value {
+            Expr::InSubquery {
+                expr: input,
+                subquery,
+                ..
+            } => expr(input) || body(subquery),
+            Expr::BinaryOp { left, right, .. }
+            | Expr::CosineDistance { left, right }
+            | Expr::Like {
+                expr: left,
+                pattern: right,
+                ..
+            } => expr(left) || expr(right),
+            Expr::UnaryOp { operand, .. }
+            | Expr::IsNull { expr: operand, .. }
+            | Expr::RowVectorSource { key: operand, .. } => expr(operand),
+            Expr::FunctionCall { args, .. } | Expr::Row(args) => args.iter().any(expr),
+            Expr::InList {
+                expr: input, list, ..
+            } => expr(input) || list.iter().any(expr),
+            _ => false,
+        }
+    }
+    fn body(select: &SelectBody) -> bool {
+        (select
+            .order_by
+            .first()
+            .is_some_and(|item| item.direction == SortDirection::CosineDistance)
+            && !matches!(select.use_vector, Some(VectorSearchMode::Exact)))
+            || select.columns.iter().any(|column| expr(&column.expr))
+            || select.where_clause.as_ref().is_some_and(expr)
+            || select.order_by.iter().any(|item| expr(&item.expr))
+            || select.joins.iter().any(|join| expr(&join.on))
+    }
+    match statement {
+        Statement::Select(select) => {
+            body(&select.body)
+                || select.ctes.iter().any(|cte| match cte {
+                    Cte::SqlCte { query, .. } => body(query),
+                    Cte::MatchCte { match_clause, .. } => {
+                        match_clause.where_clause.as_ref().is_some_and(expr)
+                            || match_clause
+                                .return_cols
+                                .iter()
+                                .any(|column| expr(&column.expr))
+                    }
+                })
+        }
+        _ => false,
+    }
+}
+
+fn statement_needs_vector_read(statement: &contextdb_parser::ast::Statement) -> bool {
+    use contextdb_parser::ast::{Cte, Expr, SelectBody, SortDirection, Statement};
+    fn expr(value: &Expr) -> bool {
+        match value {
+            Expr::CosineDistance { .. } | Expr::RowVectorSource { .. } => true,
+            Expr::InSubquery {
+                expr: input,
+                subquery,
+                ..
+            } => expr(input) || body(subquery),
+            Expr::BinaryOp { left, right, .. }
+            | Expr::Like {
+                expr: left,
+                pattern: right,
+                ..
+            } => expr(left) || expr(right),
+            Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => expr(operand),
+            Expr::FunctionCall { args, .. } | Expr::Row(args) => args.iter().any(expr),
+            Expr::InList {
+                expr: input, list, ..
+            } => expr(input) || list.iter().any(expr),
+            _ => false,
+        }
+    }
+    fn body(select: &SelectBody) -> bool {
+        if select.limit == Some(0) {
+            return false;
+        }
+        select
+            .order_by
+            .iter()
+            .any(|item| item.direction == SortDirection::CosineDistance || expr(&item.expr))
+            || select.columns.iter().any(|column| expr(&column.expr))
+            || select.where_clause.as_ref().is_some_and(expr)
+            || select.joins.iter().any(|join| expr(&join.on))
+    }
+    match statement {
+        Statement::Select(select) => {
+            body(&select.body)
+                || select.ctes.iter().any(|cte| match cte {
+                    Cte::SqlCte { query, .. } => body(query),
+                    Cte::MatchCte { match_clause, .. } => {
+                        match_clause.where_clause.as_ref().is_some_and(expr)
+                            || match_clause
+                                .return_cols
+                                .iter()
+                                .any(|column| expr(&column.expr))
+                    }
+                })
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn execute(
     db: &dyn ReadExecutionTarget,
     sql: &str,
     params: &HashMap<String, Value>,
+    read_memory: Arc<dyn ReadMemoryBudget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
     let _release_proofs = StatementProofReuse { db };
     let statement = contextdb_parser::parse(sql)?;
@@ -12153,23 +17691,39 @@ pub(super) fn execute(
     let withdrawn = cancellation.clone();
     let execution = (|| {
         let context = RequestContext::new(
-            db,
+            Arc::clone(&read_memory),
             limits,
             ReadResumption::OneShot,
             clock,
             cancellation,
             db.active_read_transaction(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             probe,
         )?;
         let schema_capture = db.capture_read_schema();
-        let membership_capture = db.relational_membership_store().begin_membership_capture();
-        let Some((snapshot, publication_lsn, _snapshot_registration)) =
-            db.bounded_read_snapshot_registration(&context.registration_budget(), &withdrawn)?
+        let membership_capture = (!db.retained_relational_membership_source())
+            .then(|| db.relational_membership_store().begin_membership_capture());
+        let Some((snapshot, publication_lsn, _snapshot_registration, writer_root)) = db
+            .bounded_read_snapshot_registration(
+                statement_needs_vector_graph(&statement),
+                &context.registration_budget(),
+                &withdrawn,
+                context.source_read_memory(BoundedWorkSource::TableScan),
+            )?
         else {
             return Err(context.withdrawn_failure());
         };
-        #[cfg(feature = "test-seams")]
+        let _writer_read = db.enter_writer_read(
+            writer_root,
+            context.source_read_memory(BoundedWorkSource::TableScan),
+        );
+        let _vector_read = enter_vector_read(
+            db,
+            snapshot,
+            &context,
+            statement_needs_vector_read(&statement),
+        )?;
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
             probe.after_snapshot_registration();
@@ -12184,32 +17738,71 @@ pub(super) fn execute(
         // that shape, not after.
         let planned_prepared_bytes = checked_size_mul(statement_bytes, 2, "bounded read plan")?;
         context.reserve(BoundedWorkSource::TableScan, planned_prepared_bytes)?;
-        let (resolved, plan) = db.prepare_bounded_read_plan(&statement, params)?;
-        let publication = context.publication_scope(publication_lsn, publication_tables(&plan));
+        let (resolved, plan) = if matches!(&statement, Statement::Select(select)
+            if select.ctes.is_empty() || select.body.where_clause.is_none()) {
+            // This branch only clones the AST and validates columns. The
+            // resolver performs no storage reads, so no codec accountant or
+            // per-call image owner is needed for static planning.
+            let mut owner = context.vector_copies.lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            db.prepare_bounded_read_plan(&statement, params, &mut owner,
+                context.reader_budget.clone())
+        } else {
+            context.with_vector_copies(|vector_copy_owner| {
+                db.prepare_bounded_read_plan(
+                    &statement, params, vector_copy_owner,
+                    Arc::new(SourceDecodeBudget {
+                        context: context.clone(), source: BoundedWorkSource::TableScan,
+                    }),
+                )
+            })
+        }?;
         let resolved_bytes = statement_capacity_bytes(&resolved)?;
         ensure_supported_plan(&plan)?;
         let plan_bytes = physical_plan_capacity_bytes(&plan)?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            planned_prepared_bytes,
-            checked_size_add(resolved_bytes, plan_bytes, "bounded read plan")?,
-        )?;
+        {
+            let admitted_bytes = planned_prepared_bytes;
+            let retained_bytes = checked_size_add(resolved_bytes, plan_bytes, "bounded read plan")?;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
         drop(statement);
         context.release(statement_bytes)?;
         drop(resolved);
         context.release(resolved_bytes)?;
+        // The original snapshot/source guards are still held. Retire the
+        // parsed/resolved AST allocations before re-entering the same vector
+        // capture and creating publication metadata.
+        let _vector_plan_read =
+            enter_vector_read(db, snapshot, &context, plan_needs_vector_read(&plan))?;
+        let publication = context.publication_scope(
+            publication_lsn,
+            publication_tables(&plan),
+            inspection_reads_committed_state(&plan),
+        )?;
 
         let planned_params_bytes = params_retained_bytes(params)?;
         context.reserve(BoundedWorkSource::TableScan, planned_params_bytes)?;
         let params = Arc::new(params.clone());
         let params_bytes = params_retained_bytes(&params)?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            planned_params_bytes,
-            params_bytes,
-        )?;
+        {
+            let admitted_bytes = planned_params_bytes;
+            let retained_bytes = params_bytes;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
         // The kernel is built out of the plan and holds a copy of every table
         // shape it reads, so the plan's own size is the floor the request is
         // admitted for before the kernel is materialized; the reservation is
@@ -12224,19 +17817,27 @@ pub(super) fn execute(
         }
         drop(membership_capture);
         drop(schema_capture);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.after_source_capture();
         }
         let root_bytes = pull_continuation_bytes(&root)?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            plan_bytes,
-            root_bytes,
-        )?;
+        let prepaid = adopt_kernel_construction(&mut root)?;
+        let construction_bytes =
+            checked_size_add(plan_bytes, prepaid, "kernel construction adoption")?;
+        // The kernel owns its copies now. Free the consumed plan before
+        // reconciling kernel capacity, retaining its separate construction credit.
         drop(plan);
         context.release(plan_bytes)?;
+        // Keep adopted credit while the root is alive if admission refuses.
+        if root_bytes > construction_bytes {
+            context.reserve(
+                BoundedWorkSource::TableScan,
+                root_bytes - construction_bytes,
+            )?;
+        } else if construction_bytes > root_bytes {
+            context.release(construction_bytes - root_bytes)?;
+        }
 
         let (result_columns, result_column_bytes) =
             clone_strings_with_reservation(&root.columns, &context, "bounded result columns")?;
@@ -12244,31 +17845,43 @@ pub(super) fn execute(
         context.reserve(BoundedWorkSource::TableScan, planned_result_trace_bytes)?;
         let result_trace = root.trace.clone();
         let result_trace_bytes = query_trace_capacity_bytes(&result_trace)?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            planned_result_trace_bytes,
-            result_trace_bytes,
-        )?;
-        let mut result = QueryResult {
+        {
+            let admitted_bytes = planned_result_trace_bytes;
+            let retained_bytes = result_trace_bytes;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
+        let mut result = crate::database::OwnedQueryResult::new(QueryResult {
             columns: result_columns,
             rows: Vec::new(),
             rows_affected: 0,
             trace: result_trace,
             cascade: None,
-        };
+        });
         let internal_row_id = result.columns.iter().position(|column| column == "row_id");
         if let Some(position) = internal_row_id {
             result.columns.remove(position);
         }
         let retained_result_column_bytes =
             strings_capacity_bytes(&result.columns, "bounded result columns")?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            result_column_bytes,
-            retained_result_column_bytes,
-        )?;
+        {
+            let admitted_bytes = result_column_bytes;
+            let retained_bytes = retained_result_column_bytes;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
         // The read is charged for the answer it is building, not for the
         // ceiling the caller allowed it. Sizing these containers to
         // `result_rows` up front would refuse a caller who only said "do not
@@ -12324,6 +17937,7 @@ pub(super) fn execute(
             result.trace.physical_plan = root.published_plan();
             result.trace.vector_search = root.published_vector_search().cloned();
             result.trace.rows_examined = context.rows_examined()?;
+            context.refresh_group_trace(&mut result.trace)?;
             let encoded = encoded_query_size(&context, &result)?;
             if encoded > limits.result_bytes {
                 return Err(RequestContext::limit_failure(
@@ -12337,6 +17951,7 @@ pub(super) fn execute(
         result.trace.physical_plan = root.published_plan();
         result.trace.vector_search = root.published_vector_search().cloned();
         result.trace.rows_examined = context.rows_examined()?;
+        context.refresh_group_trace(&mut result.trace)?;
         let encoded = encoded_query_size(&context, &result)?;
         if encoded > limits.result_bytes {
             return Err(RequestContext::limit_failure(
@@ -12346,13 +17961,20 @@ pub(super) fn execute(
         }
         context.set_encoded_bytes(encoded);
         context.check_final_boundary()?;
-        for bytes in retained_rows {
-            context.release(bytes)?;
-        }
-        context.release(held_container_bytes)?;
-        context.check_final_boundary()?;
         // Every read says what it did at least once, however short it was.
         context.flush_final_progress();
+        context.transfer_answer(&mut result)?;
+        context.publish_group_returns()?;
+        drop(retained_rows);
+        let completed_controls = completed_vector_control_bytes(&root);
+        drop(root);
+        context.release(completed_controls)?;
+        // Publication retains this executing request for limits and fences,
+        // but not a dead parameter copy. Do not return a shared allocation's
+        // invoice while any strong or weak alias could still retain it.
+        let params_destroyed = Arc::strong_count(&params) == 1 && Arc::weak_count(&params) == 0;
+        drop(params);
+        if params_destroyed { context.release(params_bytes)?; }
         Ok(BoundedExecutionResult {
             result,
             publication,
@@ -12374,12 +17996,13 @@ pub(super) struct CursorState {
     _snapshot: SnapshotId,
     _snapshot_registration: Box<dyn Send + Sync>,
     storage_snapshot: Option<crate::persistence::OwnerCursorStoragePin>,
+    writer_root: Option<crate::persistence::WriterSnapshotHandle>,
+    vector_read: bool,
     publication: ReadPublicationScope,
     /// The idle window this cursor's registration is judged by. Stamped
     /// beside `last_used_ms` on every page handed back, so removal reads the
     /// same "still entitled to another page" answer `check_expiry` gives.
     idle_window: Arc<CursorIdleWindow>,
-    context: Arc<RequestContext>,
     root: PullNode,
     replay: VecDeque<PulledRow>,
     visible_columns: Vec<String>,
@@ -12393,10 +18016,11 @@ pub(super) struct CursorState {
     /// The page scaffolding a live cursor holds between fetches.
     ///
     /// A cursor costs its scaffolding plus whatever rows it is still holding.
-    /// The scaffolding is the flat part -- a page's columns, its row capacity,
-    /// and the replay container are the same size for equally-shaped pages, so
-    /// the previous page's share is given back as this page's is taken, and a
-    /// build that is interrupted keeps it. `held_page_base` is that share.
+    /// The scaffolding is the flat part -- a page's columns and row capacity
+    /// are the same size for equally-shaped pages, so the previous page's share
+    /// is given back as this page's is taken, and an interrupted build keeps it.
+    /// `held_page_base` is that share. The replay container belongs to the
+    /// cursor and keeps its credit across fetches until its capacity changes.
     ///
     /// The rows are NOT flat, and pretending they were is what made the quoted
     /// cost untrue: a row that did not fit a page, or that a cancelled build
@@ -12406,6 +18030,9 @@ pub(super) struct CursorState {
     /// the replay, which returns the rows that left with the answer and keeps
     /// the ones that did not.
     held_page_base: usize,
+    observation: Option<CursorObservation>,
+    // Drop retained kernel/replay payloads before their request credit.
+    context: ControlArc<RequestContext>,
 }
 
 /// What a page build must leave unchanged, measured before it changes anything.
@@ -12423,7 +18050,7 @@ impl CursorState {
         let now = self.context.clock.now_ms();
         let lifetime = now
             .checked_sub(self.created_ms)
-            .ok_or_else(|| Error::Other("bounded cursor clock moved backwards".to_string()))?;
+            .ok_or_else(|| Error::Other(("bounded cursor clock moved backwards".to_string()).into()))?;
         if lifetime > self.context.limits.cursor_lifetime_ms {
             return Err(BoundedExecutionError::Refused(ReadFailure::cursor_expired(
                 CursorExpiryKind::Lifetime,
@@ -12431,7 +18058,7 @@ impl CursorState {
         }
         let idle = now
             .checked_sub(self.last_used_ms)
-            .ok_or_else(|| Error::Other("bounded cursor clock moved backwards".to_string()))?;
+            .ok_or_else(|| Error::Other(("bounded cursor clock moved backwards".to_string()).into()))?;
         if idle > self.context.limits.cursor_idle_ms {
             return Err(BoundedExecutionError::Refused(ReadFailure::cursor_expired(
                 CursorExpiryKind::Idle,
@@ -12444,7 +18071,7 @@ impl CursorState {
         let now = self.context.clock.now_ms();
         let lifetime = now
             .checked_sub(self.created_ms)
-            .ok_or_else(|| Error::Other("bounded cursor clock moved backwards".to_string()))?;
+            .ok_or_else(|| Error::Other(("bounded cursor clock moved backwards".to_string()).into()))?;
         if lifetime > self.context.limits.cursor_lifetime_ms {
             return Err(BoundedExecutionError::Refused(ReadFailure::cursor_expired(
                 CursorExpiryKind::Lifetime,
@@ -12512,14 +18139,14 @@ impl CursorState {
         {
             self.context.release(planned_bytes)?;
             return Err(
-                Error::Other("bounded cursor-page remedy allocation failed".to_string()).into(),
+                Error::Other(("bounded cursor-page remedy allocation failed".to_string()).into()).into(),
             );
         }
         required_setting.push_str(SETTING_PREFIX);
         if write!(&mut required_setting, "{required}").is_err() {
             self.context.release(planned_bytes)?;
             return Err(
-                Error::Other("bounded cursor-page remedy formatting failed".to_string()).into(),
+                Error::Other(("bounded cursor-page remedy formatting failed".to_string()).into()).into(),
             );
         }
         statement.push_str(&self.sql);
@@ -12569,9 +18196,8 @@ impl CursorState {
         if self.replay.len() < self.replay.capacity() {
             return Ok(());
         }
-        Err(Error::Other(
-            "bounded cursor replay exceeded the capacity admitted for this page".to_string(),
-        )
+        Err(Error::Other((
+            "bounded cursor replay exceeded the capacity admitted for this page".to_string()).into())
         .into())
     }
 
@@ -12596,29 +18222,30 @@ impl CursorState {
     fn restore_page_rows(
         &mut self,
         page: &mut CursorPage,
-        retained: &mut Vec<usize>,
+        retained: &mut Vec<(usize, Option<GroupBinding>)>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         while !page.rows.is_empty() && !retained.is_empty() {
             if self.replay.len() >= self.replay.capacity() {
-                return Err(Error::Other(
-                    "bounded cursor replay capacity cannot restore its cancelled page".to_string(),
-                )
+                return Err(Error::Other((
+                    "bounded cursor replay capacity cannot restore its cancelled page".to_string()).into())
                 .into());
             }
             let values = page.rows.pop().ok_or_else(|| {
-                Error::Other("bounded cursor lost a cancelled page row".to_string())
+                Error::Other(("bounded cursor lost a cancelled page row".to_string()).into())
             })?;
-            let retained_bytes = retained.pop().ok_or_else(|| {
-                Error::Other("bounded cursor lost a cancelled page charge".to_string())
+            let (retained_bytes, group_binding) = retained.pop().ok_or_else(|| {
+                Error::Other(("bounded cursor lost a cancelled page charge".to_string()).into())
             })?;
             self.replay.push_front(PulledRow {
+                window: None,
                 values,
                 retained_bytes,
+                group_binding,
             });
         }
         if !page.rows.is_empty() || !retained.is_empty() {
             return Err(
-                Error::Other("bounded cursor page rows and charges diverged".to_string()).into(),
+                Error::Other(("bounded cursor page rows and charges diverged".to_string()).into()).into(),
             );
         }
         Ok(())
@@ -12689,7 +18316,7 @@ impl CursorState {
     /// rows through the replay itself.
     /// What this cursor is holding right now, part by part -- the same walk
     /// the settlement above is computed from.
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn continuation_bytes(
         &self,
     ) -> std::result::Result<ContinuationBytes, BoundedExecutionError> {
@@ -12707,13 +18334,17 @@ impl CursorState {
             .fixed_bytes
             .saturating_sub(anchor.released_base)
             .saturating_add(page_base_bytes);
+        let observed_membership = {
+            let state = self.context.state();
+            checked_size_add(
+                state.membership_bytes,
+                state.group_observer_bytes,
+                "cursor observed membership",
+            )?
+        };
         let target = checked_size_add(
             checked_size_add(fixed, continuation_now, "cursor retained charge")?,
-            checked_size_add(
-                carried_now,
-                self.context.state().membership_bytes,
-                "cursor membership",
-            )?,
+            checked_size_add(carried_now, observed_membership, "cursor membership")?,
             "cursor retained charge",
         )?;
         let held = self.context.held_bytes();
@@ -12731,13 +18362,21 @@ impl CursorState {
     fn page_anchor(&self) -> std::result::Result<CursorPageAnchor, BoundedExecutionError> {
         let continuation = pull_continuation_bytes(&self.root)?;
         let carried = self.carried_replay_bytes()?;
+        let observed_membership = {
+            let state = self.context.state();
+            checked_size_add(
+                state.membership_bytes,
+                state.group_observer_bytes,
+                "cursor observed membership",
+            )?
+        };
         Ok(CursorPageAnchor {
             fixed_bytes: self
                 .context
                 .held_bytes()
                 .saturating_sub(continuation)
                 .saturating_sub(carried)
-                .saturating_sub(self.context.state().membership_bytes),
+                .saturating_sub(observed_membership),
             released_base: self.held_page_base,
         })
     }
@@ -12748,10 +18387,113 @@ impl CursorState {
         })
     }
 
+    fn released(&mut self, reason: BoundedCursorTerminalReason) -> BoundedCursorLifecycle {
+        let (mut observation, overflow) = self.context.take_final_observation();
+        if let Some(observation) = observation.as_mut() {
+            Arc::get_mut(&mut observation.trace)
+                .expect("terminal receipt is private until release")
+                .physical_plan = self.root.published_plan();
+        }
+        BoundedCursorLifecycle::Released(reason, observation, overflow)
+    }
+
+    fn observation(&mut self) -> std::result::Result<CursorObservation, BoundedExecutionError> {
+        self.observation_with_boundary(true)
+    }
+
+    fn observation_with_boundary(
+        &mut self,
+        check_boundary: bool,
+    ) -> std::result::Result<CursorObservation, BoundedExecutionError> {
+        let plan = self.root.published_plan();
+        let vector = self.root.published_vector_search();
+        let groups_changed = match self.observation.as_ref() {
+            Some(prior) => !self
+                .context
+                .groups_match(&prior.trace.groups, check_boundary)?,
+            None => true,
+        };
+        let changed = groups_changed
+            || self.observation.as_ref().is_none_or(|prior| {
+                prior.trace.physical_plan != plan || prior.trace.vector_search.as_ref() != vector
+            });
+        if changed && !check_boundary {
+            let mut observation = self.context.final_observation_snapshot()?;
+            Arc::get_mut(&mut observation.trace)
+                .expect("new observation snapshot")
+                .physical_plan = plan;
+            self.observation = Some(observation);
+        } else if changed {
+            // Reserve both the shared metadata and the public handle's single
+            // owned copy before either is allocated. Subsequent pages share
+            // metadata; only their touch-derived scalar changes.
+            let mut bytes = checked_size_add(
+                std::mem::size_of::<QueryTrace>(),
+                query_trace_capacity_bytes(&self.root.trace)?,
+                "cursor trace",
+            )?;
+            bytes = checked_size_add(bytes, self.context.group_snapshot_bytes()?, "cursor groups")?;
+            if let Some(vector) = vector {
+                bytes = checked_size_add(
+                    bytes,
+                    vector_search_disclosure_capacity_bytes(vector)?,
+                    "cursor vector trace",
+                )?;
+            }
+            let bytes = checked_size_add(
+                checked_size_mul(bytes, 2, "cursor trace copies")?,
+                std::mem::size_of::<SourcePageCharge>() + 4 * std::mem::size_of::<usize>(),
+                "cursor trace owners",
+            )?;
+            if check_boundary {
+                self.context.reserve(BoundedWorkSource::TableScan, bytes)?;
+            } else {
+                self.context
+                    .reserve_metadata(BoundedWorkSource::TableScan, bytes)?;
+            }
+            let credit = self.context.state().memory.try_split_off(bytes)?;
+            self.context
+                .live_source_pages
+                .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+            let charge = Arc::new(SourcePageCharge {
+                _credit: credit,
+                live: self.context.live_source_pages.clone(),
+                bytes,
+            });
+            let mut trace = self.root.trace.clone();
+            trace.physical_plan = plan;
+            trace.vector_search = vector.cloned();
+            trace.groups = self.context.group_snapshot(check_boundary)?;
+            self.observation = Some(CursorObservation {
+                trace: Arc::new(trace),
+                rows_examined: 0,
+                charge: Some(charge),
+                group_page_returns: None,
+            });
+        }
+        let mut observation = self.observation.as_ref().unwrap().clone();
+        observation.rows_examined = self.context.cumulative_rows_examined()?;
+        Ok(observation)
+    }
+
     fn fetch_page(
         &mut self,
         rows: NonZeroUsize,
     ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+        self.context.prepare_final_observation_work()?;
+        let publication_context = self.context.clone();
+        let _group_attempt = GroupPublicationAttempt(&publication_context);
+        let _writer_read = self.database.enter_writer_read(
+            self.writer_root.clone(),
+            self.context
+                .source_read_memory(BoundedWorkSource::TableScan),
+        );
+        let _vector_read = enter_vector_read(
+            self.database.as_ref(),
+            self._snapshot,
+            &self.context,
+            self.vector_read,
+        )?;
         let row_limit = u64::try_from(rows.get()).map_err(|_| {
             RequestContext::limit_failure(
                 ReadFailureLimit::ResultRows,
@@ -12771,7 +18513,7 @@ impl CursorState {
         // the replay and every byte it took for the attempt goes back here.
         // The figure is taken before the page's own scaffolding is exchanged,
         // so "as it was" means exactly that.
-        let anchor = self.page_anchor()?;
+        let mut anchor = self.page_anchor()?;
         // This page's scaffolding replaces the last page's rather than adding
         // to it: a cursor that is handing back equally-shaped pages costs the
         // same while it builds one as it does while it holds one.
@@ -12780,11 +18522,15 @@ impl CursorState {
         if released_base > 0 {
             self.context.release(released_base)?;
         }
+        // Construction guards precede the funded payloads and stay armed
+        // through every fallible scaffolding step before page ownership.
+        let mut page_column_charge = ReservedBytes::new(&publication_context, 0);
         let (page_columns, page_column_bytes) = clone_strings_with_reservation(
             &self.visible_columns,
             &self.context,
             "cursor-page columns",
         )?;
+        page_column_charge.bytes = page_column_bytes;
         let planned_row_state_bytes = checked_size_add(
             checked_size_mul(
                 row_capacity,
@@ -12793,27 +18539,30 @@ impl CursorState {
             )?,
             checked_size_mul(
                 row_capacity,
-                std::mem::size_of::<usize>(),
+                std::mem::size_of::<(usize, Option<GroupBinding>)>(),
                 "cursor-page retained capacity",
             )?,
             "cursor-page row state",
         )?;
+        let planned_row_state_bytes = checked_size_add(
+            planned_row_state_bytes,
+            crate::owned_cursor_page::SharedRows::allocation_header_bytes(),
+            "immutable page root",
+        )?;
         self.context
             .reserve(BoundedWorkSource::TableScan, planned_row_state_bytes)?;
+        let mut row_state_charge =
+            ReservedBytes::new(&publication_context, planned_row_state_bytes);
         let mut page_rows = Vec::new();
         if page_rows.try_reserve_exact(row_capacity).is_err() {
-            self.context.release(planned_row_state_bytes)?;
-            self.context.release(page_column_bytes)?;
             return Err(
-                Error::Other("bounded cursor-page row allocation failed".to_string()).into(),
+                Error::Other(("bounded cursor-page row allocation failed".to_string()).into()).into(),
             );
         }
-        let mut retained = Vec::<usize>::new();
+        let mut retained = Vec::<(usize, Option<GroupBinding>)>::new();
         if retained.try_reserve_exact(row_capacity).is_err() {
-            self.context.release(planned_row_state_bytes)?;
-            self.context.release(page_column_bytes)?;
             return Err(
-                Error::Other("bounded cursor-page charge allocation failed".to_string()).into(),
+                Error::Other(("bounded cursor-page charge allocation failed".to_string()).into()).into(),
             );
         }
         let actual_row_state_bytes = checked_size_add(
@@ -12824,22 +18573,28 @@ impl CursorState {
             )?,
             checked_size_mul(
                 retained.capacity(),
-                std::mem::size_of::<usize>(),
+                std::mem::size_of::<(usize, Option<GroupBinding>)>(),
                 "cursor-page retained capacity",
             )?,
             "cursor-page row state",
         )?;
-        reconcile_new_reservation(
-            &self.context,
-            BoundedWorkSource::TableScan,
-            planned_row_state_bytes,
+        let actual_row_state_bytes = checked_size_add(
             actual_row_state_bytes,
+            crate::owned_cursor_page::SharedRows::allocation_header_bytes(),
+            "immutable page root",
         )?;
-        // The replay is this page's scaffolding too: it holds what this page
-        // pulled but did not publish, so it is shaped by this page's row limit
-        // and by whatever an interrupted earlier page handed back, never by
-        // the largest result the limits would ever admit. Equally-shaped pages
-        // therefore take back exactly what the previous page released.
+        if actual_row_state_bytes > planned_row_state_bytes {
+            self.context.reserve(
+                BoundedWorkSource::TableScan,
+                actual_row_state_bytes - planned_row_state_bytes,
+            )?;
+        } else if planned_row_state_bytes > actual_row_state_bytes {
+            self.context
+                .release(planned_row_state_bytes - actual_row_state_bytes)?;
+        }
+        row_state_charge.bytes = actual_row_state_bytes;
+        // Replay allocation belongs to the cursor across fetches. Reserve only
+        // growth, and return capacity credit only after shrinking the allocation.
         let replay_capacity = row_capacity
             .checked_add(1)
             .ok_or_else(|| {
@@ -12849,21 +18604,27 @@ impl CursorState {
                 )
             })?
             .max(self.replay.len());
+        let previous_replay_bytes = checked_size_mul(
+            self.replay.capacity(),
+            std::mem::size_of::<PulledRow>(),
+            "cursor replay capacity",
+        )?;
         let planned_replay_bytes = checked_size_mul(
             replay_capacity,
             std::mem::size_of::<PulledRow>(),
             "cursor replay capacity",
         )?;
-        self.context
-            .reserve(BoundedWorkSource::TableScan, planned_replay_bytes)?;
+        let growth_bytes = planned_replay_bytes.saturating_sub(previous_replay_bytes);
+        if growth_bytes > 0 {
+            self.context
+                .reserve(BoundedWorkSource::TableScan, growth_bytes)?;
+        }
         if self.replay.capacity() < replay_capacity {
             let additional = replay_capacity.saturating_sub(self.replay.len());
             if self.replay.try_reserve_exact(additional).is_err() {
-                self.context.release(planned_replay_bytes)?;
-                self.context.release(actual_row_state_bytes)?;
-                self.context.release(page_column_bytes)?;
+                self.context.release(growth_bytes)?;
                 return Err(
-                    Error::Other("bounded cursor replay allocation failed".to_string()).into(),
+                    Error::Other(("bounded cursor replay allocation failed".to_string()).into()).into(),
                 );
             }
         } else if self.replay.capacity() > replay_capacity {
@@ -12874,26 +18635,31 @@ impl CursorState {
             std::mem::size_of::<PulledRow>(),
             "cursor replay capacity",
         )?;
-        reconcile_new_reservation(
-            &self.context,
-            BoundedWorkSource::TableScan,
-            planned_replay_bytes,
-            replay_bytes,
-        )?;
+        let admitted_replay_bytes = previous_replay_bytes.saturating_add(growth_bytes);
+        if replay_bytes > admitted_replay_bytes {
+            // The allocation already exists and survives cancellation. Finish
+            // its credit reconciliation before the next cancellation boundary.
+            self.context.reserve_metadata(
+                BoundedWorkSource::TableScan,
+                replay_bytes - admitted_replay_bytes,
+            )?;
+        } else if admitted_replay_bytes > replay_bytes {
+            self.context.release(admitted_replay_bytes - replay_bytes)?;
+        }
+        // Settlement preserves the updated replay allocation in the fixed
+        // cursor credit, separate from replaceable page scaffolding.
+        anchor.fixed_bytes = anchor
+            .fixed_bytes
+            .saturating_sub(previous_replay_bytes)
+            .saturating_add(replay_bytes);
         let page_base_bytes = checked_size_add(
-            checked_size_add(
-                page_column_bytes,
-                actual_row_state_bytes,
-                "cursor-page state",
-            )?,
-            replay_bytes,
+            page_column_bytes,
+            actual_row_state_bytes,
             "cursor-page state",
         )?;
-        let mut page = CursorPage {
-            columns: page_columns,
-            rows: page_rows,
-            has_more: true,
-        };
+        let mut page = CursorPage::from_parts(page_columns, page_rows, true);
+        page_column_charge.bytes = 0;
+        row_state_charge.bytes = 0;
         let assembled = (|| {
             while u64::try_from(page.rows.len()).map_err(|_| {
                 RequestContext::limit_failure(
@@ -12925,22 +18691,34 @@ impl CursorState {
                     page.has_more = matches!(self.root.has_more_hint(), Some(true));
                     break;
                 };
-                retained.push(row.retained_bytes);
+                if let Some(binding) = row.group_binding
+                    && let Err(error) = self.context.stage_group_return(binding)
+                {
+                    self.replay_push_front(row)?;
+                    return Err(error);
+                }
+                retained.push((row.retained_bytes, row.group_binding));
                 page.rows.push(row.values);
                 page.has_more =
                     !self.replay.is_empty() || !matches!(self.root.has_more_hint(), Some(false));
-                let encoded = encoded_page_size(&self.context, &page)?;
+                let observation = self.observation()?;
+                let encoded = encoded_page_size(&self.context, &page, &observation)?;
                 self.context.note_result_shape(page.rows.len(), encoded);
                 if encoded > self.context.limits.cursor_page_bytes {
                     let values = page.rows.pop().ok_or_else(|| {
-                        Error::Other("bounded cursor lost its byte-stopped row".to_string())
+                        Error::Other(("bounded cursor lost its byte-stopped row".to_string()).into())
                     })?;
-                    let retained_bytes = retained.pop().ok_or_else(|| {
-                        Error::Other("bounded cursor lost its byte-stopped charge".to_string())
+                    let (retained_bytes, group_binding) = retained.pop().ok_or_else(|| {
+                        Error::Other(("bounded cursor lost its byte-stopped charge".to_string()).into())
                     })?;
+                    if let Some(binding) = group_binding {
+                        self.context.unstage_group_return(binding)?;
+                    }
                     self.replay_push_front(PulledRow {
+                        window: None,
                         values,
                         retained_bytes,
+                        group_binding,
                     })?;
                     if page.rows.is_empty() {
                         return Err(self.page_bytes_refusal(encoded)?);
@@ -12961,11 +18739,25 @@ impl CursorState {
             {
                 page.has_more = self.has_more_after_page()?;
             }
-            let encoded = encoded_page_size(&self.context, &page)?;
+            let observation = self.observation()?;
+            let encoded = encoded_page_size(&self.context, &page, &observation)?;
             if encoded > self.context.limits.cursor_page_bytes {
                 return Err(self.page_bytes_refusal(encoded)?);
             }
-            self.context.set_encoded_bytes(encoded);
+            let page_bytes = encoded;
+            let encoded = u64::try_from(serialized_size(
+                &crate::read_contract::cursor_observation::BorrowedObservedPage::new(
+                    &page,
+                    &observation,
+                ),
+            )?)
+            .map_err(|_| bounded_size_error("cursor observation telemetry"))?;
+            let trace_bytes = encoded
+                .checked_sub(page_bytes)
+                .ok_or_else(|| bounded_size_error("cursor trace telemetry"))?;
+            let mut state = self.context.state();
+            state.telemetry.encoded_bytes = page_bytes;
+            state.telemetry.encoded_trace_bytes = trace_bytes;
             Ok(encoded)
         })();
         let encoded = match assembled {
@@ -12986,18 +18778,23 @@ impl CursorState {
             self.check_lifetime()?;
             self.context.check_final_boundary()?;
             let telemetry = self.context.telemetry();
-            if telemetry.encoded_bytes != encoded {
-                return Err(Error::Other(
-                    "bounded cursor encoded-byte telemetry changed before publication".to_string(),
-                )
+            if telemetry
+                .encoded_bytes
+                .checked_add(telemetry.encoded_trace_bytes)
+                != Some(encoded)
+            {
+                return Err(Error::Other((
+                    "bounded cursor encoded-byte telemetry changed before publication".to_string()).into())
                 .into());
             }
+            let mut observation = self.observation()?;
+            observation.group_page_returns = self.context.prepare_group_page_returns(&retained)?;
             self.check_lifetime()?;
             self.context.check_final_boundary()?;
-            Ok(telemetry)
+            Ok((telemetry, observation))
         })();
-        let telemetry = match publication_boundary {
-            Ok(telemetry) => telemetry,
+        let (telemetry, observation) = match publication_boundary {
+            Ok(prepared) => prepared,
             Err(BoundedExecutionError::Cancelled) => {
                 // Interrupted at the publication boundary. Nothing was
                 // published, every assembled row is back in the replay, and
@@ -13011,16 +18808,41 @@ impl CursorState {
             Err(error) => return Err(error),
         };
         let published = page.rows.len();
-        // The page's rows leave with the answer, so they stop being this
-        // cursor's cost; the scaffolding stays, to be given back and retaken by
-        // the next page, and the rows the replay still owns stay charged.
-        retained.clear();
-        self.held_page_base = page_base_bytes;
-        self.settle_retained_charge(anchor, page_base_bytes)?;
+        self.context.publish_group_returns()?;
+        // Transfer the existing request credit with the published allocation.
+        // The row membership scratch drops here; it never travels with the DTO.
+        let row_bytes = retained.iter().try_fold(0usize, |bytes, (held, _)| {
+            checked_size_add(bytes, *held, "published cursor rows")
+        })?;
+        let page_bytes = checked_size_add(
+            page_column_bytes,
+            checked_size_mul(
+                page.rows.capacity(),
+                std::mem::size_of::<Vec<Value>>(),
+                "published cursor row slots",
+            )?,
+            "published cursor page",
+        )?;
+        let page_bytes = checked_size_add(page_bytes, row_bytes, "published cursor page")?;
+        let page_bytes = checked_size_add(
+            page_bytes,
+            crate::owned_cursor_page::SharedRows::allocation_header_bytes(),
+            "published immutable page root",
+        )?;
+        let owner_bytes = 0; // Credit moves inline; no credit Arc allocation.
+        let credit = self.context.state().memory.try_split_off(checked_size_add(
+            page_bytes,
+            owner_bytes,
+            "published cursor credit owner",
+        )?)?;
+        page = page.with_credit(credit);
+        drop(retained);
+        self.held_page_base = 0;
+        self.settle_retained_charge(anchor, 0)?;
         self.published_rows = self
             .published_rows
             .checked_add(published)
-            .ok_or_else(|| Error::Other("bounded cursor row counter overflow".to_string()))?;
+            .ok_or_else(|| Error::Other(("bounded cursor row counter overflow".to_string()).into()))?;
         self.last_used_ms = self.context.clock.now_ms();
         self.idle_window.touch(self.last_used_ms);
         // The page is published, so this fetch is over: whatever it examined
@@ -13028,10 +18850,12 @@ impl CursorState {
         self.context.flush_final_progress();
         Ok(BoundedCursorFetch {
             page,
+            observation,
             publication: self.context.publication_scope(
                 self.publication.snapshot_lsn,
                 self.publication.tables.clone(),
-            ),
+                self.publication.inspection,
+            )?,
             telemetry,
         })
     }
@@ -13039,6 +18863,11 @@ impl CursorState {
 
 impl Drop for CursorState {
     fn drop(&mut self) {
+        // Terminal observations can retain the request context after the
+        // kernel ends. They must not retain the operation's storage root.
+        let capture = self.context.vector_read_capture.lock()
+            .unwrap_or_else(|poison| poison.into_inner()).take();
+        drop(capture);
         if self.plugin_finished {
             return;
         }
@@ -13068,10 +18897,11 @@ pub(super) fn open_cursor(
     db: Arc<dyn ReadExecutionTarget>,
     sql: &str,
     params: &HashMap<String, Value>,
+    read_memory: Arc<dyn ReadMemoryBudget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
     let statement = contextdb_parser::parse(sql)?;
     db.plugin().on_query(sql)?;
@@ -13079,28 +18909,46 @@ pub(super) fn open_cursor(
     let withdrawn = cancellation.clone();
     let prepared = (|| {
         let context = RequestContext::new(
-            db.as_ref(),
+            Arc::clone(&read_memory),
             limits,
             ReadResumption::AcrossFetches,
             Arc::clone(&clock),
             cancellation,
             db.active_read_transaction(),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             probe,
         )?;
+        if CAPTURE_CURSOR_OPEN_CONTEXT.with(Cell::get) {
+            CURSOR_OPEN_CONTEXT.with(|slot| *slot.borrow_mut() = Some(context.clone()));
+        }
         let schema_capture = db.capture_read_schema();
-        let membership_capture = db.relational_membership_store().begin_membership_capture();
-        let Some((snapshot, publication_lsn, idle_window, storage_snapshot, snapshot_registration)) =
-            db.bounded_cursor_snapshot_registration(
-                Arc::clone(&clock),
-                limits.cursor_idle_ms,
-                &context.registration_budget(),
-                &withdrawn,
-            )?
+        let membership_capture = (!db.retained_relational_membership_source())
+            .then(|| db.relational_membership_store().begin_membership_capture());
+        let Some((
+            snapshot,
+            publication_lsn,
+            idle_window,
+            storage_snapshot,
+            snapshot_registration,
+            writer_root,
+        )) = db.bounded_cursor_snapshot_registration(
+            statement_needs_vector_graph(&statement),
+            Arc::clone(&clock),
+            limits.cursor_idle_ms,
+            &context.registration_budget(),
+            &withdrawn,
+            context.source_read_memory(BoundedWorkSource::TableScan),
+        )?
         else {
             return Err(context.withdrawn_failure());
         };
-        #[cfg(feature = "test-seams")]
+        let _writer_read = db.enter_writer_read(
+            writer_root.clone(),
+            context.source_read_memory(BoundedWorkSource::TableScan),
+        );
+        let vector_read = statement_needs_vector_read(&statement);
+        let _vector_read = enter_vector_read(db.as_ref(), snapshot, &context, vector_read)?;
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
             probe.after_snapshot_registration();
@@ -13115,21 +18963,54 @@ pub(super) fn open_cursor(
         // that shape, not after.
         let planned_prepared_bytes = checked_size_mul(statement_bytes, 2, "bounded read plan")?;
         context.reserve(BoundedWorkSource::TableScan, planned_prepared_bytes)?;
-        let (resolved, plan) = db.prepare_bounded_read_plan(&statement, params)?;
-        let publication = context.publication_scope(publication_lsn, publication_tables(&plan));
+        let (resolved, plan) = if matches!(&statement, Statement::Select(select)
+            if select.ctes.is_empty() || select.body.where_clause.is_none()) {
+            // This branch only clones the AST and validates columns. The
+            // resolver performs no storage reads, so no codec accountant or
+            // per-call image owner is needed for static planning.
+            let mut owner = context.vector_copies.lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            db.prepare_bounded_read_plan(&statement, params, &mut owner,
+                context.reader_budget.clone())
+        } else {
+            context.with_vector_copies(|vector_copy_owner| {
+                db.prepare_bounded_read_plan(
+                    &statement, params, vector_copy_owner,
+                    Arc::new(SourceDecodeBudget {
+                        context: context.clone(), source: BoundedWorkSource::TableScan,
+                    }),
+                )
+            })
+        }?;
         let resolved_bytes = statement_capacity_bytes(&resolved)?;
         ensure_supported_plan(&plan)?;
         let plan_bytes = physical_plan_capacity_bytes(&plan)?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            planned_prepared_bytes,
-            checked_size_add(resolved_bytes, plan_bytes, "bounded read plan")?,
-        )?;
+        {
+            let admitted_bytes = planned_prepared_bytes;
+            let retained_bytes = checked_size_add(resolved_bytes, plan_bytes, "bounded read plan")?;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
         drop(statement);
         context.release(statement_bytes)?;
         drop(resolved);
         context.release(resolved_bytes)?;
+        // The original snapshot/source guards are still held. Retire the
+        // parsed/resolved AST allocations before re-entering the same vector
+        // capture and creating publication metadata.
+        let vector_read = vector_read || plan_needs_vector_read(&plan);
+        let _vector_plan_read = enter_vector_read(db.as_ref(), snapshot, &context, vector_read)?;
+        let publication = context.publication_scope(
+            publication_lsn,
+            publication_tables(&plan),
+            inspection_reads_committed_state(&plan),
+        )?;
         context.reserve(
             BoundedWorkSource::TableScan,
             std::mem::size_of::<BoundedCursorExecutionState>(),
@@ -13138,12 +19019,18 @@ pub(super) fn open_cursor(
         context.reserve(BoundedWorkSource::TableScan, planned_params_bytes)?;
         let params = Arc::new(params.clone());
         let params_bytes = params_retained_bytes(&params)?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            planned_params_bytes,
-            params_bytes,
-        )?;
+        {
+            let admitted_bytes = planned_params_bytes;
+            let retained_bytes = params_bytes;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
         // The kernel is built out of the plan and holds a copy of every table
         // shape it reads, so the plan's own size is the floor the request is
         // admitted for before the kernel is materialized; the reservation is
@@ -13159,19 +19046,28 @@ pub(super) fn open_cursor(
         }
         drop(membership_capture);
         drop(schema_capture);
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(probe) = context.probe() {
             probe.after_source_capture();
         }
         let root_bytes = pull_continuation_bytes(&root)?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            plan_bytes,
-            root_bytes,
-        )?;
+        let prepaid = adopt_kernel_construction(&mut root)?;
+        let construction_bytes =
+            checked_size_add(plan_bytes, prepaid, "kernel construction adoption")?;
+        // The kernel owns its copies now. Free the consumed plan before
+        // reconciling kernel capacity, retaining its separate construction credit.
         drop(plan);
         context.release(plan_bytes)?;
+        // Keep adopted credit while the root is alive if admission refuses.
+        if root_bytes > construction_bytes {
+            context.reserve(
+                BoundedWorkSource::TableScan,
+                root_bytes - construction_bytes,
+            )?;
+        } else if construction_bytes > root_bytes {
+            context.release(construction_bytes - root_bytes)?;
+        }
+        context.bind_final_trace(&root.trace)?;
         let internal_row_id = root.columns.iter().position(|column| column == "row_id");
         let (mut visible_columns, visible_column_bytes) =
             clone_strings_with_reservation(&root.columns, &context, "cursor columns")?;
@@ -13180,16 +19076,22 @@ pub(super) fn open_cursor(
         }
         let retained_visible_column_bytes =
             strings_capacity_bytes(&visible_columns, "cursor columns")?;
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            visible_column_bytes,
-            retained_visible_column_bytes,
-        )?;
+        {
+            let admitted_bytes = visible_column_bytes;
+            let retained_bytes = retained_visible_column_bytes;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
         // The replay carries rows a page did not publish into the next page,
         // so it is shaped by the page being built, not by the largest result
-        // the limits would ever allow. It is taken and given back inside
-        // `fetch_page` alongside the rest of the page's scaffolding; a cursor
+        // the limits would ever allow. Its capacity stays charged across
+        // `fetch_page` calls until resized or the cursor is destroyed; a cursor
         // that has not built a page yet holds no replay at all.
         let replay = VecDeque::new();
         let planned_sql_bytes = sql.len();
@@ -13197,22 +19099,30 @@ pub(super) fn open_cursor(
         let mut retained_sql = String::new();
         if retained_sql.try_reserve_exact(sql.len()).is_err() {
             context.release(planned_sql_bytes)?;
-            return Err(Error::Other("bounded cursor SQL allocation failed".to_string()).into());
+            return Err(Error::Other(("bounded cursor SQL allocation failed".to_string()).into()).into());
         }
         retained_sql.push_str(sql);
         let sql_bytes = retained_sql.capacity();
-        reconcile_new_reservation(
-            &context,
-            BoundedWorkSource::TableScan,
-            planned_sql_bytes,
-            sql_bytes,
-        )?;
+        {
+            let admitted_bytes = planned_sql_bytes;
+            let retained_bytes = sql_bytes;
+            if retained_bytes > admitted_bytes {
+                context.reserve(
+                    BoundedWorkSource::TableScan,
+                    retained_bytes - admitted_bytes,
+                )?;
+            } else if admitted_bytes > retained_bytes {
+                context.release(admitted_bytes - retained_bytes)?;
+            }
+        }
         let now = clock.now_ms();
         Ok(CursorState {
             database: Arc::clone(&db),
             _snapshot: snapshot,
             _snapshot_registration: snapshot_registration,
             storage_snapshot,
+            writer_root,
+            vector_read,
             publication,
             idle_window,
             context,
@@ -13227,6 +19137,7 @@ pub(super) fn open_cursor(
             plugin_finished: false,
             published_rows: 0,
             held_page_base: 0,
+            observation: None,
         })
     })();
     let mut state = match prepared {
@@ -13266,28 +19177,200 @@ pub(super) fn open_cursor(
             state
                 .storage_snapshot
                 .as_ref()
-                .map(|pin| pin.read.storage_snapshot_identity())
+                .map(|pin| pin.storage_identity())
+                .or_else(|| {
+                    state
+                        .writer_root
+                        .as_ref()
+                        .map(|root| root.storage_identity())
+                })
         })
         .flatten();
     let lifecycle = if first.page.has_more {
         BoundedCursorLifecycle::Open(state)
     } else {
-        let columns = first.page.columns.clone();
+        let columns = CursorPage::try_empty(&first.page.columns, read_memory.clone())?;
         state.finish_plugin_success();
-        BoundedCursorLifecycle::Exhausted(columns)
+        BoundedCursorLifecycle::Exhausted(columns, first.observation.clone())
     };
+    let execution = Arc::new(BoundedCursorExecutionState {
+        read_memory: read_memory.clone(),
+        lifecycle: Mutex::new(lifecycle),
+        publication: publication.clone(),
+        erased: std::sync::atomic::AtomicBool::new(false),
+        active_cancellation: Mutex::new(OwnerReadCancellation::new()),
+        expiry_watch: Mutex::new(None),
+    });
+    db.register_writer_cursor(&execution)?;
+    start_cursor_expiry_watch(&execution, Arc::clone(&read_memory))?;
     Ok(BoundedCursorOpen {
-        cursor: BoundedCursorHandle {
-            _state: Arc::new(BoundedCursorExecutionState {
-                lifecycle: Mutex::new(lifecycle),
-                publication: publication.clone(),
-            }),
-        },
+        cursor: BoundedCursorHandle { _state: execution },
         first_page: first.page,
+        observation: first.observation,
         storage_snapshot,
         publication,
         telemetry: first.telemetry,
     })
+}
+
+/// The existing deadline future wakes this admitted control owner directly.
+/// No separate native thread or strong execution cycle is created.
+pub(super) struct CursorExpiryWatch {
+    execution: std::sync::Weak<BoundedCursorExecutionState>,
+    clock: Arc<dyn DeadlineClock>,
+    wait: Mutex<Option<(u64, contextdb_core::read_contract::DeadlineWait<'static>)>>,
+    _read_memory: Arc<dyn ReadMemoryBudget>,
+}
+
+impl CursorExpiryWatch {
+    pub(super) fn retire(&self) {
+        let wait = self.wait.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(wait);
+    }
+
+    pub(super) fn drive(self: &Arc<Self>) {
+        let Some(execution) = self.execution.upgrade() else {
+            self.retire();
+            return;
+        };
+        // A wake may come from inside the active fetch. That fetch drives us
+        // again after releasing its lifecycle borrow and updating its deadline.
+        let Ok(mut lifecycle) = execution.lifecycle.try_lock() else {
+            return;
+        };
+        let BoundedCursorLifecycle::Open(state) = &mut *lifecycle else {
+            drop(lifecycle);
+            execution.retire_expiry();
+            return;
+        };
+        if let Err(error) = state.check_expiry() {
+            state.finish_plugin_error(&error);
+            let reason = match &error {
+                BoundedExecutionError::Refused(failure) => match failure.detail() {
+                    ReadFailureDetail::CursorExpired { expiry } => {
+                        BoundedCursorTerminalReason::Expired(*expiry)
+                    }
+                    _ => BoundedCursorTerminalReason::Refused,
+                },
+                _ => BoundedCursorTerminalReason::Refused,
+            };
+            release_cursor_lifecycle(&mut lifecycle, reason);
+            drop(lifecycle);
+            execution.retire_expiry();
+            return;
+        }
+        let deadline = cursor_deadline(state);
+        drop(lifecycle);
+        let Ok(mut wait) = self.wait.try_lock() else {
+            return;
+        };
+        if wait.as_ref().is_none_or(|(armed, _)| *armed != deadline) {
+            let clock = self.clock.clone();
+            *wait = Some((
+                deadline,
+                Box::pin(async move { clock.wait_until(deadline).await }),
+            ));
+        }
+        let waker = std::task::Waker::from(self.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let ready = wait
+            .as_mut()
+            .is_some_and(|(_, wait)| wait.as_mut().poll(&mut context).is_ready());
+        if ready {
+            // Latch completion: a failed timer arm is also a one-shot. Reuse
+            // the established monotonic timer for the remaining interval.
+            let now = self.clock.now_ms();
+            if now < deadline {
+                let remaining = deadline.saturating_sub(now);
+                *wait = Some((
+                    deadline,
+                    Box::pin(async move {
+                        let fallback = crate::local_transport::MonotonicDeadlineClock::new();
+                        fallback.wait_until(remaining).await;
+                    }),
+                ));
+                let fallback_ready = wait
+                    .as_mut()
+                    .is_some_and(|(_, fallback)| fallback.as_mut().poll(&mut context).is_ready());
+                if fallback_ready {
+                    let completed = wait.take();
+                    drop(wait);
+                    drop(completed);
+                    // No independently armed wake exists. Retire the parked
+                    // resources now rather than leaving a completed future
+                    // in the observer and retaining the snapshot forever.
+                    let mut lifecycle = execution
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let BoundedCursorLifecycle::Open(state) = &mut *lifecycle {
+                        let error = BoundedExecutionError::Engine(Error::Other(
+                            "cursor deadline timer could not be armed".into()));
+                        state.finish_plugin_error(&error);
+                        release_cursor_lifecycle(
+                            &mut lifecycle,
+                            BoundedCursorTerminalReason::Refused,
+                        );
+                    }
+                    drop(lifecycle);
+                    execution.retire_expiry();
+                }
+            } else {
+                let completed = wait.take();
+                drop(wait);
+                drop(completed);
+                self.drive();
+            }
+        }
+    }
+}
+impl std::task::Wake for CursorExpiryWatch {
+    fn wake(self: Arc<Self>) {
+        self.drive();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.drive();
+    }
+}
+
+fn start_cursor_expiry_watch(
+    execution: &Arc<BoundedCursorExecutionState>,
+    read_memory: Arc<dyn ReadMemoryBudget>,
+) -> std::result::Result<(), BoundedExecutionError> {
+    let clock = {
+        let lifecycle = execution
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let BoundedCursorLifecycle::Open(state) = &*lifecycle else {
+            return Ok(());
+        };
+        state.context.clock.clone()
+    };
+    let watch = Arc::new(CursorExpiryWatch {
+        execution: Arc::downgrade(execution),
+        clock,
+        wait: Mutex::new(None),
+        _read_memory: read_memory,
+    });
+    *execution
+        .expiry_watch
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(watch.clone());
+    watch.drive();
+    Ok(())
+}
+
+fn cursor_deadline(state: &CursorState) -> u64 {
+    state
+        .created_ms
+        .saturating_add(state.context.limits.cursor_lifetime_ms)
+        .min(
+            state
+                .last_used_ms
+                .saturating_add(state.context.limits.cursor_idle_ms),
+        )
+        .saturating_add(1)
 }
 
 /// A work refusal names the statement it stopped and the one move that
@@ -13329,7 +19412,82 @@ fn work_refusal_naming_the_statement(
 fn cursor_not_found() -> BoundedExecutionError {
     match ReadFailure::new(ReadFailureKind::CursorNotFound, ReadFailureDetail::None) {
         Ok(failure) => BoundedExecutionError::Refused(failure),
-        Err(error) => BoundedExecutionError::Engine(Error::Other(error.to_string())),
+        Err(error) => BoundedExecutionError::Engine(Error::Other((error.to_string()).into())),
+    }
+}
+
+impl BoundedCursorHandle {
+    /// Observe credits already held by this read, without charging or advancing it.
+    pub(crate) fn retained_read_bytes(&self) -> usize {
+        self.retained_read_bytes_with_observations(None, None)
+    }
+
+    /// Carrier-held observations can outlive the kernel's released lifecycle.
+    /// Count each surviving shared live counter once, including when the open
+    /// kernel and the carrier still share the same observation credits.
+    pub(crate) fn retained_read_bytes_with_observations(
+        &self,
+        pending: Option<&CursorObservation>,
+        cancelled: Option<&CursorObservation>,
+    ) -> usize {
+        let lifecycle = cursor_lifecycle(self);
+        let (reserved, kernel_live, kernel_returns) = match &*lifecycle {
+            BoundedCursorLifecycle::Open(state) => (
+                state.context.state().memory.bytes(),
+                Some(&state.context.live_source_pages),
+                None,
+            ),
+            BoundedCursorLifecycle::Exhausted(page, observation) => (
+                page.credit_bytes(),
+                observation.charge.as_ref().map(|charge| &charge.live),
+                observation
+                    .group_page_returns
+                    .as_ref()
+                    .map(|receipt| &receipt._charge.live),
+            ),
+            BoundedCursorLifecycle::Released(_, observation, _) => (
+                0,
+                observation
+                    .as_ref()
+                    .and_then(|observation| observation.charge.as_ref().map(|charge| &charge.live)),
+                None,
+            ),
+        };
+        let counters = [
+            kernel_live,
+            kernel_returns,
+            pending.and_then(|observation| observation.charge.as_ref().map(|charge| &charge.live)),
+            pending.and_then(|observation| {
+                observation
+                    .group_page_returns
+                    .as_ref()
+                    .map(|receipt| &receipt._charge.live)
+            }),
+            cancelled
+                .and_then(|observation| observation.charge.as_ref().map(|charge| &charge.live)),
+            cancelled.and_then(|observation| {
+                observation
+                    .group_page_returns
+                    .as_ref()
+                    .map(|receipt| &receipt._charge.live)
+            }),
+        ];
+        counters
+            .iter()
+            .enumerate()
+            .fold(reserved, |bytes, (index, counter)| {
+                let Some(counter) = counter else {
+                    return bytes;
+                };
+                if counters[..index]
+                    .iter()
+                    .flatten()
+                    .any(|prior| Arc::ptr_eq(prior, counter))
+                {
+                    return bytes;
+                }
+                bytes.saturating_add(counter.load(std::sync::atomic::Ordering::SeqCst))
+            })
     }
 }
 
@@ -13341,7 +19499,7 @@ fn cursor_not_found() -> BoundedExecutionError {
 pub(super) fn cursor_is_live(cursor: &BoundedCursorHandle) -> bool {
     !matches!(
         *cursor_lifecycle(cursor),
-        BoundedCursorLifecycle::Released(_)
+        BoundedCursorLifecycle::Released(_, _, _)
     )
 }
 
@@ -13362,67 +19520,235 @@ fn cursor_lifecycle(cursor: &BoundedCursorHandle) -> MutexGuard<'_, BoundedCurso
 }
 
 fn exhausted_fetch(
-    columns: Vec<String>,
+    page: CursorPage,
+    observation: CursorObservation,
     publication: ReadPublicationScope,
     cancellation: OwnerReadCancellation,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
-    let page = CursorPage {
-        columns,
-        rows: Vec::new(),
-        has_more: false,
-    };
-    let encoded = serialized_size(&page)?;
+    let encoded = serialized_size(
+        &crate::read_contract::cursor_observation::BorrowedObservedPage::new(&page, &observation),
+    )?;
     let encoded = u64::try_from(encoded)
-        .map_err(|_| Error::Other("empty cursor page exceeds u64".to_string()))?;
+        .map_err(|_| Error::Other(("empty cursor page exceeds u64".to_string()).into()))?;
+    let page_bytes = u64::try_from(serialized_size(&page)?)
+        .map_err(|_| Error::Other(("empty cursor page exceeds u64".to_string()).into()))?;
+    let trace_bytes = encoded
+        .checked_sub(page_bytes)
+        .ok_or_else(|| Error::Other(("empty cursor trace byte accounting underflow".to_string()).into()))?;
     Ok(BoundedCursorFetch {
         page,
+        observation,
         publication: publication.refreshed(cancellation),
         telemetry: BoundedExecutionTelemetry {
-            encoded_bytes: encoded,
+            encoded_bytes: page_bytes,
+            encoded_trace_bytes: trace_bytes,
             ..BoundedExecutionTelemetry::default()
         },
     })
+}
+
+/// A cancellation receipt excludes only this page's unpublished group returns.
+/// The retained page keeps its original observation for eventual publication.
+/// Clearing the copied receipt makes repeated withdrawal of the copy a no-op;
+/// it cannot subtract a previous page or roll back any examined-entry work.
+pub(super) fn unpublished_groups_withdrawn(
+    page: &CursorObservation,
+) -> std::result::Result<CursorObservation, BoundedExecutionError> {
+    groups_published_through(page, 0)
+}
+
+pub(super) fn groups_published_through(
+    page: &CursorObservation,
+    offset: usize,
+) -> std::result::Result<CursorObservation, BoundedExecutionError> {
+    let mut published = page.clone();
+    let Some(receipt) = published.group_page_returns.take() else {
+        return Ok(published);
+    };
+    if receipt.generation == 0 || offset > receipt.rows.len() {
+        return Err(Error::Other(("invalid group page publication offset".to_string()).into()).into());
+    }
+    let suffix = &receipt.rows[offset..];
+    if suffix.iter().all(Option::is_none) {
+        return Ok(published);
+    }
+    for binding in suffix.iter().flatten() {
+        if binding.0 >= published.trace.groups.len() {
+            return Err(Error::Other(("invalid group page return binding".to_string()).into()).into());
+        }
+    }
+    // No temporary count container: these are the actual remaining row bindings.
+    for (index, group) in published.trace.groups.iter().enumerate() {
+        let returned = suffix
+            .iter()
+            .filter(|binding| **binding == Some(GroupBinding(index)))
+            .count();
+        let returned = u64::try_from(returned)
+            .map_err(|_| Error::Other(("group page suffix exceeds u64".to_string()).into()))?;
+        group
+            .returned_rows
+            .checked_sub(returned)
+            .ok_or_else(|| Error::Other(("group page return withdrawal underflow".to_string()).into()))?;
+    }
+    // The original page trace admission funds its retained outward copy.
+    for (index, group) in Arc::make_mut(&mut published.trace)
+        .groups
+        .iter_mut()
+        .enumerate()
+    {
+        let returned = suffix
+            .iter()
+            .filter(|binding| **binding == Some(GroupBinding(index)))
+            .count();
+        group.returned_rows -= u64::try_from(returned)
+            .map_err(|_| Error::Other(("group page suffix exceeds u64".to_string()).into()))?;
+    }
+    Ok(published)
+}
+
+pub(super) fn release_cursor_lifecycle(
+    lifecycle: &mut BoundedCursorLifecycle,
+    reason: BoundedCursorTerminalReason,
+) {
+    let previous = std::mem::replace(
+        lifecycle,
+        BoundedCursorLifecycle::Released(reason, None, false),
+    );
+    *lifecycle = match previous {
+        BoundedCursorLifecycle::Open(mut state) => state.released(reason),
+        BoundedCursorLifecycle::Exhausted(_, observation) => {
+            BoundedCursorLifecycle::Released(reason, Some(observation), false)
+        }
+        BoundedCursorLifecycle::Released(_, observation, overflow) => {
+            BoundedCursorLifecycle::Released(reason, observation, overflow)
+        }
+    };
+}
+
+pub(super) fn cursor_observation(
+    cursor: &mut BoundedCursorHandle,
+) -> std::result::Result<Option<CursorObservation>, BoundedExecutionError> {
+    let mut lifecycle = cursor_lifecycle(cursor);
+    match &mut *lifecycle {
+        BoundedCursorLifecycle::Open(state) => state.observation_with_boundary(false).map(Some),
+        BoundedCursorLifecycle::Exhausted(_, observation) => Ok(Some(observation.clone())),
+        BoundedCursorLifecycle::Released(_, observation, overflow) => {
+            if *overflow {
+                return Err(
+                    Error::Other(("bounded rows-examined counter overflow".to_string()).into()).into(),
+                );
+            }
+            Ok(observation.take())
+        }
+    }
 }
 
 pub(super) fn fetch_cursor(
     cursor: &mut BoundedCursorHandle,
     rows: Option<NonZeroUsize>,
     cancellation: OwnerReadCancellation,
-    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+    // A request cancelled before it starts consumes no continuation state.
+    // Do not attach its already-fired listener to the parked cursor: that
+    // listener terminally withdraws a read, rather than cancelling this page.
+    if cancellation.is_cancelled()
+        && !cursor
+            ._state
+            .erased
+            .load(std::sync::atomic::Ordering::SeqCst)
+        && matches!(*cursor_lifecycle(cursor), BoundedCursorLifecycle::Open(_))
+    {
+        return Err(BoundedExecutionError::Cancelled);
+    }
+    *cursor
+        ._state
+        .active_cancellation
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = cancellation.clone();
+    struct DriveAfterFetch(Arc<BoundedCursorExecutionState>);
+    impl Drop for DriveAfterFetch {
+        fn drop(&mut self) {
+            // The token belongs to this request. A later cancellation must
+            // not affect the continuation parked between fetches.
+            *self
+                .0
+                .active_cancellation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = OwnerReadCancellation::new();
+            self.0.wake_expiry();
+        }
+    }
+    let _drive_after_fetch = DriveAfterFetch(cursor._state.clone());
     let mut lifecycle = cursor_lifecycle(cursor);
+    if cursor
+        ._state
+        .erased
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        release_cursor_lifecycle(&mut lifecycle, BoundedCursorTerminalReason::Erased);
+        return Err(BoundedExecutionError::Refused(
+            ReadFailure::new(
+                ReadFailureKind::AuthoritativeErasure,
+                ReadFailureDetail::Reason {
+                    reason: "authoritative erasure invalidated this captured storage capability"
+                        .into(),
+                },
+            )
+            .expect("authoritative erasure carries reason detail"),
+        ));
+    }
     let current = std::mem::replace(
         &mut *lifecycle,
-        BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::ExplicitClose),
+        BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::ExplicitClose, None, false),
     );
     let mut state = match current {
-        BoundedCursorLifecycle::Released(reason) => {
-            *lifecycle = BoundedCursorLifecycle::Released(reason);
+        BoundedCursorLifecycle::Released(
+            BoundedCursorTerminalReason::Expired(expiry),
+            observation,
+            overflow,
+        ) => {
+            *lifecycle = BoundedCursorLifecycle::Released(
+                BoundedCursorTerminalReason::Refused,
+                observation,
+                overflow,
+            );
+            return Err(BoundedExecutionError::Refused(ReadFailure::cursor_expired(
+                expiry,
+            )));
+        }
+        BoundedCursorLifecycle::Released(reason, observation, overflow) => {
+            *lifecycle = BoundedCursorLifecycle::Released(reason, observation, overflow);
             return Err(cursor_not_found());
         }
-        BoundedCursorLifecycle::Exhausted(columns) => {
+        BoundedCursorLifecycle::Exhausted(columns, observation) => {
             let fetch = exhausted_fetch(
-                columns.clone(),
+                columns.try_clone(cursor._state.read_memory.clone())?,
+                observation.clone(),
                 cursor._state.publication.clone(),
                 cancellation,
             );
-            *lifecycle = BoundedCursorLifecycle::Exhausted(columns);
+            *lifecycle = BoundedCursorLifecycle::Exhausted(columns, observation);
             return fetch;
         }
         BoundedCursorLifecycle::Open(state) => state,
     };
     if let Err(error) = state.check_expiry() {
         state.finish_plugin_error(&error);
-        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Expired);
+        *lifecycle = state.released(BoundedCursorTerminalReason::Refused);
         return Err(error);
     }
     if let Err(error) = state.context.begin_fetch(
         cancellation,
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         probe,
     ) {
-        state.finish_plugin_error(&error);
-        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+        if matches!(error, BoundedExecutionError::Cancelled) {
+            *lifecycle = BoundedCursorLifecycle::Open(state);
+        } else {
+            state.finish_plugin_error(&error);
+            *lifecycle = state.released(BoundedCursorTerminalReason::Refused);
+        }
         return Err(error);
     }
     let rows = match rows {
@@ -13431,7 +19757,7 @@ pub(super) fn fetch_cursor(
             Ok(rows) => rows,
             Err(error) => {
                 state.finish_plugin_error(&error);
-                *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+                *lifecycle = state.released(BoundedCursorTerminalReason::Refused);
                 return Err(error);
             }
         },
@@ -13456,20 +19782,33 @@ pub(super) fn fetch_cursor(
             if fetch.page.has_more {
                 *lifecycle = BoundedCursorLifecycle::Open(state);
             } else {
-                let columns = fetch.page.columns.clone();
+                let columns = match CursorPage::try_empty(
+                    &fetch.page.columns,
+                    cursor._state.read_memory.clone(),
+                ) {
+                    Ok(columns) => columns,
+                    Err(error) => {
+                        let error = BoundedExecutionError::from(error);
+                        state.finish_plugin_error(&error);
+                        *lifecycle = state.released(BoundedCursorTerminalReason::Refused);
+                        return Err(error);
+                    }
+                };
                 state.finish_plugin_success();
-                *lifecycle = BoundedCursorLifecycle::Exhausted(columns);
+                *lifecycle = BoundedCursorLifecycle::Exhausted(columns, fetch.observation.clone());
             }
             Ok(fetch)
         }
         Err(BoundedExecutionError::Cancelled) => {
+            // fetch_page restored every unpublished row to the replay. The
+            // same accounted continuation and captured root remain usable.
             *lifecycle = BoundedCursorLifecycle::Open(state);
             Err(BoundedExecutionError::Cancelled)
         }
         Err(error) => {
             let error = work_refusal_naming_the_statement(&state.sql, error);
             state.finish_plugin_error(&error);
-            *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+            *lifecycle = state.released(BoundedCursorTerminalReason::Refused);
             Err(error)
         }
     }
@@ -13481,21 +19820,27 @@ pub(super) fn close_cursor(
     let mut lifecycle = cursor_lifecycle(cursor);
     let current = std::mem::replace(
         &mut *lifecycle,
-        BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::ExplicitClose),
+        BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::ExplicitClose, None, false),
     );
     match current {
         BoundedCursorLifecycle::Open(mut state) => {
             state.finish_plugin_success();
-            *lifecycle =
-                BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::ExplicitClose);
+            *lifecycle = state.released(BoundedCursorTerminalReason::ExplicitClose);
         }
-        BoundedCursorLifecycle::Exhausted(columns) => {
-            *lifecycle = BoundedCursorLifecycle::Exhausted(columns);
+        BoundedCursorLifecycle::Exhausted(columns, observation) => {
+            drop(columns);
+            *lifecycle = BoundedCursorLifecycle::Released(
+                BoundedCursorTerminalReason::ExplicitClose,
+                Some(observation),
+                false,
+            );
         }
-        BoundedCursorLifecycle::Released(reason) => {
-            *lifecycle = BoundedCursorLifecycle::Released(reason);
+        BoundedCursorLifecycle::Released(reason, observation, overflow) => {
+            *lifecycle = BoundedCursorLifecycle::Released(reason, observation, overflow);
         }
     }
+    drop(lifecycle);
+    cursor._state.retire_expiry();
     Ok(())
 }
 
@@ -13590,6 +19935,55 @@ mod paged_vector_accounting_tests {
             .collect()
     }
 
+    fn observation_credit_bytes(observation: &CursorObservation) -> usize {
+        let live = observation.charge.as_ref().map(|charge| &charge.live);
+        let returns = observation
+            .group_page_returns
+            .as_ref()
+            .map(|returns| &returns._charge.live);
+        live.map_or(0, |bytes| bytes.load(std::sync::atomic::Ordering::SeqCst))
+            + returns
+                .filter(|bytes| live.is_none_or(|prior| !Arc::ptr_eq(prior, bytes)))
+                .map_or(0, |bytes| bytes.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn release_retained_cursor_receipts(
+        cursor: BoundedCursorHandle,
+        observation: CursorObservation,
+        reader: &crate::memory_accounting::MemoryAccountant,
+        baseline: usize,
+        trace_credit: usize,
+    ) {
+        let observation_credits =
+            cursor.retained_read_bytes_with_observations(Some(&observation), None);
+        assert!(
+            observation_credits > 0,
+            "the released cursor and its caller still hold admitted observations"
+        );
+        assert_eq!(
+            reader.usage().used,
+            baseline + observation_credits + trace_credit,
+            "close releases kernel state and retains exactly the surviving observations and trace"
+        );
+        drop(cursor);
+        let final_observation_credit = observation_credit_bytes(&observation);
+        assert!(
+            final_observation_credit > 0,
+            "the caller's open observation keeps its original credit through the last holder"
+        );
+        assert_eq!(
+            reader.usage().used,
+            baseline + final_observation_credit + trace_credit,
+            "dropping the cursor leaves only the caller observation and Database trace"
+        );
+        drop(observation);
+        assert_eq!(
+            reader.usage().used,
+            baseline + trace_credit,
+            "the final observation releases its credit while the Database trace remains alive"
+        );
+    }
+
     /// A paged vector cursor takes memory for its candidates, its scores and
     /// its output queue, holds them between fetches, and must give every byte
     /// back exactly once — against the reservation that took it. When the
@@ -13601,19 +19995,24 @@ mod paged_vector_accounting_tests {
         let rows = 64usize;
         let root = tempfile::tempdir().expect("task-scoped fixture");
         let db = fixture(&root.path().join("paged.db"), rows as i64);
-        let accountant = db.bounded_read_accountant();
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            usize::try_from(limits().memory)
+                .expect("the original declared reader limit fits usize"),
+        ));
         let baseline = accountant.usage().used;
 
         let mut opened = open_cursor(
             Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
             &statement(rows),
             &params(),
+            accountant.clone(),
             limits(),
             Arc::new(FrozenClock),
             OwnerReadCancellation::new(),
             None,
         )
         .expect("open a paged vector cursor");
+        let first_page = opened.first_page.into_public();
 
         let held_open = accountant.usage().used;
         assert!(
@@ -13621,8 +20020,8 @@ mod paged_vector_accounting_tests {
             "an open cursor holds its continuation: baseline={baseline} open={held_open}"
         );
 
-        let mut delivered = ids(&opened.first_page.rows);
-        let mut more = opened.first_page.has_more;
+        let mut delivered = ids(&first_page.rows);
+        let mut more = first_page.has_more;
         let page = NonZeroUsize::new(8).expect("a non-zero page");
         while more {
             let fetched = fetch_cursor(
@@ -13632,8 +20031,9 @@ mod paged_vector_accounting_tests {
                 None,
             )
             .expect("a paged vector cursor fetches its next page");
-            delivered.extend(ids(&fetched.page.rows));
-            more = fetched.page.has_more;
+            let fetched_page = fetched.page.into_public();
+            delivered.extend(ids(&fetched_page.rows));
+            more = fetched_page.has_more;
         }
         assert_eq!(delivered.len(), rows, "every row, once: {delivered:?}");
         let mut sorted = delivered.clone();
@@ -13642,6 +20042,59 @@ mod paged_vector_accounting_tests {
 
         let peak = accountant.high_water_for_test();
         close_cursor(&mut opened.cursor).expect("the drained cursor closes");
+        let original_trace_credit = db.last_query_vector_trace_credit_bytes_for_test();
+        assert!(
+            original_trace_credit > 0,
+            "the Database retains its last query trace"
+        );
+        release_retained_cursor_receipts(
+            opened.cursor,
+            opened.observation,
+            &accountant,
+            baseline,
+            original_trace_credit,
+        );
+
+        let mut replacement = open_cursor(
+            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+            &statement(rows),
+            &params(),
+            accountant.clone(),
+            limits(),
+            Arc::new(FrozenClock),
+            OwnerReadCancellation::new(),
+            None,
+        )
+        .expect("a second query replaces the retained last-query trace");
+        let replacement_first_page = replacement.first_page.into_public();
+        assert!(
+            !replacement_first_page.rows.is_empty(),
+            "the second query performs real vector work"
+        );
+        drop(replacement_first_page);
+        close_cursor(&mut replacement.cursor).expect("close the replacement query cursor");
+        let replacement_trace_credit = db.last_query_vector_trace_credit_bytes_for_test();
+        assert!(
+            replacement_trace_credit > 0,
+            "the replacement trace remains admitted"
+        );
+        release_retained_cursor_receipts(
+            replacement.cursor,
+            replacement.observation,
+            &accountant,
+            baseline,
+            replacement_trace_credit,
+        );
+        assert!(
+            accountant.usage().used
+                <= baseline + original_trace_credit.max(replacement_trace_credit),
+            "the second query retains at most one trace's credit"
+        );
+        assert!(
+            accountant.usage().used < baseline + original_trace_credit + replacement_trace_credit,
+            "replacing the last trace never retains the sum of both traces"
+        );
+        db.__reset_last_query_vector_trace_for_test();
         let after_close = accountant.usage().used;
         eprintln!(
             "paged vector cursor accounting: baseline={baseline} open={held_open} \
@@ -13665,7 +20118,10 @@ mod paged_vector_accounting_tests {
         let rows = 64usize;
         let root = tempfile::tempdir().expect("task-scoped fixture");
         let db = fixture(&root.path().join("refused.db"), rows as i64);
-        let accountant = db.bounded_read_accountant();
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            usize::try_from(limits().memory)
+                .expect("the original declared reader limit fits usize"),
+        ));
         let baseline = accountant.usage().used;
 
         let mut tight = limits();
@@ -13674,6 +20130,7 @@ mod paged_vector_accounting_tests {
             Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
             &statement(rows),
             &params(),
+            accountant.clone(),
             tight,
             Arc::new(FrozenClock),
             OwnerReadCancellation::new(),
@@ -13698,30 +20155,32 @@ mod paged_vector_accounting_tests {
         );
     }
 
-    /// Closing a cursor that is still part way through its range returns its
-    /// whole charge too — the state it was holding is the state it gives back.
+    /// Closing releases kernel state. Surviving observations and the last
+    /// query trace keep their own credit until their final holders release it.
     #[test]
     fn closing_a_part_drained_paged_vector_cursor_returns_every_byte() {
         let rows = 64usize;
         let root = tempfile::tempdir().expect("task-scoped fixture");
         let db = fixture(&root.path().join("partial.db"), rows as i64);
-        let accountant = db.bounded_read_accountant();
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            usize::try_from(limits().memory)
+                .expect("the original declared reader limit fits usize"),
+        ));
         let baseline = accountant.usage().used;
 
         let mut opened = open_cursor(
             Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
             &statement(rows),
             &params(),
+            accountant.clone(),
             limits(),
             Arc::new(FrozenClock),
             OwnerReadCancellation::new(),
             None,
         )
         .expect("open a paged vector cursor");
-        assert!(
-            opened.first_page.has_more,
-            "this cursor has more pages to give"
-        );
+        let first_page = opened.first_page.into_public();
+        assert!(first_page.has_more, "this cursor has more pages to give");
         let page = NonZeroUsize::new(8).expect("a non-zero page");
         let _ = fetch_cursor(
             &mut opened.cursor,
@@ -13733,6 +20192,19 @@ mod paged_vector_accounting_tests {
         let held = accountant.usage().used;
         assert!(held > baseline, "the part-drained cursor is holding state");
         close_cursor(&mut opened.cursor).expect("a part-drained cursor closes");
+        let trace_credit = db.last_query_vector_trace_credit_bytes_for_test();
+        assert!(
+            trace_credit > 0,
+            "the Database retains the part-drained query trace"
+        );
+        release_retained_cursor_receipts(
+            opened.cursor,
+            opened.observation,
+            &accountant,
+            baseline,
+            trace_credit,
+        );
+        db.__reset_last_query_vector_trace_for_test();
         let after_close = accountant.usage().used;
         eprintln!(
             "part-drained paged vector cursor: baseline={baseline} held={held} \
@@ -13756,7 +20228,8 @@ mod cursor_replay_budget_tests {
             ..ReadLimits::default()
         };
         let context = RequestContext::new(
-            &db,
+            db.declared_reader_memory()
+                .expect("admit the fixture request reader"),
             limits,
             ReadResumption::AcrossFetches,
             clock.clone(),
@@ -13802,7 +20275,8 @@ mod cursor_replay_budget_tests {
                 ..ReadLimits::default()
             };
             let context = RequestContext::new(
-                &db,
+                db.declared_reader_memory()
+                    .expect("admit the fixture request reader"),
                 limits,
                 ReadResumption::AcrossFetches,
                 clock.clone(),
@@ -13830,5 +20304,504 @@ mod cursor_replay_budget_tests {
                 }
             });
         }
+    }
+}
+
+/// Dynamic capacities owned by the typed specification; the enclosing enum's
+/// inline fields are already counted by its AST/plan container.
+fn window_capacity_bytes(
+    window: &contextdb_parser::ast::RowNumberWindow,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let mut bytes = checked_size_mul(
+        window.partition_by.capacity(),
+        std::mem::size_of::<contextdb_parser::ast::ColumnRef>(),
+        "window partitions",
+    )?;
+    bytes = checked_size_add(
+        bytes,
+        checked_size_mul(
+            window.order_by.capacity(),
+            std::mem::size_of::<contextdb_parser::ast::WindowOrderColumn>(),
+            "window orders",
+        )?,
+        "window specification",
+    )?;
+    for column in window
+        .partition_by
+        .iter()
+        .chain(window.order_by.iter().map(|order| &order.column))
+    {
+        bytes = checked_size_add(
+            bytes,
+            optional_string_capacity(&column.table),
+            "window qualifier",
+        )?;
+        bytes = checked_size_add(bytes, column.column.capacity(), "window column")?;
+    }
+    Ok(bytes)
+}
+
+// Private native control prototype. Logical strong lifetimes own T; every
+// strong or weak alias owns one physical count in the unchanged shared cell.
+// No caller is switched to this kernel until request/cursor integration exists.
+struct NativeControlCell<T> {
+    strong: std::sync::atomic::AtomicUsize,
+    payload: std::cell::UnsafeCell<Option<contextdb_core::read_memory::OwnedReadBox<T>>>,
+}
+
+// SAFETY: weak aliases never inspect payload. Initialization happens before
+// Release publication; successful upgrades acquire it. Only the final logical
+// strong takes payload after its Release decrement and Acquire fence. Every
+// borrowed T is protected by a logical strong; T handles its own shared mutation.
+unsafe impl<T: Send + Sync> Sync for NativeControlCell<T> {}
+
+struct NativeControlStrong<T> {
+    cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
+}
+
+struct NativeControlWeak<T> {
+    cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
+}
+
+impl<T> NativeControlStrong<T> {
+    /// Native companion of `try_new_with` for an infallible producer: both
+    /// layouts are admitted with native forms before either allocation, and a
+    /// refusal carries no owned diagnostic.
+    fn try_new_with_native(
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        make: impl FnOnce() -> T,
+    ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
+        use contextdb_core::read_memory::{NativeProduce, OwnedReadBox, ReadShared};
+        let control_invoice = ReadCredit::try_new_owned_native(
+            owner.clone(),
+            ReadShared::<NativeControlCell<T>>::layout().size(),
+            "reader",
+            "native_control_cell",
+            "release retained request controls",
+        )?;
+        let payload_invoice = ReadCredit::try_new_owned_native(
+            owner,
+            std::alloc::Layout::new::<T>().size(),
+            "reader",
+            "native_control_payload",
+            "release retained request payloads",
+        )?;
+        let refused = |failure: NativeProduce<std::convert::Infallible>| match failure {
+            NativeProduce::Refused(refusal) => refusal,
+            NativeProduce::Producer(never) => match never {},
+        };
+        let cell = ReadShared::try_from_prepaid_with_native(control_invoice, || {
+            Ok(NativeControlCell {
+                strong: std::sync::atomic::AtomicUsize::new(0),
+                payload: std::cell::UnsafeCell::new(None),
+            })
+        })
+        .map_err(refused)?;
+        let payload = OwnedReadBox::try_from_prepaid_with_native(payload_invoice, || Ok(make()))
+            .map_err(refused)?;
+        // SAFETY: as in `try_new_cyclic_with`; no weak alias exists yet.
+        unsafe { *cell.payload.get() = Some(payload) };
+        cell.strong.store(1, std::sync::atomic::Ordering::Release);
+        Ok(Self { cell })
+    }
+
+    fn downgrade(&self) -> NativeControlWeak<T> {
+        // The borrowed strong prevents logical final Drop; cloning the physical
+        // count alone gives the weak identity its independent storage lifetime.
+        NativeControlWeak {
+            cell: self.cell.clone(),
+        }
+    }
+}
+
+impl<T> Clone for NativeControlStrong<T> {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering;
+        // Acquire a physical owner first. The borrowed source strong already
+        // protects T throughout logical registration, so Relaxed is sufficient.
+        let cell = self.cell.clone();
+        let retained = cell
+            .strong
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                if count != 0 && count < isize::MAX as usize {
+                    Some(count + 1)
+                } else {
+                    None
+                }
+            });
+        if retained.is_err() {
+            // Match the existing shared-count exhaustion contract. Never wrap,
+            // unwind with an unregistered logical owner, or resurrect zero.
+            std::process::abort();
+        }
+        Self { cell }
+    }
+}
+
+impl<T> std::ops::Deref for NativeControlStrong<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: this borrow retains one logical strong for the entire result
+        // lifetime. Therefore final Drop cannot take or destroy this Some(T).
+        unsafe { (&*self.cell.payload.get()).as_ref() }
+            .expect("live native control must retain its payload")
+            .as_ref()
+    }
+}
+
+impl<T> Drop for NativeControlStrong<T> {
+    fn drop(&mut self) {
+        use std::sync::atomic::{Ordering, fence};
+        if self.cell.strong.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        // This zero is permanent. A CAS either won a logical strong before it
+        // or cannot upgrade; Acquire observes earlier owners' completed uses.
+        fence(Ordering::Acquire);
+        // SAFETY: zero excludes all strong borrows and all future upgrades.
+        // Take leaves None BEFORE user Drop. Our physical cell field remains
+        // alive through payload destruction and its invoice, including unwind.
+        let payload = unsafe { (&mut *self.cell.payload.get()).take() };
+        drop(payload);
+        // Automatic field cleanup now releases our physical count. Existing
+        // ReadShared frees final control storage before its external invoice.
+    }
+}
+
+impl<T> Clone for NativeControlWeak<T> {
+    fn clone(&self) -> Self {
+        Self {
+            cell: self.cell.clone(),
+        }
+    }
+}
+
+impl<T> NativeControlWeak<T> {
+    fn upgrade(&self) -> Option<NativeControlStrong<T>> {
+        use std::sync::atomic::Ordering;
+        // The borrowed weak and this new physical owner keep the cell alive
+        // independently of payload expiry; neither is a logical strong yet.
+        let cell = self.cell.clone();
+        let mut count = cell.strong.load(Ordering::Relaxed);
+        loop {
+            if count == 0 {
+                return None;
+            }
+            if count >= isize::MAX as usize {
+                std::process::abort();
+            }
+            match cell.strong.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(NativeControlStrong { cell }),
+                Err(observed) => count = observed,
+            }
+        }
+    }
+}
+
+/// The actual Native invocation owns the same bounded RequestContext used by
+/// vector adapters, decoder scopes, page admissions and ordinary checkpoints.
+/// Its observers retain only paired weak aliases of that context.
+pub(crate) struct NativeReadExecutionEntry {
+    context: ControlArc<RequestContext>,
+}
+#[derive(Clone)]
+pub(crate) struct NativeReadOpenContext {
+    context: ControlWeak<RequestContext>,
+}
+impl NativeReadExecutionEntry {
+    pub(crate) fn try_new_native(
+        operation: &crate::owner_read::NativeReadRequest,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+    ) -> std::result::Result<Self, crate::transport::NativeTerminal> {
+        if RequestContext::check_effective_limits(&limits).is_err() {
+            return Err(crate::transport::NativeTerminal::Refused(
+                contextdb_core::read_memory::NativeRefusal::Other("native read limits are invalid")));
+        }
+        let started_ms = clock.now_ms();
+        let bridge = NativeKernelBudget::try_from_operation(operation)
+            .map_err(crate::transport::NativeTerminal::from_kernel)?;
+        let reader: Arc<dyn ReadMemoryBudget> = (*bridge).clone();
+        let context = RequestContext::new_with_cancellation(reader, limits,
+            ReadResumption::OneShot, clock,
+            RequestCancellation::Native(operation.cancellation().clone()), None,
+            Some(operation.share()), Some(started_ms),
+            #[cfg(any(test, feature = "test-seams"))] None)
+            .map_err(ReadOpenContext::engine_error)
+            .map_err(crate::transport::NativeTerminal::from_kernel)?;
+        Ok(Self { context })
+    }
+    pub(crate) fn open_context(&self) -> NativeReadOpenContext {
+        NativeReadOpenContext { context: ControlArc::downgrade(&self.context) }
+    }
+}
+impl NativeReadOpenContext {
+    fn request(&self) -> Result<ControlArc<RequestContext>> {
+        self.context.upgrade().ok_or(Error::ReadCancelled)
+    }
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        let context = self.request()?;
+        if let Some(failure) = context.pending_failure() {
+            return Err(ReadOpenContext::engine_error(failure));
+        }
+        let started = context.state().started_ms;
+        let now = context.clock.now_ms();
+        if now < started || now - started > context.limits.active_ms {
+            return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(
+                ReadFailureLimit::ActiveMs, context.limits.active_ms)));
+        }
+        Ok(())
+    }
+    pub(crate) fn owner(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        let context = self.request()?;
+        // The bridge is the same original Native child; it neither creates
+        // nor obtains another operation capability.
+        Ok(context.native_operation.as_ref().expect("Native entry retains original operation").owner())
+    }
+    pub(crate) fn touch_row(&self) -> Result<()> {
+        let context = self.request()?;
+        self.checkpoint()?;
+        let mut state = context.state();
+        if state.telemetry.work_units >= context.limits.work {
+            return Err(ReadOpenContext::engine_error(RequestContext::limit_failure(
+                ReadFailureLimit::Work, context.limits.work)));
+        }
+        state.telemetry.work_units += 1;
+        Ok(())
+    }
+}
+
+/// A request paces its tied-index range probes as it paces its own index
+/// reads: each probe entry is one unit of index-range work, charged against
+/// the WORK limit after the deadline and cancellation are checked.
+impl crate::executor::IndexProbePacing for RequestContext {
+    fn before_probe_entry(&self) -> std::result::Result<(), BoundedExecutionError> {
+        self.charge_operator(BoundedWorkSource::IndexRange)
+    }
+
+    fn probe_boundary(&self) -> std::result::Result<(), BoundedExecutionError> {
+        self.checkpoint()
+    }
+}
+
+impl ControlArc<RequestContext> {
+    fn source_read_memory(
+        &self,
+        source: BoundedWorkSource,
+    ) -> Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> {
+        Arc::new(SourceDecodeBudget {
+            context: self.clone(),
+            source,
+        })
+    }
+
+    fn with_source_page_admission<T>(
+        &self,
+        source: BoundedWorkSource,
+        read: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
+    ) -> std::result::Result<T, BoundedExecutionError> {
+        let context = self.clone();
+        let callback = move |bytes: usize| {
+                context
+                    .admit_source_page(source, bytes)
+                    .map(|charge| {
+                        #[cfg(any(test, feature = "test-seams"))]
+                        crate::read_work_probe::note_worker_page_admitted(
+                            bytes,
+                            crate::read_work_probe::funding_owner_name(&context.reader_budget),
+                        );
+                        Box::new(charge) as redb::ReadPageCharge
+                    })
+                    .map_err(|error| {
+                        let error = match error {
+                            BoundedExecutionError::Engine(error) => error,
+                            BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+                            BoundedExecutionError::Cancelled => Error::ReadCancelled,
+                            BoundedExecutionError::Unimplemented => {
+                                Error::ReadSessionNotImplemented
+                            }
+                        };
+                        redb::StorageError::AdmissionRefused(Box::new(error))
+                    })
+        };
+        let bytes = ControlArc::control_bytes_for(&callback)?;
+        self.check_final_boundary()?;
+        {
+            let state = self.state();
+            let held = self.held_memory_bytes(&state);
+            if held.checked_add(bytes).and_then(|after| u64::try_from(after).ok())
+                .is_none_or(|after| after > self.limits.memory)
+            {
+                return Err(self.memory_limit_failure(held, bytes, "source_page_callback"));
+            }
+        }
+        self.live_source_pages.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        // This zero-credit guard only tracks live request occupancy. The
+        // ControlArc owns the sole original monetary invoice outside the Arc.
+        let _live = SourcePageCharge {
+            _credit: ReadCredit::new(self.reader_budget.clone()),
+            live: self.live_source_pages.clone(), bytes,
+        };
+        let admission = ControlArc::try_new(self.reader_budget.clone(), callback)?;
+        // redb retains this alias only inside its synchronous admission scope;
+        // its ResetAdmission destroys it before returning or unwinding here.
+        // Keep the owning wrapper outside that entire scope.
+        let supplied: Arc<dyn Fn(usize) -> std::result::Result<redb::ReadPageCharge,
+            redb::StorageError> + Send + Sync> = (*admission).clone();
+        redb::with_read_page_charge_storage(supplied, read)
+    }
+}
+
+impl ControlArc<RequestContext> {
+    fn observe_physical_group(
+        &self,
+        source: &SourceInputGroup,
+        scan_columns: &[String],
+        row: &VersionedRow,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let null = Value::Null;
+        let row_id =
+            Value::Int64(i64::try_from(row.row_id.0).map_err(|_| {
+                Error::Other(("bounded row identifier exceeds SQL INTEGER".to_string()).into())
+            })?);
+        let value_at = |position: &PhysicalPartitionColumn| -> std::result::Result<&Value, BoundedExecutionError> {
+            match position {
+                PhysicalPartitionColumn::RowId => Ok(&row_id),
+                PhysicalPartitionColumn::Schema(position) => {
+                    let name = scan_columns.get(*position).ok_or_else(|| {
+                        Error::PlanError("physical group column binding is missing".to_string())
+                    })?;
+                    Ok(row.values.get(name).unwrap_or(&null))
+                }
+            }
+        };
+        self.observe_source_group_values(source, value_at)
+    }
+
+    fn observe_index_group(
+        &self,
+        source: &SourceInputGroup,
+        scan_columns: &[String],
+        index_columns: &[(String, contextdb_core::SortDirection)],
+        key: &IndexKey,
+        row_id: RowId,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        // A posting only identifies partitions present in its decoded key.
+        // Missing partition columns retain their actual work globally.
+        let index_position = |position: &PhysicalPartitionColumn| -> Option<usize> {
+            match position {
+                PhysicalPartitionColumn::RowId => None,
+                PhysicalPartitionColumn::Schema(position) => scan_columns
+                    .get(*position)
+                    .and_then(|name| index_columns.iter().position(|(column, _)| column == name)),
+            }
+        };
+        if source.positions.iter().any(|position| {
+            matches!(position, PhysicalPartitionColumn::Schema(_))
+                && index_position(position)
+                    .and_then(|position| key.get(position))
+                    .is_none()
+        }) {
+            return Ok(());
+        }
+        let row_id =
+            Value::Int64(i64::try_from(row_id.0).map_err(|_| {
+                Error::Other(("bounded row identifier exceeds SQL INTEGER".to_string()).into())
+            })?);
+        self.observe_source_group_values(source, |position| match position {
+            PhysicalPartitionColumn::RowId => Ok(&row_id),
+            PhysicalPartitionColumn::Schema(_) => {
+                let value = index_position(position)
+                    .and_then(|position| key.get(position))
+                    .ok_or_else(|| {
+                        Error::Other(("source index partition binding is missing".to_string()).into())
+                    })?;
+                Ok(match value {
+                    DirectedValue::Asc(value) => &value.0,
+                    DirectedValue::Desc(value) => &value.0,
+                })
+            }
+        })
+    }
+
+    fn observe_source_group_values<'a>(
+        &self,
+        source: &SourceInputGroup,
+        value_at: impl Fn(
+            &PhysicalPartitionColumn,
+        ) -> std::result::Result<&'a Value, BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let planned = source.positions.iter().try_fold(
+            checked_size_mul(
+                source.positions.len(),
+                std::mem::size_of::<Value>(),
+                "source partition",
+            )?,
+            |bytes, position| {
+                checked_size_add(
+                    bytes,
+                    planned_value_clone_bytes(value_at(position)?)?,
+                    "source partition",
+                )
+            },
+        )?;
+        self.reserve(BoundedWorkSource::TableScan, planned)?;
+        let mut scratch = ReservedBytes::new(self, planned);
+        let mut key = Vec::new();
+        key.try_reserve_exact(source.positions.len())
+            .map_err(|_| Error::Other(("source partition allocation failed".to_string()).into()))?;
+        for position in &source.positions {
+            key.push(value_at(position)?.clone());
+        }
+        let actual = values_capacity_allocation_bytes(&key)?;
+        scratch.bytes = 0;
+        reconcile_new_reservation(self, BoundedWorkSource::TableScan, planned, actual)?;
+        scratch.bytes = actual;
+        let binding = self.bind_group(
+            source.descriptor,
+            &key,
+            "<redacted>",
+            crate::database::GroupRoute::Sort,
+        )?;
+        let mut state = self.state();
+        let group = state
+            .groups
+            .get_mut(binding.0)
+            .ok_or_else(|| Error::Other(("unknown source group binding".to_string()).into()))?;
+        group.disclosure.examined_entries = group
+            .disclosure
+            .examined_entries
+            .checked_add(1)
+            .ok_or_else(|| Error::Other(("source group work overflow".to_string()).into()))?;
+        Ok(())
+    }
+
+    fn publication_scope(
+        &self,
+        snapshot_lsn: Lsn,
+        tables: BTreeSet<String>,
+        inspection: bool,
+    ) -> std::result::Result<ReadPublicationScope, BoundedExecutionError> {
+        let state = self.state();
+        let RequestCancellation::Legacy(cancellation) = &state.cancellation else {
+            return Err(BoundedExecutionError::Unimplemented);
+        };
+        let mut scope = ReadPublicationScope::bounded(
+            snapshot_lsn,
+            tables,
+            self.limits,
+            Arc::clone(&self.clock),
+            cancellation.clone(),
+            state.started_ms,
+        );
+        scope.inspection = inspection;
+        scope.read_memory = Some(self.source_read_memory(BoundedWorkSource::AccessControl));
+        Ok(scope)
     }
 }

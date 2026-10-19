@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let db = Arc::new(Database::open(&args[1])?);
     let ticket = std::fs::read_to_string(&args[2])?;
-    let client = SyncClient::new(db.clone(), ticket.trim(), TenantId::from("custody-demo"));
+    let client = SyncClient::new(db.clone(), ticket.trim(), TenantId::from("custody-demo"))?;
     let expectation = ApplicationTablePolicyExpectation::new()
         .expect_table(
             "records",

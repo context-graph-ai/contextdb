@@ -115,7 +115,9 @@ fn nv02_two_vector_columns_on_one_row_round_trip_independently() {
         "vector_vision ANN must route to the vector_vision column, not a shared same-dimension store"
     );
 
-    let cs = db.changes_since(pre_insert_lsn);
+    let cs = db
+        .changes_since(pre_insert_lsn)
+        .expect("read the declared changes");
     assert_eq!(
         cs.vectors.len(),
         4,
@@ -276,7 +278,9 @@ fn nv03_update_one_column_invalidates_only_that_index() {
     // Sync stream must show ONLY the column that was actually rewritten. A wrong impl that re-fires
     // every vector index on UPDATE (re-writing untouched columns with their current values) is
     // observationally a no-op for projection but produces an extra envelope here.
-    let cs = db.changes_since(pre_update_lsn);
+    let cs = db
+        .changes_since(pre_update_lsn)
+        .expect("read the declared changes");
     let written_columns: Vec<&str> = cs.vectors.iter().map(|c| c.index.column.as_str()).collect();
     assert_eq!(
         written_columns,
@@ -432,7 +436,9 @@ fn nv04_delete_drops_row_from_every_vector_index() {
     // changes_since(pre_delete_lsn) returns only the DELETE entries by construction (pre_delete_lsn
     // was captured AFTER INSERT). The contract: one VectorChange per (row_id, index) pair, all at the
     // same TxId/lsn. With a single deleted row × two indexes, expect exactly two envelopes.
-    let cs: ChangeSet = db.changes_since(pre_delete_lsn);
+    let cs: ChangeSet = db
+        .changes_since(pre_delete_lsn)
+        .expect("read the declared changes");
     assert_eq!(
         cs.vectors.len(),
         2,
@@ -576,7 +582,7 @@ fn nv04b_multi_row_delete_emits_per_row_per_index_envelopes_under_one_lsn() {
         "multi-row DELETE must tombstone raw sender vector entries for every index; got text={raw_text_hits:?}, vision={raw_vision_hits:?}"
     );
 
-    let cs = db.changes_since(pre);
+    let cs = db.changes_since(pre).expect("read the declared changes");
     assert_eq!(
         cs.vectors.len(),
         6,
@@ -735,7 +741,9 @@ fn nv08_snapshot_round_trip_rebuilds_independent_indexes_per_table_column() {
     }
 
     let reopened = Database::open(&db_path).expect("reopen");
-    let snapshot = reopened.changes_since(Lsn(0));
+    let snapshot = reopened
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let snapshot_indexes: Vec<VectorIndexRef> = snapshot
         .vectors
         .iter()
@@ -1039,7 +1047,9 @@ fn nv13b_multi_vector_update_partial_failure_rolls_back_atomically() {
             .any(|(rid, similarity)| *rid == original_row_id && *similarity > 0.99),
         "failed UPDATE must not leave raw vector_text entry for the attempted new value; got {raw_new_text_hits:?}"
     );
-    let cs = db.changes_since(pre_update_lsn);
+    let cs = db
+        .changes_since(pre_update_lsn)
+        .expect("read the declared changes");
     assert!(
         cs.vectors.is_empty(),
         "failed UPDATE must not emit vector changes; got {:?}",
@@ -1133,7 +1143,9 @@ fn nv02b_null_vector_column_produces_no_index_entry() {
         .expect("third insert");
         pre
     };
-    let cs = db.changes_since(text_only_lsn);
+    let cs = db
+        .changes_since(text_only_lsn)
+        .expect("read the declared changes");
     assert_eq!(
         cs.vectors.len(),
         1,
@@ -1175,7 +1187,9 @@ fn nv05b_vector_order_by_preserves_full_row_projection() {
     )
     .expect("insert");
 
-    let cs = db.changes_since(pre_insert_lsn);
+    let cs = db
+        .changes_since(pre_insert_lsn)
+        .expect("read the declared changes");
     let indexes: Vec<VectorIndexRef> = cs.vectors.iter().map(|c| c.index.clone()).collect();
     assert!(
         indexes.contains(&VectorIndexRef::new("evidence", "vector_text"))
@@ -1523,7 +1537,7 @@ fn nv15_parser_rejects_invalid_quantization_and_banned_features() {
             "SELECT ROW_NUMBER() OVER (PARTITION BY id) FROM evidence",
             &empty_params()
         ),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { form: _ })
     ));
     assert!(matches!(
         db.execute(
@@ -1894,7 +1908,7 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
     );
 
     // The emitted changeset carries a DropTable DDL change; receivers replicate the deregistration.
-    let cs = db.changes_since(pre);
+    let cs = db.changes_since(pre).expect("read the declared changes");
     let dropped = cs.ddl.iter().any(|d| {
         matches!(d,
         contextdb_engine::sync_types::DdlChange::DropTable { name } if name == "evidence")
@@ -2370,7 +2384,9 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
 
     // Advance 1.5 s past the row's stamped time — beyond the 1 s TTL.
     mock_now.fetch_add(1_500, AtomicOrdering::SeqCst);
-    receiver.run_pruning_cycle();
+    receiver
+        .run_pruning_cycle()
+        .expect("prune receiver before repopulating the registered index");
 
     // The index is REGISTERED (DDL didn't change) but vector_count is 0. A push from a writer with a
     // VectorChange for that index must apply, not return UnknownVectorIndex.
@@ -2768,7 +2784,9 @@ fn nv02c_multi_row_multi_vector_insert_succeeds_with_per_row_routing() {
             ("vb", Value::Vector(vec![0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])),
         ]),
     ).expect("multi-row multi-vector insert");
-    let cs = db.changes_since(pre_insert_lsn);
+    let cs = db
+        .changes_since(pre_insert_lsn)
+        .expect("read the declared changes");
     assert_eq!(
         cs.vectors.len(),
         4,
@@ -3111,7 +3129,8 @@ fn nv_retain_prunes_every_vector_index_for_expired_row() {
 
     // Advance 1.5 s past the row's stamped time — beyond the 1 s TTL.
     mock_now.fetch_add(1_500, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle(); // returns u64 (count pruned); no Result, so no .expect()
+    db.run_pruning_cycle()
+        .expect("prune expired row from every vector index");
 
     // Both indexes must drop the expired row — not just the first registered.
     let text_hits = db

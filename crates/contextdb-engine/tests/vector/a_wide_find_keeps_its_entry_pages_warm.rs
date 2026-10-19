@@ -48,6 +48,7 @@ impl HnswCandidateObserver for Work {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn repeated_wide_finds_stop_filling_pages_within_the_declared_memory() {
     let fixture = seed_partition_rows(SHAPE, &ROWS);
     let working = calibrate(&fixture);
@@ -155,6 +156,7 @@ fn repeated_wide_finds_stop_filling_pages_within_the_declared_memory() {
 /// cache selected from its remaining bytes.
 #[cfg(unix)]
 #[test]
+#[ignore = "encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_graph_load_chooses_only_cache_slots_whose_directory_fits() {
     let shape = Shape {
         partitions: 1,
@@ -219,6 +221,7 @@ fn a_graph_load_chooses_only_cache_slots_whose_directory_fits() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows"]
 fn a_short_declaration_keeps_its_charge_and_refuses_missing_topologies() {
     let fixture = seed_shape(SHORT_SHAPE);
     let working = calibrate(&fixture);

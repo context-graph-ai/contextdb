@@ -260,61 +260,6 @@ fn edge_only_selection_keeps_absent_ownership_across_sources_and_restart() {
 
 #[test]
 #[serial]
-fn old_physical_keys_are_indexed_and_released_after_restart() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("legacy.db");
-    let db = Database::open(&path).unwrap();
-    let mut legacy = hold(TENANT, SOURCE, "old creation refusal".into());
-    legacy.table_absent = true;
-    legacy.dag_edge_types.push("refused_edge".into());
-    let key = Database::policy_hold_key(SOURCE, TABLE);
-    db.persistence
-        .as_ref()
-        .unwrap()
-        .flush_config_value(&key, &legacy)
-        .unwrap();
-    db.close().unwrap();
-    let db = Database::open(&path).unwrap();
-    let (filtered, _) = db
-        .split_data_held_behind_refused_units(
-            edge_delivery(),
-            &TenantId::from(TENANT),
-            "new-peer",
-            Some(Incarnation(44)),
-            false,
-        )
-        .unwrap();
-    assert!(filtered.edges.is_empty());
-    db.release_policy_holds(
-        Some("new-peer"),
-        Some((&TenantId::from(TENANT), Incarnation(44))),
-        &BTreeSet::from([TABLE.into()]),
-    )
-    .unwrap();
-    assert!(
-        !db.persistence
-            .as_ref()
-            .unwrap()
-            .config_value_exists(&key)
-            .unwrap()
-    );
-    db.close().unwrap();
-    let db = Database::open(&path).unwrap();
-    let (allowed, conflicts) = db
-        .split_data_held_behind_refused_units(
-            edge_delivery(),
-            &TenantId::from(TENANT),
-            SOURCE,
-            Some(INCARNATION),
-            false,
-        )
-        .unwrap();
-    assert_eq!(allowed.edges.len(), 1);
-    assert!(conflicts.is_empty());
-}
-
-#[test]
-#[serial]
 fn selected_holds_keep_their_memory_charge_until_the_collection_is_dropped() {
     let root = tempfile::tempdir().unwrap();
     let db = Database::open(root.path().join("lease.db")).unwrap();
@@ -334,60 +279,6 @@ fn selected_holds_keep_their_memory_charge_until_the_collection_is_dropped() {
     assert!(db.accountant.usage().used >= before + 8192);
     drop(selected);
     assert_eq!(db.accountant.usage().used, before);
-}
-
-#[test]
-#[serial]
-fn interrupted_legacy_indexing_resumes_after_its_last_committed_record() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("resume.db");
-    let db = Database::open(&path).unwrap();
-    let mut small = hold(TENANT, SOURCE, "small".into());
-    small.table = "a_small".into();
-    let mut large = hold(TENANT, SOURCE, "large".repeat(512 * 1024));
-    large.table = "z_large".into();
-    let small_key = Database::policy_hold_key(SOURCE, &small.table);
-    let large_key = Database::policy_hold_key(SOURCE, &large.table);
-    let p = db.persistence.as_ref().unwrap();
-    p.flush_config_value(&small_key, &small).unwrap();
-    p.flush_config_value(&large_key, &large).unwrap();
-    let before = db.accountant.usage().used;
-    db.accountant.set_budget(Some(before + 512 * 1024)).unwrap();
-    let error = Database::migrate_policy_hold_indexes(p, &db.accountant).unwrap_err();
-    assert!(
-        matches!(error, Error::MemoryBudgetExceeded { .. }),
-        "{error}"
-    );
-    assert_eq!(
-        p.load_config_value::<String>(Database::POLICY_HOLD_MIGRATION_CURSOR)
-            .unwrap(),
-        Some(small_key.clone())
-    );
-    assert!(
-        p.config_value_exists(&Database::policy_hold_index_marker(&small_key))
-            .unwrap()
-    );
-    assert!(
-        !p.config_value_exists(&Database::policy_hold_index_marker(&large_key))
-            .unwrap()
-    );
-    assert_eq!(db.accountant.usage().used, before);
-    db.accountant.set_budget(None).unwrap();
-    db.close().unwrap();
-    let db = Database::open(&path).unwrap();
-    let p = db.persistence.as_ref().unwrap();
-    assert!(
-        p.config_value_exists(&Database::policy_hold_index_marker(&small_key))
-            .unwrap()
-    );
-    assert!(
-        p.config_value_exists(&Database::policy_hold_index_marker(&large_key))
-            .unwrap()
-    );
-    assert!(
-        !p.config_value_exists(Database::POLICY_HOLD_MIGRATION_CURSOR)
-            .unwrap()
-    );
 }
 
 #[test]

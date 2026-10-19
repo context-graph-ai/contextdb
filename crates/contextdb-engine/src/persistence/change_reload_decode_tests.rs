@@ -144,18 +144,23 @@ fn short_authenticated_change_route_and_graph_hints_do_not_allocate_serde_cap() 
         u64::MAX,
     ))
     .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("change-decode.db");
+    let database = crate::Database::open(&path).unwrap();
+    database.close().unwrap();
+    let persistence = RedbPersistence::open(&path).unwrap();
     for payload in [&route_hint, &graph_hint] {
         let bytes = envelope(VectorPartitionRecordKind::ChangeGeneration, payload);
         let (old, old_peak, _) = measured(|| {
-            decode_vector_partition_record_payload::<VectorPartitionChangeGenerationRecord>(
+            persistence.decode_vector_partition_record::<VectorPartitionChangeGenerationRecord>(
                 VectorPartitionRecordKind::ChangeGeneration,
                 &bytes,
             )
         });
         assert!(old.is_err());
         assert!(
-            old_peak >= 1024 * 1024,
-            "fixture failed to exercise capped serde Vec: {old_peak}"
+            old_peak < 4096,
+            "guarded generic decode must reject before a large reservation: {old_peak}"
         );
         drop(old);
         let (result, peak, _) = measured(|| {

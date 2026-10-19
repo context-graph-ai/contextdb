@@ -217,7 +217,8 @@ fn start_hub_on_tenant(broker: &InProcessBroker, db: Arc<Database>, tenant: &str
             TenantId::from(tenant),
             HUB_NODE.to_string(),
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -257,6 +258,7 @@ fn edge_client_on_tenant(
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
@@ -454,6 +456,7 @@ fn dropped_push_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &s
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// The busy edge, whose only job is to leave the tenant's shared received-up-to
@@ -915,7 +918,9 @@ async fn landed_ack_lost_after_restore_recovers_pending_on_next_push_before_late
         None,
         "only the completed confirmed pull may retire the durable no-send gate"
     );
-    let (_, arrivals) = edge_a.changes_since_with_arrivals(Lsn(0));
+    let (_, arrivals) = edge_a
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read fixture changes and arrivals");
     assert!(
         matches!(arrivals.get(&lost_lsn), Some(Some(_))),
         "the confirmed identical echo must replace Pending's missing arrival: {arrivals:?}"
@@ -1083,7 +1088,9 @@ async fn successful_lost_ack_recovery_survives_later_restore_and_later_edit() {
         None,
         "a completed status recovery retires its durable pending marker"
     );
-    let (outbound, arrivals) = edge_a.changes_since_with_arrivals(Lsn(0));
+    let (outbound, arrivals) = edge_a
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read fixture changes and arrivals");
     let recovered_row = outbound
         .rows
         .iter()
@@ -1091,7 +1098,9 @@ async fn successful_lost_ack_recovery_survives_later_restore_and_later_edit() {
         .expect("recovered local row remains in history");
     assert!(
         matches!(arrivals.get(&recovered_lsn), Some(Some(_)))
-            && !edge_a.row_change_arrived_by_sync(recovered_row),
+            && !edge_a
+                .row_change_arrived_by_sync(recovered_row)
+                .expect("read row_change_arrived_by_sync fixture"),
         "the successful identical echo records exact AcceptedLocal order, never Pulled"
     );
 
@@ -1619,6 +1628,7 @@ fn landed_ack_lost_client(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn landed_ack_lost_with_recovery_pull_dropped_client(
@@ -1637,6 +1647,7 @@ fn landed_ack_lost_with_recovery_pull_dropped_client(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// A reincarnated edge (fresh DB, reused identity, LSN counter reset to zero)
@@ -2010,7 +2021,8 @@ async fn a_lost_push_only_reply_after_direction_change_recovers_its_committed_ac
         }),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let outcome = within(client.push()).await;
 
     assert_eq!(
@@ -2154,6 +2166,7 @@ fn probe_failing_dropped_push_client(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// A transport for the in-memory reincarnation scenario (G2). The test arms
@@ -2242,7 +2255,8 @@ fn warmup_then_dropped_push_client(
         }),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (client, drop_after_warmup)
 }
 

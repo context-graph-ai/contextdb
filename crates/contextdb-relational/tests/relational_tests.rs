@@ -1,3 +1,5 @@
+#[path = "../../contextdb-tx/tests/support/read_memory.rs"]
+mod test_read_memory;
 use contextdb_core::{
     ColName, Error, RelationalExecutor, RowId, StateMachineConstraint, TableMeta, UpsertResult,
     Value,
@@ -12,7 +14,11 @@ struct TestStore {
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
         if ws.relational_deletes.is_empty() || ws.relational_inserts.is_empty() {
             self.relational.apply_deletes_ref(&ws.relational_deletes);
             self.relational.apply_inserts_ref(&ws.relational_inserts);
@@ -88,7 +94,12 @@ fn scan_respects_snapshot_visibility() {
     let s0 = tx_mgr.snapshot();
     assert_eq!(exec.scan("entities", s0).unwrap().len(), 0);
 
-    tx_mgr.commit(tx).unwrap();
+    tx_mgr
+        .commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
     let s1 = tx_mgr.snapshot();
     assert_eq!(exec.scan("entities", s1).unwrap().len(), 1);
 }
@@ -120,7 +131,12 @@ fn mvcc_snapshot_isolation() {
         map(vec![("name", Value::Text("v1".into()))]),
     )
     .unwrap();
-    tx_mgr.commit(tx1).unwrap();
+    tx_mgr
+        .commit(
+            tx1,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
 
     let snap1 = tx_mgr.snapshot();
 
@@ -131,7 +147,12 @@ fn mvcc_snapshot_isolation() {
         map(vec![("name", Value::Text("v2".into()))]),
     )
     .unwrap();
-    tx_mgr.commit(tx2).unwrap();
+    tx_mgr
+        .commit(
+            tx2,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
 
     assert_eq!(exec.scan("entities", snap1).unwrap().len(), 1);
     assert_eq!(exec.scan("entities", tx_mgr.snapshot()).unwrap().len(), 2);
@@ -156,7 +177,12 @@ fn upsert_insert_update_noop() {
             tx_mgr.snapshot(),
         )
         .unwrap();
-    tx_mgr.commit(tx1).unwrap();
+    tx_mgr
+        .commit(
+            tx1,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
     assert_eq!(r1, UpsertResult::Inserted);
     let created_snapshot = tx_mgr.snapshot();
     let created_row_id = exec
@@ -178,7 +204,12 @@ fn upsert_insert_update_noop() {
             tx_mgr.snapshot(),
         )
         .unwrap();
-    tx_mgr.commit(tx2).unwrap();
+    tx_mgr
+        .commit(
+            tx2,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
     assert_eq!(r2, UpsertResult::Updated);
     let created_version = exec
         .point_lookup("entities", "id", &Value::Uuid(id), created_snapshot)
@@ -215,7 +246,12 @@ fn upsert_insert_update_noop() {
             tx_mgr.snapshot(),
         )
         .unwrap();
-    tx_mgr.commit(tx3).unwrap();
+    tx_mgr
+        .commit(
+            tx3,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
     assert_eq!(r3, UpsertResult::NoOp);
 }
 
@@ -254,7 +290,12 @@ fn invalidation_state_machine_enforced() {
         ]),
     )
     .unwrap();
-    tx_mgr.commit(tx1).unwrap();
+    tx_mgr
+        .commit(
+            tx1,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
 
     let tx2 = tx_mgr.begin();
     exec.upsert(
@@ -268,7 +309,12 @@ fn invalidation_state_machine_enforced() {
         tx_mgr.snapshot(),
     )
     .unwrap();
-    tx_mgr.commit(tx2).unwrap();
+    tx_mgr
+        .commit(
+            tx2,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .unwrap();
 
     let tx3 = tx_mgr.begin();
     let err = exec

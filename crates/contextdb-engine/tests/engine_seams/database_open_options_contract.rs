@@ -450,7 +450,7 @@ impl DatabaseOpenInterceptor for FullOptionsInterceptor {
             .lock()
             .expect("common-open interception lock")
             .push(InterceptedOpen::capture(path, options));
-        Err(Error::Other(self.refusal.clone()))
+        Err(Error::Other(self.refusal.clone().into()))
     }
 }
 

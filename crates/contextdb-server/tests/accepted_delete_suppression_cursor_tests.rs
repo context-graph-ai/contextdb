@@ -84,11 +84,10 @@ async fn start_hub(root: &Path, tenant: &str, shutdown_operation: &'static str) 
     let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(root.join("hub.redb")).expect("open hub"));
     create_notes(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let stop = stop.clone();
@@ -154,7 +153,8 @@ async fn accepted_delete_suppression_consumes_stale_cursor_across_reopen() {
     let edge_path = root.path().join("edge.redb");
     let edge = Arc::new(Database::open(&edge_path).expect("open edge"));
     create_notes(&edge);
-    let client = SyncClient::new(edge.clone(), &hub.ticket, TenantId::from(tenant));
+    let client = SyncClient::new(edge.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     let id = Uuid::new_v4();
 
     put(&edge, id, "original");
@@ -170,7 +170,8 @@ async fn accepted_delete_suppression_consumes_stale_cursor_across_reopen() {
     let carrier_path = root.path().join("carrier.redb");
     let carrier = Arc::new(Database::open(&carrier_path).expect("open carrier"));
     create_notes(&carrier);
-    let carrier_client = SyncClient::new(carrier.clone(), &hub.ticket, TenantId::from(tenant));
+    let carrier_client = SyncClient::new(carrier.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(
         "carrier pull from authoritative hub",
         carrier_client.pull_default(),
@@ -186,7 +187,8 @@ async fn accepted_delete_suppression_consumes_stale_cursor_across_reopen() {
     assert_eq!(body(&carrier, id).as_deref(), Some("original"));
     drop(client);
 
-    let client = SyncClient::new(edge.clone(), &hub.ticket, TenantId::from(tenant));
+    let client = SyncClient::new(edge.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     delete(&edge, id);
     within("edge delete push to authoritative hub", client.push())
         .await
@@ -201,7 +203,8 @@ async fn accepted_delete_suppression_consumes_stale_cursor_across_reopen() {
         .change_destination(&alternate.node_id)
         .expect("select still-empty alternate");
     drop(client);
-    let client = SyncClient::new(edge.clone(), &alternate.ticket, TenantId::from(tenant));
+    let client = SyncClient::new(edge.clone(), &alternate.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(
         "edge baseline pull from alternate hub",
         client.pull_default(),
@@ -222,7 +225,8 @@ async fn accepted_delete_suppression_consumes_stale_cursor_across_reopen() {
         .expect("move carrier to alternate");
     drop(carrier_client);
     let carrier_to_alternate =
-        SyncClient::new(carrier.clone(), &alternate.ticket, TenantId::from(tenant));
+        SyncClient::new(carrier.clone(), &alternate.ticket, TenantId::from(tenant))
+            .expect("construct SyncClient fixture");
     within(
         "carrier stale-row push to alternate hub",
         carrier_to_alternate.push(),
@@ -263,7 +267,8 @@ async fn accepted_delete_suppression_consumes_stale_cursor_across_reopen() {
 
     let edge = Arc::new(Database::open(&edge_path).expect("reopen edge"));
     create_notes(&edge);
-    let client = SyncClient::new(edge.clone(), &alternate.ticket, TenantId::from(tenant));
+    let client = SyncClient::new(edge.clone(), &alternate.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     assert_eq!(client.pull_watermark(), first_watermark);
     let second = within(
         "edge quiet pull from alternate hub after reopen",

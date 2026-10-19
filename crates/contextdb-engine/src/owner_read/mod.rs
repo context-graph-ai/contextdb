@@ -26,12 +26,14 @@
 
 mod admission;
 mod client;
+mod native_request;
 mod service;
 
 pub use admission::{OwnerAdmission, RequestLease};
 pub use client::OwnerClient;
 #[cfg(unix)]
 pub use client::OwnerDisconnectHandle;
+pub(crate) use native_request::NativeReadRequest;
 pub use service::{
     ConnectionState, CursorEntry, CursorIdentifierAllocator, OwnerReadResourceSnapshot,
     OwnerReadService, OwnerServiceSpec, ValidatedOwnerListener,
@@ -76,9 +78,12 @@ impl OwnerReadScaffoldError {
             // invalid-channel-data document instead tells them their owner is
             // sending garbage when the ceiling they themselves declared is
             // what was reached -- so they can neither act on it nor raise it.
-            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling }) => {
-                Self::Refused(crate::local_transport::memory_ceiling_read_failure(ceiling))
-            }
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                ceiling,
+                required,
+            }) => Self::Refused(crate::local_transport::memory_ceiling_read_failure(
+                ceiling, required,
+            )),
             LocalTransportError::Frame(_) | LocalTransportError::Payload(_) => Self::Refused(
                 ReadFailure::new(
                     contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,

@@ -71,11 +71,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
     declare(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -118,7 +117,8 @@ async fn authoritative_purge_reaches_sync_off_edge_while_ordinary_rows_stay_loca
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert!(
         edge.table_meta(TABLE).is_none(),
         "the blank edge has no local table before the first authoritative pull"

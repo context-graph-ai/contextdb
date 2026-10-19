@@ -85,7 +85,8 @@ fn start_hub(broker: &InProcessBroker, tenant: &str) -> RunningHub {
             TenantId::from(tenant),
             hub_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -105,6 +106,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> Sy
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// Drain a pull until it stops making progress, so "the edge did not converge"

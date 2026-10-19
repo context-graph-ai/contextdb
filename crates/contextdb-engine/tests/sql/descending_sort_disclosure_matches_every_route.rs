@@ -114,6 +114,8 @@ fn eager_execution_never_claims_to_elide_a_descending_sort_it_still_runs() {
         &db,
         "SELECT id FROM desc_disclosure WHERE parent_id = 1 ORDER BY seq DESC",
         &empty(),
+        db.declared_reader_memory()
+            .expect("admit the eager fixture reader"),
     )
     .expect("eager execution must succeed");
     assert_eq!(
@@ -157,6 +159,8 @@ fn eager_execution_still_elides_an_ascending_sort() {
         &db,
         "SELECT id FROM desc_disclosure WHERE parent_id = 1 ORDER BY seq ASC",
         &empty(),
+        db.declared_reader_memory()
+            .expect("admit the eager fixture reader"),
     )
     .expect("eager execution must succeed");
     assert_eq!(

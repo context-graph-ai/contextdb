@@ -117,7 +117,8 @@ fn start_hub(broker: &InProcessBroker) -> RunningHub {
             TenantId::from(TENANT),
             node_id.clone(),
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -156,6 +157,7 @@ fn edge_client(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn insert_windows(db: &Database, ids: std::ops::Range<i64>) {

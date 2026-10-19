@@ -115,7 +115,9 @@ fn every_row_write_is_refused(ddl: &str) {
                 .execute("SELECT * FROM mixed_rows ORDER BY id", &empty())
                 .unwrap()
                 .rows;
-            let before_changes = db.changes_since(contextdb_core::Lsn(0));
+            let before_changes = db
+                .changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes");
             let tx = db.begin().unwrap();
             let (first, second) = if ddl_first { (ddl, dml) } else { (dml, ddl) };
             db.execute_in_tx(tx, first, &empty()).unwrap_or_else(|error| panic!("newly admitted DDL prerequisite must execute, rather than manufacture a mixed-write rejection: {first}: {error}"));
@@ -139,11 +141,15 @@ fn every_row_write_is_refused(ddl: &str) {
                 before_rows
             );
             assert_eq!(
-                db.changes_since(contextdb_core::Lsn(0)).ddl,
+                db.changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes")
+                    .ddl,
                 before_changes.ddl
             );
             assert_eq!(
-                db.changes_since(contextdb_core::Lsn(0)).max_lsn(),
+                db.changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes")
+                    .max_lsn(),
                 before_changes.max_lsn()
             );
         }

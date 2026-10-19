@@ -102,13 +102,13 @@ fn assert_no_ghost_write(
     before: &[Value],
     lsn_before: contextdb_core::Lsn,
 ) {
-    let ddl_after = db.ddl_log_since(lsn_before);
+    let ddl_after = db.ddl_log_since(lsn_before).unwrap();
     assert!(
         ddl_after.is_empty(),
         "rejection must not emit any DDL change, got {} entries",
         ddl_after.len()
     );
-    let change_after = db.change_log_since(lsn_before);
+    let change_after = db.change_log_since(lsn_before).unwrap();
     assert!(
         change_after.is_empty(),
         "rejection must not emit any row-change log entry, got {} entries",
@@ -842,7 +842,7 @@ fn sc02_flag_survives_close_and_reopen() {
 #[test]
 fn sc03_create_table_ddl_round_trips_immutable_flag_via_apply_changes() {
     let origin = db_with_decisions();
-    let ddl = origin.ddl_log_since(contextdb_core::Lsn(0));
+    let ddl = origin.ddl_log_since(contextdb_core::Lsn(0)).unwrap();
     assert!(!ddl.is_empty(), "origin must have at least one DdlChange");
     let create = ddl
         .into_iter()
@@ -880,7 +880,7 @@ fn sc03_create_table_ddl_round_trips_immutable_flag_via_apply_changes() {
 // Helper: re-parse the CreateTable DDL emitted for `table` into a TableMeta.
 #[allow(clippy::collapsible_if)]
 fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
-    let ddl = db.ddl_log_since(contextdb_core::Lsn(0));
+    let ddl = db.ddl_log_since(contextdb_core::Lsn(0)).unwrap();
     for change in ddl {
         if let DdlChange::CreateTable {
             name,
@@ -942,9 +942,12 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
                             max_partitions: None,
                             search_mode: contextdb_core::VectorSearchMode::Auto,
                             auto_index_at: None,
+                            flat_below: None,
+                            auto_expansion_ceiling: None,
                             hnsw_m: None,
                             hnsw_ef_construction: None,
                             hnsw_ef_search: None,
+                            hnsw_search_radius_millionths: None,
                             vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
                             consolidation_change_percent: None,
                             consolidation_tombstone_percent: None,
@@ -965,7 +968,7 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
 #[test]
 fn sc04_peer_update_on_flagged_column_rejected_after_replication() {
     let origin = db_with_decisions();
-    let ddl = origin.ddl_log_since(contextdb_core::Lsn(0));
+    let ddl = origin.ddl_log_since(contextdb_core::Lsn(0)).unwrap();
     let create = ddl
         .into_iter()
         .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "decisions"))
@@ -2248,7 +2251,7 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
     );
     assert_eq!(row_text(&db, id, "decision_type"), "sql-migration");
     assert!(
-        db.ddl_log_since(lsn_before).is_empty(),
+        db.ddl_log_since(lsn_before).unwrap().is_empty(),
         "refusal repair must not emit DDL"
     );
     assert_eq!(
@@ -2256,7 +2259,7 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
         before,
         "refusal repair must preserve the authoritative row values"
     );
-    let repair = db.change_log_since(lsn_before);
+    let repair = db.change_log_since(lsn_before).unwrap();
     assert_eq!(
         repair.len(),
         2,
@@ -2873,7 +2876,7 @@ fn rc03_meta_column_render_preserves_immutable() {
         &empty(),
     )
     .unwrap();
-    let ddl = db.ddl_log_since(contextdb_core::Lsn(0));
+    let ddl = db.ddl_log_since(contextdb_core::Lsn(0)).unwrap();
     let create = ddl
         .into_iter()
         .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "t"))
@@ -2921,6 +2924,7 @@ fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
     let before_alter = origin.current_lsn();
     let create_ddl = origin
         .ddl_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .into_iter()
         .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "t"))
         .expect("CreateTable DDL must exist");
@@ -2946,6 +2950,7 @@ fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
         .unwrap();
     let alter_ddl: Vec<DdlChange> = origin
         .ddl_log_since(before_alter)
+        .unwrap()
         .into_iter()
         .filter(|d| matches!(d, DdlChange::AlterTable { name, .. } if name == "t"))
         .collect();

@@ -23,12 +23,12 @@ impl MemoryBudget for Budget {
                     == self.reject_tail_number.load(Ordering::SeqCst));
         if tail_refused {
             return Err(Error::MemoryBudgetExceeded {
-                subsystem: subsystem.to_owned(),
-                operation: operation.to_owned(),
+                subsystem: subsystem.to_owned().into(),
+                operation: operation.to_owned().into(),
                 requested_bytes: bytes,
                 available_bytes: 0,
                 budget_limit_bytes: self.used.load(Ordering::SeqCst),
-                hint: hint.to_owned(),
+                hint: hint.to_owned().into(),
             });
         }
         self.used.fetch_add(bytes, Ordering::SeqCst);
@@ -67,10 +67,24 @@ fn layout() -> VectorIndexLayout {
 }
 
 fn seeded() -> (VectorStore, Arc<IndexState>, Arc<Budget>) {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let store = VectorStore::default();
-    store.register_index_with_layout(index(), layout()).unwrap();
-    store.insert_loaded_vector(entry(1, TxId(1)));
     let budget = Arc::new(Budget::default());
+    let mut registration_workspace = VectorCopyAdmission::new(budget.clone());
+    store
+        .register_index_with_layout(
+            index(),
+            layout(),
+            budget.clone(),
+            &mut registration_workspace,
+        )
+        .unwrap();
+    drop(registration_workspace);
+    store
+        .insert_loaded_vector(entry(1, TxId(1)), budget.clone())
+        .unwrap();
     store.account_loaded_state(budget.clone()).unwrap();
     let state = store.state(&index()).unwrap();
     VectorStore::build_prepared_hnsw(
@@ -78,6 +92,7 @@ fn seeded() -> (VectorStore, Arc<IndexState>, Arc<Budget>) {
         &state,
         layout().resolve_policy(1, 1),
         budget.clone(),
+        VectorCopyAdmission::new(executing_accountant.clone()),
         || {},
         &mut || Ok(()),
     )
@@ -87,6 +102,9 @@ fn seeded() -> (VectorStore, Arc<IndexState>, Arc<Budget>) {
 
 #[test]
 fn refused_tail_admission_preserves_the_row_directory_and_existing_graph() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let (store, state, budget) = seeded();
     let serial = state.raw_hnsw_build_serial_for_test();
     let topology = state.raw_hnsw_topology_digest_for_test();
@@ -101,6 +119,7 @@ fn refused_tail_admission_preserves_the_row_directory_and_existing_graph() {
             )],
             Vec::new(),
             HashSet::new(),
+            VectorCopyAdmission::new(executing_accountant.clone()),
         )
         .unwrap_err();
     assert!(
@@ -129,6 +148,7 @@ fn refused_tail_admission_preserves_the_row_directory_and_existing_graph() {
             )],
             Vec::new(),
             HashSet::new(),
+            VectorCopyAdmission::new(executing_accountant.clone()),
         )
         .unwrap();
     drop(prepared);
@@ -145,6 +165,9 @@ fn refused_tail_admission_preserves_the_row_directory_and_existing_graph() {
 
 #[test]
 fn successful_tail_publication_consumes_prior_admission_without_rebuilding() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let (store, state, budget) = seeded();
     let serial = state.raw_hnsw_build_serial_for_test();
     let prepared = store
@@ -156,6 +179,7 @@ fn successful_tail_publication_consumes_prior_admission_without_rebuilding() {
             )],
             Vec::new(),
             HashSet::new(),
+            VectorCopyAdmission::new(executing_accountant.clone()),
         )
         .unwrap();
     budget
@@ -182,6 +206,9 @@ fn successful_tail_publication_consumes_prior_admission_without_rebuilding() {
 
 #[test]
 fn snapshot_counts_and_filtered_eligibility_do_not_walk_excluded_history() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let state = IndexState::new(2, VectorQuantization::F32);
     state.push_entry(state.stored_entry(entry(1, TxId(1))));
     state.push_entry(state.stored_entry(entry(2, TxId(2))));
@@ -204,20 +231,29 @@ fn snapshot_counts_and_filtered_eligibility_do_not_walk_excluded_history() {
             );
             let mut eligibility_visits = 0;
             let eligibility = state
-                .bounded_hnsw_eligibility(TxId(snapshot.0), || {
-                    eligibility_visits += 1;
-                    Ok::<(), Error>(())
-                })
+                .bounded_hnsw_eligibility(
+                    TxId(snapshot.0),
+                    || {
+                        eligibility_visits += 1;
+                        Ok::<(), Error>(())
+                    },
+                    &mut executing_admission,
+                )
                 .unwrap();
             assert_eq!(eligibility.live_count, expected);
             assert_eq!(eligibility_visits, 1, "history must not add directory work");
             let mut count_visits = 0;
             assert_eq!(
                 state
-                    .bounded_directory_visible_entry_count(snapshot, Some(&[1]), || {
-                        count_visits += 1;
-                        Ok::<(), Error>(())
-                    })
+                    .bounded_directory_visible_entry_count(
+                        snapshot,
+                        Some(&[1]),
+                        || {
+                            count_visits += 1;
+                            Ok::<(), Error>(())
+                        },
+                        &mut executing_admission
+                    )
                     .unwrap(),
                 1
             );
@@ -248,7 +284,11 @@ fn snapshot_counts_and_filtered_eligibility_do_not_walk_excluded_history() {
     );
     assert_eq!(state.directory_visible_entry_count(SnapshotId(1), None), 0);
     assert!(matches!(
-        state.bounded_hnsw_eligibility(TxId(5000), || Err::<(), _>(Error::ReadCancelled)),
+        state.bounded_hnsw_eligibility(
+            TxId(5000),
+            || Err::<(), _>(Error::ReadCancelled),
+            &mut executing_admission
+        ),
         Err(Error::ReadCancelled)
     ));
 }
@@ -414,9 +454,13 @@ fn purge_and_empty_tail_keep_the_declared_graph_policy() {
 
 struct DirectoryOnlyLoader;
 impl DormantRawVectorLoader for DirectoryOnlyLoader {
-    fn load(&self, _: &[RawVectorDirectoryEntry]) -> Result<LoadedRawVectorPartition> {
+    fn load(
+        &self,
+        _: &[RawVectorDirectoryEntry],
+        _owner: &mut VectorCopyAdmission,
+    ) -> Result<LoadedRawVectorPartition> {
         Err(Error::Other(
-            "counting must not hydrate raw vector bodies".to_owned(),
+            ("counting must not hydrate raw vector bodies".to_owned()).into(),
         ))
     }
     fn load_candidate(
@@ -426,7 +470,7 @@ impl DormantRawVectorLoader for DirectoryOnlyLoader {
         _: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<LoadedRawVectorCandidate> {
         Err(Error::Other(
-            "counting must not load a raw candidate".to_owned(),
+            ("counting must not load a raw candidate".to_owned()).into(),
         ))
     }
 }
@@ -439,6 +483,12 @@ fn dormant_counts_keep_old_snapshot_visibility_and_sorted_row_versions() {
         created_tx: TxId(created),
         deleted_tx: deleted.map(TxId),
         lsn: Lsn(created),
+        membership: VectorMembershipProvenance::new(
+            TxId(created),
+            Lsn(created),
+            TxId(created),
+            deleted.map(TxId),
+        ),
     };
     state
         .install_dormant_raw_directory(
@@ -474,6 +524,9 @@ fn dormant_counts_keep_old_snapshot_visibility_and_sorted_row_versions() {
 
 #[test]
 fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let (store, state, budget) = seeded();
     let identity = VectorGraphGeneration {
         generation_id: 1,
@@ -499,6 +552,7 @@ fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
             )],
             Vec::new(),
             HashSet::new(),
+            VectorCopyAdmission::new(executing_accountant.clone()),
         )
         .unwrap();
     let serial = state
@@ -554,6 +608,9 @@ fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
 
 #[test]
 fn refusing_a_later_tail_insert_releases_the_whole_prepared_batch() {
+    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
+    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
+
     let (store, state, budget) = seeded();
     let bytes = budget.used.load(Ordering::SeqCst);
     let topology = state.raw_hnsw_topology_digest_for_test();
@@ -567,6 +624,7 @@ fn refusing_a_later_tail_insert_releases_the_whole_prepared_batch() {
             ],
             Vec::new(),
             HashSet::new(),
+            VectorCopyAdmission::new(executing_accountant.clone()),
         )
         .unwrap_err();
     assert!(matches!(error, Error::MemoryBudgetExceeded { .. }));

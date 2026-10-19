@@ -43,6 +43,9 @@ fn an_exact_refused_outcome_lookup_decodes_only_requested_values() {
     persistence
         .flush_config_value(&format!("{prefix}{}", "f".repeat(64)), &"malformed outcome")
         .expect("persist a malformed later outcome");
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
 
     let (first, _lease) = db
         .refused_schema_unit_outcomes_for_digests(
@@ -51,10 +54,15 @@ fn an_exact_refused_outcome_lookup_decodes_only_requested_values() {
             pushing_incarnation,
             hub_node,
             &[[0; 32]],
+            fixture_operation_reader_1.clone(),
         )
         .expect("a one-item page does not decode later records");
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].source_ddl_lsn, Lsn(1));
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         db.refused_schema_unit_outcomes_for_digests(
             &tenant,
@@ -62,6 +70,7 @@ fn an_exact_refused_outcome_lookup_decodes_only_requested_values() {
             pushing_incarnation,
             hub_node,
             &[[0xff; 32]],
+            fixture_operation_reader_2.clone()
         )
         .is_err(),
         "the malformed record is reported when its exact key is requested"
@@ -89,16 +98,39 @@ fn replay_of_one_peer_does_not_decode_another_peers_malformed_held_payload() {
         .expect("file-backed store")
         .flush_config_value(&unrelated_key, &"malformed held data")
         .expect("persist another peer's malformed payload");
+    let fixture_operation_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_3 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_3.clone());
 
     let replayed = db
-        .replay_released_policy_data(&tenant, requested_node, incarnation)
+        .replay_released_policy_data(
+            &tenant,
+            requested_node,
+            incarnation,
+            &mut fixture_operation_copy_3,
+            fixture_operation_reader_3.clone(),
+        )
         .expect("a peer replays only its own durable pending data");
     assert_eq!(replayed.applied_rows, 0);
     assert_eq!(replayed.skipped_rows, 0);
     assert!(replayed.conflicts.is_empty());
+    let fixture_operation_reader_4 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_4 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_4.clone());
+
     assert!(
-        db.replay_released_policy_data(&tenant, unrelated_node, incarnation)
-            .is_err(),
+        db.replay_released_policy_data(
+            &tenant,
+            unrelated_node,
+            incarnation,
+            &mut fixture_operation_copy_4,
+            fixture_operation_reader_4.clone()
+        )
+        .is_err(),
         "the malformed payload is reported to the peer whose replay reaches it"
     );
 }
@@ -134,12 +166,18 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
     let used = db.accountant().usage().used;
     db.set_memory_limit(Some(used.saturating_add(4096)))
         .expect("leave less room than the encoded outcome needs");
+    let fixture_operation_reader_5 =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
+            .child()
+            .expect("admit the bounded fixture reader");
+
     let refused = match db.refused_schema_unit_outcomes_for_digests(
         &tenant,
         node,
         incarnation,
         hub,
         &[[1; 32]],
+        fixture_operation_reader_5.clone(),
     ) {
         Ok(_) => panic!("the encoded value must be admitted before decoding"),
         Err(refused) => refused,
@@ -148,6 +186,9 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
         matches!(refused, Error::MemoryBudgetExceeded { .. }),
         "the refusal is typed: {refused}"
     );
+    // Reading the durable outcome back is writer work: lift the refusal's
+    // budget first. Nothing runs in between.
+    db.set_memory_limit(None).expect("lift the budget");
     assert!(
         persistence
             .load_config_value::<crate::protocol::RefusedSchemaUnitOutcome>(&key)
@@ -155,13 +196,23 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
             .is_some(),
         "memory refusal leaves the durable outcome intact"
     );
-    db.set_memory_limit(None).expect("lift the budget");
+    let fixture_operation_reader_6 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let (page, lease) = db
-        .refused_schema_unit_outcomes_for_digests(&tenant, node, incarnation, hub, &[[1; 32]])
+        .refused_schema_unit_outcomes_for_digests(
+            &tenant,
+            node,
+            incarnation,
+            hub,
+            &[[1; 32]],
+            fixture_operation_reader_6.clone(),
+        )
         .expect("read after lifting the budget");
     assert!(
-        db.accountant().usage().used > used,
-        "the response holds its decoded charge"
+        lease.retained_payload_bytes() > 0,
+        "the response holds its decoded reader charge"
     );
     assert_eq!(page, vec![outcome]);
     drop(page);
@@ -208,7 +259,17 @@ fn a_large_local_refusal_fact_is_admitted_before_decode_and_survives_refusal() {
     db.set_memory_limit(Some(used.saturating_add(4096)))
         .expect("leave less room than the encoded fact needs");
     let refused = db
-        .refused_schema_local_facts(&tenant, edge, edge_life, hub, hub_life, &[[1; 32]])
+        .refused_schema_local_facts(
+            &tenant,
+            edge,
+            edge_life,
+            hub,
+            hub_life,
+            &[[1; 32]],
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
+                .child()
+                .expect("admit the bounded fixture reader"),
+        )
         .expect_err("the encoded fact must be admitted before decoding");
     assert!(
         matches!(refused, Error::MemoryBudgetExceeded { .. }),
@@ -221,11 +282,20 @@ fn a_large_local_refusal_fact_is_admitted_before_decode_and_survives_refusal() {
     );
     db.set_memory_limit(None).expect("lift the budget");
     let (facts, lease) = db
-        .refused_schema_local_facts(&tenant, edge, edge_life, hub, hub_life, &[[1; 32]])
+        .refused_schema_local_facts(
+            &tenant,
+            edge,
+            edge_life,
+            hub,
+            hub_life,
+            &[[1; 32]],
+            db.declared_reader_memory()
+                .expect("admit the actual fixture reader"),
+        )
         .expect("read the retained fact");
     assert!(
-        db.accountant().usage().used > used,
-        "decoded facts retain their charge"
+        lease.as_ref().unwrap().retained_payload_bytes() > 0,
+        "decoded facts retain their reader charge"
     );
     assert_eq!(facts, vec![outcome]);
     drop(facts);
@@ -280,7 +350,19 @@ fn a_large_held_replay_is_refused_without_removing_its_pending_record() {
     let used = db.accountant().usage().used;
     db.set_memory_limit(Some(used.saturating_add(4096)))
         .expect("leave less room than the encoded held unit needs");
-    let refused = match db.replay_released_policy_data(&tenant, node, incarnation) {
+    let fixture_operation_reader_7 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_7 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_7.clone());
+
+    let refused = match db.replay_released_policy_data(
+        &tenant,
+        node,
+        incarnation,
+        &mut fixture_operation_copy_7,
+        fixture_operation_reader_7.clone(),
+    ) {
         Ok(_) => panic!("the encoded held unit must be admitted before replay"),
         Err(refused) => refused,
     };
@@ -288,6 +370,9 @@ fn a_large_held_replay_is_refused_without_removing_its_pending_record() {
         matches!(refused, Error::MemoryBudgetExceeded { .. }),
         "the refusal is typed: {refused}"
     );
+    // Reading the durable unit back is writer work: lift the refusal's
+    // budget first. Nothing runs in between.
+    db.set_memory_limit(None).expect("lift the budget");
     assert!(
         persistence
             .load_config_value::<DurablePolicyHeldData>(&key)

@@ -233,12 +233,12 @@ fn every_class_a_read_can_meet_survives_the_round_trip_unchanged() {
         Error::UnboundedTraversal,
         Error::UnboundedVectorSearch,
         Error::MemoryBudgetExceeded {
-            subsystem: "vector".to_owned(),
-            operation: "candidate materialization".to_owned(),
+            subsystem: "vector".to_owned().into(),
+            operation: "candidate materialization".to_owned().into(),
             requested_bytes: 4096,
             available_bytes: 128,
             budget_limit_bytes: 8192,
-            hint: "raise --read-memory".to_owned(),
+            hint: "raise --read-memory".to_owned().into(),
         },
         // The caller may not see it.
         Error::PrincipalRequired {
@@ -265,7 +265,7 @@ fn every_class_a_read_can_meet_survives_the_round_trip_unchanged() {
             path: std::path::PathBuf::from("/store/widgets.db"),
         },
         // Prose, the last resort, still arrives as prose.
-        Error::Other("the owner could not say more".to_owned()),
+        Error::Other("the owner could not say more".to_owned().into()),
     ];
 
     for answer in answers {
@@ -318,7 +318,7 @@ fn an_answer_outside_the_read_surface_arrives_named_rather_than_lost() {
 /// the thing being decoded happens to be an error.
 #[test]
 fn an_engine_answer_is_admitted_against_the_ceiling_the_caller_declared() {
-    let long = Error::Other("w".repeat(4_096));
+    let long = Error::Other("w".repeat(4_096).into());
     let frame = engine_answer(long);
     let bytes = encode_message(&frame).expect("encode the long engine answer");
     let mut framed = u32::try_from(bytes.len())

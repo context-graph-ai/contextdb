@@ -150,7 +150,12 @@ fn get(
 }
 
 fn verify(page: &PageImpl, checksum: Checksum, hint: PageHint) -> Result<()> {
-    if hint.verifies_path() && page_checksum(page, None, None)? != checksum {
+    if hint.verifies_path()
+        && page
+            .to_arc()
+            .memoized_byte_node_checksum(|| page_checksum(page, None, None))?
+            != checksum
+    {
         return Err(StorageError::Corrupted(
             "retained byte-table page failed checksum verification".into(),
         ));
@@ -224,6 +229,7 @@ enum HandleSource {
         number: PageNumber,
         checksum: Checksum,
         key: Range<usize>,
+        value: Range<usize>,
     },
     Loaded {
         page: PageImpl,
@@ -239,10 +245,38 @@ pub struct BoundedByteHandle<'a> {
     _guard: Arc<TransactionGuard>,
     hint: PageHint,
     source: HandleSource,
+    authenticated: bool,
     _table: PhantomData<&'a ()>,
 }
 
-impl BoundedByteHandle<'_> {
+impl<'a> BoundedByteHandle<'a> {
+    /// Lengths belong to the captured table loan; no key/value copy is made.
+    pub fn key_len(&self) -> usize {
+        match &self.source { HandleSource::Singleton {key,..} | HandleSource::Loaded {key,..} => key.len() }
+    }
+    pub fn value_len(&self) -> usize {
+        match &self.source { HandleSource::Singleton {value,..} | HandleSource::Loaded {value,..} => value.len() }
+    }
+    /// A synchronous borrowed window. Only authenticated cursors expose bytes;
+    /// oversized singletons use charged windows, never a complete page read.
+    pub fn with_bytes<R>(&self, key: bool, range: Range<usize>, consume: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        if !self.authenticated { return Err(StorageError::Corrupted("byte loan requires an authenticated cursor".into())); }
+        let stored = match &self.source {
+            HandleSource::Singleton {key: k,value:v,..} | HandleSource::Loaded {key:k,value:v,..} => if key {k} else {v},
+        };
+        if range.start > range.end || range.end > stored.len() {
+            return Err(StorageError::Corrupted("byte loan exceeds record".into()));
+        }
+        let range = stored.start + range.start..stored.start + range.end;
+        match &self.source {
+            HandleSource::Singleton {number,..} => {
+                let window = self.mem.get_page_window(*number,range,self.hint)?;
+                Ok(consume(&window))
+            }
+            HandleSource::Loaded {page,..} => Ok(consume(&page.memory()[range])),
+        }
+    }
+
     /// False excludes this key. True must still be followed by full materialization
     /// before treating the record as descriptor, checksum, or mutation authority.
     pub fn key_matches(&self, key: &[u8]) -> Result<bool> {
@@ -288,7 +322,10 @@ impl BoundedByteHandle<'_> {
 
     /// Admit and decode the complete selected source page through ordinary reads.
     /// A refusal here does not affect the cursor's admitted navigation state.
-    pub fn materialize(&self) -> Result<ByteEntry<'static>> {
+    /// Guards carry the handle's source lifetime: a write-table loan stays live
+    /// through both guards, even after the handle and cursor are dropped.
+    /// Read-only handles retain their owned snapshot and use a static lifetime.
+    pub fn materialize(&self) -> Result<ByteEntry<'a>> {
         let (page, key, value) = match &self.source {
             HandleSource::Loaded { page, key, value } => (page.clone(), key.clone(), value.clone()),
             HandleSource::Singleton {
@@ -296,7 +333,11 @@ impl BoundedByteHandle<'_> {
             } => {
                 let page = self.mem.get_page(*number, self.hint)?;
                 validate_node(page.memory())?;
-                verify(&page, *checksum, self.hint)?;
+                if self.authenticated {
+                    if page_checksum(&page, None, None)? != *checksum {
+                        return Err(StorageError::Corrupted("authenticated singleton changed".into()));
+                    }
+                } else { verify(&page, *checksum, self.hint)?; }
                 if page.memory()[0] != LEAF {
                     return Err(StorageError::Corrupted(
                         "bounded singleton changed node type".into(),
@@ -328,8 +369,10 @@ pub struct BoundedByteCursor<'a> {
     hint: PageHint,
     next: Option<(PageNumber, Checksum)>,
     branches: Vec<(PageImpl, usize)>,
+    navigation_invoice: Option<crate::ReadPageCharge>,
     leaf: Option<(PageImpl, usize)>,
     failed: bool,
+    authenticated: bool,
     _table: PhantomData<&'a ()>,
 }
 
@@ -341,8 +384,10 @@ impl<'a> BoundedByteCursor<'a> {
             hint: tree.hint,
             next: tree.get_root().map(|root| (root.root, root.checksum)),
             branches: Vec::new(),
+            navigation_invoice: None,
             leaf: None,
             failed: false,
+            authenticated: false,
             _table: PhantomData,
         }
     }
@@ -353,6 +398,7 @@ impl<'a> BoundedByteCursor<'a> {
             _guard: self.guard.clone(),
             hint: self.hint,
             source,
+            authenticated: self.authenticated,
             _table: PhantomData,
         }
     }
@@ -398,20 +444,46 @@ impl<'a> BoundedByteCursor<'a> {
                 ));
             }
             if let Some(layout) = singleton(&self.mem, number, self.hint, None, None)? {
+                if self.authenticated {
+                    // Authenticate the complete encoded leaf (including offsets,
+                    // key and value) without allocating the complete extent.
+                    let actual = super::page_store::hash128_from_windows(layout.value.end, |start, out: &mut [u8]| {
+                        let window = self.mem.get_page_window(number, start..start + out.len(), self.hint)?;
+                        out.copy_from_slice(&window);
+                        Ok::<_, StorageError>(())
+                    })?;
+                    if actual != checksum {
+                        return Err(StorageError::Corrupted("streamed byte leaf failed checksum verification".into()));
+                    }
+                }
                 let handle = self.handle(HandleSource::Singleton {
                     number,
                     checksum,
                     key: layout.key,
+                    value: layout.value,
                 });
                 self.advance_branch();
                 return Ok(Some(handle));
             }
             let page = self.mem.get_page(number, self.hint)?;
             validate_node(page.memory())?;
-            verify(&page, checksum, self.hint)?;
+            if self.authenticated && !self.mem.uncommitted(number) {
+                if page_checksum(&page, None, None)? != checksum {
+                    return Err(StorageError::Corrupted("same-write byte path failed checksum verification".into()));
+                }
+            } else { verify(&page, checksum, self.hint)?; }
             match page.memory()[0] {
                 LEAF => self.leaf = Some((page, 0)),
                 BRANCH => {
+                    if self.authenticated && self.branches.len()==self.branches.capacity() {
+                        let capacity=self.branches.capacity().checked_mul(2).map(|n|n.max(1))
+                            .ok_or_else(||StorageError::Corrupted("byte cursor navigation overflow".into()))?;
+                        let layout=std::alloc::Layout::array::<(PageImpl,usize)>(capacity)
+                            .map_err(|_|StorageError::Corrupted("byte cursor navigation overflow".into()))?;
+                        let invoice=crate::read_admission::admit_read_memory(layout.size())?;
+                        self.branches.reserve_exact(capacity-self.branches.len());
+                        self.navigation_invoice=invoice;
+                    }
                     self.branches.push((page, 0));
                     self.advance_branch();
                 }
@@ -602,7 +674,8 @@ impl Iterator for BoundedByteIter<'_> {
 }
 
 impl Btree<&'static [u8], &'static [u8]> {
-    pub(crate) fn cursor_bounded(&self) -> BoundedByteCursor<'_> {
+    // Read-only cursors own their transaction guard; no write-table loan exists.
+    pub(crate) fn cursor_bounded(&self) -> BoundedByteCursor<'static> {
         BoundedByteCursor::new(self)
     }
     pub(crate) fn get_bounded(&self, key: &[u8]) -> Result<Option<ByteGuard<'static>>> {
@@ -625,6 +698,15 @@ impl Btree<&'static [u8], &'static [u8]> {
 }
 
 impl BtreeMut<'_, &'static [u8], &'static [u8]> {
+    pub(crate) fn cursor_authenticated(&self, guard: Arc<TransactionGuard>) -> BoundedByteCursor<'_> {
+        BoundedByteCursor {
+            mem: self.mem.clone(), guard, hint: PageHint::None,
+            next: self.get_root().map(|root| (root.root,root.checksum)),
+            branches: Vec::new(), navigation_invoice: None, leaf: None, failed: false, authenticated: true,
+            _table: PhantomData,
+        }
+    }
+
     pub(crate) fn get_bounded(&self, key: &[u8]) -> Result<Option<ByteGuard<'static>>> {
         get(self.get_root(), &self.mem, PageHint::None, key)
     }
@@ -706,7 +788,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct DamagedNodeBackend {
-        inner: Arc<crate::backends::InMemoryBackend>,
+        inner: Arc<dyn crate::StorageBackend>,
         state: Arc<std::sync::Mutex<NodeDamageState>>,
     }
 
@@ -1376,7 +1458,8 @@ mod tests {
         let observation = observe_backend_reads(Arc::new(move |bytes| {
             observed.fetch_add(bytes, AtomicOrdering::SeqCst);
         }));
-        let separator_bytes = b"z:unrelated".len() + 128;
+        let separator_bytes =
+            super::super::page_store::PageMemory::admitted_bytes_for_test(b"z:unrelated".len());
         crate::with_read_page_charge(
             Arc::new(move |bytes| {
                 if bytes == separator_bytes || bytes > 64 * 1024 {
@@ -1849,5 +1932,124 @@ mod tests {
         let handle = table.cursor_bounded().next().unwrap().unwrap();
         assert!(handle.key_matches(b"z:unrelated").unwrap());
         assert_eq!(handle.materialize().unwrap().1.value(), vec![7; HUGE]);
+    }
+    #[test]
+    fn verified_bounded_lookup_memo_checks_every_expected_checksum_and_disk_corruption() {
+        use super::super::page_store::PageMemory;
+        use std::os::unix::fs::FileExt;
+        for cache_size in [0, 1024 * 1024] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("memo.db");
+            let db = Builder::new().set_cache_size(0).create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            write
+                .open_table(VALUES)
+                .unwrap()
+                .insert(b"key".as_slice(), b"original".as_slice())
+                .unwrap();
+            write.commit().unwrap();
+            drop(db);
+            let disk = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let state = Arc::new(std::sync::Mutex::new(NodeDamageState::default()));
+            let backend = DamagedNodeBackend {
+                inner: Arc::new(
+                    crate::backends::FileBackend::new(disk.try_clone().unwrap()).unwrap(),
+                ),
+                state: state.clone(),
+            };
+            let roots = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let registered = roots.clone();
+            let db = Builder::new()
+                .set_cache_size(cache_size)
+                .open_with_backend_and_external_snapshots(
+                    backend,
+                    Arc::new(move || Ok(registered.lock().unwrap().clone())),
+                )
+                .unwrap();
+            let pin = db.begin_read().unwrap();
+            let snapshot = pin.storage_snapshot_identity();
+            roots.lock().unwrap().push(snapshot);
+            let external = db.begin_external_read(snapshot).unwrap();
+            let table = external.open_byte_table_bounded(VALUES).unwrap();
+            let cursor = table.cursor_bounded();
+            let (number, expected) = cursor.next.unwrap();
+            state.lock().unwrap().first_read = None;
+            let before = PageMemory::byte_checksum_counts_for_test();
+            assert_eq!(
+                table.get_bounded(b"key").unwrap().unwrap().value(),
+                b"original"
+            );
+            let computed = PageMemory::byte_checksum_counts_for_test();
+            assert_eq!(
+                computed[if cache_size == 0 { 2 } else { 0 }]
+                    - before[if cache_size == 0 { 2 } else { 0 }],
+                1
+            );
+            assert_eq!(
+                table.get_bounded(b"key").unwrap().unwrap().value(),
+                b"original"
+            );
+            let reused = PageMemory::byte_checksum_counts_for_test();
+            if cache_size != 0 {
+                assert_eq!(reused[0], computed[0]);
+                assert_eq!(reused[3] - computed[3], 1);
+            } else {
+                assert_eq!(reused[2] - computed[2], 1);
+            }
+            let page = cursor.mem.get_page(number, cursor.hint).unwrap();
+            assert_eq!(page.memory()[0], LEAF);
+            let disk_bytes = std::fs::read(&path).unwrap();
+            let offset = disk_bytes
+                .windows(page.memory().len())
+                .position(|bytes| bytes == page.memory())
+                .expect("captured page exists on disk") as u64;
+            validate_node(page.memory()).unwrap();
+            let leaf = LeafAccessor::new(page.memory(), None, None);
+            let (start, end) = leaf.value_range(0).unwrap();
+            let mut corrupt = page.memory().to_vec();
+            corrupt[start] ^= 1;
+            let corrupt_expected = super::super::page_store::xxh3_checksum(&corrupt[..end]);
+            assert_ne!(corrupt_expected, expected);
+            disk.write_all_at(&corrupt[start..=start], offset + start as u64)
+                .unwrap();
+            disk.sync_data().unwrap();
+            if cache_size == 0 {
+                // Fresh fault of the real changed disk page: original root
+                // expectation must yield typed corruption through public get.
+                assert_corrupted_without_panic(|| table.get_bounded(b"key"));
+            } else {
+                // Resident immutable bytes keep existing visibility semantics.
+                assert_eq!(
+                    table.get_bounded(b"key").unwrap().unwrap().value(),
+                    b"original"
+                );
+                let before_mismatch = PageMemory::byte_checksum_counts_for_test();
+                // The same production point walker visits its memoized page
+                // with the checksum a corrupt/new parent would supply.
+                assert_corrupted_without_panic(|| {
+                    get(
+                        Some(BtreeHeader::new(number, corrupt_expected, 0)),
+                        &cursor.mem,
+                        cursor.hint,
+                        b"key",
+                    )
+                });
+                let after_mismatch = PageMemory::byte_checksum_counts_for_test();
+                assert_eq!(after_mismatch[0], before_mismatch[0]);
+                assert_eq!(after_mismatch[3] - before_mismatch[3], 1);
+                assert_eq!(
+                    table.get_bounded(b"key").unwrap().unwrap().value(),
+                    b"original"
+                );
+            }
+            // Restore this task-created store before redb close housekeeping.
+            disk.write_all_at(&page.memory()[start..=start], offset + start as u64)
+                .unwrap();
+            disk.sync_data().unwrap();
+        }
     }
 }

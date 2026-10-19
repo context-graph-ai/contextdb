@@ -1,3 +1,7 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "the error type is returned by value across the crate; boxing it would change every signature"
+)]
 use super::*;
 
 const CRON_SCHEDULES_CONFIG_KEY: &str = "__cron_schedules";
@@ -294,7 +298,11 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
-    pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
+    pub fn cron_run_due_now_for_test(
+        &self,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<u64> {
         let _operation = self.open_operation()?;
         // Bounded at 1s: comfortably covers the short-but-not-instant
         // intervals a real test schedule uses (e.g. "EVERY '200
@@ -302,7 +310,7 @@ impl Database {
         // than that returns unfired rather than sleeping the test through
         // it.
         self.wait_for_imminent_cron_due_for_test(Duration::from_millis(1_000));
-        self.dispatch_due_cron_schedules(true)
+        self.dispatch_due_cron_schedules(true, vector_copy_owner, read_memory.clone())
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -340,9 +348,8 @@ impl Database {
 
     fn require_admin_cron_ddl(&self) -> Result<()> {
         if self.has_access_constraints_for_query() {
-            return Err(Error::Other(
-                "DDL requires an admin database handle".to_string(),
-            ));
+            return Err(Error::Other((
+                "DDL requires an admin database handle".to_string()).into()));
         }
         Ok(())
     }
@@ -399,7 +406,13 @@ impl Database {
                 && !shutdown.load(Ordering::SeqCst)
                 && !self.resource_closed.load(Ordering::SeqCst)
             {
-                let _ = self.dispatch_due_cron_schedules(false);
+                let _ = (|| -> Result<()> {
+                    let read_memory = self.declared_reader_memory()?;
+                    let mut vector_copy_owner =
+                        crate::vector_read_memory::admission(read_memory.clone());
+                    self.dispatch_due_cron_schedules(false, &mut vector_copy_owner, read_memory)?;
+                    Ok(())
+                })();
             }
             if shutdown.load(Ordering::SeqCst) || self.resource_closed.load(Ordering::SeqCst) {
                 break;
@@ -444,7 +457,12 @@ impl Database {
         }
     }
 
-    fn dispatch_due_cron_schedules(&self, manual: bool) -> Result<u64> {
+    fn dispatch_due_cron_schedules(
+        &self,
+        manual: bool,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<u64> {
         let reserved_runs = self.reserve_due_cron_runs()?;
         let mut successful_fires = 0u64;
         let mut fail_loud_error = None;
@@ -457,6 +475,8 @@ impl Database {
                 manual,
                 &mut successful_fires,
                 &mut fail_loud_error,
+                vector_copy_owner,
+                read_memory.clone(),
             );
             self.cron.running_schedules.lock().remove(&schedule_name);
             self.cron.waiters.notify_all();
@@ -529,6 +549,8 @@ impl Database {
         manual: bool,
         successful_fires: &mut u64,
         fail_loud_error: &mut Option<Error>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<()> {
         let schedule = run.schedule;
         let decision = run.decision;
@@ -569,7 +591,11 @@ impl Database {
         };
 
         for _ in 0..decision.fire_count {
-            match self.run_cron_callback_transaction(callback.clone()) {
+            match self.run_cron_callback_transaction(
+                callback.clone(),
+                vector_copy_owner,
+                read_memory.clone(),
+            ) {
                 Ok(lsn) => {
                     *successful_fires += 1;
                     if let Some(current) = self.cron.schedules.lock().get_mut(&schedule.name) {
@@ -589,179 +615,225 @@ impl Database {
         Ok(())
     }
 
-    fn run_cron_callback_transaction(&self, callback: CronCallback) -> Result<Lsn> {
-        let _callback_thread = self.cron.enter_callback_thread_scope();
-        let tx = self.begin_for_internal_write()?;
-        let mut pending_sink_events = Vec::new();
-        let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
-        let pending_trigger_active_guards =
-            std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
-        let mut committed_trigger_audit_entries = Vec::new();
-        // Cron callbacks are arbitrary user code and can stage vector writes
-        // while the tx manager's commit mutex is held. Acquire current vector
-        // schema refs before entering that mutex so DDL keeps the normal
-        // schema-gate -> commit-mutex lock order.
-        let mut vector_schema_guard =
-            Some(self.vector_schema_read_many(self.vector_store_schema_refs()));
-        let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
-        // Armed just before the durable apply; see `PublicationInterruptionWatch`
-        // in `database.rs`. A scheduled job's commit is durable the moment the
-        // manager applies it, and its sink events, trigger audits and commit
-        // event reach memory only afterwards -- so an unwind in between leaves
-        // this handle behind its own durable image, exactly as it does on the
-        // local and received doors, and it must stop serving until reopened.
-        let publication_watch =
-            std::cell::RefCell::new(None::<super::PublicationInterruptionWatch>);
-        let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
-            tx,
-            |reserved_lsn| {
-                let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
-                    let prior_lsn = slot.replace(Some(reserved_lsn));
-                    let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
-                    let this_db = self.identity();
-                    let prior_db = CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
-                    let gate_id = self.vector_schema_gate_id();
-                    let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
-                        .with(|gate_slot| gate_slot.replace(Some(gate_id)));
-                    let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
-                    let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)));
-                    if let Ok(Ok(())) = &result
-                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
-                    {
-                        result = Ok(Err(error));
-                    }
-                    if let Ok(Ok(())) = &result {
-                        match self.dispatch_triggers_for_tx(tx) {
-                            Ok(outcome) => {
-                                *pending_trigger_audits.borrow_mut() = outcome.pending;
-                                pending_trigger_active_guards
-                                    .borrow_mut()
-                                    .extend(outcome.active_guards);
-                            }
-                            Err(failure) => {
-                                let failure = *failure;
-                                pending_trigger_active_guards
-                                    .borrow_mut()
-                                    .extend(failure.active_guards);
-                                result = Ok(Err(failure.error));
+    fn run_cron_callback_transaction(
+        &self,
+        callback: CronCallback,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<Lsn> {
+        (|| {
+            let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
+
+            let _callback_thread = self.cron.enter_callback_thread_scope();
+            let tx = self.begin_for_internal_write()?;
+            let mut pending_sink_events = Vec::new();
+            let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+            let pending_trigger_active_guards =
+                std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
+            let mut committed_trigger_audit_entries = Vec::new();
+            // Cron callbacks are arbitrary user code and can stage vector writes
+            // while the tx manager's commit mutex is held. Acquire current vector
+            // schema refs before entering that mutex so DDL keeps the normal
+            // schema-gate -> commit-mutex lock order.
+            let mut vector_schema_guard = Some(self.vector_schema_read_many(
+                self.vector_store_schema_refs(&mut vector_copy_owner.borrow_mut())?,
+            ));
+            let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
+            // Armed just before the durable apply; see `PublicationInterruptionWatch`
+            // in `database.rs`. A scheduled job's commit is durable the moment the
+            // manager applies it, and its sink events, trigger audits and commit
+            // event reach memory only afterwards -- so an unwind in between leaves
+            // this handle behind its own durable image, exactly as it does on the
+            // local and received doors, and it must stop serving until reopened.
+            let publication_watch =
+                std::cell::RefCell::new(None::<super::PublicationInterruptionWatch>);
+            let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
+                tx,
+                read_memory.clone(),
+                |reserved_lsn| {
+                    let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
+                        let prior_lsn = slot.replace(Some(reserved_lsn));
+                        let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
+                        let this_db = self.identity();
+                        let prior_db =
+                            CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
+                        let gate_id = self.vector_schema_gate_id();
+                        let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                            .with(|gate_slot| gate_slot.replace(Some(gate_id)));
+                        let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
+                        let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)));
+                        if let Ok(Ok(())) = &result
+                            && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(
+                                tx,
+                                &mut vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            )
+                        {
+                            result = Ok(Err(error));
+                        }
+                        if let Ok(Ok(())) = &result {
+                            match self.dispatch_triggers_for_tx(
+                                tx,
+                                &mut vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            ) {
+                                Ok(outcome) => {
+                                    *pending_trigger_audits.borrow_mut() = outcome.pending;
+                                    pending_trigger_active_guards
+                                        .borrow_mut()
+                                        .extend(outcome.active_guards);
+                                }
+                                Err(failure) => {
+                                    let failure = *failure;
+                                    pending_trigger_active_guards
+                                        .borrow_mut()
+                                        .extend(failure.active_guards);
+                                    result = Ok(Err(failure.error));
+                                }
                             }
                         }
+                        if let Ok(Ok(())) = &result
+                            && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(
+                                tx,
+                                &mut vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            )
+                        {
+                            result = Ok(Err(error));
+                        }
+                        CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
+                        CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
+                        CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                            .with(|gate_slot| gate_slot.set(prior_gate));
+                        CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
+                        slot.replace(prior_lsn);
+                        result
+                    });
+                    match callback_result {
+                        Ok(result) => result,
+                        Err(payload) => Err(Error::Other((format!(
+                            "cron callback panicked: {}",
+                            panic_payload_to_string(payload)
+                        )).into())),
                     }
-                    if let Ok(Ok(())) = &result
-                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
-                    {
-                        result = Ok(Err(error));
+                },
+                |ws| {
+                    if !ws.is_empty() {
+                        debug_assert!(
+                            !Self::write_set_touches_vector_schema(ws)
+                                || vector_schema_guard.is_some()
+                        );
+                        self.rewrite_txid_placeholders(tx, ws)?;
+                        let _validation = self.commit_validate(
+                            tx,
+                            ws,
+                            &mut vector_copy_owner.borrow_mut(),
+                            read_memory.clone(),
+                        )?;
+                        self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
+                        let prepared_sink_events =
+                            self.prepare_sink_events_for_write_set(ws, read_memory.clone())?;
+                        if !prepared_sink_events.is_empty() {
+                            self.event_bus
+                                .ensure_queue_capacity(&prepared_sink_events)?;
+                        }
+                        if self.persistence.is_some() && !prepared_sink_events.is_empty() {
+                            ws.config_writes.push((
+                                super::event_bus::NEXT_ACTION_ID_CONFIG_KEY.to_string(),
+                                RedbPersistence::encode_config_value(
+                                    &self.event_bus.next_action_id(),
+                                )?,
+                            ));
+                        }
+                        if self.persistence.is_some()
+                            && let Some(lsn) = ws.commit_lsn
+                        {
+                            self.event_bus
+                                .stage_sink_events_for_persistence(lsn, prepared_sink_events);
+                        } else {
+                            pending_sink_events = prepared_sink_events;
+                        }
+                        if let Some(lsn) = ws.commit_lsn {
+                            let pending = pending_trigger_audits.borrow();
+                            committed_trigger_audit_entries =
+                                self.committed_trigger_audits_for_pending(&pending, ws, lsn);
+                            self.stage_trigger_audits_for_persistence(
+                                lsn,
+                                &committed_trigger_audit_entries,
+                            );
+                        }
+                        *delete_release_bytes.borrow_mut() = self
+                            .delete_release_bytes_for_write_set(
+                                ws,
+                                &mut vector_copy_owner.borrow_mut(),
+                                read_memory.clone(),
+                            )?;
                     }
-                    CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
-                    CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
-                    CRON_CALLBACK_VECTOR_SCHEMA_GATE.with(|gate_slot| gate_slot.set(prior_gate));
-                    CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
-                    slot.replace(prior_lsn);
-                    result
-                });
-                match callback_result {
-                    Ok(result) => result,
-                    Err(payload) => Err(Error::Other(format!(
-                        "cron callback panicked: {}",
-                        panic_payload_to_string(payload)
-                    ))),
-                }
-            },
-            |ws| {
-                if !ws.is_empty() {
-                    debug_assert!(
-                        !Self::write_set_touches_vector_schema(ws) || vector_schema_guard.is_some()
+                    *publication_watch.borrow_mut() = Some(
+                        super::PublicationInterruptionWatch::arm(&self.publication_interrupted),
                     );
-                    self.rewrite_txid_placeholders(tx, ws)?;
-                    let _validation = self.commit_validate(tx, ws)?;
-                    self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
-                    let prepared_sink_events = self.prepare_sink_events_for_write_set(ws)?;
-                    if !prepared_sink_events.is_empty() {
-                        self.event_bus
-                            .ensure_queue_capacity(&prepared_sink_events)?;
-                    }
-                    if self.persistence.is_some() && !prepared_sink_events.is_empty() {
-                        ws.config_writes.push((
-                            super::event_bus::NEXT_ACTION_ID_CONFIG_KEY.to_string(),
-                            RedbPersistence::encode_config_value(&self.event_bus.next_action_id())?,
-                        ));
-                    }
-                    if self.persistence.is_some()
-                        && let Some(lsn) = ws.commit_lsn
-                    {
-                        self.event_bus
-                            .stage_sink_events_for_persistence(lsn, prepared_sink_events);
-                    } else {
-                        pending_sink_events = prepared_sink_events;
-                    }
-                    if let Some(lsn) = ws.commit_lsn {
-                        let pending = pending_trigger_audits.borrow();
-                        committed_trigger_audit_entries =
-                            self.committed_trigger_audits_for_pending(&pending, ws, lsn);
-                        self.stage_trigger_audits_for_persistence(
+                    Ok(())
+                },
+            );
+
+            match result {
+                Ok((lsn, ws)) => {
+                    self.pending_commit_metadata.lock().remove(&tx);
+                    if !ws.is_empty() {
+                        #[cfg(test)]
+                        super::take_local_commit_stage_fault_for_test(
+                            super::LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
+                        );
+                        self.release_delete_allocations_from_bytes(&delete_release_bytes.borrow());
+                        drop(vector_schema_guard.take());
+                        self.plugin.post_commit(&ws, CommitSource::AutoCommit);
+                        let sink_events_to_publish = if self.persistence.is_some() {
+                            ws.commit_lsn
+                                .and_then(|lsn| {
+                                    self.event_bus.take_staged_sink_events_for_persistence(lsn)
+                                })
+                                .map(EventBusState::materialize_staged_sink_events)
+                                .unwrap_or_default()
+                        } else {
+                            pending_sink_events
+                        };
+                        self.publish_prepared_sink_events_to_memory(sink_events_to_publish);
+                        self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
+                        self.publish_commit_event_if_subscribers(
+                            &ws,
+                            CommitSource::AutoCommit,
                             lsn,
-                            &committed_trigger_audit_entries,
                         );
                     }
-                    *delete_release_bytes.borrow_mut() =
-                        self.delete_release_bytes_for_write_set(ws);
+                    if let Some(watch) = publication_watch.borrow_mut().take() {
+                        watch.completed();
+                    }
+                    Ok(lsn)
                 }
-                *publication_watch.borrow_mut() = Some(super::PublicationInterruptionWatch::arm(
-                    &self.publication_interrupted,
-                ));
-                Ok(())
-            },
-        );
-
-        match result {
-            Ok((lsn, ws)) => {
-                self.pending_commit_metadata.lock().remove(&tx);
-                if !ws.is_empty() {
-                    #[cfg(test)]
-                    super::take_local_commit_stage_fault_for_test(
-                        super::LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
-                    );
-                    self.release_delete_allocations_from_bytes(&delete_release_bytes.borrow());
-                    drop(vector_schema_guard.take());
-                    self.plugin.post_commit(&ws, CommitSource::AutoCommit);
-                    let sink_events_to_publish = if self.persistence.is_some() {
-                        ws.commit_lsn
-                            .and_then(|lsn| {
-                                self.event_bus.take_staged_sink_events_for_persistence(lsn)
-                            })
-                            .map(EventBusState::materialize_staged_sink_events)
-                            .unwrap_or_default()
+                Err(failure) => {
+                    if let Some(watch) = publication_watch.borrow_mut().take() {
+                        watch.completed();
+                    }
+                    // Owned no-host failure leaves source and journal installed.
+                    // Its paired rollback below validates them before cleanup.
+                    if matches!(&self.tx_mgr, super::DatabaseTransactionHost::Legacy(_)) {
+                        self.pending_commit_metadata.lock().remove(&tx);
+                    }
+                    if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
+                        let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                        self.discard_staged_trigger_audits_for_persistence(lsn);
+                    }
+                    if let Some(ws) = failure.write_set {
+                        let _ = self.release_insert_allocations(&ws, &mut vector_copy_owner.borrow_mut());
                     } else {
-                        pending_sink_events
-                    };
-                    self.publish_prepared_sink_events_to_memory(sink_events_to_publish);
-                    self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
-                    self.publish_commit_event_if_subscribers(&ws, CommitSource::AutoCommit, lsn);
+                        let _ = self.rollback_without_callback_tx_control(tx);
+                    }
+                    let pending = pending_trigger_audits.borrow();
+                    let _ = self.append_rolled_back_trigger_audits(&pending, tx, &failure.error);
+                    Err(failure.error)
                 }
-                if let Some(watch) = publication_watch.borrow_mut().take() {
-                    watch.completed();
-                }
-                Ok(lsn)
             }
-            Err(failure) => {
-                if let Some(watch) = publication_watch.borrow_mut().take() {
-                    watch.completed();
-                }
-                self.pending_commit_metadata.lock().remove(&tx);
-                if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
-                    let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
-                    self.discard_staged_trigger_audits_for_persistence(lsn);
-                }
-                if let Some(ws) = failure.write_set {
-                    self.release_insert_allocations(&ws);
-                } else {
-                    let _ = self.rollback_without_callback_tx_control(tx);
-                }
-                let pending = pending_trigger_audits.borrow();
-                self.append_rolled_back_trigger_audits(&pending, tx, &failure.error.to_string())?;
-                Err(failure.error)
-            }
-        }
+        })()
     }
 
     fn append_cron_audit(
@@ -795,7 +867,9 @@ impl Database {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        persistence.flush_config_value(CRON_SCHEDULES_CONFIG_KEY, &schedules)
+        self.publish_direct_metadata(|| {
+            persistence.flush_config_value(CRON_SCHEDULES_CONFIG_KEY, &schedules)
+        })
     }
 
     /// Encoded cron-schedule config for checkpoint export. DDL-declared
@@ -820,180 +894,1143 @@ impl Database {
             return Ok(());
         };
         let audit = self.cron.audit.lock().iter().cloned().collect::<Vec<_>>();
-        persistence.flush_config_value(CRON_AUDIT_CONFIG_KEY, &audit)
+        self.publish_direct_metadata(|| {
+            persistence.flush_config_value(CRON_AUDIT_CONFIG_KEY, &audit)
+        })
     }
 
     fn worker_handle_for_background(&self) -> Database {
-        Database {
-            id: super::DatabaseId::next(),
-            tx_mgr: self.tx_mgr.clone(),
-            relational_store: self.relational_store.clone(),
-            vector_serving_cache_bytes: self.vector_serving_cache_bytes.clone(),
-            graph_store: self.graph_store.clone(),
-            vector_store: self.vector_store.clone(),
-            vector_schema_gates: self.vector_schema_gates.clone(),
-            change_log: self.change_log.clone(),
-            change_log_table_index: self.change_log_table_index.clone(),
-            change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
-            ddl_log: self.ddl_log.clone(),
-            sync_tombstone_arrivals: self.sync_tombstone_arrivals.clone(),
-            sync_graph_arrivals: self.sync_graph_arrivals.clone(),
-            terminal_refusal_markers: self.terminal_refusal_markers.clone(),
-            terminal_refusal_scans: self.terminal_refusal_scans.clone(),
-            accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
-            sync_push_apply_locks: self.sync_push_apply_locks.clone(),
-            #[cfg(feature = "sync-orchestration")]
-            sync_client_push_locks: self.sync_client_push_locks.clone(),
-            received_schema_stages: self.received_schema_stages.clone(),
-            local_erasure_stages: self.local_erasure_stages.clone(),
-            received_arriving_table_meta: self.received_arriving_table_meta.clone(),
-            pending_local_schema_stages: self.pending_local_schema_stages.clone(),
-            local_schema_stages: self.local_schema_stages.clone(),
-            capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
-            detached_sync_write_set: self.detached_sync_write_set.clone(),
-            received_staging_access: self.received_staging_access.clone(),
-            received_vector_image_pending: self.received_vector_image_pending.clone(),
-            persistence: self.persistence.clone(),
-            committed_image_startup: self.committed_image_startup.clone(),
-            image_history: self.image_history.clone(),
-            retained_relational_source: self.retained_relational_source.clone(),
-            read_image_memory: self.read_image_memory.clone(),
-            blob_repository: self.blob_repository.clone(),
-            open_registry_path: Mutex::new(None),
-            operation_gate: self.operation_gate.clone(),
-            read_publication_gate: self.read_publication_gate.clone(),
-            schema_publication_gate: self.schema_publication_gate.clone(),
-            apply_phase_pause: self.apply_phase_pause.clone(),
-            sync_apply_pre_commit_pause: self.sync_apply_pre_commit_pause.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            received_schema_pre_commit_pause: self.received_schema_pre_commit_pause.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            received_schema_pre_publish_pause: self.received_schema_pre_publish_pause.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            received_schema_apply_observer: self.received_schema_apply_observer.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            local_schema_pre_commit_pause: self.local_schema_pre_commit_pause.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            local_schema_pre_publish_pause: self.local_schema_pre_publish_pause.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            local_schema_between_publication_pause: self
-                .local_schema_between_publication_pause
-                .clone(),
-            export_after_capture_pause: self.export_after_capture_pause.clone(),
-            relational: MemRelationalExecutor::new(
-                self.relational_store.clone(),
-                self.tx_mgr.clone(),
-            ),
-            graph: MemGraphExecutor::new(self.graph_store.clone(), self.tx_mgr.clone()),
-            vector: MemVectorExecutor::new_with_accountant(
-                self.vector_store.clone(),
-                self.tx_mgr.clone(),
-                Arc::new(OnceLock::new()),
-                self.accountant.clone(),
-            ),
-            image_store_file_bytes: None,
-            session_tx: Arc::new(Mutex::new(None)),
-            origin_session_tx: None,
-            instance_id: self.instance_id,
-            owner_thread: self.owner_thread,
-            plugin: self.plugin.clone(),
-            owner_read_config: self.owner_read_config.clone(),
-            owner_read_service: None,
-            owner_read_startup_failure: None,
-            #[cfg(feature = "test-seams")]
-            route_observer: None,
-            #[cfg(feature = "test-seams")]
-            kernel_observer: None,
-            #[cfg(feature = "test-seams")]
-            snapshot_free_retirement_pass_count: self.snapshot_free_retirement_pass_count.clone(),
-            access: AccessConstraints::default(),
-            accountant: self.accountant.clone(),
-            conflict_policies: RwLock::new(self.conflict_policies.read().clone()),
-            subscriptions: self.subscriptions.clone(),
-            pruning_runtime: Mutex::new(PruningRuntime::new()),
-            pruning_guard: self.pruning_guard.clone(),
-            retention_sync_peer: self.retention_sync_peer.clone(),
-            in_memory_destination_reuploads: self.in_memory_destination_reuploads.clone(),
-            lineage_state_lock: self.lineage_state_lock.clone(),
-            received_schema_manifest_lock: self.received_schema_manifest_lock.clone(),
-            in_memory_received_schema_manifests: self.in_memory_received_schema_manifests.clone(),
-            in_memory_table_generations: self.in_memory_table_generations.clone(),
-            in_memory_ddl_generations: self.in_memory_ddl_generations.clone(),
-            received_ddl_arrivals: self.received_ddl_arrivals.clone(),
-            superseded_ddl_occurrences: self.superseded_ddl_occurrences.clone(),
-            cron: self.cron.clone(),
-            event_bus: self.event_bus.clone(),
-            trigger: self.trigger.clone(),
-            sync_relay_mode: self.sync_relay_mode.clone(),
-            in_memory_sync_progress: self.in_memory_sync_progress.clone(),
-            in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
-            sync_incarnations: self.sync_incarnations.clone(),
-            // Derived handles share the authenticated runtime.
-            custody_runtime: self.custody_runtime.clone(),
-            custody_cache: self.custody_cache.clone(),
-            custody_metadata: self.custody_metadata.clone(),
-            pending_event_bus_ddl: Mutex::new(HashMap::new()),
-            pending_commit_metadata: Mutex::new(HashMap::new()),
-            limit_update_lock: self.limit_update_lock.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            maintenance_poll_interval_update_pause: self
-                .maintenance_poll_interval_update_pause
-                .clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            maintenance_poll_interval_update_probe: self
-                .maintenance_poll_interval_update_probe
-                .clone(),
-            disk_limit: Arc::clone(&self.disk_limit),
-            disk_limit_startup_ceiling: Arc::clone(&self.disk_limit_startup_ceiling),
-            trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
-            snapshot_registry: self.snapshot_registry.clone(),
-            vector_partition_snapshot_stages: self.vector_partition_snapshot_stages.clone(),
-            retention_deferred_edge_nodes: self.retention_deferred_edge_nodes.clone(),
-            maintenance_caller_driven: self.maintenance_caller_driven.clone(),
-            maintenance_poll_interval_ms: self.maintenance_poll_interval_ms.clone(),
-            last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
-            caller_driven_backlog_warned_at: self.caller_driven_backlog_warned_at.clone(),
-            last_auto_compact_at: self.last_auto_compact_at.clone(),
-            auto_compact_min_interval: self.auto_compact_min_interval.clone(),
-            sync_watermark: self.sync_watermark.clone(),
-            closed: AtomicBool::new(false),
-            close_progress: Arc::new(Mutex::new(CloseProgress::Idle)),
-            close_changed: Arc::new(Condvar::new()),
-            close_error: Mutex::new(None),
-            #[cfg(feature = "test-seams")]
-            close_follower_observer: Mutex::new(None),
-            resource_closed: self.resource_closed.clone(),
-            publication_interrupted: self.publication_interrupted.clone(),
-            rows_examined: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-seams"))]
-            candidate_rows_materialized: self.candidate_rows_materialized.clone(),
-            last_vector_search_used_hnsw: Arc::clone(&self.last_vector_search_used_hnsw),
-            last_vector_search_trace: Arc::clone(&self.last_vector_search_trace),
-            statement_cache: RwLock::new(HashMap::new()),
-            // The same cache, not a copy of it: a formula registered after this
-            // handle was derived is one this handle must still find.
-            rank_formula_cache: Arc::clone(&self.rank_formula_cache),
-            acl_grant_cache: RwLock::new(HashMap::new()),
-            rank_policy_eval_count: AtomicU64::new(0),
-            rank_policy_formula_parse_count: AtomicU64::new(0),
-            fk_indexed_tuple_probes: AtomicU64::new(0),
-            fk_full_scan_fallbacks: AtomicU64::new(0),
-            commit_rows_validated: AtomicU64::new(0),
-            commit_indexed_probes: AtomicU64::new(0),
-            commit_staged_vs_staged_comparisons: AtomicU64::new(0),
-            commit_scan_rows_touched: AtomicU64::new(0),
-            commit_index_maintenance_visits: AtomicU64::new(0),
-            #[cfg(feature = "test-seams")]
-            commit_stage_wall_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
-            corrupt_joined_values: RwLock::new(self.corrupt_joined_values.read().clone()),
-            resource_owner: false,
-            // A background worker is the store's own machinery: it lives as
-            // long as the process, so the store must never wait for it.
-            handle_role: super::HandleRole::Internal,
-            trigger_deadlock_timeout_override: Mutex::new(
-                *self.trigger_deadlock_timeout_override.lock(),
-            ),
-            finalization: Arc::clone(&self.finalization),
+        {
+            let mut storage = std::mem::MaybeUninit::<super::Database>::uninit();
+            let mut construction = super::DatabaseConstruction {
+                source: storage.as_mut_ptr(),
+                initialized: [false; 138],
+            };
+            // Every initializer is evaluated in its original order. A field is
+            // marked only after the write; an unwinding initializer never makes
+            // uninitialized storage eligible for cleanup.
+            unsafe {
+                {
+                    std::ptr::addr_of_mut!((*construction.source).id)
+                        .write(super::DatabaseId::next());
+                    construction.initialized[0] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(0);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).declared_read_memory)
+                        .write(self.declared_read_memory.clone());
+                    construction.initialized[54] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(54);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).tx_mgr)
+                        .write(self.tx_mgr.clone());
+                    construction.initialized[1] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(1);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).relational_store)
+                        .write(self.relational_store.clone());
+                    construction.initialized[2] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(2);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).vector_serving_cache_bytes)
+                        .write(self.vector_serving_cache_bytes.clone());
+                    construction.initialized[101] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(101);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).graph_store)
+                        .write(self.graph_store.clone());
+                    construction.initialized[3] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(3);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).vector_store)
+                        .write(self.vector_store.clone());
+                    construction.initialized[4] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(4);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).vector_schema_gates)
+                        .write(self.vector_schema_gates.clone());
+                    construction.initialized[5] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(5);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).change_log)
+                        .write(self.change_log.clone());
+                    construction.initialized[6] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(6);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).forced_change_log_gap_through)
+                        .write(self.forced_change_log_gap_through.clone());
+                    construction.initialized[7] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(7);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).change_log_table_index)
+                        .write(self.change_log_table_index.clone());
+                    construction.initialized[8] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(8);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).change_log_lsn_refcounts)
+                        .write(self.change_log_lsn_refcounts.clone());
+                    construction.initialized[9] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(9);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).ddl_log)
+                        .write(self.ddl_log.clone());
+                    construction.initialized[10] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(10);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_tombstone_arrivals)
+                        .write(self.sync_tombstone_arrivals.clone());
+                    construction.initialized[11] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(11);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_graph_arrivals)
+                        .write(self.sync_graph_arrivals.clone());
+                    construction.initialized[12] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(12);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).terminal_refusal_markers)
+                        .write(self.terminal_refusal_markers.clone());
+                    construction.initialized[13] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(13);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).terminal_refusal_scans)
+                        .write(self.terminal_refusal_scans.clone());
+                    construction.initialized[14] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(14);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).accepted_sync_row_authors)
+                        .write(self.accepted_sync_row_authors.clone());
+                    construction.initialized[15] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(15);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_push_apply_locks)
+                        .write(self.sync_push_apply_locks.clone());
+                    construction.initialized[70] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(70);
+                }
+                #[cfg(feature = "sync-orchestration")]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_client_push_locks)
+                        .write(self.sync_client_push_locks.clone());
+                    construction.initialized[71] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(71);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_schema_stages)
+                        .write(self.received_schema_stages.clone());
+                    construction.initialized[16] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(16);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).local_erasure_stages)
+                        .write(self.local_erasure_stages.clone());
+                    construction.initialized[17] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(17);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_arriving_table_meta)
+                        .write(self.received_arriving_table_meta.clone());
+                    construction.initialized[18] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(18);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).pending_local_schema_stages)
+                        .write(self.pending_local_schema_stages.clone());
+                    construction.initialized[19] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(19);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).local_schema_stages)
+                        .write(self.local_schema_stages.clone());
+                    construction.initialized[20] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(20);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).capture_detached_sync_write_set)
+                        .write(self.capture_detached_sync_write_set.clone());
+                    construction.initialized[21] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(21);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).detached_sync_write_set)
+                        .write(self.detached_sync_write_set.clone());
+                    construction.initialized[22] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(22);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_staging_access)
+                        .write(self.received_staging_access.clone());
+                    construction.initialized[23] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(23);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_vector_image_pending)
+                        .write(self.received_vector_image_pending.clone());
+                    construction.initialized[24] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(24);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).persistence)
+                        .write(self.persistence.clone());
+                    construction.initialized[25] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(25);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).commit_source_reference_charge)
+                        .write(self.commit_source_reference_charge);
+                    construction.initialized[26] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(26);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).committed_image_startup)
+                        .write(self.committed_image_startup.clone());
+                    construction.initialized[27] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(27);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).image_history)
+                        .write(self.image_history.clone());
+                    construction.initialized[28] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(28);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).retained_relational_source)
+                        .write(self.retained_relational_source.clone());
+                    construction.initialized[29] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(29);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).read_image_memory)
+                        .write(self.read_image_memory.clone());
+                    construction.initialized[134] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(134);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).blob_repository)
+                        .write(self.blob_repository.clone());
+                    construction.initialized[30] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(30);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).open_registry_path)
+                        .write(Mutex::new(None));
+                    construction.initialized[31] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(31);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).operation_gate)
+                        .write(self.operation_gate.clone());
+                    construction.initialized[32] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(32);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).read_publication_gate)
+                        .write(self.read_publication_gate.clone());
+                    construction.initialized[33] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(33);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).schema_publication_gate)
+                        .write(self.schema_publication_gate.clone());
+                    construction.initialized[34] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(34);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).apply_phase_pause)
+                        .write(self.apply_phase_pause.clone());
+                    construction.initialized[35] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(35);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_apply_pre_commit_pause)
+                        .write(self.sync_apply_pre_commit_pause.clone());
+                    construction.initialized[36] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(36);
+                }
+                {
+                    std::ptr::addr_of_mut!((*construction.source).retained_graph_source)
+                        .write(self.retained_graph_source.clone());
+                    construction.initialized[136] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(136);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_schema_pre_commit_pause)
+                        .write(self.received_schema_pre_commit_pause.clone());
+                    construction.initialized[37] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(37);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).received_schema_pre_publish_pause
+                    )
+                    .write(self.received_schema_pre_publish_pause.clone());
+                    construction.initialized[38] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(38);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_schema_apply_observer)
+                        .write(self.received_schema_apply_observer.clone());
+                    construction.initialized[39] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(39);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).local_schema_pre_commit_pause)
+                        .write(self.local_schema_pre_commit_pause.clone());
+                    construction.initialized[40] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(40);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).local_schema_pre_publish_pause)
+                        .write(self.local_schema_pre_publish_pause.clone());
+                    construction.initialized[41] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(41);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).local_schema_between_publication_pause
+                    )
+                    .write(self.local_schema_between_publication_pause.clone());
+                    construction.initialized[42] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(42);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).export_after_capture_pause)
+                        .write(self.export_after_capture_pause.clone());
+                    construction.initialized[43] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(43);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).relational).write(
+                        self.tx_mgr
+                            .relational_executor(self.relational_store.clone())
+                            .with_staged_posting_admission(Arc::<
+                                super::writer_read::WriterStagedPostingAdmission,
+                            >::clone(
+                                &self.finalization.staged_posting_admission,
+                            )),
+                    );
+                    construction.initialized[44] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(44);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).graph)
+                        .write(self.tx_mgr.graph_executor(self.graph_store.clone()));
+                    construction.initialized[45] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(45);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).vector).write(
+                        self.tx_mgr.vector_executor(
+                            self.vector_store.clone(),
+                            Arc::new(OnceLock::new()),
+                            Arc::clone(&self.finalization.vector_accountant),
+                        ),
+                    );
+                    construction.initialized[46] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(46);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).image_store_file_bytes)
+                        .write(None);
+                    construction.initialized[47] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(47);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).session_tx)
+                        .write(Arc::new(Mutex::new(None)));
+                    construction.initialized[48] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(48);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).origin_session_tx).write(None);
+                    construction.initialized[49] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(49);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).instance_id)
+                        .write(self.instance_id);
+                    construction.initialized[50] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(50);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).owner_thread)
+                        .write(self.owner_thread);
+                    construction.initialized[51] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(51);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).plugin)
+                        .write(self.plugin.clone());
+                    construction.initialized[52] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(52);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).owner_read_config)
+                        .write(self.owner_read_config.clone());
+                    construction.initialized[53] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(53);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).owner_read_service).write(None);
+                    construction.initialized[55] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(55);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).owner_read_startup_failure)
+                        .write(None);
+                    construction.initialized[56] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(56);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).route_observer).write(None);
+                    construction.initialized[57] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(57);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).kernel_observer).write(None);
+                    construction.initialized[58] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(58);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).snapshot_free_retirement_pass_count
+                    )
+                    .write(self.snapshot_free_retirement_pass_count.clone());
+                    construction.initialized[59] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(59);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).access)
+                        .write(AccessConstraints::default());
+                    construction.initialized[60] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(60);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).accountant)
+                        .write(self.accountant.clone());
+                    construction.initialized[61] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(61);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).conflict_policies)
+                        .write(RwLock::new(self.conflict_policies.read().clone()));
+                    construction.initialized[62] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(62);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).subscriptions)
+                        .write(self.subscriptions.clone());
+                    construction.initialized[63] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(63);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).pruning_runtime)
+                        .write(Mutex::new(PruningRuntime::new()));
+                    construction.initialized[64] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(64);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).pruning_guard)
+                        .write(self.pruning_guard.clone());
+                    construction.initialized[65] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(65);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).retention_sync_peer)
+                        .write(self.retention_sync_peer.clone());
+                    construction.initialized[66] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(66);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).in_memory_destination_reuploads)
+                        .write(self.in_memory_destination_reuploads.clone());
+                    construction.initialized[67] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(67);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).lineage_state_lock)
+                        .write(self.lineage_state_lock.clone());
+                    construction.initialized[68] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(68);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_schema_manifest_lock)
+                        .write(self.received_schema_manifest_lock.clone());
+                    construction.initialized[69] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(69);
+                }
+
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).in_memory_received_schema_manifests
+                    )
+                    .write(self.in_memory_received_schema_manifests.clone());
+                    construction.initialized[72] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(72);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).in_memory_table_generations)
+                        .write(self.in_memory_table_generations.clone());
+                    construction.initialized[73] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(73);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).in_memory_ddl_generations)
+                        .write(self.in_memory_ddl_generations.clone());
+                    construction.initialized[74] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(74);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).received_ddl_arrivals)
+                        .write(self.received_ddl_arrivals.clone());
+                    construction.initialized[75] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(75);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).superseded_ddl_occurrences)
+                        .write(self.superseded_ddl_occurrences.clone());
+                    construction.initialized[76] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(76);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).cron).write(self.cron.clone());
+                    construction.initialized[77] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(77);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).event_bus)
+                        .write(self.event_bus.clone());
+                    construction.initialized[78] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(78);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).trigger)
+                        .write(self.trigger.clone());
+                    construction.initialized[79] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(79);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_relay_mode)
+                        .write(self.sync_relay_mode.clone());
+                    construction.initialized[81] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(81);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).in_memory_sync_progress)
+                        .write(self.in_memory_sync_progress.clone());
+                    construction.initialized[82] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(82);
+                }
+
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).in_memory_applied_push_watermarks
+                    )
+                    .write(self.in_memory_applied_push_watermarks.clone());
+                    construction.initialized[83] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(83);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_incarnations)
+                        .write(self.sync_incarnations.clone());
+                    construction.initialized[84] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(84);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).custody_runtime)
+                        .write(self.custody_runtime.clone());
+                    construction.initialized[85] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(85);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).custody_cache)
+                        .write(self.custody_cache.clone());
+                    construction.initialized[86] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(86);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).custody_metadata)
+                        .write(self.custody_metadata.clone());
+                    construction.initialized[87] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(87);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).pending_event_bus_ddl)
+                        .write(Mutex::new(HashMap::new()));
+                    construction.initialized[88] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(88);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).pending_commit_metadata)
+                        .write(Mutex::new(HashMap::new()));
+                    construction.initialized[89] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(89);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).limit_update_lock)
+                        .write(self.limit_update_lock.clone());
+                    construction.initialized[90] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(90);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).maintenance_poll_interval_update_pause
+                    )
+                    .write(self.maintenance_poll_interval_update_pause.clone());
+                    construction.initialized[91] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(91);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).maintenance_poll_interval_update_probe
+                    )
+                    .write(self.maintenance_poll_interval_update_probe.clone());
+                    construction.initialized[92] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(92);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).disk_limit)
+                        .write(Arc::clone(&self.disk_limit));
+                    construction.initialized[93] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(93);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).disk_limit_startup_ceiling)
+                        .write(Arc::clone(&self.disk_limit_startup_ceiling));
+                    construction.initialized[94] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(94);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).trigger_audit_retention_secs)
+                        .write(self.trigger_audit_retention_secs.clone());
+                    construction.initialized[95] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(95);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).snapshot_registry)
+                        .write(self.snapshot_registry.clone());
+                    construction.initialized[96] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(96);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).vector_partition_snapshot_stages)
+                        .write(self.vector_partition_snapshot_stages.clone());
+                    construction.initialized[97] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(97);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).retention_deferred_edge_nodes)
+                        .write(self.retention_deferred_edge_nodes.clone());
+                    construction.initialized[98] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(98);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).maintenance_caller_driven)
+                        .write(self.maintenance_caller_driven.clone());
+                    construction.initialized[99] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(99);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).maintenance_poll_interval_ms)
+                        .write(self.maintenance_poll_interval_ms.clone());
+                    construction.initialized[100] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(100);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).last_maintenance_cycle_at)
+                        .write(self.last_maintenance_cycle_at.clone());
+                    construction.initialized[102] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(102);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).caller_driven_backlog_warned_at)
+                        .write(self.caller_driven_backlog_warned_at.clone());
+                    construction.initialized[103] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(103);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).last_auto_compact_at)
+                        .write(self.last_auto_compact_at.clone());
+                    construction.initialized[104] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(104);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).storage_compaction_policy)
+                        .write(self.storage_compaction_policy.clone());
+                    construction.initialized[105] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(105);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).sync_watermark)
+                        .write(self.sync_watermark.clone());
+                    construction.initialized[106] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(106);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).closed)
+                        .write(AtomicBool::new(false));
+                    construction.initialized[107] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(107);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).close_progress)
+                        .write(Arc::new(Mutex::new(CloseProgress::Idle)));
+                    construction.initialized[108] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(108);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).close_changed)
+                        .write(Arc::new(Condvar::new()));
+                    construction.initialized[109] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(109);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).close_error)
+                        .write(Mutex::new(None));
+                    construction.initialized[110] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(110);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).close_follower_observer)
+                        .write(Mutex::new(None));
+                    construction.initialized[111] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(111);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).resource_closed)
+                        .write(self.resource_closed.clone());
+                    construction.initialized[112] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(112);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).publication_interrupted)
+                        .write(self.publication_interrupted.clone());
+                    construction.initialized[113] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(113);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).rows_examined)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[114] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(114);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).candidate_rows_materialized)
+                        .write(self.candidate_rows_materialized.clone());
+                    construction.initialized[115] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(115);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).last_vector_search_used_hnsw)
+                        .write(Arc::clone(&self.last_vector_search_used_hnsw));
+                    construction.initialized[116] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(116);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).last_vector_search_trace)
+                        .write(Arc::clone(&self.last_vector_search_trace));
+                    construction.initialized[117] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(117);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).statement_cache)
+                        .write(RwLock::new(HashMap::new()));
+                    construction.initialized[118] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(118);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).rank_formula_cache)
+                        .write(Arc::clone(&self.rank_formula_cache));
+                    construction.initialized[119] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(119);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).acl_grant_cache)
+                        .write(RwLock::new(super::gate::AdmittedAclGrantCache::new()));
+                    construction.initialized[120] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(120);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).rank_policy_eval_count)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[121] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(121);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).rank_policy_formula_parse_count)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[122] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(122);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).fk_indexed_tuple_probes)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[123] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(123);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).fk_full_scan_fallbacks)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[124] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(124);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).commit_rows_validated)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[125] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(125);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).commit_indexed_probes)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[126] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(126);
+                }
+
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).commit_staged_vs_staged_comparisons
+                    )
+                    .write(AtomicU64::new(0));
+                    construction.initialized[127] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(127);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).commit_scan_rows_touched)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[128] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(128);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).commit_index_maintenance_visits)
+                        .write(AtomicU64::new(0));
+                    construction.initialized[129] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(129);
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    std::ptr::addr_of_mut!((*construction.source).commit_stage_wall_nanos)
+                        .write(std::array::from_fn(|_| AtomicU64::new(0)));
+                    construction.initialized[130] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(130);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).corrupt_joined_values)
+                        .write(RwLock::new(self.corrupt_joined_values.read().clone()));
+                    construction.initialized[131] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(131);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).resource_owner).write(false);
+                    construction.initialized[132] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(132);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).handle_role)
+                        .write(super::HandleRole::Internal);
+                    construction.initialized[133] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(133);
+                }
+
+                {
+                    std::ptr::addr_of_mut!(
+                        (*construction.source).trigger_deadlock_timeout_override
+                    )
+                    .write(Mutex::new(*self.trigger_deadlock_timeout_override.lock()));
+                    construction.initialized[80] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(80);
+                }
+
+                {
+                    std::ptr::addr_of_mut!((*construction.source).finalization)
+                        .write(Arc::clone(&self.finalization));
+                    construction.initialized[135] = true;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    super::r1_database_field_for_test(135);
+                }
+            }
+            construction.initialized.fill(false);
+            unsafe { storage.assume_init() }
         }
     }
 }
@@ -1129,8 +2166,139 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
 
+    /// Every hand-built `Database` (the cron worker handle here, and the two
+    /// initializers in `database.rs`) must write each declared field exactly
+    /// once and under exactly the cfg gate the field is declared with. A field
+    /// that exists in a build but is skipped by an initializer is left
+    /// uninitialized behind `assume_init`, which is undefined behaviour: in
+    /// plain `cargo test` the cron worker handle used to segfault this way.
+    /// This check reads the sources so the mismatch fails here, by name,
+    /// instead of crashing whichever test first drops the handle.
+    fn assert_every_hand_built_database_writes_each_field_under_its_declared_gate() {
+        fn gate_before(lines: &[&str], index: usize) -> Option<String> {
+            index
+                .checked_sub(1)
+                .map(|previous| lines[previous].trim())
+                .filter(|previous| previous.starts_with("#[cfg("))
+                .map(str::to_string)
+        }
+        fn declared_fields(source: &str) -> Vec<(String, Option<String>)> {
+            let lines: Vec<&str> = source.lines().collect();
+            let start = lines
+                .iter()
+                .position(|line| *line == "pub struct Database {")
+                .expect("the Database declaration");
+            let mut fields = Vec::new();
+            for (offset, line) in lines[start + 1..].iter().enumerate() {
+                if *line == "}" {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with('#') {
+                    continue;
+                }
+                let declaration = trimmed
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| trimmed.strip_prefix("pub(super) "))
+                    .or_else(|| trimmed.strip_prefix("pub "))
+                    .unwrap_or(trimmed);
+                let Some((name, rest)) = declaration.split_once(':') else {
+                    continue;
+                };
+                if !rest.starts_with(':')
+                    && !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    let mut index = start + 1 + offset;
+                    let mut gate = None;
+                    while index > start + 1 {
+                        let previous = lines[index - 1].trim();
+                        if previous.starts_with("#[cfg(") {
+                            gate = Some(previous.to_string());
+                            break;
+                        }
+                        if !(previous.starts_with("#[") || previous.starts_with("//")) {
+                            break;
+                        }
+                        index -= 1;
+                    }
+                    fields.push((name.to_string(), gate));
+                }
+            }
+            fields
+        }
+        fn written_fields(source: &str, anchor: &str) -> Vec<Vec<(String, Option<String>)>> {
+            const MARK: &str = "(*construction.source).";
+            let lines: Vec<&str> = source.lines().collect();
+            let mut sites = Vec::new();
+            for start in (0..lines.len()).filter(|index| lines[*index].trim() == anchor) {
+                let mut writes = Vec::new();
+                for index in start..lines.len() {
+                    if lines[index].contains("assume_init") {
+                        break;
+                    }
+                    let Some(at) = lines[index].find(MARK) else {
+                        continue;
+                    };
+                    let name: String = lines[index][at + MARK.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    let opener = (start..=index)
+                        .rev()
+                        .find(|candidate| lines[*candidate].trim() == "{")
+                        .expect("each field write sits in its own block");
+                    writes.push((name, gate_before(&lines, opener)));
+                }
+                sites.push(writes);
+            }
+            sites
+        }
+        let database = include_str!("../database.rs");
+        let declared = declared_fields(database);
+        assert!(declared.len() > 100, "parsed the Database declaration");
+        let mut sites = written_fields(
+            include_str!("cron.rs"),
+            "let mut construction = super::DatabaseConstruction {",
+        );
+        sites.extend(written_fields(
+            database,
+            "let mut construction = DatabaseConstruction {",
+        ));
+        assert_eq!(sites.len(), 3, "the three hand-built Database initializers");
+        for (site, writes) in sites.iter().enumerate() {
+            let mut mismatches = Vec::new();
+            for (field, gate) in &declared {
+                let found: Vec<_> = writes.iter().filter(|(name, _)| name == field).collect();
+                match found.as_slice() {
+                    [(_, written)] if written == gate => {}
+                    [] => mismatches.push(format!("{field}: never written")),
+                    [(_, written)] => mismatches.push(format!(
+                        "{field}: declared under {gate:?} but written under {written:?}"
+                    )),
+                    _ => mismatches.push(format!("{field}: written {} times", found.len())),
+                }
+            }
+            for (name, _) in writes {
+                if !declared.iter().any(|(field, _)| field == name) {
+                    mismatches.push(format!("{name}: written but not declared"));
+                }
+            }
+            assert!(
+                mismatches.is_empty(),
+                "hand-built Database initializer #{site} disagrees with the declaration:\n{}",
+                mismatches.join("\n")
+            );
+        }
+    }
+
     #[test]
     fn paused_manual_cron_guard_drop_does_not_restart_tickler() -> Result<()> {
+        // This test's background handle is one of the hand-built initializers;
+        // a skipped field there is undefined behaviour, so check them first.
+        assert_every_hand_built_database_writes_each_field_under_its_declared_gate();
         let db = Database::open_memory();
         let first_pause = db.pause_cron_tickler_for_test();
         let second_pause = db.pause_cron_tickler_for_test();
@@ -1192,7 +2360,17 @@ mod tests {
             ))
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = db.run_cron_callback_transaction(callback);
+            let fixture_operation_reader_1 = db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+            let mut fixture_operation_copy_1 =
+                contextdb_engine::vector_read_memory::admission(fixture_operation_reader_1.clone());
+
+            let _ = db.run_cron_callback_transaction(
+                callback,
+                &mut fixture_operation_copy_1,
+                fixture_operation_reader_1.clone(),
+            );
         }));
         let fired = LOCAL_COMMIT_STAGE_FAULT.with(|fault| fault.get().is_none());
         LOCAL_COMMIT_STAGE_FAULT.with(|fault| fault.set(None));

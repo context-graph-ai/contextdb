@@ -18,8 +18,10 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         Statement::Select(_)
         | Statement::ShowMemoryLimit
         | Statement::ShowDiskLimit
+        | Statement::ShowContentSize
         | Statement::ShowMaintenancePollInterval
         | Statement::ShowVectorServingCache
+        | Statement::ShowStorageCompaction
         | Statement::ShowSyncConflictPolicy
         | Statement::ShowVectorIndexes
         | Statement::ShowTenantTablePolicy { .. }
@@ -47,6 +49,7 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         | Statement::SetDiskLimit(_)
         | Statement::SetMaintenancePollInterval(_)
         | Statement::SetVectorServingCache(_)
+        | Statement::SetStorageCompaction(_)
         | Statement::CreateSchedule { .. }
         | Statement::DropSchedule { .. }
         | Statement::CreateTrigger { .. }
@@ -110,8 +113,11 @@ fn expr_contains_vector_subquery(expr: &crate::Expr) -> bool {
             expr_contains_vector_subquery(expr) || expr_contains_vector_subquery(pattern)
         }
         Expr::Row(elements) => elements.iter().any(expr_contains_vector_subquery),
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::RowVectorSource { .. } => {
-            false
-        }
+        Expr::RowNumber(_)
+        | Expr::WindowRank(_)
+        | Expr::Column(_)
+        | Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::RowVectorSource { .. } => false,
     }
 }

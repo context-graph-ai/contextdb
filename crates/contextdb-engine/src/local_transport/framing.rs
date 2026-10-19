@@ -1,11 +1,12 @@
+use super::query_funding::{Funded, FundedVec};
 use super::engine_answer::{BodyField, ReadChannelError, body_grammar};
 use super::{
     LOCAL_PROTOCOL_MARKER, LOCAL_PROTOCOL_VERSION, LocalTransportError, MAX_FRAME_BYTES,
     frame_read_refusal, invalid_channel_data, response_decode_refusal,
 };
-use crate::read_contract::{decode_cursor_page, decode_metadata_page};
+use crate::read_contract::decode_metadata_page;
 use bincode::config::standard;
-use bincode::serde::{decode_from_slice, encode_to_vec};
+use bincode::serde::encode_to_vec;
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, MetadataPageVocabulary, OwnerReadLimits, OwnerReadStatus,
     OwnerServiceTimeouts, ReadFailure, ReadLimits, WriterRunNumber,
@@ -34,7 +35,10 @@ pub enum PayloadViolation {
     /// name the number they would have to raise.
     MemoryCeilingExceeded {
         ceiling: u64,
+        required: Option<u64>,
     },
+    /// The linked JSON configuration cannot produce an admitted native tree.
+    /// This is an engine refusal with static taxonomy, not malformed bytes.
     TrailingBytes,
 }
 
@@ -181,6 +185,9 @@ pub enum LocalMetadataRequest {
         continuation: Option<String>,
     },
     MaintenanceStatus,
+    VerifyHistory {
+        table: String,
+    },
     DeliveryStatus {
         root_table: String,
         continuation: Option<String>,
@@ -238,12 +245,28 @@ pub enum LocalRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultChunk {
+    #[serde(deserialize_with = "deserialize_result_bytes")]
     pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSuccess {
+    #[serde(deserialize_with = "deserialize_result_bytes")]
     pub final_bytes: Vec<u8>,
+}
+
+// The admitted binary decoder knows the byte count before allocating. Use
+// its exact scalar-vector admission rather than the generic Vec growth
+// allowance, which charges four bytes for every byte in a full result frame.
+fn deserialize_result_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    if crate::read_image_memory::active_owner().is_ok() {
+        crate::read_image_memory::deserialize_exact_vec(deserializer, false)
+    } else {
+        // Preserve ordinary serde use outside a scoped engine decode.
+        Vec::<u8>::deserialize(deserializer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +494,11 @@ pub enum LocalResponse {
     CancelApplied {
         request_ordinal: u64,
     },
+    /// A cancelled fetch publishes only the work that actually ran. The
+    /// cursor remains open and the client still receives ReadCancelled.
+    CursorCancelled {
+        page: CursorPageResponse,
+    },
 }
 
 /// An engine answer, carried in the read channel's own vocabulary.
@@ -517,10 +545,38 @@ impl LocalEngineFailure {
         decode_message_under_memory_ceiling::<ReadChannelError>(&self.document, memory_ceiling)
             .map(contextdb_core::Error::from)
             .unwrap_or_else(|_| {
-                contextdb_core::Error::Other(
-                    "the owner's engine answer did not arrive in a readable shape".to_owned(),
-                )
+                contextdb_core::Error::Other((
+                    "the owner's engine answer did not arrive in a readable shape".to_owned()).into())
             })
+    }
+
+    pub(crate) fn from_query_error(
+        error: &contextdb_core::Error,
+        owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<Funded<Self>> {
+        let document = super::engine_answer::encode_query_error_funded(error, owner)?;
+        Ok(Funded { value: Self { document: document.value }, credit: document.credit })
+    }
+
+    /// Private ordinary-query conversion. It never constructs a decoder root
+    /// and never charges already-funded document bytes as a new input copy.
+    pub(crate) fn decode_query_error(
+        &self,
+        memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>, ceiling: u64,
+    ) -> contextdb_core::Result<Funded<contextdb_core::Error>> {
+        preflight_read_channel_error(&self.document, ceiling)
+            .map_err(|error| match error {
+                LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { .. }) =>
+                    contextdb_core::Error::ReadFailure(super::memory_ceiling_read_failure(ceiling, None)),
+                _ => contextdb_core::Error::Other(
+                    "the owner's engine answer did not arrive in a readable shape".into()),
+            })?;
+        let document = super::query_funding::decode::<ReadChannelError>(&self.document, memory)?;
+        let mut converted = super::engine_answer::convert_query_error(document, memory)?;
+        // Both original decoded fields and conversion outputs remain charged
+        // on the same root through the actual public error handoff.
+        if let Some(credit) = converted.credit.take() { credit.transfer(); }
+        Ok(converted)
     }
 
     /// The class this answer travels as, for tests that pin the wire.
@@ -658,7 +714,9 @@ const fn payload_answer_budget(
 fn answer_payload_mut(response: &mut LocalResponse) -> Option<&mut Vec<u8>> {
     match response {
         LocalResponse::CursorOpened { opened } => Some(&mut opened.payload),
-        LocalResponse::CursorPage { page } => Some(&mut page.payload),
+        LocalResponse::CursorPage { page } | LocalResponse::CursorCancelled { page } => {
+            Some(&mut page.payload)
+        }
         LocalResponse::Metadata { metadata } => Some(&mut metadata.payload),
         LocalResponse::Explain { payload } => Some(payload),
         _ => None,
@@ -680,6 +738,8 @@ const fn ends_the_exchange(response: &LocalResponse) -> bool {
 #[derive(Debug)]
 pub struct LocalProtocolBoundary {
     effective_limits: ReadLimits,
+    cursor_receive_memory: Option<u64>,
+    query_funding: std::sync::Mutex<Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>>,
     ordinary_bytes: std::sync::Mutex<OrdinaryBoundaryBytes>,
     payload_assembly: std::sync::Mutex<PayloadAssemblyBytes>,
 }
@@ -688,9 +748,39 @@ impl LocalProtocolBoundary {
     pub fn with_effective_limits(effective_limits: ReadLimits) -> Self {
         Self {
             effective_limits,
+            cursor_receive_memory: None,
+            query_funding: std::sync::Mutex::new(None),
             ordinary_bytes: std::sync::Mutex::new(OrdinaryBoundaryBytes::default()),
             payload_assembly: std::sync::Mutex::new(PayloadAssemblyBytes::default()),
         }
+    }
+
+    /// Private headroom from the cursor's existing retention owner. This
+    /// never changes the request envelope or the owner's execution limits.
+    pub(crate) fn with_cursor_receive_memory(mut self, memory: Option<u64>) -> Self {
+        self.cursor_receive_memory = memory;
+        self
+    }
+
+    pub(crate) fn cursor_frame_allowance(&self) -> Result<Option<u64>, LocalTransportError> {
+        let Some(memory) = self.cursor_receive_memory else {
+            return Ok(None);
+        };
+        let held = self
+            .payload_assembly
+            .lock()
+            .map_err(|_| invalid_channel_data())?
+            .inbound
+            .capacity() as u64;
+        Ok(Some(memory.saturating_sub(held)))
+    }
+
+    pub(crate) fn query_funding(&self) -> Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        self.query_funding.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn set_query_funding(&self, owner: Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>) {
+        *self.query_funding.lock().unwrap_or_else(|p| p.into_inner()) = owner;
     }
 
     pub const fn effective_limits(&self) -> ReadLimits {
@@ -700,10 +790,16 @@ impl LocalProtocolBoundary {
     /// Validate and encode one complete length-prefixed message. Successful
     /// response payloads are decoded and structurally validated here before
     /// the containing response can be emitted.
-    pub fn encode_frame(
+    pub fn encode_frame(&self, message: LocalOutboundMessage<'_>)
+        -> Result<Vec<u8>, LocalTransportError>
+    {
+        self.encode_frame_funded(message).map(Funded::into_public)
+    }
+
+    pub(crate) fn encode_frame_funded(
         &self,
         message: LocalOutboundMessage<'_>,
-    ) -> Result<Vec<u8>, LocalTransportError> {
+    ) -> Result<Funded<Vec<u8>>, LocalTransportError> {
         let ordinary_response = match message {
             LocalOutboundMessage::Response {
                 response,
@@ -715,10 +811,10 @@ impl LocalProtocolBoundary {
         };
         let encoded = (|| {
             let payload = match message {
-                LocalOutboundMessage::Handshake(handshake) => encode_message(handshake)?,
+                LocalOutboundMessage::Handshake(handshake) => crate::read_contract::encode_transport_funded(handshake, self.query_funding(), self.effective_limits.memory).map_err(transport_decode_error)?,
                 LocalOutboundMessage::Request(request) => {
                     validate_request(request)?;
-                    encode_message(request)?
+                    crate::read_contract::encode_request_funded(request, self.query_funding(), self.effective_limits.memory).map_err(transport_decode_error)?
                 }
                 LocalOutboundMessage::Response {
                     response,
@@ -726,10 +822,10 @@ impl LocalProtocolBoundary {
                 } => {
                     let position = self.note_outbound_answer_frame(response, expectation);
                     validate_response(response, expectation, self.effective_limits, position)?;
-                    encode_message(response)?
+                    crate::read_contract::encode_transport_funded(response, self.query_funding(), self.effective_limits.memory).map_err(transport_decode_error)?
                 }
             };
-            frame_length_prefix(payload.len())?;
+            let prefix = frame_length_prefix(payload.value.len())?;
             if let Some((response, expectation)) = ordinary_response {
                 self.admit_ordinary_response(
                     response,
@@ -737,7 +833,13 @@ impl LocalProtocolBoundary {
                     OrdinaryBoundaryDirection::Outbound,
                 )?;
             }
-            encode_payload_frame(&payload)
+            Funded::allocate(self.query_funding(), payload.value.len() + 4, || {
+                let mut frame = Vec::with_capacity(payload.value.len() + 4);
+                frame.extend_from_slice(&prefix);
+                frame.extend_from_slice(&payload.value);
+                frame
+            }).map_err(|error| transport_decode_error(
+                crate::read_contract::encoding_error_from_core(error, self.effective_limits.memory)))
         })();
         if encoded.is_err() {
             if ordinary_response.is_some() {
@@ -764,8 +866,12 @@ impl LocalProtocolBoundary {
             LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)
         );
         let received = (|| {
-            let payload =
-                read_payload_with_admission(reader, allocator).map_err(frame_read_refusal)?;
+            let payload = read_payload_with_memory_admission(
+                reader,
+                allocator,
+                self.cursor_frame_allowance()?,
+            )
+            .map_err(frame_read_refusal)?;
             self.decode_payload(kind, &payload).map_err(|error| {
                 if response_frame {
                     response_decode_refusal(error)
@@ -796,7 +902,9 @@ impl LocalProtocolBoundary {
         reader: &mut dyn FrameReader,
         allocator: &mut dyn FrameBufferAllocator,
     ) -> Result<LocalInboundMessage, LocalTransportError> {
-        let payload = read_payload_with_admission(reader, allocator).map_err(frame_read_refusal)?;
+        let payload =
+            read_payload_with_memory_admission(reader, allocator, self.cursor_frame_allowance()?)
+                .map_err(frame_read_refusal)?;
         self.decode_payload(kind, &payload)
     }
 
@@ -859,18 +967,50 @@ impl LocalProtocolBoundary {
                 Ok(LocalInboundMessage::Request(request))
             }
             LocalInboundKind::Response(expectation) => {
-                let memory_ceiling = self.effective_limits.memory;
+                let memory_ceiling = self
+                    .cursor_frame_allowance()?
+                    .map_or(self.effective_limits.memory, |available| {
+                        available.saturating_sub(payload.len() as u64)
+                    });
                 let continued = self.answer_assembly_in_flight();
                 preflight_response(payload, &expectation, memory_ceiling, continued)?;
-                let response: LocalResponse = if continued {
-                    decode_preflighted_message(payload)?
-                } else {
-                    decode_message_under_memory_ceiling(payload, memory_ceiling)?
-                };
+                let response: LocalResponse = decode_preflighted_message(payload, memory_ceiling)?;
                 // The frame ceiling stops here: an answer that arrived in
                 // pieces is whole again before anything validates or reads it.
-                let (response, position) = self.assemble_inbound_answer(response, &expectation)?;
-                validate_response(&response, &expectation, self.effective_limits, position)?;
+                let (response, position) =
+                    self.assemble_inbound_answer(response, &expectation, payload.len())?;
+                let mut validation_limits = self.effective_limits;
+                if let Some(memory) = self.cursor_receive_memory {
+                    let cursor_payload = match &response {
+                        LocalResponse::CursorOpened { opened } => Some(opened.payload.as_slice()),
+                        LocalResponse::CursorPage { page }
+                        | LocalResponse::CursorCancelled { page } => Some(page.payload.as_slice()),
+                        _ => None,
+                    };
+                    if let Some(bytes) = cursor_payload {
+                        validation_limits.memory = memory
+                            .saturating_sub(payload.len() as u64)
+                            .saturating_sub(bytes.len() as u64);
+                        preflight_observed_cursor_page_payload(
+                            bytes,
+                            memory
+                                .saturating_sub(payload.len() as u64)
+                                .saturating_sub(bytes.len() as u64),
+                        )
+                        .map_err(|error| match error {
+                            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                                ceiling,
+                            } => LocalTransportError::Payload(
+                                PayloadViolation::MemoryCeilingExceeded {
+                                    ceiling,
+                                    required: None,
+                                },
+                            ),
+                            _ => invalid_channel_data(),
+                        })?;
+                    }
+                }
+                validate_response(&response, &expectation, validation_limits, position)?;
                 self.admit_ordinary_response(
                     &response,
                     &expectation,
@@ -879,6 +1019,32 @@ impl LocalProtocolBoundary {
                 Ok(LocalInboundMessage::Response(response))
             }
         }
+    }
+
+    pub(crate) fn decode_query_request(
+        &self, payload: &[u8],
+        memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<Funded<LocalRequestEnvelope>, LocalTransportError> {
+        preflight_request(payload, self.effective_limits.memory)?;
+        let request = super::query_funding::decode::<LocalRequestEnvelope>(payload, memory)
+            .map_err(|error| transport_decode_error(crate::read_contract::encoding_error_from_core(
+                error, self.effective_limits.memory)))?;
+        validate_request(&request.value)?;
+        Ok(request)
+    }
+
+    pub(crate) fn decode_query_response(
+        &self, payload: &[u8],
+        memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<Funded<LocalResponse>, LocalTransportError> {
+        let expectation = LocalResponseExpectation::OrdinaryResult;
+        preflight_response(payload, &expectation, self.effective_limits.memory, false)?;
+        let response = super::query_funding::decode::<LocalResponse>(payload, memory)
+            .map_err(|error| transport_decode_error(crate::read_contract::encoding_error_from_core(
+                error, self.effective_limits.memory)))?;
+        validate_response(&response.value, &expectation, self.effective_limits, PayloadPosition::Whole)?;
+        self.admit_ordinary_response(&response.value, &expectation, OrdinaryBoundaryDirection::Inbound)?;
+        Ok(response)
     }
 
     fn admit_ordinary_response(
@@ -1004,6 +1170,7 @@ impl LocalProtocolBoundary {
         &self,
         mut response: LocalResponse,
         expectation: &LocalResponseExpectation,
+        wire_bytes: usize,
     ) -> Result<(LocalResponse, PayloadPosition), LocalTransportError> {
         let Some(budget) = payload_answer_budget(expectation, self.effective_limits) else {
             return Ok((response, PayloadPosition::Whole));
@@ -1022,7 +1189,21 @@ impl LocalProtocolBoundary {
                 tracked.inbound = Vec::new();
                 return Err(invalid_channel_data());
             }
-            tracked.inbound.extend_from_slice(&chunk.bytes);
+            if let Some(memory) = self.cursor_receive_memory {
+                admit_cursor_assembly(
+                    memory,
+                    wire_bytes,
+                    tracked.inbound.capacity(),
+                    chunk.bytes.capacity(),
+                    total as usize,
+                )?;
+                let mut whole = Vec::with_capacity(total as usize);
+                whole.extend_from_slice(&tracked.inbound);
+                whole.extend_from_slice(&chunk.bytes);
+                tracked.inbound = whole;
+            } else {
+                tracked.inbound.extend_from_slice(&chunk.bytes);
+            }
             return Ok((response, PayloadPosition::AnswerFrame { earlier_bytes }));
         }
         if !ends_the_exchange(&response) {
@@ -1033,7 +1214,24 @@ impl LocalProtocolBoundary {
             return Ok((response, PayloadPosition::Whole));
         }
         if let Some(slot) = answer_payload_mut(&mut response) {
-            let mut whole = earlier;
+            let mut whole = if let Some(memory) = self.cursor_receive_memory {
+                let total = earlier
+                    .len()
+                    .checked_add(slot.len())
+                    .ok_or_else(invalid_channel_data)?;
+                admit_cursor_assembly(
+                    memory,
+                    wire_bytes,
+                    earlier.capacity(),
+                    slot.capacity(),
+                    total,
+                )?;
+                let mut whole = Vec::with_capacity(total);
+                whole.extend_from_slice(&earlier);
+                whole
+            } else {
+                earlier
+            };
             whole.extend_from_slice(slot);
             if u64::try_from(whole.len()).map_err(|_| invalid_channel_data())? > budget {
                 return Err(invalid_channel_data());
@@ -1042,6 +1240,28 @@ impl LocalProtocolBoundary {
         }
         Ok((response, PayloadPosition::Whole))
     }
+}
+
+fn admit_cursor_assembly(
+    memory: u64,
+    wire: usize,
+    earlier: usize,
+    fragment: usize,
+    whole: usize,
+) -> Result<(), LocalTransportError> {
+    let bytes = wire
+        .checked_add(earlier)
+        .and_then(|n| n.checked_add(fragment))
+        .and_then(|n| n.checked_add(whole));
+    if bytes.is_none_or(|bytes| bytes as u64 > memory) {
+        return Err(LocalTransportError::Payload(
+            PayloadViolation::MemoryCeilingExceeded {
+                ceiling: memory,
+                required: bytes.map(|bytes| bytes as u64),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// A received ordinary reply cannot be rendered until its terminal success
@@ -1179,41 +1399,23 @@ fn canonical_bytes_identity(bytes: &[u8]) -> CanonicalBytesIdentity {
     }
 }
 
-/// An upper bound on the number of nodes the decoded form of this JSON text
-/// can hold. Every value in a JSON document is either the whole document or
-/// sits immediately after an opening bracket, a comma, or a colon, so counting
-/// those bytes cannot undercount the tree. Text that only looks like structure
-/// — those bytes inside a quoted string — inflates the count, which charges
-/// more than the decode will use and never less.
-fn json_node_ceiling(text: &[u8]) -> usize {
-    let mut nodes = 1_usize;
-    for byte in text {
-        if matches!(byte, b'[' | b'{' | b',' | b':') {
-            nodes = nodes.saturating_add(1);
-        }
-    }
-    nodes
-}
-
 /// Executable canonical grammar that walks the assembled result bytes without
 /// allocating anything: every nested container length is bounded by the bytes
-/// that remain, and the native allocation each length would claim is charged
-/// against the effective memory ceiling. A hostile or truncated assembly is
-/// refused here, before the deserializer is asked to build one container.
+/// that remain. Native buffers and JSON parser allocations are admitted by
+/// the shared scoped decoder; a cumulative wire-shape count cannot describe
+/// their live peak or the lifetime of temporary serialized JSON strings.
 struct CanonicalAllocationPreflight<'a> {
     bytes: &'a [u8],
     offset: usize,
     charged_bytes: u64,
-    memory_ceiling: u64,
 }
 
 impl<'a> CanonicalAllocationPreflight<'a> {
-    const fn new(bytes: &'a [u8], memory_ceiling: u64) -> Self {
+    const fn new(bytes: &'a [u8], _memory_ceiling: u64) -> Self {
         Self {
             bytes,
             offset: 0,
             charged_bytes: 0,
-            memory_ceiling,
         }
     }
 
@@ -1321,16 +1523,6 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             .checked_mul(element_bytes)
             .and_then(|bytes| self.charged_bytes.checked_add(bytes))
             .ok_or(crate::read_contract::ReadEncodingError::InvalidPayload)?;
-        if claimed > self.memory_ceiling {
-            // A payload that is exactly what it claims to be and simply too
-            // large to hold inside the ceiling in force is a budget answer,
-            // not unreadable content.
-            return Err(
-                crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
-                    ceiling: self.memory_ceiling,
-                },
-            );
-        }
         self.charged_bytes = claimed;
         Ok(())
     }
@@ -1351,18 +1543,14 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             .map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
     }
 
-    /// A JSON value travels as text and decodes into a tree of nodes plus
-    /// copies of the text it holds. Both are charged from the text itself,
-    /// before the tree is built.
+    /// Validate the serialized string only. Native JSON payload and parser
+    /// scratch are admitted incrementally by the shared core builder.
     fn json_text(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         let text = self.byte_vector()?;
         if std::str::from_utf8(text).is_err() {
             return Self::malformed();
         }
-        let nodes = json_node_ceiling(text);
-        let text_length = text.len();
-        self.charge::<serde_json::Value>(nodes)?;
-        self.charge::<u8>(text_length)
+        Ok(())
     }
 
     fn strings(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
@@ -1437,6 +1625,16 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         if self.option()? {
             self.u64()?;
         }
+        // effective_auto_index_at, auto_index_at_source
+        self.u64()?;
+        self.string()?;
+        // effective_flat_below, flat_below_source
+        self.u64()?;
+        self.string()?;
+        // effective_search_radius_millionths, search_radius_source
+        self.u64()?;
+        self.string()?;
+        // effective_auto_expansion_ceiling, auto_expansion_ceiling_source
         self.u64()?;
         self.string()?;
         self.strings()?;
@@ -1474,7 +1672,9 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             self.string()?;
             self.u64()?;
         }
-        for _ in 0..4 {
+        // global_candidate_budget, admission_evaluations,
+        // expansion_evaluations, rescore_evaluations, layers_admitted
+        for _ in 0..5 {
             if self.option()? {
                 self.u64()?;
             }
@@ -1525,9 +1725,26 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             if lists > self.remaining() {
                 return Self::malformed();
             }
+            self.charge::<Vec<(String, bool)>>(lists)?;
             for _ in 0..lists {
                 self.maintained_count_columns()?;
             }
+        }
+        let groups = self.length()?;
+        if groups > self.remaining() {
+            return Self::malformed();
+        }
+        // Three counters, the owned key, and a full word for the route tag
+        // conservatively cover the decoded group without importing storage.
+        self.charge::<(u64, String, u64, u64, u64)>(groups)?;
+        for _ in 0..groups {
+            // Keep the serde wire order of GroupDisclosure: ordinal precedes
+            // the rendered partition key, then the counters and route.
+            self.u64()?;
+            self.string()?;
+            self.u64()?;
+            self.u64()?;
+            self.enumeration(1)?;
         }
         Ok(())
     }
@@ -1546,29 +1763,107 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
-    fn query_result(mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
+    fn observed_cursor_page(&mut self) -> Result<u64, crate::read_contract::ReadEncodingError> {
+        self.charge::<crate::read_contract::cursor_observation::CanonicalObservedCursorPage>(1)?;
+        let columns = self.length()?;
+        if columns > self.remaining() {
+            return Self::malformed();
+        }
+        self.charge::<String>(columns)?;
+        for _ in 0..columns {
+            self.string()?;
+        }
+        let rows = self.length()?;
+        if rows > self.remaining() {
+            return Self::malformed();
+        }
+        if rows != 0 {
+            self.charge::<u8>(crate::owned_cursor_page::SharedRows::allocation_header_bytes())?;
+        }
+        self.charge::<Vec<Value>>(rows)?;
+        for _ in 0..rows {
+            let values = self.length()?;
+            if values != columns || values > self.remaining() {
+                return Self::malformed();
+            }
+            self.charge::<Value>(values)?;
+            for _ in 0..values {
+                self.value()?;
+            }
+        }
+        self.boolean()?;
+        let before_trace = self.charged_bytes;
+        self.query_trace()?;
+        if self.offset != self.bytes.len() {
+            return Self::malformed();
+        }
+        Ok(self.charged_bytes - before_trace)
+    }
+
+    fn query_result(&mut self) -> Result<u64, crate::read_contract::ReadEncodingError> {
         self.charge::<crate::read_contract::CanonicalQueryResult>(1)?;
         self.strings()?;
         self.rows()?;
         self.u64()?;
+        let before_trace = self.charged_bytes;
         self.query_trace()?;
+        let trace_bytes = self.charged_bytes - before_trace;
         if self.option()? {
             self.strings()?;
         }
         if self.offset != self.bytes.len() {
             return Self::malformed();
         }
-        Ok(())
+        Ok(trace_bytes)
     }
 }
 
 #[derive(Debug)]
 pub struct OrdinaryResultReceiver {
-    chunks: Vec<Vec<u8>>,
+    chunks: FundedVec<Funded<Vec<u8>>>,
     buffered_bytes: usize,
     byte_limit: u64,
     memory_ceiling: u64,
     state: Option<ResultReceiveState>,
+    receiving_memory: Option<std::sync::Arc<crate::read_image_memory::ImageMemory>>,
+}
+
+pub(crate) struct FundedOrdinaryResult {
+    pub(crate) bytes: Funded<Vec<u8>>,
+    pub(crate) terminal: Funded<TerminalSuccess>,
+}
+
+pub(crate) enum FundedResultReceiveOutcome {
+    Pending,
+    Published(FundedOrdinaryResult),
+    Failed(Funded<contextdb_core::read_contract::ReadFailure>),
+    EngineFailed(Funded<LocalEngineFailure>),
+    Disconnected,
+}
+
+pub(crate) fn split_canonical_result_funded(
+    bytes: &[u8],
+    owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory_ceiling: u64,
+) -> Result<Funded<Vec<LocalResponse>>, LocalTransportError> {
+    let capacity = MAX_FRAME_BYTES - 6;
+    let count = bytes.len().saturating_sub(1) / capacity + 1;
+    let invoice = count.checked_mul(std::mem::size_of::<LocalResponse>())
+        .and_then(|n| n.checked_add(bytes.len())).ok_or_else(invalid_channel_data)?;
+    Funded::allocate(Some(owner), invoice, || {
+        let mut responses = Vec::with_capacity(count);
+        let mut remainder = bytes;
+        while remainder.len() > capacity {
+            let (chunk, rest) = remainder.split_at(capacity);
+            responses.push(LocalResponse::ResultChunk { chunk: ResultChunk { bytes: chunk.to_vec() } });
+            remainder = rest;
+        }
+        responses.push(LocalResponse::TerminalSuccess {
+            success: TerminalSuccess { final_bytes: remainder.to_vec() },
+        });
+        responses
+    }).map_err(|error| transport_decode_error(
+        crate::read_contract::encoding_error_from_core(error, memory_ceiling)))
 }
 
 /// Split route-neutral canonical bytes into result envelopes whose complete
@@ -1664,13 +1959,24 @@ impl OrdinaryResultReceiver {
         Ok(receiver)
     }
 
+    pub(crate) fn with_receiving_memory(
+        byte_limit: u64,
+        memory_ceiling: u64,
+        receiving_memory: std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<Self, LocalTransportError> {
+        let mut receiver = Self::with_effective_ceilings(byte_limit, memory_ceiling)?;
+        receiver.receiving_memory = Some(receiving_memory);
+        Ok(receiver)
+    }
+
     pub fn new() -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: FundedVec::default(),
             buffered_bytes: 0,
             byte_limit: ReadLimits::SHIPPED_RESULT_BYTES,
             memory_ceiling: ReadLimits::SHIPPED_MEMORY,
             state: Some(ResultReceiveState::Receiving),
+            receiving_memory: None,
         }
     }
 
@@ -1679,11 +1985,12 @@ impl OrdinaryResultReceiver {
             return Err(invalid_channel_data());
         }
         Ok(Self {
-            chunks: Vec::new(),
+            chunks: FundedVec::default(),
             buffered_bytes: 0,
             byte_limit,
             memory_ceiling: ReadLimits::SHIPPED_MEMORY,
             state: Some(ResultReceiveState::Receiving),
+            receiving_memory: None,
         })
     }
 
@@ -1767,7 +2074,9 @@ impl OrdinaryResultReceiver {
         bytes: &[u8],
         memory_ceiling: u64,
     ) -> Result<(), crate::read_contract::ReadEncodingError> {
-        let admitted = CanonicalAllocationPreflight::new(bytes, memory_ceiling).query_result();
+        let admitted = CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+            .query_result()
+            .map(|_| ());
         #[cfg(feature = "test-seams")]
         Self::observe_canonical_preflight_for_test(bytes, memory_ceiling, admitted.is_ok());
         admitted
@@ -1929,14 +2238,46 @@ impl OrdinaryResultReceiver {
         }
     }
 
-    pub fn receive(
+    pub(crate) fn with_query_memory(
+        byte_limit: u64, memory_ceiling: u64,
+        memory: std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    ) -> Result<Self, LocalTransportError> {
+        let mut receiver = Self::with_receiving_memory(byte_limit, memory_ceiling, memory.clone())?;
+        receiver.chunks = FundedVec::new(Some(memory));
+        Ok(receiver)
+    }
+
+    pub fn receive(&mut self, response: LocalResponse)
+        -> Result<ResultReceiveOutcome, LocalTransportError>
+    {
+        Ok(match self.receive_funded(Funded::external(response))? {
+            FundedResultReceiveOutcome::Pending => ResultReceiveOutcome::Pending,
+            FundedResultReceiveOutcome::Published(result) => {
+                ResultReceiveOutcome::Published(AssembledOrdinaryResult {
+                    bytes: result.bytes.into_public(), terminal: result.terminal.into_public(),
+                })
+            }
+            FundedResultReceiveOutcome::Failed(failure) => ResultReceiveOutcome::Failed(failure.into_public()),
+            FundedResultReceiveOutcome::EngineFailed(failure) => ResultReceiveOutcome::EngineFailed(failure.into_public()),
+            FundedResultReceiveOutcome::Disconnected => ResultReceiveOutcome::Disconnected,
+        })
+    }
+
+    pub(crate) fn receive_funded(
         &mut self,
-        response: LocalResponse,
-    ) -> Result<ResultReceiveOutcome, LocalTransportError> {
+        response: Funded<LocalResponse>,
+    ) -> Result<FundedResultReceiveOutcome, LocalTransportError> {
         if self.state() != ResultReceiveState::Receiving {
             return Err(invalid_channel_data());
         }
-        match response {
+        if let Some(owner) = self.chunks.owner() {
+            let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(owner);
+            if !response.credit.as_ref().is_some_and(|credit| credit.is_funded_by(&owner)) {
+                self.discard_buffered();
+                return Err(invalid_channel_data());
+            }
+        }
+        match response.value {
             LocalResponse::ResultChunk { chunk } => {
                 if chunk.bytes.len() > MAX_FRAME_BYTES {
                     self.discard_buffered();
@@ -1949,35 +2290,81 @@ impl OrdinaryResultReceiver {
                         return Err(error);
                     }
                 };
-                self.chunks.push(chunk.bytes);
+                let chunk = Funded { value: chunk.bytes, credit: response.credit };
+                if let Err(error) = self.chunks.push(chunk) {
+                    self.discard_buffered();
+                    return Err(transport_decode_error(crate::read_contract::encoding_error_from_core(
+                        error, self.memory_ceiling)));
+                }
                 self.buffered_bytes = new_total;
-                Ok(ResultReceiveOutcome::Pending)
+                Ok(FundedResultReceiveOutcome::Pending)
             }
             LocalResponse::TerminalSuccess { success } => {
-                if success.final_bytes.len() > MAX_FRAME_BYTES {
+                let success = Funded { value: success, credit: response.credit };
+                if success.value.final_bytes.len() > MAX_FRAME_BYTES {
                     self.discard_buffered();
                     return Err(invalid_channel_data());
                 }
-                let final_length = match self.admit_bytes(success.final_bytes.len()) {
+                let final_length = match self.admit_bytes(success.value.final_bytes.len()) {
                     Ok(total) => total,
                     Err(error) => {
                         self.discard_buffered();
                         return Err(error);
                     }
                 };
-                let mut bytes = Vec::with_capacity(final_length);
-                for chunk in std::mem::take(&mut self.chunks) {
-                    bytes.extend_from_slice(&chunk);
+                let owner = self.chunks.owner();
+                let mut bytes = match Funded::allocate(owner.clone(), final_length,
+                    || Vec::with_capacity(final_length)) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.discard_buffered();
+                        return Err(transport_decode_error(crate::read_contract::encoding_error_from_core(
+                            error, self.memory_ceiling)));
+                    }
+                };
+                let chunks = std::mem::take(&mut self.chunks);
+                for chunk in &chunks.values {
+                    bytes.value.extend_from_slice(&chunk.value);
                 }
-                bytes.extend_from_slice(&success.final_bytes);
+                bytes.value.extend_from_slice(&success.value.final_bytes);
+                // All copied source allocations die before their invoices.
+                drop(chunks);
                 self.buffered_bytes = 0;
                 // Only an assembly that survives the allocation-free walk and
                 // then decodes as one exact canonical result is published; the
                 // decoded value itself is released here, because the caller is
                 // handed the assembled bytes.
-                let admitted = Self::preflight_canonical_result(&bytes, self.memory_ceiling)
+                let admitted = Self::preflight_canonical_result(&bytes.value, self.memory_ceiling)
                     .and_then(|()| {
-                        Self::decode_preflighted_canonical_result(&bytes, self.memory_ceiling)
+                        if let Some(memory) = self.receiving_memory.as_ref().filter(|_| owner.is_some()) {
+                            #[cfg(feature = "test-seams")]
+                            Self::authorize_canonical_decode_for_test(&bytes.value, self.memory_ceiling);
+                            let decoded = crate::read_contract::decode_query_result_funded(
+                                &bytes.value, memory, self.memory_ceiling)?;
+                            drop(decoded);
+                            Ok(())
+                        } else if let Some(memory) = self.receiving_memory.as_ref() {
+                            #[cfg(feature = "test-seams")]
+                            Self::authorize_canonical_decode_for_test(&bytes.value, self.memory_ceiling);
+                            let validation = memory.row_owner().map_err(|error| {
+                                crate::read_contract::encoding_error_from_core(
+                                    error,
+                                    self.memory_ceiling,
+                                )
+                            })?;
+                            let decoded = crate::read_contract::decode_query_result_with_memory(
+                                &bytes.value,
+                                &validation,
+                                self.memory_ceiling,
+                            )?;
+                            // Destroy the temporary tree before its row owner refunds.
+                            drop(decoded);
+                            drop(validation);
+                            Ok(())
+                        } else {
+                            Self::decode_preflighted_canonical_result(&bytes.value, self.memory_ceiling)
+                                .map(drop)
+                        }
                     })
                     .map(|_decoded| ());
                 if let Err(error) = admitted {
@@ -1988,8 +2375,10 @@ impl OrdinaryResultReceiver {
                         } => {
                             LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
                                 ceiling,
+                                required: None,
                             })
                         }
+
                         _ => invalid_channel_data(),
                     });
                 }
@@ -1998,18 +2387,18 @@ impl OrdinaryResultReceiver {
                 self.state = Some(ResultReceiveState::Published);
                 #[cfg(feature = "test-seams")]
                 Self::observe_canonical_assembly_for_test();
-                Ok(ResultReceiveOutcome::Published(AssembledOrdinaryResult {
+                Ok(FundedResultReceiveOutcome::Published(FundedOrdinaryResult {
                     bytes,
                     terminal: success,
                 }))
             }
             LocalResponse::Failure { failure } => {
                 self.discard_buffered();
-                Ok(ResultReceiveOutcome::Failed(failure))
+                Ok(FundedResultReceiveOutcome::Failed(Funded { value: failure, credit: response.credit }))
             }
             LocalResponse::EngineFailure { failure } => {
                 self.discard_buffered();
-                Ok(ResultReceiveOutcome::EngineFailed(failure))
+                Ok(FundedResultReceiveOutcome::EngineFailed(Funded { value: failure, credit: response.credit }))
             }
             _ => {
                 self.discard_buffered();
@@ -2047,16 +2436,6 @@ pub(crate) fn response_is_encodable(response: &LocalResponse) -> Result<(), Loca
     Ok(())
 }
 
-/// The decoder's own limit counts the bytes it reads off the wire, and it
-/// counts each integer field at its fixed width rather than the shorter
-/// variable-length form actually consumed: one maximal result chunk claims
-/// twelve units for a six-byte envelope. Stated in those units, this backstop
-/// admits any payload the four-mebibyte wire ceiling already admits, at the
-/// decoder's worst-case eight units per wire byte. It bounds wire reads only.
-/// What the decoded form costs in live memory is bounded before this point, by
-/// the allocation-free preflight below.
-const DECODE_WIRE_CLAIM_CEILING: usize = MAX_FRAME_BYTES * 8;
-
 /// Decode one complete bincode-standard payload and reject trailing bytes.
 /// The decoded footprint is charged against the shipped memory ceiling; a
 /// caller holding narrower or wider effective limits decodes through
@@ -2074,7 +2453,18 @@ pub(crate) fn decode_message_under_memory_ceiling<T: serde::de::DeserializeOwned
     memory_ceiling: u64,
 ) -> Result<T, LocalTransportError> {
     preflight_known_message::<T>(bytes, memory_ceiling)?;
-    decode_preflighted_message(bytes)
+    decode_preflighted_message(bytes, memory_ceiling)
+}
+
+/// Decode a bounded blob refusal through the existing read-channel grammar.
+pub(crate) fn decode_read_error_under_memory_ceiling(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<contextdb_core::Error, LocalTransportError> {
+    if bytes.len() > super::engine_answer::BLOB_SOURCE_REFUSAL_MAX_BYTES {
+        return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
+    }
+    decode_message_under_memory_ceiling::<ReadChannelError>(bytes, memory_ceiling).map(Into::into)
 }
 
 /// Decode a payload whose structural preflight has already run, with the
@@ -2085,16 +2475,29 @@ pub(crate) fn decode_message_under_memory_ceiling<T: serde::de::DeserializeOwned
 /// undo that.
 fn decode_preflighted_message<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
+    memory_ceiling: u64,
 ) -> Result<T, LocalTransportError> {
-    let configuration = standard().with_limit::<DECODE_WIRE_CLAIM_CEILING>();
-    let (value, consumed) = decode_from_slice(bytes, configuration)
-        .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
-    if consumed != bytes.len() {
-        return Err(LocalTransportError::Payload(
-            PayloadViolation::TrailingBytes,
-        ));
+    let memory = crate::read_contract::decoder_memory(memory_ceiling).map_err(|error| {
+        transport_decode_error(crate::read_contract::encoding_error_from_core(
+            error,
+            memory_ceiling,
+        ))
+    })?;
+    crate::read_contract::decode_exact_with_memory(bytes, &memory, memory_ceiling)
+        .map_err(transport_decode_error)
+}
+
+fn transport_decode_error(error: crate::read_contract::ReadEncodingError) -> LocalTransportError {
+    match error {
+        crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                ceiling,
+                required: None,
+            })
+        }
+
+        _ => LocalTransportError::Payload(PayloadViolation::Malformed),
     }
-    Ok(value)
 }
 
 /// The live memory one payload would occupy once decoded, accumulated as the
@@ -2281,13 +2684,6 @@ impl<'a> WirePreflight<'a> {
             .checked_mul(element_bytes)
             .and_then(|bytes| self.budget.charged_bytes.checked_add(bytes))
             .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
-        if charged > self.budget.memory_ceiling {
-            return Err(LocalTransportError::Payload(
-                PayloadViolation::MemoryCeilingExceeded {
-                    ceiling: self.budget.memory_ceiling,
-                },
-            ));
-        }
         self.budget.charged_bytes = charged;
         Ok(())
     }
@@ -2295,9 +2691,19 @@ impl<'a> WirePreflight<'a> {
     /// Walk a cursor page carried inside this payload under the same running
     /// total, so the page cannot claim a fresh allowance by being nested.
     fn nested_cursor_page(&mut self, payload: &[u8]) -> Result<(), LocalTransportError> {
-        let mut nested = WirePreflight::with_budget(payload, self.budget);
-        nested.cursor_page()?;
-        self.budget = nested.finish_into_budget()?;
+        let mut nested = CanonicalAllocationPreflight::new(payload, self.budget.memory_ceiling);
+        nested.charged_bytes = self.budget.charged_bytes;
+        nested.observed_cursor_page().map_err(|error| match error {
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
+                LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                    ceiling,
+                    required: None,
+                })
+            }
+
+            _ => LocalTransportError::Payload(PayloadViolation::Malformed),
+        })?;
+        self.budget.charged_bytes = nested.charged_bytes;
         Ok(())
     }
 
@@ -2326,18 +2732,14 @@ impl<'a> WirePreflight<'a> {
             .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
     }
 
-    /// A JSON value travels as text and decodes into a tree of nodes plus
-    /// copies of the text it holds. Both are charged from the text itself,
-    /// before the tree is built.
+    /// Validate the serialized string only. Native JSON payload and parser
+    /// scratch are admitted incrementally by the shared core builder.
     fn json_text(&mut self) -> Result<(), LocalTransportError> {
         let text = self.byte_vector()?;
         if std::str::from_utf8(text).is_err() {
             return Self::malformed();
         }
-        let nodes = json_node_ceiling(text);
-        let text_length = text.len();
-        self.charge::<serde_json::Value>(nodes)?;
-        self.charge::<u8>(text_length)
+        Ok(())
     }
 
     fn value(&mut self) -> Result<(), LocalTransportError> {
@@ -2745,7 +3147,9 @@ pub(crate) fn preflight_canonical_query_result(
     bytes: &[u8],
     memory_ceiling: u64,
 ) -> Result<(), crate::read_contract::ReadEncodingError> {
-    CanonicalAllocationPreflight::new(bytes, memory_ceiling).query_result()
+    CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+        .query_result()
+        .map(|_| ())
 }
 
 /// Admit one cursor-page payload on its own, charging its decoded footprint
@@ -2757,6 +3161,28 @@ pub(crate) fn preflight_cursor_page_payload(
     let mut wire = WirePreflight::over_admitted_answer(bytes, memory_ceiling);
     wire.cursor_page()?;
     wire.finish()
+}
+
+pub(crate) fn preflight_observed_cursor_page_payload(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<(), crate::read_contract::ReadEncodingError> {
+    CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+        .observed_cursor_page()
+        .map(|_| ())
+}
+
+/// Decoded allocation allowance, obtained without allocating the answer.
+pub(crate) fn observed_cursor_page_allocation_bytes(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<(usize, usize), crate::read_contract::ReadEncodingError> {
+    let mut preflight = CanonicalAllocationPreflight::new(bytes, memory_ceiling);
+    let trace = preflight.observed_cursor_page()?;
+    let convert = |bytes| {
+        usize::try_from(bytes).map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
+    };
+    Ok((convert(preflight.charged_bytes)?, convert(trace)?))
 }
 
 /// Admit one metadata-page payload on its own, charging its decoded footprint
@@ -2793,7 +3219,7 @@ fn preflight_response(
     continued: bool,
 ) -> Result<(), LocalTransportError> {
     let mut wire = WirePreflight::with_memory_ceiling(bytes, memory_ceiling);
-    match wire.enumeration(12)? {
+    match wire.enumeration(13)? {
         0 | 1 | 6 | 8 => {
             wire.byte_vector()?;
         }
@@ -2819,7 +3245,7 @@ fn preflight_response(
                 wire.nested_cursor_page(payload)?;
             }
         }
-        3 => {
+        3 | 13 => {
             let payload = wire.byte_vector()?;
             if !continued {
                 wire.nested_cursor_page(payload)?;
@@ -2880,12 +3306,28 @@ pub fn read_payload_with_admission(
     reader: &mut dyn FrameReader,
     allocator: &mut dyn FrameBufferAllocator,
 ) -> Result<Vec<u8>, LocalTransportError> {
+    read_payload_with_memory_admission(reader, allocator, None)
+}
+
+fn read_payload_with_memory_admission(
+    reader: &mut dyn FrameReader,
+    allocator: &mut dyn FrameBufferAllocator,
+    memory: Option<u64>,
+) -> Result<Vec<u8>, LocalTransportError> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix)?;
     let length = u32::from_be_bytes(prefix) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(LocalTransportError::Frame(
             FrameViolation::LengthExceedsMaximum,
+        ));
+    }
+    if memory.is_some_and(|available| length as u64 > available) {
+        return Err(LocalTransportError::Payload(
+            PayloadViolation::MemoryCeilingExceeded {
+                ceiling: memory.unwrap(),
+                required: Some(length as u64),
+            },
         ));
     }
     let mut payload = allocator.allocate(length)?;
@@ -3001,7 +3443,7 @@ fn validate_response(
             LocalResponse::CursorOpened { .. },
             LocalResponseExpectation::CursorOpen
         ) | (
-            LocalResponse::CursorPage { .. },
+            LocalResponse::CursorPage { .. } | LocalResponse::CursorCancelled { .. },
             LocalResponseExpectation::CursorFetch
         ) | (
             LocalResponse::CursorClosed { .. },
@@ -3049,13 +3491,15 @@ fn validate_response(
                 limits.cursor_page_bytes,
             )?;
             if position.is_whole() {
-                decode_cursor_page(&opened.payload).map_err(|_| invalid_channel_data())?;
+                crate::read_contract::decode_observed_cursor_page(&opened.payload, limits.memory)
+                    .map_err(transport_decode_error)?;
             }
         }
-        LocalResponse::CursorPage { page } => {
+        LocalResponse::CursorPage { page } | LocalResponse::CursorCancelled { page } => {
             validate_answer_payload_limit(page.payload.len(), position, limits.cursor_page_bytes)?;
             if position.is_whole() {
-                decode_cursor_page(&page.payload).map_err(|_| invalid_channel_data())?;
+                crate::read_contract::decode_observed_cursor_page(&page.payload, limits.memory)
+                    .map_err(transport_decode_error)?;
             }
         }
         LocalResponse::Metadata { metadata } => {
@@ -3080,6 +3524,7 @@ fn validate_response(
                     }
                     LocalMetadataRequest::Schema { .. }
                     | LocalMetadataRequest::MaintenanceStatus
+                    | LocalMetadataRequest::VerifyHistory { .. }
                     | LocalMetadataRequest::DeliveryStatus { .. }
                     | LocalMetadataRequest::DeliveryOutcome { .. } => {}
                 }

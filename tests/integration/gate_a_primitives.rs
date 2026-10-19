@@ -141,7 +141,7 @@ fn rt1_composite_store_ddl_round_trip_parse() {
     )
     .unwrap();
 
-    let ddl = db.ddl_log_since(Lsn(0));
+    let ddl = db.ddl_log_since(Lsn(0)).unwrap();
     assert_eq!(ddl.len(), 3);
 
     for change in ddl {
@@ -2544,7 +2544,10 @@ fn a7_02_window_function_rejected() {
         "SELECT ROW_NUMBER() OVER (PARTITION BY x) FROM t",
         &HashMap::new(),
     );
-    assert!(matches!(result, Err(Error::WindowFunctionNotSupported)));
+    assert!(matches!(
+        result,
+        Err(Error::WindowFunctionNotSupported { form: _ })
+    ));
 }
 
 #[test]

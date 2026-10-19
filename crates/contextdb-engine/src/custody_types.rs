@@ -308,6 +308,19 @@ impl crate::Database {
         tx: TxId,
         manifest: DeliveryManifest<'_>,
     ) -> contextdb_core::Result<()> {
+        self.register_delivery_manifest_with_read_memory(
+            tx,
+            manifest,
+            self.declared_reader_memory()?,
+        )
+    }
+
+    pub(crate) fn register_delivery_manifest_with_read_memory(
+        &self,
+        tx: TxId,
+        manifest: DeliveryManifest<'_>,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
         let runtime =
             self.custody_runtime()
                 .ok_or_else(|| contextdb_core::Error::SchemaInvalid {
@@ -332,6 +345,7 @@ impl crate::Database {
                     })
                     .collect(),
             },
+            read_memory,
         )
     }
     /// Read the durable outcome for the visible current root at the registered destination.
@@ -343,7 +357,16 @@ impl crate::Database {
         root_table: &str,
         root_key: &NaturalKey,
     ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
-        crate::custody::inspection::outcome(self, root_table, root_key)
+        self.delivery_outcome_with_read_memory(root_table, root_key, self.declared_reader_memory()?)
+    }
+
+    pub(crate) fn delivery_outcome_with_read_memory(
+        &self,
+        root_table: &str,
+        root_key: &NaturalKey,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
+        crate::custody::inspection::outcome(self, root_table, root_key, read_memory)
     }
     /// Count visible eligible units and their accepted, equivalent, refused, and pending states.
     ///
@@ -354,7 +377,15 @@ impl crate::Database {
         &self,
         root_table: &str,
     ) -> contextdb_core::Result<DeliveryStatusCounts> {
-        crate::custody::inspection::status(self, root_table)
+        self.delivery_status_with_read_memory(root_table, self.declared_reader_memory()?)
+    }
+
+    pub(crate) fn delivery_status_with_read_memory(
+        &self,
+        root_table: &str,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<DeliveryStatusCounts> {
+        crate::custody::inspection::status(self, root_table, read_memory)
     }
 }
 
@@ -363,6 +394,7 @@ impl crate::Database {
 pub(crate) fn decode_outcome_projection(
     text: &str,
 ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -401,7 +433,7 @@ pub(crate) fn decode_outcome_projection(
         conflicts: Option<Vec<Conflict>>,
     }
     let Some(p): Option<OutcomeProjection> =
-        serde_json::from_str(text).map_err(|_| crate::custody::canonical::invalid())?
+        crate::read_image_memory::decode_json(text.as_bytes())?
     else {
         return Ok(None);
     };

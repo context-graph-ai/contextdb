@@ -10,9 +10,13 @@ use contextdb_core::read_contract::{
     ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Value};
-use contextdb_engine::read_contract::{decode_cursor_page, encode_cursor_page};
+#[path = "../owner_cursor_test_support.rs"]
+#[allow(dead_code)]
+mod owner_cursor_test_support;
 use contextdb_engine::read_session::ReadSessionTestObserver;
 use contextdb_engine::{Database, ReadSession, ReadSessionOptions};
+use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
+use owner_cursor_test_support::replace_owner_cursor_page;
 
 const ROLE: &str = "CONTEXTDB_OWNER_DECODE_MEMORY_ROLE";
 const PATH: &str = "CONTEXTDB_OWNER_DECODE_MEMORY_PATH";
@@ -118,7 +122,7 @@ impl ReadSessionTestObserver for OversizedFetchPage {
         let mut page = decode_cursor_page(payload).expect("owner published a valid page");
         assert_eq!(page.rows.len(), 1);
         page.rows[0][1] = Value::Text("x".repeat(128 * 1024));
-        Some(encode_cursor_page(&page).expect("encode one oversized valid page"))
+        Some(replace_owner_cursor_page(payload, &page).expect("encode one oversized valid page"))
     }
 }
 
@@ -141,7 +145,10 @@ impl ReadSessionTestObserver for OversizedFirstPageOnce {
         let mut page = decode_cursor_page(payload).expect("owner published a valid first page");
         assert_eq!(page.rows.len(), 1);
         page.rows[0][1] = Value::Text("x".repeat(128 * 1024));
-        Some(encode_cursor_page(&page).expect("encode one oversized valid first page"))
+        Some(
+            replace_owner_cursor_page(payload, &page)
+                .expect("encode one oversized valid first page"),
+        )
     }
 }
 

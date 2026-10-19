@@ -5,11 +5,12 @@
 //! shape used by file-backed history, full snapshots, and server replication.
 
 use contextdb_core::{
-    CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, TableMeta, Value, VectorIndexRef,
+    ColumnType, CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, TableMeta, Value,
+    VectorIndexRef, VectorSearchMode,
 };
 use serde::de::VariantAccess;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 /// The newer schema behavior an older peer must gain before one held table
@@ -21,6 +22,44 @@ pub enum SchemaSyncCapability {
     VectorAutoIndexAt,
     VectorHnswPolicy,
     MaintainedIndexCounts,
+}
+
+pub(crate) fn schema_capabilities_in_columns(
+    columns: &[contextdb_core::ColumnDef],
+) -> BTreeSet<SchemaSyncCapability> {
+    let mut capabilities = BTreeSet::new();
+    for column in columns {
+        if !matches!(column.column_type, ColumnType::Vector(_)) {
+            continue;
+        }
+        if column
+            .partition_key_columns
+            .as_ref()
+            .is_some_and(|columns| !columns.is_empty())
+            || column.max_partitions.is_some()
+        {
+            capabilities.insert(SchemaSyncCapability::VectorPartitioning);
+        }
+        if column.search_mode != VectorSearchMode::Auto {
+            capabilities.insert(SchemaSyncCapability::VectorSearchMode);
+        }
+        if column.auto_index_at.is_some() {
+            capabilities.insert(SchemaSyncCapability::VectorAutoIndexAt);
+        }
+        if column.hnsw_m.is_some()
+            || column.flat_below.is_some()
+            || column.auto_expansion_ceiling.is_some()
+            || column.hnsw_search_radius_millionths.is_some()
+            || column.hnsw_ef_construction.is_some()
+            || column.hnsw_ef_search.is_some()
+            || column.consolidation_change_percent.is_some()
+            || column.consolidation_tombstone_percent.is_some()
+            || column.consolidation_disabled
+        {
+            capabilities.insert(SchemaSyncCapability::VectorHnswPolicy);
+        }
+    }
+    capabilities
 }
 
 impl std::fmt::Display for SchemaSyncCapability {
@@ -751,7 +790,48 @@ pub(crate) fn natural_key_from_row_values(
     NaturalKey::from_pairs(pairs)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Build an identity under the caller's existing projected-answer credit.
+pub(crate) fn natural_key_from_row_values_admitted(
+    meta: &TableMeta,
+    values: &HashMap<String, Value>,
+    admit: &dyn Fn(usize) -> contextdb_core::Result<()>,
+) -> contextdb_core::Result<Option<NaturalKey>> {
+    let columns: &[String] = if let Some(column) = &meta.natural_key_column {
+        std::slice::from_ref(column)
+    } else if !meta.primary_key_columns.is_empty() {
+        &meta.primary_key_columns
+    } else if let Some(column) = meta.columns.iter().find(|column| column.primary_key) {
+        std::slice::from_ref(&column.name)
+    } else if let Some(column) = meta.columns.iter().find(|column| column.name == "id") {
+        std::slice::from_ref(&column.name)
+    } else {
+        return Ok(None);
+    };
+    if columns.iter().any(|column| !values.contains_key(column)) {
+        return Ok(None);
+    }
+    let mut bytes = columns
+        .len()
+        .saturating_mul(std::mem::size_of::<(String, Value)>())
+        .saturating_add(held::ALLOCATION_BYTES);
+    for column in columns {
+        bytes = bytes.saturating_add(held::text(column));
+        let value = &values[column];
+        bytes = bytes.saturating_add(match value {
+            // A JSON key owns a deep copy of its payload.
+            Value::Json(value) => crate::read_image_memory::json_clone_heap_bytes(value),
+            value => held::value(value),
+        });
+    }
+    admit(bytes)?;
+    let mut pairs = Vec::with_capacity(columns.len());
+    for column in columns {
+        pairs.push((column.clone(), values[column].clone()));
+    }
+    Ok(NaturalKey::from_pairs(pairs))
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct RowChange {
     pub table: String,
     pub natural_key: NaturalKey,
@@ -767,6 +847,37 @@ pub struct RowChange {
     /// in that case the receiver supplies its own stamp.
     #[serde(default)]
     pub created_at: Option<contextdb_core::Wallclock>,
+}
+
+// History diagnostics must not change when the same durable row is decoded
+// again with a fresh randomized HashMap. Format borrowed keys in canonical
+// order without allocating another copy of the row or its values.
+impl std::fmt::Debug for RowChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Values<'a>(&'a HashMap<String, Value>);
+        impl std::fmt::Debug for Values<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let mut map = f.debug_map();
+                let mut after: Option<&str> = None;
+                while let Some((key, value)) = self.0.iter()
+                    .filter(|(key, _)| after.is_none_or(|prior| key.as_str() > prior))
+                    .min_by(|(a, _), (b, _)| a.cmp(b))
+                {
+                    map.entry(key, value);
+                    after = Some(key.as_str());
+                }
+                map.finish()
+            }
+        }
+        f.debug_struct("RowChange")
+            .field("table", &self.table)
+            .field("natural_key", &self.natural_key)
+            .field("values", &Values(&self.values))
+            .field("deleted", &self.deleted)
+            .field("lsn", &self.lsn)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// What a projected history answer's parts actually occupy in memory: every
@@ -812,7 +923,7 @@ pub(crate) mod held {
             Value::Text(text) => self::text(text),
             Value::Vector(vector) if vector.is_empty() => 0,
             Value::Vector(vector) => std::mem::size_of_val(vector.as_slice()) + ALLOCATION_BYTES,
-            Value::Json(_) => value.estimated_bytes(),
+            Value::Json(value) => contextdb_core::types::json_retained_heap_bytes(value),
             _ => 0,
         }
     }
@@ -1018,9 +1129,14 @@ impl DdlChange {
     /// tripled, because a decoded `String`/`Vec` costs more than its wire
     /// bytes once container growth is counted.
     pub(crate) fn estimated_bytes(&self) -> usize {
-        let encoded_len = bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map(|bytes| bytes.len())
-            .unwrap_or(4096);
+        // Count the canonical encoding without constructing it: this price
+        // is needed before a source-copy admission can fund any allocation.
+        let encoded_len = bincode::serde::encode_into_std_write(
+            self,
+            &mut std::io::sink(),
+            bincode::config::standard(),
+        )
+        .unwrap_or(4096);
         128 + encoded_len.saturating_mul(3)
     }
 }

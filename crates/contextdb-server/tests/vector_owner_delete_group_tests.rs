@@ -20,7 +20,7 @@ fn empty() -> HashMap<String, Value> {
 }
 
 fn assert_exact_mixed_vector_outbound_provenance(db: &Database, since: Lsn) {
-    let changes = db.changes_since(since);
+    let changes = db.changes_since(since).expect("read changes_since fixture");
     let a_row = changes
         .rows
         .iter()
@@ -75,11 +75,13 @@ fn assert_exact_mixed_vector_outbound_provenance(db: &Database, since: Lsn) {
     assert_eq!(b_vector.lsn, b_row.lsn);
 
     assert!(
-        db.row_change_arrived_by_sync(a_row),
+        db.row_change_arrived_by_sync(a_row)
+            .expect("read row_change_arrived_by_sync fixture"),
         "the Pulled A row is absent from outbound work"
     );
     assert!(
-        db.vector_change_arrived_by_sync(a_vector),
+        db.vector_change_arrived_by_sync(a_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "the Pulled A vector is absent from outbound work"
     );
     // Declared-policy pull-adoption contract (Settled Policy 9 / §3.2): B's
@@ -88,11 +90,13 @@ fn assert_exact_mixed_vector_outbound_provenance(db: &Database, since: Lsn) {
     // repair. B's provenance is therefore Pulled, exactly like A's, and B is
     // no longer outbound work either.
     assert!(
-        db.row_change_arrived_by_sync(b_row),
+        db.row_change_arrived_by_sync(b_row)
+            .expect("read row_change_arrived_by_sync fixture"),
         "the adopted B row must be classified Pulled, not AcceptedLocal"
     );
     assert!(
-        db.vector_change_arrived_by_sync(b_vector),
+        db.vector_change_arrived_by_sync(b_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "the adopted B vector must be classified Pulled, not AcceptedLocal"
     );
 }
@@ -132,7 +136,9 @@ async fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
             &empty(),
         )
         .expect("author one mixed source commit");
-    let incoming = source.changes_since(source_before);
+    let incoming = source
+        .changes_since(source_before)
+        .expect("read changes_since fixture");
     let source_lsn = incoming.rows.first().expect("mixed source rows").lsn;
     assert!(
         incoming.rows.iter().all(|row| row.lsn == source_lsn)
@@ -152,7 +158,8 @@ async fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
             tenant.clone(),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -167,7 +174,8 @@ async fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
         broker.client_as(&edge_node_id),
         tenant,
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     let edge_before = edge.current_lsn();
     let result = client
@@ -240,7 +248,8 @@ async fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
             tenant.clone(),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -255,7 +264,8 @@ async fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
         broker.client_as(&edge_node_id),
         tenant,
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     sender
         .execute(
@@ -269,7 +279,9 @@ async fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
     sender
         .execute("DELETE FROM notes", &empty())
         .expect("delete both owners in one commit");
-    let deletes = sender.changes_since(seed_lsn);
+    let deletes = sender
+        .changes_since(seed_lsn)
+        .expect("read changes_since fixture");
     assert_eq!(deletes.rows.iter().filter(|row| row.deleted).count(), 2);
     assert_eq!(
         deletes
@@ -341,7 +353,9 @@ fn non_recreated_delete_retains_relational_and_vector_tombstones() {
     sender
         .execute("DELETE FROM notes WHERE id = 1", &empty())
         .expect("delete vector owner");
-    let retained = sender.changes_since(before_insert);
+    let retained = sender
+        .changes_since(before_insert)
+        .expect("read changes_since fixture");
     assert!(
         retained.rows.iter().all(|row| row.deleted),
         "pending-delete reconciliation omits the older live owner row"
@@ -392,6 +406,7 @@ fn same_key_recreation_cannot_leave_orphan_vector_tombstone_in_destination_rebui
         .expect("insert original vector owner");
     let original_vector_owner = sender
         .changes_since(Lsn(0))
+        .expect("read changes_since fixture")
         .vectors
         .into_iter()
         .find(|vector| !vector.vector.is_empty())
@@ -402,7 +417,9 @@ fn same_key_recreation_cannot_leave_orphan_vector_tombstone_in_destination_rebui
     sender
         .execute("DELETE FROM notes WHERE id = 1", &empty())
         .expect("delete original vector owner");
-    let original_delete_history = sender.changes_since(before_delete);
+    let original_delete_history = sender
+        .changes_since(before_delete)
+        .expect("read changes_since fixture");
     let original_delete = original_delete_history
         .rows
         .iter()
@@ -422,6 +439,7 @@ fn same_key_recreation_cannot_leave_orphan_vector_tombstone_in_destination_rebui
         .expect("recreate same natural key with a new vector owner");
     let recreated_vector_owner = sender
         .changes_since(before_recreate)
+        .expect("read changes_since fixture")
         .vectors
         .into_iter()
         .find(|vector| !vector.vector.is_empty())
@@ -432,7 +450,9 @@ fn same_key_recreation_cannot_leave_orphan_vector_tombstone_in_destination_rebui
         "recreation allocates a new vector owner"
     );
 
-    let history = sender.changes_since(Lsn(0));
+    let history = sender
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     assert!(
         history.rows.iter().any(|row| {
             !row.deleted
@@ -501,7 +521,8 @@ async fn deleting_edge_pulls_its_own_vector_tombstone_with_remote_row_id() {
             tenant.clone(),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -525,7 +546,8 @@ async fn deleting_edge_pulls_its_own_vector_tombstone_with_remote_row_id() {
         broker.client_as(&edge_node_id),
         tenant,
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     client.push().await.expect("seed hub from edge");
     edge.execute("DELETE FROM notes WHERE id = 1", &empty())
         .expect("local vector delete");
@@ -610,7 +632,8 @@ async fn pulled_vector_groups_do_not_echo_but_later_local_vector_work_does() {
             tenant.clone(),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -627,7 +650,8 @@ async fn pulled_vector_groups_do_not_echo_but_later_local_vector_work_does() {
         broker.client_as(&edge_node_id),
         tenant,
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     client.push().await.expect("publish edge schema");
     client.pull_default().await.expect("pull vector owner");
     assert!(
@@ -645,12 +669,15 @@ async fn pulled_vector_groups_do_not_echo_but_later_local_vector_work_does() {
     .expect("local vector edit");
     let edited_vector = edge
         .changes_since(before_local_edit)
+        .expect("read changes_since fixture")
         .vectors
         .into_iter()
         .find(|vector| !vector.vector.is_empty())
         .expect("local vector edit change");
     assert!(
-        !edge.vector_change_arrived_by_sync(&edited_vector),
+        !edge
+            .vector_change_arrived_by_sync(&edited_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "the exact vector edit after a pull remains outbound"
     );
     assert!(
@@ -666,12 +693,15 @@ async fn pulled_vector_groups_do_not_echo_but_later_local_vector_work_does() {
         .expect("local delete after pull");
     let local_delete_vector = edge
         .changes_since(before_local_delete)
+        .expect("read changes_since fixture")
         .vectors
         .into_iter()
         .find(|vector| vector.vector.is_empty())
         .expect("local vector tombstone");
     assert!(
-        !edge.vector_change_arrived_by_sync(&local_delete_vector),
+        !edge
+            .vector_change_arrived_by_sync(&local_delete_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "the exact vector delete after a pull remains outbound"
     );
     client.push().await.expect("push local vector delete");
@@ -722,7 +752,9 @@ fn accepted_local_and_pending_vector_insert_and_delete_remain_outbound() {
         &empty(),
     )
     .expect("insert local vector owner");
-    let inserted = db.changes_since(before_insert);
+    let inserted = db
+        .changes_since(before_insert)
+        .expect("read changes_since fixture");
     let live_row = inserted
         .rows
         .iter()
@@ -736,20 +768,24 @@ fn accepted_local_and_pending_vector_insert_and_delete_remain_outbound() {
     db.record_hub_accepted_rows(std::slice::from_ref(live_row), Lsn(800), Some("hub"))
         .expect("record AcceptedLocal live owner");
     assert!(
-        !db.vector_change_arrived_by_sync(live_vector),
+        !db.vector_change_arrived_by_sync(live_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "an AcceptedLocal live vector remains outbound"
     );
     db.invalidate_accepted_local_ordering_after_hub_regression(before_insert)
         .expect("mark live owner Pending");
     assert!(
-        !db.vector_change_arrived_by_sync(live_vector),
+        !db.vector_change_arrived_by_sync(live_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "a Pending live vector remains outbound"
     );
 
     let before_delete = db.current_lsn();
     db.execute("DELETE FROM notes WHERE id = 7", &empty())
         .expect("delete local vector owner");
-    let deleted = db.changes_since(before_delete);
+    let deleted = db
+        .changes_since(before_delete)
+        .expect("read changes_since fixture");
     let delete_row = deleted
         .rows
         .iter()
@@ -763,13 +799,15 @@ fn accepted_local_and_pending_vector_insert_and_delete_remain_outbound() {
     db.record_hub_accepted_rows(std::slice::from_ref(delete_row), Lsn(900), Some("hub"))
         .expect("record AcceptedLocal delete owner");
     assert!(
-        !db.vector_change_arrived_by_sync(delete_vector),
+        !db.vector_change_arrived_by_sync(delete_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "an AcceptedLocal delete vector remains outbound"
     );
     db.mark_outbound_rows_pending(before_delete, Some(delete_row.lsn))
         .expect("mark delete owner Pending");
     assert!(
-        !db.vector_change_arrived_by_sync(delete_vector),
+        !db.vector_change_arrived_by_sync(delete_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "a Pending delete vector remains outbound"
     );
 }

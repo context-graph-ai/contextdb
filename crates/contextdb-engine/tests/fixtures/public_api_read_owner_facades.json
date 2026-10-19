@@ -1,0 +1,386 @@
+[
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "should_abandon",
+    "inputs": "db:&Database,job_id:&str,attempt:i64,node_id:&str,now_ms:i64",
+    "explicit": "should_abandon_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "run_input_retention",
+    "inputs": "db:&Database,now_ms:i64,grace_ms:i64",
+    "explicit": "run_input_retention_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "materialize_inputs",
+    "inputs": "db:&Database,job_id:&str,node_id:&str,policy:&MovementPolicy",
+    "explicit": "materialize_inputs_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "advertised_tags",
+    "inputs": "db:&Database,node_id:&str",
+    "explicit": "advertised_tags_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "advertise_capability",
+    "inputs": "db:&Database,node_id:&str,capability_id:&str,tags:&[String],now_ms:i64",
+    "explicit": "advertise_capability_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "cancel_job",
+    "inputs": "db:&Database,job_id:&str,requested_by:&str,reason:Option<&str>,now_ms:i64",
+    "explicit": "cancel_job_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "record_failure",
+    "inputs": "db:&Database,job_id:&str,attempt:i64,node_id:&str,error:&str,now_ms:i64",
+    "explicit": "record_failure_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "job_result",
+    "inputs": "db:&Database,job_id:&str",
+    "explicit": "job_result_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "record_result",
+    "inputs": "db:&Database,job_id:&str,attempt:i64,executor_node_id:&str,output:&[u8],receipt:serde_json::Value,now_ms:i64",
+    "explicit": "record_result_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "claim_holder",
+    "inputs": "db:&Database,job_id:&str,attempt:i64",
+    "explicit": "claim_holder_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "insert_claim",
+    "inputs": "db:&Database,job_id:&str,attempt:i64,node_id:&str,lease_deadline_ms:i64,now_ms:i64",
+    "explicit": "insert_claim_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "next_attempt",
+    "inputs": "db:&Database,job_id:&str",
+    "explicit": "next_attempt_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "blob_ref_retention_eligible",
+    "inputs": "db:&Database,hash:&BlobHash,now_ms:i64,grace_ms:i64",
+    "explicit": "blob_ref_retention_eligible_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "node_claim_permits_movement",
+    "inputs": "db:&Database,node_id:&str,hash:&BlobHash,policy:MovementPolicy,now_ms:i64",
+    "explicit": "node_claim_permits_movement_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "any_node_holds_claim_for_blob",
+    "inputs": "db:&Database,hash:&BlobHash,now_ms:i64",
+    "explicit": "any_node_holds_claim_for_blob_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "node_holds_claim_for_blob",
+    "inputs": "db:&Database,node_id:&str,hash:&BlobHash,now_ms:i64",
+    "explicit": "node_holds_claim_for_blob_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "claimable_jobs",
+    "inputs": "db:&Database,node_id:&str,advertised_tags:&[String],policy:&MovementPolicy,now_ms:i64",
+    "explicit": "claimable_jobs_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "job_state_counts_with_work",
+    "inputs": "db:&Database,job_ids:&[implAsRef<str>],now_ms:i64",
+    "explicit": "job_state_counts_with_work_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "job_state_counts",
+    "inputs": "db:&Database,job_ids:&[implAsRef<str>],now_ms:i64",
+    "explicit": "job_state_counts_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "job_state",
+    "inputs": "db:&Database,job_id:&str,now_ms:i64",
+    "explicit": "job_state_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "job_snapshot",
+    "inputs": "db:&Database,job_id:&str",
+    "explicit": "job_snapshot_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "submit_job",
+    "inputs": "db:&Database,spec:&JobSpec,inputs:&[I]",
+    "explicit": "submit_job_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "add_job_input_in_tx",
+    "inputs": "db:&Database,tx:TxId,job_id:&str,seq:i64,payload:&[u8]",
+    "explicit": "add_job_input_in_tx_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "submit_job_in_tx",
+    "inputs": "db:&Database,tx:TxId,spec:&JobSpec",
+    "explicit": "submit_job_in_tx_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/work_ledger.rs",
+    "name": "install_work_ledger_schema",
+    "inputs": "db:&Database",
+    "explicit": "install_work_ledger_schema_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/peer_directory.rs",
+    "name": "lookup_peer_ticket",
+    "inputs": "db:&Database,node_id:&str",
+    "explicit": "lookup_peer_ticket_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/peer_directory.rs",
+    "name": "register_peer_ticket",
+    "inputs": "db:&Database,node_id:&str,ticket:&str,now_ms:i64",
+    "explicit": "register_peer_ticket_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/peer_directory.rs",
+    "name": "install_peer_directory_schema",
+    "inputs": "db:&Database",
+    "explicit": "install_peer_directory_schema_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/cli_render.rs",
+    "name": "render_explain",
+    "inputs": "db:&Database,sql:&str,params:&std::collections::HashMap<String,Value>",
+    "explicit": "render_explain_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_client.rs",
+    "name": "bind_application_table_policy",
+    "inputs": "&self,expectation:ApplicationTablePolicyExpectation",
+    "explicit": "bind_application_table_policy_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_client.rs",
+    "name": "fetch_delivery_outcomes",
+    "inputs": "&self,since:Option<DeliveryOutcomeCursor>",
+    "explicit": "fetch_delivery_outcomes_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_client.rs",
+    "name": "new",
+    "inputs": "db:Arc<Database>,endpoint:&str,tenant_id:TenantId",
+    "explicit": "new_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_client.rs",
+    "name": "with_authenticated_transport_for_test",
+    "inputs": "db:Arc<Database>,transport:Arc<dynClientTransport>,tenant_id:TenantId",
+    "explicit": "with_authenticated_transport_for_test_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_client.rs",
+    "name": "with_authenticated_transport_and_identity_for_test",
+    "inputs": "db:Arc<Database>,transport:Arc<dynClientTransport>,tenant_id:TenantId,identity:Arc<crate::identity::FabricIdentity>",
+    "explicit": "with_authenticated_transport_and_identity_for_test_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_client.rs",
+    "name": "push",
+    "inputs": "&self",
+    "explicit": "push_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_client.rs",
+    "name": "pull_default",
+    "inputs": "&self",
+    "explicit": "pull_default_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_server.rs",
+    "name": "new",
+    "inputs": "db:Arc<Database>,endpoint:&crate::transport::PeerEndpoint,tenant_id:TenantId",
+    "explicit": "new_with_read_budget_provider",
+    "budget": "ReadRequestBudgetProvider",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_server.rs",
+    "name": "with_authenticated_transport_for_test",
+    "inputs": "db:Arc<Database>,transport:Arc<dyncrate::transport::ServerTransport>,tenant_id:TenantId",
+    "explicit": "with_authenticated_transport_for_test_with_read_budget_provider",
+    "budget": "ReadRequestBudgetProvider",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/sync_server.rs",
+    "name": "with_authenticated_transport_and_identity_for_test",
+    "inputs": "db:Arc<Database>,transport:Arc<dyncrate::transport::ServerTransport>,tenant_id:TenantId,local_node_id:String,identity:Arc<crate::identity::FabricIdentity>",
+    "explicit": "with_authenticated_transport_and_identity_for_test_with_read_budget_provider",
+    "budget": "ReadRequestBudgetProvider",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-server/src/work_ledger.rs",
+    "name": "install_node_contacts_schema",
+    "inputs": "db:&contextdb_engine::Database",
+    "explicit": "install_node_contacts_schema_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-server/src/work_ledger.rs",
+    "name": "record_node_contact",
+    "inputs": "db:&contextdb_engine::Database,node_id:&str,now_ms:i64",
+    "explicit": "record_node_contact_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-server/src/work_ledger.rs",
+    "name": "claim_job",
+    "inputs": "client:&SyncClient,job_id:&str,attempt:i64,node_id:&str,lease_deadline_ms:i64,now_ms:i64",
+    "explicit": "claim_job_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-server/src/work_ledger.rs",
+    "name": "poll_and_execute_once",
+    "inputs": "client:&SyncClient,config:&WorkerConfig,executor:Arc<dynWorkExecutor>,now_ms:i64",
+    "explicit": "poll_and_execute_once_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-server/src/work_ledger.rs",
+    "name": "run_worker_loop",
+    "inputs": "client:&SyncClient,config:&WorkerConfig,executor:Arc<dynWorkExecutor>,poll_interval:Duration,shutdown:Arc<AtomicBool>",
+    "explicit": "run_worker_loop_with_read_budget_provider",
+    "budget": "ReadRequestBudgetProvider",
+    "top_level": true
+  },
+  {
+    "source": "crates/contextdb-engine/src/blob_store.rs",
+    "name": "serve_on",
+    "inputs": "&self,endpoint:&IrohServer",
+    "explicit": "serve_on_with_read_budget_provider",
+    "budget": "ReadRequestBudgetProvider",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/blob_store.rs",
+    "name": "resolve_blob_ref",
+    "inputs": "&self,hash:&BlobHash,holder_ticket:&str,sink:&mut(dynWrite+Send)",
+    "explicit": "resolve_blob_ref_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/blob_store.rs",
+    "name": "reclaim_unreferenced",
+    "inputs": "&self,now_ms:i64,grace_ms:i64",
+    "explicit": "reclaim_unreferenced_with_read_memory",
+    "budget": "ReadMemoryBudget",
+    "top_level": false
+  },
+  {
+    "source": "crates/contextdb-engine/src/blob_store.rs",
+    "name": "spawn_reclaim_driver",
+    "inputs": "self:Arc<Self>,grace_ms:i64",
+    "explicit": "spawn_reclaim_driver_with_read_budget_provider",
+    "budget": "ReadRequestBudgetProvider",
+    "top_level": false
+  }
+]

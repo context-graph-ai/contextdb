@@ -813,6 +813,48 @@ fn hash128_large_generic(
     ((high as u128) << 64) | low as u128
 }
 
+/// The same seed-zero page checksum, fetched in bounded source windows.
+/// The long-input loop is the existing scalar algorithm with its original
+/// block/stripe boundaries, including the overlapping final stripe.
+#[cfg(feature = "contextdb-internal")]
+pub(in crate::tree_store) fn hash128_from_windows<E>(
+    len: usize,
+    mut read: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+) -> Result<u128, E> {
+    if len <= 240 {
+        let mut bytes = [0u8; 240];
+        read(0, &mut bytes[..len])?;
+        return Ok(hash128_with_seed(&bytes[..len], 0));
+    }
+    let secret = &DEFAULT_SECRET;
+    let mut accumulators = INIT_ACCUMULATORS;
+    let stripes_per_block = (secret.len() - STRIPE_LENGTH) / SECRET_CONSUME_RATE;
+    let block_len = STRIPE_LENGTH * stripes_per_block;
+    let blocks = (len - 1) / block_len;
+    let mut stripe = [0u8; STRIPE_LENGTH];
+    for block in 0..blocks {
+        for index in 0..stripes_per_block {
+            read(block * block_len + index * STRIPE_LENGTH, &mut stripe)?;
+            accumulate_stripe_generic(&mut accumulators, &stripe,
+                &secret[index * SECRET_CONSUME_RATE..]);
+        }
+        scramble_accumulators_generic(&mut accumulators, &secret[secret.len() - STRIPE_LENGTH..]);
+    }
+    let stripes = ((len - 1) - block_len * blocks) / STRIPE_LENGTH;
+    for index in 0..stripes {
+        read(blocks * block_len + index * STRIPE_LENGTH, &mut stripe)?;
+        accumulate_stripe_generic(&mut accumulators, &stripe,
+            &secret[index * SECRET_CONSUME_RATE..]);
+    }
+    read(len - STRIPE_LENGTH, &mut stripe)?;
+    accumulate_stripe_generic(&mut accumulators, &stripe,
+        &secret[secret.len() - STRIPE_LENGTH - 7..]);
+    let low = merge_accumulators(accumulators, &secret[11..], PRIME64[0].wrapping_mul(len as u64));
+    let high = merge_accumulators(accumulators, &secret[secret.len() - 64 - 11..],
+        !(PRIME64[1].wrapping_mul(len as u64)));
+    Ok(((high as u128) << 64) | low as u128)
+}
+
 #[cfg(test)]
 mod test {
     use crate::tree_store::page_store::xxh3::hash64_with_seed;

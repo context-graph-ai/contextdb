@@ -300,10 +300,36 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
     .unwrap();
     assert_eq!(db.__physical_version_count_for_test("recordings"), 2);
     let used = db.accountant().usage().used;
-    db.set_memory_limit(Some(used + 1024)).unwrap();
-    let error = db.run_maintenance_cycle().unwrap_err();
+    // Fund the measured simultaneous currency controls and source cursors,
+    // the real vector inventory, and the captured published root.
+    let allowance = 8_027 + 16_512 + 264;
+    db.set_memory_limit(Some(used + allowance)).unwrap();
+    // A budgeted batch may fit the small directory before it reaches a
+    // payload extent. Drive finite batches until an actual page cannot fit.
+    let mut refusal = None;
+    for _ in 0..256 {
+        let before = db.__storage_compaction_progress_for_test();
+        match db.run_maintenance_cycle() {
+            Ok(report) => assert!(report.compaction.ran),
+            Err(error) => {
+                assert_eq!(
+                    db.__storage_compaction_progress_for_test(),
+                    before,
+                    "a refused batch must not advance its published continuation"
+                );
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
+    let error = refusal.expect("a payload relocation exceeds this tight budget");
     assert!(
-        matches!(error, contextdb_core::Error::MemoryBudgetExceeded { .. }),
+        matches!(error, contextdb_core::Error::MemoryBudgetExceeded {
+            ref subsystem, ref operation, requested_bytes,
+            available_bytes, budget_limit_bytes, ..
+        } if subsystem == "storage_compaction" && operation == "relocate_pages"
+            && requested_bytes > available_bytes
+            && budget_limit_bytes == used + allowance),
         "typed compaction refusal: {error:?}"
     );
     assert_eq!(
@@ -311,7 +337,6 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
         1,
         "the healthy currency-cleanup sibling completes before closing compaction reports its typed deferral"
     );
-    assert!(!db.__storage_compaction_progress_for_test().0);
     db.set_memory_limit(None).unwrap();
     db.execute(
         "INSERT INTO recordings VALUES (1, 'later')",

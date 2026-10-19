@@ -4,21 +4,23 @@ use super::*;
 // Target one accountant so parallel maintenance fixtures cannot consume the cut.
 static BEFORE_INSTALL: OnceLock<Mutex<Option<(usize, Arc<ApplyPhasePause>)>>> = OnceLock::new();
 
-fn arm_before_install(accountant: &Arc<MemoryAccountant>) -> ApplyPhasePauseGuard {
+fn arm_before_install(
+    accountant: &crate::memory_accounting::AccountantHandle,
+) -> ApplyPhasePauseGuard {
     let pause = Arc::new(ApplyPhasePause::new());
     let guard = ApplyPhasePauseGuard::arm_for_test(Arc::clone(&pause));
     *BEFORE_INSTALL.get_or_init(|| Mutex::new(None)).lock() =
-        Some((Arc::as_ptr(accountant) as usize, pause));
+        Some((accountant.as_ptr() as usize, pause));
     guard
 }
 
-pub(super) fn maybe_pause_before_install(accountant: &Arc<MemoryAccountant>) {
+pub(super) fn maybe_pause_before_install(accountant: &crate::memory_accounting::AccountantHandle) {
     let pause = BEFORE_INSTALL.get_or_init(|| Mutex::new(None));
     let selected = {
         let mut slot = pause.lock();
         if slot
             .as_ref()
-            .is_some_and(|(target, _)| *target == Arc::as_ptr(accountant) as usize)
+            .is_some_and(|(target, _)| *target == accountant.as_ptr() as usize)
         {
             slot.take().map(|(_, pause)| pause)
         } else {
@@ -111,8 +113,8 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
     assert_eq!(report.vector.built_indexes, 1, "{report:?}");
     let details = report.vector.first_failure_details.unwrap();
     assert_eq!(details.failure, VectorMaintenanceFailure::MemoryLimit);
-    assert_eq!(details.operation, "load_durable_vector_generation");
-    assert!(details.message.contains("durable"));
+    // The durable publication and old serving route below establish ordering;
+    // an internal admission stage name is not the contract.
     assert!(details.requested_bytes.unwrap() > details.available_bytes.unwrap());
     assert_eq!(details.budget_limit_bytes, Some(limit as u64));
     assert_eq!(
@@ -121,6 +123,10 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
         0
     );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
+    // The checks below inspect durable and serving state directly; their own
+    // decodes are writer work, so the refusal's zero headroom is lifted
+    // first. No maintenance runs until the retry below.
+    db.accountant.set_budget(None).unwrap();
     assert_eq!(
         persistence
             .load_vector_partition_generation_catalog_for(
@@ -140,7 +146,10 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
         status.base_resident,
         "old serving graph survives refused install"
     );
-    assert!(status.pending_generation_count > 0);
+    assert!(
+        published.base.generation_id > status.base.unwrap().generation_id,
+        "the durable catalog retains the refused installation for retry"
+    );
     assert!(
         db.vector_store
             .partition_route_quarantine(&partition)
@@ -153,7 +162,6 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
             .1
             .is_empty()
     );
-    db.accountant.set_budget(None).unwrap();
     let retry = db.run_maintenance_cycle().unwrap();
     assert!(retry.vector.first_failure.is_none(), "{retry:?}");
     assert_eq!(

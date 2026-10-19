@@ -175,7 +175,10 @@ fn assert_public_hnsw_trace(
     context: &str,
 ) {
     let trace = db
-        .__debug_last_query_vector_trace_for_test()
+        .__debug_last_query_vector_trace_for_test(
+            db.declared_reader_memory().expect("admit the trace reader"),
+        )
+        .expect("read the admitted trace observation")
         .unwrap_or_else(|| panic!("{context}: missing public query_vector debug trace"));
     assert!(
         db.__debug_last_query_vector_used_hnsw_for_test(),
@@ -498,6 +501,14 @@ fn consecutive_hnsw_builds_within_one_open_database_are_stable() {
 
         for attempt in 0..IN_PROCESS_REBUILD_ATTEMPTS {
             let sentinel_row_id = insert_sentinel(&db);
+            // Committed changes are searchable before maintenance. Publish
+            // their real native graph before inspecting saved topology; a
+            // journal identity is never a substitute for an HNSW point.
+            let pending = db.query_vector(index_ref("det_one"), &axis3(1), TOP_K, None, db.snapshot()).unwrap();
+            assert_eq!(pending.first().map(|(row, _)| *row), Some(sentinel_row_id),
+                "the committed sentinel is searchable before graph publication");
+            assert!(db.persist_import_vector_tails().unwrap(),
+                "caller-driven maintenance publishes the actual saved sentinel graph");
             assert_eq!(
                 db.__debug_vector_hnsw_len(index_ref("det_one")),
                 Some(REOPEN_ROWS + 1),

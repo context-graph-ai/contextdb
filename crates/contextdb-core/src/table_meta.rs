@@ -845,6 +845,17 @@ pub struct ColumnDef {
     /// and remains silent in rendered schema.
     #[serde(default)]
     pub auto_index_at: Option<u32>,
+    /// The explicit per-partition live-row count below which a partition is
+    /// served from its maintained flat representation instead of its graph.
+    /// `None` keeps the compatibility default, 0 (never flat), and remains
+    /// silent in rendered schema.
+    #[serde(default)]
+    pub flat_below: Option<u32>,
+    /// The explicit most of its walk budget, in percent, AUTO expects one
+    /// partition's graph search to spend when it prices the walk against
+    /// comparing every row. `None` keeps the compatibility default, 25.
+    #[serde(default)]
+    pub auto_expansion_ceiling: Option<u32>,
     /// Explicit HNSW neighbour-link count. `None` preserves the compatibility
     /// profile and remains silent in rendered schema.
     #[serde(default)]
@@ -857,6 +868,11 @@ pub struct ColumnDef {
     /// Explicit HNSW query candidate-work setting. `None` preserves the
     /// compatibility profile and remains silent in rendered schema.
     pub hnsw_ef_search: Option<u32>,
+    /// Explicit HNSW search radius in millionths: how far past its beam's
+    /// edge distance a walk keeps expanding. `None` keeps the compatibility
+    /// default, 0.02 (20,000).
+    #[serde(default)]
+    pub hnsw_search_radius_millionths: Option<u32>,
     /// Durable desired topology revision. AUTO_INDEX_AT and EF_SEARCH do not
     /// advance it; M and EF_CONSTRUCTION changes do.
     #[serde(default)]
@@ -950,9 +966,13 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let max_partitions = seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let search_mode = seq.next_element::<VectorSearchMode>()?.unwrap_or_default();
                 let auto_index_at = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let flat_below = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let auto_expansion_ceiling = seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let hnsw_m = seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let hnsw_ef_construction = seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let hnsw_ef_search = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let hnsw_search_radius_millionths =
+                    seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let vector_policy_revision = seq
                     .next_element::<u64>()?
                     .unwrap_or(DEFAULT_VECTOR_POLICY_REVISION);
@@ -980,9 +1000,12 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     max_partitions,
                     search_mode,
                     auto_index_at,
+                    flat_below,
+                    auto_expansion_ceiling,
                     hnsw_m,
                     hnsw_ef_construction,
                     hnsw_ef_search,
+                    hnsw_search_radius_millionths,
                     vector_policy_revision,
                     consolidation_change_percent,
                     consolidation_tombstone_percent,
@@ -1012,9 +1035,12 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut max_partitions: Option<Option<u32>> = None;
                 let mut search_mode: Option<VectorSearchMode> = None;
                 let mut auto_index_at: Option<Option<u32>> = None;
+                let mut flat_below: Option<Option<u32>> = None;
+                let mut auto_expansion_ceiling: Option<Option<u32>> = None;
                 let mut hnsw_m: Option<Option<u32>> = None;
                 let mut hnsw_ef_construction: Option<Option<u32>> = None;
                 let mut hnsw_ef_search: Option<Option<u32>> = None;
+                let mut hnsw_search_radius_millionths: Option<Option<u32>> = None;
                 let mut vector_policy_revision: Option<u64> = None;
                 let mut consolidation_change_percent: Option<Option<u32>> = None;
                 let mut consolidation_tombstone_percent: Option<Option<u32>> = None;
@@ -1040,9 +1066,16 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "max_partitions" => max_partitions = Some(map.next_value()?),
                         "search_mode" => search_mode = Some(map.next_value()?),
                         "auto_index_at" => auto_index_at = Some(map.next_value()?),
+                        "flat_below" => flat_below = Some(map.next_value()?),
+                        "auto_expansion_ceiling" => {
+                            auto_expansion_ceiling = Some(map.next_value()?)
+                        }
                         "hnsw_m" => hnsw_m = Some(map.next_value()?),
                         "hnsw_ef_construction" => hnsw_ef_construction = Some(map.next_value()?),
                         "hnsw_ef_search" => hnsw_ef_search = Some(map.next_value()?),
+                        "hnsw_search_radius_millionths" => {
+                            hnsw_search_radius_millionths = Some(map.next_value()?)
+                        }
                         "vector_policy_revision" => {
                             vector_policy_revision = Some(map.next_value()?)
                         }
@@ -1083,9 +1116,13 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     max_partitions: max_partitions.unwrap_or_default(),
                     search_mode: search_mode.unwrap_or_default(),
                     auto_index_at: auto_index_at.unwrap_or_default(),
+                    flat_below: flat_below.unwrap_or_default(),
+                    auto_expansion_ceiling: auto_expansion_ceiling.unwrap_or_default(),
                     hnsw_m: hnsw_m.unwrap_or_default(),
                     hnsw_ef_construction: hnsw_ef_construction.unwrap_or_default(),
                     hnsw_ef_search: hnsw_ef_search.unwrap_or_default(),
+                    hnsw_search_radius_millionths: hnsw_search_radius_millionths
+                        .unwrap_or_default(),
                     vector_policy_revision: vector_policy_revision
                         .unwrap_or(DEFAULT_VECTOR_POLICY_REVISION),
                     consolidation_change_percent: consolidation_change_percent.unwrap_or_default(),
@@ -1115,9 +1152,12 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "max_partitions",
             "search_mode",
             "auto_index_at",
+            "flat_below",
+            "auto_expansion_ceiling",
             "hnsw_m",
             "hnsw_ef_construction",
             "hnsw_ef_search",
+            "hnsw_search_radius_millionths",
             "vector_policy_revision",
             "consolidation_change_percent",
             "consolidation_tombstone_percent",
@@ -1320,6 +1360,36 @@ impl StateMachineConstraint {
     }
 }
 
+/// Parse a declared HNSW `SEARCH_RADIUS`: a decimal from 0 through 2 with at
+/// most six decimal places, held exactly in millionths. `None` refuses it.
+pub fn parse_search_radius_millionths(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 6
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || (raw.contains('.') && fraction.is_empty())
+    {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?;
+    let fraction = format!("{fraction:0<6}").parse::<u64>().ok()?;
+    let millionths = whole.checked_mul(1_000_000)?.checked_add(fraction)?;
+    (millionths <= 2_000_000).then_some(millionths as u32)
+}
+
+/// Render a search radius held in millionths as its shortest exact decimal.
+pub fn render_search_radius_millionths(millionths: u32) -> String {
+    let whole = millionths / 1_000_000;
+    let fraction = millionths % 1_000_000;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let fraction = format!("{fraction:06}");
+    format!("{whole}.{}", fraction.trim_end_matches('0'))
+}
+
 impl ColumnDef {
     /// The cap this declaration enforces. Unpartitioned columns have no cap;
     /// a partitioned declaration whose SQL omitted `MAX_PARTITIONS` gets the
@@ -1461,9 +1531,12 @@ mod vector_declaration_tests {
             max_partitions: Some(32),
             search_mode: VectorSearchMode::Indexed,
             auto_index_at: None,
+            flat_below: None,
+            auto_expansion_ceiling: None,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
+            hnsw_search_radius_millionths: None,
             vector_policy_revision: DEFAULT_VECTOR_POLICY_REVISION,
             consolidation_change_percent: None,
             consolidation_tombstone_percent: None,

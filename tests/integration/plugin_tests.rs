@@ -1313,7 +1313,7 @@ fn p23_on_sync_push_filters_rows() {
 
     // Get changeset and call on_sync_push directly on the plugin
     // (tests plugin behavior, not the SyncClient transport path)
-    let mut cs = db.changes_since(Lsn(0));
+    let mut cs = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(
         cs.rows.iter().any(|r| r.table == "secret_items"),
         "changeset must contain secret_items BEFORE on_sync_push"

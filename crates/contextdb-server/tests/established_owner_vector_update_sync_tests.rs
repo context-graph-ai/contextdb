@@ -48,7 +48,8 @@ async fn hub(root: &Path, tenant: &str) -> Hub {
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -73,7 +74,8 @@ impl Hub {
 fn edge(root: &Path, name: &str, ticket: &str, tenant: &str) -> (Arc<Database>, SyncClient) {
     let db = Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open edge"));
     db.execute("CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3)) SYNC CONFLICT KEEP LATEST", &HashMap::new()).expect("edge schema");
-    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant));
+    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     (db, client)
 }
 

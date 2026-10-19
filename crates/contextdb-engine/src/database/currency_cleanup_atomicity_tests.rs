@@ -1,6 +1,7 @@
 //! A currency cleanup crash cannot orphan vectors or commit-index entries.
 
 use super::*;
+include!("durable_test_observations.rs");
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use tempfile::TempDir;
 
@@ -148,7 +149,7 @@ fn assert_clean(db: &Database, obsolete_lsns: &[Lsn], untouched: &serde_json::Va
     let persistence = db.persistence.as_ref().unwrap();
     for table in ["currency_vectors", "currency_scalar"] {
         assert_eq!(persistence.load_relational_table(table).unwrap().len(), 1);
-        assert_eq!(db.relational_store.tables.read()[table].len(), 1);
+        assert_eq!(durable_observation::version_count(db, table), 1);
     }
     let vectors = persistence.load_vectors().unwrap();
     let memberships = persistence.load_vector_partition_memberships().unwrap();
@@ -346,7 +347,16 @@ fn currency_cleanup_storage_errors_keep_memory_and_disk_available_for_retry() {
         let before = durable_state(&db);
         let memory_rows = serde_json::to_value(&*db.relational_store.tables.read()).unwrap();
         let memory_log = serde_json::to_value(&*db.change_log.read()).unwrap();
-        let memory_directory = db.vector_store.raw_directory_entries();
+        let vector_fixture_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_1 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
+        let memory_directory = db
+            .vector_store
+            .raw_directory_entries(&mut vector_fixture_copy_1)
+            .expect("read or publish the admitted vector fixture");
         let charged = db.accountant().usage().used;
         crate::persistence::arm_currency_reclaim_fault_for_test(boundary, false);
         let error = db.compact_currency_versions().unwrap_err();
@@ -364,7 +374,18 @@ fn currency_cleanup_storage_errors_keep_memory_and_disk_available_for_retry() {
             serde_json::to_value(&*db.change_log.read()).unwrap(),
             memory_log
         );
-        assert_eq!(db.vector_store.raw_directory_entries(), memory_directory);
+        let vector_fixture_reader_2 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_2 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
+        assert_eq!(
+            db.vector_store
+                .raw_directory_entries(&mut vector_fixture_copy_2)
+                .expect("read or publish the admitted vector fixture"),
+            memory_directory
+        );
         assert_eq!(db.accountant().usage().used, charged);
         let report = db.compact_currency_versions().unwrap();
         assert_eq!(report.pruned_versions, 2 * (VERSIONS - 1));
@@ -402,7 +423,7 @@ fn currency_cleanup_reclaims_eligible_generations_at_its_durable_boundary() {
         }
         db.run_maintenance_cycle().unwrap();
         let snapshot = db.snapshot();
-        let pin = db.pin_snapshot(snapshot);
+        let pin = db.pin_snapshot(snapshot).unwrap();
         for v in [0.25, 0.5] {
             db.execute(
                 "UPDATE items SET v = $v WHERE id = 0",

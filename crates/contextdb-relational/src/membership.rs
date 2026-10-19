@@ -487,12 +487,12 @@ mod tests {
             let limit = self.limit.load(AtomicOrdering::SeqCst);
             if bytes > limit.saturating_sub(self.used()) {
                 return Err(Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.to_owned(),
-                    operation: operation.to_owned(),
+                    subsystem: subsystem.to_owned().into(),
+                    operation: operation.to_owned().into(),
                     requested_bytes: bytes,
                     available_bytes: limit.saturating_sub(self.used()),
                     budget_limit_bytes: limit,
-                    hint: hint.to_owned(),
+                    hint: hint.to_owned().into(),
                 });
             }
             self.used.fetch_add(bytes, AtomicOrdering::SeqCst);

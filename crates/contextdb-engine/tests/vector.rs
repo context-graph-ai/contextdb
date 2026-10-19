@@ -1,9 +1,17 @@
+#[path = "vector/a_broad_filter_examines_rows_within_the_breadth.rs"]
+mod a_broad_filter_examines_rows_within_the_breadth;
+#[path = "vector/a_damaged_index_refuses_only_reads_that_consume_its_postings.rs"]
+mod a_damaged_index_refuses_only_reads_that_consume_its_postings;
+#[path = "vector/a_damaged_saved_graph_page_refuses_only_its_route.rs"]
+mod a_damaged_saved_graph_page_refuses_only_its_route;
 #[path = "vector/a_declared_breadth_gets_exactly_its_approved_budget.rs"]
 mod a_declared_breadth_gets_exactly_its_approved_budget;
 #[path = "vector/a_declared_graph_degree_loads_when_its_memory_fits.rs"]
 mod a_declared_graph_degree_loads_when_its_memory_fits;
 #[path = "vector/a_declared_serving_cache_is_honoured.rs"]
 mod a_declared_serving_cache_is_honoured;
+#[path = "vector/a_disconnected_graph_partition_is_compared_exactly.rs"]
+mod a_disconnected_graph_partition_is_compared_exactly;
 #[path = "vector/a_filtered_scope_is_charged_for_its_candidates.rs"]
 mod a_filtered_scope_is_charged_for_its_candidates;
 #[path = "vector/a_find_answers_a_full_page_when_a_candidate_is_withdrawn.rs"]
@@ -22,13 +30,24 @@ mod a_graph_search_stays_inside_its_serving_cache;
 #[path = "vector/a_replaced_vector_cannot_end_a_tied_frontier.rs"]
 mod a_replaced_vector_cannot_end_a_tied_frontier;
 #[cfg(unix)]
+#[path = "vector/a_replaced_vector_tied_frontier_walk_diagnostic.rs"]
+mod a_replaced_vector_tied_frontier_walk_diagnostic;
+#[path = "vector/a_row_checked_find_keeps_recall_and_refusals.rs"]
+mod a_row_checked_find_keeps_recall_and_refusals;
+#[cfg(unix)]
 #[path = "vector/a_saved_graph_load_checks_its_bytes_once.rs"]
 mod a_saved_graph_load_checks_its_bytes_once;
 #[cfg(unix)]
 #[path = "vector/a_saved_graph_search_reports_its_distance_work.rs"]
 mod a_saved_graph_search_reports_its_distance_work;
+#[path = "vector/a_store_reopens_after_every_vector_maintenance_commit.rs"]
+mod a_store_reopens_after_every_vector_maintenance_commit;
+#[path = "vector/a_synced_vector_policy_change_keeps_the_receivers_graphs.rs"]
+mod a_synced_vector_policy_change_keeps_the_receivers_graphs;
 #[path = "vector/a_tied_frontier_cannot_hide_a_smaller_row.rs"]
 mod a_tied_frontier_cannot_hide_a_smaller_row;
+#[path = "vector/a_tied_frontier_walk_diagnostic.rs"]
+mod a_tied_frontier_walk_diagnostic;
 #[cfg(unix)]
 #[path = "vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs"]
 mod a_wide_find_admits_every_partition_when_serving_pages_give_way;
@@ -48,13 +67,22 @@ mod auto_chooses_the_cheaper_route_for_each_partition;
 mod auto_decides_the_route_once_for_the_whole_scope;
 #[path = "vector/auto_pays_what_indexed_pays.rs"]
 mod auto_pays_what_indexed_pays;
+#[cfg(feature = "nightly-tests")]
+#[path = "vector/continuous_writers_hold_throughput_and_reader_latency.rs"]
+mod continuous_writers_hold_throughput_and_reader_latency;
 #[cfg(unix)]
 #[path = "vector/each_layer_a_wide_find_loads_keeps_its_share.rs"]
 mod each_layer_a_wide_find_loads_keeps_its_share;
 #[path = "vector/equal_distance_rows_keep_canonical_order_across_contexts.rs"]
 mod equal_distance_rows_keep_canonical_order_across_contexts;
+#[path = "vector/every_graph_route_reaches_every_row.rs"]
+mod every_graph_route_reaches_every_row;
 #[path = "vector/first_filtered_search_in_a_fresh_reader_uses_the_saved_graph.rs"]
 mod first_filtered_search_in_a_fresh_reader_uses_the_saved_graph;
+#[path = "vector/flat_route_below_declared_threshold.rs"]
+mod flat_route_below_declared_threshold;
+#[path = "vector/flat_route_crossover_diagnostic.rs"]
+mod flat_route_crossover_diagnostic;
 #[path = "vector/graph_build_distance_evaluations_stay_under_the_ratchet.rs"]
 mod graph_build_distance_evaluations_stay_under_the_ratchet;
 #[path = "vector/graph_route_profile_quality.rs"]
@@ -63,20 +91,34 @@ mod graph_route_profile_quality;
 mod indexed_route_does_less_work_than_exact;
 #[path = "fixtures/maintained_search/mod.rs"]
 mod maintained_search;
+#[path = "vector/multi_context_auto_route_diagnostic.rs"]
+mod multi_context_auto_route_diagnostic;
+#[path = "vector/multi_partition_union_recall_beam_diagnostic.rs"]
+mod multi_partition_union_recall_beam_diagnostic;
 #[path = "vector/multi_partition_union_recovers_nearest_rows.rs"]
 mod multi_partition_union_recovers_nearest_rows;
 #[path = "vector/named_vector_planner_tests.rs"]
 mod named_vector_planner_tests;
 #[path = "vector/one_search_covers_every_layer_on_both_routes.rs"]
 mod one_search_covers_every_layer_on_both_routes;
+#[path = "vector/passive_explain_predicts_the_executed_auto_route.rs"]
+mod passive_explain_predicts_the_executed_auto_route;
 #[path = "vector/public_row_apis_honor_quantized_columns.rs"]
 mod public_row_apis_honor_quantized_columns;
 #[path = "vector/quantized_vector_read_agreement.rs"]
 mod quantized_vector_read_agreement;
+#[path = "vector/restamped_group_rescoring_stays_inside_the_breadth_allowance.rs"]
+mod restamped_group_rescoring_stays_inside_the_breadth_allowance;
 #[path = "vector/retained_indexed_rows.rs"]
 mod retained_indexed_rows;
 #[path = "vector/row_delete_and_guards_honor_vector_columns.rs"]
 mod row_delete_and_guards_honor_vector_columns;
+#[path = "vector/rows_sharing_a_graph_point_answer_per_row.rs"]
+mod rows_sharing_a_graph_point_answer_per_row;
+#[path = "vector/search_radius_and_expansion_ceiling_are_declared_policy.rs"]
+mod search_radius_and_expansion_ceiling_are_declared_policy;
+#[path = "vector/single_context_search_radius_work_diagnostic.rs"]
+mod single_context_search_radius_work_diagnostic;
 #[path = "vector/the_owner_doors_run_one_search_over_every_layer.rs"]
 mod the_owner_doors_run_one_search_over_every_layer;
 #[path = "vector/vector_delete_only_journal_progress_contract.rs"]
@@ -169,3 +211,13 @@ mod what_the_approved_budget_does_to_one_large_context;
 mod where_one_partition_spends_its_find;
 #[path = "vector/writer_residency_attribution.rs"]
 mod writer_residency_attribution;
+
+#[path = "vector/a_ranked_file_route_read_holds_bounded_memory.rs"]
+mod a_ranked_file_route_read_holds_bounded_memory;
+#[path = "vector/a_ranked_search_answers_the_same_on_every_read_route.rs"]
+mod a_ranked_search_answers_the_same_on_every_read_route;
+#[path = "vector/a_write_transactions_vector_copies_are_funded_by_the_writer.rs"]
+mod a_write_transactions_vector_copies_are_funded_by_the_writer;
+#[cfg(unix)]
+#[path = "vector/paged_generation_load_pricing_contract.rs"]
+mod paged_generation_load_pricing_contract;

@@ -6,8 +6,8 @@
 //! what was committed since. A find over many Contexts is answered by ONE
 //! search: one bounded candidate budget spent best-first over one frontier and
 //! one result heap, across every non-empty layer of every admitted Context.
-//! That has to hold on the owner route, whose graphs are resident, exactly as
-//! on the file route, whose sealed graphs are paged -- and it has to hold in
+//! That has to hold on the owner route exactly as on the file route, whose
+//! sealed graphs are paged -- and it has to hold in
 //! the ordinary window after a commit, when a Context carries a live tail. A
 //! Context that falls back to its own per-layer walks spends a whole breadth
 //! per layer per Context again, which is the defect the one search exists to
@@ -205,9 +205,14 @@ fn seed(db: &Database, extra_tail: usize) {
     drive_maintenance(
         db,
         |db| {
+            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
             let ready = db
                 .vector_store_for_test()
-                .partition_infos(&index())
+                .partition_infos(&index(), &mut partition_observation_owner_1)
                 .expect("inspect partition readiness");
             ready.len() == contexts && ready.iter().all(|info| info.graph_available)
         },
@@ -241,6 +246,29 @@ fn seed(db: &Database, extra_tail: usize) {
             db,
             SEEN - 1,
             tail + TAIL_ROWS..tail + TAIL_ROWS + extra_tail,
+        );
+    }
+    for context in 0..contexts {
+        let suffix = db
+            .inspect_captured_vector_suffix_for_test(
+                &partition(context),
+                db.snapshot(),
+                db.declared_reader_memory()
+                    .expect("admit the suffix reader"),
+                &mut || Ok(()),
+            )
+            .expect("inspect the captured suffix")
+            .expect("each seeded Context has its committed suffix");
+        assert!(suffix.points >= TAIL_ROWS);
+        let status = db
+            .vector_store_for_test()
+            .partition_graph_generation_status(&partition(context))
+            .expect("each seeded Context has a partition");
+        assert_eq!(status.fresh_tail_entries, 0);
+        assert!(
+            db.vector_store_for_test()
+                .with_partition_fresh_tail(&partition(context), |graph| graph.len())
+                .is_none()
         );
     }
 }
@@ -295,7 +323,9 @@ fn nonempty_layers(store: &VectorStore, context: usize) -> usize {
         .expect("every seeded Context has a partition");
     usize::from(status.base.is_some() || status.dormant_base.is_some())
         + usize::from(status.change.is_some() || status.dormant_change.is_some())
-        + usize::from(status.fresh_tail_entries != 0)
+        // `seed` inspected the actual captured suffix under an operation
+        // reader. It is deliberately not a resident mutable graph.
+        + 1
 }
 
 fn every_context() -> Vec<usize> {
@@ -380,7 +410,8 @@ fn check_route(
     };
 
     // (a) Every non-empty layer of every admitted Context is opened by the one
-    // search, and the budget is the same however many Contexts it admits.
+    // request. INDEXED gives each admitted index its declared cap, so the
+    // request reports their aggregate rather than a made-up global cap.
     let open_query = scattered(999_983);
     let narrow = ask("one Context", &[0], open_query.clone(), true);
     let wide = ask("every Context", &every_context(), open_query, true);
@@ -399,14 +430,25 @@ fn check_route(
             ));
         }
     }
-    if let (Some((_, narrow)), Some((_, wide))) = (&narrow, &wide)
-        && narrow.budget != wide.budget
-    {
-        failures.borrow_mut().push(format!(
-            "{route}: the budget is one search's, not one per Context: {} at one Context, {} \
-             at {SEEN}",
-            narrow.budget, wide.budget
-        ));
+    if let (Some((_, narrow)), Some((_, wide))) = (&narrow, &wide) {
+        let per_index_cap = narrow
+            .resolved_ef_search
+            .saturating_mul(narrow.layer_zero_degree);
+        // EF_SEARCH 100 times the layer-0 degree: twice M = 16, plus the links
+        // that keep every point reachable from the entry point.
+        let declared_cap = 100 * (32 + contextdb_vector::hnsw::LAYER0_REACHABILITY_LINKS);
+        if narrow.budget != declared_cap
+            || narrow.budget != per_index_cap
+            || wide.budget != SEEN * per_index_cap
+        {
+            failures.borrow_mut().push(format!(
+                "{route}: INDEXED gives each index its declared cap: expected {declared_cap} \
+                 for one Context and {} for {SEEN}, got {} and {}; receipts {narrow:?} {wide:?}",
+                SEEN * per_index_cap,
+                narrow.budget,
+                wide.budget
+            ));
+        }
     }
 
     // (b) The nearest row lives only in a sealed change, then only in a live

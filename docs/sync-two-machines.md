@@ -15,6 +15,9 @@ On machine A, run a sync hub — a `contextdb-server` process the edges dial int
 contextdb-server --db-path hub.db --tenant-id demo
 ```
 
+A hub requires a durable store: `--db-path` names the file it keeps its state in, and an in-memory
+store is not a supported hub (it serves only as a test fixture).
+
 On startup it prints an enrollment ticket and the exact command an edge runs to connect (substitute your own database path for `<client-db-path>`):
 
 ```text
@@ -85,6 +88,17 @@ Both edges now hold the same two rows, converged through the hub. `.sync status`
 ## Restart durability
 
 The hub keeps its identity in `<db-path>.fabric-identity.key` next to the database file (here, `hub.db.fabric-identity.key`). Restarting the hub reuses that key, so the same ticket — and every edge already pinned to it — keeps working. Back this file up like a credential; never commit it to source control.
+
+## Memory accounting
+
+Fetching delivery outcomes is charged to the reading store's declared reader memory on both sides.
+Each page stops at the reader's `cursor_page_bytes` (and never exceeds the transport's 64 MiB frame),
+and a fetch the reader cannot fund is refused with a typed memory refusal before its bytes are
+allocated.
+<!-- enforced by: crates/contextdb-engine/src/sync_server/native_delivery_tests.rs::every_hub_admission_site_refuses_before_its_allocation -->
+Two things sit outside this accounting: the Iroh networking stack's own buffers and connection
+state, and tracing output. Each accepted connection also keeps one small fixed task frame, bounded
+by the hub's pre-admission connection limit (128 by default).
 
 
 ## Manifested application units

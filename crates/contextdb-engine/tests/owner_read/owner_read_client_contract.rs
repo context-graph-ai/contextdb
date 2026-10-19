@@ -98,12 +98,14 @@ fn multiple_chunks_remain_private_until_terminal_success() {
     // that are not a canonical result are refused at terminal assembly by the
     // same framing contract this journey lives beside, so staging them would
     // make the journey prove nothing about privacy-until-terminal-success.
-    let result = QueryResult {
-        columns: vec!["payload".to_owned()],
-        rows: vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]],
-        rows_affected: 0,
-        trace: QueryTrace::scan(),
-        cascade: None,
+    let result = {
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = vec!["payload".to_owned()];
+        query_fixture.rows = vec![vec![Value::Text("x".repeat(MAX_FRAME_BYTES + 512))]];
+        query_fixture.rows_affected = 0;
+        query_fixture.trace = QueryTrace::scan();
+        query_fixture.cascade = None;
+        query_fixture
     };
     let canonical = encode_query_result(&result).expect("encode the route-neutral result");
     let responses =

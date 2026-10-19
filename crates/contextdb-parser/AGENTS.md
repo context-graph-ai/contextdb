@@ -12,8 +12,17 @@ Owns `src/grammar.pest` (the pest grammar), `src/ast.rs` (every `Statement` and 
 `src/parser.rs` (`parse()`: raw-text pre-checks, then pest, then AST builders), and
 `src/classification.rs` (`statement_effect()` — whether a statement needs a writable store, and
 `select_contains_vector_similarity`). The pre-checks refuse unsupported features by name before
-pest runs: `CREATE PROCEDURE/FUNCTION`, `WITH RECURSIVE`, `GROUP BY`, window `OVER`, full-text
-`MATCH`; `validate_select_body` then refuses a vector ordering without `LIMIT`.
+pest runs: `CREATE PROCEDURE/FUNCTION`, `WITH RECURSIVE`, full-text `MATCH`;
+`validate_select_body` then refuses a vector ordering without `LIMIT`. A window parses only as
+`ROW_NUMBER() OVER ([PARTITION BY cols] ORDER BY cols [ASC|DESC])` into `Expr::RowNumber`;
+`build_window_call` refuses every other window form by name with
+`WindowFunctionNotSupported { form }`. A statement naming
+`GROUP BY` parses only in one shape (`is_grouped_count`): `COUNT(*)` and grouped plain columns
+from one table, the WHERE clause only `col = literal|parameter` / `col IS NULL` conjuncts, no
+CTE, join, `DISTINCT`, `ORDER BY`, `LIMIT` or vector clause. Every other statement naming it —
+`HAVING`, `SUM`/`COUNT(col)` per group, a subquery or CTE body — keeps the exact
+`ParseError("GROUP BY is not supported")`. Whether the table maintains a count over those columns
+is the engine's decision.
 
 The vector declaration grammar lives here, as syntax only. On a `VECTOR(n)` column, after
 `WITH (quantization = ...)`, the clauses come in this fixed order, each at most once:
@@ -23,7 +32,8 @@ The vector declaration grammar lives here, as syntax only. On a `VECTOR(n)` colu
 `ALTER TABLE t ALTER COLUMN c SET MAX_PARTITIONS | SEARCH_MODE | AUTO_INDEX_AT | HNSW (...)|DEFAULT
 | CONSOLIDATION ...|DEFAULT`. Queries take `ORDER BY col <=> q [USE VECTOR mode] [USE RANK name]
 LIMIT k`. Store-level forms: `SET/SHOW MAINTENANCE_POLL_INTERVAL` (`MILLISECONDS|SECONDS`),
-`SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT n [OFFSET m]]`, `SHOW VECTOR_INDEXES`.
+`SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT n [OFFSET m]]`, `SHOW VECTOR_INDEXES`,
+and read-classified `SHOW CONTENT_SIZE` (the engine defines its file-backed scope).
 
 Must not own: meaning. Whether `MAX_PARTITIONS` without `PARTITION_KEY` is legal, whether a column
 exists, whether a mode fits the column — those are the engine's semantic validation. Plan choice
@@ -51,6 +61,7 @@ to register `:memory:` session callbacks).
 | Vector-similarity detection follows nested queries and ignores string text | `tests/vector_partition_syntax_contract.rs::shared_vector_query_detection_follows_nested_queries_and_ignores_text` |
 | A vector ordering without `LIMIT` is refused | `tests/parser_tests.rs::rejection_unbounded_vector_search` |
 | Unsupported SQL is refused by name | `tests/parser_tests.rs::rejection_recursive_cte`, `::rejection_window_functions`, `::rejection_stored_procs`, `::rejection_full_text_match_operator` |
+| A `GROUP BY` outside the grouped `COUNT(*)` shape keeps the exact established refusal before planning | `crates/contextdb-engine/tests/read/read_session_application_contract.rs::legacy_execute_preserves_the_exact_parse_error_before_planning_or_pull` |
 | `PURGE` is its own statement, not a `DELETE` | `tests/purge_parser_contract_tests.rs::purge_from_where_parses_as_distinct_statement` |
 | The removed conflict-policy statements stay parse errors | `tests/legacy_conflict_policy_ddl_tests.rs::legacy_global_set_sync_conflict_policy_is_a_parse_error` |
 | A `WRITE` substring in a comment or quoted label does not split a scope-label list | `tests/scope_label_write_keyword_word_boundary_tests.rs::comment_containing_write_substring_inside_read_list_does_not_corrupt_labels` |

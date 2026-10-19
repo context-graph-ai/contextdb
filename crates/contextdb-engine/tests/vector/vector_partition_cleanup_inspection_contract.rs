@@ -191,7 +191,7 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
     }
 
     let snapshot = db.snapshot();
-    let pin = db.pin_snapshot(snapshot);
+    let pin = db.pin_snapshot(snapshot).unwrap();
     let refusal = db
         .execute(
             "UPDATE partition_items SET scope = 'charlie' WHERE id = $id",
@@ -507,9 +507,15 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
     for (id, scope, query) in expected {
         let key = VectorPartitionKey::from_values(&[Value::Text(scope.to_owned())])
             .expect("scope has a canonical partition key");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let info = db
             .vector_store_for_test()
-            .partition_info(&index, &key)
+            .partition_info(&index, &key, &mut partition_observation_owner_1)
+            .unwrap()
             .expect("the live partition keeps its inspection state");
         assert!(
             info.graph_available,
@@ -575,7 +581,7 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     )
     .expect("seed the sole partition");
 
-    let pin = db.pin_snapshot(db.snapshot());
+    let pin = db.pin_snapshot(db.snapshot()).unwrap();
     db.execute(
         "DELETE FROM retained_partition_items WHERE id = $id",
         &params(vec![("id", Value::Uuid(alpha))]),
@@ -665,7 +671,7 @@ fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_sta
         "two partitions built for one vector column count as one built index"
     );
 
-    let held = db.pin_snapshot(db.snapshot());
+    let held = db.pin_snapshot(db.snapshot()).unwrap();
     db.execute(
         "DELETE FROM retirement_items WHERE id = $id",
         &params(vec![("id", Value::Uuid(alpha))]),
@@ -810,7 +816,7 @@ fn explicit_storage_compaction_cannot_retire_the_index_needed_by_a_pinned_old_sn
         1
     );
     let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
+    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
     db.execute(
         "DELETE FROM snapshot_items WHERE id = $id",
         &params(vec![("id", Value::Uuid(id))]),

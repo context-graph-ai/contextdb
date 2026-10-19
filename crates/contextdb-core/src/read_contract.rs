@@ -5,10 +5,17 @@
 //! route and transport layers that consume this vocabulary.
 
 use crate::Value;
+use crate::read_memory::{
+    NativeCancellationCallback, OwnedReadBox, ReadCredit, ReadMemoryOwner, ReadShared,
+};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::marker::PhantomPinned;
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +54,9 @@ impl ReadLimits {
     pub const SHIPPED_RESULT_BYTES: u64 = 4 * MIB;
     pub const SHIPPED_MEMORY: u64 = 16 * MIB;
     pub const SHIPPED_CURSOR_PAGE_BYTES: u64 = MIB;
+    /// Number of caller-held snapshot registrations prepaid by an open store.
+    /// Further registrations use declared reader memory.
+    pub const SHIPPED_SNAPSHOT_PIN_SLOTS: usize = 64;
 
     pub fn validate(&self) -> Result<(), ReadContractViolation> {
         for (value, field) in [
@@ -474,154 +484,326 @@ pub trait DeadlineClock: Send + Sync + 'static {
     fn now_ms(&self) -> u64;
 
     fn wait_until(&self, deadline_ms: u64) -> DeadlineWait<'_>;
+
+    #[doc(hidden)]
+    fn try_native_source(
+        &self,
+        _standing: &ReadMemoryOwner,
+    ) -> crate::Result<Option<OwnedReadBox<dyn NativeDeadlineSource>>> {
+        Ok(None)
+    }
 }
 
-/// A callback registered to run the moment a read is cancelled.
-type CancellationCallback = Arc<dyn Fn() + Send + Sync>;
+/// Synchronous parking on the driver caller's already-owned thread. A call
+/// performs at most one kernel wait, returning on wake, interruption or timeout.
+/// The lease retains the original paid wake control, never a host Waker.
+#[doc(hidden)]
+pub trait NativeDriverPark: crate::read_memory::NativeReadWake {
+    fn park(&self) -> crate::Result<()>;
+    fn park_for_ms(&self, ms: u64) -> crate::Result<()>;
+    fn wake_lease(&self) -> crate::read_memory::NativeReadWakeLease;
+}
 
+/// A clock-authored native producer with no worker or independent time origin.
+/// All time decisions use the binding's supplied clock; implementations only
+/// park the caller for the remaining interval or register in that same clock.
+#[doc(hidden)]
+pub trait NativeDeadlineSource: Send + Sync {
+    fn park_until(
+        &self,
+        now_ms: u64,
+        deadline_ms: u64,
+        park: &dyn NativeDriverPark,
+    ) -> crate::Result<()>;
+}
+
+/// The supplied clock and its own admitted producer remain one time domain.
+/// Source destruction precedes release of the clock alias; no worker exists.
+/// This inline value must itself live in its consumer's admitted frame/root.
+#[doc(hidden)]
+pub struct NativeClockBinding {
+    source: OwnedReadBox<dyn NativeDeadlineSource>,
+    clock: Arc<dyn DeadlineClock>,
+}
+impl NativeClockBinding {
+    #[doc(hidden)]
+    pub fn try_select(
+        clock: &Arc<dyn DeadlineClock>,
+        standing: &ReadMemoryOwner,
+    ) -> crate::Result<Self> {
+        let source = clock
+            .try_native_source(standing)?
+            .ok_or(crate::Error::ReadSessionNotImplemented)?;
+        if !source.is_funded_by(standing) {
+            return Err(crate::Error::ReadSessionNotImplemented);
+        }
+        Ok(Self {
+            source,
+            clock: Arc::clone(clock),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    #[doc(hidden)]
+    pub fn park_until(&self, deadline_ms: u64, park: &dyn NativeDriverPark) -> crate::Result<()> {
+        let now_ms = self.clock.now_ms();
+        if now_ms >= deadline_ms {
+            return Ok(());
+        }
+        self.source.park_until(now_ms, deadline_ms, park)
+    }
+}
+
+/// Host callbacks retain the public caller's existing allocation contract.
+type CancellationCallback = Arc<dyn Fn() + Send + Sync>;
+#[derive(Clone)]
+enum ListenerCallback {
+    Host(CancellationCallback),
+    Paid(NativeCancellationCallback),
+}
+impl ListenerCallback {
+    fn call(&self) {
+        match self { Self::Host(told) => told(), Self::Paid(told) => told.call() }
+    }
+}
+struct ListenerNode {
+    identity: u64,
+    born: u64,
+    retired: Option<u64>,
+    callback: ListenerCallback,
+    next: Option<ListenerStorage>,
+}
+// Box deallocation precedes original credit release, also on payload unwind.
+struct ListenerStorage {
+    node: Box<ListenerNode>,
+    _credit: Option<ReadCredit>,
+}
+#[derive(Default)]
+struct ListenerDirectory {
+    head: Option<ListenerStorage>,
+    epoch: u64,
+    snapshots: usize,
+}
+impl ListenerDirectory {
+    fn advance(&mut self) -> u64 {
+        self.epoch = self.epoch.checked_add(1).expect("cancellation listener epoch exhausted");
+        self.epoch
+    }
+    fn sweep(&mut self) -> RetiredListeners {
+        let mut removed = RetiredListeners(None);
+        if self.snapshots != 0 { return removed; }
+        let mut link = &mut self.head;
+        while link.is_some() {
+            if link.as_ref().unwrap().node.retired.is_some() {
+                let mut old = link.take().unwrap();
+                *link = old.node.next.take();
+                old.node.next = removed.0.take();
+                removed.0 = Some(old);
+            } else {
+                link = &mut link.as_mut().unwrap().node.next;
+            }
+        }
+        removed
+    }
+}
+struct RetiredListeners(Option<ListenerStorage>);
+impl Drop for RetiredListeners {
+    fn drop(&mut self) {
+        while let Some(mut entry) = self.0.take() {
+            self.0 = entry.node.next.take();
+            drop(entry);
+        }
+    }
+}
+impl Drop for ListenerDirectory {
+    fn drop(&mut self) { drop(RetiredListeners(self.head.take())); }
+}
 struct CancellationToken {
     cancelled: AtomicBool,
     identity: u64,
-    /// Who has asked to be told the moment this token is cancelled.
-    ///
-    /// A caller that is blocked waiting on something else -- a reply from
-    /// another process, say -- cannot notice a flag being set. Watching it
-    /// would mean waking up to look, over and over, at a rate nobody can
-    /// choose well: too often and the waiting costs more than the read, too
-    /// rarely and the caller keeps working long after it was told to stop. So
-    /// the cancellation tells THEM, once, on the thread that cancelled.
-    told_on_cancel: Mutex<Vec<(u64, CancellationCallback)>>,
+    listeners: Mutex<ListenerDirectory>,
+    owner: Option<ReadMemoryOwner>,
 }
-
-impl std::fmt::Debug for CancellationToken {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CancellationToken")
-            .field("cancelled", &self.cancelled)
-            .field("identity", &self.identity)
-            .finish_non_exhaustive()
+impl CancellationToken {
+    fn new(owner: Option<ReadMemoryOwner>) -> Self {
+        Self { cancelled: AtomicBool::new(false),
+            identity: NEXT_CANCELLATION_IDENTITY.fetch_add(1, Ordering::SeqCst),
+            listeners: Mutex::new(ListenerDirectory::default()), owner }
     }
 }
-
+impl std::fmt::Debug for CancellationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancellationToken").field("cancelled", &self.cancelled)
+            .field("identity", &self.identity).finish_non_exhaustive()
+    }
+}
+#[derive(Debug, Clone)]
+enum CancellationTokenHandle {
+    Host(Arc<CancellationToken>),
+    Paid(crate::read_memory::ReadPaidArc<CancellationToken>),
+}
+impl std::ops::Deref for CancellationTokenHandle {
+    type Target = CancellationToken;
+    fn deref(&self) -> &CancellationToken {
+        match self { Self::Host(token) => token, Self::Paid(token) => token }
+    }
+}
 static NEXT_CANCELLATION_IDENTITY: AtomicU64 = AtomicU64::new(1);
 static NEXT_CANCELLATION_LISTENER: AtomicU64 = AtomicU64::new(1);
 
-/// Registration for being told when a read is cancelled, which stops being
-/// told when it is dropped.
-///
-/// The registration is tied to one operation, not to the token: a token
-/// outlives the request it interrupted, and a listener that outlived its own
-/// request would act on a later cancellation about work it no longer has.
+/// The registration retains its token and ends only this listener on drop.
 pub struct CancellationListener {
-    token: Arc<CancellationToken>,
+    token: CancellationTokenHandle,
     listener: u64,
 }
-
 impl std::fmt::Debug for CancellationListener {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CancellationListener")
-            .field("listener", &self.listener)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancellationListener").field("listener", &self.listener)
             .finish_non_exhaustive()
     }
 }
-
 impl Drop for CancellationListener {
     fn drop(&mut self) {
-        let mut listeners = self
-            .token
-            .told_on_cancel
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        listeners.retain(|(identity, _)| *identity != self.listener);
+        let retired = {
+            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            let epoch = directory.advance();
+            let mut entry = directory.head.as_mut();
+            while let Some(current) = entry {
+                if current.node.identity == self.listener {
+                    current.node.retired = Some(epoch);
+                    break;
+                }
+                entry = current.node.next.as_mut();
+            }
+            directory.sweep()
+        };
+        // Caller-owned callback destructors never run under the directory lock.
+        drop(retired);
     }
 }
-
+struct CancellationSnapshot<'a> {
+    token: &'a CancellationToken,
+    epoch: u64,
+    cursor: u64,
+}
+impl CancellationSnapshot<'_> {
+    fn next(&mut self) -> Option<ListenerCallback> {
+        let directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+        let mut entry = directory.head.as_ref();
+        let mut selected: Option<&ListenerNode> = None;
+        while let Some(current) = entry {
+            let node = &current.node;
+            if node.born > self.cursor && node.born <= self.epoch
+                && node.retired.is_none_or(|retired| retired > self.epoch)
+                && selected.is_none_or(|old| node.born < old.born)
+            { selected = Some(node); }
+            entry = node.next.as_ref();
+        }
+        let selected = selected.map(|node| (node.born, node.callback.clone()));
+        drop(directory);
+        selected.map(|(born, callback)| { self.cursor = born; callback })
+    }
+}
+impl Drop for CancellationSnapshot<'_> {
+    fn drop(&mut self) {
+        let retired = {
+            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            directory.snapshots -= 1;
+            directory.sweep()
+        };
+        drop(retired);
+    }
+}
 #[derive(Debug, Clone)]
 pub struct OwnerReadCancellation {
-    token: Arc<CancellationToken>,
+    token: CancellationTokenHandle,
 }
-
-impl Default for OwnerReadCancellation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+impl Default for OwnerReadCancellation { fn default() -> Self { Self::new() } }
 impl OwnerReadCancellation {
     pub fn new() -> Self {
-        Self {
-            token: Arc::new(CancellationToken {
-                cancelled: AtomicBool::new(false),
-                identity: NEXT_CANCELLATION_IDENTITY.fetch_add(1, Ordering::SeqCst),
-                told_on_cancel: Mutex::new(Vec::new()),
-            }),
-        }
+        Self { token: CancellationTokenHandle::Host(Arc::new(CancellationToken::new(None))) }
     }
-
+    /// Original concrete token and independent final-consumer invoice blocks.
+    #[doc(hidden)]
+    pub fn funded_bytes() -> usize {
+        crate::read_memory::ReadPaidArc::<CancellationToken>::bytes()
+    }
+    #[doc(hidden)]
+    pub fn from_prepaid(owner: ReadMemoryOwner, invoice: ReadCredit) -> Self {
+        if !invoice.is_funded_by(&owner) {
+            panic!("cancellation invoice belongs to another owner");
+        }
+        Self { token: CancellationTokenHandle::Paid(
+            crate::read_memory::ReadPaidArc::from_prepaid(CancellationToken::new(Some(owner)), invoice)) }
+    }
+    /// Private standing-refusal reuse: all old strong aliases retire first.
+    /// There is no raw or Weak token escape and no reservation is refunded.
+    #[doc(hidden)]
+    pub fn rearm_standing(&mut self) {
+        let CancellationTokenHandle::Paid(token) = &mut self.token else {
+            panic!("standing cancellation requires original funding");
+        };
+        let token = token.wait_unique();
+        let owner = token.owner.clone();
+        *token = CancellationToken::new(owner);
+    }
     pub fn cancel(&self) {
         self.token.cancelled.store(true, Ordering::SeqCst);
-        // Taken out from under the lock and called with nothing held: a
-        // listener is caller code, it may send, wait, or take locks of its
-        // own, and it must not be able to hold up the next thing this token
-        // has to tell somebody.
-        let listeners: Vec<_> = {
-            let listeners = self
-                .token
-                .told_on_cancel
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            listeners.iter().map(|(_, told)| Arc::clone(told)).collect()
+        let mut snapshot = {
+            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            directory.snapshots = directory.snapshots.checked_add(1)
+                .expect("cancellation snapshot count exhausted");
+            CancellationSnapshot { token: &self.token, epoch: directory.epoch, cursor: 0 }
         };
-        for told in listeners {
-            told();
-        }
+        // Exactly the listeners present at capture, in registration order.
+        // Recursive/concurrent cancellation requires no new snapshot allocation.
+        while let Some(told) = snapshot.next() { told.call(); }
     }
-
-    /// Ask to be told the moment this read is cancelled.
-    ///
-    /// A caller blocked on something that is not this token -- waiting for
-    /// another process to reply, most of all -- cannot see a flag being set.
-    /// This is how it hears instead. A token that has ALREADY been cancelled
-    /// tells the new listener immediately, so a registration can never fall
-    /// into the gap between the cancellation and itself. The registration
-    /// ends when the returned value is dropped.
-    pub fn tell_on_cancel(&self, told: impl Fn() + Send + Sync + 'static) -> CancellationListener {
-        let told: Arc<dyn Fn() + Send + Sync> = Arc::new(told);
+    fn register(&self, callback: ListenerCallback, credit: Option<ReadCredit>) -> CancellationListener {
         let listener = NEXT_CANCELLATION_LISTENER.fetch_add(1, Ordering::SeqCst);
+        let mut entry = ListenerStorage { node: Box::new(ListenerNode {
+            identity: listener, born: 0, retired: None, callback: callback.clone(), next: None,
+        }), _credit: credit };
         {
-            let mut listeners = self
-                .token
-                .told_on_cancel
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            listeners.push((listener, Arc::clone(&told)));
+            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            entry.node.born = directory.advance();
+            entry.node.next = directory.head.take();
+            directory.head = Some(entry);
         }
-        let registration = CancellationListener {
-            token: Arc::clone(&self.token),
-            listener,
-        };
-        if self.is_cancelled() {
-            told();
-        }
+        let registration = CancellationListener { token: self.token.clone(), listener };
+        if self.is_cancelled() { callback.call(); }
         registration
     }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.token.cancelled.load(Ordering::SeqCst)
+    /// Public caller-supplied listeners retain their host-funded API and
+    /// infallible signature. Internal owned listeners use the private companion.
+    pub fn tell_on_cancel(&self, told: impl Fn() + Send + Sync + 'static) -> CancellationListener {
+        self.register(ListenerCallback::Host(Arc::new(told)), None)
     }
-
-    /// Which token this is.
-    ///
-    /// Clones of one token share an identity because they are one token; two
-    /// separately minted tokens never do. That is what lets a caller show
-    /// that the read it started is the read its own cancel would stop, rather
-    /// than some other read that merely also finished. The number is minted
-    /// with the token rather than read off where it happens to live, so a
-    /// token that has been released cannot lend its name to the next one.
-    pub fn identity(&self) -> u64 {
-        self.token.identity
+    /// Admit actual callback and list-node layouts on the token's original
+    /// payer before either allocation. Legacy host tokens keep their host path.
+    #[doc(hidden)]
+    pub fn try_tell_on_cancel<F: Fn() + Send + Sync + 'static>(&self, told: F) -> crate::Result<CancellationListener> {
+        let Some(owner) = self.token.owner.clone() else { return Ok(self.tell_on_cancel(told)); };
+        let callback_bytes = ReadShared::<F>::layout().size();
+        let mut invoice = ReadCredit::try_new_owned(owner,
+            callback_bytes + std::mem::size_of::<ListenerNode>(), "reader", "cancellation_listener",
+            "Reduce simultaneous read listeners or raise the declared reader limit.")?;
+        let callback = invoice.try_split_off(callback_bytes)?;
+        let callback = match ReadShared::try_from_prepaid(told, callback) {
+            Ok(callback) => callback.into_cancellation_callback(),
+            // The released public constructor uses Arc::new. Preserve its
+            // allocator-error path; admission refusal above remains fallible.
+            Err(_) => std::alloc::handle_alloc_error(ReadShared::<F>::layout()),
+        };
+        Ok(self.register(ListenerCallback::Paid(callback), Some(invoice)))
     }
+    pub fn is_cancelled(&self) -> bool { self.token.cancelled.load(Ordering::SeqCst) }
+    /// Clones retain one identity; separately minted tokens never share it.
+    pub fn identity(&self) -> u64 { self.token.identity }
 }
 
 pub trait OwnerRequestHandler: Send + Sync {
@@ -631,6 +813,625 @@ pub trait OwnerRequestHandler: Send + Sync {
         request: &[u8],
         cancel: &OwnerReadCancellation,
     ) -> crate::Result<Vec<u8>>;
+}
+
+/// The native cancellation capability is internal to the admitted read route.
+/// It cannot be made from, converted into, or substituted for the public
+/// Legacy cancellation token.
+#[doc(hidden)]
+pub struct NativeReadCancellation {
+    token: ReadShared<NativeCancellationToken>,
+}
+
+impl Clone for NativeReadCancellation {
+    fn clone(&self) -> Self {
+        Self {
+            token: self.token.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for NativeReadCancellation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReadCancellation")
+            .field("identity", &self.identity())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A native handler receives the authentic original cancellation capability
+/// and owner. There is intentionally no Legacy adapter or default method.
+#[doc(hidden)]
+pub trait NativeOwnerRequestHandler: Send + Sync {
+    fn handle_native(
+        &self,
+        namespace: &str,
+        request: &[u8],
+        cancel: &NativeReadCancellation,
+        owner: ReadMemoryOwner,
+    ) -> crate::Result<OwnedReadBox<[u8]>>;
+}
+
+static NEXT_NATIVE_CANCELLATION_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+impl NativeReadCancellation {
+    /// Inspect the original cancellation control's funder without conversion.
+    #[doc(hidden)]
+    pub fn is_funded_by(&self, owner: &ReadMemoryOwner) -> bool {
+        self.token.owner.same_owner(owner)
+    }
+
+    #[doc(hidden)]
+    pub fn try_new(owner: ReadMemoryOwner) -> crate::Result<Self> {
+        let identity = NEXT_NATIVE_CANCELLATION_IDENTITY
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| crate::Error::NativeCancellationIdentityExhausted)?;
+        let invoice = ReadCredit::try_new_owned(
+            owner.clone(),
+            ReadShared::<NativeCancellationToken>::layout().size(),
+            "reader",
+            "native cancellation token",
+            "admit the original cancellation control before publishing it",
+        )?;
+        let token = ReadShared::try_from_prepaid(
+            NativeCancellationToken {
+                cancelled: AtomicBool::new(false),
+                identity,
+                owner,
+                directory: Mutex::new(NativeListenerDirectory::default()),
+            },
+            invoice,
+        )?;
+        Ok(Self { token })
+    }
+
+    /// Native companion of `try_new`: admission, allocation and identity
+    /// exhaustion refuse with a `NativeRefusal`, without an owned diagnostic.
+    #[doc(hidden)]
+    pub fn try_new_native(
+        owner: ReadMemoryOwner,
+    ) -> std::result::Result<Self, crate::read_memory::NativeRefusal> {
+        use crate::read_memory::NativeRefusal;
+        let identity = NEXT_NATIVE_CANCELLATION_IDENTITY
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| NativeRefusal::Other("native cancellation identity exhausted"))?;
+        let invoice = ReadCredit::try_new_owned_native(
+            owner.clone(),
+            ReadShared::<NativeCancellationToken>::layout().size(),
+            "reader",
+            "native cancellation token",
+            "admit the original cancellation control before publishing it",
+        )?;
+        let token = ReadShared::try_from_prepaid_native(
+            NativeCancellationToken {
+                cancelled: AtomicBool::new(false),
+                identity,
+                owner,
+                directory: Mutex::new(NativeListenerDirectory::default()),
+            },
+            invoice,
+        )?;
+        Ok(Self { token })
+    }
+
+    pub fn cancel(&self) {
+        self.token.cancelled.store(true, Ordering::SeqCst);
+        // Pin the stack record before it is linked. Its borrowed token keeps
+        // the token body alive for the record's entire linked lifetime.
+        let snapshot = NativeCancellationSnapshot::new(&self.token);
+        let mut snapshot = std::pin::pin!(snapshot);
+        snapshot.as_mut().link_and_capture();
+        while let Some(callback) = snapshot.as_mut().take_next_callback() {
+            // No callback or callback Drop runs under the directory mutex.
+            callback.call();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn identity(&self) -> u64 {
+        self.token.identity
+    }
+
+    pub fn try_tell_on_cancel<F>(&self, told: F) -> crate::Result<NativeCancellationListener>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        // Admit both escaping cells before allocating either one or changing
+        // membership. Any refusal drops the original callback before credit.
+        let callback_credit = ReadCredit::try_new_owned(
+            self.token.owner.clone(),
+            ReadShared::<F>::layout().size(),
+            "reader",
+            "native cancellation callback",
+            "admit the callback before registration",
+        )?;
+        let node_credit = ReadCredit::try_new_owned(
+            self.token.owner.clone(),
+            ReadShared::<NativeListenerNode>::layout().size(),
+            "reader",
+            "native cancellation listener",
+            "admit the listener node before registration",
+        )?;
+        let callback =
+            ReadShared::try_from_prepaid(told, callback_credit)?.into_cancellation_callback();
+        let node = ReadShared::try_from_prepaid(NativeListenerNode::new(callback), node_credit)?;
+        {
+            let mut directory = lock_directory(&self.token);
+            directory.append(node.clone());
+        }
+        let listener = NativeCancellationListener {
+            token: self.token.clone(),
+            node,
+        };
+        // Linking precedes the SeqCst check, preserving the Legacy immediate
+        // and registration/cancel race semantics (including duplicate calls).
+        let callback = {
+            let _directory = lock_directory(&self.token);
+            listener.node.callback_clone()
+        };
+        if self.is_cancelled()
+            && let Some(callback) = callback
+        {
+            callback.call();
+        }
+        Ok(listener)
+    }
+}
+
+/// Inline registration guard; it retains the token and its node instead of a
+/// finite listener identity.
+#[doc(hidden)]
+pub struct NativeCancellationListener {
+    token: ReadShared<NativeCancellationToken>,
+    node: ReadShared<NativeListenerNode>,
+}
+
+impl Drop for NativeCancellationListener {
+    fn drop(&mut self) {
+        retire_node(&self.token, &self.node);
+    }
+}
+
+struct NativeCancellationToken {
+    cancelled: AtomicBool,
+    identity: u64,
+    owner: ReadMemoryOwner,
+    directory: Mutex<NativeListenerDirectory>,
+}
+
+impl Drop for NativeCancellationToken {
+    fn drop(&mut self) {
+        // Borrowed snapshots retain this token, so no linked stack record can
+        // remain. Detach the strong chain iteratively; callback/node Drops are
+        // outside the mutex and ReadShared frees before each original refund.
+        let next = {
+            let directory = self.directory.get_mut().unwrap_or_else(|p| p.into_inner());
+            directory.tail = None;
+            directory.newest = None;
+            directory.head.take()
+        };
+        let mut drain = NativeTokenDrain { next };
+        while drain.drain_one() {}
+    }
+}
+
+struct NativeTokenDrain {
+    next: Option<ReadShared<NativeListenerNode>>,
+}
+
+impl NativeTokenDrain {
+    fn drain_one(&mut self) -> bool {
+        let Some(node) = self.next.take() else {
+            return false;
+        };
+        let (following, callback) = {
+            // SAFETY: final token destruction is the sole remaining node
+            // access path: listeners retain the token, and linked snapshots
+            // borrow it. No shared ReadShared dereference grants &mut access;
+            // this raw access is justified by that sole destruction state.
+            let data = unsafe { &mut *node.data.get() };
+            (data.next.take(), data.callback.take())
+        };
+        // Set the remainder first: if callback Drop panics, this stack guard
+        // continues the iterative teardown during unwind. A second panic keeps
+        // Rust's ordinary abort behavior rather than fabricating recovery.
+        self.next = following;
+        drop(callback);
+        drop(node);
+        true
+    }
+}
+
+impl Drop for NativeTokenDrain {
+    fn drop(&mut self) {
+        while self.drain_one() {}
+    }
+}
+
+#[derive(Default)]
+struct NativeListenerDirectory {
+    head: Option<ReadShared<NativeListenerNode>>,
+    tail: Option<NonNull<NativeListenerNode>>,
+    newest: Option<NonNull<NativeSnapshotRecord>>,
+}
+
+// SAFETY: the directory's non-owning node and stack-record pointers are read
+// or changed only while NativeCancellationToken::directory holds its mutex.
+// Node ownership stays in the forward ReadShared chain, and snapshots unlink
+// their pinned records before their stack storage expires. The directory itself
+// is never shared without that mutex.
+unsafe impl Send for NativeListenerDirectory {}
+
+impl NativeListenerDirectory {
+    fn append(&mut self, node: ReadShared<NativeListenerNode>) {
+        let node_ptr = NonNull::from(&*node);
+        // SAFETY: directory mutex is held by every caller; tail is a node in
+        // the strong chain and no raw node capability escapes that mutex.
+        if let Some(tail) = self.tail {
+            unsafe { (*tail.as_ref().data.get()).next = Some(node) };
+        } else {
+            self.head = Some(node);
+        }
+        self.tail = Some(node_ptr);
+    }
+}
+
+struct NativeListenerNode {
+    data: UnsafeCell<NativeListenerNodeData>,
+}
+
+struct NativeListenerNodeData {
+    next: Option<ReadShared<NativeListenerNode>>,
+    registered: bool,
+    retired_through: Option<NonNull<NativeSnapshotRecord>>,
+    callback: Option<NativeCancellationCallback>,
+}
+
+// SAFETY: directory locking is the sole access path to the UnsafeCell and no
+// raw node capability is exposed outside this module.
+unsafe impl Send for NativeListenerNode {}
+unsafe impl Sync for NativeListenerNode {}
+
+impl NativeListenerNode {
+    fn new(callback: NativeCancellationCallback) -> Self {
+        Self {
+            data: UnsafeCell::new(NativeListenerNodeData {
+                next: None,
+                registered: true,
+                retired_through: None,
+                callback: Some(callback),
+            }),
+        }
+    }
+
+    fn callback_clone(&self) -> Option<NativeCancellationCallback> {
+        // SAFETY: callers hold the directory mutex; callback cloning only
+        // increments the same ReadShared ownership and does not invoke user code.
+        unsafe { (&*self.data.get()).callback.clone() }
+    }
+}
+
+struct NativeCancellationSnapshot<'a> {
+    token: &'a NativeCancellationToken,
+    record: UnsafeCell<NativeSnapshotRecord>,
+    _pin: PhantomPinned,
+}
+
+struct NativeSnapshotRecord {
+    newer: Option<NonNull<NativeSnapshotRecord>>,
+    older: Option<NonNull<NativeSnapshotRecord>>,
+    next: Option<NonNull<NativeListenerNode>>,
+    last: Option<NonNull<NativeListenerNode>>,
+    linked: bool,
+}
+
+impl<'a> NativeCancellationSnapshot<'a> {
+    fn new(token: &'a NativeCancellationToken) -> Self {
+        Self {
+            token,
+            record: UnsafeCell::new(NativeSnapshotRecord {
+                newer: None,
+                older: None,
+                next: None,
+                last: None,
+                linked: false,
+            }),
+            _pin: PhantomPinned,
+        }
+    }
+
+    fn link_and_capture(self: Pin<&mut Self>) {
+        let mut directory = lock_directory(self.token);
+        // SAFETY: this record was pinned by cancel before linking; every raw
+        // snapshot pointer is read or written only while this mutex is held.
+        unsafe {
+            let record = &mut *self.record.get();
+            let record_ptr = NonNull::from(&mut *record);
+            record.older = directory.newest;
+            if let Some(newest) = directory.newest {
+                (*newest.as_ptr()).newer = Some(record_ptr);
+            }
+            record.next = directory.head.as_deref().map(NonNull::from);
+            record.last = directory.tail;
+            record.linked = true;
+            directory.newest = Some(record_ptr);
+        }
+    }
+
+    fn take_next_callback(self: Pin<&mut Self>) -> Option<NativeCancellationCallback> {
+        let _directory = lock_directory(self.token);
+        // SAFETY: the pinned record and all node pointer traversal occur under
+        // the directory mutex. Advancing next before unlock makes the passed
+        // node unavailable to later snapshot traversal/reclamation checks.
+        unsafe {
+            let record = &mut *self.record.get();
+            loop {
+                let node = record.next?;
+                let data = &mut *node.as_ref().data.get();
+                let is_last = record.last == Some(node);
+                record.next = if is_last {
+                    record.last = None;
+                    None
+                } else {
+                    data.next.as_deref().map(NonNull::from)
+                };
+                if node_eligible(record, data)
+                    && let Some(callback) = data.callback.clone()
+                {
+                    return Some(callback);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for NativeCancellationSnapshot<'_> {
+    fn drop(&mut self) {
+        {
+            let mut directory = lock_directory(self.token);
+            // SAFETY: cutoff rewrite happens before unlink while each pointer
+            // is protected by the directory mutex; no stack pointer survives.
+            unsafe { unlink_snapshot(&mut directory, self.record.get()) };
+        }
+        reclaim_retired(self.token);
+    }
+}
+
+fn lock_directory(
+    token: &NativeCancellationToken,
+) -> std::sync::MutexGuard<'_, NativeListenerDirectory> {
+    token
+        .directory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn node_eligible(record: &NativeSnapshotRecord, data: &NativeListenerNodeData) -> bool {
+    if data.registered {
+        return true;
+    }
+    let mut cutoff = data.retired_through;
+    while let Some(current) = cutoff {
+        if std::ptr::eq(current.as_ptr(), record) {
+            return true;
+        }
+        // SAFETY: record pointers are live only in the mutex-protected active
+        // snapshot list, and this caller holds that mutex.
+        cutoff = unsafe { current.as_ref().older };
+    }
+    false
+}
+
+fn retire_node(token: &NativeCancellationToken, node: &ReadShared<NativeListenerNode>) {
+    {
+        let directory = lock_directory(token);
+        // SAFETY: raw node access is under the directory mutex. The cutoff is
+        // the active newest record, never an address-derived ordering.
+        unsafe {
+            let data = &mut *node.data.get();
+            if !data.registered {
+                return;
+            }
+            data.registered = false;
+            data.retired_through = directory.newest;
+        }
+    }
+    reclaim_retired(token);
+}
+
+/// Returns whether an active snapshot can still reach this node. This must be
+/// checked before either detaching the tombstone or retiring its callback.
+unsafe fn snapshot_contains(
+    record: NonNull<NativeSnapshotRecord>,
+    needle: NonNull<NativeListenerNode>,
+) -> bool {
+    // SAFETY: callers hold the directory mutex; next/last delimit the live
+    // interval and no physical node free occurs while any interval contains it.
+    unsafe {
+        let record = record.as_ref();
+        let mut current = record.next;
+        while let Some(node) = current {
+            if node == needle {
+                return true;
+            }
+            if Some(node) == record.last {
+                break;
+            }
+            current = (*node.as_ref().data.get())
+                .next
+                .as_deref()
+                .map(NonNull::from);
+        }
+        false
+    }
+}
+
+unsafe fn any_snapshot_contains(
+    directory: &NativeListenerDirectory,
+    node: NonNull<NativeListenerNode>,
+) -> bool {
+    // SAFETY: all record links are protected by the directory mutex.
+    unsafe {
+        let mut record = directory.newest;
+        while let Some(current) = record {
+            if snapshot_contains(current, node) {
+                return true;
+            }
+            record = current.as_ref().older;
+        }
+        false
+    }
+}
+
+/// Returns whether an active snapshot can still invoke this retired callback.
+/// An ineligible snapshot retains its cursor/node lifetime but cannot retain
+/// the callback itself.
+unsafe fn any_eligible_snapshot_contains(
+    directory: &NativeListenerDirectory,
+    node: NonNull<NativeListenerNode>,
+    data: &NativeListenerNodeData,
+) -> bool {
+    // SAFETY: all record links and callback membership inputs are protected by
+    // the directory mutex held by the caller.
+    unsafe {
+        let mut record = directory.newest;
+        while let Some(current) = record {
+            let snapshot = current.as_ref();
+            if snapshot_contains(current, node) && node_eligible(snapshot, data) {
+                return true;
+            }
+            record = snapshot.older;
+        }
+        false
+    }
+}
+
+enum NativeReclaimed {
+    Callback(NativeCancellationCallback),
+    Node(ReadShared<NativeListenerNode>),
+}
+
+fn reclaim_retired(token: &NativeCancellationToken) {
+    let mut guard = NativeReclaimGuard {
+        token,
+        complete: false,
+    };
+    loop {
+        let reclaimed = {
+            let mut directory = lock_directory(token);
+            // SAFETY: every raw node/snapshot pointer below is reached and
+            // modified only while the directory mutex is held. We take one
+            // object then release the lock before any callback/node Drop.
+            unsafe { take_one_reclaimable(&mut directory) }
+        };
+        match reclaimed {
+            Some(NativeReclaimed::Callback(callback)) => drop(callback),
+            Some(NativeReclaimed::Node(node)) => drop(node),
+            None => {
+                guard.complete = true;
+                return;
+            }
+        }
+    }
+}
+
+struct NativeReclaimGuard<'a> {
+    token: &'a NativeCancellationToken,
+    complete: bool,
+}
+
+impl Drop for NativeReclaimGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            // A callback/node destructor panicked after its object had been
+            // detached. Continue reclaiming the remaining tombstones during
+            // unwind; a second panic preserves normal process abort behavior.
+            reclaim_retired(self.token);
+        }
+    }
+}
+
+unsafe fn take_one_reclaimable(directory: &mut NativeListenerDirectory) -> Option<NativeReclaimed> {
+    let mut link: *mut Option<ReadShared<NativeListenerNode>> = &mut directory.head;
+    let mut previous = None;
+    // SAFETY: caller holds the directory mutex. This pointer is either the
+    // directory head or a node's next field, and never escapes the lock.
+    unsafe {
+        while let Some(node) = (*link).as_ref().cloned() {
+            let node_ptr = NonNull::from(&*node);
+            let data = &mut *node.data.get();
+            if !data.registered {
+                // A callback's lifetime is independent of the traversal
+                // tombstone: an ineligible snapshot preserves its cursor but
+                // cannot invoke this callback.
+                if !any_eligible_snapshot_contains(directory, node_ptr, data)
+                    && let Some(callback) = data.callback.take()
+                {
+                    return Some(NativeReclaimed::Callback(callback));
+                }
+                // Keep the tombstone until every active traversal has passed
+                // it, including snapshots for which it is not eligible.
+                if !any_snapshot_contains(directory, node_ptr) {
+                    let detached = (*link).take().expect("linked node exists");
+                    // SAFETY: the directory mutex excludes every other node
+                    // mutation; detachment leaves this cell inaccessible from
+                    // the chain before its ReadShared owner is dropped.
+                    let next = (*detached.data.get()).next.take();
+                    *link = next;
+                    if directory.tail == Some(node_ptr) {
+                        directory.tail = previous;
+                    }
+                    return Some(NativeReclaimed::Node(detached));
+                }
+            }
+            previous = Some(node_ptr);
+            link = &mut data.next;
+        }
+    }
+    None
+}
+
+unsafe fn unlink_snapshot(
+    directory: &mut NativeListenerDirectory,
+    record_ptr: *mut NativeSnapshotRecord,
+) {
+    // SAFETY: caller holds the directory mutex and record_ptr belongs to the
+    // still-pinned stack snapshot. Rewrite every cutoff before unlinking it.
+    unsafe {
+        let record = &mut *record_ptr;
+        if !record.linked {
+            return;
+        }
+        let record_non_null = NonNull::new_unchecked(record_ptr);
+        let mut node = directory.head.as_deref().map(NonNull::from);
+        while let Some(current) = node {
+            let data = &mut *current.as_ref().data.get();
+            if data.retired_through == Some(record_non_null) {
+                data.retired_through = record.older;
+            }
+            node = data.next.as_deref().map(NonNull::from);
+        }
+        if let Some(older) = record.older {
+            older.as_ptr().as_mut().expect("active snapshot").newer = record.newer;
+        }
+        if let Some(newer) = record.newer {
+            newer.as_ptr().as_mut().expect("active snapshot").older = record.older;
+        } else {
+            directory.newest = record.older;
+        }
+        record.newer = None;
+        record.older = None;
+        record.next = None;
+        record.last = None;
+        record.linked = false;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -818,7 +1619,15 @@ pub struct HeldByWriterDetail {
 /// merely that something was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerRouteUnsupportedDetail {
-    pub inspection: String,
+    #[serde(deserialize_with = "deserialize_static_diagnostic")]
+    pub inspection: Cow<'static, str>,
+}
+
+fn deserialize_static_diagnostic<'de, D>(deserializer: D) -> Result<Cow<'static, str>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Cow::Owned)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -842,10 +1651,53 @@ pub enum ReadFailureConstructionError {
     InvalidHeldByReadersDetail(ReadContractViolation),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadFailure {
     kind: ReadFailureKind,
+    detail: ReadFailureStorage,
+}
+
+#[derive(Clone)]
+enum ReadFailureStorage {
+    Inline(ReadFailureDetail),
+    Funded(ReadShared<FundedReadFailureDetail>),
+}
+
+struct FundedReadFailureDetail {
+    // Field order keeps the original backing invoice live through String Drop.
     detail: ReadFailureDetail,
+    _reason_credit: ReadCredit,
+}
+
+impl Clone for ReadFailure {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind,
+            detail: self.detail.clone(),
+        }
+    }
+}
+impl std::fmt::Debug for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadFailure")
+            .field("kind", &self.kind)
+            .field("detail", self.detail())
+            .finish()
+    }
+}
+impl PartialEq for ReadFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.detail() == other.detail()
+    }
+}
+impl Eq for ReadFailure {}
+impl Serialize for ReadFailure {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ReadFailure", 2)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("detail", self.detail())?;
+        state.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -907,13 +1759,16 @@ impl ReadFailure {
                 .map_err(ReadFailureConstructionError::InvalidHeldByReadersDetail)?;
         }
 
-        Ok(Self { kind, detail })
+        Ok(Self {
+            kind,
+            detail: ReadFailureStorage::Inline(detail),
+        })
     }
 
     pub const fn owner_limit_exceeded(detail: OwnerLimitExceededDetail) -> Self {
         Self {
             kind: ReadFailureKind::OwnerLimitExceeded,
-            detail: ReadFailureDetail::OwnerLimitExceeded(detail),
+            detail: ReadFailureStorage::Inline(ReadFailureDetail::OwnerLimitExceeded(detail)),
         }
     }
 
@@ -923,7 +1778,7 @@ impl ReadFailure {
     pub const fn invalid_continuation(reason: String) -> Self {
         Self {
             kind: ReadFailureKind::InvalidContinuation,
-            detail: ReadFailureDetail::Reason { reason },
+            detail: ReadFailureStorage::Inline(ReadFailureDetail::Reason { reason }),
         }
     }
 
@@ -932,7 +1787,7 @@ impl ReadFailure {
     pub const fn cursor_already_open(reason: String) -> Self {
         Self {
             kind: ReadFailureKind::CursorAlreadyOpen,
-            detail: ReadFailureDetail::Reason { reason },
+            detail: ReadFailureStorage::Inline(ReadFailureDetail::Reason { reason }),
         }
     }
 
@@ -943,26 +1798,28 @@ impl ReadFailure {
     pub const fn declared_principal_refused(reason: String) -> Self {
         Self {
             kind: ReadFailureKind::DeclaredPrincipalRefused,
-            detail: ReadFailureDetail::Reason { reason },
+            detail: ReadFailureStorage::Inline(ReadFailureDetail::Reason { reason }),
         }
     }
 
     /// A refusal whose answer is that the route this was asked on does not
     /// answer this inspection, carrying the stable word for the inspection so
     /// the caller learns which question was refused.
-    pub const fn owner_route_unsupported(inspection: String) -> Self {
+    pub const fn owner_route_unsupported(inspection: Cow<'static, str>) -> Self {
         Self {
             kind: ReadFailureKind::OwnerRouteUnsupported,
-            detail: ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-                inspection,
-            }),
+            detail: ReadFailureStorage::Inline(ReadFailureDetail::OwnerRouteUnsupported(
+                OwnerRouteUnsupportedDetail {
+                    inspection,
+                },
+            )),
         }
     }
 
     pub const fn cursor_expired(expiry: CursorExpiryKind) -> Self {
         Self {
             kind: ReadFailureKind::CursorExpired,
-            detail: ReadFailureDetail::CursorExpired { expiry },
+            detail: ReadFailureStorage::Inline(ReadFailureDetail::CursorExpired { expiry }),
         }
     }
 
@@ -975,6 +1832,88 @@ impl ReadFailure {
         )
     }
 
+    /// Construct an engine diagnostic with exact backing and shared-control
+    /// invoices from its original reader. The producer must stay within capacity.
+    #[doc(hidden)]
+    pub fn try_funded_reason(
+        kind: ReadFailureKind,
+        owner: ReadMemoryOwner,
+        capacity: usize,
+        make: impl FnOnce(&mut String),
+    ) -> crate::Result<Self> {
+        let hint = "Raise the reader memory limit to report authoritative erasure.";
+        let reason_layout = std::alloc::Layout::array::<u8>(capacity)
+            .map_err(|_| Self::diagnostic_allocation_failure(capacity))?;
+        let reason_credit = ReadCredit::try_new_owned(
+            owner.clone(),
+            reason_layout.size(),
+            "reader",
+            "authorize_read",
+            hint,
+        )?;
+        let control_layout = ReadShared::<FundedReadFailureDetail>::layout();
+        let control_credit = ReadCredit::try_new_owned(
+            owner,
+            control_layout.size(),
+            "reader",
+            "authorize_read",
+            hint,
+        )?;
+        let detail = ReadShared::try_from_prepaid_with(control_credit, move || {
+            let reason = if capacity == 0 {
+                String::new()
+            } else {
+                // SAFETY: admission precedes this exact, nonzero byte allocation.
+                let storage = unsafe { std::alloc::alloc(reason_layout) };
+                if storage.is_null() {
+                    return Err(Self::diagnostic_allocation_failure(capacity));
+                }
+                // SAFETY: fresh byte backing, empty UTF-8, exact String layout.
+                unsafe { String::from_raw_parts(storage, 0, capacity) }
+            };
+            let mut funded = FundedReadFailureDetail {
+                detail: ReadFailureDetail::Reason { reason },
+                _reason_credit: reason_credit,
+            };
+            if let ReadFailureDetail::Reason { reason } = &mut funded.detail {
+                make(reason);
+            }
+            // Preserve the existing kind/detail validation without copying detail.
+            let checked = Self::new(kind, funded.detail)
+                .map_err(|error| crate::Error::Other(error.to_string().into()))?;
+            let ReadFailureStorage::Inline(detail) = checked.detail else {
+                unreachable!()
+            };
+            Ok(FundedReadFailureDetail {
+                detail,
+                _reason_credit: funded._reason_credit,
+            })
+        })
+        .map_err(|error| match error {
+            crate::Error::Other(ref message)
+                if message == "cannot allocate admitted shared control" =>
+            {
+                Self::diagnostic_allocation_failure(control_layout.size())
+            }
+            other => other,
+        })?;
+        Ok(Self {
+            kind,
+            detail: ReadFailureStorage::Funded(detail),
+        })
+    }
+
+    fn diagnostic_allocation_failure(bytes: usize) -> crate::Error {
+        crate::Error::MemoryBudgetExceeded {
+            subsystem: "reader".into(),
+            operation: "authorize_read".into(),
+            requested_bytes: bytes,
+            available_bytes: 0,
+            budget_limit_bytes: bytes,
+            hint: "Raise the reader memory limit to report authoritative erasure.".into(),
+        }
+    }
+
     pub const fn kind(&self) -> ReadFailureKind {
         self.kind
     }
@@ -984,7 +1923,10 @@ impl ReadFailure {
     }
 
     pub const fn detail(&self) -> &ReadFailureDetail {
-        &self.detail
+        match &self.detail {
+            ReadFailureStorage::Inline(detail) => detail,
+            ReadFailureStorage::Funded(shared) => &shared.payload_ref().detail,
+        }
     }
 }
 
@@ -996,7 +1938,7 @@ impl ReadFailureKind {
         match self {
             Self::WriteRequiresFlag => "this statement writes, so it needs a write session",
             Self::HeldByWriter => "another session holds this store for writing",
-            Self::HeldByReaders => "direct readers are hydrating this store",
+            Self::HeldByReaders => "direct readers are hydrating or finishing with this store",
             Self::OwnerNotRunning => "the owner process for this store is not running",
             Self::OwnerNotServing => "the owner process for this store is not serving reads",
             Self::OwnerUserMismatch => "the owner process for this store belongs to another user",
@@ -1087,19 +2029,19 @@ impl CursorExpiryKind {
 
 impl std::fmt::Display for ReadFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.detail {
+        match self.detail() {
             ReadFailureDetail::HeldByReaders(detail) => {
                 if detail.verified_readers.is_empty() {
                     return write!(
                         formatter,
-                        "{} direct readers are hydrating this store; retry in a moment",
+                        "{} direct readers are hydrating or finishing with this store; retry in a moment",
                         detail.observed_direct_readers
                     );
                 }
 
                 write!(
                     formatter,
-                    "{} direct readers are hydrating this store: ",
+                    "{} direct readers are hydrating or finishing with this store: ",
                     detail.observed_direct_readers
                 )?;
                 for (index, reader) in detail.verified_readers.iter().enumerate() {
@@ -1150,12 +2092,14 @@ impl std::fmt::Display for ReadFailure {
                     detail.store_path
                 ),
             },
-            ReadFailureDetail::OwnerRouteUnsupported(detail) => write!(
-                formatter,
-                "{}: {}; a direct file session answers it once no writer holds the store",
-                self.kind.stated(),
-                detail.inspection.replace('_', " ")
-            ),
+            ReadFailureDetail::OwnerRouteUnsupported(detail) => {
+                write!(formatter, "{}: ", self.kind.stated())?;
+                for (index, segment) in detail.inspection.split('_').enumerate() {
+                    if index != 0 { formatter.write_str(" ")?; }
+                    formatter.write_str(segment)?;
+                }
+                formatter.write_str("; a direct file session answers it once no writer holds the store")
+            },
             ReadFailureDetail::CursorExpired { expiry } => formatter.write_str(expiry.stated()),
             ReadFailureDetail::None => formatter.write_str(self.kind.stated()),
             ReadFailureDetail::Reason { reason } => {
@@ -1173,6 +2117,30 @@ pub struct CursorPage {
 }
 
 impl CursorPage {
+    /// Assemble a public terminal answer. Working credit belongs to the private engine page.
+    #[doc(hidden)]
+    pub fn from_parts(columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool) -> Self {
+        Self {
+            columns,
+            rows,
+            has_more,
+        }
+    }
+    /// Public terminal copies retain the HEAD payload (rulings 76/78).
+    pub fn try_clone(
+        &self,
+        _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+    ) -> crate::Result<Self> {
+        Ok(self.clone())
+    }
+    #[doc(hidden)]
+    pub fn try_empty(
+        columns: &[String],
+        _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+    ) -> crate::Result<Self> {
+        Ok(Self::from_parts(columns.to_vec(), Vec::new(), false))
+    }
+
     pub fn validate(&self) -> Result<(), ReadContractViolation> {
         for (row, values) in self.rows.iter().enumerate() {
             if values.len() != self.columns.len() {
@@ -1231,6 +2199,389 @@ impl MetadataPage {
             (true, false) => Err(ReadContractViolation::MissingMetadataContinuation),
             (false, true) => Err(ReadContractViolation::UnexpectedMetadataContinuation),
             _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_snapshot_tests {
+    use super::*;
+    use crate::read_memory::native_control_tests::{SERIAL, Watch};
+    use std::sync::atomic::AtomicUsize;
+
+    fn register_callback<F: Fn() + Send + Sync + 'static>(
+        w: &Watch,
+        token: &NativeReadCancellation,
+        callback: F,
+    ) -> NativeCancellationListener {
+        let listener = w.allocating(|| token.try_tell_on_cancel(callback)).unwrap();
+        w.assert_shared(&listener.node, &token.token.owner);
+        let _directory = lock_directory(&token.token);
+        let callback = listener.node.callback_clone().unwrap();
+        w.assert_callback::<F>(&callback, &token.token.owner);
+        drop(callback);
+        drop(_directory);
+        listener
+    }
+    fn register(
+        w: &Watch,
+        token: &NativeReadCancellation,
+        count: &Arc<AtomicUsize>,
+    ) -> NativeCancellationListener {
+        let count = count.clone();
+        register_callback(w, token, move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+    fn empty(token: &NativeReadCancellation) {
+        let d = lock_directory(&token.token);
+        assert!(
+            d.newest.is_none(),
+            "no pinned stack record survives completion or unwind"
+        );
+        assert!(d.head.is_none());
+        assert!(d.tail.is_none());
+    }
+    fn run(w: &Watch, f: impl FnOnce(&NativeReadCancellation)) {
+        let owner = w.native(false);
+        let token = w
+            .allocating(|| NativeReadCancellation::try_new(owner.clone()))
+            .unwrap();
+        assert!(token.token.owner.same_owner(&owner));
+        w.assert_shared(&token.token, &owner);
+        let clone = token.clone();
+        assert_eq!(token.identity(), clone.identity());
+        drop(clone);
+        drop(owner);
+        f(&token);
+        drop(token);
+        w.finish();
+    }
+    #[test]
+    fn native_cancellation_snapshot_rows() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let w = Watch::new("captured-membership-tombstone-and-new-tail");
+            run(&w, |token| {
+                let first_count = Arc::new(AtomicUsize::new(0));
+                let later_count = Arc::new(AtomicUsize::new(0));
+                let new_count = Arc::new(AtomicUsize::new(0));
+                let first = register(&w, token, &first_count);
+                let later = register(&w, token, &later_count);
+                let first_pointer = NonNull::from(&*first.node);
+                let later_pointer = NonNull::from(&*later.node);
+                token.token.cancelled.store(true, Ordering::SeqCst);
+                // This outer stack storage is never moved while linked. Its
+                // pinned reference ends before the stack storage is destroyed.
+                {
+                    let mut newer_storage = NativeCancellationSnapshot::new(&token.token);
+                    let mut newer = unsafe { Pin::new_unchecked(&mut newer_storage) };
+                    let before_retire = w.frees();
+                    {
+                        let older = NativeCancellationSnapshot::new(&token.token);
+                        let mut older = std::pin::pin!(older);
+                        older.as_mut().link_and_capture();
+                        std::thread::scope(|s| {
+                            s.spawn(move || drop(first)).join().unwrap();
+                        });
+                        assert_eq!(
+                            w.frees(),
+                            before_retire,
+                            "eligible captured membership retains callback and node"
+                        );
+                        newer.as_mut().link_and_capture();
+                        let new_tail = register(&w, token, &new_count);
+                        assert_eq!(
+                            new_count.load(Ordering::SeqCst),
+                            1,
+                            "cancelled token calls new registrations immediately"
+                        );
+                        {
+                            let _d = lock_directory(&token.token);
+                            // SAFETY: both pinned intervals and the mutex keep
+                            // the retired node and stack pointers alive.
+                            unsafe {
+                                assert_eq!((*newer.record.get()).last, Some(later_pointer));
+                                let data = &*first_pointer.as_ref().data.get();
+                                assert!(!data.registered);
+                                assert!(data.callback.is_some());
+                                assert!(node_eligible(&*older.record.get(), data));
+                                assert!(!node_eligible(&*newer.record.get(), data));
+                            }
+                        }
+                        older.as_mut().take_next_callback().unwrap().call();
+                        assert_eq!(first_count.load(Ordering::SeqCst), 1);
+                        // Retiring an appended tail cannot extend either capture.
+                        drop(new_tail);
+                    }
+                    {
+                        let d = lock_directory(&token.token);
+                        unsafe {
+                            assert_eq!(d.newest, Some(NonNull::new_unchecked(newer.record.get())));
+                            let data = &*first_pointer.as_ref().data.get();
+                            assert!(!data.registered);
+                            assert!(data.callback.is_none());
+                            assert!(data.retired_through.is_none());
+                            assert_eq!((*newer.record.get()).next, Some(first_pointer));
+                        }
+                    }
+                    // The actual production traversal must skip this retained
+                    // tombstone and reach the later eligible listener.
+                    newer
+                        .as_mut()
+                        .take_next_callback()
+                        .expect("ineligible tombstone must not stop later listener")
+                        .call();
+                    assert!(newer.as_mut().take_next_callback().is_none());
+                    assert_eq!(first_count.load(Ordering::SeqCst), 1);
+                    assert_eq!(later_count.load(Ordering::SeqCst), 1);
+                    assert_eq!(new_count.load(Ordering::SeqCst), 1);
+                    #[allow(
+                        clippy::drop_non_drop,
+                        reason = "the drop marks where the pinned test value goes out of scope"
+                    )]
+                    drop(newer);
+                    // The linked value drops in place here, including unwind.
+                }
+                drop(later);
+                empty(token);
+            });
+        }
+        for operation in [
+            "native cancellation token",
+            "native cancellation callback",
+            "native cancellation listener",
+        ] {
+            let w = Watch::new(operation);
+            let owner = w.native(false);
+            w.refuse(Some(operation));
+            let before = w.cells();
+            if operation == "native cancellation token" {
+                assert!(
+                    w.allocating(|| NativeReadCancellation::try_new(owner.clone()))
+                        .is_err()
+                );
+                assert_eq!(w.cells(), before);
+            } else {
+                w.refuse(None);
+                let token = w
+                    .allocating(|| NativeReadCancellation::try_new(owner.clone()))
+                    .unwrap();
+                w.refuse(Some(operation));
+                let before = w.cells();
+                assert!(w.allocating(|| token.try_tell_on_cancel(|| {})).is_err());
+                assert_eq!(
+                    w.cells(),
+                    before,
+                    "both admissions precede either allocation"
+                );
+                empty(&token);
+                drop(token);
+            }
+            w.refuse(None);
+            drop(owner);
+            w.finish();
+        }
+        {
+            let w = Watch::new("token-null-allocation");
+            let owner = w.native(false);
+            w.null(ReadShared::<NativeCancellationToken>::layout());
+            assert!(
+                w.allocating(|| NativeReadCancellation::try_new(owner.clone()))
+                    .is_err()
+            );
+            assert_eq!(w.cells(), 1);
+            drop(owner);
+            w.finish();
+        }
+        {
+            let w = Watch::new("callback-null-allocation");
+            run(&w, |token| {
+                fn null_callback<F: Fn() + Send + Sync + 'static>(
+                    w: &Watch,
+                    token: &NativeReadCancellation,
+                    f: F,
+                ) {
+                    w.null(ReadShared::<F>::layout());
+                    let before = w.cells();
+                    assert!(w.allocating(|| token.try_tell_on_cancel(f)).is_err());
+                    assert_eq!(w.cells(), before);
+                }
+                null_callback(&w, token, || {});
+                empty(token);
+            });
+        }
+        {
+            let w = Watch::new("listener-node-null-allocation");
+            run(&w, |token| {
+                w.null(ReadShared::<NativeListenerNode>::layout());
+                assert!(w.allocating(|| token.try_tell_on_cancel(|| {})).is_err());
+                empty(token);
+            });
+        }
+        {
+            let w = Watch::new("concurrent-register-unregister-cancel");
+            run(&w, |token| {
+                let count = Arc::new(AtomicUsize::new(0));
+                let listener = register(&w, token, &count);
+                let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+                let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+                let continue_rx = Mutex::new(continue_rx);
+                let blocker = w
+                    .allocating(|| {
+                        token.try_tell_on_cancel(move || {
+                            entered_tx.send(()).unwrap();
+                            continue_rx.lock().unwrap().recv().unwrap();
+                        })
+                    })
+                    .unwrap();
+                std::thread::scope(|s| {
+                    let clone = token.clone();
+                    let cancel = s.spawn(move || clone.cancel());
+                    entered_rx.recv().unwrap();
+                    drop(listener);
+                    let immediate = Arc::new(AtomicUsize::new(0));
+                    let tail = register(&w, token, &immediate);
+                    assert_eq!(immediate.load(Ordering::SeqCst), 1);
+                    drop(tail);
+                    continue_tx.send(()).unwrap();
+                    cancel.join().unwrap();
+                });
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                drop(blocker);
+                empty(token);
+            });
+        }
+        {
+            let w = Watch::new("nested-reentrant-cancel");
+            run(&w, |token| {
+                let entered = Arc::new(AtomicBool::new(false));
+                let count = Arc::new(AtomicUsize::new(0));
+                let nested_token = token.clone();
+                let entered_c = entered.clone();
+                let first = w
+                    .allocating(|| {
+                        token.try_tell_on_cancel(move || {
+                            if !entered_c.swap(true, Ordering::SeqCst) {
+                                nested_token.cancel();
+                            }
+                        })
+                    })
+                    .unwrap();
+                let later = register(&w, token, &count);
+                token.cancel();
+                assert!(entered.load(Ordering::SeqCst));
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+                assert!(lock_directory(&token.token).newest.is_none());
+                drop(first);
+                drop(later);
+                empty(token);
+            });
+        }
+        {
+            let w = Watch::new("callback-panic-stack-cutoff-restoration");
+            run(&w, |token| {
+                let listener = w
+                    .allocating(|| token.try_tell_on_cancel(|| panic!("callback invocation panic")))
+                    .unwrap();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| token.cancel()))
+                        .is_err()
+                );
+                assert!(lock_directory(&token.token).newest.is_none());
+                drop(listener);
+                empty(token);
+                let count = Arc::new(AtomicUsize::new(0));
+                let immediate = register(&w, token, &count);
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                token.cancel();
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+                drop(immediate);
+                empty(token);
+            });
+        }
+        {
+            struct PanicDrop;
+            impl Drop for PanicDrop {
+                fn drop(&mut self) {
+                    panic!("callback destructor panic");
+                }
+            }
+            let w = Watch::new("callback-drop-panic-reclamation");
+            run(&w, |token| {
+                let payload = PanicDrop;
+                let first = w
+                    .allocating(|| {
+                        token.try_tell_on_cancel(move || {
+                            std::hint::black_box(&payload);
+                        })
+                    })
+                    .unwrap();
+                let count = Arc::new(AtomicUsize::new(0));
+                let later = register(&w, token, &count);
+                // An older actual pinned interval retains both callbacks.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let snapshot = NativeCancellationSnapshot::new(&token.token);
+                    let mut snapshot = std::pin::pin!(snapshot);
+                    snapshot.as_mut().link_and_capture();
+                    drop(first);
+                    drop(later);
+                    // Leaving the scope unlinks the stack record then really
+                    // drops the retired callback outside the mutex.
+                }));
+                assert!(result.is_err());
+                assert_eq!(count.load(Ordering::SeqCst), 0);
+                empty(token);
+            });
+        }
+        for panic in [false, true] {
+            let w = Watch::new(if panic {
+                "snapshot-cutoff-panic-unlink"
+            } else {
+                "snapshot-cutoff-error-unlink"
+            });
+            run(&w, |token| {
+                let count = Arc::new(AtomicUsize::new(0));
+                let listener = register(&w, token, &count);
+                {
+                    let mut outer_storage = NativeCancellationSnapshot::new(&token.token);
+                    let mut outer = unsafe { Pin::new_unchecked(&mut outer_storage) };
+                    outer.as_mut().link_and_capture();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> crate::Result<()> {
+                            let inner = NativeCancellationSnapshot::new(&token.token);
+                            let mut inner = std::pin::pin!(inner);
+                            inner.as_mut().link_and_capture();
+                            drop(listener);
+                            if panic {
+                                panic!("snapshot body panic");
+                            }
+                            Err(crate::Error::Other("snapshot body error".into()))
+                        },
+                    ));
+                    assert_eq!(result.is_err(), panic);
+                    if !panic {
+                        assert!(result.unwrap().is_err());
+                    }
+                    {
+                        let d = lock_directory(&token.token);
+                        unsafe {
+                            assert_eq!(d.newest, Some(NonNull::new_unchecked(outer.record.get())));
+                            let node = d.head.as_ref().unwrap();
+                            assert_eq!((*node.data.get()).retired_through, d.newest);
+                            assert!((*outer.record.get()).newer.is_none());
+                        }
+                    }
+                    outer.as_mut().take_next_callback().unwrap().call();
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                    #[allow(
+                        clippy::drop_non_drop,
+                        reason = "the drop marks where the pinned test value goes out of scope"
+                    )]
+                    drop(outer);
+                }
+                empty(token);
+            });
         }
     }
 }

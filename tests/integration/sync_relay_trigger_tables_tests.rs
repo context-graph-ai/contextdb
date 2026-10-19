@@ -53,7 +53,10 @@ fn assert_table_absent(db: &Database, table: &str, reason: &str) {
 }
 
 fn assert_no_ddl_logged(db: &Database, reason: &str) {
-    let ddl = db.changes_since(Lsn(0)).ddl;
+    let ddl = db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     assert!(ddl.is_empty(), "{reason}: unexpected DDL log {ddl:?}");
 }
 
@@ -109,7 +112,9 @@ fn relay_hub_applies_combined_ddl_and_trigger_table_data_in_one_batch() {
         &widget_params(id, "w1"),
     )
     .unwrap();
-    let combined = edge.changes_since(Lsn(0));
+    let combined = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
 
     let hub = open_relay_hub();
     let res = hub.apply_changes(combined, &server_wins());
@@ -129,7 +134,9 @@ fn relay_hub_applies_combined_ddl_and_trigger_table_data_in_one_batch() {
 #[test]
 fn relay_hub_applies_data_batch_after_trigger_declared_separately() {
     let edge = open_edge_with_widget_trigger();
-    let ddl_only = edge.changes_since(Lsn(0));
+    let ddl_only = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let after_ddl = edge.current_lsn();
     let id = wuuid(2);
     edge.execute(
@@ -137,7 +144,9 @@ fn relay_hub_applies_data_batch_after_trigger_declared_separately() {
         &widget_params(id, "w2"),
     )
     .unwrap();
-    let data_only = edge.changes_since(after_ddl);
+    let data_only = edge
+        .changes_since(after_ddl)
+        .expect("read the declared changes");
 
     let hub = open_relay_hub();
     let res_ddl = hub.apply_changes(ddl_only, &server_wins());
@@ -162,7 +171,9 @@ fn strict_hub_rejects_callbackless_trigger_table_apply() {
         &widget_params(id, "w3"),
     )
     .unwrap();
-    let combined = edge.changes_since(Lsn(0));
+    let combined = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
 
     let hub = Database::open_memory();
     hub.complete_initialization().unwrap();
@@ -427,7 +438,9 @@ fn relay_apply_does_not_fabricate_trigger_cascade_rows() {
         &widget_params(id, "w5"),
     )
     .unwrap();
-    let combined = edge.changes_since(Lsn(0));
+    let combined = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
 
     let hub = open_relay_hub();
     let res = hub.apply_changes(combined, &server_wins());
@@ -483,7 +496,8 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
             contextdb_core::TenantId::from(tenant_id),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let constructor_id = wuuid(6);
     let constructor_apply = hub_db.apply_changes(
@@ -529,7 +543,8 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from(tenant_id),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client
         .pull_default()
         .await
@@ -546,7 +561,9 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
         )
         .unwrap();
     let pending = client.pending_push_change_count().unwrap();
-    let raw = edge_db.changes_since(Lsn(0));
+    let raw = edge_db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let direction = edge_db
         .table_meta("widgets")
         .and_then(|meta| meta.sync_direction);

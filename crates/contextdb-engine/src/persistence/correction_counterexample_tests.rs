@@ -392,6 +392,21 @@ fn pull_identity(
             .map(|tx| tx.0)
             .unwrap(),
     );
+    let persistence_fixture_parent_1 =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            load.source
+                .verified_ordered_runs
+                .memory
+                .accountant
+                .usage()
+                .limit
+                .map(|bytes| bytes as u64)
+                .unwrap_or(u64::MAX),
+        );
+    let persistence_fixture_reader_1 = persistence_fixture_parent_1
+        .child()
+        .expect("admit the persistence fixture reader child");
+
     load.source
         .bounded_relational_ordered_next(
             "postings",
@@ -402,6 +417,7 @@ fn pull_identity(
             &mut || Ok(()),
             &mut || Ok(()),
             &mut |_| Ok(()),
+            persistence_fixture_reader_1,
         )
         .map(|row| row.map(|row| row.row_id))
 }
@@ -708,7 +724,7 @@ fn the_export_destination_admits_its_format_marker_and_initial_identity() {
     let before = budget.admitted_bytes_for_test();
     let artifact = RedbPersistence::create_with_accountant(
         &root.path().join("destination.db"),
-        Some(Arc::clone(&budget)),
+        Some(Arc::clone(&budget).into()),
         crate::persistence::redb_cache_bytes_for_limit(budget.usage().limit),
     )
     .expect("create an export destination");
@@ -722,7 +738,7 @@ fn the_export_destination_admits_its_format_marker_and_initial_identity() {
     ));
     let late =
         RedbPersistence::create(&root.path().join("late.db")).expect("create a second destination");
-    late.attach_memory_accountant(Arc::clone(&control));
+    late.attach_memory_accountant(Arc::clone(&control).into());
     let unaccounted = control.admitted_bytes_for_test();
     late.close();
     assert_eq!(

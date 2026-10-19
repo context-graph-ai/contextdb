@@ -4,7 +4,9 @@
 //! server adapter translates transport commands into these bounded,
 //! transport-neutral records.
 
+pub(crate) mod native_purge;
 use crate::persistence::RedbPersistence;
+use crate::persistence::blob_selector::FrozenBlobSelector;
 use contextdb_core::{Error, Lsn, Result};
 use parking_lot::{Condvar, Mutex};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
@@ -218,14 +220,13 @@ pub(crate) struct BlobAuthoritativePurgeHashProjection {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BlobAuthoritativePurgeProjection {
     hashes: Vec<BlobAuthoritativePurgeHashProjection>,
+    native_control: Option<u64>,
 }
 
 #[derive(Default)]
 struct HashFenceState {
     active_shared: usize,
     writer_active: bool,
-    quiescing: bool,
-    purge_waiters: usize,
 }
 
 #[derive(Default)]
@@ -245,7 +246,7 @@ impl BlobRepositoryOperationGate {
     fn begin(self: &Arc<Self>) -> Result<BlobRepositoryOperationGuard> {
         let mut state = self.state.lock();
         if state.closing || state.closed {
-            return Err(Error::Other("blob repository is closed".to_string()));
+            return Err(Error::Other(("blob repository is closed".to_string()).into()));
         }
         state.active = state.active.saturating_add(1);
         Ok(BlobRepositoryOperationGuard {
@@ -301,213 +302,237 @@ impl Drop for BlobRepositoryOperationGuard {
     }
 }
 
+// Only admitted shared operations have per-hash state. Each exclusion owns a
+// complete immutable union; no entry is created for its inactive historical keys.
+#[derive(Default)]
+struct BlobFenceState {
+    shared: HashMap<[u8;32],HashFenceState>,
+    exclusions: Vec<Arc<BlobExclusion>>,
+    registration: u64,
+}
+enum BlobExcludedHashes {
+    Resident(Arc<[[u8;32]]>),
+    Disk(Arc<FrozenBlobSelector>),
+}
+struct BlobExclusion {
+    hashes: BlobExcludedHashes,
+    draining: AtomicBool,
+    _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+}
+impl BlobExcludedHashes {
+    fn len(&self) -> u64 { match self { Self::Resident(hashes)=>hashes.len() as u64, Self::Disk(hashes)=>hashes.len() } }
+    fn at(&self,index:u64) -> Result<[u8;32]> { match self {
+        Self::Resident(hashes)=>hashes.get(index as usize).copied().ok_or_else(blob_fence_invalid),
+        Self::Disk(hashes)=>hashes.at(index),
+    }}
+    fn contains(&self,hash:&[u8;32]) -> Result<bool> { match self {
+        Self::Resident(hashes)=>Ok(hashes.binary_search(hash).is_ok()),
+        Self::Disk(hashes)=>hashes.contains(hash),
+    }}
+    fn snapshot_memory(&self,count:usize) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
+        match self {
+            Self::Disk(selector)=>Ok(Some(selector.registry_memory(
+                std::alloc::Layout::array::<Arc<BlobExclusion>>(count).map_err(|_|blob_fence_invalid())?.size())?)),
+            Self::Resident(_)=>Ok(None),
+        }
+    }
+    fn overlaps(&self,other:&Self) -> Result<bool> {
+        let (mut left,mut right)=(0,0);
+        while left < self.len() && right < other.len() {
+            match self.at(left)?.cmp(&other.at(right)?) {
+                std::cmp::Ordering::Equal=>return Ok(true),
+                std::cmp::Ordering::Less=>left+=1,
+                std::cmp::Ordering::Greater=>right+=1,
+            }
+        } Ok(false)
+    }
+}
+fn blob_fence_invalid() -> Error { Error::Other("blob exclusion lost its complete selector".into()) }
+
 /// Process-local coordination for bounded readers, writers, and purge.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct BlobHashFenceRegistry {
-    states: Mutex<HashMap<[u8; 32], HashFenceState>>,
+    states: Mutex<BlobFenceState>,
     changed: Condvar,
     closed: AtomicBool,
 }
-
 impl BlobHashFenceRegistry {
-    fn acquire_shared(
-        self: &Arc<Self>,
-        hash: [u8; 32],
-        generation: u64,
-        operation: BlobRepositoryOperationGuard,
-    ) -> Result<BlobSharedGenerationGuard> {
-        let mut states = self.states.lock();
+    // Short membership probes use registry -> immutable backend I/O. Long
+    // union merges run outside the registry and revalidate registration.
+    // Backend reads never acquire store, source, Original or operation gates.
+    // A failed membership check leaves existing exclusions owned and installed.
+    fn excluded(states:&BlobFenceState,hash:&[u8;32]) -> Result<bool> {
+        for exclusion in &states.exclusions { if exclusion.hashes.contains(hash)? { return Ok(true); } }
+        Ok(false)
+    }
+    fn acquire_shared(self:&Arc<Self>,hash:[u8;32],generation:u64,
+        operation:BlobRepositoryOperationGuard) -> Result<BlobSharedGenerationGuard> {
+        self.acquire_one(hash,generation,false,operation)
+    }
+    fn acquire_writer(self:&Arc<Self>,hash:[u8;32],generation:u64,
+        operation:BlobRepositoryOperationGuard) -> Result<BlobSharedGenerationGuard> {
+        self.acquire_one(hash,generation,true,operation)
+    }
+    fn acquire_one(self:&Arc<Self>,hash:[u8;32],generation:u64,writer:bool,
+        operation:BlobRepositoryOperationGuard) -> Result<BlobSharedGenerationGuard> {
+        let mut states=self.states.lock();
         loop {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(Error::Other("blob repository is closed".to_string()));
-            }
-            let state = states.entry(hash).or_default();
-            if !state.quiescing {
-                state.active_shared = state.active_shared.saturating_add(1);
-                return Ok(BlobSharedGenerationGuard {
-                    registry: self.clone(),
-                    hash,
-                    generation,
-                    writer: false,
-                    _operation: operation,
-                    released: false,
-                });
+            if self.closed.load(Ordering::Acquire) { return Err(Error::Other("blob repository is closed".into())); }
+            if !Self::excluded(&states,&hash)? && (!writer || !states.shared.get(&hash).is_some_and(|s|s.writer_active)) {
+                let state=states.shared.entry(hash).or_default();
+                state.active_shared=state.active_shared.checked_add(1).ok_or_else(blob_fence_invalid)?;
+                state.writer_active |= writer;
+                return Ok(BlobSharedGenerationGuard { registry:self.clone(),hash,generation,writer,_operation:operation,released:false });
             }
             self.changed.wait(&mut states);
         }
     }
-
-    fn acquire_writer(
-        self: &Arc<Self>,
-        hash: [u8; 32],
-        generation: u64,
-        operation: BlobRepositoryOperationGuard,
-    ) -> Result<BlobSharedGenerationGuard> {
-        let mut states = self.states.lock();
+    fn acquire_shared_sorted(self:&Arc<Self>,generations:&BTreeMap<[u8;32],u64>,
+        operation:BlobRepositoryOperationGuard) -> Result<BlobSharedHashSetGuard> {
+        let mut states=self.states.lock();
         loop {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(Error::Other("blob repository is closed".to_string()));
-            }
-            let state = states.entry(hash).or_default();
-            if !state.quiescing && !state.writer_active {
-                state.writer_active = true;
-                state.active_shared = state.active_shared.saturating_add(1);
-                return Ok(BlobSharedGenerationGuard {
-                    registry: self.clone(),
-                    hash,
-                    generation,
-                    writer: true,
-                    _operation: operation,
-                    released: false,
-                });
-            }
-            self.changed.wait(&mut states);
-        }
-    }
-
-    fn acquire_shared_sorted(
-        self: &Arc<Self>,
-        generations: &BTreeMap<[u8; 32], u64>,
-        operation: BlobRepositoryOperationGuard,
-    ) -> Result<BlobSharedHashSetGuard> {
-        let mut states = self.states.lock();
-        loop {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(Error::Other("blob repository is closed".to_string()));
-            }
-            if generations
-                .keys()
-                .all(|hash| !states.get(hash).is_some_and(|state| state.quiescing))
-            {
+            if self.closed.load(Ordering::Acquire) { return Err(Error::Other("blob repository is closed".into())); }
+            let mut excluded=false;
+            for hash in generations.keys() { excluded |= Self::excluded(&states,hash)?; }
+            if !excluded {
+                // Validate every counter before changing any one of them.
                 for hash in generations.keys() {
-                    let state = states.entry(*hash).or_default();
-                    state.active_shared = state.active_shared.saturating_add(1);
+                    if states.shared.get(hash).is_some_and(|s|s.active_shared==usize::MAX) { return Err(blob_fence_invalid()); }
                 }
-                return Ok(BlobSharedHashSetGuard {
-                    registry: self.clone(),
-                    generations: generations.clone(),
-                    _operation: operation,
-                    released: false,
-                });
+                for hash in generations.keys() { states.shared.entry(*hash).or_default().active_shared+=1; }
+                return Ok(BlobSharedHashSetGuard {registry:self.clone(),generations:generations.clone(),_operation:operation,released:false});
             }
             self.changed.wait(&mut states);
         }
     }
-
-    /// Atomically mark the complete sorted set quiescing, then wait for every
-    /// existing shared operation. A caller retry drops this entire guard and
-    /// reacquires the full expanded union from the beginning.
-    fn acquire_exclusive_sorted(
-        self: &Arc<Self>,
-        hashes: &BTreeSet<[u8; 32]>,
-        operation: BlobRepositoryOperationGuard,
-    ) -> Result<BlobExclusiveHashSetGuard> {
-        let hashes = hashes.iter().copied().collect::<Vec<_>>();
-        let mut states = self.states.lock();
-        loop {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(Error::Other("blob repository is closed".to_string()));
-            }
-            if hashes
-                .iter()
-                .all(|hash| !states.get(hash).is_some_and(|state| state.quiescing))
-            {
-                for hash in &hashes {
-                    states.entry(*hash).or_default().quiescing = true;
-                }
-                break;
-            }
-            self.changed.wait(&mut states);
-        }
-
-        for hash in &hashes {
-            states.entry(*hash).or_default().purge_waiters = 1;
-        }
+    fn acquire_exclusion(self:&Arc<Self>,exclusion:Arc<BlobExclusion>) -> Result<()> {
+        let mut states=loop {
+            let (registration,count)={
+                let states=self.states.lock();
+                if self.closed.load(Ordering::Acquire) {return Err(Error::Other("blob repository is closed".into()));}
+                (states.registration,states.exclusions.len())
+            };
+            // Original admission and long selector merges run outside the
+            // registry. Snapshot custody scales only with live operations.
+            let memory=exclusion.hashes.snapshot_memory(count)?;
+            let snapshot={
+                let states=self.states.lock();
+                if states.registration!=registration {continue;}
+                let mut snapshot=Vec::with_capacity(count);
+                if snapshot.capacity()!=count {return Err(blob_fence_invalid());}
+                snapshot.extend(states.exclusions.iter().cloned());
+                snapshot
+            };
+            let mut overlap=false;
+            for prior in &snapshot {overlap |= exclusion.hashes.overlaps(&prior.hashes)?;}
+            drop(snapshot);
+            drop(memory);
+            let mut states=self.states.lock();
+            if self.closed.load(Ordering::Acquire) {return Err(Error::Other("blob repository is closed".into()));}
+            if states.registration!=registration {continue;}
+            if overlap {self.changed.wait(&mut states);continue;}
+            // Exhaustion refuses before installation, never wraps identity.
+            states.registration=states.registration.checked_add(1).ok_or_else(blob_fence_invalid)?;
+            break states;
+        };
+        // One atomic insertion excludes the complete union before any drain.
+        states.exclusions.push(exclusion.clone());
         self.changed.notify_all();
-        while hashes.iter().any(|hash| {
-            states
-                .get(hash)
-                .is_some_and(|state| state.active_shared != 0)
-        }) {
-            self.changed.wait(&mut states);
-        }
-        for hash in &hashes {
-            states.entry(*hash).or_default().purge_waiters = 0;
-        }
-        Ok(BlobExclusiveHashSetGuard {
-            registry: self.clone(),
-            hashes,
-            _operation: operation,
-            released: false,
-        })
-    }
-
-    #[cfg(feature = "test-seams")]
-    fn wait_until_purge_waits_for_hash_for_test(
-        &self,
-        hash: &[u8; 32],
-        timeout: std::time::Duration,
-    ) -> bool {
-        let started = std::time::Instant::now();
-        let mut states = self.states.lock();
-        loop {
-            if states
-                .get(hash)
-                .is_some_and(|state| state.purge_waiters != 0)
-            {
-                return true;
+        let drain=(|| -> Result<()> {
+            loop {
+                if self.closed.load(Ordering::Acquire) { return Err(Error::Other("blob repository is closed".into())); }
+                let mut active=false;
+                for (hash,state) in &states.shared {
+                    if state.active_shared!=0 && exclusion.hashes.contains(hash)? { active=true; break; }
+                }
+                if !active { return Ok(()); }
+                self.changed.wait(&mut states);
             }
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return false;
-            }
-            self.changed.wait_for(&mut states, remaining);
-        }
-    }
-
-    fn release_shared(&self, hash: [u8; 32], writer: bool) {
-        let mut states = self.states.lock();
-        if let Some(state) = states.get_mut(&hash) {
-            state.active_shared = state.active_shared.saturating_sub(1);
-            if writer {
-                state.writer_active = false;
-            }
+        })();
+        if drain.is_err() {
+            states.exclusions.retain(|entry|!Arc::ptr_eq(entry,&exclusion));
+            self.advance_registration(&mut states);
+            if states.exclusions.is_empty() { states.exclusions=Vec::new(); } else {states.exclusions.shrink_to_fit();}
             self.changed.notify_all();
+            return drain;
+        }
+        exclusion.draining.store(false,Ordering::Release);
+        Ok(())
+    }
+    fn acquire_exclusive_sorted(self:&Arc<Self>,hashes:&BTreeSet<[u8;32]>,
+        operation:BlobRepositoryOperationGuard) -> Result<BlobExclusiveHashSetGuard> {
+        let hashes:Arc<[[u8;32]]>=hashes.iter().copied().collect::<Vec<_>>().into();
+        let exclusion=Arc::new(BlobExclusion { hashes:BlobExcludedHashes::Resident(hashes.clone()),draining:AtomicBool::new(true),_memory:None });
+        self.acquire_exclusion(exclusion.clone())?;
+        Ok(BlobExclusiveHashSetGuard {registry:self.clone(),hashes,exclusion,_operation:operation,released:false})
+    }
+    #[cfg(any(test,feature="test-seams"))]
+    fn wait_until_purge_waits_for_hash_for_test(&self,hash:&[u8;32],timeout:std::time::Duration) -> bool {
+        let started=std::time::Instant::now(); let mut states=self.states.lock();
+        loop {
+            if states.exclusions.iter().any(|entry|entry.draining.load(Ordering::Acquire)
+                && entry.hashes.contains(hash).unwrap_or(false)) { return true; }
+            let remaining=timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() { return false; }
+            self.changed.wait_for(&mut states,remaining);
         }
     }
-
-    fn release_shared_set(&self, hashes: impl Iterator<Item = [u8; 32]>) {
-        let mut states = self.states.lock();
-        for hash in hashes {
-            if let Some(state) = states.get_mut(&hash) {
-                state.active_shared = state.active_shared.saturating_sub(1);
-            }
+    fn release_shared(&self,hash:[u8;32],writer:bool) {
+        let mut states=self.states.lock();
+        if let Some(state)=states.shared.get_mut(&hash) {
+            state.active_shared=state.active_shared.saturating_sub(1);
+            if writer {state.writer_active=false;}
+            if state.active_shared==0 {states.shared.remove(&hash);}
         }
-        states.retain(|_, state| {
-            state.quiescing || state.active_shared != 0 || state.purge_waiters != 0
-        });
+        if states.shared.is_empty() {states.shared=HashMap::new();} else {states.shared.shrink_to_fit();}
         self.changed.notify_all();
     }
-
-    fn release_exclusive(&self, hashes: &[[u8; 32]]) {
-        let mut states = self.states.lock();
+    fn release_shared_set(&self,hashes:impl Iterator<Item=[u8;32]>) {
+        let mut states=self.states.lock();
         for hash in hashes {
-            if let Some(state) = states.get_mut(hash) {
-                state.quiescing = false;
-                state.purge_waiters = 0;
+            if let Some(state)=states.shared.get_mut(&hash) {
+                state.active_shared=state.active_shared.saturating_sub(1);
+                if state.active_shared==0 {states.shared.remove(&hash);}
             }
         }
-        states.retain(|_, state| {
-            state.quiescing || state.active_shared != 0 || state.purge_waiters != 0
-        });
+        if states.shared.is_empty() {states.shared=HashMap::new();} else {states.shared.shrink_to_fit();}
         self.changed.notify_all();
     }
-
+    fn release_exclusive(&self,exclusion:&Arc<BlobExclusion>) {
+        let mut states=self.states.lock();
+        states.exclusions.retain(|entry|!Arc::ptr_eq(entry,exclusion));
+        self.advance_registration(&mut states);
+        if states.exclusions.is_empty() {states.exclusions=Vec::new();} else {states.exclusions.shrink_to_fit();}
+        self.changed.notify_all();
+    }
+    fn advance_registration(&self,states:&mut BlobFenceState) {
+        match states.registration.checked_add(1) {
+            Some(next)=>states.registration=next,
+            None=>self.closed.store(true,Ordering::Release),
+        }
+    }
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.changed.notify_all();
+        // Serialize the close predicate with wait registration: no lost wake.
+        let _states=self.states.lock();
+        self.closed.store(true,Ordering::Release);self.changed.notify_all();
     }
+}
+
+pub(crate) struct BlobExclusiveSelectorGuard {
+    registry:Arc<BlobHashFenceRegistry>,
+    exclusion:Arc<BlobExclusion>,
+    selector:Arc<FrozenBlobSelector>,
+    _operation:BlobRepositoryOperationGuard,
+}
+impl BlobExclusiveSelectorGuard {
+    pub(crate) fn selector(&self) -> &Arc<FrozenBlobSelector> { &self.selector }
+    pub(crate) fn require(&self,repository:&BlobRepository) -> Result<()> {
+        if !Arc::ptr_eq(&self.registry,&repository.fences) {return Err(blob_fence_invalid());} Ok(())
+    }
+}
+impl Drop for BlobExclusiveSelectorGuard {
+    fn drop(&mut self) {self.registry.release_exclusive(&self.exclusion);}
 }
 
 /// A shared provider/writer lease carrying the generation it must revalidate.
@@ -571,7 +596,8 @@ impl Drop for BlobSharedGenerationGuard {
 #[doc(hidden)]
 pub struct BlobExclusiveHashSetGuard {
     registry: Arc<BlobHashFenceRegistry>,
-    hashes: Vec<[u8; 32]>,
+    hashes: Arc<[[u8; 32]]>,
+    exclusion: Arc<BlobExclusion>,
     _operation: BlobRepositoryOperationGuard,
     released: bool,
 }
@@ -585,7 +611,7 @@ impl BlobExclusiveHashSetGuard {
 impl Drop for BlobExclusiveHashSetGuard {
     fn drop(&mut self) {
         if !self.released {
-            self.registry.release_exclusive(&self.hashes);
+            self.registry.release_exclusive(&self.exclusion);
             self.released = true;
         }
     }
@@ -641,7 +667,7 @@ impl BlobReadSession {
         let partial = self
             .partial
             .as_ref()
-            .ok_or_else(|| Error::Other("partial blob lost its exact state".to_string()))?;
+            .ok_or_else(|| Error::Other(("partial blob lost its exact state".to_string()).into()))?;
         let indices = decode_chunk_indices(&partial.payload_indices)?;
         let block_bytes = BLOB_LOGICAL_BLOCK_BYTES as u64;
         let block_count = logical_block_count(self.manifest.total_size);
@@ -658,9 +684,8 @@ impl BlobReadSession {
                 .min(block_bytes);
             let bytes = self.read_payload_at(offset, expected as usize)?;
             if bytes.len() as u64 != expected {
-                return Err(Error::Other(
-                    "partial blob exact state names a missing payload block".to_string(),
-                ));
+                return Err(Error::Other((
+                    "partial blob exact state names a missing payload block".to_string()).into()));
             }
             prefix = prefix.saturating_add(expected);
         }
@@ -727,16 +752,15 @@ impl BlobRepository {
     /// this handle never had one.
     fn store(&self) -> Result<&RedbPersistence> {
         self.persistence.as_deref().ok_or_else(|| {
-            Error::Other(
+            Error::Other((
                 "this handle reads a committed image whose source is released, so it holds no media repository"
-                    .to_string(),
-            )
+                    .to_string()).into())
         })
     }
 
     /// Attach blob tables to an existing file-backed database.
     pub fn shared(persistence: Arc<RedbPersistence>) -> Arc<Self> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_blob_repository_open();
         Arc::new(Self {
             persistence: Some(persistence),
@@ -749,11 +773,11 @@ impl BlobRepository {
 
     /// Create a disk-bounded ephemeral repository for `Database::open_memory`.
     pub fn ephemeral() -> Result<Arc<Self>> {
-        #[cfg(feature = "test-seams")]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_blob_repository_open();
         let dir = Arc::new(
             tempfile::tempdir()
-                .map_err(|err| Error::Other(format!("create ephemeral blob repository: {err}")))?,
+                .map_err(|err| Error::Other((format!("create ephemeral blob repository: {err}")).into()))?,
         );
         let persistence = Arc::new(RedbPersistence::create(
             &dir.path().join("contextdb-blobs.redb"),
@@ -775,7 +799,7 @@ impl BlobRepository {
         self.bounded_blob_bytes_read.load(Ordering::Relaxed)
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn wait_until_authoritative_purge_waits_for_hash_for_test(
         &self,
         hash: &[u8; 32],
@@ -821,15 +845,14 @@ impl BlobRepository {
         let initial = self
             .generation_state_under_operation(&hash)?
             .active
-            .ok_or_else(|| Error::Other("blob generation is not active".to_string()))?;
+            .ok_or_else(|| Error::Other(("blob generation is not active".to_string()).into()))?;
         let guard = self
             .fences
             .acquire_shared(hash, initial.generation, operation)?;
         let current = self.generation_state_under_operation(&hash)?.active;
         if current != Some(initial) {
-            return Err(Error::Other(
-                "blob generation changed while acquiring its shared guard".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob generation changed while acquiring its shared guard".to_string()).into()));
         }
         Ok(guard)
     }
@@ -854,9 +877,8 @@ impl BlobRepository {
             .map(|active| active.generation)
             .unwrap_or(current.next_generation);
         if generation != current_generation {
-            return Err(Error::Other(
-                "blob write generation changed while acquiring its shared guard".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob write generation changed while acquiring its shared guard".to_string()).into()));
         }
         Ok(guard)
     }
@@ -872,7 +894,7 @@ impl BlobRepository {
                 let active = self
                     .generation_state_under_operation(hash)?
                     .active
-                    .ok_or_else(|| Error::Other("blob tag owner is not active".to_string()))?;
+                    .ok_or_else(|| Error::Other(("blob tag owner is not active".to_string()).into()))?;
                 generations.insert(*hash, active.generation);
             }
             let guard = self.fences.acquire_shared_sorted(&generations, operation)?;
@@ -897,6 +919,17 @@ impl BlobRepository {
     ) -> Result<BlobExclusiveHashSetGuard> {
         let operation = self.begin_operation()?;
         self.fences.acquire_exclusive_sorted(hashes, operation)
+    }
+
+    pub(crate) fn acquire_exclusive_selector(self:&Arc<Self>,selector:Arc<FrozenBlobSelector>)
+        -> Result<BlobExclusiveSelectorGuard> {
+        selector.require_store(self.store()?)?;
+        let operation=self.begin_operation()?;
+        let memory=selector.registry_memory(std::mem::size_of::<BlobExclusion>()
+            +std::mem::size_of::<BlobExclusiveSelectorGuard>()+8*std::mem::size_of::<Arc<BlobExclusion>>())?;
+        let exclusion=Arc::new(BlobExclusion {hashes:BlobExcludedHashes::Disk(selector.clone()),draining:AtomicBool::new(true),_memory:Some(memory)});
+        self.fences.acquire_exclusion(exclusion.clone())?;
+        Ok(BlobExclusiveSelectorGuard {registry:self.fences.clone(),exclusion,selector,_operation:operation})
     }
 
     /// Ordinary cache/reclaim deletion. This retires the active generation
@@ -924,9 +957,8 @@ impl BlobRepository {
                 return Ok(false);
             };
             if guard.hashes() != [hash] {
-                return Err(Error::Other(
-                    "ordinary blob delete lost its exclusive hash fence".to_string(),
-                ));
+                return Err(Error::Other((
+                    "ordinary blob delete lost its exclusive hash fence".to_string()).into()));
             }
             let manifest_key = Self::manifest_key(&hash, active.generation);
             let manifest = {
@@ -939,7 +971,7 @@ impl BlobRepository {
                     .map(|value| decode::<BlobManifest>(value.value()))
                     .transpose()?
                     .ok_or_else(|| {
-                        Error::Other("ordinary blob delete lost its manifest".to_string())
+                        Error::Other(("ordinary blob delete lost its manifest".to_string()).into())
                     })?
             };
             let tags = {
@@ -956,7 +988,17 @@ impl BlobRepository {
                     if !key.value().starts_with(manifest_key.as_slice()) {
                         break;
                     }
-                    tags.push(decode::<BlobTagRecord>(value.value())?);
+                    let tag: BlobTagRecord = decode(value.value())?;
+                    let mut expected_key = manifest_key.to_vec();
+                    expected_key.extend_from_slice(&tag.name);
+                    if tag.version != RECORD_VERSION
+                        || tag.hash != hash
+                        || tag.generation != active.generation
+                        || key.value() != expected_key.as_slice()
+                    {
+                        return Err(Error::Other(("blob reverse tag witness disagrees with its canonical owner".to_string()).into()));
+                    }
+                    tags.push(tag);
                 }
                 tags
             };
@@ -965,11 +1007,41 @@ impl BlobRepository {
                 return Ok(false);
             }
             if tags.len() > 256 {
-                return Err(Error::Other(
-                    "ordinary blob deletion requires bounded prior tag cleanup".to_string(),
-                ));
+                return Err(Error::Other((
+                    "ordinary blob deletion requires bounded prior tag cleanup".to_string()).into()));
+            }
+            // Check authoritative names as well: a missing reverse entry
+            // cannot leave an addressable tag behind a retired generation.
+            {
+                let by_name = write
+                    .open_table(TAGS_BY_NAME_TABLE)
+                    .map_err(RedbPersistence::storage_error)?;
+                let by_hash = write
+                    .open_table(TAGS_BY_HASH_TABLE)
+                    .map_err(RedbPersistence::storage_error)?;
+                for entry in by_name.iter().map_err(RedbPersistence::storage_error)? {
+                    let (name, value) = entry.map_err(RedbPersistence::storage_error)?;
+                    let tag: BlobTagRecord = decode(value.value())?;
+                    if tag.hash == hash && tag.generation == active.generation {
+                        let mut key = manifest_key.to_vec();
+                        key.extend_from_slice(&tag.name);
+                        let counterpart = by_hash
+                            .get(key.as_slice())
+                            .map_err(RedbPersistence::storage_error)?
+                            .ok_or_else(|| Error::Other(("blob authoritative tag has no reverse ownership witness".to_string()).into()))?;
+                        let reverse_owner: BlobTagRecord = decode(counterpart.value())?;
+                        if tag.version != RECORD_VERSION
+                            || tag.name.as_slice() != name.value()
+                            || reverse_owner != tag
+                            || counterpart.value() != value.value()
+                        {
+                            return Err(Error::Other(("blob authoritative tag witness is malformed".to_string()).into()));
+                        }
+                    }
+                }
             }
             for tag in tags {
+                require_tag_owner_in_write(&write, &tag)?;
                 let mut reverse = manifest_key.to_vec();
                 reverse.extend_from_slice(&tag.name);
                 {
@@ -1036,15 +1108,13 @@ impl BlobRepository {
         adapter_state: Vec<u8>,
     ) -> Result<BlobImportStaging> {
         if !Arc::ptr_eq(&guard.registry, &self.fences) || !guard.writer {
-            return Err(Error::Other(
+            return Err(Error::Other((
                 "blob staging creation requires this repository's exclusive writer lease"
-                    .to_string(),
-            ));
+                    .to_string()).into()));
         }
         if adapter_state.len() > BLOB_VALUE_BYTES {
-            return Err(Error::Other(
-                "blob adapter staging state exceeds its bounded value".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob adapter staging state exceeds its bounded value".to_string()).into()));
         }
         let _operation = self.begin_operation()?;
         let state = self.generation_state_under_operation(&guard.hash)?;
@@ -1053,9 +1123,8 @@ impl BlobRepository {
             .map(|active| active.generation)
             .unwrap_or(state.next_generation);
         if current_generation != guard.generation {
-            return Err(Error::Other(
-                "blob write generation changed before staging creation".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob write generation changed before staging creation".to_string()).into()));
         }
         let mut staging = new_import_staging(Lsn(state.last_purge_lsn), expected_size)?;
         staging.provisional_generation = Some((guard.hash, guard.generation));
@@ -1142,7 +1211,7 @@ impl BlobRepository {
                     continue;
                 };
                 let object_id: [u8; 16] = key.try_into().map_err(|_| {
-                    Error::Other("blob staging object id has invalid length".to_string())
+                    Error::Other(("blob staging object id has invalid length".to_string()).into())
                 })?;
                 result.push((object_id, hash));
                 if result.len() == limit {
@@ -1162,9 +1231,8 @@ impl BlobRepository {
     ) -> Result<bool> {
         let guard = self.acquire_exclusive_sorted(&BTreeSet::from([hash]))?;
         if guard.hashes() != [hash] {
-            return Err(Error::Other(
-                "provisional staging reclaim lost its exclusive hash fence".to_string(),
-            ));
+            return Err(Error::Other((
+                "provisional staging reclaim lost its exclusive hash fence".to_string()).into()));
         }
         self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
@@ -1203,10 +1271,9 @@ impl BlobRepository {
         object_id: [u8; 16],
     ) -> Result<bool> {
         if !Arc::ptr_eq(&guard.registry, &self.fences) || !guard.writer {
-            return Err(Error::Other(
+            return Err(Error::Other((
                 "blob staging discard requires this repository's exclusive writer lease"
-                    .to_string(),
-            ));
+                    .to_string()).into()));
         }
         self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
@@ -1225,9 +1292,8 @@ impl BlobRepository {
                 return Ok(false);
             };
             if staging.provisional_generation != Some((guard.hash, guard.generation)) {
-                return Err(Error::Other(
-                    "blob writer cannot discard another generation's staging".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob writer cannot discard another generation's staging".to_string()).into()));
             }
             remove_staging_in_write(&write, &staging)?;
             write.commit().map_err(RedbPersistence::storage_error)?;
@@ -1267,30 +1333,26 @@ impl BlobRepository {
         adapter_state: Vec<u8>,
     ) -> Result<BlobImportStaging> {
         if !Arc::ptr_eq(&guard.registry, &self.fences) || !guard.writer {
-            return Err(Error::Other(
+            return Err(Error::Other((
                 "blob staging checkpoint requires this repository's exclusive writer lease"
-                    .to_string(),
-            ));
+                    .to_string()).into()));
         }
         if adapter_state.len() > BLOB_VALUE_BYTES {
-            return Err(Error::Other(
-                "blob adapter staging state exceeds its bounded value".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob adapter staging state exceeds its bounded value".to_string()).into()));
         }
         let _operation = self.begin_operation()?;
         if bytes.is_empty() || bytes.len() > BLOB_LOGICAL_BLOCK_BYTES {
-            return Err(Error::Other(
-                "blob staging fragment violates the logical block bound".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob staging fragment violates the logical block bound".to_string()).into()));
         }
         let block_offset = index.saturating_mul(BLOB_LOGICAL_BLOCK_BYTES as u64);
         let expected = logical_size
             .saturating_sub(block_offset)
             .min(BLOB_LOGICAL_BLOCK_BYTES as u64) as usize;
         if expected == 0 || within.saturating_add(bytes.len()) > expected {
-            return Err(Error::Other(
-                "blob staging fragment is outside its declared logical block".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob staging fragment is outside its declared logical block".to_string()).into()));
         }
         self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
@@ -1302,21 +1364,19 @@ impl BlobRepository {
                     table
                         .get(object_id.as_slice())
                         .map_err(RedbPersistence::storage_error)?
-                        .ok_or_else(|| Error::Other("blob staging object is missing".to_string()))?
+                        .ok_or_else(|| Error::Other(("blob staging object is missing".to_string()).into()))?
                         .value(),
                 )?
             };
             if staging.provisional_generation != Some((guard.hash, guard.generation)) {
-                return Err(Error::Other(
+                return Err(Error::Other((
                     "blob staging fragment lost its durable hash-generation association"
-                        .to_string(),
-                ));
+                        .to_string()).into()));
             }
             if staging.adapter_state != expected_adapter_state {
-                return Err(Error::Other(
+                return Err(Error::Other((
                     "blob staging adapter state changed before its atomic fragment checkpoint"
-                        .to_string(),
-                ));
+                        .to_string()).into()));
             }
             let encoded_indices = if outboard {
                 &staging.outboard_indices
@@ -1342,9 +1402,8 @@ impl BlobRepository {
                     .unwrap_or_else(|| vec![0; expected])
             };
             if value.len() != expected {
-                return Err(Error::Other(
-                    "blob staging fragment found a malformed physical block".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob staging fragment found a malformed physical block".to_string()).into()));
             }
             value[within..within + bytes.len()].copy_from_slice(bytes);
             {
@@ -1392,9 +1451,8 @@ impl BlobRepository {
         let _operation = self.begin_operation()?;
         let value_bound = BLOB_LOGICAL_BLOCK_BYTES;
         if bytes.len() > value_bound {
-            return Err(Error::Other(
-                "blob staging value exceeds its logical block bound".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob staging value exceeds its logical block bound".to_string()).into()));
         }
         self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
@@ -1405,14 +1463,13 @@ impl BlobRepository {
                 let value = table
                     .get(object_id.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::Other("blob staging object is missing".to_string()))?;
+                    .ok_or_else(|| Error::Other(("blob staging object is missing".to_string()).into()))?;
                 decode::<BlobImportStaging>(value.value())?
             };
             if staging.provisional_generation.is_none() {
-                return Err(Error::Other(
+                return Err(Error::Other((
                     "blob bytes cannot be written before durable hash-generation association"
-                        .to_string(),
-                ));
+                        .to_string()).into()));
             }
             let encoded_indices = if outboard {
                 &staging.outboard_indices
@@ -1421,9 +1478,9 @@ impl BlobRepository {
             };
             let mut indices = decode_chunk_indices(encoded_indices)?;
             if !indices.insert(index) {
-                return Err(Error::Other(format!(
+                return Err(Error::Other((format!(
                     "blob staging chunk index {index} was already occupied"
-                )));
+                )).into()));
             }
             let key = Self::chunk_key(&object_id, index);
             {
@@ -1439,9 +1496,8 @@ impl BlobRepository {
                     .insert(key.as_slice(), bytes)
                     .map_err(RedbPersistence::storage_error)?;
                 if previous.is_some() {
-                    return Err(Error::Other(
-                        "blob staging chunk key already exists".to_string(),
-                    ));
+                    return Err(Error::Other((
+                        "blob staging chunk key already exists".to_string()).into()));
                 }
             }
             let encoded_indices = encode_chunk_indices(&indices)?;
@@ -1483,9 +1539,8 @@ impl BlobRepository {
         // this complete transaction, including a close racing this call.
         if !Arc::ptr_eq(&guard.registry, &self.fences) || guard.hash() != bind.hash || !guard.writer
         {
-            return Err(Error::Other(
-                "blob staging bind requires this repository's exclusive hash writer".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob staging bind requires this repository's exclusive hash writer".to_string()).into()));
         }
         enum BindOutcome {
             Bound(ActiveBlobGeneration),
@@ -1501,7 +1556,7 @@ impl BlobRepository {
                 let value = table
                     .get(bind.object_id.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::Other("blob staging object is missing".to_string()))?;
+                    .ok_or_else(|| Error::Other(("blob staging object is missing".to_string()).into()))?;
                 decode::<BlobImportStaging>(value.value())?
             };
             let mut generation_state = {
@@ -1556,23 +1611,20 @@ impl BlobRepository {
                         if payload_indices != staging_payload_indices
                             || outboard_indices != staging_outboard_indices
                         {
-                            return Err(Error::Other(
+                            return Err(Error::Other((
                                 "canonical partial state does not match the staged exact chunk sets"
-                                    .to_string(),
-                            ));
+                                    .to_string()).into()));
                         }
                     }
                     (BlobManifestState::Partial, None) => {
-                        return Err(Error::Other(
+                        return Err(Error::Other((
                             "partial blob bind is missing its durable exact chunk sets and adapter bitfield"
-                                .to_string(),
-                        ));
+                                .to_string()).into()));
                     }
                     (BlobManifestState::Complete, Some(_)) => {
-                        return Err(Error::Other(
+                        return Err(Error::Other((
                             "complete blob bind unexpectedly carries partial transfer state"
-                                .to_string(),
-                        ));
+                                .to_string()).into()));
                     }
                     (BlobManifestState::Complete, None) => {
                         validate_complete_block_count(
@@ -1626,14 +1678,12 @@ impl BlobRepository {
                             || tag.hash != bind.hash
                             || tag.generation != active.generation
                         {
-                            return Err(Error::Other(
-                                "blob staging tag does not match its bound generation".to_string(),
-                            ));
+                            return Err(Error::Other((
+                                "blob staging tag does not match its bound generation".to_string()).into()));
                         }
                         if !tag_names.insert(tag.name.clone()) {
-                            return Err(Error::Other(
-                                "blob staging bind contains duplicate tag ownership".to_string(),
-                            ));
+                            return Err(Error::Other((
+                                "blob staging bind contains duplicate tag ownership".to_string()).into()));
                         }
                         if replaced.is_none() {
                             let by_name = write
@@ -1644,10 +1694,9 @@ impl BlobRepository {
                                 .map_err(RedbPersistence::storage_error)?
                                 .is_some()
                             {
-                                return Err(Error::Other(
+                                return Err(Error::Other((
                                     "blob staging bind conflicts with existing authoritative tag ownership"
-                                        .to_string(),
-                                ));
+                                        .to_string()).into()));
                             }
                         }
                         let mut reverse_key =
@@ -1662,10 +1711,9 @@ impl BlobRepository {
                                 .map_err(RedbPersistence::storage_error)?
                                 .is_some()
                             {
-                                return Err(Error::Other(
+                                return Err(Error::Other((
                                     "blob staging bind conflicts with existing reverse tag ownership"
-                                        .to_string(),
-                                ));
+                                        .to_string()).into()));
                             }
                         }
                     }
@@ -1681,18 +1729,16 @@ impl BlobRepository {
                                 .map(|value| decode::<BlobManifest>(value.value()))
                                 .transpose()?
                                 .ok_or_else(|| {
-                                    Error::Other(
+                                    Error::Other((
                                         "blob replacement lost its prior canonical manifest"
-                                            .to_string(),
-                                    )
+                                            .to_string()).into())
                                 })?
                         };
                         if old_manifest.state == BlobManifestState::Complete
                             && bind.state == BlobManifestState::Partial
                         {
-                            return Err(Error::Other(
-                                "a complete canonical blob cannot regress to partial".to_string(),
-                            ));
+                            return Err(Error::Other((
+                                "a complete canonical blob cannot regress to partial".to_string()).into()));
                         }
                         remove_object_chunks_in_write(
                             &write,
@@ -1791,10 +1837,9 @@ impl BlobRepository {
                             {
                                 siblings.push(candidate);
                                 if siblings.len() > 256 {
-                                    return Err(Error::Other(
+                                    return Err(Error::Other((
                                         "complete blob bind found more than 256 provisional siblings"
-                                            .to_string(),
-                                    ));
+                                            .to_string()).into()));
                                 }
                             }
                         }
@@ -1820,12 +1865,10 @@ impl BlobRepository {
         })?;
         match outcome {
             BindOutcome::Bound(active) => Ok(active),
-            BindOutcome::RefusedByPurge => Err(Error::Other(
-                "blob staging began before the hash's authoritative purge frontier".to_string(),
-            )),
-            BindOutcome::StaleGeneration => Err(Error::Other(
-                "blob staging retained a stale hash generation".to_string(),
-            )),
+            BindOutcome::RefusedByPurge => Err(Error::Other((
+                "blob staging began before the hash's authoritative purge frontier".to_string()).into())),
+            BindOutcome::StaleGeneration => Err(Error::Other((
+                "blob staging retained a stale hash generation".to_string()).into())),
         }
     }
 
@@ -1866,10 +1909,9 @@ impl BlobRepository {
                 .iter()
                 .any(|hash| guard.hashes.binary_search(hash).is_err())
         {
-            return Err(Error::Other(
+            return Err(Error::Other((
                 "blob authoritative purge does not hold its complete exclusive hash set"
-                    .to_string(),
-            ));
+                    .to_string()).into()));
         }
 
         self.store()?.with_db(|db| {
@@ -1899,10 +1941,10 @@ impl BlobRepository {
                     .transpose()?
                     .unwrap_or_default();
                 if generation.version != RECORD_VERSION {
-                    return Err(Error::Other(format!(
+                    return Err(Error::Other((format!(
                         "blob authoritative purge found unsupported generation version {}",
                         generation.version
-                    )));
+                    )).into()));
                 }
 
                 let mut manifest = None;
@@ -1913,9 +1955,8 @@ impl BlobRepository {
 
                 if let Some(active) = generation.active {
                     if !table_names.contains(MANIFESTS_TABLE.name()) {
-                        return Err(Error::Other(
-                            "blob active generation has no canonical manifest table".to_string(),
-                        ));
+                        return Err(Error::Other((
+                            "blob active generation has no canonical manifest table".to_string()).into()));
                     }
                     let manifest_key = Self::manifest_key(hash, active.generation).to_vec();
                     let manifest_bytes = {
@@ -1926,10 +1967,9 @@ impl BlobRepository {
                             .get(manifest_key.as_slice())
                             .map_err(RedbPersistence::storage_error)?
                             .ok_or_else(|| {
-                                Error::Other(
+                                Error::Other((
                                     "blob active generation lost its canonical manifest"
-                                        .to_string(),
-                                )
+                                        .to_string()).into())
                             })?
                             .value()
                             .to_vec()
@@ -1938,10 +1978,9 @@ impl BlobRepository {
                     if decoded_manifest.version != RECORD_VERSION
                         || decoded_manifest.object_id != active.object_id
                     {
-                        return Err(Error::Other(
+                        return Err(Error::Other((
                             "blob active generation and canonical manifest witnesses disagree"
-                                .to_string(),
-                        ));
+                                .to_string()).into()));
                     }
 
                     let (payload_indices, outboard_indices) = match decoded_manifest.state {
@@ -1963,10 +2002,9 @@ impl BlobRepository {
                         }
                         BlobManifestState::Partial => {
                             if !table_names.contains(PARTIAL_BITFIELDS_TABLE.name()) {
-                                return Err(Error::Other(
+                                return Err(Error::Other((
                                     "blob partial generation has no durable partial-state table"
-                                        .to_string(),
-                                ));
+                                        .to_string()).into()));
                             }
                             let partial_bytes = {
                                 let table = read
@@ -1976,10 +2014,9 @@ impl BlobRepository {
                                     .get(manifest_key.as_slice())
                                     .map_err(RedbPersistence::storage_error)?
                                     .ok_or_else(|| {
-                                        Error::Other(
+                                        Error::Other((
                                             "blob partial generation lost its exact chunk sets"
-                                                .to_string(),
-                                        )
+                                                .to_string()).into())
                                     })?
                                     .value()
                                     .to_vec()
@@ -2020,7 +2057,6 @@ impl BlobRepository {
                         &read,
                         hash,
                         active.generation,
-                        decoded_manifest.format,
                         &table_names,
                     )?;
                     canonical_object = Some(BlobCanonicalObjectPurgeWitness {
@@ -2054,9 +2090,8 @@ impl BlobRepository {
                         if decoded.version != RECORD_VERSION
                             || key.value() != decoded.object_id.as_slice()
                         {
-                            return Err(Error::Other(
-                                "blob provisional staging witness is malformed".to_string(),
-                            ));
+                            return Err(Error::Other((
+                                "blob provisional staging witness is malformed".to_string()).into()));
                         }
                         let Some((staged_hash, staged_generation)) = decoded.provisional_generation
                         else {
@@ -2079,9 +2114,8 @@ impl BlobRepository {
                                     partials.insert(partial_key, encoded_partial.clone())
                                     && existing != encoded_partial
                                 {
-                                    return Err(Error::Other(
-                                        "blob provisional partial witnesses disagree".to_string(),
-                                    ));
+                                    return Err(Error::Other((
+                                        "blob provisional partial witnesses disagree".to_string()).into()));
                                 }
                             }
                         }
@@ -2109,7 +2143,7 @@ impl BlobRepository {
                 });
             }
 
-            Ok(BlobAuthoritativePurgeProjection { hashes: projected })
+            Ok(BlobAuthoritativePurgeProjection { hashes: projected, native_control: None })
         })
     }
 
@@ -2132,9 +2166,8 @@ impl BlobRepository {
         start_lsn: u64,
     ) -> Result<()> {
         if verified_prefix.len() as u64 >= total_size {
-            return Err(Error::Other(
-                "blob interrupted fixture must retain a missing suffix".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob interrupted fixture must retain a missing suffix".to_string()).into()));
         }
         self.install_fixture_for_test(hash, verified_prefix, total_size, start_lsn, true)
     }
@@ -2222,9 +2255,8 @@ impl BlobRepository {
                     .unwrap_or_default()
             };
             if generation_state.active.is_some() || generation_state.next_generation != generation {
-                return Err(Error::Other(
-                    "blob fixture conflicts with an existing active generation".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob fixture conflicts with an existing active generation".to_string()).into()));
             }
             insert_fixture_chunks_in_write(&write, PAYLOAD_CHUNKS_TABLE, &object_id, payload)?;
             insert_fixture_chunks_in_write(&write, OUTBOARD_CHUNKS_TABLE, &object_id, outboard)?;
@@ -2237,9 +2269,8 @@ impl BlobRepository {
                     .map_err(RedbPersistence::storage_error)?
                     .is_some()
                 {
-                    return Err(Error::Other(
-                        "blob fixture would overwrite a canonical manifest".to_string(),
-                    ));
+                    return Err(Error::Other((
+                        "blob fixture would overwrite a canonical manifest".to_string()).into()));
                 }
             }
             if let Some(partial_state) = partial_state.as_ref() {
@@ -2260,9 +2291,8 @@ impl BlobRepository {
                     .map_err(RedbPersistence::storage_error)?
                     .is_some()
                 {
-                    return Err(Error::Other(
-                        "blob fixture would overwrite authoritative tag ownership".to_string(),
-                    ));
+                    return Err(Error::Other((
+                        "blob fixture would overwrite authoritative tag ownership".to_string()).into()));
                 }
             }
             {
@@ -2407,14 +2437,14 @@ impl BlobRepository {
                     .get(hash.as_slice())
                     .map_err(RedbPersistence::storage_error)?
                     .ok_or_else(|| {
-                        Error::Other("blob bounded read lost its generation fence".to_string())
+                        Error::Other(("blob bounded read lost its generation fence".to_string()).into())
                     })?
                     .value(),
             )?;
             let active = generation
                 .active
                 .filter(|active| active.generation == guard.generation())
-                .ok_or_else(|| Error::Other("blob bounded read lost its generation".to_string()))?;
+                .ok_or_else(|| Error::Other(("blob bounded read lost its generation".to_string()).into()))?;
             let key = Self::manifest_key(hash, active.generation);
             let manifests = read
                 .open_table(MANIFESTS_TABLE)
@@ -2423,7 +2453,7 @@ impl BlobRepository {
                 manifests
                     .get(key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::Other("blob bounded read lost its manifest".to_string()))?
+                    .ok_or_else(|| Error::Other(("blob bounded read lost its manifest".to_string()).into()))?
                     .value(),
             )?;
             let payload = read
@@ -2439,7 +2469,7 @@ impl BlobRepository {
                     .get(chunk_key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
                     .ok_or_else(|| {
-                        Error::Other("blob bounded read lost a payload block".to_string())
+                        Error::Other(("blob bounded read lost a payload block".to_string()).into())
                     })?;
                 let remaining = max_bytes.saturating_sub(bytes.len());
                 bytes.extend_from_slice(&chunk.value()[..chunk.value().len().min(remaining)]);
@@ -2468,7 +2498,7 @@ impl BlobRepository {
                 manifests
                     .get(key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::Other("blob resume read lost its manifest".to_string()))?
+                    .ok_or_else(|| Error::Other(("blob resume read lost its manifest".to_string()).into()))?
                     .value(),
             )?;
             if manifest.state != BlobManifestState::Partial {
@@ -2481,7 +2511,7 @@ impl BlobRepository {
                 partials
                     .get(key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::Other("blob resume state is missing".to_string()))?
+                    .ok_or_else(|| Error::Other(("blob resume state is missing".to_string()).into()))?
                     .value(),
             )?;
             let (payload_indices, _) = validate_partial_state(
@@ -2512,15 +2542,14 @@ impl BlobRepository {
                     .get(chunk_key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
                     .ok_or_else(|| {
-                        Error::Other("blob durable partial index has no payload block".to_string())
+                        Error::Other(("blob durable partial index has no payload block".to_string()).into())
                     })?
                     .value()
                     .len() as u64;
                 let expected = manifest.total_size.saturating_sub(offset).min(block_bytes);
                 if chunk_len == 0 || chunk_len > expected {
-                    return Err(Error::Other(
-                        "blob durable partial block length is malformed".to_string(),
-                    ));
+                    return Err(Error::Other((
+                        "blob durable partial block length is malformed".to_string()).into()));
                 }
                 if chunk_len < expected {
                     return Ok(Some(
@@ -2556,7 +2585,7 @@ impl BlobRepository {
                     .get(key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
                     .ok_or_else(|| {
-                        Error::Other("blob read session lost its canonical manifest".to_string())
+                        Error::Other(("blob read session lost its canonical manifest".to_string()).into())
                     })?
                     .value(),
             )?;
@@ -2569,7 +2598,7 @@ impl BlobRepository {
                         .get(key.as_slice())
                         .map_err(RedbPersistence::storage_error)?
                         .ok_or_else(|| {
-                            Error::Other("blob read session lost its partial state".to_string())
+                            Error::Other(("blob read session lost its partial state".to_string()).into())
                         })?
                         .value(),
                 )?)
@@ -2594,14 +2623,12 @@ impl BlobRepository {
         outboard: bool,
     ) -> Result<Vec<u8>> {
         if !Arc::ptr_eq(&session.guard.registry, &self.fences) {
-            return Err(Error::Other(
-                "blob read session belongs to a different repository".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob read session belongs to a different repository".to_string()).into()));
         }
         if len > BLOB_VALUE_BYTES {
-            return Err(Error::Other(
-                "blob bounded read exceeds the repository value bound".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob bounded read exceeds the repository value bound".to_string()).into()));
         }
         let total_size = if outboard {
             session.manifest.outboard_size
@@ -2626,14 +2653,13 @@ impl BlobRepository {
                 generations
                     .get(session.guard.hash.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::Other("blob read lost its generation fence".to_string()))?
+                    .ok_or_else(|| Error::Other(("blob read lost its generation fence".to_string()).into()))?
                     .value(),
             )?;
             if generation.active.map(|active| active.generation) != Some(session.guard.generation())
             {
-                return Err(Error::Other(
-                    "blob read generation changed while its guard was held".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob read generation changed while its guard was held".to_string()).into()));
             }
             let table = read
                 .open_table(definition)
@@ -2677,9 +2703,9 @@ impl BlobRepository {
     pub fn list_tags_page(&self, after: Option<&[u8]>, limit: usize) -> Result<Vec<BlobTagRecord>> {
         const MAX_TAG_PAGE: usize = 256;
         if limit == 0 || limit > MAX_TAG_PAGE {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob tag page must contain 1..={MAX_TAG_PAGE} records"
-            )));
+            )).into()));
         }
         let _operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -2711,9 +2737,9 @@ impl BlobRepository {
     ) -> Result<Vec<[u8; 32]>> {
         const MAX_HASH_PAGE: usize = 256;
         if limit == 0 || limit > MAX_HASH_PAGE {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob hash page must contain 1..={MAX_HASH_PAGE} records"
-            )));
+            )).into()));
         }
         let _operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -2837,13 +2863,12 @@ impl BlobRepository {
                     .transpose()?
             };
             if current_previous != previous {
-                return Err(Error::Other(
-                    "blob tag ownership changed while acquiring its complete guard set".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob tag ownership changed while acquiring its complete guard set".to_string()).into()));
             }
             let generation = guard
                 .generation(&hash)
-                .ok_or_else(|| Error::Other("blob tag destination guard is missing".to_string()))?;
+                .ok_or_else(|| Error::Other(("blob tag destination guard is missing".to_string()).into()))?;
             let record = BlobTagRecord::new(name.clone(), hash, generation, format, role);
             let encoded = encode(&record)?;
             {
@@ -2902,7 +2927,11 @@ impl BlobRepository {
                     {
                         continue;
                     }
-                    victims.push(decode::<BlobTagRecord>(value.value())?);
+                    let record: BlobTagRecord = decode(value.value())?;
+                    if record.version != RECORD_VERSION || record.name.as_slice() != key.value() {
+                        return Err(Error::Other(("blob authoritative tag witness is malformed".to_string()).into()));
+                    }
+                    victims.push(record);
                     if victims.len() == DELETE_PAGE {
                         break;
                     }
@@ -2918,9 +2947,8 @@ impl BlobRepository {
                 let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
                 for record in &victims {
                     if guard.generation(&record.hash) != Some(record.generation) {
-                        return Err(Error::Other(
-                            "blob tag owner generation changed before bounded deletion".to_string(),
-                        ));
+                        return Err(Error::Other((
+                            "blob tag owner generation changed before bounded deletion".to_string()).into()));
                     }
                     let current = {
                         let by_name = write
@@ -2933,10 +2961,10 @@ impl BlobRepository {
                             .transpose()?
                     };
                     if current.as_ref() != Some(record) {
-                        return Err(Error::Other(
-                            "blob tag ownership changed before bounded deletion".to_string(),
-                        ));
+                        return Err(Error::Other((
+                            "blob tag ownership changed before bounded deletion".to_string()).into()));
                     }
+                    require_tag_owner_in_write(&write, record)?;
                     let mut reverse_key =
                         Self::manifest_key(&record.hash, record.generation).to_vec();
                     reverse_key.extend_from_slice(&record.name);
@@ -2967,7 +2995,7 @@ impl BlobRepository {
     pub fn rename_tag(self: &Arc<Self>, from: &[u8], to: Vec<u8>) -> Result<()> {
         let record = self
             .tag_by_name(from)?
-            .ok_or_else(|| Error::Other("blob tag does not exist".to_string()))?;
+            .ok_or_else(|| Error::Other(("blob tag does not exist".to_string()).into()))?;
         let guard = self.begin_shared_generation_set(&BTreeSet::from([record.hash]))?;
         self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
@@ -2984,9 +3012,8 @@ impl BlobRepository {
             if current.as_ref() != Some(&record)
                 || guard.generation(&record.hash) != Some(record.generation)
             {
-                return Err(Error::Other(
-                    "blob tag ownership changed before rename".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob tag ownership changed before rename".to_string()).into()));
             }
             {
                 let by_name = write
@@ -2997,9 +3024,8 @@ impl BlobRepository {
                     .map_err(RedbPersistence::storage_error)?
                     .is_some()
                 {
-                    return Err(Error::Other(
-                        "blob destination tag already exists".to_string(),
-                    ));
+                    return Err(Error::Other((
+                        "blob destination tag already exists".to_string()).into()));
                 }
             }
             let mut updated = record.clone();
@@ -3126,16 +3152,15 @@ impl BlobExportSnapshot {
             let hash = hash.value().to_vec();
             let state_bytes = state_bytes.value().to_vec();
             if hash.len() != 32 {
-                return Err(Error::Other(
-                    "blob generation table contains a malformed hash key".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob generation table contains a malformed hash key".to_string()).into()));
             }
             let state: BlobHashGenerationState = decode(&state_bytes)?;
             if state.version != RECORD_VERSION {
-                return Err(Error::Other(format!(
+                return Err(Error::Other((format!(
                     "unsupported blob generation-state version {}",
                     state.version
-                )));
+                )).into()));
             }
             insert_raw_entries(
                 artifact,
@@ -3157,24 +3182,22 @@ impl BlobExportSnapshot {
                 .get(manifest_key.as_slice())
                 .map_err(RedbPersistence::storage_error)?
                 .ok_or_else(|| {
-                    Error::Other(
+                    Error::Other((
                         "active blob generation has no canonical manifest in export snapshot"
-                            .to_string(),
-                    )
+                            .to_string()).into())
                 })?
                 .value()
                 .to_vec();
             let manifest: BlobManifest = decode(&manifest_bytes)?;
             if manifest.version != RECORD_VERSION {
-                return Err(Error::Other(format!(
+                return Err(Error::Other((format!(
                     "unsupported blob manifest version {}",
                     manifest.version
-                )));
+                )).into()));
             }
             if manifest.object_id != active.object_id {
-                return Err(Error::Other(
-                    "active blob generation and manifest object witnesses disagree".to_string(),
-                ));
+                return Err(Error::Other((
+                    "active blob generation and manifest object witnesses disagree".to_string()).into()));
             }
             insert_raw_entries(
                 artifact,
@@ -3216,10 +3239,9 @@ impl BlobExportSnapshot {
                 }
                 BlobManifestState::Partial => {
                     if !table_names.contains(PARTIAL_BITFIELDS_TABLE.name()) {
-                        return Err(Error::Other(
+                        return Err(Error::Other((
                             "partial blob export snapshot is missing durable partial state"
-                                .to_string(),
-                        ));
+                                .to_string()).into()));
                     }
                     let bitfields = self
                         .read
@@ -3229,10 +3251,9 @@ impl BlobExportSnapshot {
                         .get(manifest_key.as_slice())
                         .map_err(RedbPersistence::storage_error)?
                         .ok_or_else(|| {
-                            Error::Other(
+                            Error::Other((
                                 "partial blob export snapshot is missing its exact chunk sets"
-                                    .to_string(),
-                            )
+                                    .to_string()).into())
                         })?
                         .value()
                         .to_vec();
@@ -3296,10 +3317,10 @@ impl BlobExportSnapshot {
             return Ok(());
         }
         if !table_names.contains(definition.name()) {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "canonical blob manifest owns missing table {}",
                 definition.name()
-            )));
+            )).into()));
         }
         let source = self
             .read
@@ -3315,10 +3336,10 @@ impl BlobExportSnapshot {
                 .get(key.as_slice())
                 .map_err(RedbPersistence::storage_error)?
                 .ok_or_else(|| {
-                    Error::Other(format!(
+                    Error::Other((format!(
                         "canonical blob manifest owns missing chunk {index} in {}",
                         definition.name()
-                    ))
+                    )).into())
                 })?
                 .value()
                 .to_vec();
@@ -3331,10 +3352,10 @@ impl BlobExportSnapshot {
                 }
             };
             if expected_value_bytes == 0 || !valid_length {
-                return Err(Error::Other(format!(
+                return Err(Error::Other((format!(
                     "blob chunk {index} in {} disagrees with its deterministic logical offset",
                     definition.name()
-                )));
+                )).into()));
             }
             if !batch.is_empty() && batch_bytes.saturating_add(value.len()) > BLOB_WRITE_BATCH_BYTES
             {
@@ -3350,10 +3371,10 @@ impl BlobExportSnapshot {
             insert_raw_entries(artifact, definition, &batch)?;
         }
         if copied != expected_count {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob exact chunk set cardinality {copied} disagrees with manifest count {expected_count} in {}",
                 definition.name()
-            )));
+            )).into()));
         }
         Ok(())
     }
@@ -3369,9 +3390,8 @@ impl BlobExportSnapshot {
             return Ok(());
         }
         if !table_names.contains(TAGS_BY_NAME_TABLE.name()) {
-            return Err(Error::Other(
-                "blob reverse tag index exists without its authoritative by-name index".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob reverse tag index exists without its authoritative by-name index".to_string()).into()));
         }
         let reverse = self
             .read
@@ -3396,34 +3416,29 @@ impl BlobExportSnapshot {
             let value = value.value().to_vec();
             let tag: BlobTagRecord = decode(&value)?;
             if tag.version != RECORD_VERSION || tag.hash != *hash || tag.generation != generation {
-                return Err(Error::Other(
-                    "blob reverse tag index disagrees with its canonical generation".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob reverse tag index disagrees with its canonical generation".to_string()).into()));
             }
             let mut expected_reverse_key = prefix.to_vec();
             expected_reverse_key.extend_from_slice(&tag.name);
             if key.value() != expected_reverse_key.as_slice() {
-                return Err(Error::Other(
-                    "blob reverse tag key disagrees with its encoded owner".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob reverse tag key disagrees with its encoded owner".to_string()).into()));
             }
             if !owned_names.insert(tag.name.clone()) {
-                return Err(Error::Other(
-                    "blob export snapshot contains duplicate reverse tag ownership".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob export snapshot contains duplicate reverse tag ownership".to_string()).into()));
             }
             let authoritative_value = authoritative
                 .get(tag.name.as_slice())
                 .map_err(RedbPersistence::storage_error)?
                 .ok_or_else(|| {
-                    Error::Other(
-                        "blob reverse tag has no authoritative by-name ownership".to_string(),
-                    )
+                    Error::Other((
+                        "blob reverse tag has no authoritative by-name ownership".to_string()).into())
                 })?;
             if authoritative_value.value() != value.as_slice() {
-                return Err(Error::Other(
-                    "blob reverse tag disagrees with authoritative by-name ownership".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob reverse tag disagrees with authoritative by-name ownership".to_string()).into()));
             }
             reverse_entries.push((expected_reverse_key, value.clone()));
             name_entries.push((tag.name, value));
@@ -3448,16 +3463,15 @@ fn insert_fixture_chunks_in_write(
         .map_err(RedbPersistence::storage_error)?;
     for (index, block) in BlobRepository::logical_blocks(bytes).enumerate() {
         let index = u64::try_from(index)
-            .map_err(|_| Error::Other("blob fixture has too many bounded blocks".to_string()))?;
+            .map_err(|_| Error::Other(("blob fixture has too many bounded blocks".to_string()).into()))?;
         let key = BlobRepository::chunk_key(object_id, index);
         if table
             .insert(key.as_slice(), block)
             .map_err(RedbPersistence::storage_error)?
             .is_some()
         {
-            return Err(Error::Other(
-                "blob fixture would overwrite a bounded chunk".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob fixture would overwrite a bounded chunk".to_string()).into()));
         }
     }
     Ok(())
@@ -3512,18 +3526,18 @@ fn validate_canonical_chunk_witnesses_in_read(
     let block_count = logical_block_count(logical_size);
     for index in indices {
         if index >= block_count {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob canonical {role} witness is outside its declared size"
-            )));
+            )).into()));
         }
         let key = BlobRepository::chunk_key(object_id, index);
         let actual = table
             .get(key.as_slice())
             .map_err(RedbPersistence::storage_error)?
             .ok_or_else(|| {
-                Error::Other(format!(
+                Error::Other((format!(
                     "blob canonical {role} witness is missing bounded block {index}"
-                ))
+                )).into())
             })?
             .value()
             .len();
@@ -3534,10 +3548,48 @@ fn validate_canonical_chunk_witnesses_in_read(
             BlobManifestState::Partial => actual != 0 && actual <= expected,
         };
         if !valid {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob canonical {role} block {index} length disagrees with its manifest"
-            )));
+            )).into()));
         }
+    }
+    Ok(())
+}
+
+// Erasure authenticates the tag's own format and role by complete typed
+// equality, never by equating its independent format with a manifest format.
+// Both lookups and the eventual removals belong to the caller's same write.
+fn require_tag_owner_in_write(
+    write: &redb::WriteTransaction,
+    tag: &BlobTagRecord,
+) -> Result<()> {
+    let invalid = || Error::Other(("blob durable erasure witness disagrees with its owner".to_string()).into());
+    if tag.version != RECORD_VERSION {
+        return Err(invalid());
+    }
+    let names = write
+        .open_table(TAGS_BY_NAME_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    let authoritative = names
+        .get(tag.name.as_slice())
+        .map_err(RedbPersistence::storage_error)?
+        .ok_or_else(invalid)?;
+    let owner: BlobTagRecord = decode(authoritative.value())?;
+    if &owner != tag {
+        return Err(invalid());
+    }
+    let mut key = BlobRepository::manifest_key(&tag.hash, tag.generation).to_vec();
+    key.extend_from_slice(&tag.name);
+    let reverse = write
+        .open_table(TAGS_BY_HASH_TABLE)
+        .map_err(RedbPersistence::storage_error)?;
+    let counterpart = reverse
+        .get(key.as_slice())
+        .map_err(RedbPersistence::storage_error)?
+        .ok_or_else(invalid)?;
+    let reverse_owner: BlobTagRecord = decode(counterpart.value())?;
+    if &reverse_owner != tag || counterpart.value() != authoritative.value() {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -3546,7 +3598,6 @@ fn collect_tag_purge_witnesses_in_read(
     read: &redb::ReadTransaction,
     hash: &[u8; 32],
     generation: u64,
-    format: u8,
     table_names: &HashSet<String>,
 ) -> Result<Vec<BlobTagPurgeWitness>> {
     let has_reverse = table_names.contains(TAGS_BY_HASH_TABLE.name());
@@ -3555,9 +3606,8 @@ fn collect_tag_purge_witnesses_in_read(
         return Ok(Vec::new());
     }
     if !has_reverse || !has_names {
-        return Err(Error::Other(
-            "blob tag indexes are not both present for authoritative purge".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob tag indexes are not both present for authoritative purge".to_string()).into()));
     }
 
     let reverse = read
@@ -3583,22 +3633,21 @@ fn collect_tag_purge_witnesses_in_read(
         if tag.version != RECORD_VERSION
             || tag.hash != *hash
             || tag.generation != generation
-            || tag.format != format
             || key.value() != expected_key.as_slice()
         {
-            return Err(Error::Other(
-                "blob reverse tag witness disagrees with its canonical owner".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob reverse tag witness disagrees with its canonical owner".to_string()).into()));
         }
         let authoritative = by_name
             .get(tag.name.as_slice())
             .map_err(RedbPersistence::storage_error)?
             .ok_or_else(|| {
-                Error::Other("blob reverse tag lost its authoritative name witness".to_string())
+                Error::Other(("blob reverse tag lost its authoritative name witness".to_string()).into())
             })?;
-        if authoritative.value() != encoded.as_slice() {
+        let counterpart: BlobTagRecord = decode(authoritative.value())?;
+        if counterpart != tag || authoritative.value() != encoded.as_slice() {
             return Err(Error::Other(
-                "blob reverse tag disagrees with authoritative tag ownership".to_string(),
+                ("blob reverse tag disagrees with authoritative tag ownership".to_string()).into(),
             ));
         }
         if reverse_by_name
@@ -3612,9 +3661,8 @@ fn collect_tag_purge_witnesses_in_read(
             )
             .is_some()
         {
-            return Err(Error::Other(
-                "blob canonical generation has duplicate tag ownership".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob canonical generation has duplicate tag ownership".to_string()).into()));
         }
     }
 
@@ -3625,17 +3673,17 @@ fn collect_tag_purge_witnesses_in_read(
             continue;
         }
         let Some(reverse_witness) = reverse_by_name.get(name.value()) else {
-            return Err(Error::Other(
-                "blob authoritative tag has no reverse ownership witness".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob authoritative tag has no reverse ownership witness".to_string()).into()));
         };
+        let counterpart: BlobTagRecord = decode(&reverse_witness.encoded)?;
         if tag.version != RECORD_VERSION
             || tag.name.as_slice() != name.value()
+            || counterpart != tag
             || reverse_witness.encoded.as_slice() != value.value()
         {
-            return Err(Error::Other(
-                "blob authoritative tag witness is malformed".to_string(),
-            ));
+            return Err(Error::Other((
+                "blob authoritative tag witness is malformed".to_string()).into()));
         }
     }
     Ok(reverse_by_name.into_values().collect())
@@ -3647,7 +3695,11 @@ fn collect_tag_purge_witnesses_in_read(
 pub(crate) fn apply_authoritative_purge_in_write(
     write: &redb::WriteTransaction,
     projection: &BlobAuthoritativePurgeProjection,
+    original: Option<&crate::persistence::OriginalPersistenceFrame<'_>>,
 ) -> Result<()> {
+    if projection.native_control.is_some() {
+        return native_purge::apply(write,projection,original.ok_or_else(blob_fence_invalid)?);
+    }
     for hash_projection in &projection.hashes {
         {
             let mut table = write
@@ -3658,9 +3710,8 @@ pub(crate) fn apply_authoritative_purge_in_write(
                 .map_err(RedbPersistence::storage_error)?
                 .map(|value| value.value().to_vec());
             if current != hash_projection.expected_generation {
-                return Err(Error::Other(
-                    "blob generation witness changed before authoritative purge commit".to_string(),
-                ));
+                return Err(Error::Other((
+                    "blob generation witness changed before authoritative purge commit".to_string()).into()));
             }
             table
                 .insert(
@@ -3731,9 +3782,8 @@ pub(crate) fn apply_authoritative_purge_in_write(
     if !projection.hashes.is_empty()
         && AUTHORITATIVE_PURGE_BLOB_COMMIT_FAULT.with(|fault| fault.replace(false))
     {
-        return Err(Error::Other(
-            "blob authoritative purge commit failure injected".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob authoritative purge commit failure injected".to_string()).into()));
     }
     Ok(())
 }
@@ -3752,10 +3802,10 @@ fn remove_exact_blob_value_in_write(
         .map_err(RedbPersistence::storage_error)?
         .map(|value| value.value().to_vec());
     if current.as_deref() != Some(expected) {
-        return Err(Error::Other(format!(
+        return Err(Error::Other((format!(
             "blob durable witness changed in {} before authoritative purge commit",
             definition.name()
-        )));
+        )).into()));
     }
     table.remove(key).map_err(RedbPersistence::storage_error)?;
     Ok(())
@@ -3788,18 +3838,18 @@ fn validate_canonical_chunk_witnesses_in_write(
     let block_count = logical_block_count(logical_size);
     for index in indices {
         if index >= block_count {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob canonical {role} witness is outside its declared size"
-            )));
+            )).into()));
         }
         let key = BlobRepository::chunk_key(object_id, index);
         let actual = table
             .get(key.as_slice())
             .map_err(RedbPersistence::storage_error)?
             .ok_or_else(|| {
-                Error::Other(format!(
+                Error::Other((format!(
                     "blob canonical {role} witness disappeared before authoritative purge commit"
-                ))
+                )).into())
             })?
             .value()
             .len();
@@ -3810,9 +3860,9 @@ fn validate_canonical_chunk_witnesses_in_write(
             BlobManifestState::Partial => actual != 0 && actual <= expected,
         };
         if !valid {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob canonical {role} block changed before authoritative purge commit"
-            )));
+            )).into()));
         }
     }
     Ok(())
@@ -3905,13 +3955,13 @@ fn encode_chunk_indices(indices: &roaring::RoaringTreemap) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     indices
         .serialize_into(&mut bytes)
-        .map_err(|err| Error::Other(format!("encode exact blob chunk set: {err}")))?;
+        .map_err(|err| Error::Other((format!("encode exact blob chunk set: {err}")).into()))?;
     Ok(bytes)
 }
 
 fn decode_chunk_indices(bytes: &[u8]) -> Result<roaring::RoaringTreemap> {
     roaring::RoaringTreemap::deserialize_from(bytes)
-        .map_err(|err| Error::Other(format!("decode exact blob chunk set: {err}")))
+        .map_err(|err| Error::Other((format!("decode exact blob chunk set: {err}")).into()))
 }
 
 fn validate_partial_state(
@@ -3920,17 +3970,16 @@ fn validate_partial_state(
     outboard_count: u64,
 ) -> Result<(roaring::RoaringTreemap, roaring::RoaringTreemap)> {
     if partial.version != RECORD_VERSION {
-        return Err(Error::Other(format!(
+        return Err(Error::Other((format!(
             "unsupported blob partial-state version {}",
             partial.version
-        )));
+        )).into()));
     }
     let payload = decode_chunk_indices(&partial.payload_indices)?;
     let outboard = decode_chunk_indices(&partial.outboard_indices)?;
     if payload.len() != payload_count || outboard.len() != outboard_count {
-        return Err(Error::Other(
-            "blob partial exact chunk sets disagree with manifest cardinalities".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob partial exact chunk sets disagree with manifest cardinalities".to_string()).into()));
     }
     Ok((payload, outboard))
 }
@@ -3942,9 +3991,9 @@ fn logical_block_count(size: u64) -> u64 {
 fn validate_complete_block_count(size: u64, count: u64, role: &str) -> Result<()> {
     let expected = logical_block_count(size);
     if count != expected {
-        return Err(Error::Other(format!(
+        return Err(Error::Other((format!(
             "complete blob {role} count {count} disagrees with size-implied count {expected}"
-        )));
+        )).into()));
     }
     Ok(())
 }
@@ -3958,41 +4007,36 @@ fn validate_staging_bind_metadata(
     verified_payload_bytes: u64,
 ) -> Result<()> {
     if staging.provisional_generation != Some((bind.hash, generation)) {
-        return Err(Error::Other(
-            "blob staging bind lacks its exact durable hash-generation association".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob staging bind lacks its exact durable hash-generation association".to_string()).into()));
     }
     if staging
         .expected_size
         .is_some_and(|size| size != bind.total_size)
     {
-        return Err(Error::Other(
-            "blob staging declared size disagrees with its canonical manifest".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob staging declared size disagrees with its canonical manifest".to_string()).into()));
     }
     if bind.validated_size > bind.total_size
         || bind.validated_size != verified_payload_bytes
         || staging.received_size != verified_payload_bytes
     {
-        return Err(Error::Other(
-            "blob validated size disagrees with its verified payload blocks".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob validated size disagrees with its verified payload blocks".to_string()).into()));
     }
     if payload_indices.len() != staging.payload_chunk_count
         || outboard_indices.len() != staging.outboard_chunk_count
     {
-        return Err(Error::Other(
-            "blob staging exact block sets disagree with their cardinalities".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob staging exact block sets disagree with their cardinalities".to_string()).into()));
     }
     let payload_bound = logical_block_count(bind.total_size);
     let outboard_bound = logical_block_count(bind.outboard_size);
     if payload_indices.iter().any(|index| index >= payload_bound)
         || outboard_indices.iter().any(|index| index >= outboard_bound)
     {
-        return Err(Error::Other(
-            "blob staging contains a logical block outside its declared size".to_string(),
-        ));
+        return Err(Error::Other((
+            "blob staging contains a logical block outside its declared size".to_string()).into()));
     }
     Ok(())
 }
@@ -4016,21 +4060,21 @@ fn validate_staged_blocks_in_write(
     let mut verified_bytes = 0u64;
     for index in indices {
         if index >= block_count {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob {role} block {index} is outside its declared size"
-            )));
+            )).into()));
         }
         let key = BlobRepository::chunk_key(object_id, index);
         let value = table
             .get(key.as_slice())
             .map_err(RedbPersistence::storage_error)?
-            .ok_or_else(|| Error::Other(format!("blob {role} block {index} is missing")))?;
+            .ok_or_else(|| Error::Other((format!("blob {role} block {index} is missing")).into()))?;
         let offset = index.saturating_mul(block_bytes);
         let expected = logical_size.saturating_sub(offset).min(block_bytes);
         if value.value().len() as u64 != expected {
-            return Err(Error::Other(format!(
+            return Err(Error::Other((format!(
                 "blob {role} block {index} length disagrees with its deterministic offset"
-            )));
+            )).into()));
         }
         verified_bytes = verified_bytes.saturating_add(expected);
     }
@@ -4039,9 +4083,9 @@ fn validate_staged_blocks_in_write(
 
 fn validate_dense_indices(indices: &roaring::RoaringTreemap, count: u64, role: &str) -> Result<()> {
     if indices.len() != count || !indices.iter().eq(0..count) {
-        return Err(Error::Other(format!(
+        return Err(Error::Other((format!(
             "complete blob {role} staging indices are not the dense range implied by its count"
-        )));
+        )).into()));
     }
     Ok(())
 }
@@ -4071,12 +4115,12 @@ pub fn new_partial_state(
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     rmp_serde::to_vec_named(value)
-        .map_err(|err| Error::Other(format!("encode blob repository record: {err}")))
+        .map_err(|err| Error::Other((format!("encode blob repository record: {err}")).into()))
 }
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     rmp_serde::from_slice(bytes)
-        .map_err(|err| Error::Other(format!("decode blob repository record: {err}")))
+        .map_err(|err| Error::Other((format!("decode blob repository record: {err}")).into()))
 }
 
 /// Construct an unbound staging record at a database frontier.

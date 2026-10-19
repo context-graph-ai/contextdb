@@ -1218,7 +1218,9 @@ fn t4_17_changes_since_filters_context_rows_and_schema() {
 
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
-    let changes = scoped.changes_since(Lsn(0));
+    let changes = scoped
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert!(
         changes.ddl.is_empty(),
         "constrained changes_since must not leak schema DDL"
@@ -1259,7 +1261,9 @@ fn t4_17b_changes_since_emits_delete_when_row_moves_out_of_context_after_ddl_lsn
 
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
-    let changes = scoped.changes_since(since);
+    let changes = scoped
+        .changes_since(since)
+        .expect("read the declared changes");
     assert!(
         changes.ddl.is_empty(),
         "scoped change streams must not expose schema DDL"
@@ -1356,7 +1360,7 @@ fn t4_19_scoped_raw_helpers_respect_context_boundary() {
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
     assert!(
-        scoped.ddl_log_since(Lsn(0)).is_empty(),
+        scoped.ddl_log_since(Lsn(0)).unwrap().is_empty(),
         "scoped raw DDL log helper must not expose schema"
     );
     let row_changes = scoped.change_log_rows_since(Lsn(0)).unwrap();
@@ -1371,12 +1375,15 @@ fn t4_19_scoped_raw_helpers_respect_context_boundary() {
         "raw row log helper leaked hidden context row"
     );
     assert!(
-        !scoped.has_live_vector(hidden_row_id, scoped.snapshot()),
+        !scoped
+            .has_live_vector(hidden_row_id, scoped.snapshot())
+            .expect("inspect the live vector"),
         "has_live_vector must hide vectors attached to hidden rows"
     );
     assert!(
         scoped
             .live_vector_entry(hidden_row_id, scoped.snapshot())
+            .expect("read the actual fixture observation")
             .is_none(),
         "live_vector_entry must not return hidden vector payloads"
     );

@@ -70,7 +70,7 @@ fn a_never_claimed_jobs_input_copies_age_out_under_the_declared_window() {
 
     // Advance past the declared 7-day window; nobody ever claimed the job.
     mock_now.fetch_add(SEVEN_DAYS_MS + 60_000, AtomicOrdering::SeqCst);
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert!(
         pruned > 0,
         "the aged-out input row must be pruned by the shipped retention pass"
@@ -104,7 +104,8 @@ fn reading_an_expired_jobs_input_returns_a_typed_refusal_not_empty_bytes() {
     submit_job(&db, &spec, &[b"payload bytes".as_slice()]).expect("submit");
 
     mock_now.fetch_add(SEVEN_DAYS_MS + 60_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired job inputs before checking the typed read refusal");
     assert_eq!(
         work_inputs_row_count(&db, "job-expired"),
         0,
@@ -186,7 +187,8 @@ fn an_ordinary_incremental_pull_does_not_resurrect_an_expired_input_row() {
     let hub = Database::open_memory();
     install_work_ledger_schema(&hub).expect("install on hub");
     hub.apply_changes(
-        edge.changes_since(contextdb_core::Lsn(0)),
+        edge.changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .expect("hub receives the pushed job and its inputs");
@@ -204,7 +206,8 @@ fn an_ordinary_incremental_pull_does_not_resurrect_an_expired_input_row() {
 
     // The edge expires its OWN copy locally.
     mock_now.fetch_add(SEVEN_DAYS_MS + 60_000, AtomicOrdering::SeqCst);
-    edge.run_pruning_cycle();
+    edge.run_pruning_cycle()
+        .expect("prune the edge input before the incremental pull");
     assert_eq!(
         work_inputs_row_count(&edge, "job-pushed"),
         0,
@@ -221,7 +224,8 @@ fn an_ordinary_incremental_pull_does_not_resurrect_an_expired_input_row() {
     // An ORDINARY incremental pull -- from the edge's own recorded
     // watermark, never `Lsn(0)` -- must not resurrect the expired row.
     edge.apply_changes(
-        hub.changes_since(hub_watermark_after_convergence),
+        hub.changes_since(hub_watermark_after_convergence)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .expect("an ordinary incremental pull must apply without erroring");

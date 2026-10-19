@@ -606,7 +606,7 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
 
     let reader = run(
         &[store.path_str(), "--json", "--read-work", "5000000"],
-        &format!("{query}\n"),
+        &format!(".trace on\n{query}\n"),
     );
     assert_eq!(
         reader.code,
@@ -618,6 +618,25 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
         reader.stderr.contains("\"route\":\"owner\""),
         "the proof must use the live owner's read route.\n{}",
         reader.describe()
+    );
+    // The search's work crosses the owner channel with its answer: the
+    // stored vectors it read to score its candidates are reported.
+    let trace = reader
+        .stderr_docs()
+        .into_iter()
+        .filter_map(|document| document.get("trace").cloned())
+        .find(|trace| trace["vector_search"].is_object())
+        .unwrap_or_else(|| {
+            panic!(
+                "the live reader publishes its executed route.\n{}",
+                reader.describe()
+            )
+        });
+    assert!(
+        trace["vector_search"]["rescore_evaluations"]
+            .as_u64()
+            .is_some_and(|reads| reads > 0),
+        "the owner's answer reports the stored vectors its search read: {trace}"
     );
 
     let owner_result = documents_named(&owner.documents(), "result")
@@ -673,6 +692,54 @@ fn maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli()
             outcome.stdout.contains(field),
             "the text maintenance status is missing {field:?}:\n{}",
             outcome.describe()
+        );
+    }
+
+    // A cycle with no check due measured nothing: its receipt says unknown,
+    // never 0. Every run and compact receipt names the policy that governed it.
+    let receipts = run(
+        &[store.path_str(), "--write"],
+        ".maintenance run\n.maintenance run\n.maintenance compact\n",
+    );
+    assert_eq!(receipts.code, Some(0), "{}", receipts.describe());
+    assert!(
+        receipts
+            .stdout
+            .contains("auto_compact_fragmentation_before=unknown"),
+        "the second cycle's text receipt says unknown:\n{}",
+        receipts.describe()
+    );
+    let policy = "compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),\
+                  stop_ratio:0.05(default),max_sweeps:8(default)";
+    assert_eq!(
+        receipts.stdout.matches(policy).count(),
+        3,
+        "every run and compact text receipt names the governing policy:\n{}",
+        receipts.describe()
+    );
+    let json_receipts = run(
+        &[store.path_str(), "--write", "--json"],
+        ".maintenance run\n.maintenance run\n",
+    );
+    assert_eq!(json_receipts.code, Some(0), "{}", json_receipts.describe());
+    let cycles = documents_named(&json_receipts.stdout_docs(), "maintenance_cycle");
+    assert_eq!(cycles.len(), 2, "{}", json_receipts.describe());
+    assert!(
+        cycles[1]["compaction"]["fragmentation_before"].is_null(),
+        "the second cycle's JSON receipt says null: {}",
+        cycles[1]
+    );
+    for (name, value) in [
+        ("start_ratio", serde_json::json!(0.5)),
+        ("min_interval_ms", serde_json::json!(3_600_000)),
+        ("stop_ratio", serde_json::json!(0.05)),
+        ("max_sweeps", serde_json::json!(8)),
+    ] {
+        assert_eq!(
+            cycles[1]["compaction"]["policy"][name],
+            serde_json::json!({ "value": value, "source": "default" }),
+            "the JSON receipt names {name}: {}",
+            cycles[1]
         );
     }
 }

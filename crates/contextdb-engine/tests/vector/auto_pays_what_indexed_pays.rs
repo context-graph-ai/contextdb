@@ -158,9 +158,17 @@ fn fixture() -> Database {
     for _ in 0..512 {
         db.run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = db
             .vector_store_for_test()
-            .partition_infos(&VectorIndexRef::new("route_vectors", "embedding"))
+            .partition_infos(
+                &VectorIndexRef::new("route_vectors", "embedding"),
+                &mut partition_observation_owner_1,
+            )
             .expect("inspect partition readiness");
         if ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available) {
             return db;

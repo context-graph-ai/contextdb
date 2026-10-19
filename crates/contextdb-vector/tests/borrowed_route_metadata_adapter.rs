@@ -7,9 +7,10 @@ use contextdb_core::{
     VectorPartitionKey, VectorQuantization, VectorSearchMode,
 };
 use contextdb_vector::{
-    MemoryBudget, PartitionedVectorDelete, PartitionedVectorEntry, VectorIndexLayout,
-    VectorMaintenanceFailure, VectorMaintenanceFailureDetails, VectorPartitionRef,
-    VectorPartitionSourceMaintenanceMetadata, VectorRouteQuarantineReason, VectorStore,
+    MemoryBudget, PartitionedVectorDelete, PartitionedVectorEntry, VectorCopyAdmission,
+    VectorIndexLayout, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
+    VectorPartitionRef, VectorPartitionSourceMaintenanceMetadata, VectorRouteQuarantineReason,
+    VectorStore,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -108,6 +109,45 @@ impl MemoryBudget for Budget {
     }
 }
 
+fn insert_partition_fixture(
+    store: &VectorStore,
+    body_owner: &Arc<Budget>,
+    entries: Vec<PartitionedVectorEntry>,
+    executing_owner: VectorCopyAdmission,
+) -> contextdb_core::Result<()> {
+    let mut bodies = VectorCopyAdmission::new(body_owner.clone());
+    bodies.reserve(
+        entries
+            .iter()
+            .map(|entry| entry.entry.vector.len() * std::mem::size_of::<f32>())
+            .sum(),
+    )?;
+    let result = store.apply_partitioned_inserts(entries, executing_owner);
+    if result.is_ok() {
+        bodies.transfer();
+    }
+    result
+}
+fn insert_inline_fixture(
+    store: &VectorStore,
+    body_owner: &Arc<Budget>,
+    entries: Vec<VectorEntry>,
+    executing_owner: VectorCopyAdmission,
+) -> contextdb_core::Result<()> {
+    let mut bodies = VectorCopyAdmission::new(body_owner.clone());
+    bodies.reserve(
+        entries
+            .iter()
+            .map(|entry| entry.vector.len() * std::mem::size_of::<f32>())
+            .sum(),
+    )?;
+    let result = store.apply_inserts(entries, executing_owner);
+    if result.is_ok() {
+        bodies.transfer();
+    }
+    result
+}
+
 fn index() -> VectorIndexRef {
     VectorIndexRef::new("items", "embedding")
 }
@@ -160,9 +200,18 @@ fn entry(index: &VectorIndexRef, row: u64) -> VectorEntry {
 fn fixed_metadata_can_be_sampled_from_source_and_publication_views() {
     fn require_copy<T: Copy>(_: T) {}
 
+    let declared_column_owner = Arc::new(Budget::default());
+    let _executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
-    store.register_index(index.clone(), 2, VectorQuantization::F32);
+    store
+        .register_index(
+            index.clone(),
+            2,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
     let state = store.state(&index).unwrap();
     let partition = VectorPartitionRef::new(index.clone(), VectorPartitionKey::unpartitioned());
     let metadata = store
@@ -187,9 +236,18 @@ fn fixed_metadata_can_be_sampled_from_source_and_publication_views() {
 
 #[test]
 fn scalar_marks_and_none_leave_existing_fields_and_serving_state_intact() {
+    let declared_column_owner = Arc::new(Budget::default());
+    let _executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
-    store.register_index(index.clone(), 2, VectorQuantization::F32);
+    store
+        .register_index(
+            index.clone(),
+            2,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
     let state = store.state(&index).unwrap();
     let partition = VectorPartitionRef::new(index.clone(), VectorPartitionKey::unpartitioned());
     let before = store.partition_graph_generation_status(&partition);
@@ -218,13 +276,27 @@ fn scalar_marks_and_none_leave_existing_fields_and_serving_state_intact() {
 
 #[test]
 fn removed_index_rejects_its_sampled_source() {
+    let declared_column_owner = Arc::new(Budget::default());
+    let executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
-    store.register_index(index.clone(), 2, VectorQuantization::F32);
+    store
+        .register_index(
+            index.clone(),
+            2,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
     let sampled = store.state(&index).unwrap();
     assert!(
         store
-            .deregister_index(&index, &Budget::default())
+            .deregister_index(
+                &index,
+                declared_column_owner.as_ref(),
+                &mut VectorCopyAdmission::new(executing_owner.clone())
+            )
+            .unwrap()
             .is_empty()
     );
     assert!(!store.apply_partition_source_maintenance_metadata(
@@ -239,14 +311,25 @@ fn removed_index_rejects_its_sampled_source() {
 
 #[test]
 fn replacement_column_rejects_the_old_state_without_marking_the_new_source() {
+    let declared_column_owner = Arc::new(Budget::default());
+    let executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
-    store.register_index(index.clone(), 2, VectorQuantization::F32);
+    store
+        .register_index(
+            index.clone(),
+            2,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
     let sampled = store.state(&index).unwrap();
     store
         .register_index_with_layout(
             index.clone(),
             VectorIndexLayout::unpartitioned(3, VectorQuantization::F32),
+            declared_column_owner.clone(),
+            &mut VectorCopyAdmission::new(executing_owner.clone()),
         )
         .unwrap();
     let replacement = store.state(&index).unwrap();
@@ -269,24 +352,35 @@ fn replacement_column_rejects_the_old_state_without_marking_the_new_source() {
 
 #[test]
 fn removed_and_recreated_partition_rejects_the_old_state_in_the_same_column() {
+    let declared_column_owner = Arc::new(Budget::default());
+    let executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
     let key = text_key("same-route");
     store
-        .register_index_with_layout(index.clone(), partitioned_layout())
+        .register_index_with_layout(
+            index.clone(),
+            partitioned_layout(),
+            declared_column_owner.clone(),
+            &mut VectorCopyAdmission::new(executing_owner.clone()),
+        )
         .unwrap();
-    store
-        .apply_partitioned_inserts(vec![PartitionedVectorEntry::new(
-            key.clone(),
-            entry(&index, 1),
-        )])
-        .unwrap();
+    insert_partition_fixture(
+        &store,
+        &declared_column_owner,
+        vec![PartitionedVectorEntry::new(key.clone(), entry(&index, 1))],
+        VectorCopyAdmission::new(executing_owner.clone()),
+    )
+    .unwrap();
     let sampled = store.partition_state(&index, &key).unwrap();
-    store.prune_row_ids_in_indexes(
-        &HashSet::from([RowId(1)]),
-        std::slice::from_ref(&index),
-        &Budget::default(),
-    );
+    store
+        .prune_row_ids_in_indexes(
+            &HashSet::from([RowId(1)]),
+            std::slice::from_ref(&index),
+            declared_column_owner.as_ref(),
+            &mut VectorCopyAdmission::new(executing_owner.clone()),
+        )
+        .unwrap();
     assert!(store.try_partition_state(&index, &key).is_none());
     assert!(!store.apply_partition_source_maintenance_metadata(
         &index,
@@ -294,12 +388,13 @@ fn removed_and_recreated_partition_rejects_the_old_state_in_the_same_column() {
         Some(failure()),
         None
     ));
-    store
-        .apply_partitioned_inserts(vec![PartitionedVectorEntry::new(
-            key.clone(),
-            entry(&index, 2),
-        )])
-        .unwrap();
+    insert_partition_fixture(
+        &store,
+        &declared_column_owner,
+        vec![PartitionedVectorEntry::new(key.clone(), entry(&index, 2))],
+        VectorCopyAdmission::new(executing_owner.clone()),
+    )
+    .unwrap();
     let replacement = store.partition_state(&index, &key).unwrap();
     assert!(!Arc::ptr_eq(&sampled, &replacement));
     assert!(!store.apply_partition_source_maintenance_metadata(
@@ -314,19 +409,42 @@ fn removed_and_recreated_partition_rejects_the_old_state_in_the_same_column() {
 
 #[test]
 fn renamed_index_rejects_the_old_name_even_when_that_name_is_reused() {
+    let declared_column_owner = Arc::new(Budget::default());
+    let executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let old = index();
     let renamed = VectorIndexRef::new("items", "renamed_embedding");
-    store.register_index(old.clone(), 2, VectorQuantization::F32);
+    store
+        .register_index(
+            old.clone(),
+            2,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
     let sampled = store.state(&old).unwrap();
-    store.rename_index(&old, renamed.clone()).unwrap();
+    store
+        .prepare_index_rename(
+            &old,
+            &renamed,
+            VectorCopyAdmission::new(executing_owner.clone()),
+        )
+        .unwrap()
+        .publish();
     assert!(!store.apply_partition_source_maintenance_metadata(
         &old,
         &sampled,
         Some(failure()),
         None
     ));
-    store.register_index(old.clone(), 2, VectorQuantization::F32);
+    store
+        .register_index(
+            old.clone(),
+            2,
+            VectorQuantization::F32,
+            declared_column_owner.clone(),
+        )
+        .unwrap();
     let replacement = store.state(&old).unwrap();
     assert!(!store.apply_partition_source_maintenance_metadata(
         &old,
@@ -347,29 +465,48 @@ fn renamed_index_rejects_the_old_name_even_when_that_name_is_reused() {
 
 #[test]
 fn scalar_marking_preserves_historical_only_sources() {
+    let declared_column_owner = Arc::new(Budget::default());
+    let executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
     let key = text_key("historical");
     store
-        .register_index_with_layout(index.clone(), partitioned_layout())
-        .unwrap();
-    store
-        .apply_partitioned_inserts(vec![PartitionedVectorEntry::new(
-            key.clone(),
-            entry(&index, 1),
-        )])
-        .unwrap();
-    store
-        .apply_partitioned_deletes(vec![PartitionedVectorDelete::new(
+        .register_index_with_layout(
             index.clone(),
-            key.clone(),
-            RowId(1),
-            TxId(2),
-        )])
+            partitioned_layout(),
+            declared_column_owner.clone(),
+            &mut VectorCopyAdmission::new(executing_owner.clone()),
+        )
+        .unwrap();
+    insert_partition_fixture(
+        &store,
+        &declared_column_owner,
+        vec![PartitionedVectorEntry::new(key.clone(), entry(&index, 1))],
+        VectorCopyAdmission::new(executing_owner.clone()),
+    )
+    .unwrap();
+    store
+        .apply_partitioned_deletes(
+            vec![PartitionedVectorDelete::new(
+                index.clone(),
+                key.clone(),
+                RowId(1),
+                TxId(2),
+                TxId(1),
+                Lsn(1),
+            )],
+            VectorCopyAdmission::new(executing_owner.clone()),
+        )
         .unwrap();
     // This isolated store has no concurrent commits or registered snapshots.
     assert_eq!(
-        store.retire_snapshot_free_partition_states(&[], &Budget::default()),
+        store
+            .retire_snapshot_free_partition_states(
+                &[],
+                declared_column_owner.as_ref(),
+                &mut VectorCopyAdmission::new(executing_owner.clone())
+            )
+            .unwrap(),
         1
     );
     let source = store.partition_state(&index, &key).unwrap();
@@ -384,7 +521,15 @@ fn scalar_marking_preserves_historical_only_sources() {
     assert!(metadata.historical_only);
     assert_eq!(metadata.failure, Some(failure()));
     assert_eq!(metadata.quarantine, None);
-    assert!(store.partition_keys(&index).unwrap().is_empty());
+    assert!(
+        store
+            .partition_keys(
+                &index,
+                &mut VectorCopyAdmission::new(executing_owner.clone())
+            )
+            .unwrap()
+            .is_empty()
+    );
     store
         .with_partition_sources::<Error, _>(&index, |sources| {
             assert_eq!(sources.len(), 1);
@@ -398,6 +543,8 @@ fn scalar_marking_preserves_historical_only_sources() {
 
 #[test]
 fn successful_ordinary_publication_clears_an_adapter_failure() {
+    let declared_column_owner = Arc::new(Budget::default());
+    let executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
     store
@@ -410,9 +557,17 @@ fn successful_ordinary_publication_clears_an_adapter_failure() {
                 Some(16),
                 1,
             ),
+            declared_column_owner.clone(),
+            &mut VectorCopyAdmission::new(executing_owner.clone()),
         )
         .unwrap();
-    store.apply_inserts(vec![entry(&index, 1), entry(&index, 2)]);
+    insert_inline_fixture(
+        &store,
+        &declared_column_owner,
+        vec![entry(&index, 1), entry(&index, 2)],
+        VectorCopyAdmission::new(executing_owner.clone()),
+    )
+    .unwrap();
     let sampled = store.state(&index).unwrap();
     assert!(store.apply_partition_source_maintenance_metadata(
         &index,
@@ -421,7 +576,12 @@ fn successful_ordinary_publication_clears_an_adapter_failure() {
         None
     ));
     let budget = Arc::new(Budget::default());
-    let report = store.run_hnsw_maintenance_cycle(budget.clone()).unwrap();
+    let report = store
+        .run_hnsw_maintenance_cycle(
+            budget.clone(),
+            &mut VectorCopyAdmission::new(executing_owner.clone()),
+        )
+        .unwrap();
     assert_eq!(report.built_partitions, 1);
     assert_eq!(sampled.source_maintenance_metadata().failure, None);
     assert!(store.has_hnsw_index_for(&index));
@@ -434,18 +594,26 @@ fn successful_ordinary_publication_clears_an_adapter_failure() {
 #[test]
 fn giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding() {
     const GIANT: usize = 1024 * 1024;
+    let declared_column_owner = Arc::new(Budget::default());
+    let executing_owner = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = index();
     let key = text_key("k".repeat(GIANT));
     store
-        .register_index_with_layout(index.clone(), partitioned_layout())
+        .register_index_with_layout(
+            index.clone(),
+            partitioned_layout(),
+            declared_column_owner.clone(),
+            &mut VectorCopyAdmission::new(executing_owner.clone()),
+        )
         .unwrap();
-    store
-        .apply_partitioned_inserts(vec![PartitionedVectorEntry::new(
-            key.clone(),
-            entry(&index, 1),
-        )])
-        .unwrap();
+    insert_partition_fixture(
+        &store,
+        &declared_column_owner,
+        vec![PartitionedVectorEntry::new(key.clone(), entry(&index, 1))],
+        VectorCopyAdmission::new(executing_owner.clone()),
+    )
+    .unwrap();
     let source = store.partition_state(&index, &key).unwrap();
     let details = failure();
     assert_eq!(details.failure, VectorMaintenanceFailure::MemoryLimit);

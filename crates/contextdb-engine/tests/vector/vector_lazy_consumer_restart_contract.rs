@@ -143,7 +143,10 @@ fn point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector
         .expect("point lookup succeeds")
         .expect("alpha row exists");
     assert_row_vector(&row, &[1.0, 0.0, 0.0]);
-    assert!(raw_resident(&db, ALPHA_SCOPE));
+    assert!(
+        !raw_resident(&db, ALPHA_SCOPE),
+        "the selected body is loaded on demand without hydrating its complete partition"
+    );
     assert!(
         !raw_resident(&db, BRAVO_SCOPE),
         "reading alpha cannot load an unrelated dormant partition"
@@ -157,7 +160,7 @@ fn outbound_snapshot_after_reopen_contains_every_vector_and_owner_value() {
     seed(&path);
     let db = reopen(&path);
 
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert_eq!(
         changes.vectors.len(),
         2,
@@ -227,9 +230,19 @@ fn delete_after_reopen_tombstones_the_dormant_vector_and_keeps_the_other_partiti
             &params([("id", Value::Uuid(ALPHA_ID))]),
         )
         .expect("delete alpha after restart");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         assert!(
             db.vector_store_for_test()
-                .partition_info(&index(), &partition(ALPHA_SCOPE))
+                .partition_info(
+                    &index(),
+                    &partition(ALPHA_SCOPE),
+                    &mut partition_observation_owner_1
+                )
+                .unwrap()
                 .is_none_or(|info| info.live_rows == 0),
             "the accepted delete removes alpha from live vector membership"
         );
@@ -318,6 +331,14 @@ fn snapshot_inspection_counts_vectors_without_hydrating_the_inspection_copy_firs
     let path = root.path().join("inspection-source.db");
     let artifact = root.path().join("inspection.snapshot");
     seed(&path);
+    let inspection_fixture_parent_1 =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            contextdb_engine::OwnerReadConfig::default()
+                .limits
+                .limits
+                .memory,
+        );
+
     {
         let db = reopen(&path);
         db.export_snapshot(&artifact)
@@ -325,7 +346,14 @@ fn snapshot_inspection_counts_vectors_without_hydrating_the_inspection_copy_firs
         db.close().expect("close the export source");
     }
 
-    let inspector = SnapshotInspector::open(&artifact).expect("open the exported inspection copy");
+    let inspector = SnapshotInspector::open(
+        &artifact,
+        inspection_fixture_parent_1
+            .child()
+            .expect("admit the inspection reader"),
+        inspection_fixture_parent_1.clone(),
+    )
+    .expect("open the exported inspection copy");
     let report = inspector
         .inspect_sync_apply_state()
         .expect("inspect the complete exported state");

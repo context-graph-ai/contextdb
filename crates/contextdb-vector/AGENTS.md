@@ -17,6 +17,20 @@ a saved graph read page by page (`hnsw/unfiltered.rs`) and the multi-partition u
 (`hnsw/union.rs`); `SQ8`/`SQ4` payloads (`quantized.rs`); memory charge ownership
 (`memory_budget.rs`); the core `VectorExecutor` implementation (`mem.rs`: `MemVectorExecutor`).
 
+Large partitions are served and built without holding the population in memory. A partition can
+register a paged builder or reclaimer (`register_partition_paged_builder`,
+`register_partition_paged_reclaimer`, progress and publish/abandon calls in `store.rs`) that
+inserts a durable batch at a time through `hnsw/paged_builder.rs`: the engine supplies authenticated
+point pages and lookup directories (`PagedVectorReader`, `PagedVectorTransaction`,
+`PagedVectorGraphSource`, `PagedVectorPersistence`), and this crate retains no all-node graph or
+row-to-vector map. The mutable tail can be paged the same way (`PagedVectorTail`, installed and
+appended through `install_partition_paged_tail` / `append_partition_paged_tail`), so a search sees
+saved base, change graphs and tail with the same visibility, tie order and work charges.
+Raw memberships are read through durable sources pinned to one root (`store/membership.rs`:
+`RawVectorMembershipSource`, cursors, `LazyRawVectorMembershipSource`); no decoded directory is
+retained, and partition membership is verified on first use.
+<!-- enforced by: crates/contextdb-engine/tests/engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs::unpartitioned_vector_membership_pages_reload_at_constant_residency, crates/contextdb-engine/tests/engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs::paged_initial_replacement_and_reclamation_progress_under_writes, crates/contextdb-engine/tests/engine_seams/first_search_after_writer_reopen_uses_saved_pages_without_build.rs::first_search_after_writer_reopen_uses_saved_pages_without_build -->
+
 Must not own: where generation bytes, raw vectors, the catalog or the change journal are stored,
 or when a maintenance cycle runs — the engine does both. SQL grammar, planning, row
 authorization and sync belong to the parser, planner and engine. A second graph implementation
@@ -54,7 +68,7 @@ vector search needs from a graph is written here, in `hnsw.rs`, on top of that f
 | A saved base plus resident tail preserves row-id ties even at search breadth one | `src/hnsw.rs` → `tests::mixed_saved_base_and_resident_tail_keep_exact_row_id_ties_at_breadth_one` |
 | Exhaustive AUTO can stream a dormant partition one body at a time when bulk loading is refused; unrestricted explicit EXACT on a writer still requires that load | `crates/contextdb-engine/tests/vector/vector_lazy_raw_residency_contract.rs` → `auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition` |
 | Unfiltered search descends each upper level until no closer neighbour remains before searching the bottom level | `src/hnsw.rs` → `tests::unfiltered_upper_descent_finishes_each_level_before_searching_bottom` |
-| A multi-partition search stays within its one statement work budget (`max(EF_SEARCH, k)` × stored bottom-level degree) and completes its answer; a distance already computed while admitting partitions is reused rather than recomputed, without changing any answer | `crates/contextdb-engine/tests/vector/multi_partition_union_recovers_nearest_rows.rs` → `uniform_three_and_eight_partition_shared_walk_regression`, `clustered_one_three_and_eight_partition_shared_walk_regression` |
+| A multi-partition search stays within its one statement work budget (`max(EF_SEARCH, k)` × stored bottom-level degree, `2 × M` plus the 4 links that keep every point reachable) and completes its answer; a distance already computed while admitting partitions is reused rather than recomputed, without changing any answer | `crates/contextdb-engine/tests/vector/multi_partition_union_recovers_nearest_rows.rs` → `uniform_three_and_eight_partition_shared_walk_regression`, `clustered_one_three_and_eight_partition_shared_walk_regression` |
 | Filtered search charges no work for excluded history | `src/hnsw.rs` → `tests::ordinary_allowed_search_excluded_history_adds_no_visit_or_distance_work` |
 | Recall-at-10 of the indexed route is at least 95% of exact | `crates/contextdb-engine/tests/vector/vector_held_out_native_reference.rs` → `held_out_unfiltered_native_reference_recovers_the_required_neighbors` |
 | Every search, index and consolidation threshold comes from the declared column policy resolved in one place (`VectorIndexLayout::resolve_policy` / `effective_auto_index_at` in `store.rs`); an undeclared value falls back to a documented default there, but a declared value is never silently overridden by a constant elsewhere | `crates/contextdb-engine/tests/vector/vector_policy_resolver_contract.rs` → `declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries` |
@@ -64,6 +78,10 @@ vector search needs from a graph is written here, in `hnsw.rs`, on top of that f
 | Detached-copy hydration moves unique uncharged bodies out of shared headers; shared histories and charged or resident sources keep their representation and final-holder charge | `src/store/detached_copy_payload_tests.rs::detached_copy_unique_unwrap_moves_the_body_and_preserves_shared_or_charged_owners`, `src/store/detached_copy_payload_tests.rs::detached_copy_hydration_retains_only_new_singleton_bodies_and_releases_headers`, `src/store/detached_copy_payload_tests.rs::detached_copy_header_refusal_releases_loader_body_workspace_and_retries`, `src/store/detached_copy_payload_tests.rs::detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges`, `src/store/detached_copy_payload_tests.rs::detached_copy_already_resident_sources_keep_representation_charge_and_funder` |
 | Resident generation selection copies only frontier-live entries after the optional LSN boundary, preserving representations and history; inconsistent directory metadata refuses before body materialization | `src/store/generation_selection_tests.rs::selected_generation_materialization_preserves_all_representations_and_snapshot_intervals`, `src/store/generation_selection_tests.rs::selected_generation_refuses_inconsistent_metadata_before_body_materialization` |
 | Borrowed source metadata and scalar marking copy no giant partition key; stale source identities cannot mark a replacement column or partition | `tests/borrowed_route_metadata_adapter.rs::giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding`, `tests/borrowed_route_metadata_adapter.rs::replacement_column_rejects_the_old_state_without_marking_the_new_source`, `tests/borrowed_route_metadata_adapter.rs::removed_and_recreated_partition_rejects_the_old_state_in_the_same_column` |
+| A writable reopen searches saved pages without rebuilding the graph | `crates/contextdb-engine/tests/engine_seams/first_search_after_writer_reopen_uses_saved_pages_without_build.rs` → `first_search_after_writer_reopen_uses_saved_pages_without_build` |
+| Unpartitioned membership pages reload at constant residency | `crates/contextdb-engine/tests/engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs` → `unpartitioned_vector_membership_pages_reload_at_constant_residency` |
+| Initial build, replacement and reclamation progress in finite batches beside live writes | `crates/contextdb-engine/tests/engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs` → `paged_initial_replacement_and_reclamation_progress_under_writes` |
+| The AUTO index threshold is judged on the aggregate across partitions, before partition cost | `crates/contextdb-engine/tests/engine_seams/aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope.rs` → `aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope` |
 
 Publication, restart, repair and partition behaviour end to end are guarded by the engine's
 `crates/contextdb-engine/tests/vector_*_contract.rs` files; the claims they bind are tagged in
@@ -76,6 +94,8 @@ Publication, restart, repair and partition behaviour end to end are guarded by t
 | Streaming exhaustive bodies after refused bulk admission | `mem.rs::BoundedBruteForceCursor`; `store.rs::DormantRawVectorLoader` tells it whether a committed-image exact read can stream. The engine supplies the loader. |
 | A search route, merge order or refusal | `store.rs` (per-layout search, global merge), `mem.rs` for the `VectorExecutor` entry |
 | Graph build or search behaviour, the owned generation byte format | `hnsw.rs`; unfiltered F32 search in `hnsw/unfiltered.rs` (one walk for resident and saved graphs — never a second copy), multi-partition union in `hnsw/union.rs`; the fork only for a primitive `hnsw.rs` cannot build on |
+| Paged (transactional) graph build, reclaim and tail; durable point/row/exact lookup records | `hnsw/paged_builder.rs`; the graph algorithm is `contextdb-hnsw` `src/paged.rs`; the engine supplies the page and directory storage. |
+| Reading raw memberships from durable storage | `store/membership.rs` traits; `store.rs` registers sources (`register_lazy_durable_raw_partition`, `register_durable_raw_reverse_source`). Never retain a decoded directory here. |
 | A quantization format | `quantized.rs`, plus the resident-byte estimate beside it |
 | Per-column policy resolution (`AUTO_INDEX_AT`, `HNSW`, `CONSOLIDATION`, limits) | `store.rs` (`VectorIndexLayout`, `ResolvedVectorPolicy`); the grammar is the parser's |
 | Store-size-dependent default search breadth profile | `src/store.rs::compatibility_hnsw_profile`, used by `VectorIndexLayout::resolve_policy`; test all size-band boundaries and partial policy validation in `src/store.rs::compatibility_profile_edges_and_partial_policy_validation_agree`. |

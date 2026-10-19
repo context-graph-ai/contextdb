@@ -14,6 +14,100 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// Work boundaries for exact root-capture counters and admission-failure proofs.
+/// This entire module is absent without `test-seams`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootWorkKindForTest {
+    CatalogBegin,
+    CatalogEntry,
+    DirectoryLookup,
+    CaptureBegin,
+    CaptureEnd,
+    FinalizeBegin,
+    FinalizeEnd,
+    ChecksumPage,
+    ChecksumBytes,
+    PublishBegin,
+    PublishEnd,
+    HeaderBegin,
+    HeaderEnd,
+}
+
+/// A borrowed observation; the callback owns any storage used to retain it.
+/// `page` is the native serialized page number (including allocation order),
+/// and `bytes` is the complete extent size for a checksum visit.
+#[derive(Debug, Clone, Copy)]
+pub struct RootWorkForTest<'a> {
+    pub kind: RootWorkKindForTest,
+    pub table: &'a str,
+    pub page: Option<[u8; 8]>,
+    pub bytes: usize,
+    pub tag: u8,
+}
+
+pub type RootWorkObserverForTest = Arc<dyn Fn(&RootWorkForTest<'_>) -> crate::Result + Send + Sync>;
+
+thread_local! {
+    static ROOT_WORK_OBSERVER: RefCell<Option<RootWorkObserverForTest>> = const { RefCell::new(None) };
+    static ROOT_WORK_TABLE: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
+}
+
+/// Observe work on this thread, restoring the previous callback on return or
+/// unwind. Returning an error injects a failure at that exact work boundary;
+/// it does not set the backend's storage-failed bit. Callbacks must not reenter
+/// the observed database, whose directory/page locks may still be held.
+pub fn observe_root_work_for_test<T>(
+    observer: RootWorkObserverForTest,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<RootWorkObserverForTest>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ROOT_WORK_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(ROOT_WORK_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    operation()
+}
+
+pub(crate) struct RootWorkTableScope(Option<Arc<str>>);
+
+impl Drop for RootWorkTableScope {
+    fn drop(&mut self) {
+        ROOT_WORK_TABLE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+pub(crate) fn root_work_table_scope(name: &str) -> RootWorkTableScope {
+    let active = ROOT_WORK_OBSERVER.with(|slot| slot.borrow().is_some());
+    RootWorkTableScope(if active {
+        ROOT_WORK_TABLE.with(|slot| slot.replace(Some(Arc::from(name))))
+    } else {
+        None
+    })
+}
+
+pub(crate) fn observe_root_work(
+    kind: RootWorkKindForTest,
+    table: Option<&str>,
+    page: Option<[u8; 8]>,
+    bytes: usize,
+) -> crate::Result {
+    let observer = ROOT_WORK_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        let scoped_table = ROOT_WORK_TABLE.with(|slot| slot.borrow().clone());
+        observer(&RootWorkForTest {
+            kind,
+            table: table.or(scoped_table.as_deref()).unwrap_or(""),
+            page,
+            bytes,
+            tag: CURRENT_TAG.with(Cell::get),
+        })?;
+    }
+    Ok(())
+}
 
 /// Commits observed and allocated extents in their freed and allocated lists.
 /// The legacy `*_pages` field names count list items, not physical pages. One

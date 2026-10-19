@@ -71,8 +71,14 @@ use std::sync::Arc;
 /// A writing session over a throwaway in-memory database — the mode
 /// `:memory:` always has, and the one these framing fixtures need.
 fn writing_session(database: &Arc<Database>) -> Session {
-    Session::writing(Arc::clone(database), ReadLimits::default())
-        .expect("a live database opens its own bounded read view")
+    Session::writing(
+        Arc::clone(database),
+        ReadLimits::default(),
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            ReadLimits::default().memory,
+        ),
+    )
+    .expect("a live database opens its own bounded read view")
 }
 
 // ============================================================================

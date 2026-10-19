@@ -89,8 +89,14 @@ fn accepted_delete_record(
 
 fn assert_receiver_has_no_durable_generation(receiver: &Database) {
     assert!(receiver.table_meta(TABLE).is_none());
+    let fixture_operation_reader_1 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
-        receiver.durable_lineage_table_generation(TABLE).is_err(),
+        receiver
+            .durable_lineage_table_generation(TABLE, fixture_operation_reader_1.clone())
+            .is_err(),
         "the receiver has no installed durable schema generation"
     );
 }
@@ -106,6 +112,10 @@ fn drop_accepted_lineage_replays_against_generation_projection() {
     let lineages = vec![(TABLE.to_string(), key.clone(), row.lsn, lineage.clone())];
 
     assert_receiver_has_no_durable_generation(&receiver);
+    let fixture_operation_reader_2 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let retained = receiver
         .drop_accepted_lineage_replays_against_generation_projection(
             &tenant,
@@ -115,12 +125,17 @@ fn drop_accepted_lineage_replays_against_generation_projection() {
             },
             &lineages,
             &projected_generations(),
+            fixture_operation_reader_2.clone(),
         )
         .expect("a valid projected live row without an accepted delete remains");
     assert_eq!(retained.changes.rows, vec![row.clone()]);
     assert!(!retained.suppressed_live_replay);
 
     accepted_delete_record(&receiver, &key, &lineage);
+    let fixture_operation_reader_3 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let suppressed = receiver
         .drop_accepted_lineage_replays_against_generation_projection(
             &tenant,
@@ -130,6 +145,7 @@ fn drop_accepted_lineage_replays_against_generation_projection() {
             },
             &lineages,
             &projected_generations(),
+            fixture_operation_reader_3.clone(),
         )
         .expect("an exact accepted delete suppresses its projected replay");
     assert!(suppressed.changes.rows.is_empty());
@@ -147,6 +163,10 @@ fn reject_dependency_complete_accepted_lineage_replays_against_generation_projec
     let lineages = vec![(TABLE.to_string(), key.clone(), row.lsn, lineage.clone())];
 
     assert_receiver_has_no_durable_generation(&receiver);
+    let fixture_operation_reader_4 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let retained = receiver
         .reject_dependency_complete_accepted_lineage_replays_against_generation_projection(
             &tenant,
@@ -156,6 +176,7 @@ fn reject_dependency_complete_accepted_lineage_replays_against_generation_projec
             },
             &lineages,
             &projected_generations(),
+            fixture_operation_reader_4.clone(),
         )
         .expect("a valid projected dependency member without an accepted delete remains");
     assert_eq!(retained.changes.rows, vec![row.clone()]);
@@ -165,6 +186,10 @@ fn reject_dependency_complete_accepted_lineage_replays_against_generation_projec
     let sibling_key = NaturalKey::single("id".to_string(), Value::Int64(2));
     let sibling = live_row(sibling_key.clone(), Lsn(30));
     let sibling_lineage = authenticated_lineage(&tenant, &sibling_key, 24, &identity);
+    let fixture_operation_reader_5 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let error = receiver
         .reject_dependency_complete_accepted_lineage_replays_against_generation_projection(
             &tenant,
@@ -177,6 +202,7 @@ fn reject_dependency_complete_accepted_lineage_replays_against_generation_projec
                 (TABLE.to_string(), sibling_key, Lsn(30), sibling_lineage),
             ],
             &projected_generations(),
+            fixture_operation_reader_5.clone(),
         )
         .err()
         .expect("an accepted-delete replay rejects the complete dependency unit");
@@ -189,4 +215,155 @@ fn reject_dependency_complete_accepted_lineage_replays_against_generation_projec
         message.contains("store already agrees"),
         "the refusal must state benign convergence, not just that it terminated: {message}"
     );
+}
+
+#[test]
+fn durable_accepted_delete_classification_restores_the_retained_reader_root() {
+    let directory = tempfile::tempdir().expect("temporary durable receiver");
+    let receiver = Database::open_with_options(
+        directory.path().join("accepted-delete-root.redb"),
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .expect("open durable receiver");
+    let empty = HashMap::new();
+    receiver
+        .execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT) HISTORY CURRENT ONLY SYNC OFF",
+            &empty,
+        )
+        .unwrap();
+    receiver
+        .execute("INSERT INTO events VALUES (1, 'original')", &empty)
+        .unwrap();
+    let captured = receiver.tx_mgr.capture_published_read();
+    let snapshot = captured.snapshot;
+    let root = writer_read::durable_root(captured.handle).unwrap().unwrap();
+    let physical = root.storage_identity();
+    let tenant = TenantId::from("durable-projected-generation");
+    let identity = FabricIdentity::generate();
+    let key = NaturalKey::single("id".to_string(), Value::Int64(1));
+    let row = live_row(key.clone(), Lsn(19));
+    let lineage = authenticated_lineage(&tenant, &key, 13, &identity);
+    let lineages = vec![(TABLE.to_string(), key.clone(), row.lsn, lineage.clone())];
+    receiver
+        .execute("DELETE FROM events WHERE id = 1", &empty)
+        .unwrap();
+    accepted_delete_record(&receiver, &key, &lineage);
+    receiver
+        .execute("INSERT INTO events VALUES (2, 'following')", &empty)
+        .unwrap();
+    receiver.compact_currency_versions().unwrap();
+    assert!(receiver.snapshot().0 > snapshot.0);
+    assert_ne!(
+        receiver
+            .writer_read_root()
+            .unwrap()
+            .unwrap()
+            .storage_identity(),
+        physical
+    );
+    let fixture_operation_reader_1 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let scope = receiver.enter_writer_read(Some(root.clone()), fixture_operation_reader_1.clone());
+    let fixture_operation_reader_6 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let suppressed = receiver
+        .drop_accepted_lineage_replays_against_generation_projection(
+            &tenant,
+            ChangeSet {
+                rows: vec![row.clone()],
+                ..ChangeSet::default()
+            },
+            &lineages,
+            &projected_generations(),
+            fixture_operation_reader_6.clone(),
+        )
+        .expect("classify at the current durable frontier while the reply retains its old root");
+    assert!(suppressed.changes.rows.is_empty());
+    assert!(suppressed.suppressed_live_replay);
+    let observed_identity = receiver
+        .writer_read_root()
+        .unwrap()
+        .unwrap()
+        .storage_identity();
+    assert!(observed_identity.transaction_id >= physical.transaction_id);
+    assert_eq!(observed_identity.user_root, physical.user_root);
+    let fixture_operation_reader_7 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let error = receiver
+        .reject_dependency_complete_accepted_lineage_replays_against_generation_projection(
+            &tenant,
+            ChangeSet {
+                rows: vec![row.clone()],
+                ..ChangeSet::default()
+            },
+            &lineages,
+            &projected_generations(),
+            fixture_operation_reader_7.clone(),
+        )
+        .err()
+        .expect("dependency-complete replay remains a typed refusal");
+    assert!(matches!(error, Error::SyncReplayOfAcceptedDelete { .. }));
+    assert_eq!(
+        receiver
+            .execute_at_snapshot("SELECT id, body FROM events ORDER BY id", &empty, snapshot)
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(1), Value::Text("original".to_string())]],
+        "classification restores the external reader's original durable view"
+    );
+    drop(scope);
+    receiver
+        .execute("INSERT INTO events VALUES (1, 'fresh')", &empty)
+        .unwrap();
+    let fixture_operation_reader_2 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let scope = receiver.enter_writer_read(Some(root.clone()), fixture_operation_reader_2.clone());
+    let fixture_operation_reader_8 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let error = receiver
+        .drop_accepted_lineage_replays_against_generation_projection(
+            &tenant,
+            ChangeSet {
+                rows: vec![row],
+                ..ChangeSet::default()
+            },
+            &lineages,
+            &projected_generations(),
+            fixture_operation_reader_8.clone(),
+        )
+        .err()
+        .expect("a genuinely fresh same-key current row rejects terminated-lineage replay");
+    assert!(
+        matches!(error, Error::SyncError(message) if message.contains("fresh same-key row is visible"))
+    );
+    assert_eq!(
+        receiver
+            .execute_at_snapshot("SELECT body FROM events WHERE id = 1", &empty, snapshot)
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("original".to_string())]]
+    );
+    drop(scope);
+    drop(root);
+    assert_eq!(
+        receiver
+            .__native_read_transaction_count_for_test(physical.transaction_id)
+            .unwrap(),
+        0
+    );
+    receiver.close().unwrap();
 }

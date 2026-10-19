@@ -1,4 +1,5 @@
 use crate::types::{ContextId, Principal, RowId, ScopeLabel, TxId, Value, VectorIndexRef};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 /// Distinguishes which callback context produced a callback-active error.
@@ -20,57 +21,93 @@ impl std::fmt::Display for CallbackKind {
     }
 }
 
-fn format_context_set(values: &BTreeSet<ContextId>) -> String {
-    let body = values
-        .iter()
-        .map(|context| context.0.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{body}}}")
-}
-
-fn format_scope_label_set(values: &BTreeSet<ScopeLabel>) -> String {
-    let body = values
-        .iter()
-        .map(|label| label.0.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{body}}}")
-}
-
-fn format_principal(principal: &Principal) -> String {
-    match principal {
-        Principal::System => "system".to_string(),
-        Principal::Agent(id) => format!("agent:{id}"),
-        Principal::Human(id) => format!("human:{id}"),
+struct ContextSetDisplay<'a>(&'a BTreeSet<ContextId>);
+impl std::fmt::Display for ContextSetDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("{")?;
+        for (index, context) in self.0.iter().enumerate() {
+            if index != 0 { f.write_str(", ")?; }
+            write!(f, "{}", context.0)?;
+        }
+        f.write_str("}")
     }
 }
 
-fn context_scope_violation_display(requested: &ContextId, allowed: &BTreeSet<ContextId>) -> String {
-    let requested = if requested.0 == uuid::Uuid::from_u128(u128::MAX) {
-        "row has no context".to_string()
-    } else {
-        format!("context {}", requested.0)
-    };
-    format!(
-        "row hidden by context scope: requested {requested}, allowed {}",
-        format_context_set(allowed)
-    )
+struct ScopeLabelSetDisplay<'a>(&'a BTreeSet<ScopeLabel>);
+impl std::fmt::Display for ScopeLabelSetDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("{")?;
+        for (index, label) in self.0.iter().enumerate() {
+            if index != 0 { f.write_str(", ")?; }
+            f.write_str(label.0.as_str())?;
+        }
+        f.write_str("}")
+    }
 }
 
-fn scope_label_violation_display(requested: &ScopeLabel, allowed: &BTreeSet<ScopeLabel>) -> String {
-    format!(
-        "row hidden by scope label: requested {}, allowed {}",
-        requested.0,
-        format_scope_label_set(allowed)
-    )
+struct PrincipalDisplay<'a>(&'a Principal);
+impl std::fmt::Display for PrincipalDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Principal::System => f.write_str("system"),
+            Principal::Agent(id) => write!(f, "agent:{id}"),
+            Principal::Human(id) => write!(f, "human:{id}"),
+        }
+    }
 }
 
-fn acl_denied_display(table: &str, row_id: &RowId, principal: &Principal) -> String {
-    format!(
-        "row hidden by ACL on table `{table}` row {row_id} for principal {}",
-        format_principal(principal)
-    )
+struct ContextScopeViolationDisplay<'a> {
+    requested: &'a ContextId,
+    allowed: &'a BTreeSet<ContextId>,
+}
+impl std::fmt::Display for ContextScopeViolationDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("row hidden by context scope: requested ")?;
+        if self.requested.0 == uuid::Uuid::from_u128(u128::MAX) {
+            f.write_str("row has no context")?;
+        } else {
+            write!(f, "context {}", self.requested.0)?;
+        }
+        write!(f, ", allowed {}", ContextSetDisplay(self.allowed))
+    }
+}
+fn context_scope_violation_display<'a>(
+    requested: &'a ContextId, allowed: &'a BTreeSet<ContextId>,
+) -> ContextScopeViolationDisplay<'a> {
+    ContextScopeViolationDisplay { requested, allowed }
+}
+
+struct ScopeLabelViolationDisplay<'a> {
+    requested: &'a ScopeLabel,
+    allowed: &'a BTreeSet<ScopeLabel>,
+}
+impl std::fmt::Display for ScopeLabelViolationDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "row hidden by scope label: requested {}, allowed {}",
+            self.requested.0, ScopeLabelSetDisplay(self.allowed))
+    }
+}
+fn scope_label_violation_display<'a>(
+    requested: &'a ScopeLabel, allowed: &'a BTreeSet<ScopeLabel>,
+) -> ScopeLabelViolationDisplay<'a> {
+    ScopeLabelViolationDisplay { requested, allowed }
+}
+
+struct AclDeniedDisplay<'a> {
+    table: &'a str,
+    row_id: &'a RowId,
+    principal: &'a Principal,
+}
+impl std::fmt::Display for AclDeniedDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "row hidden by ACL on table `{}` row {} for principal {}",
+            self.table, self.row_id, PrincipalDisplay(self.principal))
+    }
+}
+fn acl_denied_display<'a>(
+    table: &'a str, row_id: &'a RowId, principal: &'a Principal,
+) -> AclDeniedDisplay<'a> {
+    AclDeniedDisplay { table, row_id, principal }
 }
 
 /// Safe structural reasons a vector partition declaration can be refused.
@@ -115,6 +152,16 @@ pub enum VectorPolicyDeclarationIssue {
     AutoIndexAtNotPositive,
     #[error("AUTO_INDEX_AT is outside the persisted numeric range")]
     AutoIndexAtOutOfRange,
+    #[error("FLAT_BELOW must be a non-negative integer")]
+    FlatBelowNegative,
+    #[error("FLAT_BELOW is outside the persisted numeric range")]
+    FlatBelowOutOfRange,
+    #[error("AUTO_EXPANSION_CEILING must be an integer percent from 1 through 100")]
+    AutoExpansionCeilingOutOfRange,
+    #[error(
+        "HNSW SEARCH_RADIUS must be a decimal from 0 through 2 with at most six decimal places"
+    )]
+    SearchRadiusOutOfRange,
     #[error("HNSW policy values must be positive integers")]
     HnswValueNotPositive,
     #[error("an HNSW policy value is outside the persisted numeric range")]
@@ -123,6 +170,27 @@ pub enum VectorPolicyDeclarationIssue {
     EfConstructionBelowM,
     #[error("vector consolidation percentages must be integers from 1 through 100")]
     ConsolidationPercentOutOfRange,
+}
+
+/// Why a `SET STORAGE_COMPACTION` declaration was refused. The SQL statement
+/// and the Rust setter refuse the same declarations with the same issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StorageCompactionDeclarationIssue {
+    #[error("START_RATIO must be greater than 0 and at most 1")]
+    StartRatioOutOfRange,
+    #[error("STOP_RATIO must be greater than 0 and at most 1")]
+    StopRatioOutOfRange,
+    #[error("MAX_SWEEPS must be at least 1")]
+    MaxSweepsNotPositive,
+    #[error("MAX_SWEEPS is outside the persisted numeric range")]
+    MaxSweepsOutOfRange,
+    #[error("MIN_INTERVAL must be positive")]
+    MinIntervalNotPositive,
+    #[error("MIN_INTERVAL is longer than 9223372036854775807 milliseconds")]
+    MinIntervalOutOfRange,
+    #[error("a clause may appear only once in one declaration")]
+    DuplicateClause,
 }
 
 /// The engine's own answers.
@@ -137,6 +205,11 @@ pub enum VectorPolicyDeclarationIssue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Native cancellation identities are never reused. This is a local,
+    /// typed construction refusal rather than a channel or wire condition.
+    #[doc(hidden)]
+    #[error("native cancellation identity space exhausted")]
+    NativeCancellationIdentityExhausted,
     #[error("bounded read session is not implemented")]
     ReadSessionNotImplemented,
     #[error("owner reads did not drain before shutdown deadline")]
@@ -147,6 +220,23 @@ pub enum Error {
     EventBusQueueQuiescent,
     #[error("read operation was cancelled")]
     ReadCancelled,
+    /// A writable open asked to bound its wait for starting readers by a
+    /// cancellation or a deadline, and this process cannot give it a wait it
+    /// can end early. An open that asks for neither still waits.
+    #[error("a cancellable or bounded wait for starting readers is not available in this process")]
+    ReaderWaitUnsupported,
+    /// The helper a writable open's cancellable wait started ended without
+    /// handing over the store; the open is refused and holds nothing.
+    #[error("the wait for starting readers failed: {0}")]
+    ReaderWaitHelperFailed(String),
+    /// A writable open's acquisition helper could not be confirmed dead after
+    /// its wait was ended. This process keeps the store held, so nothing the
+    /// helper might still be granted can reach anyone else; a later open or
+    /// close of the store re-checks, and process exit releases it.
+    #[error(
+        "the store at {path} is held by this process until an ended reader wait is confirmed; restart the process if it persists"
+    )]
+    ReaderWaitQuarantined { path: String },
     #[error("{0}")]
     ReadFailure(crate::read_contract::ReadFailure),
     #[error("table not found: {0}")]
@@ -176,6 +266,17 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "vector source identity mismatch on {index} row {row_id}: expected created {expected_created_tx}/LSN {expected_lsn}, got created {actual_created_tx:?}/LSN {actual_lsn:?}"
+    )]
+    VectorSourceIdentityMismatch {
+        index: VectorIndexRef,
+        row_id: RowId,
+        expected_created_tx: TxId,
+        expected_lsn: crate::types::Lsn,
+        actual_created_tx: Option<TxId>,
+        actual_lsn: Option<crate::types::Lsn>,
+    },
     #[error("unknown vector index {index}")]
     UnknownVectorIndex { index: VectorIndexRef },
     #[error("invalid vector partition declaration on {index}: {issue}")]
@@ -187,6 +288,10 @@ pub enum Error {
     InvalidVectorPolicyDeclaration {
         index: VectorIndexRef,
         issue: VectorPolicyDeclarationIssue,
+    },
+    #[error("invalid storage compaction declaration: {issue}")]
+    InvalidStorageCompactionDeclaration {
+        issue: StorageCompactionDeclarationIssue,
     },
     /// A write's PARTITION_KEY value is not of the type its column declares.
     ///
@@ -221,6 +326,13 @@ pub enum Error {
         "INDEXED vector search on {index} has no complete maintained route; wait for or repair index maintenance"
     )]
     VectorIndexedRouteUnavailable { index: VectorIndexRef },
+    #[error(
+        "INDEXED vector search on {index} refused: partition {partition} (in scope order) holds live rows its maintained graph does not connect (graph_frontier_disconnected); repair index maintenance, or use AUTO or EXACT"
+    )]
+    VectorIndexedPartitionDisconnected {
+        index: VectorIndexRef,
+        partition: u64,
+    },
     #[error(
         "filtered vector search on {index} has no bounded relational candidate route for columns {predicate_columns:?}; add a supporting relational index or use EXACT"
     )]
@@ -311,6 +423,8 @@ pub enum Error {
     },
     #[error("corrupt store at {path}: {reason}")]
     StoreCorrupted { path: String, reason: String },
+    #[error("vector metadata I/O failed during {operation}: {reason}")]
+    VectorMetadataIo { operation: String, reason: String },
     #[error(
         "no store at {path}: this open was asked to change a store that already exists, so it created nothing — point it at an existing store, or open it with the creating disposition if a new one is wanted"
     )]
@@ -321,6 +435,14 @@ pub enum Error {
     StoreIdentityUnprovable { path: String },
     #[error("{operation} cannot safely coordinate readers through {path}: {reason}")]
     ReaderCoordinationUnavailable {
+        operation: String,
+        path: String,
+        reason: String,
+    },
+    #[error(
+        "{operation} cannot take a holder-presence lock through {path}: {reason}; this filesystem cannot prove whether a background-work holder is alive"
+    )]
+    HolderPresenceUnavailable {
         operation: String,
         path: String,
         reason: String,
@@ -343,8 +465,8 @@ pub enum Error {
     },
     #[error("recursive CTEs are not supported")]
     RecursiveCteNotSupported,
-    #[error("window functions are not supported")]
-    WindowFunctionNotSupported,
+    #[error("window form is not supported: {form}")]
+    WindowFunctionNotSupported { form: String },
     #[error("stored procedures/functions are not supported")]
     StoredProcNotSupported,
     #[error("graph traversal requires explicit depth bound")]
@@ -364,7 +486,7 @@ pub enum Error {
     #[error("plan error: {0}")]
     PlanError(String),
     #[error("sync error: {0}")]
-    SyncError(String),
+    SyncError(Cow<'static, str>),
     #[error("tenant table policy is not declared for {table}")]
     TenantPolicyNotDeclared { table: String },
     #[error("tenant table policy for {table} differs at {clause}")]
@@ -479,12 +601,12 @@ pub enum Error {
         "memory budget exceeded: {subsystem}/{operation} requested {requested_bytes} bytes, {available_bytes} available of {budget_limit_bytes} budget. Hint: {hint}"
     )]
     MemoryBudgetExceeded {
-        subsystem: String,
-        operation: String,
+        subsystem: Cow<'static, str>,
+        operation: Cow<'static, str>,
         requested_bytes: usize,
         available_bytes: usize,
         budget_limit_bytes: usize,
-        hint: String,
+        hint: Cow<'static, str>,
     },
     #[error(
         "disk budget exceeded: {operation} - file is {current_bytes} bytes, limit is {budget_limit_bytes} bytes. Hint: {hint}"
@@ -494,6 +616,14 @@ pub enum Error {
         current_bytes: u64,
         budget_limit_bytes: u64,
         hint: String,
+    },
+    /// Scratch working storage could not complete `create`, `read`, or `write`.
+    /// This is an I/O failure, not a refusal of the store's configured disk
+    /// budget. Retain the kind without exposing a scratch path or error source.
+    #[error("scratch working storage unavailable during {operation}: {io_kind}")]
+    ScratchWorkingStorageUnavailable {
+        operation: String,
+        io_kind: std::io::ErrorKind,
     },
     #[error("column type mismatch: {table}.{column} expected {expected}, got {actual}")]
     ColumnTypeMismatch {
@@ -687,7 +817,7 @@ pub enum Error {
     )]
     PublicationInterrupted,
     #[error("{0}")]
-    Other(String),
+    Other(Cow<'static, str>),
 }
 
 impl Error {
@@ -702,42 +832,71 @@ impl From<crate::read_contract::ReadFailure> for Error {
     }
 }
 
-fn drop_blocked_rank_policy_display(
-    table: &str,
-    column: &Option<Box<str>>,
-    dropped_index: &Option<Box<str>>,
-    policy_table: &str,
-    policy_column: &str,
-    sort_key: &str,
-) -> String {
-    if let Some(column) = column {
-        return format!(
-            "cannot drop or rename column `{table}.{column}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
-        );
+struct DropBlockedRankPolicyDisplay<'a> {
+    table: &'a str,
+    column: &'a Option<Box<str>>,
+    dropped_index: &'a Option<Box<str>>,
+    policy_table: &'a str,
+    policy_column: &'a str,
+    sort_key: &'a str,
+}
+impl std::fmt::Display for DropBlockedRankPolicyDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { table, column, dropped_index, policy_table, policy_column, sort_key } = self;
+        if let Some(column) = column {
+            return write!(f,
+                "cannot drop or rename column `{table}.{column}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+            );
+        }
+        if let Some(index) = dropped_index {
+            return write!(f,
+                "cannot drop index `{index}` on `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+            );
+        }
+        write!(f,
+            "cannot drop table `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+        )
     }
-    if let Some(index) = dropped_index {
-        return format!(
-            "cannot drop index `{index}` on `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
-        );
-    }
-    format!(
-        "cannot drop table `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
-    )
+}
+fn drop_blocked_rank_policy_display<'a>(
+    table: &'a str,
+    column: &'a Option<Box<str>>,
+    dropped_index: &'a Option<Box<str>>,
+    policy_table: &'a str,
+    policy_column: &'a str,
+    sort_key: &'a str,
+) -> DropBlockedRankPolicyDisplay<'a> {
+    DropBlockedRankPolicyDisplay { table, column, dropped_index, policy_table, policy_column, sort_key }
 }
 
-fn foreign_key_violation_display(
-    child_table: &str,
-    child_columns: &[String],
-    parent_table: &str,
-    parent_columns: &[String],
-) -> String {
-    format!(
-        "foreign key violation: {}({}) references {}({})",
-        child_table,
-        child_columns.join(", "),
-        parent_table,
-        parent_columns.join(", ")
-    )
+struct ForeignKeyViolationDisplay<'a> {
+    child_table: &'a str,
+    child_columns: &'a [String],
+    parent_table: &'a str,
+    parent_columns: &'a [String],
+}
+impl std::fmt::Display for ForeignKeyViolationDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "foreign key violation: {}(", self.child_table)?;
+        for (index, column) in self.child_columns.iter().enumerate() {
+            if index != 0 { f.write_str(", ")?; }
+            f.write_str(column)?;
+        }
+        write!(f, ") references {}(", self.parent_table)?;
+        for (index, column) in self.parent_columns.iter().enumerate() {
+            if index != 0 { f.write_str(", ")?; }
+            f.write_str(column)?;
+        }
+        f.write_str(")")
+    }
+}
+fn foreign_key_violation_display<'a>(
+    child_table: &'a str,
+    child_columns: &'a [String],
+    parent_table: &'a str,
+    parent_columns: &'a [String],
+) -> ForeignKeyViolationDisplay<'a> {
+    ForeignKeyViolationDisplay { child_table, child_columns, parent_table, parent_columns }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

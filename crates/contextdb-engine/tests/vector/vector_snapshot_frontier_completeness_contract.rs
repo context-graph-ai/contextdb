@@ -133,7 +133,7 @@ fn indexed_pinned_snapshot_keeps_eligible_tail_across_newer_commits() {
     .expect("commit the row visible only after the sealed base");
     let snapshot = db.snapshot();
     let snapshot_tx = TxId::from_snapshot(snapshot);
-    let pin = db.pin_snapshot(snapshot);
+    let pin = db.pin_snapshot(snapshot).unwrap();
 
     db.execute(
         "INSERT INTO snapshot_frontier_items (id, scope_id, embedding) \

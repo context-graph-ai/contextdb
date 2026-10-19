@@ -395,7 +395,8 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
             TenantId::from(TENANT),
             hub_node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -414,7 +415,8 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
         broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
 
     client
@@ -528,7 +530,8 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
             TenantId::from(REVERTED_PUSH_TENANT),
             hub_node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -552,7 +555,8 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
         transport.clone(),
         TenantId::from(REVERTED_PUSH_TENANT),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
 
     client
@@ -579,21 +583,28 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
         .await
         .expect("an upgraded hub receives exact authored history");
     assert!(client.schema_sync_holdbacks().is_empty());
-    let original = edge.changes_since(Lsn(0));
+    let original = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let schema = contextdb_engine::sync_types::ChangeSet {
         ddl: original.ddl,
         ddl_lsn: original.ddl_lsn,
         ..Default::default()
     };
-    let (_, provenance) = edge
-        .outbound_row_lineages_and_ddl_provenance_for_test(
+    let (_, provenance) = {
+        let seam_read_memory = edge
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        edge.outbound_row_lineages_and_ddl_provenance_for_test(
             &schema,
             &TenantId::from(REVERTED_PUSH_TENANT),
             &edge_node_id,
             contextdb_core::Incarnation::mint(),
             &|bytes| Ok(edge_identity.sign_for_test(bytes)),
+            seam_read_memory,
         )
-        .unwrap();
+    }
+    .unwrap();
     let expected = schema
         .ddl
         .into_iter()

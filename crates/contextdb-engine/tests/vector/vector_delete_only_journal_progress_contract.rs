@@ -82,8 +82,18 @@ fn current_generation(db: &Database, scope: Uuid) -> VectorGraphGeneration {
 }
 
 fn graph_ready(db: &Database, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(&index(), &partition(scope))
+        .partition_info(
+            &index(),
+            &partition(scope),
+            &mut partition_observation_owner_1,
+        )
+        .unwrap()
         .is_some_and(|info| info.graph_available)
 }
 
@@ -296,7 +306,7 @@ fn delete_only_final_route_truncates_covered_history_before_snapshot_release_can
     let journal_before_delete =
         db.__debug_vector_partition_journal_file_for_test(&route(emptied_scope));
     let pre_delete_snapshot = db.snapshot();
-    let retirement_hold = db.pin_snapshot(pre_delete_snapshot);
+    let retirement_hold = db.pin_snapshot(pre_delete_snapshot).unwrap();
     let deleted_rows = db
         .execute(
             "DELETE FROM delete_only_items WHERE id = $id",

@@ -13,7 +13,7 @@ metadata outside the source-only upstream diff below.
 
 ## Why the fork exists
 
-ContextDB needs five things upstream does not provide:
+ContextDB needs seven things upstream does not provide:
 
 - **Deterministic builds.** Rebuilding a graph from the same points must produce the same topology,
   which needs a caller-provided seed for the level-assignment RNG.
@@ -31,14 +31,21 @@ ContextDB needs five things upstream does not provide:
 - **Source-driven saved-graph search.** An immutable graph reader needs one neighbour's identity
   without copying an adjacency list, so resident and paged F32 graphs use the same bounded walk.
 
+- **Caller-maintained reachability.** A caller that keeps every point reachable must add one
+  level-zero link that neighbour re-selection did not choose, without pruning any other, and must
+  reload a graph whose lists carry those extra links. The fork appends the link and decodes a
+  declared slack; which links to add, and the bound on them, stay with the caller.
+- **Provider-backed construction.** A durable graph must resume seeded insertion from a compact RNG position, load one point at a time, use finite admitted scratch, and stream the existing owned point/graph layout. The provider owns transactions and errors; the fork owns descent, diversity selection, reciprocal pruning and deterministic ties.
+
 [upstream-0.3.4.patch](upstream-0.3.4.patch) is the complete source-only delta against that exact
 package:
 
 | Changed source | Reason |
 |---|---|
-| `src/hnsw.rs` | Seeded `new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`; empty-graph point iteration; `with_point_data`, `neighbour_identity`, and read-only getters; the owned read-only `LoadedHnsw`; `search_with_bounded_control` and `search_allowed_with_bounded_control` with `HnswAllowedSearchLimits` and their typed status/result/error types, where the bounded search scores its entry point once during descent and carries that distance into its level-zero walk; `insert_slice_with_point_id` returning the physical point identity. |
-| `src/hnswio.rs` | `encode_owned_graph`, `encode_owned_graph_into`, and `decode_owned_graph` for the owned graph representation, which validates every edge and returns an error for malformed bytes; `load_hnsw_owned` and `load_hnsw_owned_with_dist`; loaded points own shared handles to their memory mapping. |
-| `src/lib.rs` | Allow four upstream clippy lints so the workspace's strict lint gate passes on unchanged upstream code. |
+| `src/paged.rs` | Provider-backed sequential construction/search with finite scratch with lazy growth capped by the admitted capacity (exact `exact_allocation_bound`, and `new_spilled`/`spilled_allocation_bound` for a provider that spills search scratch), provider-admitted selection windows streaming one candidate/prior pair at a time, optional transaction-local visited/priority-queue spill, constant-size degree counters, fallible point access, allowed-result refill through excluded nodes, a policy-declared layer-zero slack the loader honours for links a caller appended, shared statement visit/distance hooks, and levels drawn by the shared order-independent `level_for_point` so a resumed build needs no generator state; parity and refusal tests. |
+| `src/hnsw.rs` | Seeded `new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`, whose levels are a pure function of the seed and the point's data id (`level_for_point`), so parallel insertion draws the same levels in any thread order; empty-graph point iteration; `with_point_data`, `neighbour_identity`, and read-only getters; the owned read-only `LoadedHnsw`; `search_with_bounded_control` and `search_allowed_with_bounded_control` with `HnswAllowedSearchLimits` and their typed status/result/error types, where the bounded search scores its entry point once during descent and carries that distance into its level-zero walk; `insert_slice_with_point_id` returning the physical point identity; `append_neighbour`, which adds one ordered link without pruning; `insertion_scratch_bound` accounting actual private scratch layouts without candidate extension, and reciprocal updates copying one adjacency layer before acquiring any other point lock; serializable physical PointId for provider checkpoints. Rust formatting is normalized without changing expressions or assertions. |
+| `src/hnswio.rs` | `encode_owned_graph`, `encode_owned_graph_into`, and `decode_owned_graph` for the owned graph representation, which validates every edge and returns an error for malformed bytes, with `decode_owned_graph_with_layer0_slack` accepting a caller-declared number of appended layer-zero links; `load_hnsw_owned` and `load_hnsw_owned_with_dist`; loaded points own shared handles to their memory mapping; `encode_paged_graph_into`, `encode_paged_point_into` and `decode_paged_point` stream the unchanged owned layout through provider point reads. |
+| `src/lib.rs` | Export the provider module; allow four upstream clippy lints so the workspace's strict lint gate passes on unchanged upstream code. |
 | `src/api.rs`, `src/datamap.rs`, `src/filter.rs`, `src/flatten.rs`, `src/libext.rs` | Trailing whitespace removed from doc comments; no code change. |
 
 To reproduce the patch, obtain and verify the exact package above, unpack it outside the repository,
@@ -81,6 +88,12 @@ once an upstream release carries it:
 3. An owned, validated graph encoding with a read-only loaded graph.
 4. Allowed-set search with hard visit/distance limits and typed incomplete results.
 5. Read-only access to one neighbour identity for a shared saved-graph walk.
+6. Storage-neutral fallible point provider for canonical construction/search, finite insertion scratch, checkpointable seeded RNG, and streaming owned encoding; replace it when upstream supports this access seam.
+7. `Hnsw::append_neighbour(from, to, level)` and a decoder slack for appended layer-zero links,
+   with an order and round-trip test. Proposal text: "Add a way to append one neighbour link
+   without triggering neighbour re-selection, so a caller can repair reachability after pruning
+   (for example, keeping every point reachable from the entry point), and let the owned-graph
+   decoder accept a declared number of such extra layer-zero links."
 
-The fork can be retired only when upstream carries all five; until then, deleting it breaks vector
+The fork can be retired only when upstream carries all seven; until then, deleting it breaks vector
 search. None of these proposals has been submitted upstream.

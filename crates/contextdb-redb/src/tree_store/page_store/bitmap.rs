@@ -1,11 +1,19 @@
-use crate::tree_store::page_store::xxh3_checksum;
+use super::allocator_pager::AllocatorPager;
+use crate::tree_store::page_store::hash128_with_seed;
 use std::mem::size_of;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const HEIGHT_OFFSET: usize = 0;
 const END_OFFSETS: usize = HEIGHT_OFFSET + size_of::<u32>();
 
 pub(crate) struct BtreeBitmap {
     heights: Vec<U64GroupedBitmap>,
+    // The one-word root summary, kept resident once read and forgotten on any
+    // mutation. A fixed 16 bytes per bitmap: free-space questions about an
+    // untouched order are answered without loading its root window.
+    root_word: AtomicU64,
+    root_known: AtomicBool,
 }
 
 // Stores a 64-way bit-tree of allocated ids.
@@ -16,12 +24,58 @@ pub(crate) struct BtreeBitmap {
 // layer data: u64s
 // ...consecutive layers. Except for the last level, all sub-trees of the root must be complete
 impl BtreeBitmap {
+    fn from_heights(heights: Vec<U64GroupedBitmap>) -> Self {
+        Self {
+            heights,
+            root_word: AtomicU64::new(0),
+            root_known: AtomicBool::new(false),
+        }
+    }
+
+    fn root(&self) -> u64 {
+        if self.root_known.load(Ordering::Relaxed) {
+            return self.root_word.load(Ordering::Relaxed);
+        }
+        let root = self.get_level(0).word(0);
+        // A poisoned read answers "full" once and is not remembered.
+        if !self.get_level(0).poisoned() {
+            self.root_word.store(root, Ordering::Relaxed);
+            self.root_known.store(true, Ordering::Relaxed);
+        }
+        root
+    }
+
+    fn forget_root(&self) {
+        self.root_known.store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) fn poisoned(&self) -> bool {
+        self.heights.iter().any(U64GroupedBitmap::poisoned)
+    }
+    pub(crate) fn materialize_paged_words(&mut self) {
+        for height in &mut self.heights {
+            height.materialize_paged_words();
+        }
+        self.forget_root();
+    }
+    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
+        self.heights.capacity() * size_of::<U64GroupedBitmap>()
+            + self
+                .heights
+                .iter()
+                .map(|height| height.data.capacity() * size_of::<u64>())
+                .sum::<usize>()
+    }
+
     pub(crate) fn count_unset(&self) -> u32 {
         self.get_level(self.get_height() - 1).count_unset()
     }
 
+    // Answered by the maintained fullness summary: one word per level, the
+    // same descent `alloc` takes, rather than a sweep of the leaf words whose
+    // length is the region's page count. True exactly when `alloc` succeeds.
     pub(crate) fn has_unset(&self) -> bool {
-        self.get_level(self.get_height() - 1).any_unset()
+        self.find_first_unset().is_some()
     }
 
     pub(crate) fn get(&self, i: u32) -> bool {
@@ -33,16 +87,23 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn find_first_unset(&self) -> Option<u32> {
-        if let Some(mut entry) = self.get_level(0).first_unset(0, 64) {
+        // The root level holds at most 64 bits, so the resident root word is
+        // the whole of `get_level(0).first_unset(0, 64)`.
+        let root_entry = if self.get_level(0).len() == 0 {
+            None
+        } else {
+            match self.root().trailing_ones() {
+                64 => None,
+                free => Some(free),
+            }
+        };
+        if let Some(mut entry) = root_entry {
             let mut height = 0;
 
             while height < self.get_height() - 1 {
                 height += 1;
                 entry *= 64;
-                entry = self
-                    .get_level(height)
-                    .first_unset(entry, entry + 64)
-                    .unwrap();
+                entry = self.get_level(height).first_unset(entry, entry + 64)?;
             }
 
             Some(entry)
@@ -61,33 +122,34 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn xxh3_hash(&self) -> u128 {
-        let mut result = 0;
-        for height in &self.heights {
-            result ^= height.xxh3_hash();
-        }
-        result
+        // The leaf level is the allocator's whole state. The levels above it
+        // only summarize which leaf words are full, and a paged allocator may
+        // leave them optimistic -- "maybe free" until a window is read -- so
+        // two allocators holding the same pages can differ there.
+        self.get_level(self.get_height() - 1).xxh3_hash()
     }
 
-    pub(crate) fn to_vec(&self) -> Vec<u8> {
-        let mut result = vec![];
-        let height: u32 = self.heights.len().try_into().unwrap();
-        result.extend(height.to_le_bytes());
+    pub(crate) fn encoded_len(&self) -> usize {
+        END_OFFSETS
+            + self.heights.len() * size_of::<u32>()
+            + self
+                .heights
+                .iter()
+                .map(U64GroupedBitmap::encoded_len)
+                .sum::<usize>()
+    }
 
-        let vecs: Vec<Vec<u8>> = self.heights.iter().map(|x| x.to_vec()).collect();
-        let mut data_offset = END_OFFSETS + self.heights.len() * size_of::<u32>();
-        let end_metadata = data_offset;
-        for serialized in &vecs {
-            data_offset += serialized.len();
-            let offset_u32: u32 = data_offset.try_into().unwrap();
-            result.extend(offset_u32.to_le_bytes());
+    pub(crate) fn encode_into(&self, out: &mut [u8]) {
+        assert!(out.len() >= self.encoded_len());
+        out[..4].copy_from_slice(&u32::try_from(self.heights.len()).unwrap().to_le_bytes());
+        let mut offset = END_OFFSETS + self.heights.len() * size_of::<u32>();
+        for (height, bitmap) in self.heights.iter().enumerate() {
+            let end = offset + bitmap.encoded_len();
+            let field = END_OFFSETS + height * size_of::<u32>();
+            out[field..field + 4].copy_from_slice(&u32::try_from(end).unwrap().to_le_bytes());
+            bitmap.encode_into(&mut out[offset..end]);
+            offset = end;
         }
-
-        assert_eq!(end_metadata, result.len());
-        for serialized in &vecs {
-            result.extend(serialized);
-        }
-
-        result
     }
 
     pub(crate) fn from_bytes(data: &[u8]) -> Self {
@@ -112,7 +174,7 @@ impl BtreeBitmap {
             metadata += size_of::<u32>();
         }
 
-        Self { heights }
+        Self::from_heights(heights)
     }
 
     // Initializes a new allocator, with no ids free
@@ -132,7 +194,7 @@ impl BtreeBitmap {
         // Reverse so that the root is at index 0
         heights.reverse();
 
-        Self { heights }
+        Self::from_heights(heights)
     }
 
     // Like new(), but pads the tree height for max_capacity so resize()
@@ -152,6 +214,41 @@ impl BtreeBitmap {
         result
     }
 
+    pub(crate) fn new_padded_paged(
+        mut num_pages: u32,
+        _capacity: u32,
+        max_capacity: u32,
+        array_base: u64,
+        pager: &Arc<AllocatorPager>,
+        optimistic: bool,
+    ) -> Self {
+        let mut dimensions = Vec::with_capacity(Self::height_for_capacity(max_capacity));
+        let mut capacity = max_capacity;
+        loop {
+            dimensions.push((num_pages, capacity));
+            if capacity <= 64 {
+                break;
+            }
+            capacity = capacity.div_ceil(64);
+            num_pages = num_pages.div_ceil(64);
+        }
+        dimensions.reverse();
+        let heights = dimensions
+            .into_iter()
+            .enumerate()
+            .map(|(height, (len, capacity))| {
+                U64GroupedBitmap::new_paged(
+                    len,
+                    capacity,
+                    array_base + height as u64,
+                    pager,
+                    optimistic,
+                )
+            })
+            .collect();
+        Self::from_heights(heights)
+    }
+
     fn height_for_capacity(mut capacity: u32) -> usize {
         let mut height = 1;
         while capacity > 64 {
@@ -162,6 +259,7 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn resize(&mut self, mut new_len: u32, full: bool) {
+        self.forget_root();
         for height in self.heights.iter_mut().rev() {
             height.resize(new_len, full);
             new_len = new_len.div_ceil(64);
@@ -171,18 +269,38 @@ impl BtreeBitmap {
 
     // Returns the first unset id, and sets it
     pub(crate) fn alloc(&mut self) -> Option<u32> {
+        if self.poisoned() {
+            return None;
+        }
         let entry = self.find_first_unset()?;
+        if self.poisoned() {
+            return None;
+        }
         self.set(entry);
-        Some(entry)
+        (!self.poisoned()).then_some(entry)
     }
 
     pub(crate) fn set(&mut self, i: u32) {
+        self.forget_root();
+        if self.poisoned() {
+            return;
+        }
         let full = self.get_level_mut(self.get_height() - 1).set(i);
+        if self.poisoned() {
+            return;
+        }
         self.update_to_root(i, full);
     }
 
     pub(crate) fn clear(&mut self, i: u32) {
+        self.forget_root();
+        if self.poisoned() {
+            return;
+        }
         self.get_level_mut(self.get_height() - 1).clear(i);
+        if self.poisoned() {
+            return;
+        }
         self.update_to_root(i, false);
     }
 
@@ -221,9 +339,30 @@ impl BtreeBitmap {
 pub(crate) struct U64GroupedBitmap {
     len: u32,
     data: Vec<u64>,
+    paged: Option<PagedWords>,
+}
+
+struct PagedWords {
+    array: u64,
+    capacity_words: usize,
+    pager: Arc<AllocatorPager>,
+    optimistic: bool,
 }
 
 impl U64GroupedBitmap {
+    fn poisoned(&self) -> bool {
+        self.paged
+            .as_ref()
+            .is_some_and(|paged| paged.pager.is_poisoned())
+    }
+    fn materialize_paged_words(&mut self) {
+        if self.paged.is_some() {
+            for index in 0..self.word_count() {
+                let value = self.word(index);
+                self.set_word(index, value);
+            }
+        }
+    }
     fn required_words(elements: u32) -> usize {
         let words = elements.div_ceil(64);
         words as usize
@@ -231,40 +370,117 @@ impl U64GroupedBitmap {
 
     pub fn new_full(len: u32, capacity: u32) -> Self {
         let data = vec![u64::MAX; Self::required_words(capacity)];
-        Self { len, data }
+        Self {
+            len,
+            data,
+            paged: None,
+        }
+    }
+
+    fn new_paged(
+        len: u32,
+        capacity: u32,
+        array: u64,
+        pager: &Arc<AllocatorPager>,
+        optimistic: bool,
+    ) -> Self {
+        Self {
+            len,
+            data: Vec::new(),
+            paged: Some(PagedWords {
+                array,
+                capacity_words: Self::required_words(capacity),
+                pager: Arc::clone(pager),
+                optimistic,
+            }),
+        }
+    }
+
+    fn word(&self, index: usize) -> u64 {
+        // A saved region can have been larger than the currently published
+        // geometry after shrink. Its old tail bits are outside this bitmap and
+        // must never advertise a page to the allocator.
+        let first_bit = index * 64;
+        if first_bit >= self.len as usize {
+            return u64::MAX;
+        }
+        let value = if let Some(paged) = &self.paged {
+            assert!(index < paged.capacity_words);
+            paged
+                .pager
+                .read_word(paged.array, index, self.len, paged.optimistic)
+        } else {
+            self.data[index]
+        };
+        let valid = (self.len as usize - first_bit).min(64);
+        if valid == 64 {
+            value
+        } else {
+            value | (u64::MAX << valid)
+        }
+    }
+
+    fn set_word(&mut self, index: usize, value: u64) {
+        if let Some(paged) = &self.paged {
+            assert!(index < paged.capacity_words);
+            paged
+                .pager
+                .write_word(paged.array, index, self.len, paged.optimistic, value);
+        } else {
+            self.data[index] = value;
+        }
+    }
+
+    fn word_count(&self) -> usize {
+        Self::required_words(self.len)
     }
 
     pub fn xxh3_hash(&self) -> u128 {
         if self.len == 0 {
             return 0;
         }
-        let mut bytes = vec![];
-        bytes.extend(self.len.to_le_bytes());
-        // Hash all the whole words
-        for x in &self.data[0..Self::required_words(self.len) - 1] {
-            bytes.extend(x.to_le_bytes());
+        let mut buffer = [0u8; 4096];
+        buffer[..4].copy_from_slice(&self.len.to_le_bytes());
+        let mut used = 4;
+        let mut state = 0u128;
+        // This hash is an in-process mutation guard, not a durable checksum.
+        // Fold fixed windows so large bitmaps never allocate a full copy.
+        let mut add_word = |word: u64| {
+            if used + 8 > buffer.len() {
+                let seed = u64::from_le_bytes(state.to_le_bytes()[..8].try_into().unwrap());
+                state = hash128_with_seed(&buffer[..used], seed) ^ state.rotate_left(17);
+                used = 0;
+            }
+            buffer[used..used + 8].copy_from_slice(&word.to_le_bytes());
+            used += 8;
+        };
+        for index in 0..Self::required_words(self.len) - 1 {
+            add_word(self.word(index));
         }
         let (index, bit) = Self::data_index_of(self.len - 1);
         // Select the bit and all lower ones
         let mask = ((1 << bit) - 1) | (1 << bit);
-        let group = self.data[index];
+        let group = self.word(index);
         let group = group & mask;
-        bytes.extend(group.to_le_bytes());
-
-        xxh3_checksum(&bytes)
+        add_word(group);
+        let seed = u64::from_le_bytes(state.to_le_bytes()[..8].try_into().unwrap());
+        hash128_with_seed(&buffer[..used], seed) ^ state.rotate_left(17)
     }
 
     // Format:
     // 4 bytes: number of elements
     // n bytes: serialized groups
-    pub fn to_vec(&self) -> Vec<u8> {
-        let words = Self::required_words(self.len);
-        let mut result = Vec::with_capacity(size_of::<u32>() + words * size_of::<u64>());
-        result.extend_from_slice(&self.len.to_le_bytes());
-        for x in &self.data[..words] {
-            result.extend_from_slice(&x.to_le_bytes());
+    fn encoded_len(&self) -> usize {
+        size_of::<u32>() + Self::required_words(self.len) * size_of::<u64>()
+    }
+
+    fn encode_into(&self, out: &mut [u8]) {
+        assert!(out.len() >= self.encoded_len());
+        out[..4].copy_from_slice(&self.len.to_le_bytes());
+        for index in 0..Self::required_words(self.len) {
+            let start = 4 + index * 8;
+            out[start..start + 8].copy_from_slice(&self.word(index).to_le_bytes());
         }
-        result
     }
 
     pub fn from_bytes(serialized: &[u8]) -> Self {
@@ -282,7 +498,11 @@ impl U64GroupedBitmap {
             data.push(value);
         }
 
-        Self { len, data }
+        Self {
+            len,
+            data,
+            paged: None,
+        }
     }
 
     fn data_index_of(bit: u32) -> (usize, usize) {
@@ -294,11 +514,9 @@ impl U64GroupedBitmap {
     }
 
     fn count_unset(&self) -> u32 {
-        self.data.iter().map(|x| x.count_zeros()).sum()
-    }
-
-    fn any_unset(&self) -> bool {
-        self.data.iter().any(|x| x.count_zeros() > 0)
+        (0..self.word_count())
+            .map(|i| self.word(i).count_zeros())
+            .sum()
     }
 
     fn first_unset(&self, start_bit: u32, end_bit: u32) -> Option<u32> {
@@ -309,7 +527,7 @@ impl U64GroupedBitmap {
 
         let (index, bit) = Self::data_index_of(start_bit);
         let mask = (1 << bit) - 1;
-        let group = self.data[index];
+        let group = self.word(index);
         let group = group | mask;
         match group.trailing_ones() {
             64 => None,
@@ -322,7 +540,7 @@ impl U64GroupedBitmap {
     }
 
     pub fn resize(&mut self, new_len: u32, full: bool) {
-        if self.data.len() < Self::required_words(new_len) {
+        if self.paged.is_none() && self.data.len() < Self::required_words(new_len) {
             let default_value = if full { u64::MAX } else { 0 };
             self.data
                 .resize(Self::required_words(new_len), default_value);
@@ -344,7 +562,7 @@ impl U64GroupedBitmap {
     pub fn get(&self, bit: u32) -> bool {
         assert!(bit < self.len);
         let (index, bit_index) = Self::data_index_of(bit);
-        let group = self.data[index];
+        let group = self.word(index);
         group & U64GroupedBitmap::select_mask(bit_index) != 0
     }
 
@@ -352,9 +570,9 @@ impl U64GroupedBitmap {
     pub fn set(&mut self, bit: u32) -> bool {
         assert!(bit < self.len);
         let (index, bit_index) = Self::data_index_of(bit);
-        let mut group = self.data[index];
+        let mut group = self.word(index);
         group |= Self::select_mask(bit_index);
-        self.data[index] = group;
+        self.set_word(index, group);
 
         group == u64::MAX
     }
@@ -362,7 +580,7 @@ impl U64GroupedBitmap {
     pub fn clear(&mut self, bit: u32) {
         assert!(bit < self.len, "{bit} must be less than {}", self.len);
         let (index, bit_index) = Self::data_index_of(bit);
-        self.data[index] &= !Self::select_mask(bit_index);
+        self.set_word(index, self.word(index) & !Self::select_mask(bit_index));
     }
 }
 

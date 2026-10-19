@@ -26,6 +26,23 @@ contextdb-engine        Database struct — wires all subsystems, plugin API, su
     └── contextdb-cli       Interactive REPL binary
 ```
 
+Modules that carry the bounded writer working set (details in each crate's `AGENTS.md`):
+
+| Crate | Module | What it does |
+|---|---|---|
+| `contextdb-redb` | `tree_store/page_store/allocator_pager.rs` | Pages allocator bitmap words through 32 fixed windows with same-directory scratch spill |
+| `contextdb-hnsw` | `paged.rs` | Builds and searches an HNSW graph over caller-supplied point storage, keeping one insertion's workspace |
+| `contextdb-vector` | `hnsw/paged_builder.rs`, `store/membership.rs` | Transactional paged graph builder and tail; durable raw-membership sources with no retained directory |
+| `contextdb-relational` | `source.rs` | Root-pinned row and index reads with staged-row merge |
+| `contextdb-graph` | `source.rs` | Root-pinned adjacency reads with an edge overlay |
+| `contextdb-tx` | `commit_directory.rs`, `ordered_staged.rs` | Durable commit-history seam; ordered staged rows |
+| `contextdb-engine` | `persistence/writer_*.rs`, `database/writer_read.rs` | Pinned-root writer reads, durable history cursors, open bounds, statement read scope |
+
+A writable file store keeps a bounded working set however long its history is: it opens without
+reading row versions, change log or commit index, serves reads from roots pinned at publication,
+and releases pages, indexes and history after use; readers keep the view they opened with.
+<!-- enforced by: writable_open_never_touches_history_families::writable_open_never_touches_history_families, writer_reopen_and_doubling_keep_a_fixed_resident_envelope::writer_reopen_and_doubling_keep_a_fixed_resident_envelope, writer_reader_root_survives_commit_eviction_and_cleanup::writer_reader_root_survives_commit_eviction_and_cleanup -->
+
 Dependencies flow downward. `contextdb-engine` owns the `Database` struct and is the crate applications depend on.
 
 `contextdb-hnsw` is the eleventh crate and the one exception to "in-house surface": it is a
@@ -95,7 +112,7 @@ audio, or policy embeddings with different dimensions and quantization choices.
 - A commit updates the durable base/change/tail lifecycle for the affected layout. Inserts enter a
   fresh searchable tail; deletes and replacements add tombstones. Searches merge the valid base,
   sealed committed changes, and tail under one MVCC snapshot.
-  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_tail_admission_refuses_the_complete_transaction_before_durability -->
+  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_current_identity_admission_refuses_the_complete_transaction_before_durability -->
 - `AUTO_INDEX_AT` and HNSW (`M`, `EF_CONSTRUCTION`, `EF_SEARCH`) are declarable per-column
   workload policy; silence keeps the compatibility profile. `AUTO` applies its effective threshold
   to the aggregate allowed set, while `EXACT` and `INDEXED` remain explicit whole-query contracts.
@@ -167,6 +184,20 @@ reclamation with `ReaderCoordinationUnavailable`, covering readers with differen
 when no platform root exists. The filesystem must support Linux OFD locks. Other Unix systems
 without a common platform root retain a conservative floor and refuse these operations when
 the inventory cannot be proved complete.
+
+**Holder presence.** A process that owns background work beside a store, and keeps working while
+its `Database` handle is closed, proves it is alive with `persistence::holder_presence::hold`: an
+exclusive Linux OFD lock on one byte of the store's empty `<store>.holders` companion, chosen from
+the work's 16-byte token. The lock lasts as long as the returned guard, independent of any
+`Database` handle, and the kernel releases it when the holder exits for any reason, a kill or a
+crash included; a stopped or suspended process keeps it. `probe` asks whether a token's holder is
+alive without changing a byte or creating the companion, and `wait_released` blocks in the kernel
+until the holder releases or exits, with no polling and no timeout. A filesystem that cannot take
+the lock refuses with `HolderPresenceUnavailable` before anything is written, and so does any
+platform without OFD locks. Holder locks never touch the data file or the `.lock` companion, so
+they neither hide nor impersonate a reader or the writer. Presence reports liveness only: a
+consumer that publishes work under a claim still fences that publication on its own token inside
+the publishing transaction, because a holder can lose its lock without exiting.
 
 Once a file reader has captured its committed image, it publishes an authenticated registration
 for that physical store incarnation and exact storage root for the lifetime of the shared session
@@ -266,6 +297,16 @@ A stored value too large for a read's memory budget is refused before its source
 allocated. Opening a session need not read that value: the refusal belongs to the statement that
 selects it, on both the file and owner routes, and leaves no new charge behind.
 <!-- enforced by: direct_file_image_memory_lifetime::one_oversized_durable_value_is_refused_before_its_source_buffer_is_allocated -->
+
+Fallible engine reads that return history-sized results use a per-operation reader child and
+admit retained output as it is built. `trigger_audit_history` and `changes_since_with_arrivals`
+therefore refuse with `MemoryBudgetExceeded` when their selected history exceeds that child;
+`get_edge_properties` uses the same pattern for its returned properties. Configuration-scale
+metadata reads (`table_names`, `table_meta`, `retention_sync_peer`, `list_triggers`, and
+`registered_trigger_callbacks`) remain infallible and are exempt from per-operation admission.
+`plugin_describe` returns host-supplied plugin output, and `RowChange`/`ChangeSet` DTO cloning and
+transformations operate on values already owned by the caller; those allocations belong to the
+host. `trigger_audit_log` is a bounded recent ring rather than persisted unbounded history.
 
 This is still the standard embedded-database model — the same shape as SQLite,
 LMDB, or redb: the application that mutates the data **owns the handle for its
@@ -450,6 +491,27 @@ exact work only within the active budget. Repair and first build run through mai
 query path, so an older valid route and ordinary relational/graph reads remain usable.
 <!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_lazy_replay_budget_contract::first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_ceiling, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors, vector_generation_quarantine_compaction_lock_contract::newer_catalog_format_quarantines_only_that_route, vector_generation_quarantine_compaction_lock_contract::corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds, vector_generation_quarantine_compaction_lock_contract::caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart, vector_generation_quarantine_compaction_lock_contract::engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle -->
 
+Opening a store reads at most 64 records of each route's change journal, whatever the number of
+changes waiting to be indexed. Damage to a later change record is reported by the first indexed read
+or maintenance pass that touches it; until then `SHOW VECTOR_PARTITIONS` reports the route `ready`.
+From then the route is quarantined with `availability_reason = corrupt_changes`: an indexed query
+refuses with the route unavailable, `AUTO` answers exactly only within the active budget, and repair
+starts at the next engine-owned maintenance wake (every 60 seconds by default) or the next
+caller-driven cycle, and needs the memory and disk of a rebuild. No indexed answer is served from a
+damaged change record.
+<!-- enforced by: opening_a_store_does_a_bounded_vector_journal_cleanup::the_open_reads_the_same_journal_records_however_long_the_suffix_is, opening_a_store_does_a_bounded_vector_journal_cleanup::damage_past_the_first_uncovered_record_is_reported_by_the_first_indexed_read -->
+
+A logical import can carry an owned mutable vector tail across physical writer closes. Each reopen
+validates the committed generation, journal frontier, schema and store identity, then charges the
+working set to that writer; a mismatch or refused cache admission drops it and uses ordinary recovery.
+The carried tail holds no store source or lock and is released at import end, error or eviction.
+<!-- enforced by: writer_tail_reuse_is_bounded_across_physical_opens::repeated_writer_opens_reuse_tail_without_reexamining_n_or_four_n_history, writer_tail_reuse_is_bounded_across_physical_opens::another_writer_between_opens_invalidates_tail_and_its_answer_is_exact, writer_tail_reuse_is_bounded_across_physical_opens::optional_tail_never_refuses_an_open_that_fits_without_it -->
+
+Journal suffix admission and replay seek past the entire covered LSN cohort. They authenticate
+selected records without decoding already-covered history; a finite upper frontier includes every
+ordinal of its LSN, and a maximal covered frontier has an empty suffix.
+<!-- enforced by: crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::fixed_journal_suffix_selection_does_not_examine_n_or_four_n_covered_records, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::suffix_seek_includes_all_ordinals_and_excludes_later_cohorts, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::suffix_seek_still_authenticates_each_selected_record, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::both_tail_loaders_and_delete_carrier_selection_seek_past_covered_history -->
+
 Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
 Generation admission counts raw versions separately from selected live graph points at one committed
 frontier. Ordinary resident generations price and copy only their consumed frontier-live entries,
@@ -619,7 +681,7 @@ exact fallback and preserves the sibling's indexed route. Historical raw-only ro
 deletes remain candidates and physically clean their journals before retirement.
 <!-- enforced by: crates/contextdb-engine/src/database/vector_retry_frontier_integrity_tests.rs::cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_progress, vector_delete_only_journal_progress_contract::delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirement, vector_delete_only_journal_progress_contract::delete_only_final_route_truncates_covered_history_before_snapshot_release_can_retire_it -->
 
-**Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
+**Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. Each open store prepays `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` (64) pin slots. Further pins charge their exact registration bytes against the store's declared reader memory and release that charge at unpin; `pin_snapshot` returns the typed `snapshot_pin` memory refusal only when that budget cannot fund another pin. Dropping a prepaid pin returns its slot. Pin admission has no fixed count ceiling. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
 
 **The cost model.** Version cleanup examines eligible table histories and the affected vector
 columns' partition-directory metadata to select exact version identities; selection does not load
@@ -1123,16 +1185,22 @@ a product-level "erase this person" operation.
 - **Ingest** on the holder node: `ingest_bytes(&[u8]) -> BlobHash` or
   `ingest_file(&Path) -> BlobHash`. The returned `BlobHash` is the hash of the
   bytes, so ingesting the same content twice is idempotent.
-- **Serve** on the holder: `serve_on(&IrohServer)` registers the serving
+- **Serve** on the holder: `serve_on(&IrohServer) -> Result<()>` registers the serving
   handler. It checks the requesting peer's authorization against the ledger
   *before* any payload bytes move — the check is the gate, not an
-  after-the-fact audit.
+  after-the-fact audit. Each request obtains its own child of the store's declared reader memory.
+  Hosts supplying their existing provider use `serve_on_with_read_budget_provider`. Directory registration failures propagate.
 - **Fetch** on the consumer: `resolve_blob_ref(&BlobHash, holder_ticket, sink)`
   is async, fetches node-to-node, and is hash-verified — only bytes that hash
   to the requested `BlobHash` ever reach the sink. Errors are a matchable
   `ResolveError`: `Unentitled`, `PolicyForbidden`, `HashMismatch`,
   `HolderUnreachable`, `LocalStoreUnavailable`, `BlobNotFound`,
-  `TransferAborted`, `SinkWrite`, `FetchTimedOut`.
+  `TransferAborted`, `SinkWrite`, `FetchTimedOut`, `LedgerRead(Error)`.
+  The default creates an operation child internally; hosts supplying their actual
+  READ owner use `resolve_blob_ref_with_read_memory`. Ledger source refusals retain
+  their typed core error, including when returned by the holder on the same
+  blob stream before Bao payload data. A malformed or oversized control frame
+  returns a typed protocol refusal.
 - **Fetch deadline**: the whole `resolve_blob_ref` attempt — dial, the
   holder's tag bookkeeping, and the verified transfer loop — is bounded by a
   declared `BlobFetchPolicy { fetch_deadline_ms }` (documented default:
@@ -1159,7 +1227,11 @@ a product-level "erase this person" operation.
 - **Reclaim**: `reclaim_unreferenced(now_ms, grace_ms)` frees a blob once every
   job referencing it is terminal past the grace window (or once no job
   references it at all). A later resolve attempt against a reclaimed blob
-  returns `BlobNotFound`, even from an otherwise-entitled caller.
+  returns `BlobNotFound`, even from an otherwise-entitled caller. The captured ledger root stays funded by the operation child throughout
+  the sweep. `spawn_reclaim_driver(grace_ms)` obtains a child of the declared
+  reader parent for each cycle. Explicit host variants are
+  `reclaim_unreferenced_with_read_memory` and
+  `spawn_reclaim_driver_with_read_budget_provider`.
 - **Direct vs. relay**: whether a transfer goes direct or via a relay is a
   serve-time choice on the holder's endpoint spec. By default it's direct
   only — contextdb contacts no relay unless asked. The operator opts into the
@@ -1195,7 +1267,7 @@ install_work_ledger_schema(&db)?;
 
 let bytes = std::fs::read("frame.jpg")?;
 let blob_hash = blob_store.ingest_bytes(&bytes)?;
-blob_store.serve_on(&iroh_server);
+blob_store.serve_on_with_read_budget_provider(&iroh_server, read_budgets.clone())?;
 
 let spec = JobSpec::builder("job-1", "describe-image", "once", "node-a")
     .input_refs(vec![InputRef::blob_ref(blob_hash.clone())])
@@ -1208,7 +1280,7 @@ submit_job(&db, &spec, &no_direct_inputs)?;
 let claim = claim_job(&sync_client, "job-1", 1, "node-b", lease_deadline_ms, now_ms).await?;
 let mut sink = Vec::new();
 let bytes_written = blob_store
-    .resolve_blob_ref(&blob_hash, &holder_ticket, &mut sink)
+    .resolve_blob_ref_with_read_memory(read_memory.clone(), &blob_hash, &holder_ticket, &mut sink)
     .await?;
 ```
 
@@ -1220,6 +1292,31 @@ The on-disk store carries a format-version marker (current: `1.0.0`). Opening a
 store with an incompatible marker, schema layout, or versioned-key shape fails
 with `LegacyVectorStoreDetected`. A store written by an earlier build is not
 read. Move it aside and create the store again.
+
+### Reading a store whose writer died
+
+A writer killed at any point leaves a store that a direct reader on the same machine opens at once,
+without waiting for a writer to repair it. Every commit writes all of its pages to the file before
+the header that names it and syncs once, so after a process crash the header always names a commit
+whose pages are all in the file. The reader picks the commit slot exactly as a writer's repair would,
+verifies only its two root pages, and registers that root -- the same fixed admission work as a
+healthy read (`ADMISSION_PAGE_BUDGET`), with no allocator state, no walk of the store, and nothing
+written to it. What it serves is what the next writer's repair keeps.
+
+It does this only when the dead writer's published run names this boot and this exact data file
+(device, inode, birth time), and the file sits on a local filesystem (ext2/3/4, XFS, Btrfs, tmpfs,
+F2FS) on Linux. Otherwise it refuses with `DirectReadRequiresWriter` and a writable open repairs
+the store:
+- after a machine crash or power loss, a commit can be torn below its roots, and only repair's walk
+  of the whole tree can tell;
+- on other platforms and filesystems there is no such guarantee to lean on.
+
+Two limits are recorded:
+- A reader on the same boot can serve a commit whose sync the dead writer never completed; if the
+  machine then loses power before any writer repairs the store, that commit is gone.
+- Media damage below verified roots surfaces as `StoreCorrupted` when a read reaches it.
+
+<!-- enforced by: a_crashed_writers_store_opens_for_a_reader::a_writer_killed_at_any_write_of_a_commit_leaves_what_repair_keeps, a_crashed_writers_store_opens_for_a_reader::a_crashed_stores_admission_does_not_grow_with_the_store, a_crashed_writers_store_opens_for_a_reader::a_crashed_store_the_reader_cannot_vouch_for_is_left_to_a_writer -->
 
 ### Recovering a wedged or corrupt data root
 

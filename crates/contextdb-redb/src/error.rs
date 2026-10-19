@@ -12,6 +12,9 @@ pub enum StorageError {
     Corrupted(String),
     /// The value being inserted exceeds the maximum of 3GiB
     ValueTooLarge(usize),
+    /// Opaque caller admission refusal, distinct from device or file I/O.
+    #[doc(hidden)]
+    AdmissionRefused(Box<dyn std::error::Error + Send + Sync>),
     Io(io::Error),
     PreviousIo,
     DatabaseClosed,
@@ -35,6 +38,7 @@ impl From<StorageError> for Error {
         match err {
             StorageError::Corrupted(msg) => Error::Corrupted(msg),
             StorageError::ValueTooLarge(x) => Error::ValueTooLarge(x),
+            StorageError::AdmissionRefused(error) => Error::AdmissionRefused(error),
             StorageError::Io(x) => Error::Io(x),
             StorageError::PreviousIo => Error::PreviousIo,
             StorageError::DatabaseClosed => Error::DatabaseClosed,
@@ -56,6 +60,7 @@ impl Display for StorageError {
                     MAX_VALUE_LENGTH / 1024 / 1024 / 1024
                 )
             }
+            StorageError::AdmissionRefused(error) => write!(f, "admission refused: {error}"),
             StorageError::Io(err) => {
                 write!(f, "I/O error: {err}")
             }
@@ -553,6 +558,9 @@ pub enum Error {
     // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
     TableAlreadyOpen(String, &'static panic::Location<'static>),
+    /// Opaque caller admission refusal, distinct from device or file I/O.
+    #[doc(hidden)]
+    AdmissionRefused(Box<dyn std::error::Error + Send + Sync>),
     Io(io::Error),
     DatabaseClosed,
     /// A previous IO error occurred. The database must be closed and re-opened
@@ -629,6 +637,7 @@ impl Display for Error {
             Error::TableAlreadyOpen(name, location) => {
                 write!(f, "Table '{name}' already opened at: {location}")
             }
+            Error::AdmissionRefused(error) => write!(f, "admission refused: {error}"),
             Error::Io(err) => {
                 write!(f, "I/O error: {err}")
             }

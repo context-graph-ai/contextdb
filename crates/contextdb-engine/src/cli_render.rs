@@ -306,19 +306,31 @@ pub fn render_explain(
     sql: &str,
     params: &std::collections::HashMap<String, Value>,
 ) -> contextdb_core::Result<String> {
+    let read_memory = db.declared_reader_memory()?;
+    render_explain_with_read_memory(db, sql, params, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+pub fn render_explain_with_read_memory(
+    db: &Database,
+    sql: &str,
+    params: &std::collections::HashMap<String, Value>,
+    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> contextdb_core::Result<String> {
     let statement = contextdb_parser::parse(sql)?;
+    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
     match &statement {
         contextdb_parser::Statement::Select(select)
             if contextdb_parser::classification::select_contains_vector_similarity(select) =>
         {
-            db.explain_output_with_params(sql, params)
+            db.explain_output_with_params(sql, params, &mut vector_copy_owner, read_memory.clone())
                 .map(|explained| render_explain_output(&explained))
         }
         contextdb_parser::Statement::Select(_) => db
-            .execute(sql, params)
+            .execute_with_read_memory(sql, params, read_memory.clone())
             .map(|result| render_explain_trace(&result.trace)),
         _ => db
-            .explain_output_with_params(sql, params)
+            .explain_output_with_params(sql, params, &mut vector_copy_owner, read_memory.clone())
             .map(|explained| render_explain_output(&explained)),
     }
 }
@@ -414,7 +426,6 @@ pub fn sync_conflict_document(conflict: &Conflict) -> serde_json::Value {
 pub fn render_sync_conflict(conflict: &Conflict) -> String {
     sync_conflict_document(conflict).to_string()
 }
-
 #[cfg(test)]
 mod sync_conflict_tests {
     use super::*;

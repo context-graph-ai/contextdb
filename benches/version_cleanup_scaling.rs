@@ -483,11 +483,41 @@ struct ScopeResult {
 fn run_scope_gates(gate: &mut Gate) -> ScopeResult {
     println!("building A1 (250k released, small ballast)...");
     let a1_arm = build_arm(released_large(), 1);
-    let a1_fingerprint_before = a1_arm.db.__vector_and_graph_fingerprint_for_test();
-    let a1_change_log_len_before = a1_arm.db.change_log_since(contextdb_core::Lsn(0)).len();
+    let a1_fingerprint_before = {
+        let fixture_observer_read = a1_arm
+            .db
+            .declared_reader_memory()
+            .expect("admit the fixture observation reader");
+        let mut fixture_observer_copy =
+            contextdb_engine::vector_read_memory::admission(fixture_observer_read);
+        a1_arm
+            .db
+            .__vector_and_graph_fingerprint_for_test(&mut fixture_observer_copy)
+            .expect("read the exact fixture observation")
+    };
+    let a1_change_log_len_before = a1_arm
+        .db
+        .change_log_since(contextdb_core::Lsn(0))
+        .unwrap()
+        .len();
     let a1 = measure_one_cycle(&a1_arm.db);
-    let a1_fingerprint_after = a1_arm.db.__vector_and_graph_fingerprint_for_test();
-    let a1_change_log_len_after = a1_arm.db.change_log_since(contextdb_core::Lsn(0)).len();
+    let a1_fingerprint_after = {
+        let fixture_observer_read = a1_arm
+            .db
+            .declared_reader_memory()
+            .expect("admit the fixture observation reader");
+        let mut fixture_observer_copy =
+            contextdb_engine::vector_read_memory::admission(fixture_observer_read);
+        a1_arm
+            .db
+            .__vector_and_graph_fingerprint_for_test(&mut fixture_observer_copy)
+            .expect("read the exact fixture observation")
+    };
+    let a1_change_log_len_after = a1_arm
+        .db
+        .change_log_since(contextdb_core::Lsn(0))
+        .unwrap()
+        .len();
     print_report("A1", &a1);
 
     println!("building A2 (250k released, 20x ballast)...");
@@ -891,9 +921,16 @@ fn run_scope_vector_bearing_arm(gate: &mut Gate) {
     }
     let released_versions_expected = rows * (writes_per_row - 1);
 
-    let report = db
-        .__compact_currency_versions_for_tables_for_test(&["vector_currency"])
-        .expect("scoped compaction over the vector-bearing table must succeed");
+    let report = {
+        let fixture_observer_read = db
+            .declared_reader_memory()
+            .expect("admit the fixture observation reader");
+        db.__compact_currency_versions_for_tables_for_test(
+            &["vector_currency"],
+            fixture_observer_read.clone(),
+        )
+    }
+    .expect("scoped compaction over the vector-bearing table must succeed");
     println!(
         "A5 (vector-bearing declared table): pruned_versions={} vector_keys_rewritten={} \
          expected_released={released_versions_expected}",

@@ -78,9 +78,17 @@ fn equal_distance_rows_keep_canonical_order_across_contexts() {
         db.run_maintenance_cycle()
             .expect("advance deterministic graph maintenance");
         if ["ties_reverse", "ties_forward"].into_iter().all(|table| {
+            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
             let ready = db
                 .vector_store_for_test()
-                .partition_infos(&VectorIndexRef::new(table, "embedding"))
+                .partition_infos(
+                    &VectorIndexRef::new(table, "embedding"),
+                    &mut partition_observation_owner_1,
+                )
                 .expect("inspect graph readiness");
             ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available)
         }) {

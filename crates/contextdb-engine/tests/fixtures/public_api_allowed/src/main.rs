@@ -32,6 +32,7 @@ fn main() {
             "used".to_string(),
             "available".to_string(),
             "startup_ceiling".to_string(),
+            "ceiling_refresh_failures".to_string(),
         ]
     );
     assert_eq!(shown.rows.len(), 1, "one memory-limit row");
@@ -41,12 +42,14 @@ fn main() {
         Value::Int64(used),
         Value::Int64(available),
         Value::Text(startup),
+        Value::Int64(ceiling_refresh_failures),
     ] = row.as_slice()
     else {
-        panic!("SHOW MEMORY_LIMIT must return the durable limit and no startup ceiling: {row:?}");
+        panic!("SHOW MEMORY_LIMIT must return the durable limit, no startup ceiling, and a typed ceiling-refresh failure count: {row:?}");
     };
     assert_eq!(*limit, memory as i64);
     assert_eq!(startup, "none");
     assert_eq!(*available, (memory as i64 - *used).max(0));
     assert_eq!(reopened.disk_limit(), Some(disk));
+    let _ = ceiling_refresh_failures;
 }

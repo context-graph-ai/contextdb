@@ -101,7 +101,7 @@ impl ReadOnlyVectorGraphPageReader for Reader {
         self.0
             .get(offset..offset.saturating_add(len))
             .map(<[u8]>::to_vec)
-            .ok_or_else(|| Error::Other("page out of range".to_string()))
+            .ok_or_else(|| Error::Other("page out of range".to_string().into()))
     }
 }
 

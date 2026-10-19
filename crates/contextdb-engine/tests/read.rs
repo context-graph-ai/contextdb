@@ -10,8 +10,21 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 #[cfg(unix)]
 #[path = "read/a_budget_refusal_is_never_reported_as_a_corrupt_store.rs"]
 mod a_budget_refusal_is_never_reported_as_a_corrupt_store;
+// A crashed store opens for a reader only where the boot it crashed on can be
+// identified (Linux); elsewhere the reader is told the store needs its writer.
+#[cfg(target_os = "linux")]
+#[path = "read/a_crashed_writers_store_opens_for_a_reader.rs"]
+mod a_crashed_writers_store_opens_for_a_reader;
 #[path = "read/a_damaged_edge_tombstone_keeps_its_typed_diagnosis.rs"]
 mod a_damaged_edge_tombstone_keeps_its_typed_diagnosis;
+#[cfg(unix)]
+#[path = "read/a_finished_read_leaves_no_runtime_files.rs"]
+mod a_finished_read_leaves_no_runtime_files;
+#[cfg(unix)]
+#[path = "read/a_finished_reader_removes_its_own_registration_record.rs"]
+mod a_finished_reader_removes_its_own_registration_record;
+#[path = "read/a_live_read_charge_is_the_reads_own.rs"]
+mod a_live_read_charge_is_the_reads_own;
 #[path = "read/a_local_drop_leaves_the_remaining_history_readable.rs"]
 mod a_local_drop_leaves_the_remaining_history_readable;
 #[cfg(unix)]
@@ -25,11 +38,12 @@ mod a_reopened_store_never_reuses_a_committed_transaction;
 #[cfg(unix)]
 #[path = "read/a_statement_on_the_file_route_costs_what_the_statement_costs.rs"]
 mod a_statement_on_the_file_route_costs_what_the_statement_costs;
+#[path = "read/an_erasure_invalidates_exactly_the_snapshots_older_than_it.rs"]
+mod an_erasure_invalidates_exactly_the_snapshots_older_than_it;
 #[cfg(unix)]
 #[cfg(unix)]
 #[path = "read/an_undeclared_count_answers_exactly_on_every_route.rs"]
 mod an_undeclared_count_answers_exactly_on_every_route;
-#[cfg(unix)]
 #[path = "read/authoritative_purge_reader_publication.rs"]
 mod authoritative_purge_reader_publication;
 #[path = "read/completed_read_totals_reach_an_out_of_crate_observer.rs"]
@@ -64,6 +78,9 @@ mod existing_only_open_contract_tests;
 mod graceful_owner_drop_completes_accepted_read;
 #[path = "read/history_answer_is_complete_and_in_author_order.rs"]
 mod history_answer_is_complete_and_in_author_order;
+#[cfg(unix)]
+#[path = "read/json_decode_admission_contract.rs"]
+mod json_decode_admission_contract;
 #[cfg(unix)]
 #[path = "read/ledger_job_state_through_a_read_session_matches_the_writable_answer.rs"]
 mod ledger_job_state_through_a_read_session_matches_the_writable_answer;
@@ -157,3 +174,6 @@ mod reader_proof_support;
 #[cfg(unix)]
 #[path = "read/working_set_bounded_contract.rs"]
 mod working_set_bounded_contract;
+
+#[path = "read/content_size_independent_contract.rs"]
+mod content_size_independent_contract;

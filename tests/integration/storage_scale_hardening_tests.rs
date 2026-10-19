@@ -730,6 +730,43 @@ fn ssh_c3_maint_edge_indegree() {
     assert_eq!(db.__index_maintenance_visits(), 2);
 }
 
+/// Writable open restores identity bounds without replaying any history family.
+fn assert_open_reads_only_bounds(
+    work: &contextdb_engine::writer_query_test_seams::WriterHistoryWork,
+) {
+    assert_eq!(
+        (
+            work.row_versions,
+            work.index_rebuild_inputs,
+            work.graph_versions,
+            work.change_log_entries,
+            work.commit_index_entries,
+            work.vector_memberships
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "open must not replay this table or its siblings: {work:?}"
+    );
+    assert_eq!(
+        (
+            work.ddl_occurrences,
+            work.sidecar_entries,
+            work.sidecar_decodes,
+            work.selection_entries
+        ),
+        (0, [0; 8], [0; 8], 0),
+        "open must not enumerate durable declarations or sidecars: {work:?}"
+    );
+    assert!(
+        work.commit_bound_keys > 0,
+        "a populated open observes real commit bounds: {work:?}"
+    );
+    #[cfg(feature = "test-seams")]
+    assert!(
+        work.allocator_regions_loaded > 0,
+        "open observes real allocator metadata: {work:?}"
+    );
+}
+
 #[test]
 fn ssh_c3_open_isolated() {
     let tmp = TempDir::new().unwrap();
@@ -754,30 +791,160 @@ fn ssh_c3_open_isolated() {
         }
         db.close().unwrap();
     }
-    let db = Database::open(&path).unwrap();
-    assert_eq!(db.__open_index_maintenance_visits(), 12);
+    let (opened, work) =
+        contextdb_engine::writer_query_test_seams::observe(|| Database::open(&path));
+    let db = opened.unwrap();
+    assert_open_reads_only_bounds(&work.history);
+    assert_eq!(
+        db.execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(203))]]
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM sib WHERE x = 1", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(301))]]
+    );
+    assert_eq!(
+        db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..5)
+            .map(|i| vec![Value::Uuid(uuid(200 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        db.execute("SELECT id, x FROM sib ORDER BY x", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..2)
+            .map(|i| vec![Value::Uuid(uuid(300 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        db.change_log_since(contextdb_core::Lsn(0)).unwrap().len(),
+        7
+    );
+    let prior = db.snapshot();
+    insert_uuid_row(&db, "t", uuid(205), 5);
+    assert!(db.snapshot().0 > prior.0);
+    assert_eq!(
+        db.execute("SELECT id FROM t WHERE col = 5", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(205))]]
+    );
 }
 
 #[test]
 fn ssh_c3_open_sibling_scaling() {
-    let tmp1 = setup_file_db_for_open("open_sibling_1.redb", false, 1);
-    let db1 = Database::open(tmp1.path().join("open_sibling_1.redb")).unwrap();
-    let o1 = db1.__open_index_maintenance_visits();
-
-    let tmp2 = setup_file_db_for_open("open_sibling_2.redb", true, 1);
-    let db2 = Database::open(tmp2.path().join("open_sibling_2.redb")).unwrap();
-    let o2 = db2.__open_index_maintenance_visits();
-
-    assert_eq!(o1, 7);
-    assert_eq!(o2, 10);
-    assert_eq!(o1 - 1, o2 - 4);
+    // Preserve both original sibling index shapes. Within each shape, only the
+    // sibling history doubles; target history and schema stay identical.
+    for extra_indexes in [false, true] {
+        let mut measurements = Vec::new();
+        for sibling_rows in [16, 32] {
+            let tmp = setup_file_db_for_open("open_sibling.redb", extra_indexes, sibling_rows);
+            let (opened, work) = contextdb_engine::writer_query_test_seams::observe(|| {
+                Database::open(tmp.path().join("open_sibling.redb"))
+            });
+            let db = opened.unwrap();
+            assert_open_reads_only_bounds(&work.history);
+            assert_eq!(
+                db.change_log_since(contextdb_core::Lsn(0)).unwrap().len(),
+                3 + sibling_rows
+            );
+            assert_eq!(
+                db.execute("SELECT id FROM t WHERE col = 1", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Uuid(uuid(0x1001))]]
+            );
+            assert_eq!(
+                db.execute("SELECT x, y FROM sib ORDER BY x", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                (0..sibling_rows)
+                    .map(|i| vec![Value::Int64(i as i64), Value::Int64(i as i64)])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                (0..3)
+                    .map(|i| vec![Value::Uuid(uuid(0x1000 + i)), Value::Int64(i as i64)])
+                    .collect::<Vec<_>>()
+            );
+            let prior = db.snapshot();
+            insert_uuid_row(&db, "t", uuid(0x1003), 3);
+            assert!(db.snapshot().0 > prior.0);
+            assert_eq!(
+                db.execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Uuid(uuid(0x1003))]]
+            );
+            measurements.push(work.history);
+        }
+        assert_eq!(
+            measurements[0].commit_bound_keys, measurements[1].commit_bound_keys,
+            "doubling unrelated history adds no bound reads: {measurements:?}"
+        );
+        #[cfg(feature = "test-seams")]
+        assert_eq!(
+            measurements[0].allocator_regions_loaded, measurements[1].allocator_regions_loaded,
+            "doubling unrelated history adds no allocator-region reads: {measurements:?}"
+        );
+    }
 }
 
 #[test]
 fn ssh_c3_open_empty_sibling() {
     let tmp = setup_file_db_for_open("open_empty_sibling.redb", true, 0);
-    let db = Database::open(tmp.path().join("open_empty_sibling.redb")).unwrap();
-    assert_eq!(db.__open_index_maintenance_visits(), 6);
+    let (opened, work) = contextdb_engine::writer_query_test_seams::observe(|| {
+        Database::open(tmp.path().join("open_empty_sibling.redb"))
+    });
+    let db = opened.unwrap();
+    assert_open_reads_only_bounds(&work.history);
+    assert_eq!(
+        db.change_log_since(contextdb_core::Lsn(0)).unwrap().len(),
+        3
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM t WHERE col = 1", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(0x1001))]]
+    );
+    assert!(
+        db.execute("SELECT id FROM sib WHERE x = 1", &HashMap::new())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..3)
+            .map(|i| vec![Value::Uuid(uuid(0x1000 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    let prior = db.snapshot();
+    db.execute(
+        "INSERT INTO sib (id, x, y) VALUES ($id, 1, 1)",
+        &params(vec![("id", Value::Uuid(uuid(0x2000)))]),
+    )
+    .unwrap();
+    assert!(db.snapshot().0 > prior.0);
+    assert_eq!(
+        db.execute("SELECT id FROM sib WHERE x = 1 AND y = 1", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(0x2000))]]
+    );
 }
 
 #[test]
@@ -1148,7 +1315,9 @@ fn ssh_c2_sync_applied_commit_contract() {
 
     insert_uuid_row(&source, "t", uuid(500), 1);
     peer.apply_changes(
-        source.changes_since(base),
+        source
+            .changes_since(base)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();
@@ -1542,7 +1711,9 @@ fn ssh_c2_sync_applied_index_ddl_lifecycle() {
     let base = source.current_lsn();
     exec(&source, "CREATE INDEX idx_c ON t (col, col2)");
     peer.apply_changes(
-        source.changes_since(base),
+        source
+            .changes_since(base)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();
@@ -1558,7 +1729,9 @@ fn ssh_c2_sync_applied_index_ddl_lifecycle() {
     let drop_base = source.current_lsn();
     exec(&source, "DROP INDEX idx_c ON t");
     peer.apply_changes(
-        source.changes_since(drop_base),
+        source
+            .changes_since(drop_base)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();
@@ -1701,21 +1874,56 @@ fn ssh_c2_mixed_paradigm_failed_commit_atomic() {
 
 #[test]
 fn ssh_c1_alter_drop_column_cascade_cleans_storage() {
+    fn durable_entries(path: &std::path::Path) -> ([u64; 2], [u64; 2]) {
+        use redb::{ReadableDatabase, ReadableTableMetadata, TableHandle};
+        let store = redb::ReadOnlyDatabase::open(path).unwrap();
+        let read = store.begin_read().unwrap();
+        let mut physical = [0; 2];
+        let mut current = [0; 2];
+        for (ordinal, index) in ["idx_a", "idx_ab"].iter().enumerate() {
+            let route = format!("t\0{index}");
+            let name = format!("__rel_index_{}", blake3::hash(route.as_bytes()).to_hex());
+            for handle in read.list_tables().unwrap() {
+                if handle.name() == name {
+                    physical[ordinal] = read.open_untyped_table(handle).unwrap().len().unwrap();
+                } else if handle.name() == format!("{name}_current") {
+                    current[ordinal] = read.open_untyped_table(handle).unwrap().len().unwrap();
+                }
+            }
+        }
+        (physical, current)
+    }
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("drop_column.redb");
     {
         let db = Database::open(&path).unwrap();
         seed_t_for_identity(&db);
         exec(&db, "CREATE INDEX idx_ab ON t (col, col2)");
-        let before = db.__introspect_indexes_total_entries();
+        db.close().unwrap();
+        drop(db);
+        let before_entries = durable_entries(&path);
+        assert_eq!(
+            before_entries,
+            ([6, 6], [6, 6]),
+            "both declared indexes have all six durable postings"
+        );
+        let before = before_entries.0.into_iter().sum::<u64>();
+        let db = Database::open(&path).unwrap();
         exec(&db, "ALTER TABLE t DROP COLUMN col CASCADE");
-        let after = db.__introspect_indexes_total_entries();
         let rendered = render_table_meta("t", &db.table_meta("t").unwrap());
+        db.close().unwrap();
+        drop(db);
+        let after_entries = durable_entries(&path);
+        assert_eq!(
+            after_entries,
+            ([0, 0], [0, 0]),
+            "cascade removes physical and current postings for both dropped indexes"
+        );
+        let after = after_entries.0.into_iter().sum::<u64>();
         assert!(after < before);
         assert!(!rendered.contains("idx_a"));
         assert!(!rendered.contains("idx_ab"));
         assert!(!rendered.contains(" col "));
-        db.close().unwrap();
     }
     let reopened = Database::open(&path).unwrap();
     let rendered = render_table_meta("t", &reopened.table_meta("t").unwrap());

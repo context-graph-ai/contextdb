@@ -1154,7 +1154,7 @@ fn an_empty_owner_first_page_does_not_skip_the_first_replayed_row() {
 // the thread inside measure() participate; a header retains the measurement so
 // deallocation on another thread, or after the next sample starts, is correct.
 // The oracle includes transient vectors and COW buffers, unlike reader charges.
-mod append_heap_oracle {
+pub(crate) mod append_heap_oracle {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::sync::Arc;
@@ -1164,6 +1164,9 @@ mod append_heap_oracle {
     struct Counters {
         live: AtomicUsize,
         peak: AtomicUsize,
+        funding: Option<Arc<AtomicUsize>>,
+        unfunded: AtomicUsize,
+        allocations: AtomicUsize,
     }
     thread_local! {
         static ACTIVE: Cell<*const Counters> = const { Cell::new(std::ptr::null()) };
@@ -1201,6 +1204,16 @@ mod append_heap_oracle {
                 let counters = unsafe { &*counters };
                 let live = counters.live.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
                 counters.peak.fetch_max(live, Ordering::SeqCst);
+                if let Some(funding) = &counters.funding {
+                    // No caller code runs between System.alloc and this sample.
+                    // Observe the funding at this allocation boundary, including
+                    // both buffers of a realloc; never infer order from a peak.
+                    counters.allocations.fetch_add(1, Ordering::SeqCst);
+                    counters.unfunded.fetch_max(
+                        live.saturating_sub(funding.load(Ordering::SeqCst)),
+                        Ordering::SeqCst,
+                    );
+                }
             }
             pointer
         }
@@ -1238,6 +1251,29 @@ mod append_heap_oracle {
         let value = operation();
         drop(reset);
         (value, counters.peak.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn measure_funding<T>(
+        funding: Arc<AtomicUsize>,
+        operation: impl FnOnce() -> T,
+    ) -> (T, usize, usize, usize) {
+        let counters = Arc::new(Counters {
+            funding: Some(funding),
+            ..Counters::default()
+        });
+        ACTIVE.with(|active| {
+            assert!(active.get().is_null());
+            active.set(Arc::as_ptr(&counters));
+        });
+        let reset = Reset;
+        let value = operation();
+        drop(reset);
+        (
+            value,
+            counters.peak.load(Ordering::SeqCst),
+            counters.unfunded.load(Ordering::SeqCst),
+            counters.allocations.load(Ordering::SeqCst),
+        )
     }
 }
 

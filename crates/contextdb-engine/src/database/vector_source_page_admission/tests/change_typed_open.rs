@@ -135,7 +135,7 @@ fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
     // the actual load. Decode ownership admitted between the two reads cannot
     // make a source refusal at the second open_table into corruption.
     assert_eq!(
-        with_source_page_admission(Arc::clone(&accountant), load).unwrap(),
+        with_source_page_admission(accountant.clone().into(), load).unwrap(),
         record
     );
     drop(probe_observation);
@@ -154,7 +154,7 @@ fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
     let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
-    let error = with_source_page_admission(Arc::clone(&accountant), load).unwrap_err();
+    let error = with_source_page_admission(accountant.clone().into(), load).unwrap_err();
     match error {
         Error::MemoryBudgetExceeded {
             subsystem,
@@ -184,7 +184,7 @@ fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
     drop(observation);
     accountant.set_budget(Some(128 * 1024 * 1024)).unwrap();
     assert_eq!(
-        with_source_page_admission(Arc::clone(&accountant), load).unwrap(),
+        with_source_page_admission(accountant.clone().into(), load).unwrap(),
         record
     );
     assert_eq!(

@@ -56,9 +56,9 @@ fn logical_key(parts: &[&[u8]]) -> Vec<u8> {
 
 fn logical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let value = serde_json::to_value(value)
-        .map_err(|error| contextdb_core::Error::Other(error.to_string()))?;
+        .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
     serde_json::to_vec(&independently_canonicalize_json(value))
-        .map_err(|error| contextdb_core::Error::Other(error.to_string()))
+        .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))
 }
 
 fn logical_hash_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -153,7 +153,7 @@ fn independently_reconstruct_relational_index_posting_records(
                     },
                     bincode::config::standard(),
                 )
-                .map_err(|error| contextdb_core::Error::Other(error.to_string()))?;
+                .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
                 let mut logical_key = POSTING_MAGIC.to_vec();
                 logical_key.extend_from_slice(&(table.len() as u32).to_be_bytes());
                 logical_key.extend_from_slice(table.as_bytes());
@@ -246,8 +246,8 @@ fn independently_reconstruct_relational_index_count_records(
         // reconstruction must disagree when maintained count state is wrong.
         //
         // Read independently of `maintained_counts::maintained_count_member`:
-        // an absent clause means the table maintains NO prefix count (owner
-        // ruling 2026-09-19), `ALL PREFIXES` means every prefix of every
+        // an absent clause means the table maintains NO prefix count,
+        // `ALL PREFIXES` means every prefix of every
         // index, and an explicit set means exactly the listed column lists.
         let declared_member = |columns: &[(String, SortDirection)]| -> bool {
             match meta.maintained_counts.as_ref() {
@@ -296,14 +296,14 @@ fn independently_reconstruct_relational_index_count_records(
                         },
                         bincode::config::standard(),
                     )
-                    .map_err(|error| contextdb_core::Error::Other(error.to_string()))?;
+                    .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
                     counts.entry(encoded).or_default().insert(row.row_id);
                 }
             }
         }
         for (key, row_ids) in counts {
             let count = u64::try_from(row_ids.len())
-                .map_err(|error| contextdb_core::Error::Other(error.to_string()))?;
+                .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
             records.push(logical_record(
                 10,
                 logical_key(&[COUNT_NAMESPACE, &key]),
@@ -319,7 +319,7 @@ fn independently_enumerate_auxiliary_records(
 ) -> Result<Vec<LogicalContentRecordForTest>> {
     let mut records = Vec::new();
 
-    let edges = project_edges(parts);
+    let edges = project_edges(parts)?;
     for edge in edges {
         let properties = edge.properties.into_iter().collect::<BTreeMap<_, _>>();
         records.push(logical_record(
@@ -421,20 +421,6 @@ fn independently_enumerate_auxiliary_records(
     // counting from zero within its LSN; a schema statement at `{lsn:020}`
     // when it is alone at its LSN and at `{lsn:020}:{ordinal:06}` otherwise;
     // a commit at its LSN.
-    let mut change_ordinal = (None, 0usize);
-    for entry in &parts.change_log {
-        let lsn = entry.lsn().0;
-        change_ordinal = match change_ordinal {
-            (Some(previous), ordinal) if previous == lsn => (Some(lsn), ordinal + 1),
-            _ => (Some(lsn), 0),
-        };
-        let position = format!("{lsn:020}:{:06}", change_ordinal.1);
-        records.push(logical_record(
-            8,
-            logical_history_key(1, position.as_bytes()),
-            logical_json(entry)?,
-        ));
-    }
     let mut at_lsn = BTreeMap::<u64, usize>::new();
     for (lsn, _) in &parts.ddl_log {
         *at_lsn.entry(lsn.0).or_default() += 1;
@@ -505,6 +491,91 @@ fn independently_enumerate_auxiliary_records(
     Ok(records)
 }
 
+// The oracle decodes physical bodies into its own wire representation. It
+// does not read identity leaves or call the production version-manifest hash.
+#[derive(Serialize, Deserialize)]
+struct IndependentVersion {
+    row_id: RowId,
+    values: HashMap<String, IndependentStoredValue>,
+    created_tx: TxId,
+    deleted_tx: Option<TxId>,
+    lsn: Lsn,
+    created_at: Option<contextdb_core::Wallclock>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum IndependentStoredValue {
+    Plain(Value),
+    Vector(IndependentStoredVector),
+}
+
+#[derive(Serialize, Deserialize)]
+enum IndependentStoredVector {
+    F32(Vec<f32>),
+    SQ8 {
+        min: f32,
+        max: f32,
+        len: u32,
+        payload: Vec<u8>,
+    },
+    SQ4 {
+        min: f32,
+        max: f32,
+        len: u32,
+        payload: Vec<u8>,
+    },
+}
+
+fn independently_reconstruct_version_records(
+    bodies: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<LogicalContentRecordForTest>> {
+    let mut records = Vec::new();
+    for (table, body) in bodies {
+        let (row, consumed): (IndependentVersion, usize) =
+            bincode::serde::decode_from_slice(&body, bincode::config::standard())
+                .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
+        if consumed != body.len() {
+            return Err(contextdb_core::Error::Other(
+                "oracle row has trailing bytes".into()));
+        }
+        let mut identity = Vec::new();
+        for value in [row.row_id.0, row.created_tx.0, row.lsn.0] {
+            identity.extend_from_slice(&value.to_be_bytes());
+        }
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"contextdb.relational.version.v1");
+        hash.update(&(table.len() as u32).to_be_bytes());
+        hash.update(table.as_bytes());
+        hash.update(&identity);
+        for value in [
+            row.created_at.map(|stamp| stamp.0),
+            row.deleted_tx.map(|tx| tx.0),
+        ] {
+            hash.update(&[u8::from(value.is_some())]);
+            hash.update(&value.unwrap_or(0).to_be_bytes());
+        }
+        hash.update(&(row.values.len() as u64).to_be_bytes());
+        for (name, value) in row.values.into_iter().collect::<BTreeMap<_, _>>() {
+            let encoded = bincode::serde::encode_to_vec(value, bincode::config::standard())
+                .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
+            hash.update(&(name.len() as u32).to_be_bytes());
+            hash.update(name.as_bytes());
+            hash.update(&encoded[..1]);
+            hash.update(&((encoded.len() - 1) as u64).to_be_bytes());
+            hash.update(&encoded[1..]);
+        }
+        let mut coordinate = vec![1];
+        coordinate.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        coordinate.extend_from_slice(table.as_bytes());
+        coordinate.extend_from_slice(&identity);
+        coordinate.push(u8::from(row.deleted_tx.is_some()));
+        coordinate.extend_from_slice(&row.deleted_tx.map(|tx| tx.0).unwrap_or(0).to_be_bytes());
+        coordinate.extend_from_slice(hash.finalize().as_bytes());
+        records.push(logical_record(8, logical_history_key(3, &coordinate), [1]));
+    }
+    Ok(records)
+}
+
 /// A history record's logical key: the ordered-history marker, its kind
 /// (0 commit, 1 change, 2 schema) and its stored position.
 fn logical_history_key(kind: u8, position: &[u8]) -> Vec<u8> {
@@ -514,18 +585,47 @@ fn logical_history_key(kind: u8, position: &[u8]) -> Vec<u8> {
     key
 }
 
-pub fn committed_content_for_test(path: &Path) -> Result<CommittedContentForTest> {
-    let load = crate::persistence::load_read_image(path)
-        .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
+pub fn committed_content_for_test(
+    path: &Path,
+    operation_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+) -> Result<CommittedContentForTest> {
+    let open_context = crate::executor::bounded::ReadOpenContext::new(
+        operation_read_memory.clone(),
+        crate::read_session::ReadSessionOptions::default().limits,
+        crate::read_session::read_clock(),
+        contextdb_core::read_contract::OwnerReadCancellation::new(),
+    )?;
+    let load = crate::persistence::load_read_image_at_registration_with_context(
+        path,
+        None,
+        None,
+        None,
+        open_context,
+    )
+    .map_err(|e| contextdb_core::Error::Other((e.to_string()).into()))?;
     let (mut image, receipt, retained_source) = load.into_parts();
     receipt
         .validate_released()
-        .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
+        .map_err(|e| contextdb_core::Error::Other((e.to_string()).into()))?;
     let maintained_digest = image.content_identity_for_test();
     image.hydrate_logical_content_for_test(&retained_source)?;
     let parts = image.into_runtime_parts(retained_source);
     let identity_table_meta = parts.table_meta.clone();
+    let version_records = independently_reconstruct_version_records(
+        parts
+            .retained_source
+            .relational_version_bodies_for_test(&identity_table_meta)?,
+    )?;
     let mut logical_records = independently_enumerate_auxiliary_records(&parts)?;
+    logical_records.extend(version_records);
+    for (position, body) in parts.retained_source.change_history_bodies_for_test()? {
+        logical_records.push(logical_record(
+            8,
+            logical_history_key(1, position.as_bytes()),
+            body,
+        ));
+    }
     let encode = |value: &dyn std::fmt::Debug| format!("{value:?}").into_bytes();
     // These are witnesses of committed auxiliary mutations, not canonical root
     // encodings. Ordered table entries are supplied by the persistence decoder.
@@ -539,13 +639,13 @@ pub fn committed_content_for_test(path: &Path) -> Result<CommittedContentForTest
             // serde_json's map representation sorts object keys, so a map's
             // per-process bincode iteration order cannot fake changed content.
             let value = serde_json::to_value(entry)
-                .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
+                .map_err(|e| contextdb_core::Error::Other((e.to_string()).into()))?;
             decoded.push((*key, value));
         }
         queue_contents.insert(sink.clone(), decoded);
     }
     let canonical_queues = serde_json::to_vec(&queue_contents)
-        .map_err(|e| contextdb_core::Error::Other(e.to_string()))?;
+        .map_err(|e| contextdb_core::Error::Other((e.to_string()).into()))?;
     let auxiliary = BTreeMap::from([
         ("configuration".into(), encode(&parts.config_values)),
         ("sink_audit".into(), encode(&parts.sink_audit)),
@@ -554,7 +654,7 @@ pub fn committed_content_for_test(path: &Path) -> Result<CommittedContentForTest
         ("sink_queues".into(), encode(&parts.sink_queues)),
         ("queue_contents".into(), canonical_queues),
     ]);
-    let graph = project_edges(&parts);
+    let graph = project_edges(&parts)?;
     let vectors = project_vectors(&parts);
     let commits = parts
         .commit_index
@@ -584,11 +684,23 @@ pub fn committed_content_for_test(path: &Path) -> Result<CommittedContentForTest
         })
         .collect::<HashMap<_, _>>();
     let accountant = parts.memory.accountant.clone();
+    let read_memory = operation_read_memory;
     // Test-only use of the existing committed decoder target provides metadata
     // and history semantics; no replacement full image enters a reader's life.
-    let database =
-        Database::open_committed_image(parts, Arc::new(crate::plugin::CorePlugin), accountant)?;
-    let mut content = project_test_content(&database, graph, vectors, commits, maintained_digest)?;
+    let database = Database::open_committed_image(
+        parts,
+        Arc::new(crate::plugin::CorePlugin),
+        accountant,
+        declared_read_memory,
+    )?;
+    let mut content = project_test_content(
+        &database,
+        graph,
+        vectors,
+        commits,
+        maintained_digest,
+        read_memory,
+    )?;
     content.configuration.memory_limit_bytes = memory_limit;
     content.durable_auxiliary = auxiliary;
     for row in &content.relational_rows {
@@ -621,13 +733,24 @@ pub fn committed_content_for_test(path: &Path) -> Result<CommittedContentForTest
     Ok(content)
 }
 
-fn project_edges(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredEdge> {
+fn project_edges(parts: &ReadPersistenceImageParts) -> Result<Vec<DirectStoredEdge>> {
     // One edge identity can carry several stored occurrences -- a later write
     // that adds properties does not erase the one that introduced the edge --
     // and an image holds current state, so the latest occurrence is the one
     // an edge reads as.
     let mut current = BTreeMap::new();
-    for edge in &parts.forward_edges {
+    let budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
+        Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+    let mut cursor =
+        crate::persistence::graph_read::EngineGraphReadRoot::Image(parts.retained_source.clone())
+            .cursor(
+                false,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                budget,
+            )?;
+    while let Some(window) = cursor.next_edge_with(&mut || Ok(()))? {
+        let edge = window.edge();
         if edge.deleted_tx.is_some() {
             continue;
         }
@@ -636,7 +759,7 @@ fn project_edges(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredEdge> {
         match current.get(&identity) {
             Some((seen, _)) if *seen >= order => {}
             _ => {
-                current.insert(identity, (order, edge));
+                current.insert(identity, (order, edge.clone()));
             }
         }
     }
@@ -660,7 +783,7 @@ fn project_edges(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredEdge> {
             right.target,
         ))
     });
-    edges
+    Ok(edges)
 }
 
 fn project_vectors(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredVector> {
@@ -714,14 +837,21 @@ fn project_test_content(
     vectors: Vec<DirectStoredVector>,
     commit_index: Vec<(Lsn, TxId)>,
     maintained_digest: DirectTypedImageDigest,
+    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
 ) -> Result<CommittedContentForTest> {
+    let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
     let snapshot_id = database.snapshot();
     let mut table_names = database.table_names();
     table_names.sort();
 
     let mut relational_rows = Vec::new();
     for table in &table_names {
-        for row in database.scan(table, snapshot_id)? {
+        for row in database.scan_with_read_memory(
+            table,
+            snapshot_id,
+            &mut vector_copy_owner,
+            read_memory.clone(),
+        )? {
             relational_rows.push(DirectStoredRow {
                 table: table.clone(),
                 row_id: row.row_id,
@@ -741,7 +871,11 @@ fn project_test_content(
         })
         .collect::<Vec<_>>();
 
-    let (changes, arrivals) = database.changes_since_with_arrivals(Lsn(0));
+    let (changes, arrivals) = database.changes_since_with_arrivals_with_read_memory(
+        Lsn(0),
+        &mut vector_copy_owner,
+        read_memory,
+    )?;
     let changes_state = DirectChangeState {
         current_lsn: database.current_lsn(),
         committed_watermark: database.committed_watermark(),

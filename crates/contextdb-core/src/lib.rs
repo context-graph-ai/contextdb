@@ -1,6 +1,7 @@
 pub mod companion;
 pub mod error;
 pub mod find_attribution;
+mod json_read_builder;
 pub mod memory;
 #[doc(hidden)]
 pub mod read_contract;
@@ -11,11 +12,14 @@ pub mod table_meta;
 pub mod traits;
 pub mod types;
 
-pub use companion::store_companion_path;
+pub use companion::{store_companion_path, store_holders_path};
 pub use error::{
-    CallbackKind, Error, Result, VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue,
+    CallbackKind, Error, Result, StorageCompactionDeclarationIssue,
+    VectorPartitionDeclarationIssue, VectorPolicyDeclarationIssue,
 };
 pub use memory::*;
+#[doc(hidden)]
+pub use read_memory::{NativeReadWake, ReadOwnedFuture};
 // Explicit re-exports only — do NOT glob-export `table_meta::*`. `SortDirection`
 // collides by name with `contextdb_parser::ast::SortDirection`, so downstream
 // crates must use fully-qualified paths at ambiguous sites.
@@ -27,7 +31,8 @@ pub use table_meta::{
     ForeignKeyReference, HistoryPolicy, IndexDecl, IndexKind, MaintainedCounts, PropagationRule,
     RankPolicy, RetainUnit, ScopeLabelKind, SingleColumnForeignKey, SortDirection,
     StateMachineConstraint, SyncDirection, TableMeta, VectorQuantization,
-    render_maintained_count_columns, render_sql_identifier,
+    parse_search_radius_millionths, render_maintained_count_columns,
+    render_search_radius_millionths, render_sql_identifier,
 };
 pub use traits::*;
 pub use types::*;

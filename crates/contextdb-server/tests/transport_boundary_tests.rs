@@ -48,7 +48,8 @@ fn authenticated_server(
             contextdb_core::TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     )
 }
 
@@ -70,6 +71,7 @@ fn authenticated_client_with_identity(
         contextdb_core::TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// Construct an in-process fake hub over `broker` and immediately spawn its
@@ -929,6 +931,10 @@ fn smoke_policy_journey_without_authorized_verifier_orchestration(src: &str) -> 
         );
     }
     for (authorized_use, expected_count) in [
+        (
+            "contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(",
+            1,
+        ),
         // Each is an existing durable verifier handle. A new open expression
         // must stay visible to the ownership scanner.
         ("Arc<Database>", 2),
@@ -1067,8 +1073,11 @@ async fn ip_01_push_pull_converges_over_fake() {
     edge_a_db
         .execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
         .expect("insert on edge A");
-    let expected_push_batches =
-        acceptance_stamped_push_batches_for_test(edge_a_db.changes_since(Lsn(0)));
+    let expected_push_batches = acceptance_stamped_push_batches_for_test(
+        edge_a_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     let expected_batch_results =
         expected_apply_results_for_batches(&expected_push_batches, &policies);
     let edge_a_identity = Arc::new(FabricIdentity::generate());
@@ -1100,7 +1109,9 @@ async fn ip_01_push_pull_converges_over_fake() {
             .is_some_and(|lsn| lsn <= edge_a_push.new_lsn),
         "push status must not claim a hub position beyond the following accepted push: {push_status:?}"
     );
-    let live_hub_history = server_db.changes_since(Lsn(0));
+    let live_hub_history = server_db
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     let push_exchanges = exchanges_on(&broker, &push_subject(tenant));
     assert_eq!(
         push_exchanges.len(),
@@ -1183,8 +1194,12 @@ async fn ip_01_push_pull_converges_over_fake() {
         1,
         "pull must send one complete PullRequest envelope through the fake"
     );
-    let expected_pull_changes =
-        expected_deliverable_table_changes(server_db.changes_since(Lsn(0)), "notes");
+    let expected_pull_changes = expected_deliverable_table_changes(
+        server_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+        "notes",
+    );
     let (expected_ordinary_pull, expected_dependency_units) =
         split_expected_pull_units(expected_pull_changes);
     assert_eq!(
@@ -1359,6 +1374,7 @@ async fn ip_interrupted_push_after_commit_must_not_report_false_failure() {
         .expect("insert on edge");
     let transmitted_source_ceiling = edge_db
         .changes_since(Lsn(0))
+        .expect("read changes_since fixture")
         .max_lsn()
         .expect("the interrupted push has source work to transmit");
 
@@ -1373,7 +1389,8 @@ async fn ip_interrupted_push_after_commit_must_not_report_false_failure() {
         faulty,
         contextdb_core::TenantId::from(tenant),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     let push = within(edge.push()).await;
 
@@ -1462,8 +1479,11 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
         )
         .expect("insert second");
     let losing_lsn = second_db.current_lsn();
-    let expected_push_batches =
-        acceptance_stamped_push_batches_for_test(second_db.changes_since(Lsn(0)));
+    let expected_push_batches = acceptance_stamped_push_batches_for_test(
+        second_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     let second = authenticated_client(second_db.clone(), &broker, tenant);
     let second_push = within(second.push()).await;
     assert!(
@@ -1726,12 +1746,20 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
             )
             .expect("insert blob");
     }
-    let size_split_batches = split_changeset_for_test(edge_db.changes_since(Lsn(0)));
+    let size_split_batches = split_changeset_for_test(
+        edge_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     assert!(
         size_split_batches.len() > 1,
         "fixture must exercise the independent size/barrier splitter"
     );
-    let expected_batches = acceptance_stamped_push_batches_for_test(edge_db.changes_since(Lsn(0)));
+    let expected_batches = acceptance_stamped_push_batches_for_test(
+        edge_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    );
     assert!(
         expected_batches.len() > 1,
         "fixture must force several sync batches, got {}",
@@ -1790,7 +1818,9 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
     )
     .server_current_lsn
     .expect("authenticated status carries the live hub position");
-    let live_hub_history = server_db.changes_since(Lsn(0));
+    let live_hub_history = server_db
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     let push_exchanges = exchanges_on(&broker, &push_subject(tenant));
     assert_eq!(
         push_exchanges.len(),
@@ -1909,8 +1939,12 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
         1,
         "the reader pull must travel as a complete pull request over the fake"
     );
-    let expected_pull_changes =
-        expected_deliverable_table_changes(server_db.changes_since(Lsn(0)), "blobs");
+    let expected_pull_changes = expected_deliverable_table_changes(
+        server_db
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+        "blobs",
+    );
     let (expected_ordinary_pull, expected_dependency_units) =
         split_expected_pull_units(expected_pull_changes);
     assert_eq!(

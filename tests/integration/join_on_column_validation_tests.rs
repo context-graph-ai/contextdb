@@ -167,6 +167,38 @@ fn join_on_valid_column_with_rows_still_works() {
         vec![vec![Value::Int64(1), Value::Int64(100)]],
         "must return exactly the one row whose id matches across both tables"
     );
+
+    // Chained joins retain each table's qualifier rather than assigning the
+    // first FROM name to every column of the accumulated left-hand relation.
+    insert_s(&db, _id2, 200);
+    db.execute(
+        "CREATE TABLE join_limits (id INTEGER PRIMARY KEY, source_id UUID, committed_sequence INTEGER)",
+        &empty(),
+    ).unwrap();
+    for (id, source_id, sequence) in [(1, id1, 7), (2, id1, 9), (3, _id2, 99)] {
+        db.execute(
+            "INSERT INTO join_limits VALUES ($id, $source, $sequence)",
+            &params(vec![
+                ("id", Value::Int64(id)),
+                ("source", Value::Uuid(source_id)),
+                ("sequence", Value::Int64(sequence)),
+            ]),
+        )
+        .unwrap();
+    }
+    let expected = vec![vec![Value::Int64(1), Value::Int64(100), Value::Int64(9)]];
+    for sql in [
+        "SELECT t.a, s.x, join_limits.committed_sequence FROM t INNER JOIN s ON t.id = s.id INNER JOIN join_limits ON s.id = join_limits.source_id WHERE join_limits.committed_sequence >= 8 AND join_limits.committed_sequence < 10",
+        "SELECT events.a, cursors.x, limits.committed_sequence FROM t AS events INNER JOIN s AS cursors ON events.id = cursors.id INNER JOIN join_limits AS limits ON cursors.id = limits.source_id WHERE limits.committed_sequence >= 8 AND limits.committed_sequence < 10",
+    ] {
+        let joined = db
+            .execute(sql, &empty())
+            .expect("three-table join resolves qualified columns from every input");
+        assert_eq!(
+            joined.rows, expected,
+            "third-table WHERE excludes both low and high sequences without losing the second input's qualifier"
+        );
+    }
 }
 
 // ============================================================================

@@ -54,7 +54,8 @@ fn start_hub(broker: &InProcessBroker, tenant: &str, hub_db: Arc<Database>) -> R
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -87,7 +88,8 @@ async fn pull_in_progress_is_true_only_while_a_pull_is_running() {
             transport,
             TenantId::from(tenant),
             edge_identity,
-        ),
+        )
+        .expect("construct SyncClient fixture"),
     );
 
     assert!(

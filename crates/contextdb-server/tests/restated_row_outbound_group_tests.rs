@@ -79,7 +79,9 @@ fn a_republished_restated_row_stays_grouped_with_its_vector() {
     insert_note(&db, id, "held-value");
     let natural_key = NaturalKey::single("id".to_string(), Value::Uuid(id));
 
-    let outbound = db.changes_since(Lsn(0));
+    let outbound = db
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     let stored = outbound
         .rows
         .iter()
@@ -95,18 +97,21 @@ fn a_republished_restated_row_stays_grouped_with_its_vector() {
 
     apply_identical_row(&db, id, "held-value");
     assert!(
-        db.row_version_arrived_by_sync("notes", &natural_key),
+        db.row_version_arrived_by_sync("notes", &natural_key)
+            .expect("read row_version_arrived_by_sync fixture"),
         "an identical authoritative restatement records arrival provenance for the held row"
     );
 
     // The stored version itself: both halves agree it arrived, so the whole
     // group is withheld and the push obligation is discharged.
     assert!(
-        db.row_change_arrived_by_sync(&stored),
+        db.row_change_arrived_by_sync(&stored)
+            .expect("read row_change_arrived_by_sync fixture"),
         "the change describing the stored version is classified by its own sidecar"
     );
     assert!(
-        db.vector_change_arrived_by_sync(&stored_vector),
+        db.vector_change_arrived_by_sync(&stored_vector)
+            .expect("read vector_change_arrived_by_sync fixture"),
         "the vector of that same version is classified identically"
     );
 
@@ -125,8 +130,12 @@ fn a_republished_restated_row_stays_grouped_with_its_vector() {
         lsn: republished_lsn,
     };
 
-    let row_withheld = db.row_change_arrived_by_sync(&republished_row);
-    let vector_withheld = db.vector_change_arrived_by_sync(&republished_vector);
+    let row_withheld = db
+        .row_change_arrived_by_sync(&republished_row)
+        .expect("read row_change_arrived_by_sync fixture");
+    let vector_withheld = db
+        .vector_change_arrived_by_sync(&republished_vector)
+        .expect("read vector_change_arrived_by_sync fixture");
     assert!(
         !row_withheld,
         "a republished row at a position the stored version never took must not be \
@@ -150,7 +159,8 @@ fn a_restated_row_that_is_then_locally_edited_returns_to_outbound_work() {
     let natural_key = NaturalKey::single("id".to_string(), Value::Uuid(id));
     apply_identical_row(&db, id, "held-value");
     assert!(
-        db.row_version_arrived_by_sync("notes", &natural_key),
+        db.row_version_arrived_by_sync("notes", &natural_key)
+            .expect("read row_version_arrived_by_sync fixture"),
         "the restatement marks the held version"
     );
 
@@ -165,12 +175,14 @@ fn a_restated_row_that_is_then_locally_edited_returns_to_outbound_work() {
 
     let edited = db
         .changes_since(Lsn(0))
+        .expect("read changes_since fixture")
         .rows
         .into_iter()
         .rfind(|row| row.natural_key == natural_key)
         .expect("the local edit is outbound");
     assert!(
-        !db.row_change_arrived_by_sync(&edited),
+        !db.row_change_arrived_by_sync(&edited)
+            .expect("read row_change_arrived_by_sync fixture"),
         "local work after a restatement is this node's own and must still propagate"
     );
 }

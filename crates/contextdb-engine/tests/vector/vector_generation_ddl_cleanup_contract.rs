@@ -31,8 +31,14 @@ fn partition(scope: Uuid) -> VectorPartitionKey {
 }
 
 fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(index, &partition(scope))
+        .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
+        .unwrap()
         .map(|info| info.graph_available)
         .unwrap_or(false)
 }
@@ -43,8 +49,15 @@ fn graph_serial(db: &Database, index: &VectorIndexRef, scope: Uuid) -> Option<u6
 }
 
 fn index_is_present(db: &Database, expected: &VectorIndexRef) -> bool {
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     db.vector_store_for_test()
-        .index_infos()
+        .index_infos(&mut vector_fixture_copy_1)
+        .expect("read or publish the admitted vector fixture")
         .into_iter()
         .any(|info| info.index == *expected)
 }
@@ -252,5 +265,67 @@ fn drop_of_a_renamed_generated_vector_column_leaves_no_identity_after_clean_reop
             ),
             Err(Error::UnknownVectorIndex { index: actual }) if actual == index
         ));
+    }
+}
+
+/// Catalog and paged bindings share a commit: either name is wholly usable.
+#[test]
+#[cfg(unix)]
+fn sealed_generation_rename_crash_keeps_catalog_and_paged_bindings_atomic() {
+    use std::os::unix::process::ExitStatusExt;
+    const CHILD_PATH: &str = "CONTEXTDB_SEALED_RENAME_CRASH_PATH";
+    const CHILD_BOUNDARY: &str = "CONTEXTDB_SEALED_RENAME_CRASH_BOUNDARY";
+    if let Ok(path) = std::env::var(CHILD_PATH) {
+        let boundary = std::env::var(CHILD_BOUNDARY).unwrap().parse().unwrap();
+        let db = Database::open(path).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.arm_table_meta_rewrite_crash_for_test(boundary);
+        let outcome = db.execute(
+            "ALTER TABLE generation_ddl_items RENAME COLUMN embedding TO embedding_v2",
+            &empty(),
+        );
+        panic!("armed rename checkpoint did not abort: {outcome:?}");
+    }
+    for boundary in [1, 2, 3] {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("atomic-rename.db");
+        let scope = Uuid::from_u128(0xD001);
+        let first = Uuid::from_u128(0xD100);
+        {
+            let db = Database::open(&path).unwrap();
+            create_and_seal_partition(&db, scope, first);
+            db.close().unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "vector_generation_ddl_cleanup_contract::sealed_generation_rename_crash_keeps_catalog_and_paged_bindings_atomic", "--nocapture"])
+            .env(CHILD_PATH, &path)
+            .env(CHILD_BOUNDARY, boundary.to_string())
+            .output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("TABLE_META_REWRITE_CRASH={boundary}"))
+        );
+        assert_eq!(output.status.signal(), Some(6));
+        let db = Database::open(&path).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let (present, absent) = if boundary == 3 {
+            ("embedding_v2", "embedding")
+        } else {
+            ("embedding", "embedding_v2")
+        };
+        let present_index = VectorIndexRef::new("generation_ddl_items", present);
+        assert!(index_is_present(&db, &present_index));
+        assert!(!index_is_present(
+            &db,
+            &VectorIndexRef::new("generation_ddl_items", absent)
+        ));
+        assert!(graph_available(&db, &present_index, scope));
+        let serial = graph_serial(&db, &present_index, scope);
+        assert_eq!(
+            indexed_search(&db, present, scope, vec![1.0, 0.0, 0.0]),
+            vec![first]
+        );
+        assert_eq!(graph_serial(&db, &present_index, scope), serial);
+        db.close().unwrap();
     }
 }

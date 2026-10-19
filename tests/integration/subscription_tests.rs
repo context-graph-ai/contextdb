@@ -113,7 +113,7 @@ fn s04_apply_changes_source_is_sync_pull() {
         contextdb_engine::plugin::CommitSource::SyncPull,
         "apply_changes must report SyncPull source"
     );
-    // Ported from s20 (folded): SyncPull-path field coverage on the apply_changes event.
+    // SyncPull-path field coverage on the apply_changes event.
     assert!(event.lsn > Lsn(0));
     assert!(event.row_count > 0);
     assert!(event.tables_changed.contains(&"t".to_string()));

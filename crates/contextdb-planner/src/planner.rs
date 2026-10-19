@@ -1,7 +1,8 @@
 use crate::plan::*;
 use contextdb_core::{Direction, Error, PropagationRule, Result};
 use contextdb_parser::ast::{
-    AstPropagationRule, Cte, Expr, FromItem, SelectBody, SelectStatement, SortDirection, Statement,
+    AstPropagationRule, Cte, Expr, FromItem, RowNumberWindow, SelectBody, SelectStatement,
+    SortDirection, Statement, WindowBindingId,
 };
 use std::collections::{BTreeSet, HashMap};
 
@@ -95,12 +96,17 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::ShowMemoryLimit => Ok(PhysicalPlan::ShowMemoryLimit),
         Statement::SetDiskLimit(val) => Ok(PhysicalPlan::SetDiskLimit(val.clone())),
         Statement::ShowDiskLimit => Ok(PhysicalPlan::ShowDiskLimit),
+        Statement::ShowContentSize => Ok(PhysicalPlan::ShowContentSize),
         Statement::SetMaintenancePollInterval(milliseconds) => {
             Ok(PhysicalPlan::SetMaintenancePollInterval(*milliseconds))
         }
         Statement::ShowMaintenancePollInterval => Ok(PhysicalPlan::ShowMaintenancePollInterval),
         Statement::SetVectorServingCache(bytes) => Ok(PhysicalPlan::SetVectorServingCache(*bytes)),
         Statement::ShowVectorServingCache => Ok(PhysicalPlan::ShowVectorServingCache),
+        Statement::SetStorageCompaction(setting) => {
+            Ok(PhysicalPlan::SetStorageCompaction(setting.clone()))
+        }
+        Statement::ShowStorageCompaction => Ok(PhysicalPlan::ShowStorageCompaction),
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
         Statement::DeclareTenantTablePolicy(declaration) => Ok(
@@ -245,6 +251,46 @@ fn extract_propagation_rules(
     Ok(rules)
 }
 
+/// `COUNT(*)` per group over one table. The parser admits only that shape;
+/// whether the table maintains a count over these columns is decided by the
+/// engine at runtime, against the declaration.
+fn plan_grouped_count(
+    body: &SelectBody,
+    cte_env: &HashMap<String, PhysicalPlan>,
+) -> Result<PhysicalPlan> {
+    let refused = || Error::ParseError("GROUP BY is not supported".to_string());
+    let [FromItem::Table { name, alias }] = body.from.as_slice() else {
+        return Err(refused());
+    };
+    if cte_env.contains_key(name) || !body.joins.is_empty() {
+        return Err(refused());
+    }
+    let group_by = body
+        .group_by
+        .iter()
+        .map(|item| match item {
+            Expr::Column(column) => Ok(column.clone()),
+            _ => Err(refused()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PhysicalPlan::GroupedCount {
+        input: Box::new(PhysicalPlan::Scan {
+            table: name.clone(),
+            alias: alias.clone(),
+            filter: body.where_clause.clone(),
+        }),
+        group_by,
+        columns: body
+            .columns
+            .iter()
+            .map(|column| ProjectColumn {
+                expr: column.expr.clone(),
+                alias: column.alias.clone(),
+            })
+            .collect(),
+    })
+}
+
 fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     let mut cte_env = HashMap::new();
     let mut visible_ctes = Vec::new();
@@ -275,6 +321,25 @@ fn plan_select_body(
     cte_env: &HashMap<String, PhysicalPlan>,
     visible_ctes: &[Cte],
 ) -> Result<PhysicalPlan> {
+    if !body.group_by.is_empty() {
+        return plan_grouped_count(body, cte_env);
+    }
+    // Work on this query scope only. CTE plans retain their own projection,
+    // DISTINCT and LIMIT barriers, and their rank bindings have already been consumed.
+    let mut lowered_body = body.clone();
+    let body = &mut lowered_body;
+    let mut window = None;
+    if body.where_clause.as_ref().is_some_and(contains_window)
+        || body.joins.iter().any(|join| contains_window(&join.on))
+    {
+        return Err(window_error("window in source predicate"));
+    }
+    for column in &mut body.columns {
+        lower_window(&mut column.expr, &mut window)?;
+    }
+    for order in &mut body.order_by {
+        lower_window(&mut order.expr, &mut window)?;
+    }
     let graph_from = body
         .from
         .iter()
@@ -291,7 +356,10 @@ fn plan_select_body(
         match from_item {
             Some((from_table, from_alias)) => {
                 if let Some(cte_plan) = cte_env.get(&from_table) {
-                    let mut cte_plan = cte_plan.clone();
+                    let mut cte_plan = PhysicalPlan::MaterializeCte {
+                        name: from_alias.clone().unwrap_or_else(|| from_table.clone()),
+                        input: Box::new(cte_plan.clone()),
+                    };
                     if body.joins.is_empty()
                         && let Some(where_clause) = &body.where_clause
                     {
@@ -329,7 +397,10 @@ fn plan_select_body(
 
         for join in &body.joins {
             let right = if let Some(cte_plan) = cte_env.get(&join.table) {
-                cte_plan.clone()
+                PhysicalPlan::MaterializeCte {
+                    name: join.alias.clone().unwrap_or_else(|| join.table.clone()),
+                    input: Box::new(cte_plan.clone()),
+                }
             } else {
                 PhysicalPlan::Scan {
                     table: join.table.clone(),
@@ -357,6 +428,14 @@ fn plan_select_body(
                 predicate: where_clause.clone(),
             };
         }
+    }
+
+    if let Some(window) = window {
+        current = PhysicalPlan::WindowRank {
+            input: Box::new(current),
+            window,
+            binding: WindowBindingId(0),
+        };
     }
 
     let row_vector_order_count = body
@@ -438,7 +517,10 @@ fn plan_select_body(
                 // at all: refuse it rather than let the comparator treat
                 // every row as equal and hand back a silently unsorted
                 // result.
-                if !matches!(expr, Expr::Column(_) | Expr::FunctionCall { .. }) {
+                if !matches!(
+                    expr,
+                    Expr::Column(_) | Expr::FunctionCall { .. } | Expr::WindowRank(_)
+                ) {
                     return Err(Error::OrderByExpressionNotSupported);
                 }
                 Ok(SortKey {
@@ -541,7 +623,18 @@ fn collect_row_columns(expr: &Expr, selected: &mut BTreeSet<String>) {
                 collect_row_columns(element, selected);
             }
         }
-        Expr::RowVectorSource { .. } | Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::RowNumber(window) => {
+            for column in &window.partition_by {
+                selected.insert(column.column.clone());
+            }
+            for order in &window.order_by {
+                selected.insert(order.column.column.clone());
+            }
+        }
+        Expr::WindowRank(_)
+        | Expr::RowVectorSource { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_) => {}
     }
 }
 
@@ -607,7 +700,11 @@ fn expr_contains_row_vector_source(expr: &Expr) -> bool {
                 || select_body_contains_row_vector_source(subquery)
         }
         Expr::Row(elements) => elements.iter().any(expr_contains_row_vector_source),
-        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::RowNumber(_)
+        | Expr::WindowRank(_)
+        | Expr::Column(_)
+        | Expr::Literal(_)
+        | Expr::Parameter(_) => false,
     }
 }
 
@@ -757,4 +854,74 @@ fn map_parser_to_core_sort_direction(
             "CosineDistance is not a valid CREATE INDEX direction".to_string(),
         )),
     }
+}
+
+fn window_error(form: &str) -> Error {
+    Error::WindowFunctionNotSupported {
+        form: form.to_string(),
+    }
+}
+
+fn contains_window(expr: &Expr) -> bool {
+    match expr {
+        Expr::RowNumber(_) | Expr::WindowRank(_) => true,
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            contains_window(left) || contains_window(right)
+        }
+        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+            contains_window(operand)
+        }
+        Expr::FunctionCall { args, .. } | Expr::Row(args) => args.iter().any(contains_window),
+        Expr::InList { expr, list, .. } => {
+            contains_window(expr) || list.iter().any(contains_window)
+        }
+        Expr::Like { expr, pattern, .. } => contains_window(expr) || contains_window(pattern),
+        // Nested SELECT has a separate window scope, not the parent's input.
+        Expr::InSubquery { expr, .. } => contains_window(expr),
+        Expr::RowVectorSource { key, .. } => contains_window(key),
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => false,
+    }
+}
+
+/// A single typed binding serves repeated identical windows in this SELECT.
+/// Specification equality uses parsed identifiers and defaulted directions.
+fn lower_window(expr: &mut Expr, window: &mut Option<RowNumberWindow>) -> Result<()> {
+    match expr {
+        Expr::RowNumber(spec) => {
+            if let Some(existing) = window.as_ref() {
+                if existing != spec {
+                    return Err(window_error("several distinct windows"));
+                }
+            } else {
+                *window = Some(spec.clone());
+            }
+            *expr = Expr::WindowRank(WindowBindingId(0));
+        }
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            lower_window(left, window)?;
+            lower_window(right, window)?;
+        }
+        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+            lower_window(operand, window)?
+        }
+        Expr::FunctionCall { args, .. } | Expr::Row(args) => {
+            for arg in args {
+                lower_window(arg, window)?;
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            lower_window(expr, window)?;
+            for item in list {
+                lower_window(item, window)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            lower_window(expr, window)?;
+            lower_window(pattern, window)?;
+        }
+        Expr::InSubquery { expr, .. } => lower_window(expr, window)?,
+        Expr::RowVectorSource { key, .. } => lower_window(key, window)?,
+        Expr::WindowRank(_) | Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
+    }
+    Ok(())
 }

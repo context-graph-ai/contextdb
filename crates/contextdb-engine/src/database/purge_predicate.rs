@@ -105,7 +105,11 @@ impl Predicate {
             // replayed on other nodes, and inventing a wire shape for it here
             // would let a node replay something this one never proved it could
             // evaluate. Refused until it has one.
-            Expr::InSubquery { .. } | Expr::RowVectorSource { .. } | Expr::Row(_) => {
+            Expr::InSubquery { .. }
+            | Expr::RowVectorSource { .. }
+            | Expr::Row(_)
+            | Expr::RowNumber(_)
+            | Expr::WindowRank(_) => {
                 return Err(Error::SubqueryNotSupported);
             }
         })
@@ -201,14 +205,15 @@ impl NodeLocalPredicate {
         &self,
         db: &Database,
         table: &str,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<Vec<AuthoritativePurgeSelection>> {
         let Some(meta) = db.table_meta(table) else {
             return Ok(Vec::new());
         };
         if crate::executor::effective_sync_direction(&meta) != SyncDirection::None {
             return Err(Error::SyncError(
-                "node-local purge instruction requires SYNC OFF".into(),
-            ));
+                "node-local purge instruction requires SYNC OFF".into()));
         }
         let predicate = self
             .predicate
@@ -216,7 +221,12 @@ impl NodeLocalPredicate {
             .map(Predicate::expression)
             .transpose()?;
         let rows = crate::executor::filter_rows_by_predicate(
-            db.scan(table, db.snapshot_for_read())?,
+            db.scan_with_read_memory(
+                table,
+                db.snapshot_for_read(),
+                vector_copy_owner,
+                read_memory.clone(),
+            )?,
             predicate.as_ref(),
             &self.parameters,
         )?;
@@ -224,7 +234,7 @@ impl NodeLocalPredicate {
             .map(|row| {
                 let key = natural_key_from_row_values(&meta, &row.values)
                     .ok_or_else(|| Error::NotSyncEligible(table.into()))?;
-                db.resolve_authoritative_purge_selection(table, &key)
+                db.resolve_authoritative_purge_selection(table, &key, read_memory.clone())
             })
             .collect()
     }

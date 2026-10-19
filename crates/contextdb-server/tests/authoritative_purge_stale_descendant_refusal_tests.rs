@@ -68,11 +68,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
     db.execute(DDL, &HashMap::new())
         .expect("hub solely declares the explicit two-way table");
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -113,7 +112,8 @@ async fn pre_purge_descendant_is_visibly_refused_then_removed_by_authoritative_p
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert!(
         edge.table_meta(TABLE).is_none(),
         "blank edge receives the authoritative table through the baseline pull"
@@ -288,7 +288,8 @@ async fn fresh_same_key_hub_lineage_survives_stale_descendant_group_and_stale_ed
         stale.clone(),
         &peer_dial_spec(&hub.ticket, &stale_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     let fresh_path = root.path().join("fresh.db");
     let fresh_identity = root.path().join("fresh.db.fabric-identity.key");
@@ -298,7 +299,8 @@ async fn fresh_same_key_hub_lineage_survives_stale_descendant_group_and_stale_ed
         fresh.clone(),
         &peer_dial_spec(&hub.ticket, &fresh_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     within(stale_client.pull_default())
         .await
@@ -407,7 +409,9 @@ async fn fresh_same_key_hub_lineage_survives_stale_descendant_group_and_stale_ed
         )
         .expect("stage stale sibling insert");
     stale.commit(stale_tx).expect("commit stale two-row group");
-    let stale_group = stale.changes_since(stale_before_group);
+    let stale_group = stale
+        .changes_since(stale_before_group)
+        .expect("read changes_since fixture");
     assert_eq!(stale_group.rows.len(), 2, "stale group carries two rows");
     assert!(
         stale_group
@@ -435,7 +439,8 @@ async fn fresh_same_key_hub_lineage_survives_stale_descendant_group_and_stale_ed
         stale.clone(),
         &peer_dial_spec(&hub.ticket, &stale_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let stale_push = within(stale_client.push())
         .await
         .expect("hub adjudicates the stale descendant group");

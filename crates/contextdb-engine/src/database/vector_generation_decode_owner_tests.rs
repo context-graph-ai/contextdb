@@ -1,6 +1,71 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+// Each request declares a separate reader funder; none borrows the writer accountant.
+#[derive(Debug)]
+struct LoaderReadBudget(Arc<MemoryAccountant>);
+impl contextdb_core::read_memory::ReadMemoryBudget for LoaderReadBudget {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        self.0.try_allocate_for(bytes, subsystem, operation, hint)
+    }
+    fn release(&self, bytes: usize) {
+        self.0.release(bytes);
+    }
+}
+fn loader_read_request(
+    limit: usize,
+) -> (Arc<MemoryAccountant>, contextdb_vector::VectorCopyAdmission) {
+    let reader = Arc::new(MemoryAccountant::with_budget(limit));
+    let capability: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
+        Arc::new(LoaderReadBudget(reader.clone()));
+    (reader, crate::vector_read_memory::admission(capability))
+}
+
+fn retained_loader_metadata(
+    writer: Arc<MemoryAccountant>,
+    partition: &VectorPartitionRef,
+) -> Arc<contextdb_vector::VectorCopyAdmission> {
+    let mut retained = contextdb_vector::VectorCopyAdmission::new(writer);
+    retained
+        .reserve(
+            std::mem::size_of::<DurableRawVectorPartitionLoader>()
+                .saturating_add(std::mem::size_of::<contextdb_vector::VectorCopyAdmission>())
+                .saturating_add(4 * std::mem::size_of::<usize>())
+                .saturating_add(partition.index.table.len())
+                .saturating_add(partition.index.column.len())
+                .saturating_add(partition.partition_key.estimated_bytes()),
+        )
+        .expect("admit the retained loader metadata before its constructor clone");
+    Arc::new(retained)
+}
+fn loader_metadata_bytes(loader: &DurableRawVectorPartitionLoader) -> usize {
+    loader
+        .metadata_copy_owner
+        .as_ref()
+        .expect("fixture retains its real column metadata owner")
+        .retained_bytes()
+}
+fn assert_last_loader_owner_releases(
+    loader: DurableRawVectorPartitionLoader,
+    reader: &MemoryAccountant,
+) {
+    let writer = loader.accountant.clone();
+    assert_eq!(writer.usage().used, loader_metadata_bytes(&loader));
+    drop(loader);
+    assert_eq!(
+        writer.usage().used,
+        0,
+        "last loader releases its retained metadata"
+    );
+    assert_eq!(reader.usage().used, 0);
+}
+
 fn resident_owner_bound(quantization: VectorQuantization) {
     let layout = VectorIndexLayout::unpartitioned(64, quantization);
     let partition = VectorPartitionRef::new(
@@ -134,7 +199,14 @@ fn dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases() 
     ] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("decode-owner.db");
-        Database::open(&path).unwrap().close().unwrap();
+        let database = Database::open(&path).unwrap();
+        database
+            .execute(
+                "CREATE TABLE decode_items (id INTEGER PRIMARY KEY, embedding VECTOR(1))",
+                &HashMap::new(),
+            )
+            .expect("declare the decoder fixture table before physical vector publication");
+        database.close().unwrap();
         let persistence = Arc::new(RedbPersistence::open_with_cache(&path, 0).unwrap());
         let partition = VectorPartitionRef::new(
             VectorIndexRef::new("decode_items", "embedding"),
@@ -154,29 +226,38 @@ fn dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases() 
                 &HashMap::from([(partition.index.clone(), quantization)]),
             )
             .unwrap();
+        let membership = VectorPartitionMembershipRecord {
+            index: partition.index.clone(),
+            partition_key: partition.partition_key.clone(),
+            row_id: entry.row_id,
+            row_created_tx: entry.created_tx,
+            row_lsn: entry.lsn,
+            vector_created_tx: entry.created_tx,
+            vector_lsn: entry.lsn,
+            visible_from: entry.created_tx,
+            deleted_tx: None,
+        };
         persistence
-            .append_vector_partition_memberships_batch(&[VectorPartitionMembershipRecord {
-                index: partition.index.clone(),
-                partition_key: partition.partition_key.clone(),
-                row_id: entry.row_id,
-                row_created_tx: entry.created_tx,
-                row_lsn: entry.lsn,
-                vector_created_tx: entry.created_tx,
-                vector_lsn: entry.lsn,
-                visible_from: entry.created_tx,
-                deleted_tx: None,
-            }])
+            .append_vector_partition_memberships_batch(std::slice::from_ref(&membership))
             .unwrap();
         let raw_directory = [RawVectorDirectoryEntry {
+            membership: contextdb_vector::store::VectorMembershipProvenance::new(
+                membership.row_created_tx,
+                membership.row_lsn,
+                membership.visible_from,
+                membership.deleted_tx,
+            ),
             row_id: entry.row_id,
             created_tx: entry.created_tx,
             deleted_tx: None,
             lsn: entry.lsn,
         }];
-        let mut loader = DurableRawVectorPartitionLoader {
+        let accountant = Arc::new(MemoryAccountant::with_budget(1024 * 1024));
+        let loader = DurableRawVectorPartitionLoader {
+            metadata_copy_owner: Some(retained_loader_metadata(accountant.clone(), &partition)),
             source: DurableRawVectorSource::Writable(persistence),
-            accountant: Arc::new(MemoryAccountant::with_budget(1024 * 1024)),
-            partition,
+            accountant: accountant.into(),
+            partition: partition.clone(),
             dimension: 1,
             quantization,
         };
@@ -185,30 +266,70 @@ fn dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases() 
         let observation = redb::observe_backend_reads(Arc::new(move |_| {
             observed.fetch_add(1, Ordering::SeqCst);
         }));
-        let error = match loader.load(&raw_directory) {
+        let (reader, mut read_owner) = loader_read_request(1024 * 1024);
+        let error = match loader.load(&raw_directory, &mut read_owner) {
             Err(error) => error,
             Ok(_) => panic!("loader omitted its independently owned decoder scratch"),
         };
-        assert!(matches!(error, Error::MemoryBudgetExceeded {
-            subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, ..
-        } if subsystem == "vector_store" && operation == "load_raw_vector_partition"
-            && requested_bytes > 1024 * 1024 && available_bytes == 1024 * 1024
-            && budget_limit_bytes == 1024 * 1024));
+        let (failed_requested, failed_available) = match error {
+            Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                ..
+            } if subsystem == "vector_copy"
+                && operation == "materialize"
+                && budget_limit_bytes == 1024 * 1024 =>
+            {
+                (requested_bytes, available_bytes)
+            }
+            other => panic!("executing reader must refuse its decoder scratch: {other:?}"),
+        };
+        assert!(failed_requested > 1024 * 1024);
         assert_eq!(reads.load(Ordering::SeqCst), 0);
         drop(observation);
-        assert_eq!(loader.accountant.usage().used, 0);
-        loader.accountant = Arc::new(MemoryAccountant::with_budget(2 * 1024 * 1024));
-        let loaded = loader.load(&raw_directory).unwrap();
+        assert_eq!(
+            loader.accountant.usage().used,
+            loader_metadata_bytes(&loader)
+        );
+        let source = loader.source.clone();
+        assert_last_loader_owner_releases(loader, &reader);
+        let accountant = Arc::new(MemoryAccountant::with_budget(2 * 1024 * 1024));
+        let loader = DurableRawVectorPartitionLoader {
+            metadata_copy_owner: Some(retained_loader_metadata(accountant.clone(), &partition)),
+            source,
+            accountant: accountant.into(),
+            partition: partition.clone(),
+            dimension: 1,
+            quantization,
+        };
+        assert_eq!(reader.usage().used, 0);
+        let (reader, mut read_owner) = loader_read_request(2 * 1024 * 1024);
+        let loaded = loader.load(&raw_directory, &mut read_owner).unwrap();
+        assert_eq!(
+            failed_available + loaded.workspace_owner.retained_bytes(),
+            1024 * 1024,
+            "only the exact returned workspace preceded the refused transient reservation"
+        );
         assert_eq!(loaded.entries.len(), 1);
-        assert_eq!(loaded.entries[0].vector, vec![0.25]);
-        let retained = loaded.resident_bytes + loaded.workspace_bytes;
-        assert_eq!(loader.accountant.usage().used, retained);
+        assert_eq!(loaded.entries[0].entry.vector, vec![0.25]);
+        let retained = loaded.resident_bytes + loaded.workspace_owner.retained_bytes();
+        assert_eq!(
+            loader.accountant.usage().used - loader_metadata_bytes(&loader) + reader.usage().used,
+            retained
+        );
         assert!(
             retained < 1024 * 1024,
             "decoder scratch died before publication"
         );
         drop(loaded);
-        loader.accountant.release(retained);
-        assert_eq!(loader.accountant.usage().used, 0);
+        assert_eq!(reader.usage().used, 0);
+        assert_eq!(
+            loader.accountant.usage().used,
+            loader_metadata_bytes(&loader)
+        );
+        assert_last_loader_owner_releases(loader, &reader);
     }
 }

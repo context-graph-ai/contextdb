@@ -1,8 +1,12 @@
 use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
-    AlterAction, ColumnDef, CompositeForeignKey, Cte, Expr, OnConflict, RetainOption,
-    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef, VectorSearchMode,
+    AlterAction, ColumnDef, ColumnRef, CompositeForeignKey, Cte, Expr, OnConflict, RetainOption,
+    RowNumberWindow, SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef,
+    StorageCompactionSetting, VectorSearchMode, WindowBindingId,
 };
+
+/// ROW_NUMBER produces SQL INTEGER values represented as Value::Int64.
+pub const ROW_NUMBER_OUTPUT_TYPE: contextdb_core::ColumnType = contextdb_core::ColumnType::Integer;
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
@@ -57,9 +61,24 @@ pub enum PhysicalPlan {
         search_mode: Option<VectorSearchMode>,
         materialized_columns: Option<Vec<String>>,
     },
+    /// Assigns one-based INT64 rank after its input predicates, before projection.
+    /// Runtime binds columns against input schema and selects the actual Sort/Index route.
+    WindowRank {
+        input: Box<PhysicalPlan>,
+        window: RowNumberWindow,
+        binding: WindowBindingId,
+    },
     Filter {
         input: Box<PhysicalPlan>,
         predicate: Expr,
+    },
+    /// `COUNT(*)` per group of `group_by` over its input `Scan`, projected as
+    /// `columns` (grouped columns and `COUNT(*)` items only). Runtime decides
+    /// whether a declared maintained count answers it or refuses it.
+    GroupedCount {
+        input: Box<PhysicalPlan>,
+        group_by: Vec<ColumnRef>,
+        columns: Vec<ProjectColumn>,
     },
     Project {
         input: Box<PhysicalPlan>,
@@ -100,10 +119,13 @@ pub enum PhysicalPlan {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
+    ShowContentSize,
     SetMaintenancePollInterval(u64),
     ShowMaintenancePollInterval,
     SetVectorServingCache(Option<u64>),
     ShowVectorServingCache,
+    SetStorageCompaction(StorageCompactionSetting),
+    ShowStorageCompaction,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicyPlan),
@@ -201,8 +223,29 @@ impl PhysicalPlan {
                 .map(Self::explain)
                 .collect::<Vec<_>>()
                 .join(" -> "),
+            PhysicalPlan::WindowRank { input, window, .. } => {
+                format!(
+                    "WindowRank(partitions={}, order_keys={}) -> {}",
+                    window.partition_by.len(),
+                    window.order_by.len(),
+                    input.explain()
+                )
+            }
             PhysicalPlan::Project { input, .. } => {
                 format!("Project -> {}", input.explain())
+            }
+            PhysicalPlan::GroupedCount {
+                input, group_by, ..
+            } => {
+                format!(
+                    "GroupedCount(columns={}) -> {}",
+                    group_by
+                        .iter()
+                        .map(|column| column.column.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    input.explain()
+                )
             }
             _ => format!("{:?}", self),
         }

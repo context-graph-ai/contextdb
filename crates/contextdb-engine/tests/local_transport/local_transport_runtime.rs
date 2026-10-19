@@ -9,8 +9,9 @@ use contextdb_engine::local_transport::{
     RuntimeDirectoryFacts, RuntimeDirectoryInspector, RuntimeDirectoryRequest,
     RuntimeDirectorySource, RuntimeRootViolation, SystemRuntimeDirectoryInspector,
     channel_socket_path, inspect_channel_path, opaque_channel_basename, prepare_runtime_directory,
-    prepare_runtime_directory_with_environment, resolve_runtime_directory_with_environment,
-    unix_socket_path_limit, validate_channel_path, validate_runtime_root,
+    prepare_runtime_directory_with_environment, resolve_runtime_directory,
+    resolve_runtime_directory_with_environment, unix_socket_path_limit, validate_channel_path,
+    validate_runtime_root,
 };
 use std::collections::BTreeMap;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -304,30 +305,233 @@ fn linux_filesystem_locality_is_an_allowlist_and_unknown_types_are_refused() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn local_channel_derives_the_macos_confstr_temporary_root() {
-    let owner = LocalUserIdentity(7_102);
-    let temporary_root = PathBuf::from("/var/folders/contextdb-user-temp");
+fn local_channel_derives_the_macos_direct_default_channel() {
+    let owner = LocalUserIdentity(7_106); // 0x1bc2
+    let canonical_parent = PathBuf::from("/private/tmp");
     let request = RuntimeDirectoryRequest {
         explicit_root: None,
         current_user: owner,
     };
-    let inspector = FactsInspector::default().with(facts(temporary_root.clone(), owner));
+    let inspector = FactsInspector::default()
+        .with(RuntimeDirectoryFacts {
+            requested_root: PathBuf::from("/tmp"),
+            resolved_root: canonical_parent.clone(),
+            is_absolute: true,
+            is_local: true,
+            is_directory: true,
+            is_symbolic_link: true,
+            owner: LocalUserIdentity(0),
+            mode: 0o1777,
+            writable: true,
+            available: true,
+        })
+        .with(RuntimeDirectoryFacts {
+            requested_root: canonical_parent.clone(),
+            resolved_root: canonical_parent.clone(),
+            is_absolute: true,
+            is_local: true,
+            is_directory: true,
+            is_symbolic_link: false,
+            owner: LocalUserIdentity(0),
+            mode: 0o1777,
+            writable: true,
+            available: true,
+        });
 
+    let resolved = resolve_runtime_directory_with_environment(
+        &request,
+        &inspector,
+        &RuntimeEnvironment {
+            xdg: Some(PathBuf::from("/ignored-on-macos")),
+            effective_user: owner,
+            macos_temporary: None,
+        },
+    )
+    .expect("macOS direct default runtime resolution");
+
+    let expected_dir = canonical_parent.join("cdb0000000000001bc2");
     assert_eq!(
-        resolve_runtime_directory_with_environment(
+        resolved,
+        ResolvedRuntimeDirectory {
+            path: expected_dir.clone(),
+            source: RuntimeDirectorySource::MacosTemporary,
+        }
+    );
+    assert_eq!(expected_dir.as_os_str().as_encoded_bytes().len(), 32);
+    let socket_path = expected_dir.join("0000000000000000000000000000000000000000000000000000000000000000.sock");
+    assert_eq!(socket_path.as_os_str().as_encoded_bytes().len(), 102);
+    assert!(socket_path.as_os_str().as_encoded_bytes().len() <= 103);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_default_channel_full_u64_uid_boundaries() {
+    let canonical_parent = PathBuf::from("/private/tmp");
+    let base_parent_facts = RuntimeDirectoryFacts {
+        requested_root: canonical_parent.clone(),
+        resolved_root: canonical_parent.clone(),
+        is_absolute: true,
+        is_local: true,
+        is_directory: true,
+        is_symbolic_link: false,
+        owner: LocalUserIdentity(0),
+        mode: 0o1777,
+        writable: true,
+        available: true,
+    };
+    let tmp_facts = RuntimeDirectoryFacts {
+        requested_root: PathBuf::from("/tmp"),
+        resolved_root: canonical_parent.clone(),
+        is_absolute: true,
+        is_local: true,
+        is_directory: true,
+        is_symbolic_link: true,
+        owner: LocalUserIdentity(0),
+        mode: 0o1777,
+        writable: true,
+        available: true,
+    };
+
+    let boundary_cases = [
+        (LocalUserIdentity(0), "cdb0000000000000000"),
+        (LocalUserIdentity(0xffff_ffff_ffff_ffff), "cdbffffffffffffffff"),
+    ];
+
+    for (uid, leaf_name) in boundary_cases {
+        let inspector = FactsInspector::default()
+            .with(tmp_facts.clone())
+            .with(base_parent_facts.clone());
+        let request = RuntimeDirectoryRequest {
+            explicit_root: None,
+            current_user: uid,
+        };
+        let resolved = resolve_runtime_directory_with_environment(
             &request,
             &inspector,
             &RuntimeEnvironment {
-                xdg: Some(PathBuf::from("/ignored-on-macos")),
-                effective_user: owner,
-                macos_temporary: Some(temporary_root.clone()),
+                xdg: None,
+                effective_user: uid,
+                macos_temporary: None,
             },
         )
-        .expect("macOS temporary runtime resolution"),
-        ResolvedRuntimeDirectory {
-            path: temporary_root.join("contextdb"),
-            source: RuntimeDirectorySource::MacosTemporary,
-        }
+        .expect("boundary UID resolution");
+        assert_eq!(
+            resolved,
+            ResolvedRuntimeDirectory {
+                path: canonical_parent.join(leaf_name),
+                source: RuntimeDirectorySource::MacosTemporary,
+            }
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_default_channel_path_length_bound_b13_accept_b14_refuse() {
+    let dummy_address = contextdb_core::read_contract::ChannelAddress([0x33; 32]);
+    // Leaf is cdb0000000000000001 (19 bytes). Channel socket name is 69 bytes.
+    // Full socket address is B + 1 + 19 + 1 + 69 = B + 90 bytes.
+    // B = 13 encoded bytes gives 13 + 90 = 103 bytes (accepted).
+    // B = 14 encoded bytes gives 14 + 90 = 104 bytes (refused).
+    let parent_b13 = PathBuf::from("/private/tmp1"); // 13 bytes
+    assert_eq!(parent_b13.as_os_str().as_encoded_bytes().len(), 13);
+    let dir_b13 = parent_b13.join("cdb0000000000000001");
+    let socket_b13 = channel_socket_path(&dir_b13, dummy_address);
+    assert!(socket_b13.is_ok(), "B=13 parent must yield valid 103-byte socket path");
+    assert_eq!(socket_b13.unwrap().as_os_str().as_encoded_bytes().len(), 103);
+
+    let parent_b14 = PathBuf::from("/private/tmp14"); // 14 bytes
+    assert_eq!(parent_b14.as_os_str().as_encoded_bytes().len(), 14);
+    let dir_b14 = parent_b14.join("cdb0000000000000001");
+    let socket_b14 = channel_socket_path(&dir_b14, dummy_address);
+    assert_eq!(
+        socket_b14,
+        Err(LocalTransportError::ChannelPath(
+            ChannelPathViolation::PathTooLong
+        )),
+        "B=14 parent must be refused as exceeding 103-byte limit"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_default_channel_canonicalizes_alias_before_symlink_inspection() {
+    let owner = LocalUserIdentity(7_102);
+    let tmp = PathBuf::from("/tmp");
+    let canonical_parent = PathBuf::from("/private/tmp");
+
+    // /tmp is a symlink on Darwin; canonical parent /private/tmp is not a symlink.
+    let inspector = FactsInspector::default()
+        .with(RuntimeDirectoryFacts {
+            requested_root: tmp.clone(),
+            resolved_root: canonical_parent.clone(),
+            is_absolute: true,
+            is_local: true,
+            is_directory: true,
+            is_symbolic_link: true,
+            owner: LocalUserIdentity(0),
+            mode: 0o1777,
+            writable: true,
+            available: true,
+        })
+        .with(RuntimeDirectoryFacts {
+            requested_root: canonical_parent.clone(),
+            resolved_root: canonical_parent.clone(),
+            is_absolute: true,
+            is_local: true,
+            is_directory: true,
+            is_symbolic_link: false,
+            owner: LocalUserIdentity(0),
+            mode: 0o1777,
+            writable: true,
+            available: true,
+        });
+
+    let default_res = resolve_runtime_directory_with_environment(
+        &RuntimeDirectoryRequest {
+            explicit_root: None,
+            current_user: owner,
+        },
+        &inspector,
+        &RuntimeEnvironment {
+            xdg: None,
+            effective_user: owner,
+            macos_temporary: None,
+        },
+    );
+    assert!(default_res.is_ok(), "platform alias /tmp must canonicalize to /private/tmp without symlink rejection");
+
+    // Explicit roots MUST still reject symlinks
+    let explicit_symlink = PathBuf::from("/service/explicit-symlink");
+    let explicit_inspector = FactsInspector::default()
+        .with(RuntimeDirectoryFacts {
+            requested_root: explicit_symlink.clone(),
+            resolved_root: PathBuf::from("/elsewhere"),
+            is_absolute: true,
+            is_local: true,
+            is_directory: true,
+            is_symbolic_link: true,
+            owner: owner,
+            mode: OWNER_ONLY_MODE,
+            writable: true,
+            available: true,
+        });
+    let explicit_res = resolve_runtime_directory_with_environment(
+        &RuntimeDirectoryRequest {
+            explicit_root: Some(explicit_symlink),
+            current_user: owner,
+        },
+        &explicit_inspector,
+        &RuntimeEnvironment {
+            xdg: None,
+            effective_user: owner,
+            macos_temporary: None,
+        },
+    );
+    assert_eq!(
+        explicit_res,
+        Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::SymbolicLink)),
+        "explicit root pointing to symlink must still be refused"
     );
 }
 
@@ -559,24 +763,21 @@ fn production_preparation_refuses_every_hostile_preexisting_runtime_child() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn process_environment_uses_the_native_macos_user_temporary_directory() {
-    let environment = ProcessRuntimeDirectoryEnvironment;
-    let temporary = environment
-        .macos_user_temporary_directory()
-        .expect("read _CS_DARWIN_USER_TEMP_DIR through confstr");
-    assert!(temporary.is_absolute());
+fn process_environment_resolves_the_native_macos_direct_default_channel() {
     let current = LocalUserIdentity(nix::unistd::geteuid().as_raw() as u64);
+    let resolved = resolve_runtime_directory(
+        &RuntimeDirectoryRequest {
+            explicit_root: None,
+            current_user: current,
+        },
+        &SystemRuntimeDirectoryInspector,
+    )
+    .expect("resolve native macOS default runtime directory");
     assert_eq!(
-        resolve_runtime_directory(
-            &RuntimeDirectoryRequest {
-                explicit_root: None,
-                current_user: current,
-            },
-            &SystemRuntimeDirectoryInspector,
-        )
-        .expect("resolve through the process environment"),
+        resolved,
         ResolvedRuntimeDirectory {
-            path: temporary.join("contextdb"),
+            path: PathBuf::from("/private/tmp")
+                .join(format!("cdb{:016x}", current.0)),
             source: RuntimeDirectorySource::MacosTemporary,
         }
     );

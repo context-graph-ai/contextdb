@@ -106,7 +106,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     db.commit(tx).unwrap();
     db.run_maintenance_cycle().unwrap();
     let snapshot = db.snapshot();
-    let _pin = db.pin_snapshot(snapshot);
+    let _pin = db.pin_snapshot(snapshot).unwrap();
     let query = [0.7, 0.3, 0.1];
     let sql = "SELECT id FROM items WHERE bucket = 0 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
     db.execute(
@@ -403,13 +403,27 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                 semantic.search_mode = Some(VectorSearchMode::Indexed);
                 db.__reset_last_query_vector_trace_for_test();
                 let embedded = db.semantic_search(semantic.clone()).unwrap();
-                let plain_trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                let plain_trace = {
+                    let seam_read_memory = db
+                        .declared_reader_memory()
+                        .expect("admit the fixture operation reader");
+                    db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                        .expect("read the admitted trace observation")
+                }
+                .unwrap();
                 if selected == 100 && query_id == 0 {
                     for threshold in [0.0, embedded[4].vector_score] {
                         semantic.min_similarity = Some(threshold);
                         db.__reset_last_query_vector_trace_for_test();
                         let filtered = db.semantic_search(semantic.clone()).unwrap();
-                        let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                        let trace = {
+                            let seam_read_memory = db
+                                .declared_reader_memory()
+                                .expect("admit the fixture operation reader");
+                            db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                                .expect("read the admitted trace observation")
+                        }
+                        .unwrap();
                         println!(
                             "minimum_similarity quantization={mode} threshold={threshold} plain_ef={:?} threshold_ef={:?} plain_candidates={} threshold_candidates={}",
                             plain_trace.hnsw_ef_search,
@@ -760,7 +774,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                 .expect("the counterexample needs an immutable base with the old score");
             let query = [1.0, 0.0, 0.0];
             let old_snapshot = db.snapshot();
-            let pin = db.pin_snapshot(old_snapshot);
+            let pin = db.pin_snapshot(old_snapshot).unwrap();
             let sql = "SELECT id, score FROM items ORDER BY embedding <=> $query \
                        USE VECTOR INDEXED LIMIT 2";
             let old_answer = db.execute(sql, &parameters(&query)).unwrap();
@@ -788,8 +802,17 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
             let cleaned = db.compact_currency_versions().unwrap();
             assert_eq!(cleaned.pruned_versions, 1);
             assert_eq!(cleaned.vector_keys_rewritten, 1);
+            let vector_fixture_reader_1 = db
+                .declared_reader_memory()
+                .expect("admit the vector fixture reader");
+            let mut vector_fixture_copy_1 =
+                contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
             assert_eq!(
-                db.vector_store_for_test().raw_directory_entries().len(),
+                db.vector_store_for_test()
+                    .raw_directory_entries(&mut vector_fixture_copy_1)
+                    .expect("read or publish the admitted vector fixture")
+                    .len(),
                 2,
                 "cleanup must actually leave one version of each row"
             );
@@ -822,13 +845,27 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                     );
                     db.__reset_last_query_vector_trace_for_test();
                     let ordinary = db.execute(&sql, &parameters(&query)).unwrap();
-                    let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                    let trace = {
+                        let seam_read_memory = db
+                            .declared_reader_memory()
+                            .expect("admit the fixture operation reader");
+                        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                            .expect("read the admitted trace observation")
+                    }
+                    .unwrap();
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(ordinary.rows, expected.rows[..limit]);
                     db.__reset_last_query_vector_trace_for_test();
                     let bounded = bounded_query(&db, &sql, &query);
-                    let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                    let trace = {
+                        let seam_read_memory = db
+                            .declared_reader_memory()
+                            .expect("admit the fixture operation reader");
+                        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                            .expect("read the admitted trace observation")
+                    }
+                    .unwrap();
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(
@@ -864,20 +901,21 @@ fn embedded_graph_scratch_obeys_memory_admission_and_returns_its_charge() {
             .map(|seed| generated_vector(seed, 32))
             .collect::<Vec<_>>(),
     );
-    let resident = db.accountant().usage().used;
     let mut query = SemanticQuery::new("items", "embedding", generated_vector(10_000, 32), 10);
     query.search_mode = Some(VectorSearchMode::Indexed);
+    let control = db.semantic_search(query.clone()).unwrap();
+    let answer = |rows: &[contextdb_engine::SearchResult]| rows.iter()
+        .map(|row| (row.row_id, row.vector_score.to_bits())).collect::<Vec<_>>();
+    assert_eq!(control.len(), 10);
+    let resident = db.accountant().usage().used;
     db.set_memory_limit(Some(resident)).unwrap();
-    let error = db.semantic_search(query.clone()).unwrap_err();
-    assert!(
-        matches!(error, contextdb_core::Error::MemoryBudgetExceeded { ref operation, .. } if operation == "graph_scratch"),
-        "{error:?}"
-    );
-    assert_eq!(db.accountant().usage().used, resident);
-    db.set_memory_limit(Some(resident + 1024 * 1024)).unwrap();
-    assert_eq!(db.semantic_search(query).unwrap().len(), 10);
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
-    assert_eq!(db.accountant().usage().used, resident);
+    // Real reader exhaustion, child identity, physical-free ordering and
+    // recovery are complementary rows in the existing private funder host.
+    for _ in 0..2 {
+        assert_eq!(answer(&db.semantic_search(query.clone()).unwrap()), answer(&control));
+        assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+        assert_eq!(db.accountant().usage().used, resident);
+    }
 }
 
 #[test]
@@ -942,7 +980,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
         .unwrap();
     assert_eq!(ids(&exact), vec![1, 2, 3, 4, 5]);
     let snapshot = db.snapshot();
-    let _pin = db.pin_snapshot(snapshot);
+    let _pin = db.pin_snapshot(snapshot).unwrap();
 
     for (start, end) in [(100, 612), (612, 4196)] {
         let tx = db.begin().unwrap();
@@ -960,8 +998,8 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             .unwrap();
         }
         db.commit(tx).unwrap();
-        // The unfiltered exact control proves that historical rows really are
-        // closer and that the whole-entry source observation is armed.
+        // The unfiltered control must really score every visible body while
+        // keeping whole-entry slices and raw partition residency absent.
         let before = db
             .vector_store_for_test()
             .passive_activity_counters_for_test();
@@ -975,11 +1013,13 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
         let after = db
             .vector_store_for_test()
             .passive_activity_counters_for_test();
-        assert!(after.whole_entry_slice_requests > before.whole_entry_slice_requests);
-        assert!(
-            after.whole_entry_slice_entries_exposed - before.whole_entry_slice_entries_exposed
-                >= (end - 100 + 32) as u64
-        );
+        let scored = (end - 100 + 32) as u64;
+        assert_eq!(after.raw_candidate_point_loads - before.raw_candidate_point_loads, scored);
+        assert_eq!(after.raw_candidate_point_body_bytes - before.raw_candidate_point_body_bytes,
+            scored * 3 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(after.raw_partition_loads, before.raw_partition_loads);
+        assert_eq!(after.whole_entry_slice_requests, before.whole_entry_slice_requests);
+        assert_eq!(after.whole_entry_slice_entries_exposed, before.whole_entry_slice_entries_exposed);
 
         for mode in ["AUTO", "INDEXED"] {
             let sql = current_sql.replace("INDEXED", mode);
@@ -997,8 +1037,15 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                 "{mode} history={} filters before top-k",
                 end - 100
             );
-            let trace = db.__take_last_query_vector_trace_for_test().unwrap();
-            assert_eq!(trace.used_hnsw, mode == "INDEXED");
+            let trace = {
+                let seam_read_memory = db
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                    .expect("read the admitted trace observation")
+            }
+            .unwrap();
+            assert_eq!(trace.used_hnsw, mode == "INDEXED", "source route: {trace:?}");
             assert_eq!(trace.supplemented_row_count, 0);
             if mode == "INDEXED" {
                 assert!(distances.0.load(Ordering::SeqCst) > 0);
@@ -1021,8 +1068,15 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             );
             let bounded = bounded::execute(&db, &request).unwrap();
             assert_eq!(bounded.result.rows, exact.rows);
-            let trace = db.__take_last_query_vector_trace_for_test().unwrap();
-            assert_eq!(trace.used_hnsw, mode == "INDEXED");
+            let trace = {
+                let seam_read_memory = db
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                    .expect("read the admitted trace observation")
+            }
+            .unwrap();
+            assert_eq!(trace.used_hnsw, mode == "INDEXED", "source route: {trace:?}");
             assert_eq!(trace.supplemented_row_count, 0);
             assert_eq!(
                 bounded

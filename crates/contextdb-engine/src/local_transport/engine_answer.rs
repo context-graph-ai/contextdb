@@ -152,6 +152,9 @@ pub const TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE: u16 = 53;
 pub const TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE: u16 = 54;
 /// Whole-index vector inspection was attempted through a constrained handle.
 pub const TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED: u16 = 55;
+/// A requested indexed vector route found a partition whose maintained graph
+/// does not connect all of its live rows.
+pub const TAG_VECTOR_INDEXED_PARTITION_DISCONNECTED: u16 = 56;
 
 /// The principal kinds, tagged explicitly rather than by declaration order.
 const PRINCIPAL_KIND_SYSTEM: u32 = 0;
@@ -184,7 +187,6 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         | TAG_OWNER_READ_DRAIN_TIMEOUT
         | TAG_READ_CANCELLED
         | TAG_RECURSIVE_CTE_NOT_SUPPORTED
-        | TAG_WINDOW_FUNCTION_NOT_SUPPORTED
         | TAG_STORED_PROC_NOT_SUPPORTED
         | TAG_SUBQUERY_NOT_SUPPORTED
         | TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED
@@ -196,7 +198,8 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         | TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER
         | TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED => &[],
         TAG_READ_FAILURE => &[Failure],
-        TAG_PARSE_ERROR
+        TAG_WINDOW_FUNCTION_NOT_SUPPORTED
+        | TAG_PARSE_ERROR
         | TAG_PLAN_ERROR
         | TAG_SCHEMA_INVALID
         | TAG_TABLE_NOT_FOUND
@@ -216,6 +219,7 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         | TAG_LEGACY_VECTOR_STORE_DETECTED
         | TAG_UNKNOWN => &[Word, Word],
         TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE => &[Word, Word, WordSequence],
+        TAG_VECTOR_INDEXED_PARTITION_DISCONNECTED => &[Word, Word, Number64],
         TAG_COLUMN_TYPE_MISMATCH | TAG_RANK_POLICY_COLUMN_TYPE => &[Word, Word, Word, Word],
         TAG_PERSISTED_ROW_VECTOR_ROW_MISSING
         | TAG_PERSISTED_ROW_VECTOR_CELL_NULL
@@ -295,6 +299,7 @@ pub const ALL_TAGS: &[u16] = &[
     TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
     TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE,
     TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED,
+    TAG_VECTOR_INDEXED_PARTITION_DISCONNECTED,
 ];
 
 /// One engine answer, in the vocabulary this channel owns.
@@ -334,7 +339,9 @@ pub enum ReadChannelError {
         message: String,
     },
     RecursiveCteNotSupported,
-    WindowFunctionNotSupported,
+    WindowFunctionNotSupported {
+        form: String,
+    },
     StoredProcNotSupported,
     SubqueryNotSupported,
     FullTextSearchNotSupported,
@@ -389,6 +396,11 @@ pub enum ReadChannelError {
     VectorIndexedRouteUnavailable {
         table: String,
         column: String,
+    },
+    VectorIndexedPartitionDisconnected {
+        table: String,
+        column: String,
+        partition: u64,
     },
     VectorFilteredRouteUnavailable {
         table: String,
@@ -506,7 +518,7 @@ impl ReadChannelError {
             Self::IndexNotFound { .. } => TAG_INDEX_NOT_FOUND,
             Self::NotFound { .. } => TAG_NOT_FOUND,
             Self::RecursiveCteNotSupported => TAG_RECURSIVE_CTE_NOT_SUPPORTED,
-            Self::WindowFunctionNotSupported => TAG_WINDOW_FUNCTION_NOT_SUPPORTED,
+            Self::WindowFunctionNotSupported { .. } => TAG_WINDOW_FUNCTION_NOT_SUPPORTED,
             Self::StoredProcNotSupported => TAG_STORED_PROC_NOT_SUPPORTED,
             Self::SubqueryNotSupported => TAG_SUBQUERY_NOT_SUPPORTED,
             Self::FullTextSearchNotSupported => TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED,
@@ -528,6 +540,9 @@ impl ReadChannelError {
             Self::VectorPartitionLimitExceeded { .. } => TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
             Self::VectorExactSearchBudgetExceeded { .. } => TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
             Self::VectorIndexedRouteUnavailable { .. } => TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
+            Self::VectorIndexedPartitionDisconnected { .. } => {
+                TAG_VECTOR_INDEXED_PARTITION_DISCONNECTED
+            }
             Self::VectorFilteredRouteUnavailable { .. } => TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE,
             Self::VectorWholeIndexInspectionDenied => TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED,
             Self::RankPolicyNotFound { .. } => TAG_RANK_POLICY_NOT_FOUND,
@@ -669,7 +684,9 @@ impl From<&contextdb_core::Error> for ReadChannelError {
                 message: message.clone(),
             },
             Engine::RecursiveCteNotSupported => Self::RecursiveCteNotSupported,
-            Engine::WindowFunctionNotSupported => Self::WindowFunctionNotSupported,
+            Engine::WindowFunctionNotSupported { form } => {
+                Self::WindowFunctionNotSupported { form: form.clone() }
+            }
             Engine::StoredProcNotSupported => Self::StoredProcNotSupported,
             Engine::SubqueryNotSupported => Self::SubqueryNotSupported,
             Engine::FullTextSearchNotSupported => Self::FullTextSearchNotSupported,
@@ -744,6 +761,13 @@ impl From<&contextdb_core::Error> for ReadChannelError {
                 Self::VectorIndexedRouteUnavailable {
                     table: index.table.clone(),
                     column: index.column.clone(),
+                }
+            }
+            Engine::VectorIndexedPartitionDisconnected { index, partition } => {
+                Self::VectorIndexedPartitionDisconnected {
+                    table: index.table.clone(),
+                    column: index.column.clone(),
+                    partition: *partition,
                 }
             }
             Engine::VectorFilteredRouteUnavailable {
@@ -873,12 +897,12 @@ impl From<&contextdb_core::Error> for ReadChannelError {
                 budget_limit_bytes,
                 hint,
             } => Self::MemoryBudgetExceeded {
-                subsystem: subsystem.clone(),
-                operation: operation.clone(),
+                subsystem: subsystem.to_string(),
+                operation: operation.to_string(),
                 requested_bytes: *requested_bytes as u64,
                 available_bytes: *available_bytes as u64,
                 budget_limit_bytes: *budget_limit_bytes as u64,
-                hint: hint.clone(),
+                hint: hint.to_string(),
             },
             Engine::DiskBudgetExceeded {
                 operation,
@@ -892,7 +916,7 @@ impl From<&contextdb_core::Error> for ReadChannelError {
                 hint: hint.clone(),
             },
             Engine::Other(message) => Self::Other {
-                message: message.clone(),
+                message: message.to_string(),
             },
             other => Self::Unknown {
                 class_name: class_name_of(other),
@@ -940,7 +964,9 @@ impl From<ReadChannelError> for contextdb_core::Error {
             }
             ReadChannelError::NotFound { message } => Self::NotFound(message),
             ReadChannelError::RecursiveCteNotSupported => Self::RecursiveCteNotSupported,
-            ReadChannelError::WindowFunctionNotSupported => Self::WindowFunctionNotSupported,
+            ReadChannelError::WindowFunctionNotSupported { form } => {
+                Self::WindowFunctionNotSupported { form }
+            }
             ReadChannelError::StoredProcNotSupported => Self::StoredProcNotSupported,
             ReadChannelError::SubqueryNotSupported => Self::SubqueryNotSupported,
             ReadChannelError::FullTextSearchNotSupported => Self::FullTextSearchNotSupported,
@@ -989,7 +1015,7 @@ impl From<ReadChannelError> for contextdb_core::Error {
                     issue,
                 },
                 None => Self::Other(
-                    "read channel carried an unknown vector declaration issue".to_owned(),
+                    "read channel carried an unknown vector declaration issue".into(),
                 ),
             },
             ReadChannelError::VectorPartitionLimitExceeded {
@@ -1015,6 +1041,14 @@ impl From<ReadChannelError> for contextdb_core::Error {
                     index: VectorIndexRef { table, column },
                 }
             }
+            ReadChannelError::VectorIndexedPartitionDisconnected {
+                table,
+                column,
+                partition,
+            } => Self::VectorIndexedPartitionDisconnected {
+                index: VectorIndexRef { table, column },
+                partition,
+            },
             ReadChannelError::VectorFilteredRouteUnavailable {
                 table,
                 column,
@@ -1095,7 +1129,7 @@ impl From<ReadChannelError> for contextdb_core::Error {
                 let Some(requested) = context_from_word(&requested) else {
                     return Self::Other(format!(
                         "ContextScopeViolation: requested context {requested} did not arrive as a readable identifier"
-                    ));
+                    ).into());
                 };
                 Self::ContextScopeViolation {
                     requested,
@@ -1139,12 +1173,12 @@ impl From<ReadChannelError> for contextdb_core::Error {
                 budget_limit_bytes,
                 hint,
             } => Self::MemoryBudgetExceeded {
-                subsystem,
-                operation,
+                subsystem: subsystem.into(),
+                operation: operation.into(),
                 requested_bytes: count(requested_bytes),
                 available_bytes: count(available_bytes),
                 budget_limit_bytes: count(budget_limit_bytes),
-                hint,
+                hint: hint.into(),
             },
             ReadChannelError::DiskBudgetExceeded {
                 operation,
@@ -1157,13 +1191,416 @@ impl From<ReadChannelError> for contextdb_core::Error {
                 budget_limit_bytes,
                 hint,
             },
-            ReadChannelError::Other { message } => Self::Other(message),
+            ReadChannelError::Other { message } => Self::Other(message.into()),
             ReadChannelError::Unknown {
                 class_name,
                 message,
-            } => Self::Other(format!("{class_name}: {message}")),
+            } => Self::Other(format!("{class_name}: {message}").into()),
         }
     }
+}
+
+/// The request parser selects mutually exclusive conversion destinations.
+/// Price the tree OR invalid-UUID diagnostic, never their nonexistent overlap.
+pub(crate) fn query_context_conversion_bytes(
+    requested: &str, allowed: usize,
+) -> contextdb_core::Result<usize> {
+    if context_from_word(requested).is_some() {
+        super::query_funding::tree_bytes::<contextdb_core::ContextId, ()>(allowed)
+    } else {
+        requested.len().checked_add(
+            "ContextScopeViolation: requested context  did not arrive as a readable identifier".len(),
+        ).ok_or_else(|| contextdb_core::Error::Other("query allocation size overflow".into()))
+    }
+}
+
+/// Ordinary queries preserve their decoder's ORIGINAL invoice through a move
+/// conversion. The special cases avoid collect/format replacement scratch.
+pub(crate) fn convert_query_error(
+    document: super::query_funding::Funded<ReadChannelError>,
+    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+) -> contextdb_core::Result<super::query_funding::Funded<contextdb_core::Error>> {
+    use contextdb_core::types::{ContextId, ScopeLabel};
+    use contextdb_core::Error as E;
+    let bytes = super::query_funding::error_conversion_bytes(&document.value)?;
+    super::query_funding::Funded::allocate(Some(memory.clone()), bytes, || {
+        match document.into_retained() {
+            ReadChannelError::Unknown { class_name, message } => {
+                let mut text = String::with_capacity(class_name.len() + message.len() + 2);
+                text.push_str(&class_name); text.push_str(": "); text.push_str(&message);
+                E::Other(text.into())
+            }
+            ReadChannelError::ContextScopeViolation { requested, allowed } => {
+                match context_from_word(&requested) {
+                    Some(requested) => {
+                        let mut retained = BTreeSet::<ContextId>::new();
+                        for word in allowed {
+                            if let Some(context) = context_from_word(&word) { retained.insert(context); }
+                        }
+                        E::ContextScopeViolation { requested, allowed: retained }
+                    }
+                    None => {
+                        let prefix = "ContextScopeViolation: requested context ";
+                        let suffix = " did not arrive as a readable identifier";
+                        let mut text = String::with_capacity(prefix.len() + requested.len() + suffix.len());
+                        text.push_str(prefix); text.push_str(&requested); text.push_str(suffix);
+                        E::Other(text.into())
+                    }
+                }
+            }
+            ReadChannelError::ScopeLabelViolation { requested, allowed } => {
+                let mut retained = BTreeSet::new();
+                for word in allowed { retained.insert(ScopeLabel(word)); }
+                E::ScopeLabelViolation { requested: ScopeLabel(requested), allowed: retained }
+            }
+            other => E::from(other),
+        }
+    })
+}
+
+/// The same-stream blob control document is bounded independently of Bao data.
+pub(crate) const BLOB_SOURCE_REFUSAL_MAX_BYTES: usize = 4096;
+
+/// Encode the existing read-channel error grammar directly from borrowed
+/// source fields. No intermediate owned error document or field copy exists.
+pub(crate) fn encode_read_error_into_slice(
+    error: &contextdb_core::Error, output: &mut [u8],
+) -> Result<usize, super::LocalTransportError> {
+    let length = output.len().min(BLOB_SOURCE_REFUSAL_MAX_BYTES);
+    write_read_error(error, &mut &mut output[..length])
+}
+
+/// The same borrowed field writer also serves ordinary queries, whose existing
+/// frame ceiling is the only wire cap. No blob cap is imposed on a query.
+pub(crate) fn encode_query_error_funded(
+    error: &contextdb_core::Error,
+    owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+) -> contextdb_core::Result<super::query_funding::Funded<Vec<u8>>> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).ok_or(std::io::ErrorKind::InvalidData)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let invalid = || contextdb_core::Error::Other("query error encoding failed".into());
+    let mut size = Count(0);
+    write_read_error(error, &mut size).map_err(|_| invalid())?;
+    let mut output = super::query_funding::Funded::allocate(Some(owner), size.0,
+        || Vec::with_capacity(size.0))?;
+    write_read_error(error, &mut output.value).map_err(|_| invalid())?;
+    if output.value.len() != size.0 { return Err(invalid()); }
+    Ok(output)
+}
+
+pub(super) fn write_read_error<W: std::io::Write>(
+    error: &contextdb_core::Error, output: &mut W,
+) -> Result<usize, super::LocalTransportError> {
+    use super::{LocalTransportError, PayloadViolation};
+    use contextdb_core::Error as E;
+    struct Sink<'a, W> { output: &'a mut W, offset: usize }
+    impl<W: std::io::Write> Sink<'_, W> {
+        fn field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), LocalTransportError> {
+            let written = bincode::serde::encode_into_std_write(value, &mut *self.output,
+                bincode::config::standard())
+                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            self.offset = self.offset.checked_add(written)
+                .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            Ok(())
+        }
+        fn display(&mut self, value: impl fmt::Display) -> Result<(), LocalTransportError> {
+            struct Count(usize);
+            impl fmt::Write for Count {
+                fn write_str(&mut self, text: &str) -> fmt::Result {
+                    self.0 = self.0.checked_add(text.len()).ok_or(fmt::Error)?;
+                    Ok(())
+                }
+            }
+            let mut count = Count(0);
+            fmt::write(&mut count, format_args!("{value}"))
+                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            self.field(&(count.0 as u64))?;
+            struct Text<'a, W> { output: &'a mut W, count: usize }
+            impl<W: std::io::Write> fmt::Write for Text<'_, W> {
+                fn write_str(&mut self, text: &str) -> fmt::Result {
+                    self.output.write_all(text.as_bytes()).map_err(|_| fmt::Error)?;
+                    self.count = self.count.checked_add(text.len()).ok_or(fmt::Error)?;
+                    Ok(())
+                }
+            }
+            let mut text = Text { output: &mut *self.output, count: 0 };
+            fmt::write(&mut text, format_args!("{value}"))
+                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            if text.count != count.0 {
+                return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
+            }
+            self.offset = self.offset.checked_add(count.0)
+                .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            Ok(())
+        }
+    }
+    struct Class<'a>(&'a contextdb_core::Error);
+    impl fmt::Display for Class<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            struct Prefix<'a, 'b> {
+                out: &'a mut fmt::Formatter<'b>,
+                stopped: bool,
+            }
+            impl fmt::Write for Prefix<'_, '_> {
+                fn write_str(&mut self, text: &str) -> fmt::Result {
+                    for ch in text.chars() {
+                        if self.stopped {
+                            break;
+                        }
+                        if ch.is_alphanumeric() || ch == '_' {
+                            self.out.write_str(ch.encode_utf8(&mut [0; 4]))?;
+                        } else {
+                            self.stopped = true;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            fmt::write(
+                &mut Prefix {
+                    out: formatter,
+                    stopped: false,
+                },
+                format_args!("{:?}", self.0),
+            )
+        }
+    }
+    let mut sink = Sink { output, offset: 0 };
+    macro_rules! body {
+        ($tag:expr, $body:expr) => {{
+            sink.field(&$tag)?;
+            sink.field(&$body)?;
+        }};
+    }
+    macro_rules! index {
+        ($tag:expr, $index:expr) => {
+            body!($tag, (&$index.table, &$index.column))
+        };
+    }
+    match error {
+        E::ReadSessionNotImplemented => body!(TAG_READ_SESSION_NOT_IMPLEMENTED, ()),
+        E::OwnerReadDrainTimeout => body!(TAG_OWNER_READ_DRAIN_TIMEOUT, ()),
+        E::ReadCancelled => body!(TAG_READ_CANCELLED, ()),
+        E::ReadFailure(failure) => body!(TAG_READ_FAILURE, failure),
+        E::ParseError(message) => body!(TAG_PARSE_ERROR, message),
+        E::PlanError(message) => body!(TAG_PLAN_ERROR, message),
+        E::SchemaInvalid { reason } => body!(TAG_SCHEMA_INVALID, reason),
+        E::TableNotFound(table) => body!(TAG_TABLE_NOT_FOUND, table),
+        E::ColumnNotFound { table, column } => body!(TAG_COLUMN_NOT_FOUND, (table, column)),
+        E::ColumnTypeMismatch {
+            table,
+            column,
+            expected,
+            actual,
+        } => {
+            sink.field(&TAG_COLUMN_TYPE_MISMATCH)?;
+            sink.field(&(table, column))?;
+            sink.display(expected)?;
+            sink.display(actual)?;
+        }
+        E::IndexNotFound { table, index } => body!(TAG_INDEX_NOT_FOUND, (table, index)),
+        E::NotFound(message) => body!(TAG_NOT_FOUND, message),
+        E::RecursiveCteNotSupported => body!(TAG_RECURSIVE_CTE_NOT_SUPPORTED, ()),
+        E::WindowFunctionNotSupported { form } => body!(TAG_WINDOW_FUNCTION_NOT_SUPPORTED, form),
+        E::StoredProcNotSupported => body!(TAG_STORED_PROC_NOT_SUPPORTED, ()),
+        E::SubqueryNotSupported => body!(TAG_SUBQUERY_NOT_SUPPORTED, ()),
+        E::FullTextSearchNotSupported => body!(TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED, ()),
+        E::OrderByExpressionNotSupported => body!(TAG_ORDER_BY_EXPRESSION_NOT_SUPPORTED, ()),
+        E::UnboundedTraversal => body!(TAG_UNBOUNDED_TRAVERSAL, ()),
+        E::UnboundedVectorSearch => body!(TAG_UNBOUNDED_VECTOR_SEARCH, ()),
+        E::BfsDepthExceeded(maximum) => body!(TAG_BFS_DEPTH_EXCEEDED, maximum),
+        E::BfsVisitedExceeded(limit) => body!(TAG_BFS_VISITED_EXCEEDED, *limit as u64),
+        E::UnknownVectorIndex { index: i } => index!(TAG_UNKNOWN_VECTOR_INDEX, i),
+        E::VectorIndexDimensionMismatch {
+            index: i,
+            expected,
+            actual,
+        } => body!(
+            TAG_VECTOR_INDEX_DIMENSION_MISMATCH,
+            (&i.table, &i.column, *expected as u64, *actual as u64)
+        ),
+        E::PersistedRowVectorRowMissing { index: i, key } => body!(
+            TAG_PERSISTED_ROW_VECTOR_ROW_MISSING,
+            (&i.table, &i.column, key)
+        ),
+        E::PersistedRowVectorCellNull { index: i, key } => body!(
+            TAG_PERSISTED_ROW_VECTOR_CELL_NULL,
+            (&i.table, &i.column, key)
+        ),
+        E::UseRankRequiresVectorOrder => body!(TAG_USE_RANK_REQUIRES_VECTOR_ORDER, ()),
+        E::UseRankRequiresLimit => body!(TAG_USE_RANK_REQUIRES_LIMIT, ()),
+        E::UseVectorRequiresVectorOrder => body!(TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, ()),
+        E::InvalidVectorPartitionDeclaration { index: i, issue } => {
+            if let Some(issue) = vector_declaration_issue_code(*issue) {
+                body!(
+                    TAG_INVALID_VECTOR_PARTITION_DECLARATION,
+                    (&i.table, &i.column, issue)
+                );
+            } else {
+                sink.field(&TAG_UNKNOWN)?;
+                sink.display(Class(error))?;
+                sink.display(error)?;
+            }
+        }
+        E::VectorPartitionLimitExceeded {
+            index: i,
+            max_partitions,
+        } => body!(
+            TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
+            (&i.table, &i.column, max_partitions)
+        ),
+        E::VectorExactSearchBudgetExceeded {
+            index: i,
+            required_bytes,
+            available_bytes,
+        } => body!(
+            TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
+            (&i.table, &i.column, required_bytes, available_bytes)
+        ),
+        E::VectorIndexedRouteUnavailable { index: i } => {
+            index!(TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, i)
+        }
+        E::VectorIndexedPartitionDisconnected {
+            index: i,
+            partition,
+        } => body!(
+            TAG_VECTOR_INDEXED_PARTITION_DISCONNECTED,
+            (&i.table, &i.column, partition)
+        ),
+        E::VectorFilteredRouteUnavailable {
+            index: i,
+            predicate_columns,
+        } => body!(
+            TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE,
+            (&i.table, &i.column, predicate_columns)
+        ),
+        E::VectorWholeIndexInspectionDenied => body!(TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, ()),
+        E::RankPolicyNotFound { index, sort_key } => {
+            body!(TAG_RANK_POLICY_NOT_FOUND, (index, sort_key))
+        }
+        E::RankPolicyColumnUnknown { index, column } => {
+            body!(TAG_RANK_POLICY_COLUMN_UNKNOWN, (index, column))
+        }
+        E::RankPolicyColumnAmbiguous { index, column } => {
+            body!(TAG_RANK_POLICY_COLUMN_AMBIGUOUS, (index, column))
+        }
+        E::RankPolicyColumnType {
+            index,
+            column,
+            expected,
+            actual,
+        } => body!(
+            TAG_RANK_POLICY_COLUMN_TYPE,
+            (index, column, expected, actual)
+        ),
+        E::RankPolicyJoinTableUnknown { index, table } => {
+            body!(TAG_RANK_POLICY_JOIN_TABLE_UNKNOWN, (index, table))
+        }
+        E::RankPolicyJoinColumnUnknown {
+            index,
+            table,
+            column,
+        } => body!(TAG_RANK_POLICY_JOIN_COLUMN_UNKNOWN, (index, table, column)),
+        E::RankPolicyJoinColumnUnindexed {
+            index,
+            joined_table,
+            column,
+        } => body!(
+            TAG_RANK_POLICY_JOIN_COLUMN_UNINDEXED,
+            (index, joined_table, column)
+        ),
+        E::RankPolicyFormulaParse {
+            index,
+            position,
+            reason,
+        } => body!(
+            TAG_RANK_POLICY_FORMULA_PARSE,
+            (index, *position as u64, reason)
+        ),
+        E::PrincipalRequired { table } => body!(TAG_PRINCIPAL_REQUIRED, table),
+        E::AclDenied {
+            table,
+            row_id,
+            principal,
+        } => {
+            let (kind, id) = match principal {
+                contextdb_core::types::Principal::System => (PRINCIPAL_KIND_SYSTEM, ""),
+                contextdb_core::types::Principal::Agent(id) => (PRINCIPAL_KIND_AGENT, id.as_str()),
+                contextdb_core::types::Principal::Human(id) => (PRINCIPAL_KIND_HUMAN, id.as_str()),
+            };
+            body!(TAG_ACL_DENIED, (table, row_id.0, kind, id));
+        }
+        E::ContextScopeViolation { requested, allowed } => {
+            sink.field(&TAG_CONTEXT_SCOPE_VIOLATION)?;
+            sink.display(requested.0)?;
+            sink.field(&(allowed.len() as u64))?;
+            for item in allowed {
+                sink.display(item.0)?;
+            }
+        }
+        E::ScopeLabelViolation { requested, allowed } => {
+            sink.field(&TAG_SCOPE_LABEL_VIOLATION)?;
+            sink.field(&requested.0)?;
+            sink.field(&(allowed.len() as u64))?;
+            for item in allowed {
+                sink.field(&item.0)?;
+            }
+        }
+        E::StoreCorrupted { path, reason } => body!(TAG_STORE_CORRUPTED, (path, reason)),
+        E::StoreIdentityUnprovable { path } => body!(TAG_STORE_IDENTITY_UNPROVABLE, path),
+        E::LegacyVectorStoreDetected {
+            found_format_marker,
+            expected_release,
+        } => body!(
+            TAG_LEGACY_VECTOR_STORE_DETECTED,
+            (found_format_marker, expected_release)
+        ),
+        E::DatabaseLocked { holder_pid, path } => {
+            sink.field(&TAG_DATABASE_LOCKED)?;
+            sink.field(holder_pid)?;
+            sink.display(path.display())?;
+        }
+        E::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => body!(
+            TAG_MEMORY_BUDGET_EXCEEDED,
+            (
+                subsystem,
+                operation,
+                *requested_bytes as u64,
+                *available_bytes as u64,
+                *budget_limit_bytes as u64,
+                hint
+            )
+        ),
+        E::DiskBudgetExceeded {
+            operation,
+            current_bytes,
+            budget_limit_bytes,
+            hint,
+        } => body!(
+            TAG_DISK_BUDGET_EXCEEDED,
+            (operation, current_bytes, budget_limit_bytes, hint)
+        ),
+        E::Other(message) => body!(TAG_OTHER, message),
+        _ => {
+            sink.field(&TAG_UNKNOWN)?;
+            sink.display(Class(error))?;
+            sink.display(error)?;
+        }
+    }
+    Ok(sink.offset)
 }
 
 impl Serialize for ReadChannelError {
@@ -1175,7 +1612,6 @@ impl Serialize for ReadChannelError {
             | Self::OwnerReadDrainTimeout
             | Self::ReadCancelled
             | Self::RecursiveCteNotSupported
-            | Self::WindowFunctionNotSupported
             | Self::StoredProcNotSupported
             | Self::SubqueryNotSupported
             | Self::FullTextSearchNotSupported
@@ -1187,6 +1623,7 @@ impl Serialize for ReadChannelError {
             | Self::UseVectorRequiresVectorOrder
             | Self::VectorWholeIndexInspectionDenied => document.serialize_element(&())?,
             Self::ReadFailure(failure) => document.serialize_element(failure)?,
+            Self::WindowFunctionNotSupported { form } => document.serialize_element(form)?,
             Self::ParseError { message }
             | Self::PlanError { message }
             | Self::NotFound { message }
@@ -1207,6 +1644,13 @@ impl Serialize for ReadChannelError {
                 predicate_columns,
             } => {
                 document.serialize_element(&(table, column, predicate_columns))?;
+            }
+            Self::VectorIndexedPartitionDisconnected {
+                table,
+                column,
+                partition,
+            } => {
+                document.serialize_element(&(table, column, partition))?;
             }
             Self::VectorExactSearchBudgetExceeded {
                 table,
@@ -1364,10 +1808,9 @@ impl<'de> Visitor<'de> for ReadChannelErrorVisitor {
                 body::<A, ()>(&mut sequence)?;
                 ReadChannelError::RecursiveCteNotSupported
             }
-            TAG_WINDOW_FUNCTION_NOT_SUPPORTED => {
-                body::<A, ()>(&mut sequence)?;
-                ReadChannelError::WindowFunctionNotSupported
-            }
+            TAG_WINDOW_FUNCTION_NOT_SUPPORTED => ReadChannelError::WindowFunctionNotSupported {
+                form: body::<A, String>(&mut sequence)?,
+            },
             TAG_STORED_PROC_NOT_SUPPORTED => {
                 body::<A, ()>(&mut sequence)?;
                 ReadChannelError::StoredProcNotSupported
@@ -1456,6 +1899,14 @@ impl<'de> Visitor<'de> for ReadChannelErrorVisitor {
             TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE => {
                 let (table, column) = body::<A, (String, String)>(&mut sequence)?;
                 ReadChannelError::VectorIndexedRouteUnavailable { table, column }
+            }
+            TAG_VECTOR_INDEXED_PARTITION_DISCONNECTED => {
+                let (table, column, partition) = body::<A, (String, String, u64)>(&mut sequence)?;
+                ReadChannelError::VectorIndexedPartitionDisconnected {
+                    table,
+                    column,
+                    partition,
+                }
             }
             TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE => {
                 let (table, column, predicate_columns) =

@@ -1,3 +1,4 @@
+mod allocator_pager;
 mod backends;
 mod base;
 mod bitmap;
@@ -9,6 +10,8 @@ mod header;
 mod layout;
 mod lru_cache;
 mod page_manager;
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub(crate) use page_manager::rewrite_header_for_test;
 mod region;
 mod savepoint;
 #[allow(clippy::pedantic, dead_code)]
@@ -29,3 +32,6 @@ pub(crate) use savepoint::SerializedSavepoint;
 
 pub(super) use base::{PageImpl, PageMut};
 pub(super) use xxh3::hash128_with_seed;
+
+#[cfg(feature = "contextdb-internal")]
+pub(super) use xxh3::hash128_from_windows;

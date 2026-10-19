@@ -1,3 +1,4 @@
+use crate::source::RelationalCursor as _;
 use crate::store::{RelationalStore, index_key_from_values};
 use contextdb_core::read_memory::ReadMemoryBudget;
 use contextdb_core::*;
@@ -6,9 +7,40 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
+pub trait StagedPostingAdmission: Send + Sync {
+    fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>>;
+}
+
+enum ExecutorTransactions<S: WriteSetApplicator> {
+    Legacy(Arc<TransactionManager<S>>),
+    Owned(contextdb_tx::manager::EngineTransactionHandle<S>),
+}
+impl<S: WriteSetApplicator> ExecutorTransactions<S> {
+    fn snapshot(&self) -> SnapshotId {
+        match self {
+            Self::Legacy(manager) => manager.snapshot(),
+            Self::Owned(handle) => handle.with_transactions(|transactions| transactions.snapshot()),
+        }
+    }
+    // Existing standalone/public mutations retain their genuine Legacy route.
+    fn with_write_set<R>(
+        &self,
+        tx: TxId,
+        f: impl FnOnce(&mut contextdb_tx::WriteSet) -> R,
+    ) -> Result<R> {
+        match self {
+            Self::Legacy(manager) => manager.with_write_set(tx, f),
+            Self::Owned(_) => Err(Error::InvalidStateTransition(
+                "owned executor requires its admitted engine producer".into(),
+            )),
+        }
+    }
+}
+
 pub struct MemRelationalExecutor<S: WriteSetApplicator> {
     store: Arc<RelationalStore>,
-    tx_mgr: Arc<TransactionManager<S>>,
+    tx_mgr: ExecutorTransactions<S>,
+    staged_posting_admission: Option<Arc<dyn StagedPostingAdmission>>,
 }
 
 /// Position in an ordered B-tree posting walk. The cursor stores only owned
@@ -79,12 +111,22 @@ pub struct BoundedOrderedRowCursor {
     /// Opaque durable-source position. The engine's retained file source owns
     /// the encoding; the relational cursor only keeps it between pulls.
     source_key: Option<Vec<u8>>,
+    /// The `(snapshot, captured frontier)` the engine already authenticated
+    /// this cursor's historical index source for. One authentication covers
+    /// every pull of the same source; a new frontier authenticates again.
+    source_authenticated: Option<(u64, u64)>,
     /// Opaque position in a retained source's authenticated run cache. The
     /// relational layer never interprets the cache; it only keeps one run's
     /// continuation between pulls.
     source_cache_key: Option<[u8; 32]>,
     source_cache_position: usize,
     source_run_precharged: bool,
+    /// The window operator's remaining visible-rank demand. This bounds each
+    /// authenticated source window; suppression and staged merge update demand
+    /// before requesting another window. None preserves ordinary source reads.
+    source_prefix_quota: Option<u64>,
+    /// Quota completion is not proof that the declared range is exhausted.
+    source_prefix_stopped: bool,
     /// Opaque read a retained source keeps open for every run this cursor
     /// walks, so one statement opens its read and its physical index once
     /// rather than once per window. The relational layer never looks inside.
@@ -121,9 +163,12 @@ impl Default for BoundedOrderedRowCursor {
             key_generation: 0,
             exhausted: false,
             source_key: None,
+            source_authenticated: None,
             source_cache_key: None,
             source_cache_position: 0,
             source_run_precharged: false,
+            source_prefix_quota: None,
+            source_prefix_stopped: false,
             source_read: None,
             source_proof: None,
         }
@@ -153,9 +198,12 @@ impl BoundedOrderedRowCursor {
             key_generation: 0,
             exhausted: false,
             source_key: None,
+            source_authenticated: None,
             source_cache_key: None,
             source_cache_position: 0,
             source_run_precharged: false,
+            source_prefix_quota: None,
+            source_prefix_stopped: false,
             source_read: None,
             source_proof: None,
         }
@@ -175,6 +223,11 @@ impl BoundedOrderedRowCursor {
     where
         E: From<Error>,
     {
+        if store.uses_disk_backed_committed_bodies() {
+            return Err(E::from(Error::Other(
+                "durable index capture requires a captured source".into())));
+        }
+
         let indexes = store.indexes.read();
         let name = self
             .index
@@ -416,9 +469,47 @@ impl BoundedOrderedRowCursor {
         self.key_generation
     }
 
+    /// Update the next window's demand after the caller applies suppression
+    /// and ranks a visible row. An existing proved window is retained: its
+    /// entries were examined under its original demand and remain accounted.
+    #[doc(hidden)]
+    pub fn source_set_prefix_quota(&mut self, remaining: Option<u64>) {
+        self.source_prefix_quota = remaining;
+        self.source_prefix_stopped = remaining == Some(0);
+    }
+
+    #[doc(hidden)]
+    pub fn source_prefix_quota(&self) -> Option<u64> {
+        self.source_prefix_quota
+    }
+
+    #[doc(hidden)]
+    pub fn source_prefix_stopped(&self) -> bool {
+        self.source_prefix_stopped
+    }
+
+    #[doc(hidden)]
+    pub fn source_stop_prefix(&mut self) {
+        self.source_prefix_stopped = true;
+    }
+
     #[doc(hidden)]
     pub fn source_position(&self) -> Option<&[u8]> {
         self.source_key.as_deref()
+    }
+
+    /// Whether the engine already authenticated this cursor's historical
+    /// index source for `snapshot` at the captured `frontier`.
+    #[doc(hidden)]
+    pub fn source_authenticated_for(&self, snapshot: SnapshotId, frontier: u64) -> bool {
+        self.source_authenticated == Some((snapshot.0, frontier))
+    }
+
+    /// Record that this cursor's historical index source is authenticated
+    /// for `snapshot` at the captured `frontier`.
+    #[doc(hidden)]
+    pub fn mark_source_authenticated(&mut self, snapshot: SnapshotId, frontier: u64) {
+        self.source_authenticated = Some((snapshot.0, frontier));
     }
 
     #[doc(hidden)]
@@ -439,6 +530,26 @@ impl BoundedOrderedRowCursor {
     #[doc(hidden)]
     pub fn source_seek(&self) -> Bound<&[DirectedValue]> {
         self.seek_from()
+    }
+
+    /// A complete comparator-domain endpoint can be pushed into the durable
+    /// cursor. Short prefixes and appended seek-only sentinels keep their
+    /// existing conservative traversal until the source supplies that codec.
+    #[doc(hidden)]
+    pub fn source_terminal_bound(&self) -> Bound<&IndexKey> {
+        if self.run_prefix_len != self.image_components {
+            return Bound::Unbounded;
+        }
+        let edge = if self.reverse {
+            &self.run_start
+        } else {
+            &self.run_end
+        };
+        match edge {
+            Bound::Included(key) if key.len() == self.image_components => Bound::Included(key),
+            Bound::Excluded(key) if key.len() == self.image_components => Bound::Excluded(key),
+            _ => Bound::Unbounded,
+        }
     }
 
     #[doc(hidden)]
@@ -519,6 +630,23 @@ impl BoundedOrderedRowCursor {
     }
 
     #[doc(hidden)]
+    pub fn source_advance_charged(
+        &mut self,
+        position: Vec<u8>,
+        key: IndexKey,
+        row: RowId,
+        bytes: usize,
+    ) -> Result<()> {
+        self.key_generation = self
+            .key_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("ordered cursor key generation overflow".into()))?;
+        self.retained_key_bytes = bytes;
+        self.source_advance(position, key, row);
+        Ok(())
+    }
+
+    #[doc(hidden)]
     pub fn source_finish_run(&mut self) -> bool {
         self.source_key = None;
         self.source_cache_key = None;
@@ -550,8 +678,12 @@ fn run_prefix_len(start: &Bound<IndexKey>, end: &Bound<IndexKey>) -> usize {
 }
 
 fn key_prefix_cmp(key: &IndexKey, edge: &IndexKey, prefix_len: usize) -> std::cmp::Ordering {
-    key.get(..prefix_len)
-        .map(|prefix| prefix.cmp(&edge[..prefix_len]))
+    // A run can pair a group boundary with a longer component cutoff. Each
+    // endpoint compares in its own domain: the shorter endpoint includes or
+    // excludes the whole group, while the longer one restricts that group.
+    let edge_len = prefix_len.min(edge.len());
+    key.get(..edge_len)
+        .map(|prefix| prefix.cmp(&edge[..edge_len]))
         .unwrap_or(std::cmp::Ordering::Less)
 }
 
@@ -569,6 +701,13 @@ pub struct BoundedPhysicalCursor {
     last_emitted: Option<(RowId, TxId)>,
     exhausted: bool,
     source_key: Option<Vec<u8>>,
+    source_position_charge: Option<Arc<ChargedPhysicalPosition>>,
+}
+
+#[derive(Debug)]
+struct ChargedPhysicalPosition {
+    key: Vec<u8>,
+    _credit: contextdb_core::read_memory::ReadCredit,
 }
 
 impl BoundedPhysicalCursor {
@@ -586,18 +725,45 @@ impl BoundedPhysicalCursor {
 
     #[doc(hidden)]
     pub fn source_position(&self) -> Option<&[u8]> {
-        self.source_key.as_deref()
+        self.source_position_charge
+            .as_ref()
+            .map(|position| position.key.as_slice())
+            .or(self.source_key.as_deref())
     }
 
     #[doc(hidden)]
     pub fn source_advance(&mut self, key: Vec<u8>, row: &VersionedRow) {
         self.source_key = Some(key);
+        self.source_position_charge = None;
+        self.last_inspected = Some((row.row_id, row.created_tx));
+    }
+
+    #[doc(hidden)]
+    pub fn source_position_owner_bytes() -> usize {
+        std::mem::size_of::<ChargedPhysicalPosition>() + 2 * std::mem::size_of::<usize>()
+    }
+
+    /// The engine transfers the reservation admitted before key allocation.
+    /// Cloned cursors share the immutable position and its native owner charge.
+    #[doc(hidden)]
+    pub fn source_advance_with_credit(
+        &mut self,
+        key: Vec<u8>,
+        row: &VersionedRow,
+        credit: contextdb_core::read_memory::ReadCredit,
+    ) {
+        self.source_key = None;
+        self.source_position_charge = Some(Arc::new(ChargedPhysicalPosition {
+            key,
+            _credit: credit,
+        }));
         self.last_inspected = Some((row.row_id, row.created_tx));
     }
 
     #[doc(hidden)]
     pub fn source_exhaust(&mut self) {
         self.exhausted = true;
+        self.source_position_charge = None;
     }
 }
 
@@ -648,12 +814,26 @@ pub struct BoundedExactIndexCursor {
     retained_bytes: usize,
     exhausted: bool,
     source_key: Option<Vec<u8>>,
+    /// See [`BoundedOrderedRowCursor`]'s field of the same name.
+    source_authenticated: Option<(u64, u64)>,
 }
 
 impl BoundedExactIndexCursor {
     /// The caller has proved that this membership alone decides its filter.
     pub fn select_identities_only(&mut self) {
         self.identities_only = true;
+    }
+
+    /// See [`BoundedOrderedRowCursor::source_authenticated_for`].
+    #[doc(hidden)]
+    pub fn source_authenticated_for(&self, snapshot: SnapshotId, frontier: u64) -> bool {
+        self.source_authenticated == Some((snapshot.0, frontier))
+    }
+
+    /// See [`BoundedOrderedRowCursor::mark_source_authenticated`].
+    #[doc(hidden)]
+    pub fn mark_source_authenticated(&mut self, snapshot: SnapshotId, frontier: u64) {
+        self.source_authenticated = Some((snapshot.0, frontier));
     }
 
     pub fn for_keys(keys: impl IntoIterator<Item = IndexKey>) -> Self {
@@ -667,6 +847,7 @@ impl BoundedExactIndexCursor {
             retained_bytes: 0,
             exhausted: false,
             source_key: None,
+            source_authenticated: None,
         }
     }
 
@@ -684,6 +865,11 @@ impl BoundedExactIndexCursor {
     where
         E: From<Error>,
     {
+        if store.uses_disk_backed_committed_bodies() {
+            return Err(E::from(Error::Other(
+                "durable index capture requires a captured source".into())));
+        }
+
         let indexes = store.indexes.read();
         let storage = indexes
             .get(table)
@@ -749,7 +935,14 @@ impl BoundedExactIndexCursor {
     }
 
     #[doc(hidden)]
+    pub fn source_advance_charged(&mut self, source_key: Vec<u8>, row_id: RowId, bytes: usize) {
+        self.source_advance(source_key, row_id);
+        self.retained_bytes = bytes;
+    }
+
+    #[doc(hidden)]
     pub fn source_finish_probe(&mut self) -> bool {
+        self.retained_bytes = 0;
         self.keys.pop_front();
         self.source_key = None;
         self.last_row_id = None;
@@ -815,7 +1008,7 @@ fn bounded_index_key_heap_bytes(key: &IndexKey) -> Result<usize> {
     let mut bytes = key
         .len()
         .checked_mul(std::mem::size_of::<DirectedValue>())
-        .ok_or_else(|| Error::Other("bounded index key size overflow".to_string()))?;
+        .ok_or_else(|| Error::Other(("bounded index key size overflow".to_string()).into()))?;
     for value in key {
         let value = match value {
             DirectedValue::Asc(TotalOrdAsc(value)) | DirectedValue::Desc(TotalOrdDesc(value)) => {
@@ -824,7 +1017,7 @@ fn bounded_index_key_heap_bytes(key: &IndexKey) -> Result<usize> {
         };
         bytes = bytes
             .checked_add(value.estimated_bytes())
-            .ok_or_else(|| Error::Other("bounded index key size overflow".to_string()))?;
+            .ok_or_else(|| Error::Other(("bounded index key size overflow".to_string()).into()))?;
     }
     Ok(bytes)
 }
@@ -832,12 +1025,348 @@ fn bounded_index_key_heap_bytes(key: &IndexKey) -> Result<usize> {
 fn bounded_index_key_owned_bytes(key: &IndexKey) -> Result<usize> {
     std::mem::size_of::<IndexKey>()
         .checked_add(bounded_index_key_heap_bytes(key)?)
-        .ok_or_else(|| Error::Other("bounded owned index key size overflow".to_string()))
+        .ok_or_else(|| Error::Other(("bounded owned index key size overflow".to_string()).into()))
+}
+
+fn push_admitted_source_row(
+    rows: &mut Vec<VersionedRow>,
+    row: &VersionedRow,
+    before_clone: &mut impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    if rows.len() == rows.capacity() {
+        let capacity = rows
+            .capacity()
+            .checked_mul(2)
+            .map(|capacity| capacity.max(4))
+            .ok_or_else(|| Error::Other("relational scan capacity overflow".into()))?;
+        let bytes = capacity
+            .checked_sub(rows.capacity())
+            .and_then(|slots| slots.checked_mul(std::mem::size_of::<VersionedRow>()))
+            .ok_or_else(|| Error::Other("relational scan capacity size overflow".into()))?;
+        // Exact reservation avoids Vec::push's implicit, unadmitted growth.
+        // Existing capacity stays charged, including slots freed by retain.
+        before_clone(bytes)?;
+        rows.try_reserve_exact(capacity - rows.len())
+            .map_err(|_| Error::Other("relational scan capacity allocation failed".into()))?;
+    }
+    before_clone(row.estimated_bytes())?;
+    rows.push(row.clone());
+    Ok(())
 }
 
 impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
+    #[doc(hidden)]
+    pub fn new_engine(
+        store: Arc<RelationalStore>,
+        transactions: contextdb_tx::manager::EngineTransactionHandle<S>,
+    ) -> Self {
+        Self {
+            store,
+            tx_mgr: ExecutorTransactions::Owned(transactions),
+            staged_posting_admission: None,
+        }
+    }
+    #[doc(hidden)]
+    pub fn stage_engine_row(
+        &self,
+        tx: TxId,
+        table: &str,
+        row: VersionedRow,
+        invoice: contextdb_tx::staged_source::OriginalRowInvoice,
+    ) -> Result<RowId> {
+        struct Original {
+            row: VersionedRow,
+            invoice: contextdb_tx::staged_source::OriginalRowInvoice,
+        }
+        let original = Original { row, invoice };
+        let row_id = original.row.row_id;
+        let ExecutorTransactions::Owned(handle) = &self.tx_mgr else {
+            return Err(Error::InvalidStateTransition(
+                "engine row requires owned executor".into(),
+            ));
+        };
+        let meta = self.store.table_meta.read();
+        let meta = meta
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        handle.with_transactions(|transactions| {
+            transactions.with_engine(tx, |guard| {
+                let prepared =
+                    guard.prepare_row_from_meta(table, original.row, meta, original.invoice)?;
+                guard.publish(prepared);
+                Ok(row_id)
+            })
+        })
+    }
+
     pub fn new(store: Arc<RelationalStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
-        Self { store, tx_mgr }
+        Self {
+            store,
+            tx_mgr: ExecutorTransactions::Legacy(tx_mgr),
+            staged_posting_admission: None,
+        }
+    }
+
+    pub fn with_staged_posting_admission(
+        mut self,
+        admission: Arc<dyn StagedPostingAdmission>,
+    ) -> Self {
+        self.staged_posting_admission = Some(admission);
+        self
+    }
+
+    /// Stage admitted positions before publishing a row into its write set.
+    pub fn stage_ordered_row(
+        &self,
+        ws: &mut contextdb_tx::WriteSet,
+        table: &str,
+        row: &VersionedRow,
+        position: usize,
+    ) -> Result<()> {
+        if self.staged_posting_admission.is_none() {
+            return Ok(());
+        }
+        let meta = self.store.table_meta.read();
+        let meta = meta
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        self.stage_ordered_row_from_descriptor(ws, table, row, position, meta)
+    }
+    pub fn stage_ordered_row_from_descriptor(
+        &self,
+        ws: &mut contextdb_tx::WriteSet,
+        table: &str,
+        row: &VersionedRow,
+        position: usize,
+        meta: &TableMeta,
+    ) -> Result<()> {
+        let Some(admission) = &self.staged_posting_admission else {
+            return Ok(());
+        };
+        let scratch_bytes = meta.indexes.iter().fold(256usize, |bytes, index| {
+            bytes.saturating_add(index.name.len()).saturating_add(
+                index
+                    .columns
+                    .iter()
+                    .map(|(column, _)| {
+                        row.values
+                            .get(column)
+                            .map_or(0, Value::estimated_bytes)
+                            .saturating_mul(4)
+                            .saturating_add(128)
+                    })
+                    .sum::<usize>(),
+            )
+        });
+        let _scratch = admission.reserve(scratch_bytes)?;
+        let schema_charge = admission.reserve(
+            contextdb_tx::ordered_staged::StagedSchema::bytes_for_meta(meta),
+        )?;
+        let schema = Arc::new(contextdb_tx::ordered_staged::StagedSchema::from_meta(
+            meta,
+            schema_charge,
+        ));
+        let keys = meta
+            .indexes
+            .iter()
+            .map(|index| {
+                let values = index
+                    .columns
+                    .iter()
+                    .map(|(column, _)| row.values.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                (
+                    index.name.clone(),
+                    index_key_from_values(&index.columns, &values),
+                )
+            })
+            .collect::<Vec<_>>();
+        let statement_row = ws.ordered_staged_rows.prepare_statement_row(
+            table,
+            row,
+            &keys,
+            schema.clone(),
+            |bytes| admission.reserve(bytes),
+        )?;
+        ws.ordered_staged_rows.stage_retiring_row(
+            table,
+            contextdb_tx::StagedPosition {
+                position,
+                row_id: row.row_id,
+                created_tx: row.created_tx,
+            },
+            &keys,
+            &schema,
+            if ws.ordered_staged_rows.contains_row(table, row.row_id) {
+                ws.relational_inserts
+                    .iter()
+                    .filter(|(name, old)| name == table && old.row_id == row.row_id)
+                    .count()
+            } else {
+                0
+            },
+            |bytes| admission.reserve(bytes),
+        )?;
+        ws.ordered_staged_rows
+            .publish_statement_row(table, statement_row);
+        Ok(())
+    }
+
+    /// Complete operation output from a captured durable root. The caller
+    /// admits output capacity and every retained row before allocation/copy,
+    /// including the overlay. Output admission must outlive the returned
+    /// collection; on error the caller releases its operation reservations
+    /// after this method has dropped all partial output and source windows.
+    pub fn scan_with_source(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        snapshot: SnapshotId,
+        source: &dyn crate::source::RelationalReadSource,
+        before_clone: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<VersionedRow>> {
+        self.scan_filter_with_source(tx, table, snapshot, source, &|_| true, before_clone)
+    }
+
+    /// Filter borrowed windows before copying output; unrelated row bodies
+    /// never become retained operation output.
+    pub fn scan_filter_with_source(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        snapshot: SnapshotId,
+        source: &dyn crate::source::RelationalReadSource,
+        predicate: &dyn Fn(&VersionedRow) -> bool,
+        mut before_clone: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<VersionedRow>> {
+        source.validate_table(table)?;
+        if snapshot.0 > source.snapshot().0 {
+            return Err(Error::Other(
+                "relational snapshot exceeds the captured source frontier".into()));
+        }
+        let mut cursor = source.row_cursor(table, Bound::Unbounded, Bound::Unbounded, false)?;
+        let mut result = Vec::new();
+        while let Some(window) = cursor.next_window()? {
+            self.store.bump_scan_rows_touched(1);
+            let row = window.value();
+            if row.visible_at(snapshot) && predicate(row) {
+                push_admitted_source_row(&mut result, row, &mut before_clone)?;
+            }
+        }
+        if let Some(tx) = tx {
+            self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
+                let scratch_entries = result
+                    .len()
+                    .saturating_add(ws.relational_deletes.len())
+                    .saturating_add(ws.relational_inserts.len());
+                let scratch_bytes = scratch_entries.saturating_mul(32);
+                before_clone(scratch_bytes)?;
+                let staged_ids: HashSet<_> = ws
+                    .relational_inserts
+                    .iter()
+                    .filter(|(t, _)| t == table)
+                    .map(|(_, row)| row.row_id)
+                    .collect();
+                let deleted_ids: HashSet<_> = ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(t, _, _)| t == table)
+                    .map(|(_, row, _)| *row)
+                    .collect();
+                result.retain(|row| {
+                    !deleted_ids.contains(&row.row_id)
+                        && !staged_ids.contains(&row.row_id)
+                        && !row_matches_delete_predicates(
+                            &ws.relational_delete_predicates,
+                            table,
+                            row,
+                        )
+                });
+                let mut seen = HashSet::new();
+                let staged_start = result.len();
+                for (t, row) in ws.relational_inserts.iter().rev() {
+                    if t == table
+                        && seen.insert(row.row_id)
+                        && predicate(row)
+                        && (!deleted_ids.contains(&row.row_id)
+                            || crate::source::visible_row(source, table, row.row_id, snapshot)?
+                                .is_some())
+                    {
+                        push_admitted_source_row(&mut result, row, &mut before_clone)?;
+                    }
+                }
+                result[staged_start..].reverse();
+                Ok(())
+            })??;
+        }
+        Ok(result)
+    }
+
+    /// Pull one physical version using the full encoded continuation key in
+    /// the caller's root. No store lock, row directory or fresh root is used.
+    pub fn bounded_physical_row_next_from_source<E>(
+        &self,
+        source: &dyn crate::source::RelationalReadSource,
+        table: &str,
+        cursor: &mut BoundedPhysicalCursor,
+        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        if cursor.exhausted {
+            return Ok(None);
+        }
+        before_touch()?;
+        let lower = cursor
+            .source_key
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let mut source_cursor = source
+            .row_cursor(table, lower, Bound::Unbounded, false)
+            .map_err(E::from)?;
+        let Some(window) = source_cursor.next_window().map_err(E::from)? else {
+            cursor.source_exhaust();
+            cursor.source_key = None;
+            return Ok(None);
+        };
+        let bytes = window
+            .value()
+            .estimated_bytes()
+            .checked_add(window.position_key().len())
+            .ok_or_else(|| E::from(Error::Other("source row output size overflow".into())))?;
+        before_clone(bytes)?;
+        let row = window.value().clone();
+        cursor.source_advance(window.position_key().to_vec(), &row);
+        self.store.bump_scan_rows_touched(1);
+        Ok(Some(row))
+    }
+
+    /// Open a source continuation without a table-history census.
+    pub fn bounded_physical_cursor_from_source(
+        &self,
+        table: &str,
+    ) -> Result<BoundedPhysicalCursor> {
+        self.ensure_table_exists(table)?;
+        Ok(BoundedPhysicalCursor {
+            position: 0,
+            end: 0,
+            last_inspected: None,
+            last_emitted: None,
+            exhausted: false,
+            source_key: None,
+            source_position_charge: None,
+        })
+    }
+
+    fn ensure_memory_reads(&self) -> Result<()> {
+        if self.store.uses_disk_backed_committed_bodies() {
+            Err(Error::Other(
+                "durable relational reads require a captured source".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn ensure_table_exists(&self, table: &str) -> Result<()> {
@@ -857,32 +1386,87 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         tx: TxId,
         table: &str,
         row_id: RowId,
+        staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
+    ) -> Result<usize> {
+        let committed_row_exists = self
+            .store
+            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
+            .is_some();
+        self.delete_retiring_staged_charge_with_presence(
+            tx,
+            table,
+            row_id,
+            committed_row_exists,
+            staged_charge,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn delete_retiring_staged_charge_with_presence(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        committed_row_exists: bool,
+        staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
+    ) -> Result<usize> {
+        self.delete_retiring_staged_charge_with_undo(
+            tx,
+            table,
+            row_id,
+            committed_row_exists,
+            staged_charge,
+            |_| None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn delete_retiring_staged_charge_with_undo(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        committed_row_exists: bool,
         mut staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
+        mut transfer: impl FnMut(usize) -> Option<Arc<dyn contextdb_tx::StagedPostingCharge>>,
     ) -> Result<usize> {
         self.ensure_table_exists(table)?;
         if self.store.is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
-
-        let committed_row_exists = self
-            .store
-            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
-            .is_some();
-
         self.tx_mgr.with_write_set(tx, |ws| {
             let admitted = ws.admitted_bytes_for_staged_row(table, row_id);
             let mut retired = 0usize;
-            let mut removed = false;
-            ws.relational_inserts.retain(|(staged_table, row)| {
+            let mut count = 0usize;
+            for (staged_table, row) in &ws.relational_inserts {
                 if staged_table == table && row.row_id == row_id {
-                    removed = true;
+                    count += 1;
                     retired = retired.saturating_add(staged_charge(row, admitted));
-                    false
-                } else {
-                    true
                 }
-            });
+            }
+            if let Some(admission) = &self.staged_posting_admission {
+                ws.ordered_staged_rows
+                    .prepare_row_removal(table, row_id, count, |bytes| admission.reserve(bytes))?;
+            }
+            ws.ordered_staged_rows.remove_statement_row(table, row_id)?;
+            let removed = count != 0;
+            let deferred = removed
+                && ws.ordered_staged_rows.checkpoint_active()
+                && ws.ordered_staged_rows.retain_displaced(
+                    &mut ws.relational_inserts,
+                    table,
+                    row_id,
+                    admitted,
+                    transfer(retired),
+                );
+            if !deferred {
+                ws.relational_inserts
+                    .retain(|(name, row)| name != table || row.row_id != row_id);
+            }
+
             if removed {
+                ws.ordered_staged_rows.remove(table, row_id);
+                ws.rebind_ordered_staged_rows();
                 ws.forget_relational_insert_admitted_bytes(table, row_id);
             }
             if committed_row_exists
@@ -893,14 +1477,16 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             {
                 ws.relational_deletes.push((table.to_string(), row_id, tx));
             }
-            retired
-        })
+            Ok(if deferred { 0 } else { retired })
+        })?
     }
 
     /// Number of physical versions currently addressable by a pull scan.
     /// Capturing this once gives a cursor a stable end position; later commits
     /// are outside its snapshot and do not extend its source.
     pub fn bounded_table_len(&self, table: &str) -> Result<usize> {
+        self.ensure_memory_reads()?;
+
         let tables = self.store.tables.read();
         tables
             .get(table)
@@ -920,6 +1506,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             last_emitted: None,
             exhausted: false,
             source_key: None,
+            source_position_charge: None,
         })
     }
 
@@ -932,12 +1519,34 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         &self,
         table: &str,
         cursor: &mut BoundedPhysicalCursor,
-        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
         before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        self.bounded_physical_row_next_observed(
+            table,
+            cursor,
+            before_touch,
+            |_| Ok(()),
+            before_clone,
+        )
+    }
+
+    pub fn bounded_physical_row_next_observed<E>(
+        &self,
+        table: &str,
+        cursor: &mut BoundedPhysicalCursor,
+        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        mut observed: impl FnMut(&VersionedRow) -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -963,6 +1572,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     loop {
                         before_touch()?;
                         let row = &rows[candidate];
+                        observed(row)?;
                         let identity = Some((row.row_id, row.created_tx));
                         if identity == cursor.last_inspected {
                             found = Some((candidate, true));
@@ -1000,10 +1610,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     }
                     None => {
                         if cursor.last_emitted.is_some() {
-                            return Err(E::from(Error::Other(
+                            return Err(E::from(Error::Other((
                                 "bounded physical scan lost its emitted continuation row"
-                                    .to_string(),
-                            )));
+                                    .to_string()).into())));
                         }
                         cursor.position = 0;
                         cursor.last_inspected = None;
@@ -1017,6 +1626,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         }
         before_touch()?;
         let row = &rows[cursor.position];
+        observed(row)?;
         before_clone(row.estimated_bytes())?;
         let row = row.clone();
         cursor.last_inspected = Some((row.row_id, row.created_tx));
@@ -1043,6 +1653,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     where
         E: From<Error>,
     {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -1102,9 +1714,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .is_none_or(|current| current.as_slice() != key.as_slice());
         let next_generation = if key_changed {
             Some(cursor.key_generation.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other(
-                    "bounded index key generation overflow".to_string(),
-                ))
+                E::from(Error::Other((
+                    "bounded index key generation overflow".to_string()).into()))
             })?)
         } else {
             None
@@ -1119,9 +1730,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .checked_add(output_key_bytes)
             .and_then(|bytes| bytes.checked_add(new_cursor_key_bytes))
             .ok_or_else(|| {
-                E::from(Error::Other(
-                    "bounded index clone size overflow".to_string(),
-                ))
+                E::from(Error::Other((
+                    "bounded index clone size overflow".to_string()).into()))
             })?;
         before_clone(clone_bytes)?;
         let replacement_key = if key_changed { Some(key.clone()) } else { None };
@@ -1173,6 +1783,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     where
         E: From<Error>,
     {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -1296,9 +1908,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 .len()
                 .checked_mul(std::mem::size_of::<crate::store::IndexEntry>())
                 .ok_or_else(|| {
-                    E::from(Error::Other(
-                        "bounded exact posting size overflow".to_string(),
-                    ))
+                    E::from(Error::Other((
+                        "bounded exact posting size overflow".to_string()).into()))
                 })?;
             before_retain(retained)?;
             cursor.postings = postings.to_vec();
@@ -1316,12 +1927,42 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         direction: SortDirection,
         snapshot: SnapshotId,
         cursor: &mut BoundedOrderedRowCursor,
-        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
         before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        self.bounded_ordered_row_next_observed(
+            table,
+            column,
+            direction,
+            snapshot,
+            cursor,
+            before_touch,
+            |_, _| Ok(()),
+            before_clone,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_ordered_row_next_observed<E>(
+        &self,
+        table: &str,
+        column: &str,
+        direction: SortDirection,
+        snapshot: SnapshotId,
+        cursor: &mut BoundedOrderedRowCursor,
+        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        mut observed: impl FnMut(&IndexKey, RowId) -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -1344,6 +1985,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 return Ok(None);
             };
             before_touch()?;
+            observed(key, entry.row_id)?;
             self.store.bump_index_entries_touched(1);
             let key_changed = cursor.key.as_ref() != Some(key);
             let key_bytes = if key_changed {
@@ -1353,9 +1995,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             };
             let generation = if key_changed {
                 cursor.key_generation.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other(
-                        "bounded ordered key generation overflow".to_string(),
-                    ))
+                    E::from(Error::Other((
+                        "bounded ordered key generation overflow".to_string()).into()))
                 })?
             } else {
                 cursor.key_generation
@@ -1372,9 +2013,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                         .estimated_bytes()
                         .checked_add(key_bytes)
                         .ok_or_else(|| {
-                            E::from(Error::Other(
-                                "bounded ordered clone size overflow".to_string(),
-                            ))
+                            E::from(Error::Other((
+                                "bounded ordered clone size overflow".to_string()).into()))
                         })?;
                     before_clone.take().expect("one membership row charge")(bytes)
                 },
@@ -1404,9 +2044,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .get(table)
             .ok_or_else(|| E::from(Error::TableNotFound(table.to_string())))?;
         let index_name = cursor.index.as_deref().ok_or_else(|| {
-            E::from(Error::Other(
-                "bounded ordered cursor requires a selected index".to_string(),
-            ))
+            E::from(Error::Other((
+                "bounded ordered cursor requires a selected index".to_string()).into()))
         })?;
         let storage = table_indexes.get(index_name).ok_or_else(|| {
             E::from(Error::IndexNotFound {
@@ -1420,15 +2059,15 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 .first()
                 .is_none_or(|(candidate, _)| candidate != column)
         {
-            return Err(E::from(Error::Other(format!(
+            return Err(E::from(Error::Other((format!(
                 "index {index_name} cannot order {table}.{column}"
-            ))));
+            )).into())));
         }
         let expected_reverse = storage.columns[0].1 != direction;
         if cursor.reverse != expected_reverse {
-            return Err(E::from(Error::Other(format!(
+            return Err(E::from(Error::Other((format!(
                 "ordered cursor direction does not match index {index_name}"
-            ))));
+            )).into())));
         }
 
         if cursor.image.is_none() {
@@ -1436,13 +2075,14 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             cursor.image = Some(storage.current_image(snapshot).cloned());
             if matches!(cursor.image, Some(Some(_))) {
                 drop(indexes);
-                return self.bounded_ordered_row_next(
+                return self.bounded_ordered_row_next_observed(
                     table,
                     column,
                     direction,
                     snapshot,
                     cursor,
                     before_touch,
+                    observed,
                     before_clone,
                 );
             }
@@ -1521,8 +2161,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         // key. Resolve the row version separately: an unchanged indexed key
         // can retain a posting created before the visible row version. Charge
         // every retained posting examined, but return the row once per key.
-        for _ in &entries[run_start..run_end] {
+        for entry in &entries[run_start..run_end] {
             before_touch()?;
+            observed(key, entry.row_id)?;
             self.store.bump_index_entries_touched(1);
         }
         let visible_entry = entries[run_start..run_end]
@@ -1534,9 +2175,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .is_none_or(|current| current.as_slice() != key.as_slice());
         let next_generation = if key_changed {
             Some(cursor.key_generation.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other(
-                    "bounded ordered key generation overflow".to_string(),
-                ))
+                E::from(Error::Other((
+                    "bounded ordered key generation overflow".to_string()).into()))
             })?)
         } else {
             None
@@ -1576,14 +2216,12 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                         .estimated_bytes()
                         .checked_add(new_cursor_key_bytes)
                         .ok_or_else(|| {
-                            E::from(Error::Other(
-                                "bounded ordered clone size overflow".to_string(),
-                            ))
+                            E::from(Error::Other((
+                                "bounded ordered clone size overflow".to_string()).into()))
                         })?;
                     let before_clone = before_clone.take().ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded ordered row charged twice".to_string(),
-                        ))
+                        E::from(Error::Other((
+                            "bounded ordered row charged twice".to_string()).into()))
                     })?;
                     before_clone(clone_bytes)
                 })?;
@@ -1626,6 +2264,12 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         table: &str,
         snapshot: SnapshotId,
     ) -> Result<Vec<VersionedRow>> {
+        if tx.is_some() && matches!(&self.tx_mgr, ExecutorTransactions::Owned(_)) {
+            return Err(Error::InvalidStateTransition(
+                "owned staged reads require a sealed statement capture".into(),
+            ));
+        }
+        self.ensure_memory_reads()?;
         let mut result: Vec<VersionedRow> = {
             let tables = self.store.tables.read();
             let rows = tables
@@ -1698,6 +2342,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         value: &Value,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
+        self.ensure_memory_reads()?;
         self.ensure_table_exists(table)?;
 
         let (deleted_row_ids, delete_predicates) = match tx {
@@ -1882,8 +2527,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {
+            self.stage_ordered_row(ws, table, &row, ws.relational_inserts.len())?;
             ws.relational_inserts.push((table.to_string(), row));
-        })?;
+            Ok::<_, Error>(())
+        })??;
 
         Ok(row_id)
     }
@@ -1916,6 +2563,59 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         self.ensure_table_exists(table)?;
         self.validate_state_transition(tx, table, &values, snapshot)?;
         self.stage_insert_with_row_id_at(tx, table, row_id, values, created_at)
+    }
+
+    /// Stage through the normal insertion owner using the caller's captured
+    /// schema and visible base-plus-overlay row, without a resident lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_with_row_id_from_descriptor(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: HashMap<ColName, Value>,
+        meta: &TableMeta,
+        existing: Option<&VersionedRow>,
+        created_at: Option<Wallclock>,
+    ) -> Result<RowId> {
+        if let Some(sm) = &meta.state_machine
+            && let Some(Value::Text(new_status)) = values.get(&sm.column)
+            && matches!(values.get("id"), Some(Value::Uuid(_)))
+            && let Some(existing) = existing
+        {
+            let old_status = existing
+                .values
+                .get(&sm.column)
+                .and_then(Value::as_text)
+                .unwrap_or("");
+            if !RelationalStore::validate_state_transition_for_meta(
+                meta, &sm.column, old_status, new_status,
+            ) {
+                return Err(Error::InvalidStateTransition(format!(
+                    "{old_status} -> {new_status}"
+                )));
+            }
+        }
+        let row = VersionedRow {
+            row_id,
+            values,
+            created_tx: tx,
+            deleted_tx: None,
+            lsn: Lsn(0),
+            created_at: Some(created_at.unwrap_or_else(Wallclock::now)),
+        };
+        self.tx_mgr.with_write_set(tx, |ws| {
+            self.stage_ordered_row_from_descriptor(
+                ws,
+                table,
+                &row,
+                ws.relational_inserts.len(),
+                meta,
+            )?;
+            ws.relational_inserts.push((table.to_owned(), row));
+            Ok::<_, Error>(())
+        })??;
+        Ok(row_id)
     }
 
     pub fn insert_with_row_id_assume_no_state_machine(
@@ -1967,8 +2667,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {
+            self.stage_ordered_row(ws, table, &row, ws.relational_inserts.len())?;
             ws.relational_inserts.push((table.to_string(), row));
-        })?;
+            Ok::<_, Error>(())
+        })??;
 
         Ok(row_id)
     }
@@ -1990,7 +2692,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
 
         let conflict_val = values
             .get(conflict_col)
-            .ok_or_else(|| Error::Other("conflict column not in values".to_string()))?
+            .ok_or_else(|| Error::Other(("conflict column not in values".to_string()).into()))?
             .clone();
 
         let existing =
@@ -2069,9 +2771,12 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
             .is_some();
 
         self.tx_mgr.with_write_set(tx, |ws| {
+            ws.ordered_staged_rows.remove_statement_row(table, row_id)?;
             let table_name = table.to_string();
             ws.relational_inserts
                 .retain(|(t, row)| !(t == table && row.row_id == row_id));
+            ws.ordered_staged_rows.remove(table, row_id);
+            ws.rebind_ordered_staged_rows();
 
             if committed_row_exists
                 && !ws
@@ -2081,7 +2786,8 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
             {
                 ws.relational_deletes.push((table_name, row_id, tx));
             }
-        })?;
+            Ok::<_, Error>(())
+        })??;
 
         Ok(())
     }

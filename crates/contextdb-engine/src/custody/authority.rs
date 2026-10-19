@@ -182,6 +182,66 @@ pub(crate) fn history_root(states: &[StateRecord]) -> Digest {
     }
     e.digest()
 }
+/// The Owned history root keeps borrowed selected states and prepaid sort and
+/// encoder scratch; the ordinary history's token order and domains are exact.
+pub(crate) fn history_root_owned(db: &crate::Database, states: &[&StateRecord]) -> Result<Digest> {
+    use super::preparation::{OwnedPreparationValue, preparation_array_bytes};
+    let sorted = OwnedPreparationValue::try_produce(
+        db,
+        preparation_array_bytes::<(usize, &StateRecord)>(states.len())?,
+        || {
+            let mut sorted = Vec::with_capacity(states.len());
+            if sorted.capacity() != states.len() {
+                return Err(invalid());
+            }
+            sorted.extend(
+                states
+                    .iter()
+                    .enumerate()
+                    .map(|(position, state)| (position, *state)),
+            );
+            // Preserve the original stable order for equal tokens without an
+            // unadmitted stable-sort scratch allocation.
+            sorted.sort_unstable_by_key(|(position, state)| (state.state.token, *position));
+            Ok(sorted)
+        },
+    )?;
+    let capacity = (8usize + "delivery-history-index.v1".len() + 8)
+        .checked_add(states.len().checked_mul(64).ok_or_else(invalid)?)
+        .ok_or_else(invalid)?;
+    let bytes = super::canonical::prepare_encoder_owned(db, capacity, |e| {
+        e.string("delivery-history-index.v1");
+        e.u64(states.len() as u64);
+        sorted.with_value(|states| -> Result<()> {
+            for (_, state) in states {
+                let state_capacity =
+                    80usize + 1 + usize::from(state.parent.is_some()) * 32 + 8 + 32;
+                let state_bytes =
+                    super::canonical::prepare_encoder_owned(db, state_capacity, |e| {
+                        state.state.encode(e);
+                        e.option(state.parent.as_ref(), |e, token| e.raw(token));
+                        e.u64(state.sequence);
+                        e.raw(&state.retirement_root);
+                        Ok(())
+                    })?;
+                let record = super::canonical::prepare_encoder_owned(
+                    db,
+                    8 + "delivery-state-record.v1".len() + state_capacity,
+                    |e| {
+                        e.string("delivery-state-record.v1");
+                        state_bytes.with_value(|bytes| e.raw(bytes));
+                        Ok(())
+                    },
+                )?;
+                e.raw(&state.state.token);
+                record.with_value(|bytes| e.raw(blake3::hash(bytes).as_bytes()));
+            }
+            Ok(())
+        })
+    })?;
+    Ok(bytes.with_value(|bytes| *blake3::hash(bytes).as_bytes()))
+}
+
 fn birth_key(b: &BirthRef) -> Vec<u8> {
     let mut e = Encoder::default();
     b.encode(&mut e);
@@ -276,4 +336,241 @@ pub(crate) fn retired_descriptors(records: &[Record], active: &Birth) -> Result<
                 .ok_or_else(invalid)
         })
         .collect()
+}
+
+impl BirthRef {
+    pub(crate) fn encode_finite(&self, e: &mut FiniteEncoder<'_>) {
+        e.raw(self.logical_store_id.as_bytes());
+        e.raw(&self.incarnation.0.to_be_bytes());
+        e.raw(self.birth_id.as_bytes());
+    }
+}
+impl Birth {
+    fn bytes_finite(&self, e: &mut FiniteEncoder<'_>) {
+        self.identity.encode_finite(e);
+        e.option(self.predecessor.as_ref(), |e, s| s.encode_finite(e));
+        e.option(self.selected_image.as_ref(), |e, s| s.encode_finite(e));
+        e.u64(self.triggers.len() as u64);
+        for id in &self.triggers {
+            e.raw(id);
+        }
+        e.u64(self.retired.len() as u64);
+        for b in &self.retired {
+            b.encode_finite(e);
+        }
+    }
+    fn digest_finite(&self) -> Result<Digest> {
+        finite_hash(|e| {
+            e.string("delivery-incarnation-birth.v1");
+            self.bytes_finite(e);
+            Ok(())
+        })
+    }
+}
+impl StateRecord {
+    fn bytes_finite(&self, e: &mut FiniteEncoder<'_>) {
+        self.state.encode_finite(e);
+        e.option(self.parent.as_ref(), |e, t| e.raw(t));
+        e.u64(self.sequence);
+        e.raw(&self.retirement_root);
+    }
+}
+fn compare_birth(a: &BirthRef, b: &BirthRef) -> std::cmp::Ordering {
+    a.logical_store_id
+        .as_bytes()
+        .cmp(b.logical_store_id.as_bytes())
+        .then_with(|| {
+            a.incarnation
+                .0
+                .to_be_bytes()
+                .cmp(&b.incarnation.0.to_be_bytes())
+        })
+        .then_with(|| a.birth_id.as_bytes().cmp(b.birth_id.as_bytes()))
+}
+pub(crate) fn retirement_root_finite(births: &[Birth]) -> Result<Digest> {
+    retirement_root_finite_with_error(births.iter().map(Ok), invalid)
+}
+
+/// Borrowed descriptors in canonical order; no temporary collection is needed.
+pub(crate) fn retirement_root_finite_with_error<'a, E>(
+    births: impl ExactSizeIterator<Item = std::result::Result<&'a Birth, E>>,
+    invalid: impl Fn() -> E,
+) -> std::result::Result<Digest, E> {
+    use super::canonical::{finite_hash_with_error, finite_len_with_error};
+    finite_hash_with_error(
+        |e| {
+            let count = births.len();
+            e.string(if count == 0 {
+                "delivery-history-index.v1"
+            } else {
+                "delivery-retirement-index.v1"
+            });
+            e.u64(count as u64);
+            let mut previous: Option<&BirthRef> = None;
+            for birth in births {
+                let birth = birth?;
+                if previous
+                    .is_some_and(|p| compare_birth(p, &birth.identity) != std::cmp::Ordering::Less)
+                {
+                    return Err(invalid());
+                }
+                previous = Some(&birth.identity);
+                e.u64(finite_len_with_error(
+                    |e| {
+                        birth.bytes_finite(e);
+                        Ok(())
+                    },
+                    &invalid,
+                )? as u64);
+                birth.bytes_finite(e);
+            }
+            Ok(())
+        },
+        &invalid,
+    )
+}
+pub(crate) fn validate_retirement_closure_owned(
+    db: &crate::Database,
+    active: &Birth,
+    retired: &[Birth],
+) -> Result<()> {
+    use super::preparation::{OwnedPreparationValue, preparation_array_bytes};
+    retirement_root_finite(retired)?;
+    if active.retired.len() != retired.len()
+        || active
+            .retired
+            .iter()
+            .zip(retired)
+            .any(|(id, b)| *id != b.identity)
+        || active.triggers.windows(2).any(|w| w[0] >= w[1])
+    {
+        return Err(invalid());
+    }
+    for birth in std::iter::once(active).chain(retired) {
+        if birth.identity.logical_store_id != active.identity.logical_store_id
+            || birth
+                .retired
+                .windows(2)
+                .any(|w| compare_birth(&w[0], &w[1]) != std::cmp::Ordering::Less)
+            || birth.triggers.windows(2).any(|w| w[0] >= w[1])
+            || birth
+                .retired
+                .iter()
+                .any(|id| *id == birth.identity || !retired.iter().any(|b| b.identity == *id))
+            || birth
+                .predecessor
+                .as_ref()
+                .is_some_and(|s| !birth.retired.contains(&BirthRef::from(s)))
+            || birth
+                .selected_image
+                .as_ref()
+                .is_some_and(|s| !birth.retired.contains(&BirthRef::from(s)))
+        {
+            return Err(invalid());
+        }
+    }
+    let edges = retired.iter().try_fold(0usize, |n, b| {
+        n.checked_add(b.retired.len()).ok_or_else(invalid)
+    })?;
+    for origin in std::iter::once(active).chain(retired) {
+        let capacity = edges
+            .checked_add(origin.retired.len())
+            .ok_or_else(invalid)?;
+        let mut pending = OwnedPreparationValue::try_produce(
+            db,
+            preparation_array_bytes::<BirthRef>(capacity)?,
+            || {
+                let mut pending = Vec::with_capacity(capacity);
+                if pending.capacity() != capacity {
+                    return Err(invalid());
+                }
+                pending.extend(origin.retired.iter().cloned());
+                Ok(pending)
+            },
+        )?;
+        let mut visited = OwnedPreparationValue::try_produce(
+            db,
+            preparation_array_bytes::<usize>(retired.len())?,
+            || {
+                let capacity = retired.len();
+                let value = Vec::with_capacity(capacity);
+                if value.capacity() != capacity {
+                    return Err(invalid());
+                }
+                Ok(value)
+            },
+        )?;
+        while let Some(id) = pending.pop_slot() {
+            if id == origin.identity {
+                return Err(invalid());
+            }
+            let index = retired
+                .iter()
+                .position(|b| b.identity == id)
+                .ok_or_else(invalid)?;
+            if !visited.with_value(|v| v.contains(&index)) {
+                visited.push_slot(index);
+                for id in &retired[index].retired {
+                    pending.push_slot(id.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+pub(crate) fn certificate_bytes_finite(
+    e: &mut FiniteEncoder<'_>,
+    format: u32,
+    tenant: &contextdb_core::TenantId,
+    hub_node: &str,
+    state: &StateRecord,
+    birth: &Birth,
+    retirement_digest: &Digest,
+) -> Result<()> {
+    e.string("delivery-committed-state.v1");
+    e.u32(format);
+    e.string(tenant.as_str());
+    e.node(hub_node)?;
+    BirthRef::from(&state.state).encode_finite(e);
+    state.bytes_finite(e);
+    e.raw(&birth.digest_finite()?);
+    e.raw(retirement_digest);
+    Ok(())
+}
+impl Certificate {
+    pub(crate) fn bytes_finite(&self, e: &mut FiniteEncoder<'_>) -> Result<()> {
+        certificate_bytes_finite(
+            e,
+            self.format,
+            &self.tenant,
+            &self.hub_node,
+            &self.state,
+            &self.birth,
+            &self.retirement_digest,
+        )
+    }
+    pub(crate) fn id_finite(&self) -> Result<Digest> {
+        finite_hash(|e| {
+            e.string("delivery-state-certificate-id.v1");
+            e.u64(finite_len(|e| self.bytes_finite(e))? as u64);
+            self.bytes_finite(e)?;
+            e.bytes(&self.signature);
+            Ok(())
+        })
+    }
+}
+pub(crate) fn object_digest_finite(
+    tag: u8,
+    walk: impl Fn(&mut FiniteEncoder<'_>) -> Result<()>,
+    signature: &[u8],
+) -> Result<Digest> {
+    let len = finite_len(|e| walk(e))?;
+    finite_hash(|e| {
+        e.string("delivery-authority-object.v1");
+        e.u8(tag);
+        e.u64(len as u64);
+        walk(e)?;
+        e.bytes(signature);
+        Ok(())
+    })
 }

@@ -105,7 +105,7 @@ impl ReadOnlyVectorGraphPageReader for Reader {
         self.bytes
             .get(offset..offset.saturating_add(len))
             .map(<[u8]>::to_vec)
-            .ok_or_else(|| Error::Other("page out of range".to_string()))
+            .ok_or_else(|| Error::Other("page out of range".to_string().into()))
     }
 }
 
@@ -331,7 +331,7 @@ fn a_paused_search_holds_no_page_the_serving_cache_has_let_go() {
     let refused = search(
         &query_b,
         &cancelled,
-        Box::new(|| Err(Error::Other("cancelled".to_string()))),
+        Box::new(|| Err(Error::Other("cancelled".to_string().into()))),
     );
     assert!(
         refused.is_err(),

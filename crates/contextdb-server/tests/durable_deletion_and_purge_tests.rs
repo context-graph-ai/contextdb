@@ -716,11 +716,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
     create_notes(&db);
     create_keep_first_notes(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -748,7 +747,8 @@ fn edge(root: &Path, name: &str, ticket: &str, tenant: &str) -> (Arc<Database>, 
         Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open file-backed edge"));
     create_notes(&db);
     create_keep_first_notes(&db);
-    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant));
+    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -757,7 +757,8 @@ fn reopen_edge(root: &Path, name: &str, ticket: &str, tenant: &str) -> (Arc<Data
         Arc::new(Database::open(root.join(format!("{name}.db"))).expect("reopen edge database"));
     create_notes(&db);
     create_keep_first_notes(&db);
-    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant));
+    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -779,7 +780,8 @@ fn copy_test_edge(
         db.clone(),
         &peer_dial_spec(ticket, &identity_path),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client, identity_path)
 }
 
@@ -932,7 +934,9 @@ fn change_set_contains(
     selected_row_id: contextdb_core::RowId,
     secret: &str,
 ) -> bool {
-    let changes = db.changes_since(Lsn(0));
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     changes.rows.iter().any(|row| {
         row.values
             .values()
@@ -1069,7 +1073,9 @@ fn assert_restored_purge(
         deletion_state(restored, selected).purge_frontier.is_some(),
         "{place} must retain the permanent purge frontier"
     );
-    let changes = restored.changes_since(Lsn(0));
+    let changes = restored
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
     assert!(
         !changes.rows.iter().any(|row| {
             row.values
@@ -1184,7 +1190,8 @@ async fn offline_delete_survives_restart_reconnect_and_later_pulls() {
         edge_a.clone(),
         &peer_dial_spec(&hub.ticket, &edge_a_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let (edge_b, b) = edge(root.path(), "edge-b", &hub.ticket, tenant);
     put(&edge_a, id, "forget-me");
     let seed_lsn = edge_a.current_lsn();
@@ -1230,7 +1237,8 @@ async fn offline_delete_survives_restart_reconnect_and_later_pulls() {
         edge_a.clone(),
         &peer_dial_spec(&hub.ticket, &edge_a_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert_eq!(
         deletion_state(&edge_a, id).delete_obligation.as_deref(),
         Some("pending"),
@@ -1284,7 +1292,8 @@ async fn offline_delete_survives_restart_reconnect_and_later_pulls() {
         edge_a.clone(),
         &peer_dial_spec(&hub.ticket, &edge_a_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert_eq!(
         deletion_state(&edge_a, id)
             .accepted_delete_marker
@@ -1318,7 +1327,8 @@ async fn delete_obligation_transitions_through_hub_outcomes() {
         accepted_edge.clone(),
         &alternate.ticket,
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(alternate_seed.push())
         .await
         .expect("alternate hub receives the same original lineage before deletion");
@@ -1332,7 +1342,8 @@ async fn delete_obligation_transitions_through_hub_outcomes() {
         .expect("operator returns the edge to the authoritative hub before deleting");
     drop(alternate_seed);
     drop(client);
-    let client = SyncClient::new(accepted_edge.clone(), &hub.ticket, TenantId::from(tenant));
+    let client = SyncClient::new(accepted_edge.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     delete(&accepted_edge, accepted);
     assert_absent(
         &accepted_edge,
@@ -1608,7 +1619,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         );
     }
     let held_snapshot = edge_a.snapshot();
-    let _open_read = edge_a.pin_snapshot(held_snapshot);
+    let _open_read = edge_a.pin_snapshot(held_snapshot).unwrap();
     edit(&edge_a, selected, "selected-secret-after-edit");
     assert_eq!(
         edge_a
@@ -1886,7 +1897,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         holder_node,
         "the serving endpoint must use edge A's one persisted participant identity"
     );
-    edge_a_blob.serve_on(&blob_endpoint);
+    let _ = edge_a_blob.serve_on(&blob_endpoint);
     edge_b_blob.set_test_clock(1_700_000_000_000);
     let mut partial = Vec::new();
     let interrupted =
@@ -1927,12 +1938,14 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         edge_a.clone(),
         &peer_dial_spec(&hub.ticket, &edge_a_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let b = SyncClient::new(
         edge_b.clone(),
         &peer_dial_spec(&hub.ticket, &edge_b_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     assert!(
         change_set_contains(
@@ -1948,8 +1961,12 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         ),
         "change serving must expose both selected versions before purge"
     );
-    let edge_a_delta =
-        serde_json::to_string(&edge_a.changes_since(Lsn(0))).expect("serialize pre-purge delta");
+    let edge_a_delta = serde_json::to_string(
+        &edge_a
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    )
+    .expect("serialize pre-purge delta");
     assert!(
         edge_a_delta.contains(&blob_hash.to_hex())
             && edge_a_delta.contains("selected-durable-payload"),
@@ -1990,8 +2007,11 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             ),
             "{place} must not serve the selected lineage as a sync delta"
         );
-        let delta =
-            serde_json::to_string(&db.changes_since(Lsn(0))).expect("serialize post-purge delta");
+        let delta = serde_json::to_string(
+            &db.changes_since(Lsn(0))
+                .expect("read changes_since fixture"),
+        )
+        .expect("serialize post-purge delta");
         assert!(
             !delta.contains("selected-secret-before-edit")
                 && !delta.contains("selected-secret-after-edit")
@@ -2386,7 +2406,8 @@ async fn wrong_bound_hub_pull_is_refused_before_mutation() {
         edge.clone(),
         &peer_dial_spec(&wrong.ticket, &edge_identity),
         TenantId::from("bound-hub"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(wrong_client.ensure_connected())
         .await
         .expect("authenticate the non-bound hub before refusal");
@@ -2604,7 +2625,8 @@ async fn authenticated_edge_push_borne_purge_is_refused_before_hub_mutation() {
         injected_transport,
         tenant_id.clone(),
         edge_fabric_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let refusal = within(forged_client.push())
         .await
         .expect_err("authenticated edge push carrying PURGE must be refused");
@@ -2632,7 +2654,7 @@ async fn authenticated_edge_push_borne_purge_is_refused_before_hub_mutation() {
         before_selected_deletion,
         "the rejected push cannot install deletion or purge state"
     );
-    let post_request_changes = hub.db.change_log_since(before_lsn);
+    let post_request_changes = hub.db.change_log_since(before_lsn).unwrap();
     // A contact timestamp can match the already-recorded millisecond and be
     // idempotent, so this exchange may leave no change-log entry. Any entry
     // that does exist must remain hub-local peer bookkeeping.
@@ -2690,7 +2712,8 @@ async fn ordinary_delete_then_explicit_fresh_same_key_mints_new_lineage_and_sync
         .expect("move the old lineage to a stale alternate hub");
     within(client.shutdown()).await;
     drop(client);
-    let alternate_seed = SyncClient::new(edge.clone(), &alternate_dial, TenantId::from(tenant));
+    let alternate_seed = SyncClient::new(edge.clone(), &alternate_dial, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(alternate_seed.push())
         .await
         .expect("stale alternate receives the exact old lineage");
@@ -2705,11 +2728,10 @@ async fn ordinary_delete_then_explicit_fresh_same_key_mints_new_lineage_and_sync
     within(alternate_seed.shutdown()).await;
     drop(alternate_seed);
 
-    let client = Arc::new(SyncClient::new(
-        edge.clone(),
-        &hub_dial,
-        TenantId::from(tenant),
-    ));
+    let client = Arc::new(
+        SyncClient::new(edge.clone(), &hub_dial, TenantId::from(tenant))
+            .expect("construct SyncClient fixture"),
+    );
     // Destination restoration may first replay schema or previously accepted
     // batches. Drain them before arming a barrier for this delete's response.
     within(client.push())
@@ -2776,7 +2798,8 @@ async fn ordinary_delete_then_explicit_fresh_same_key_mints_new_lineage_and_sync
         recording_transport.clone(),
         TenantId::from(tenant),
         identity.clone(),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let fresh = within(client.push())
         .await
         .expect("explicit fresh same-key creation syncs");
@@ -2811,7 +2834,8 @@ async fn ordinary_delete_then_explicit_fresh_same_key_mints_new_lineage_and_sync
         .expect("point the fresh edge at the stale alternate hub");
     within(client.shutdown()).await;
     drop(client);
-    let alternate_client = SyncClient::new(edge.clone(), &alternate_dial, TenantId::from(tenant));
+    let alternate_client = SyncClient::new(edge.clone(), &alternate_dial, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     let stale_replay = within(alternate_client.pull_default())
         .await
         .expect_err("accepted old lineage is visibly refused after fresh creation");
@@ -2842,7 +2866,8 @@ async fn ordinary_delete_then_explicit_fresh_same_key_mints_new_lineage_and_sync
         client_transport(&hub_dial),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     delete(&edge, id);
     let fresh_delete_result = within(client.push())
         .await
@@ -3030,9 +3055,11 @@ async fn recreated_table_refuses_removed_generation_and_syncs_new_rows() {
         restored_old.clone(),
         &peer_dial_spec(&hub.ticket, &old_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let replay_source_ceiling = restored_old
         .changes_since(restored_client.push_watermark())
+        .expect("read changes_since fixture")
         .max_lsn()
         .expect("the stale old-generation descendants are outbound work");
     let replay = within(restored_client.push())
@@ -3168,7 +3195,8 @@ async fn malformed_authenticated_push_replies_to_an_exact_retry() {
         transport,
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     for attempt in 1..=2 {
         let result = within(client.push()).await;
@@ -3203,7 +3231,8 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(baseline.pull_default())
         .await
         .expect("edge receives the old-generation row before purge");
@@ -3226,21 +3255,27 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
     create_notes(&hub.db);
     put(&hub.db, current_id, "current-generation-row");
 
-    // Reopen proves the durable image is complete; then force the exact
-    // unavailable-log condition while retaining that store image. The next
-    // pull must use persisted-state recovery, not convenient live history.
+    // The row-log gap requires persisted row recovery. Authoritative DDL
+    // history survives both reopening and that row-log gap.
+    let durable_ddl = format!("{:?}", hub.db.ddl_log_since(Lsn(0)).unwrap());
     let old_hub_handle = hub.db.clone();
     hub.stop().await;
     drop(old_hub_handle);
     let hub = start_hub(root.path(), tenant).await;
     hub.db.__force_sync_log_gap_for_test();
     assert!(
-        hub.db.change_log_since(Lsn(0)).is_empty(),
+        hub.db.change_log_since(Lsn(0)).unwrap().is_empty(),
         "fixture: reopening forces the durable persisted-state path instead of change-log replay"
     );
+    let reopened_ddl = hub.db.ddl_log_since(Lsn(0)).unwrap();
     assert!(
-        hub.db.ddl_log_since(Lsn(0)).is_empty(),
-        "fixture: reopening forces synthetic current schema rather than a live DDL log"
+        !reopened_ddl.is_empty(),
+        "authoritative DDL history remains available"
+    );
+    assert_eq!(
+        format!("{reopened_ddl:?}"),
+        durable_ddl,
+        "reopen and a row-log gap preserve the exact durable schema history"
     );
 
     let edge_identity_value = Arc::new(
@@ -3257,7 +3292,8 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
             transport.clone(),
             TenantId::from(tenant),
             edge_identity_value,
-        ),
+        )
+        .expect("construct SyncClient fixture"),
     );
     let pulling_client = client.clone();
     let pull = tokio::spawn(async move { pulling_client.pull_default().await });
@@ -3368,7 +3404,8 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
         blank.clone(),
         &peer_dial_spec(&hub.ticket, &blank_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(blank_client.pull_default())
         .await
         .expect("a blank edge adopts the old frontier and current snapshot");
@@ -3590,7 +3627,8 @@ async fn pre_purge_restore_is_refused_by_peers_then_reissued() {
             TenantId::from(tenant),
             restored_node_id,
             restored_identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let restored_stop = Arc::new(AtomicBool::new(false));
     let restored_task = tokio::spawn({
@@ -3602,7 +3640,8 @@ async fn pre_purge_restore_is_refused_by_peers_then_reissued() {
         edge.clone(),
         &peer_dial_spec(&restored_ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let retained_tombstone = deletion_state(&edge, id);
     let expected_lineage_root = retained_tombstone
         .lineage_root
@@ -3805,7 +3844,8 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
         stale_edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let refusal = within(stale_client.push())
         .await
         .expect("live tombstoned hub visibly refuses the stale push-only descendant");

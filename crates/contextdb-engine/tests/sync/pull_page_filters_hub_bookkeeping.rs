@@ -41,7 +41,8 @@ impl RunningHub {
                 TenantId::from(TENANT),
                 hub_node,
                 hub_identity,
-            ),
+            )
+            .expect("read or construct the declared fixture result"),
         );
         let edge_node = FabricIdentity::generate().node_id();
         let client = broker.client_as(&edge_node);
@@ -178,7 +179,10 @@ async fn first_bounded_page_skips_hub_contacts_and_delivers_whole_source_groups_
             .unwrap();
     }
     hub.db.commit(rows_tx).unwrap();
-    let source = hub.db.changes_since(Lsn(0));
+    let source = hub
+        .db
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let schema_lsn = source
         .ddl_lsn
         .iter()

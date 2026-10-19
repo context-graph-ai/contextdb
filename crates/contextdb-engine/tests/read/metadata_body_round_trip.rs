@@ -348,6 +348,12 @@ fn an_explained_statement_survives_the_wire() {
             aggregate_allowed_vectors: Some(1_024),
             effective_auto_index_at: 1_000,
             auto_index_at_source: "declared".to_owned(),
+            effective_flat_below: 0,
+            flat_below_source: "compatibility_profile".to_owned(),
+            effective_search_radius_millionths: 20_000,
+            search_radius_source: "compatibility_profile".into(),
+            effective_auto_expansion_ceiling: 25,
+            auto_expansion_ceiling_source: "compatibility_profile".into(),
             partition_key_columns: vec!["scope_id".to_owned()],
             scope: VectorSearchScopeShape::Few,
             route: Some(VectorSearchRoute::FilteredIndexed),
@@ -362,6 +368,7 @@ fn an_explained_statement_survives_the_wire() {
             global_candidate_budget: None,
             admission_evaluations: None,
             expansion_evaluations: None,
+            rescore_evaluations: None,
             layers_admitted: None,
             budget_terminal: None,
             partition_hnsw: vec![VectorPartitionHnswDisclosure {
@@ -407,6 +414,29 @@ fn a_maintenance_status_survives_the_wire() {
             currency_compaction_enabled: false,
             active_maintenance_loops: 3,
         },
+    });
+}
+
+#[test]
+fn a_historical_index_verification_survives_the_wire() {
+    survives_the_wire(&MetadataBody::VerifyHistory {
+        table: "tagged".to_owned(),
+        indexes: vec![
+            contextdb_engine::HistoricalIndexVerification {
+                index: "tagged_by_tag".to_owned(),
+                postings: 2,
+                versions: 3,
+            },
+            contextdb_engine::HistoricalIndexVerification {
+                index: "__pk_tagged".to_owned(),
+                postings: 0,
+                versions: 0,
+            },
+        ],
+    });
+    survives_the_wire(&MetadataBody::VerifyHistory {
+        table: "empty".to_owned(),
+        indexes: Vec::new(),
     });
 }
 

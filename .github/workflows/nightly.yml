@@ -23,5 +23,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
-      - run: cargo test -p contextdb-engine --features nightly-tests
-      - run: cargo test -p contextdb-engine --features nightly-tests --release --test acceptance
+      - run: cargo test -p contextdb-engine --features test-seams,iroh,nightly-tests
+      - run: cargo test -p contextdb-engine --features test-seams,nightly-tests --release --test acceptance

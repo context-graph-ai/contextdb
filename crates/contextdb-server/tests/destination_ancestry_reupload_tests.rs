@@ -92,11 +92,10 @@ async fn start_hub(root: &Path) -> Hub {
     let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub database"));
     declare_table(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(TENANT),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -248,7 +247,8 @@ async fn explicit_destination_change_reuploads_inherited_live_and_delete_lineage
     let creator_db = Arc::new(Database::open(&creator_path).expect("open creator database"));
     declare_table(&creator_db);
     let creator_dial = peer_dial_spec(&old_hub.ticket, &creator_identity_path);
-    let creator = SyncClient::new(creator_db.clone(), &creator_dial, TenantId::from(TENANT));
+    let creator = SyncClient::new(creator_db.clone(), &creator_dial, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     let live_id = Uuid::parse_str(LIVE_ID).expect("live UUID");
     let deleted_id = Uuid::parse_str(DELETED_ID).expect("deleted UUID");
     insert(&creator_db, live_id, "inherited-live");
@@ -262,7 +262,8 @@ async fn explicit_destination_change_reuploads_inherited_live_and_delete_lineage
     let relay_db = Arc::new(Database::open(&relay_path).expect("open relay database"));
     declare_table(&relay_db);
     let old_hub_dial = peer_dial_spec(&old_hub.ticket, &relay_identity_path);
-    let relay = SyncClient::new(relay_db.clone(), &old_hub_dial, TenantId::from(TENANT));
+    let relay = SyncClient::new(relay_db.clone(), &old_hub_dial, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     within(relay.push())
         .await
         .expect("relay declaration reaches old hub");
@@ -297,7 +298,8 @@ async fn explicit_destination_change_reuploads_inherited_live_and_delete_lineage
     drop(relay);
 
     let new_hub_dial = peer_dial_spec(&new_hub.ticket, &relay_identity_path);
-    let moving = SyncClient::new(relay_db.clone(), &new_hub_dial, TenantId::from(TENANT));
+    let moving = SyncClient::new(relay_db.clone(), &new_hub_dial, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     moving
         .change_destination(&new_hub.node_id)
         .expect("explicitly move to new authenticated hub");
@@ -345,7 +347,8 @@ async fn explicit_destination_change_reuploads_inherited_live_and_delete_lineage
         recording.clone(),
         TenantId::from(TENANT),
         relay_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(moved.push())
         .await
         .expect("moved relay rebuilds the new empty hub");

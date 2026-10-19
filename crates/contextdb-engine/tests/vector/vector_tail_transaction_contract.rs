@@ -61,11 +61,11 @@ fn indexed_ids(db: &Database) -> Vec<i64> {
 }
 fn assert_refusal(db: &Database, error: Error) {
     assert!(
-        db.vector_tail_admission_failure_consumed_for_test(),
-        "the refusal reaches actual tail admission: {error:?}"
+        db.vector_current_identity_admission_failure_consumed_for_test(),
+        "the refusal reaches actual canonical identity admission: {error:?}"
     );
     assert!(
-        matches!(error, Error::MemoryBudgetExceeded { operation, .. } if operation == "prepare_hnsw_tail")
+        matches!(error, Error::MemoryBudgetExceeded { operation, .. } if operation == "current_identity_delta")
     );
     assert_eq!(
         db.execute("SELECT id FROM items ORDER BY id", &HashMap::new())
@@ -81,7 +81,7 @@ fn assert_refusal(db: &Database, error: Error) {
 }
 
 #[test]
-fn local_tail_admission_refuses_the_complete_transaction_before_durability() {
+fn local_current_identity_admission_refuses_the_complete_transaction_before_durability() {
     let root = TempDir::new().unwrap();
     let path = root.path().join("local.db");
     let db = Database::open(&path).unwrap();
@@ -90,7 +90,7 @@ fn local_tail_admission_refuses_the_complete_transaction_before_durability() {
         .vector_store_for_test()
         .partition_graph_generation_status(&partition())
         .unwrap();
-    db.arm_vector_tail_admission_failure_for_test();
+    db.arm_vector_current_identity_admission_failure_for_test();
     let tx = db.begin_or_panic();
     db.insert_row(
         tx,
@@ -118,7 +118,7 @@ fn local_tail_admission_refuses_the_complete_transaction_before_durability() {
             .base,
         generation.base
     );
-    db.arm_vector_tail_admission_failure_for_test();
+    db.arm_vector_current_identity_admission_failure_for_test();
     let error = db
         .execute("UPDATE items SET embedding = $v WHERE id = 1", &params(90))
         .unwrap_err();
@@ -137,7 +137,7 @@ fn local_tail_admission_refuses_the_complete_transaction_before_durability() {
 }
 
 #[test]
-fn sync_tail_admission_refuses_rows_vectors_and_the_authenticated_receipt() {
+fn sync_current_identity_admission_refuses_rows_vectors_and_the_authenticated_receipt() {
     let root = TempDir::new().unwrap();
     let path = root.path().join("receiver.db");
     let target = Database::open(&path).unwrap();
@@ -162,14 +162,16 @@ fn sync_tail_admission_refuses_rows_vectors_and_the_authenticated_receipt() {
             .unwrap();
     }
     source.commit(tx).unwrap();
-    let changes = source.changes_since(Lsn(1));
+    let changes = source
+        .changes_since(Lsn(1))
+        .expect("read the declared changes");
     let source_lsn = changes.max_lsn().unwrap();
     let tenant = TenantId::from("tail-admission");
     let incarnation = Incarnation::mint();
-    target.arm_vector_tail_admission_failure_for_test();
+    target.arm_vector_current_identity_admission_failure_for_test();
     let error = target
         .apply_synced_changes_with_receipt(
-            changes,
+            changes.clone(),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
             &HashMap::new(),
             SyncAdoption::Continuing,
@@ -212,40 +214,104 @@ fn sync_tail_admission_refuses_rows_vectors_and_the_authenticated_receipt() {
     assert_eq!(
         indexed_ids(&reopened),
         vec![1, 4],
-        "the next admitted write can still extend the fresh tail"
+        "the next admitted write can still extend the captured suffix"
     );
+    for _ in 0..2 {
+        reopened
+            .apply_synced_changes_with_receipt(
+                changes.clone(),
+                &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
+                &HashMap::new(),
+                SyncAdoption::Continuing,
+                SyncApplyReceipt {
+                    tenant_id: tenant.clone(),
+                    node_id: "edge".into(),
+                    incarnation,
+                    source_lsn,
+                    dependency_complete: false,
+                    hub_contact_ms: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(indexed_ids(&reopened), vec![1, 2, 3, 4]);
+        assert_eq!(
+            reopened
+                .persisted_sync_applied_push_watermark_for_node_incarnation(
+                    &tenant,
+                    "edge",
+                    incarnation
+                )
+                .unwrap(),
+            Some(source_lsn)
+        );
+    }
 }
 
 #[test]
-fn declared_topology_and_search_breadth_reach_replayed_and_post_restart_tails() {
+fn declared_topology_and_search_breadth_reach_captured_suffixes_without_a_resident_tail() {
     let root = TempDir::new().unwrap();
     let path = root.path().join("policy.db");
     let db = Database::open(&path).unwrap();
     seed(&db);
     insert(&db, 2).unwrap();
+    let inspected = db
+        .inspect_captured_vector_suffix_for_test(
+            &partition(),
+            db.snapshot(),
+            db.declared_reader_memory().unwrap(),
+            &mut || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(inspected.points, 1);
+    assert_eq!(inspected.policy, (32, 96, 17));
     assert_eq!(
         db.vector_store_for_test()
-            .with_partition_fresh_tail(&partition(), |graph| graph.policy_values()),
-        Some((32, 96, 17))
+            .partition_graph_generation_status(&partition())
+            .unwrap()
+            .fresh_tail_entries,
+        0
+    );
+    assert!(
+        db.vector_store_for_test()
+            .with_partition_fresh_tail(&partition(), |graph| graph.policy_values())
+            .is_none()
     );
     db.close().unwrap();
     for id in [3, 4] {
         let reopened = Database::open(&path).unwrap();
         reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
         assert_eq!(indexed_ids(&reopened).len(), (id - 1) as usize);
-        assert_eq!(
-            reopened
-                .vector_store_for_test()
-                .with_partition_fresh_tail(&partition(), |graph| graph.policy_values()),
-            Some((32, 96, 17))
-        );
+        let before = reopened
+            .inspect_captured_vector_suffix_for_test(
+                &partition(),
+                reopened.snapshot(),
+                reopened.declared_reader_memory().unwrap(),
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.policy, (32, 96, 17));
         insert(&reopened, id).unwrap();
         assert_eq!(indexed_ids(&reopened).len(), id as usize);
+        let after = reopened
+            .inspect_captured_vector_suffix_for_test(
+                &partition(),
+                reopened.snapshot(),
+                reopened.declared_reader_memory().unwrap(),
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.policy, (32, 96, 17));
+        assert!(after.points > before.points);
         assert_eq!(
             reopened
                 .vector_store_for_test()
-                .with_partition_fresh_tail(&partition(), |graph| graph.policy_values()),
-            Some((32, 96, 17))
+                .partition_graph_generation_status(&partition())
+                .unwrap()
+                .fresh_tail_entries,
+            0
         );
         reopened.close().unwrap();
     }
@@ -402,7 +468,9 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
 fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
     use contextdb_engine::executor::bounded_read_test_support as bounded;
     let root = TempDir::new().unwrap();
-    let db = Database::open(root.path().join("history.db")).unwrap();
+    let mut options = contextdb_engine::DatabaseOpenOptions::default();
+    options.owner_reads.limits.limits.memory = 64 * 1024 * 1024;
+    let db = Database::open_with_options(root.path().join("history.db"), options).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, is_current BOOLEAN, embedding VECTOR(2) AUTO_INDEX_AT 1 HNSW (M = 32, EF_CONSTRUCTION = 96, EF_SEARCH = 17))", &HashMap::new()).unwrap();
     db.execute(
@@ -421,7 +489,7 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
         db.run_maintenance_cycle().unwrap();
     }
     let snapshot = db.snapshot();
-    let pin = db.pin_snapshot(snapshot);
+    let pin = db.pin_snapshot(snapshot).unwrap();
     let sql = "SELECT id FROM items WHERE is_current = true ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
     let bound = HashMap::from([("q".to_owned(), Value::Vector(vec![1.0, 0.0]))]);
     let expected = db.execute(sql, &bound).unwrap().rows;

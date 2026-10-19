@@ -62,10 +62,23 @@
 //! [lmdb]: https://www.lmdb.tech/doc/
 //! [design]: https://github.com/cberner/redb/blob/master/docs/design.md
 
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::scratch_backend_allocation_size;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::{ADMISSION_PAGE_BUDGET, AdmissionReadReceipt, last_admission_read_receipt};
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub use db::{
+    AdmissionBudgetOverride, StoreDamage, allocator_state_lookups_for_test, damage_store_for_test,
+    override_admission_page_budget_for_test,
+};
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
-    ReadableDatabase, RepairSession, StorageBackend, TableDefinition, TableHandle,
-    UntypedMultimapTableHandle, UntypedTableHandle,
+    ReadableDatabase, ReclaimBoundary, ReclaimStep, RepairSession, ScratchBackend, StorageBackend,
+    TableDefinition, TableHandle, UntypedMultimapTableHandle, UntypedTableHandle,
+    scratch_backend_in_directory,
 };
 pub use error::{
     CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
@@ -83,6 +96,9 @@ pub use table::{
 pub use transactions::StorageStatisticsSnapshot;
 #[doc(hidden)]
 pub use transactions::{CompactionCursor, CompactionProgress};
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use transactions::{PreparedReadInput, PreparedReadView, PreparedWrite};
 pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
 #[doc(hidden)]
 pub use transactions::{ExternalSnapshotProvider, ExternalSnapshotRetentionStats};
@@ -105,8 +121,18 @@ mod error;
 mod multimap_table;
 mod sealed;
 mod table;
+mod table_registry;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use table_registry::{RegistryAllocationRecord, set_registry_allocation_observer_for_test};
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveError};
 #[cfg(feature = "test-seams")]
 mod table_write_observer;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use tree_store::with_random_state_for_test;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub use table_write_observer::{
@@ -128,8 +154,32 @@ fn create_tempfile() -> tempfile::NamedTempFile {
     }
 }
 
+mod native_storage_admission;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use native_storage_admission::{
+    PreparedReadError, PreparedTableDefinitionError, NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
+    NativeStorageRefused, native_storage_active, with_native_storage_admission,
+};
+
 mod read_admission;
 #[doc(hidden)]
 pub use read_admission::{BackendReadObservation, observe_backend_reads};
 #[doc(hidden)]
-pub use read_admission::{ReadPageCharge, with_read_memory_admission, with_read_page_charge};
+pub use read_admission::{
+    ReadPageCharge, ScanAllowance, ScanReads, scan_reads, with_read_memory_admission,
+    with_read_memory_admission_storage, with_read_page_charge, with_read_page_charge_storage,
+    with_scan_reads,
+};
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use db::allocator_metadata_test_seams::observe_allocator_region_loads_for_test;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use db::FreeTotalsSaveForTest;
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use transactions::{NativeReadView, TableRootEvent};
