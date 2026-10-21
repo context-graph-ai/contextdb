@@ -5455,7 +5455,11 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                     }
                     checked_size_add(
                         mode_bytes,
-                        cursor.pending_run_bytes(),
+                        checked_size_add(
+                            cursor.pending_run_bytes(),
+                            crate::persistence::ordered_cursor_proof_bytes(cursor),
+                            "retained ordered proof",
+                        )?,
                         "index cursor continuation",
                     )?
                 }
@@ -5470,7 +5474,11 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                     }
                     checked_size_add(
                         mode_bytes,
-                        cursor.pending_run_bytes(),
+                        checked_size_add(
+                            cursor.pending_run_bytes(),
+                            crate::persistence::ordered_cursor_proof_bytes(cursor),
+                            "retained ordered proof",
+                        )?,
                         "ordered cursor continuation",
                     )?
                 }
@@ -19720,17 +19728,12 @@ impl CursorExpiryWatch {
             return;
         }
         if matches!(outcome, Some(std::task::Poll::Ready(Ok(())))) {
-            // Latch completion: a failed timer arm is also a one-shot. Reuse
-            // the established monotonic timer for the remaining interval.
+            // A completed arm is a one-shot. Rearm the SAME supplied clock
+            // at the original absolute deadline; never invent a time domain.
             let now = this.clock.now_ms();
             if now < deadline {
-                let remaining = deadline.saturating_sub(now);
-                let owner = this._read_memory.clone();
-                let fallback = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(async move {
-                    let fallback = crate::local_transport::MonotonicDeadlineClock::new();
-                    crate::local_transport::wait_until_owned(&fallback, remaining, &owner)?.await;
-                    Ok(())
-                }));
+                let fallback = owned_cursor_expiry_wait(
+                    this.clock.clone(), deadline, this._read_memory.clone());
                 match fallback {
                     Ok(fallback) => *wait = Some((deadline, fallback)),
                     Err(error) => { drop(wait); this.refuse(&execution, error); return; }
