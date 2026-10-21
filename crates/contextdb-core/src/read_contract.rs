@@ -557,7 +557,6 @@ impl NativeClockBinding {
         if !source.is_funded_by(standing) {
             return Err(crate::Error::ReadSessionNotImplemented);
         }
-        clock.native_driver_started();
         Ok(Self { source, clock: Arc::clone(clock) })
     }
 
@@ -578,10 +577,6 @@ impl NativeClockBinding {
         Ok(())
     }
 }
-impl Drop for NativeClockBinding {
-    fn drop(&mut self) { self.clock.native_driver_ended(); }
-}
-
 
 /// Host callbacks retain the public caller's existing allocation contract.
 type CancellationCallback = Arc<dyn Fn() + Send + Sync>;

@@ -18,7 +18,6 @@ use crate::plugin::{CorePlugin, DatabasePlugin};
 use crate::read_progress::{ReadProgressObserver, with_progress_observer};
 use crate::{Database, QueryResult};
 use contextdb_core::read_contract::ChannelAddress;
-#[cfg(any(test, feature = "test-seams"))]
 use contextdb_core::read_contract::DeadlineClock;
 use contextdb_core::read_contract::{
     CursorPage, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerRequestHandler,

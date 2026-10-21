@@ -71,16 +71,10 @@ impl OwnerReadScaffoldError {
 
     pub(crate) fn from_local(error: LocalTransportError) -> Self {
         let error = match error.into_admission_error() {
-            Ok(error) => return if crate::read_image_memory::is_memory_refusal(&error) {
-                let ceiling = match error.engine_diagnostic() {
-                    Error::MemoryBudgetExceeded { budget_limit_bytes, .. } => *budget_limit_bytes as u64,
-                    Error::NativeEngineOther(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded { budget_limit_bytes, .. }
-                        | contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded { budget_limit_bytes, .. }) => *budget_limit_bytes as u64,
-                    Error::ReadFailure(failure) => return Self::Refused(failure.clone()),
-                    _ => unreachable!("classified memory refusal"),
-                };
-                Self::Refused(crate::local_transport::memory_ceiling_read_failure(ceiling, None))
-            } else { Self::from_local(crate::local_transport::invalid_channel_data()) },
+            Ok(error) => return match crate::local_transport::query_funding::memory_refusal_ceiling(&error) {
+                Some(ceiling) => Self::Refused(crate::local_transport::memory_ceiling_read_failure(ceiling, None)),
+                None => Self::from_local(crate::local_transport::invalid_channel_data()),
+            },
             Err(error) => error,
         };
         match error {

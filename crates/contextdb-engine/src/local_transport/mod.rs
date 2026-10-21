@@ -33,6 +33,8 @@
 mod address;
 mod authentication;
 mod carrier;
+#[cfg(target_os = "linux")]
+pub(crate) mod native_driver;
 pub(crate) mod deadlines;
 mod engine_answer;
 mod framing;

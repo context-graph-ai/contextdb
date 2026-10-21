@@ -705,7 +705,9 @@ pub(crate) fn borrowed_table_page<'a>(
     owner: ReadMemoryOwner, names: impl ExactSizeIterator<Item = &'a str>,
     continuation: Option<&str>, page_bytes: u64,
 ) -> Result<Funded<MetadataPage>, MetadataPagingError> {
-    let mut names = Funded::allocate_owned(Some(owner.clone()), names.len() * std::mem::size_of::<&str>(),
+    let bytes = names.len().checked_mul(std::mem::size_of::<&str>())
+        .ok_or_else(|| MetadataPagingError::Encoding(ReadEncodingError::Admission(promotion_size_error())))?;
+    let mut names = Funded::allocate_owned(Some(owner.clone()), bytes,
         || names.collect::<Vec<_>>()).map_err(|error| MetadataPagingError::Encoding(ReadEncodingError::Admission(error)))?;
     names.value.sort_unstable(); names.value.dedup();
     inventory_page(owner, MetadataPageVocabulary::Tables, Inventory::Tables(&names.value), continuation, page_bytes)
@@ -715,8 +717,11 @@ pub(crate) fn borrowed_event_page(
 ) -> Result<Funded<MetadataPage>, MetadataPagingError> {
     use InventoryValue::{Text, Bool, Int};
     let error = |error| MetadataPagingError::Encoding(ReadEncodingError::Admission(error));
-    let count = status.event_types.len() + status.sinks.len() + status.routes.len() + status.schedules.len();
-    let mut items = Funded::allocate_owned(Some(owner.clone()), count * std::mem::size_of::<EventProjection<'_>>(),
+    let count = status.event_types.len().checked_add(status.sinks.len())
+        .and_then(|n| n.checked_add(status.routes.len())).and_then(|n| n.checked_add(status.schedules.len()))
+        .ok_or_else(|| error(promotion_size_error()))?;
+    let bytes = count.checked_mul(std::mem::size_of::<EventProjection<'_>>()).ok_or_else(|| error(promotion_size_error()))?;
+    let mut items = Funded::allocate_owned(Some(owner.clone()), bytes,
         || Vec::with_capacity(count)).map_err(error)?;
     for event in &status.event_types { items.value.push(event_projection(&owner, "event_type", &event.name,
         &[("trigger", Text(&event.trigger)), ("table", Text(&event.table))]).map_err(error)?); }

@@ -1105,6 +1105,51 @@ where T: Send + 'a, F: Future<Output = Result<T, LocalTransportError>> + Send + 
     }
 }
 
+#[cfg(target_os = "linux")]
+struct NativeDriverLease(Arc<dyn DeadlineClock>);
+#[cfg(target_os = "linux")]
+impl Drop for NativeDriverLease {
+    fn drop(&mut self) { self.0.native_driver_ended(); }
+}
+
+// The complete driver, including binding, clock lease, wake handle and the
+// concrete operation, occupies one prepaid pinned frame. The operation is
+// destroyed before its driver lease and before the frame's physical free.
+#[cfg(target_os = "linux")]
+struct DrivenLocalFuture<F> {
+    future: F,
+    binding: Option<contextdb_core::read_contract::NativeClockBinding>,
+    park: super::native_driver::NativeCallerPark,
+    _driving: Option<NativeDriverLease>,
+}
+#[cfg(target_os = "linux")]
+impl<F, T> Future for DrivenLocalFuture<F>
+where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> {
+    type Output = crate::owner_read::OwnerReadScaffoldResult<T>;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        use contextdb_core::read_contract::NativeDriverPark;
+        // F is never moved after this prepaid frame is pinned. There is no
+        // Drop implementation that could move it during destruction.
+        let this = unsafe { self.get_unchecked_mut() };
+        let waker = this.park.waker();
+        let mut cx = Context::from_waker(&waker);
+        match unsafe { Pin::new_unchecked(&mut this.future) }.poll(&mut cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => {
+                let result = match &this.binding {
+                    Some(binding) => binding.park_until(u64::MAX, &this.park),
+                    None => this.park.park(),
+                };
+                match result {
+                    Ok(()) => Poll::Pending,
+                    Err(error) => Poll::Ready(Err(crate::owner_read::OwnerReadScaffoldError::from_local(
+                        super::LocalTransportError::OriginalAdmission(error)))),
+                }
+            }
+        }
+    }
+}
+
 /// Drive an admitted operation on the caller's existing thread. Engine clock
 /// waits contribute their earliest deadline; host waits retain their own wake.
 #[cfg(target_os = "linux")]
@@ -1113,29 +1158,26 @@ pub(crate) fn drive_local<F, T>(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> crate::owner_read::OwnerReadScaffoldResult<T>
 where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
-    use contextdb_core::read_contract::{NativeClockBinding, NativeDriverPark};
+    use contextdb_core::read_contract::NativeClockBinding;
     use crate::owner_read::OwnerReadScaffoldError as E;
-    let binding = match NativeClockBinding::try_select(clock, &owner) {
-        Ok(binding) => Some(binding),
-        Err(contextdb_core::Error::ReadSessionNotImplemented) => None,
-        Err(error) => return Err(E::Database(error)),
-    };
-    let park = crate::transport::in_process::native_serving::NativeInProcessPark::try_new(owner.clone())
-        .map_err(E::Database)?;
-    let waker = park.waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut future = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner, || Ok(future))
-        .map_err(E::Database)?;
+    let mut driver = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
+        let binding = match NativeClockBinding::try_select(clock, &owner) {
+            Ok(binding) => Some(binding),
+            Err(contextdb_core::Error::ReadSessionNotImplemented) => None,
+            Err(error) => return Err(error),
+        };
+        let park = super::native_driver::NativeCallerPark::try_new(owner)?;
+        // A selected source alone is not an active driver. This admitted
+        // poll-and-park frame is the actual caller/connection responsible.
+        let driving = binding.as_ref().map(|_| {
+            clock.native_driver_started();
+            NativeDriverLease(clock.clone())
+        });
+        Ok(DrivenLocalFuture { future, binding, park, _driving: driving })
+    }).map_err(|error| E::from_local(super::LocalTransportError::OriginalAdmission(error)))?;
+    let mut cx = Context::from_waker(Waker::noop());
     loop {
-        match Pin::new(&mut future).poll(&mut cx) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => {
-                match &binding {
-                    Some(binding) => binding.park_until(u64::MAX, &park),
-                    None => park.park(),
-                }.map_err(E::Database)?;
-            }
-        }
+        if let Poll::Ready(result) = Pin::new(&mut driver).poll(&mut cx) { return result; }
     }
 }
 
@@ -1239,6 +1281,27 @@ impl Future for LegacyMonotonicWait<'_> {
             Self::Ready => Poll::Ready(()), Self::Timer(wait) => Pin::new(wait).poll(cx),
             #[cfg(any(test, feature = "test-seams"))] Self::Injected(wait) => Pin::new(wait).poll(cx),
             #[cfg(not(any(test, feature = "test-seams")))] Self::Lifetime(_) => Poll::Ready(()),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn drive_local<F, T>(
+    future: F, _clock: &Arc<dyn DeadlineClock>, _owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> crate::owner_read::OwnerReadScaffoldResult<T>
+where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
+    struct Caller(std::thread::Thread);
+    impl std::task::Wake for Caller {
+        fn wake(self: Arc<Self>) { self.0.unpark(); }
+        fn wake_by_ref(self: &Arc<Self>) { self.0.unpark(); }
+    }
+    let waker = Waker::from(Arc::new(Caller(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => std::thread::park(),
         }
     }
 }

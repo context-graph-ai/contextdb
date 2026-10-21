@@ -1167,6 +1167,7 @@ pub(crate) fn decode_metadata_body_with_memory(
         ReadEncodingError::MemoryCeilingExceeded { .. } => {
             ReadEncodingError::MemoryCeilingExceeded { ceiling }
         }
+        ReadEncodingError::Admission(error) => encoding_error_from_core(error, ceiling),
         error => error,
     })
 }
@@ -1337,10 +1338,7 @@ pub fn decode_cursor_page_under_memory_ceiling(
 
 pub fn cursor_page_encoded_size(page: &CursorPage) -> Result<usize, ReadEncodingError> {
     page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
-    let mut measured = bincode::enc::write::SizeWriter::default();
-    bincode::serde::encode_into_writer(page, &mut measured, standard())
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    Ok(measured.bytes_written)
+    encoded_size(page)
 }
 
 // Match MetadataPage/MetadataItem field and variant order while borrowing
@@ -1448,7 +1446,8 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
         bincode::serde::encode_into_writer(value, &mut measured, standard()))
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     let mut encoded = Vec::with_capacity(measured.bytes_written);
-    bincode::serde::encode_into_std_write(value, &mut encoded, standard())
+    contextdb_core::types::with_borrowed_json_wire(||
+        bincode::serde::encode_into_std_write(value, &mut encoded, standard()))
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(encoded)
 }
@@ -1468,7 +1467,9 @@ pub(crate) fn encoding_error_from_core(
     match error {
         error if crate::read_image_memory::is_memory_refusal(&error) => {
             ReadEncodingError::MemoryCeilingExceeded {
-                ceiling: memory_ceiling,
+                ceiling: if memory_ceiling == u64::MAX {
+                    crate::local_transport::query_funding::memory_refusal_ceiling(&error).unwrap_or(memory_ceiling)
+                } else { memory_ceiling },
             }
         }
         _ => ReadEncodingError::InvalidPayload,

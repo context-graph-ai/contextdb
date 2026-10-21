@@ -3697,7 +3697,10 @@ impl OwnerReadService {
         let drained = crate::local_transport::deadlines::drive_local(async {
             operation.await.map_err(OwnerReadScaffoldError::from_local)
         }, &self.spec.clock, owner).map_err(|error| match error {
-            error @ (OwnerReadScaffoldError::Database(_) | OwnerReadScaffoldError::Refused(_)) => error,
+            error @ OwnerReadScaffoldError::Database(_) => error,
+            OwnerReadScaffoldError::Refused(failure) if matches!(failure.detail(),
+                contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
+                    if detail.limit == contextdb_core::read_contract::ReadFailureLimit::Memory) => OwnerReadScaffoldError::Refused(failure),
             _ => OwnerReadScaffoldError::Database(contextdb_core::Error::OwnerReadDrainTimeout),
         });
         if let Some(error) = stop_error {
