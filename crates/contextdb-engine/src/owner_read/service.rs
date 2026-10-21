@@ -1429,9 +1429,8 @@ impl OwnerReadService {
         self: &Arc<Self>,
         stream: &mut std::os::unix::net::UnixStream,
         connection_id: [u8; 16],
+        connection_owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<()> {
-        let connection_owner = self.reading_handle(connection_id)
-            .declared_read_request_provider().request_budget().map_err(OwnerReadScaffoldError::Database)?;
         let owner_limits = self.spec.config.limits.limits;
         let carrier = UnixLocalCarrier;
         let handshake_deadline_ms = self.request_deadline_ms()?;
@@ -4042,7 +4041,7 @@ fn run_owner_accept_loop(
                         .declared_read_request_provider().request_budget();
                     let _served = match owner {
                         Ok(owner) => crate::local_transport::deadlines::drive_local(
-                            connection_service.serve_accepted_stream(&mut stream, connection_id),
+                            connection_service.serve_accepted_stream(&mut stream, connection_id, owner.clone()),
                             &connection_service.spec.clock, owner),
                         Err(error) => Err(OwnerReadScaffoldError::Database(error)),
                     };

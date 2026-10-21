@@ -461,6 +461,18 @@ impl OwnerClient {
             let response = match received {
                 Ok(response) => response,
                 Err(error) => {
+                    let error = match (cursor_memory, error) {
+                        (Some(_), crate::local_transport::LocalTransportError::Payload(
+                            crate::local_transport::PayloadViolation::MemoryCeilingExceeded { ceiling, required })) => {
+                            crate::local_transport::LocalTransportError::Payload(
+                                crate::local_transport::PayloadViolation::MemoryCeilingExceeded {
+                                    ceiling: envelope.limits.memory,
+                                    required: required.map(|bytes| bytes.saturating_add(
+                                        envelope.limits.memory.saturating_sub(ceiling))),
+                                })
+                        }
+                        (_, other) => other,
+                    };
                     // Prefix admission may leave the rejected payload unread.
                     // Close this selected carrier before a caller attempts a
                     // best-effort cursor close on that incomplete exchange.
