@@ -532,25 +532,21 @@ pub enum DirectMetadataBody {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectMetadataResponse {
-    pub body: DirectMetadataBody,
+    pub(crate) metadata: crate::read_session::MetadataAnswer,
     pub canonical_bytes: crate::read_contract::EncodedReadBytes,
     pub snapshot: DirectSnapshot,
-    /// Where to resume, when this answer was one page of an inventory and more
-    /// of it remains. It sits here rather than in the body because the body is
-    /// the published document -- the same bytes whoever answered -- and where
-    /// a paged read left off belongs to the exchange, not the document.
-    pub continuation: Option<String>,
-    pub(crate) charge: crate::read_image_memory::AnswerCharge,
+}
+impl std::ops::Deref for DirectMetadataResponse {
+    type Target = crate::read_session::MetadataAnswer;
+    fn deref(&self) -> &Self::Target { &self.metadata }
 }
 
 #[derive(Debug)]
 pub struct DirectCursorPage {
     pub page: CursorPage,
     pub(crate) observation: crate::executor::CursorObservation,
-    pub canonical_bytes: Vec<u8>,
+    pub canonical_bytes: crate::read_contract::EncodedReadBytes,
     pub snapshot: DirectSnapshot,
-    #[allow(dead_code)] // Owns the canonical copy until its payload is dropped.
-    pub(crate) canonical_credit: Option<contextdb_core::read_memory::ReadCredit>,
 }
 
 impl DirectCursorPage {
@@ -560,14 +556,6 @@ impl DirectCursorPage {
     ) -> Result<Self, DirectFileReaderError> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let canonical_credit = contextdb_core::read_memory::ReadCredit::try_new(
-            read_memory.clone(),
-            self.canonical_bytes.len(),
-            "read_channel",
-            "copy_direct_page",
-            "Reduce the page or raise the reader memory limit.",
-        )
-        .map_err(crate::read_image::history_answer_error)?;
         let page = self
             .page
             .try_clone(read_memory)
@@ -577,7 +565,6 @@ impl DirectCursorPage {
             observation: self.observation.clone(),
             canonical_bytes: self.canonical_bytes.clone(),
             snapshot: self.snapshot,
-            canonical_credit: Some(canonical_credit),
         })
     }
 }

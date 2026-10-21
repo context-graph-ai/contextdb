@@ -521,23 +521,15 @@ pub enum LocalResponse {
 /// the fallback class with its name and its words intact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalEngineFailure {
-    document: Vec<u8>,
+    document: crate::read_contract::EncodedReadBytes,
 }
 
 impl LocalEngineFailure {
-    pub fn from_error(error: &contextdb_core::Error) -> Self {
-        let document = ReadChannelError::from(error);
-        Self {
-            // An engine answer that cannot be written down is itself an
-            // engine answer: the caller still learns what happened, in the
-            // one class that carries prose.
-            document: encode_message(&document).unwrap_or_else(|_| {
-                encode_message(&ReadChannelError::Other {
-                    message: error.to_string(),
-                })
-                .unwrap_or_default()
-            }),
-        }
+    pub fn from_error(
+        error: &contextdb_core::Error,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<Self> {
+        Self::from_query_error(error, owner).map(|answer| answer.value)
     }
 
     /// Rebuild the answer under the memory ceiling in force for this exchange.
@@ -557,7 +549,12 @@ impl LocalEngineFailure {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
         let document = super::engine_answer::encode_query_error_funded(error, owner)?;
-        Ok(Funded { value: Self { document: document.value }, credit: document.credit })
+        let document = crate::read_contract::EncodedReadBytes::from_funded(document, u64::MAX)
+            .map_err(|error| match error {
+                crate::read_contract::ReadEncodingError::Admission(error) => error,
+                _ => contextdb_core::Error::Other("invalid funded engine error document".into()),
+            })?;
+        Ok(Funded::external(Self { document }))
     }
 
     /// Private ordinary-query conversion. It never constructs a decoder root
@@ -792,15 +789,25 @@ impl LocalProtocolBoundary {
     /// Validate and encode one complete length-prefixed message. Successful
     /// response payloads are decoded and structurally validated here before
     /// the containing response can be emitted.
-    pub fn encode_frame(&self, message: LocalOutboundMessage<'_>)
-        -> Result<Vec<u8>, LocalTransportError>
-    {
-        self.encode_frame_funded(message).map(Funded::into_public)
+    pub fn encode_frame(
+        &self, message: LocalOutboundMessage<'_>,
+        caller_owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<crate::read_contract::EncodedReadBytes, LocalTransportError> {
+        let owner = self.query_funding().unwrap_or(caller_owner);
+        let frame = self.encode_frame_on_owner(message, Some(owner))?;
+        crate::read_contract::EncodedReadBytes::from_funded(frame, self.effective_limits.memory)
+            .map_err(transport_decode_error)
     }
 
     pub(crate) fn encode_frame_funded(
-        &self,
-        message: LocalOutboundMessage<'_>,
+        &self, message: LocalOutboundMessage<'_>,
+    ) -> Result<Funded<Vec<u8>>, LocalTransportError> {
+        self.encode_frame_on_owner(message, self.query_funding())
+    }
+
+    fn encode_frame_on_owner(
+        &self, message: LocalOutboundMessage<'_>,
+        owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Funded<Vec<u8>>, LocalTransportError> {
         let ordinary_response = match message {
             LocalOutboundMessage::Response {
@@ -813,10 +820,10 @@ impl LocalProtocolBoundary {
         };
         let encoded = (|| {
             let payload = match message {
-                LocalOutboundMessage::Handshake(handshake) => crate::read_contract::encode_transport_funded(handshake, self.query_funding(), self.effective_limits.memory).map_err(transport_decode_error)?,
+                LocalOutboundMessage::Handshake(handshake) => crate::read_contract::encode_transport_funded(handshake, owner.clone(), self.effective_limits.memory).map_err(transport_decode_error)?,
                 LocalOutboundMessage::Request(request) => {
                     validate_request(request)?;
-                    crate::read_contract::encode_request_funded(request, self.query_funding(), self.effective_limits.memory).map_err(transport_decode_error)?
+                    crate::read_contract::encode_request_funded(request, owner.clone(), self.effective_limits.memory).map_err(transport_decode_error)?
                 }
                 LocalOutboundMessage::Response {
                     response,
@@ -824,7 +831,7 @@ impl LocalProtocolBoundary {
                 } => {
                     let position = self.note_outbound_answer_frame(response, expectation);
                     validate_response(response, expectation, self.effective_limits, position)?;
-                    crate::read_contract::encode_transport_funded(response, self.query_funding(), self.effective_limits.memory).map_err(transport_decode_error)?
+                    crate::read_contract::encode_transport_funded(response, owner.clone(), self.effective_limits.memory).map_err(transport_decode_error)?
                 }
             };
             let prefix = frame_length_prefix(payload.value.len())?;
@@ -835,13 +842,13 @@ impl LocalProtocolBoundary {
                     OrdinaryBoundaryDirection::Outbound,
                 )?;
             }
-            Funded::allocate_owned(self.query_funding(), payload.value.len() + 4, || {
+            Funded::allocate_owned(owner.clone(), payload.value.len() + 4, || {
                 let mut frame = Vec::with_capacity(payload.value.len() + 4);
                 frame.extend_from_slice(&prefix);
                 frame.extend_from_slice(&payload.value);
                 frame
             }).map_err(|error| transport_decode_error(
-                crate::read_contract::encoding_error_from_core(error, self.effective_limits.memory)))
+                crate::read_contract::ReadEncodingError::Admission(error)))
         })();
         if encoded.is_err() {
             if ordinary_response.is_some() {
@@ -1918,7 +1925,7 @@ pub(crate) fn split_payload_answer_funded(
             std::mem::size_of::<LocalResponse>(), "reader", "query_buffer",
             "Reduce simultaneous query working memory or raise the declared reader limit.",
         ).map_err(|error| transport_decode_error(
-            crate::read_contract::encoding_error_from_core(error, memory_ceiling)))?;
+            crate::read_contract::ReadEncodingError::Admission(error)))?;
         let mut responses = Vec::with_capacity(1);
         responses.push(terminal(payload.value));
         return Ok(Funded { value: responses, credit: payload.credit });
@@ -1940,7 +1947,7 @@ pub(crate) fn split_payload_answer_funded(
         responses.push(terminal(remainder.to_vec()));
         responses
     }).map_err(|error| transport_decode_error(
-        crate::read_contract::encoding_error_from_core(error, memory_ceiling)))
+        crate::read_contract::ReadEncodingError::Admission(error)))
 }
 
 /// Split one payload-carrying answer into the frames this channel can move,
@@ -2463,9 +2470,12 @@ impl OrdinaryResultReceiver {
 }
 
 /// Encode one local payload with bincode standard configuration.
-pub fn encode_message<T: Serialize>(message: &T) -> Result<Vec<u8>, LocalTransportError> {
-    encode_to_vec(message, standard())
-        .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
+pub fn encode_message<T: Serialize>(
+    message: &T, owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<crate::read_contract::EncodedReadBytes, LocalTransportError> {
+    let bytes = crate::read_contract::encode_transport_funded(message, Some(owner), u64::MAX)
+        .map_err(transport_decode_error)?;
+    crate::read_contract::EncodedReadBytes::from_funded(bytes, u64::MAX).map_err(transport_decode_error)
 }
 
 /// Prove one response can be encoded and framed under the shared wire-format
@@ -2535,6 +2545,7 @@ fn decode_preflighted_message<T: serde::de::DeserializeOwned>(
 
 fn transport_decode_error(error: crate::read_contract::ReadEncodingError) -> LocalTransportError {
     match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => super::query_funding::transport_error(error, u64::MAX),
         crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
             LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
                 ceiling,
@@ -3411,18 +3422,17 @@ pub fn receive_framed_ordinary_result(
 }
 
 /// Encode one complete four-byte-length-prefixed payload frame.
-pub fn encode_payload_frame(payload: &[u8]) -> Result<Vec<u8>, LocalTransportError> {
+pub fn encode_payload_frame(
+    payload: &[u8], owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<crate::read_contract::EncodedReadBytes, LocalTransportError> {
     let prefix = frame_length_prefix(payload.len())?;
-    let capacity = payload
-        .len()
-        .checked_add(prefix.len())
-        .ok_or(LocalTransportError::Frame(
-            FrameViolation::LengthExceedsMaximum,
-        ))?;
-    let mut frame = Vec::with_capacity(capacity);
-    frame.extend_from_slice(&prefix);
-    frame.extend_from_slice(payload);
-    Ok(frame)
+    let capacity = payload.len().checked_add(prefix.len())
+        .ok_or(LocalTransportError::Frame(FrameViolation::LengthExceedsMaximum))?;
+    let mut frame = Funded::allocate_owned(Some(owner), capacity, || Vec::with_capacity(capacity))
+        .map_err(|error| super::query_funding::transport_error(error, u64::MAX))?;
+    frame.value.extend_from_slice(&prefix);
+    frame.value.extend_from_slice(payload);
+    crate::read_contract::EncodedReadBytes::from_funded(frame, u64::MAX).map_err(transport_decode_error)
 }
 
 /// Decode precisely one complete frame, with no trailing bytes.

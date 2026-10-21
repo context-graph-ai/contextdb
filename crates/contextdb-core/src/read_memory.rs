@@ -1534,7 +1534,7 @@ impl<T, I> ReadPrepared<T, I> {
 
 // Private, allocation-free erasure for the cross-crate cursor vocabulary.
 // No pointer, mutable projection or owning payload is exposed to callers.
-impl<T: crate::read_contract::CursorPageStorage, I: Send + Sync + 'static> ReadShared<T, I> {
+impl<T: crate::read_contract::CursorPageStorage, I: ReadSharedInvoice + 'static> ReadShared<T, I> {
     pub(crate) fn into_cursor_page_handle(self) -> crate::read_contract::CursorPageHandle {
         let shared = ManuallyDrop::new(self);
         crate::read_contract::CursorPageHandle {
@@ -1542,7 +1542,14 @@ impl<T: crate::read_contract::CursorPageStorage, I: Send + Sync + 'static> ReadS
             view: Self::cursor_view,
             retain: Self::cursor_retain,
             release: Self::cursor_release,
+            encoding_owner: Self::cursor_encoding_owner,
         }
+    }
+    unsafe fn cursor_encoding_owner(block: NonNull<()>) -> ReadMemoryOwner {
+        // The live erased cursor handle retains this exact native cell and
+        // its original external invoice; this only clones that capability.
+        let cell = unsafe { block.cast::<ReadSharedBlock<T, I>>().as_ref() };
+        cell.invoice.credit().owner()
     }
     unsafe fn cursor_view(
         block: NonNull<()>,

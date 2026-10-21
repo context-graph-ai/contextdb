@@ -109,6 +109,21 @@ impl UnixLocalCarrier {
         Ok(listener)
     }
 
+    pub(crate) fn connect_funded<'a>(
+        &'a self, path: &'a std::path::Path, clock: &'a dyn DeadlineClock, deadline_ms: u64,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> DeadlineOperationWait<'a, std::os::unix::net::UnixStream> {
+        super::deadline_operation_funded(clock, super::DeadlineStage::Connect, deadline_ms, owner, || {
+            let connect = connect_readiness(path);
+            async move {
+                match connect?.await? {
+                    ConnectAttempt::Connected(stream) => Ok(stream),
+                    ConnectAttempt::NoListener | ConnectAttempt::AddressAbsent => Err(super::refusal(ReadFailureKind::OwnerNotRunning)),
+                }
+            }
+        })
+    }
+
     pub fn connect<'a>(
         &'a self,
         path: &'a std::path::Path,
@@ -163,7 +178,7 @@ impl UnixLocalCarrier {
         boundary: &'a LocalProtocolBoundary,
         message: LocalOutboundMessage<'_>,
         allow_write: impl Fn() -> Result<(), LocalTransportError> + Send + 'static,
-    ) -> LocalDeadlineOperation<'a> {
+    ) -> impl Future<Output = Result<(), LocalTransportError>> + Send + 'a {
         let ordinary_response = matches!(
             message,
             LocalOutboundMessage::Response {
@@ -171,20 +186,13 @@ impl UnixLocalCarrier {
                 ..
             } if *expectation == LocalResponseExpectation::OrdinaryResult
         );
-        let operation: LocalDeadlineOperation<'a> = match boundary.encode_frame_funded(message) {
-            Ok(frame) => match guarded_write_readiness(stream, frame, allow_write) {
-                Ok(write) => Box::pin(write),
-                Err(error) => Box::pin(std::future::ready(Err(error))),
-            },
-            Err(error) => Box::pin(std::future::ready(Err(error))),
-        };
-        Box::pin(async move {
-            let result = operation.await;
-            if result.is_err() && ordinary_response {
-                boundary.reset_ordinary_outbound();
-            }
+        let operation = boundary.encode_frame_funded(message)
+            .and_then(|frame| guarded_write_readiness(stream, frame, allow_write));
+        async move {
+            let result = match operation { Ok(operation) => operation.await, Err(error) => Err(error) };
+            if result.is_err() && ordinary_response { boundary.reset_ordinary_outbound(); }
             result
-        })
+        }
     }
 
     pub fn receive_message(
@@ -209,6 +217,14 @@ impl UnixLocalCarrier {
         clock: &'a dyn DeadlineClock,
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a> {
+        if let Some(owner) = boundary.query_funding() {
+            return super::deadline_operation_funded(clock, super::DeadlineStage::RequestWrite,
+                deadline_ms, owner, || {
+                    let operation = boundary.encode_frame_funded(LocalOutboundMessage::Request(request))
+                        .and_then(|frame| write_readiness(stream, frame));
+                    async move { operation?.await }
+                });
+        }
         let operation = match boundary.encode_frame_funded(LocalOutboundMessage::Request(request)) {
             Ok(frame) => match write_readiness(stream, frame) {
                 Ok(write) => Box::pin(write) as LocalDeadlineOperation<'a>,
@@ -227,6 +243,19 @@ impl UnixLocalCarrier {
         clock: &'a dyn DeadlineClock,
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a, LocalResponse> {
+        if let Some(owner) = boundary.query_funding() {
+            return super::deadline_operation_funded(clock, super::DeadlineStage::Response, deadline_ms, owner, || {
+                let admission_reset = OrdinaryInboundReset::new(boundary, expectation == LocalResponseExpectation::OrdinaryResult);
+                let reader = boundary.cursor_frame_allowance().and_then(|memory| frame_readiness_with_memory(stream, memory));
+                async move {
+                    let mut admission_reset = admission_reset;
+                    let payload = reader?.await.map_err(frame_read_refusal)?;
+                    let LocalInboundMessage::Response(response) = boundary.decode_payload(LocalInboundKind::Response(expectation), &payload)
+                        .map_err(response_decode_refusal)? else { return Err(invalid_channel_data()); };
+                    admission_reset.disarm(); Ok(response)
+                }
+            });
+        }
         let admission_reset = OrdinaryInboundReset::new(
             boundary,
             expectation == LocalResponseExpectation::OrdinaryResult,
@@ -256,42 +285,27 @@ impl UnixLocalCarrier {
     }
 
     pub(crate) fn receive_query_response<'a>(
-        &'a self,
-        stream: &'a mut std::os::unix::net::UnixStream,
-        boundary: &'a LocalProtocolBoundary,
-        memory: crate::read_image_memory::ImageMemoryHandle,
-        clock: &'a dyn DeadlineClock,
-        deadline_ms: u64,
+        &'a self, stream: &'a mut std::os::unix::net::UnixStream,
+        boundary: &'a LocalProtocolBoundary, memory: crate::read_image_memory::ImageMemoryHandle,
+        clock: &'a dyn DeadlineClock, deadline_ms: u64,
     ) -> DeadlineOperationWait<'a, Funded<LocalResponse>> {
-        let admission_reset = OrdinaryInboundReset::new(boundary, true);
-        let allocator_memory = memory.clone();
-        let ceiling = boundary.effective_limits().memory;
-        let reader = frame_readiness_allocating(stream, None, move |length| {
-            Funded::allocate_owned(Some(allocator_memory.owner()), length, || vec![0_u8; length])
-                .map_err(|error| match crate::read_contract::encoding_error_from_core(error, ceiling) {
-                    crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } =>
-                        LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
-                            ceiling, required: None,
-                        }),
-                    _ => invalid_channel_data(),
-                })
-        });
-        let operation: LocalDeadlineOperation<'a, Funded<LocalResponse>> = match reader {
-            Ok(reader) => Box::pin(async move {
+        let owner = memory.owner();
+        super::deadline_operation_funded(clock, super::DeadlineStage::Response, deadline_ms, owner, || {
+            let admission_reset = OrdinaryInboundReset::new(boundary, true);
+            let allocator_memory = memory.clone();
+            let ceiling = boundary.effective_limits().memory;
+            let reader = frame_readiness_allocating(stream, None, move |length| {
+                Funded::allocate_owned(Some(allocator_memory.owner()), length, || vec![0_u8; length])
+                    .map_err(|error| super::query_funding::transport_error(error, ceiling))
+            });
+            async move {
                 let mut admission_reset = admission_reset;
-                let payload = reader.await.map_err(frame_read_refusal)?;
+                let payload = reader?.await.map_err(frame_read_refusal)?;
                 let response = boundary.decode_query_response(&payload.value, &memory)
                     .map_err(response_decode_refusal)?;
-                drop(payload);
-                admission_reset.disarm();
-                Ok(response)
-            }),
-            Err(error) => {
-                drop(admission_reset);
-                Box::pin(std::future::ready(Err(error)))
+                drop(payload); admission_reset.disarm(); Ok(response)
             }
-        };
-        receive_response_with_deadline(clock, deadline_ms, operation)
+        })
     }
 
     pub fn retry_connect<'a>(

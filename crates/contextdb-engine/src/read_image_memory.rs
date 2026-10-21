@@ -566,6 +566,26 @@ impl ImageMemory {
             "Reduce the statement's output or raise the declared reader memory limit.", ())
     }
 
+    /// Partition construction streams temporary decodes on the operation's
+    /// already supplied capability. Each call has an admitted native owner;
+    /// completing one call releases its payload before the next begins.
+    pub(crate) fn operation_reader_per_call(
+        accountant: crate::memory_accounting::AccountantHandle,
+        reader_budget: impl Into<ReadMemoryOwner>,
+    ) -> Result<ImageMemoryHandle> {
+        use contextdb_core::read_memory::ReadCredit;
+        let reader_budget = reader_budget.into();
+        let credit = ReadCredit::try_new_owned(reader_budget.clone(),
+            Self::admitted_control_bytes(), "vector_maintenance", "prepare_vector_generation",
+            "Raise MEMORY_LIMIT before inspecting this maintained route.")?;
+        let mut payload = Self::reader_payload(accountant, reader_budget,
+            "vector_maintenance", "prepare_vector_generation",
+            "Raise MEMORY_LIMIT before inspecting this maintained route.");
+        payload.per_call = Some(parking_lot::Mutex::new(None));
+        ReadMemoryOwner::try_native_typed(payload, credit)
+            .map(ImageMemoryHandle::Native).map_err(Error::NativeEngineOther)
+    }
+
     /// Actual write-side decoding borrows the existing writer accountant;
     /// the operation owner holds and releases only its own admitted payloads.
     pub(crate) fn operation_writer(
@@ -1174,7 +1194,8 @@ impl QueryAnswerCharge {
         match self {
             Self::Image(charge) => Some(charge.image.value.owner()),
             Self::Receiver(image) => Some(image.owner()),
-            _ => None,
+            Self::Reader(credit) => Some(credit.owner()),
+            Self::None => None,
         }
     }
     pub(crate) fn held(&self) -> usize {
@@ -2525,13 +2546,13 @@ impl ImageMemoryHandle {
         // and codec growth are already dropped.
         drop(slot.take());
         let call = match &self.reader_budget {
-            Some(reader) => ImageMemory::charging_reader_for(
+            Some(reader) => ImageMemory::admitted_reader_for(
                 self.accountant.clone(),
                 reader.clone(),
                 self.subsystem,
                 self.operation,
                 self.hint,
-            ),
+            )?,
             None => {
                 let mut payload = ImageMemory::writer_payload(self.accountant.clone(),
                     "writer_source", "decode_stored_value",

@@ -485,6 +485,16 @@ pub trait DeadlineClock: Send + Sync + 'static {
 
     fn wait_until(&self, deadline_ms: u64) -> DeadlineWait<'_>;
 
+    /// Engine-owned clocks admit their concrete wait before constructing it.
+    /// A custom host keeps creating its own opaque future through wait_until;
+    /// the engine never retrospectively charges that application allocation.
+    #[doc(hidden)]
+    fn try_owned_wait(
+        &self, _deadline_ms: u64, _owner: &ReadMemoryOwner,
+    ) -> crate::Result<Option<crate::read_memory::ReadOwnedFuture<'_, ()>>> {
+        Ok(None)
+    }
+
     #[doc(hidden)]
     fn try_native_source(
         &self,
@@ -2179,6 +2189,7 @@ pub(crate) struct CursorPageHandle {
     pub(crate) view: unsafe fn(std::ptr::NonNull<()>) -> &'static dyn CursorPageStorage,
     pub(crate) retain: unsafe fn(std::ptr::NonNull<()>),
     pub(crate) release: unsafe fn(std::ptr::NonNull<()>),
+    pub(crate) encoding_owner: unsafe fn(std::ptr::NonNull<()>) -> ReadMemoryOwner,
 }
 // SAFETY: constructors require immutable Send + Sync storage and callbacks
 // manipulate only its atomic ReadShared count or borrow its retained payload.
@@ -2193,6 +2204,7 @@ impl Clone for CursorPageHandle {
             view: self.view,
             retain: self.retain,
             release: self.release,
+            encoding_owner: self.encoding_owner,
         }
     }
 }
@@ -2234,6 +2246,11 @@ impl CursorPage {
         self.storage
             .as_ref()
             .map(|handle| unsafe { (handle.view)(handle.block) })
+    }
+    /// Retain the actual original publication invoice owner for encoding.
+    #[doc(hidden)]
+    pub fn encoding_owner(&self) -> Option<ReadMemoryOwner> {
+        self.storage.as_ref().map(|handle| unsafe { (handle.encoding_owner)(handle.block) })
     }
     pub fn columns(&self) -> &[String] {
         self.storage().map_or(&[], |page| page.columns())
@@ -2290,7 +2307,7 @@ impl CursorPage {
 pub struct PreparedCursorPage<T: CursorPageStorage, I: Send + Sync + 'static = crate::read_memory::ReadCredit> {
     storage: crate::read_memory::ReadPrepared<T, I>,
 }
-impl<T: CursorPageStorage, I: Send + Sync + 'static> PreparedCursorPage<T, I> {
+impl<T: CursorPageStorage, I: crate::read_memory::ReadSharedInvoice + 'static> PreparedCursorPage<T, I> {
     #[doc(hidden)]
     pub fn invoice(&self) -> &I { self.storage.invoice() }
 

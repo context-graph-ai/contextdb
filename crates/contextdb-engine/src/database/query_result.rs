@@ -50,6 +50,16 @@ impl QueryResult {
             inner: QueryResultInner::Empty { rows_affected },
         }
     }
+    /// Reuse the originating operation capability for later canonical output.
+    pub(crate) fn encoding_owner(&self) -> Option<ReadMemoryOwner> {
+        match &self.inner {
+            QueryResultInner::Empty { .. } => None,
+            QueryResultInner::Shared(answer) => answer.retained_read_memory.clone()
+                .or_else(|| answer.answer_charge.owner())
+                .or_else(|| answer.vector_copy_charge.owner())
+                .or_else(|| Some(answer.credit().owner())),
+        }
+    }
     pub fn columns(&self) -> &[String] {
         match &self.inner {
             QueryResultInner::Empty { .. } => &[],

@@ -1298,6 +1298,8 @@ fn attempt_route_once(
             presented,
             options.timeouts,
             read_clock(),
+            crate::local_transport::query_funding::QueryMemory::new(options.limits.memory.min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)))
+                .map_err(|error| RouteOpenRefusal { failure: ReadRouteOpenFailure::OwnerAuthentication, error })?.image().owner(),
         )) {
             Ok(client) => {
                 // An owner that is winding down accepts the connection and
@@ -2937,19 +2939,17 @@ impl ReadSession {
                 publication.read_memory = Some(read_memory.clone());
                 let answer = crate::read_image::project_metadata_from_database(
                     database,
-                    read_memory,
+                    read_memory.clone(),
                     request,
                     self.options.limits,
                     clock,
                     continuation,
                     cancellation,
                 )
-                .map(|(body, continuation)| MetadataAnswer {
-                    body,
-                    continuation,
-                    charge: Default::default(),
-                })
-                .map_err(|error| direct_error(Path::new(""), error))?;
+                .map_err(|error| direct_error(Path::new(""), error))
+                .and_then(|(body, continuation, charge)| MetadataAnswer::try_new(
+                    body, continuation, crate::read_image_memory::AnswerCharge::holding(charge), read_memory,
+                ))?;
                 database.publish_authoritative_read(&publication, |error| error, || Ok(answer))
             }
             // The committed file answers from the image the reader already
@@ -2957,11 +2957,7 @@ impl ReadSession {
             // exactly what a direct reader says.
             ReadSessionState::DirectFile(reader) => reader
                 .metadata_from_with_cancellation(request, continuation, cancellation)
-                .map(|answered| MetadataAnswer {
-                    body: answered.body,
-                    continuation: answered.continuation,
-                    charge: answered.charge,
-                })
+                .map(|answered| answered.metadata)
                 .map_err(|error| direct_error(Path::new(""), error)),
             ReadSessionState::OwnerChannel(owner) => {
                 self.owner_metadata(owner, request, continuation, cancellation)
@@ -3039,10 +3035,10 @@ impl ReadSession {
                 .map_or(u64::MAX, |bytes| bytes as u64),
         );
         let receiving_memory = crate::read_contract::decoder_memory(receiving_limit)?;
-        let responses = owner.ask(
+        let responses = owner.ask_with_cursor_memory(
             limits,
             crate::local_transport::LocalRequest::Metadata { request: local },
-            Some(cancellation),
+            Some(cancellation), None, Some(receiving_memory.owner()),
             #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )?;
@@ -3063,7 +3059,9 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
-        let answered = owner.ask(
+        let receiving_limit = self.options.limits.memory.min(self.options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64));
+        let receiving_memory = crate::read_contract::decoder_memory(receiving_limit)?;
+        let answered = owner.ask_with_cursor_memory(
             self.options.limits,
             crate::local_transport::LocalRequest::Explain {
                 statement: sql,
@@ -3072,7 +3070,7 @@ impl ReadSession {
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect(),
             },
-            Some(cancellation),
+            Some(cancellation), None, Some(receiving_memory.owner()),
             #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )?;
@@ -3080,13 +3078,10 @@ impl ReadSession {
         // writer the file route uses, so it is read back with that writer's
         // own inverse rather than re-derived from a query result.
         let body =
-            crate::read_contract::decode_metadata_body(&published_explain_payload(answered)?)
-                .map_err(|error| Error::Other((error.to_string()).into()))?;
-        Ok(MetadataAnswer {
-            body,
-            continuation: None,
-            charge: Default::default(),
-        })
+            crate::read_contract::decode_metadata_body_with_memory(&published_explain_payload(answered)?, &receiving_memory, receiving_limit)
+                .map_err(read_encoding_error)?;
+        MetadataAnswer::try_new(body, None,
+            crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()), receiving_memory.owner())
     }
 
     /// Present this session's kernel observer, if a test attached one, in the
@@ -3181,6 +3176,7 @@ impl ReadSession {
                         self.options.limits.memory,
                         &retained_memory,
                     )),
+                    Some(retained_owner.clone()),
                     #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
@@ -3644,6 +3640,7 @@ impl ReadSession {
                     presented,
                     options.timeouts,
                     read_clock(),
+                    crate::local_transport::query_funding::QueryMemory::new(options.limits.memory.min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)))?.image().owner(),
                 )) {
                     Ok(mut client) => {
                         let answered = wait_for_local_answer(client.request(
@@ -3783,6 +3780,7 @@ impl OwnerRoute {
             request,
             cancellation,
             None,
+            None,
             #[cfg(any(test, feature = "test-seams"))]
             observer,
         )
@@ -3827,6 +3825,7 @@ impl OwnerRoute {
         request: crate::local_transport::LocalRequest,
         cancellation: Option<&OwnerReadCancellation>,
         cursor_memory: Option<u64>,
+        original_owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
         #[cfg(any(test, feature = "test-seams"))] observer: Option<
             &Arc<dyn ReadSessionTestObserver>,
         >,
@@ -3841,11 +3840,20 @@ impl OwnerRoute {
                 observer.observe_event(ReadSessionEvent::ResponseFrameReceived { terminal });
             })));
         }
+        let owned_request;
+        let request_owner = match original_owner {
+            Some(owner) => owner,
+            None => {
+                owned_request = crate::local_transport::query_funding::QueryMemory::with_original_owner(client.original_connection_owner(), limits.memory)?;
+                owned_request.image().owner()
+            }
+        };
         let answered = wait_for_local_answer(client.request_watching_under_cursor_memory(
             crate::local_transport::LocalRequestEnvelope { limits, request },
             progress.as_ref(),
             cancellation,
             cursor_memory,
+            request_owner,
         ));
         #[cfg(any(test, feature = "test-seams"))]
         client.observe_response_frames_for_test(None);
@@ -3999,14 +4007,39 @@ impl OwnerReport {
 /// The continuation sits beside the body rather than inside it: the body is
 /// the published document, byte-for-byte the same on every route, and where a
 /// paged read left off is this exchange's business, not the document's.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MetadataAnswer {
+/// Immutable metadata. Clones retain the same admitted body and continuation;
+/// a field projection cannot detach their allocations from original custody.
+#[derive(Debug, Clone)]
+pub struct MetadataAnswer(contextdb_core::read_memory::ReadShared<MetadataAnswerData>);
+#[derive(Debug, PartialEq)]
+pub struct MetadataAnswerData {
     pub body: MetadataBody,
-    /// Where to resume, when this answer was one page of an inventory and more
-    /// of it remains. Absent means the answer is complete.
     pub continuation: Option<String>,
-    /// What the answer holds against the session's memory while it is held.
     pub(crate) charge: crate::read_image_memory::AnswerCharge,
+}
+impl std::ops::Deref for MetadataAnswer {
+    type Target = MetadataAnswerData;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl PartialEq for MetadataAnswer {
+    fn eq(&self, other: &Self) -> bool { *self.0 == *other.0 }
+}
+impl MetadataAnswer {
+    pub(crate) fn try_new(
+        body: MetadataBody, continuation: Option<String>,
+        charge: crate::read_image_memory::AnswerCharge,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<Self> {
+        use contextdb_core::read_memory::{ReadCredit, ReadShared, NativeProduce};
+        let invoice = ReadCredit::try_new_owned(owner, ReadShared::<MetadataAnswerData>::layout().size(),
+            "reader", "metadata_answer", "Raise the reader memory limit.")?;
+        ReadShared::try_from_prepaid_with_native(invoice, || Ok::<_, Error>(MetadataAnswerData {
+            body, continuation, charge,
+        })).map(Self).map_err(|error| match error {
+            NativeProduce::Refused(error) => Error::NativeEngineOther(error),
+            NativeProduce::Producer(error) => error,
+        })
+    }
 }
 
 /// Whether this kind of question can be answered a page at a time.
@@ -4098,34 +4131,28 @@ fn promoted_metadata_answer(
                 limits.memory,
             )
             .map_err(read_encoding_error)?;
-            Ok(MetadataAnswer {
-                body,
-                continuation: None,
-                charge: crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()),
-            })
+            MetadataAnswer::try_new(body, None,
+                crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()), receiving_memory.owner())
         }
         MetadataRequest::Tables => {
-            let page = decoded_metadata_page(payload, limits)?;
-            Ok(MetadataAnswer {
-                body: MetadataBody::Tables {
-                    items: crate::metadata_page::table_names_of(&page),
-                    has_more: page.has_more,
-                },
-                continuation: page.continuation,
-                charge: Default::default(),
-            })
+            let page = crate::read_contract::decode_metadata_page_with_memory(payload, &receiving_memory, limits.memory)
+                .map_err(read_encoding_error)?;
+            let body = MetadataBody::Tables {
+                items: crate::metadata_page::table_names_of_funded(&page, &receiving_memory)?, has_more: page.has_more,
+            };
+            MetadataAnswer::try_new(body, page.continuation,
+                crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()), receiving_memory.owner())
         }
         MetadataRequest::EventsStatus => {
-            let page = decoded_metadata_page(payload, limits)?;
-            Ok(MetadataAnswer {
-                body: MetadataBody::EventsStatus {
-                    status: crate::metadata_page::events_of(&page),
-                    has_more: page.has_more,
-                    continuation: page.continuation.clone(),
-                },
-                continuation: page.continuation,
-                charge: Default::default(),
-            })
+            let page = crate::read_contract::decode_metadata_page_with_memory(payload, &receiving_memory, limits.memory)
+                .map_err(read_encoding_error)?;
+            receiving_memory.reserve(page.continuation.as_ref().map_or(0, String::len))?;
+            let body = MetadataBody::EventsStatus {
+                status: crate::metadata_page::events_of_funded(&page, &receiving_memory)?, has_more: page.has_more,
+                continuation: page.continuation.clone(),
+            };
+            MetadataAnswer::try_new(body, page.continuation,
+                crate::read_image_memory::AnswerCharge::holding(receiving_memory.clone()), receiving_memory.owner())
         }
         MetadataRequest::Explain { .. } | MetadataRequest::ImageState { .. } => {
             Err(Error::ReadFailure(owner_disconnected()))
@@ -4149,6 +4176,7 @@ fn read_encoding_error(error: crate::read_contract::ReadEncodingError) -> Error 
     };
 
     match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => error,
         crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
             Error::ReadFailure(ReadFailure::owner_limit_exceeded(
                 OwnerLimitExceededDetail {
@@ -5095,6 +5123,7 @@ impl OwnerCursorExecution {
             request,
             cancellation,
             cursor_memory,
+            Some(self.retained_owner.clone()),
             #[cfg(any(test, feature = "test-seams"))]
             self.observer.as_ref(),
         )

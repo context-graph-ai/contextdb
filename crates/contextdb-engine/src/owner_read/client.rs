@@ -29,6 +29,7 @@ pub struct OwnerClient {
     presented_handshake: LocalHandshake,
     timeouts: ReadClientTimeouts,
     clock: Arc<dyn DeadlineClock>,
+    connection_owner: contextdb_core::read_memory::ReadMemoryOwner,
     requests_sent: u64,
     cancellations: Arc<CancelCoordination>,
     /// What the owner said about itself when it accepted this reader.
@@ -65,32 +66,29 @@ impl OwnerClient {
         presented_handshake: LocalHandshake,
         timeouts: ReadClientTimeouts,
         clock: Arc<dyn DeadlineClock>,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<Self> {
         timeouts.validate()?;
         let channel_path = channel_path.as_ref().to_path_buf();
         let deadline_ms = checked_deadline(clock.as_ref(), timeouts.connect_ms)?;
         let carrier = UnixLocalCarrier;
         let mut stream = carrier
-            .connect(&channel_path, clock.as_ref(), deadline_ms)
+            .connect_funded(&channel_path, clock.as_ref(), deadline_ms, owner.clone())
             .await
             .map_err(OwnerReadScaffoldError::from_local)?;
         let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits::default());
-        let handshake: LocalDeadlineOperation<'_> = Box::pin(async {
-            UnixLocalCarrier::send_message(
-                &carrier,
-                &mut stream,
-                &boundary,
-                LocalOutboundMessage::Handshake(&presented_handshake),
-            )
-        });
-        handshake_with_deadline(clock.as_ref(), deadline_ms, handshake)
-            .await
-            .map_err(OwnerReadScaffoldError::from_local)?;
+        boundary.set_query_funding(Some(owner.clone()));
+        crate::local_transport::deadline_operation_funded(clock.as_ref(),
+            crate::local_transport::DeadlineStage::Handshake, deadline_ms, owner.clone(), || async {
+                UnixLocalCarrier::send_message(&carrier, &mut stream, &boundary,
+                    LocalOutboundMessage::Handshake(&presented_handshake))
+            }).await.map_err(OwnerReadScaffoldError::from_local)?;
         let mut client = Self {
             channel_path,
             presented_handshake,
             timeouts,
             clock,
+            connection_owner: owner,
             requests_sent: 0,
             cancellations: Arc::new(CancelCoordination::default()),
             accepted_status: None,
@@ -119,10 +117,10 @@ impl OwnerClient {
     #[cfg(unix)]
     async fn confirm_the_owner_accepted_this_reader(&mut self) -> OwnerReadScaffoldResult<()> {
         let answered = self
-            .request(LocalRequestEnvelope {
+            .request_with_original_owner(LocalRequestEnvelope {
                 limits: ReadLimits::default(),
                 request: LocalRequest::OwnerStatus,
-            })
+            }, self.connection_owner.clone())
             .await?;
         for response in answered {
             match response {
@@ -189,6 +187,10 @@ impl OwnerClient {
         self.response_frames = observer;
     }
 
+    pub(crate) fn original_connection_owner(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
+        self.connection_owner.clone()
+    }
+
     /// Decode one request only after the length prefix has passed the shared
     /// pre-allocation admission check. This reads through the same typed
     /// protocol boundary the carrier uses, but keeps the refusal decode
@@ -216,10 +218,12 @@ impl OwnerClient {
 
     /// Encode a request through the shared payload and frame codecs, via the
     /// same typed protocol boundary the carrier uses to write one.
-    pub fn encode_envelope(envelope: &LocalRequestEnvelope) -> OwnerReadScaffoldResult<Vec<u8>> {
+    pub fn encode_envelope(
+        envelope: &LocalRequestEnvelope, owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<crate::read_contract::EncodedReadBytes> {
         let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits::default());
         boundary
-            .encode_frame(LocalOutboundMessage::Request(envelope))
+            .encode_frame(LocalOutboundMessage::Request(envelope), owner)
             .map_err(OwnerReadScaffoldError::from_local)
     }
 
@@ -231,17 +235,23 @@ impl OwnerClient {
         &mut self,
         envelope: LocalRequestEnvelope,
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
-        let custody = if response_expectation(&envelope.request) == LocalResponseExpectation::OrdinaryResult {
-            Some(crate::local_transport::query_funding::QueryMemory::new(envelope.limits.memory)
-                .map_err(OwnerReadScaffoldError::Database)?)
-        } else { None };
+        let custody = Some(crate::local_transport::query_funding::QueryMemory::with_original_owner(self.connection_owner.clone(), envelope.limits.memory)
+                .map_err(OwnerReadScaffoldError::Database)?);
         let answered = self.request_watching_funded(envelope, None, None, None,
-            custody.as_ref()).await;
+            custody.as_ref(), None).await;
         match answered {
             Ok(responses) => responses.into_public().map_err(OwnerReadScaffoldError::Database),
             Err(error) => Err(custody.as_ref().and_then(|q| q.take_stop())
                 .map(OwnerReadScaffoldError::Database).unwrap_or(error)),
         }
+    }
+
+    #[cfg(unix)]
+    async fn request_with_original_owner(
+        &mut self, envelope: LocalRequestEnvelope, owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+        self.request_watching_funded(envelope, None, None, None, None, Some(owner)).await?
+            .into_public().map_err(OwnerReadScaffoldError::Database)
     }
 
     /// Send one request, hear what the owner's read is doing while it runs,
@@ -266,12 +276,10 @@ impl OwnerClient {
         if cancellation.is_some_and(OwnerReadCancellation::is_cancelled) {
             return Err(OwnerReadScaffoldError::Database(contextdb_core::Error::ReadCancelled));
         }
-        let custody = if response_expectation(&envelope.request) == LocalResponseExpectation::OrdinaryResult {
-            Some(crate::local_transport::query_funding::QueryMemory::new(envelope.limits.memory)
-                .map_err(OwnerReadScaffoldError::Database)?)
-        } else { None };
+        let custody = Some(crate::local_transport::query_funding::QueryMemory::with_original_owner(self.connection_owner.clone(), envelope.limits.memory)
+                .map_err(OwnerReadScaffoldError::Database)?);
         let answered = self.request_watching_funded(envelope, progress, cancellation, None,
-            custody.as_ref()).await;
+            custody.as_ref(), None).await;
         match answered {
             Ok(responses) => responses.into_public().map_err(OwnerReadScaffoldError::Database),
             Err(error) => Err(custody.as_ref().and_then(|q| q.take_stop())
@@ -286,6 +294,7 @@ impl OwnerClient {
         &mut self, envelope: LocalRequestEnvelope,
         progress: Option<&Arc<dyn ReadProgressObserver>>,
         cancellation: Option<&OwnerReadCancellation>, cursor_memory: Option<u64>,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
         if cancellation.is_some_and(OwnerReadCancellation::is_cancelled) {
             return Err(OwnerReadScaffoldError::Database(contextdb_core::Error::ReadCancelled));
@@ -293,7 +302,7 @@ impl OwnerClient {
         if let Some(failure) = &self.terminal_refusal {
             return Err(OwnerReadScaffoldError::Refused(failure.clone()));
         }
-        self.request_watching_funded(envelope, progress, cancellation, cursor_memory, None)
+        self.request_watching_funded(envelope, progress, cancellation, cursor_memory, None, Some(owner))
             .await?.into_public().map_err(OwnerReadScaffoldError::Database)
     }
 
@@ -308,7 +317,7 @@ impl OwnerClient {
         // the whole envelope before this outside invoice may settle.
         let Funded { value: request, credit: _request_credit } = request;
         let envelope = LocalRequestEnvelope { limits, request };
-        self.request_watching_funded(envelope, progress, cancellation, None, Some(memory)).await
+        self.request_watching_funded(envelope, progress, cancellation, None, Some(memory), None).await
     }
 
     #[cfg(unix)]
@@ -319,6 +328,7 @@ impl OwnerClient {
         cancellation: Option<&OwnerReadCancellation>,
         cursor_memory: Option<u64>,
         query_custody: Option<&crate::local_transport::query_funding::QueryMemory>,
+        supplied_owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> OwnerReadScaffoldResult<FundedVec<Funded<LocalResponse>>> {
         // A statement its caller has already withdrawn is not sent at all.
         // Sending it and interrupting it a moment later makes the answer a
@@ -357,8 +367,9 @@ impl OwnerClient {
                     "ordinary query requires its original terminal custody")),
             })
         } else { None };
-        boundary.set_query_funding(query_memory.as_ref().map(|memory|
-            memory.owner()));
+        let operation_owner = query_custody.map(|memory| memory.image().owner()).or(supplied_owner)
+            .expect("internal request carries its original read owner");
+        boundary.set_query_funding(Some(operation_owner));
         let carrier = UnixLocalCarrier;
         // An owner that refuses a connection answers it and then closes, so
         // the request going out and the answer coming back cross: the write
