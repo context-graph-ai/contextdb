@@ -1281,8 +1281,25 @@ impl PartialEq for AnswerCharge {
     }
 }
 
+// This is a borrowed capability representation, never an additional strong
+// count. The entering scope owns a real cloned handle until after restoration.
+// ManuallyDrop prevents thread-exit registration and accidental settlement.
+struct BorrowedActiveOwner {
+    owner: std::mem::ManuallyDrop<ImageMemoryHandle>,
+    generation: usize,
+}
+impl BorrowedActiveOwner {
+    fn new(owner: &ImageMemoryHandle, generation: usize) -> Self {
+        // SAFETY: the scope retains this exact existing capability. This copies
+        // its representation for shared borrowing only; it is never consumed,
+        // dropped, or reconstructed from an ImageMemory payload/raw Arc.
+        let owner = std::mem::ManuallyDrop::new(unsafe { std::ptr::read(owner) });
+        Self { owner, generation }
+    }
+}
 thread_local! {
-    static ACTIVE: RefCell<Option<crate::read_image_memory::ImageMemoryHandle>> = const { RefCell::new(None) };
+    static ACTIVE: RefCell<Option<BorrowedActiveOwner>> = const { RefCell::new(None) };
+    static ACTIVE_GENERATION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NATIVE_DECODE: std::cell::Cell<Option<std::ptr::NonNull<NativeDecodeMemory>>> =
         const { std::cell::Cell::new(None) };
 }
@@ -1432,20 +1449,31 @@ pub(crate) fn decode_msgpack_native<T: de::DeserializeOwned>(
 /// Inline restoration preserves nested owners and failure unwinding without a
 /// heap-allocated context stack.
 pub(crate) struct ImageMemoryScope {
-    previous: Option<crate::read_image_memory::ImageMemoryHandle>,
+    previous: Option<BorrowedActiveOwner>,
+    generation: usize,
+    // Restore JSON admission before releasing the handle that funds it.
     _json: contextdb_core::types::JsonReadAdmissionGuard,
+    _owner: ImageMemoryHandle,
+    _same_thread: PhantomData<std::rc::Rc<()>>,
 }
 impl Drop for ImageMemoryScope {
     fn drop(&mut self) {
         ACTIVE.with(|active| {
-            active.replace(self.previous.take());
+            let mut active = active.borrow_mut();
+            // Internal scopes must retire in nesting order. Continuing after
+            // a misplaced retirement would leave a borrowed capability dangling.
+            // Abort before freeing either keeper, including during unwinding.
+            if active.as_ref().map(|active| active.generation) != Some(self.generation) {
+                std::process::abort();
+            }
+            *active = self.previous.take();
         });
     }
 }
 
 pub(crate) fn active_owner() -> Result<crate::read_image_memory::ImageMemoryHandle> {
     ACTIVE
-        .with(|active| active.borrow().clone())
+        .with(|active| active.borrow().as_ref().map(|active| ImageMemoryHandle::clone(&active.owner)))
         .ok_or_else(|| Error::Other("engine decode requires an operation memory owner".into()))
 }
 
@@ -1474,7 +1502,7 @@ pub(crate) fn current_reader_budget()
         active
             .borrow()
             .as_ref()
-            .and_then(|owner| owner.reader_budget())
+            .and_then(|active| active.owner.reader_budget())
     })
 }
 
@@ -2701,11 +2729,21 @@ impl ImageMemoryHandle {
     /// owner with the same funder and labels; any other owner is entered
     /// as is.
     pub(crate) fn enter(&self) -> ImageMemoryScope {
-        let previous = ACTIVE.with(|active| active.replace(Some(self.clone())));
-        let json = contextdb_core::types::JsonReadAdmissionGuard::enter_owned(self.owner());
+        let owner = self.clone();
+        // JSON entry can unwind; install ACTIVE only after both keepers exist.
+        let json = contextdb_core::types::JsonReadAdmissionGuard::enter_owned(owner.owner());
+        let generation = ACTIVE_GENERATION.with(|next| {
+            let generation = next.get().checked_add(1).unwrap_or_else(|| std::process::abort());
+            next.set(generation);
+            generation
+        });
+        let previous = ACTIVE.with(|active| active.replace(Some(BorrowedActiveOwner::new(&owner, generation))));
         ImageMemoryScope {
             previous,
+            generation,
             _json: json,
+            _owner: owner,
+            _same_thread: PhantomData,
         }
     }
 
