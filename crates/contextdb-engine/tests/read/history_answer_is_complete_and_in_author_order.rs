@@ -110,7 +110,7 @@ fn change_history(reader: &DirectFileReader) -> Result<DirectChangeState, Direct
         .metadata(DirectMetadataRequest::ImageState {
             kind: DirectImageMetadataKind::ChangeLog,
         })
-        .map(|response| match response.body {
+        .map(|response| match response.body.clone() {
             DirectMetadataBody::ImageState {
                 state: DirectImageState::ChangeLog(changes),
             } => changes,
@@ -429,7 +429,7 @@ fn history_under(
         },
         cancellation,
     )
-    .map(|response| match response.body {
+    .map(|response| match response.body.clone() {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),
         } => changes,

@@ -1290,7 +1290,7 @@ fn assert_query(reader: &DirectFileReader, expected: &ExpectedQuery) -> (Vec<u8>
     assert_eq!(result.result.rows(), expected.rows, "{} rows", expected.label);
     assert_eq!(
         result.canonical_bytes,
-        encode_query_result(&result.result)
+        encode_query_result(&result.result, result.result.encoding_owner_for_test())
             .expect("shared canonical encoder supplies ordinary-result bytes")
     );
     (result.canonical_bytes.to_vec(), result.snapshot)
@@ -1472,7 +1472,7 @@ fn assert_complete_public_image_state(
             kind: DirectImageMetadataKind::ChangeLog,
         })
         .expect("the change history answers on request")
-        .body
+        .body.clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),
@@ -3614,7 +3614,7 @@ fn direct_file_damage_child() {
         let tables = match reader
             .metadata(DirectMetadataRequest::Tables)
             .expect("list damaged fixture tables")
-            .body
+            .body.clone()
         {
             DirectMetadataBody::Tables { items, .. } => items,
             other => panic!("table inventory has the wrong body: {other:?}"),
@@ -3638,7 +3638,7 @@ fn direct_file_damage_child() {
                     table: table.clone(),
                 })
                 .expect("inspect damaged fixture schema")
-                .body
+                .body.clone()
             {
                 DirectMetadataBody::Schema { schema } => schema,
                 other => panic!("schema inspection has the wrong body: {other:?}"),

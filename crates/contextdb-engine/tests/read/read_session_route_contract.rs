@@ -323,8 +323,8 @@ fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
     );
     assert_eq!(file_result.rows().len(), row_count);
     assert_eq!(
-        encode_query_result(&file_result).expect("encode file result canonically"),
-        encode_query_result(&owner_result).expect("encode owner result canonically"),
+        encode_query_result(&file_result, file_result.encoding_owner_for_test()).expect("encode file result canonically"),
+        encode_query_result(&owner_result, owner_result.encoding_owner_for_test()).expect("encode owner result canonically"),
     );
     assert!(matches!(
         (file_error, owner_error),

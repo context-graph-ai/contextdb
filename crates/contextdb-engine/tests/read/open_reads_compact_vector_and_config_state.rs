@@ -185,7 +185,7 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
     let DirectMetadataBody::Tables {
         mut items,
         has_more,
-    } = schemas.body
+    } = schemas.body.clone()
     else {
         panic!("schema directory has a table inventory");
     };
@@ -202,7 +202,7 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
         .expect("read committed configuration");
     let DirectMetadataBody::ImageState {
         state: DirectImageState::Configuration(configuration),
-    } = configuration.body
+    } = configuration.body.clone()
     else {
         panic!("configuration is a typed committed image");
     };

@@ -60,6 +60,12 @@ impl QueryResult {
                 .or_else(|| Some(answer.credit().owner())),
         }
     }
+    /// Existing answer owner for fixture serializers; never opens another bank.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn encoding_owner_for_test(&self) -> ReadMemoryOwner {
+        self.encoding_owner().expect("fixture supplies a funded answer")
+    }
     pub fn columns(&self) -> &[String] {
         match &self.inner {
             QueryResultInner::Empty { .. } => &[],

@@ -114,7 +114,7 @@ fn schema_of(session: &ReadSession, table: &str) -> DirectSchema {
             None,
         )
         .unwrap_or_else(|error| panic!("the read door answers the schema of {table}: {error}"));
-    match answer.body {
+    match answer.body.clone() {
         MetadataBody::Schema { schema } => {
             let replayed = Database::open_memory();
             replayed

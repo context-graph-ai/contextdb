@@ -556,7 +556,7 @@ fn sink_queued(
     match reader
         .metadata(DirectMetadataRequest::EventsStatus)
         .expect("events status answers")
-        .body
+        .body.clone()
     {
         DirectMetadataBody::EventsStatus { status, .. } => status
             .sinks
@@ -672,7 +672,7 @@ fn open_history_footprint_child() {
             kind: DirectImageMetadataKind::ChangeLog,
         })
         .expect("the change history answers on request")
-        .body
+        .body.clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),

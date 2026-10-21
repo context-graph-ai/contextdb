@@ -303,7 +303,7 @@ fn both_routes_describe_the_same_store_the_same_way() {
         let events = session
             .metadata(MetadataRequest::EventsStatus, None)
             .expect("the owner answers");
-        (tables.body, schema.body, events.body)
+        (tables.body.clone(), schema.body.clone(), events.body.clone())
     };
 
     // The same store, now idle, asked the same questions.
@@ -317,7 +317,7 @@ fn both_routes_describe_the_same_store_the_same_way() {
         session
             .metadata(MetadataRequest::Tables, None)
             .expect("the file answers")
-            .body,
+            .body.clone(),
         session
             .metadata(
                 MetadataRequest::Schema {
@@ -326,11 +326,11 @@ fn both_routes_describe_the_same_store_the_same_way() {
                 None,
             )
             .expect("the file answers")
-            .body,
+            .body.clone(),
         session
             .metadata(MetadataRequest::EventsStatus, None)
             .expect("the file answers")
-            .body,
+            .body.clone(),
     );
 
     assert_eq!(
@@ -641,7 +641,7 @@ fn a_continuation_is_refused_by_a_question_that_never_issues_one() {
     let issued = paging
         .metadata(MetadataRequest::Tables, None)
         .expect("the table inventory answers")
-        .continuation
+        .continuation.clone()
         .expect("this ceiling stops the inventory early, so it issues a token");
 
     let crossed = paging.metadata(MetadataRequest::EventsStatus, Some(&issued));
@@ -726,7 +726,7 @@ fn drain_the_table_inventory(session: &ReadSession) -> Vec<Vec<String>> {
             .metadata(MetadataRequest::Tables, resume.as_deref())
             .expect("a page of the table inventory");
         pages.push(table_names(&answer.body));
-        match answer.continuation {
+        match answer.continuation.clone() {
             Some(next) => resume = Some(next),
             None => break,
         }
@@ -827,7 +827,7 @@ fn a_continuation_from_one_route_resumes_the_same_place_on_the_other() {
             .expect("the owner's first page");
         (
             table_names(&answer.body),
-            answer.continuation.expect("the owner has more to give"),
+            answer.continuation.clone().expect("the owner has more to give"),
         )
     };
 

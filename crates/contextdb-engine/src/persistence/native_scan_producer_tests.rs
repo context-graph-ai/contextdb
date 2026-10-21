@@ -37,7 +37,9 @@ struct Reader {
 impl Reader {
     fn new(limit: u64) -> Self {
         let parent = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
-        let child = parent.child().unwrap();
+        let (child, _) = crate::vector_read_memory::statement_child_proof::observe(
+            &parent, limit, || parent.child().unwrap(),
+        );
         let counter = declared_child_observer(&child)
             .unwrap()
             .physical_funding_counter_for_test();

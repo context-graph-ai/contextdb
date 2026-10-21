@@ -87,7 +87,7 @@ fn history(
         .expect("the reader opens: the tombstone is checked when history is read");
     reader
         .metadata(DirectMetadataRequest::ImageState { kind })
-        .map(|response| match response.body {
+        .map(|response| match response.body.clone() {
             DirectMetadataBody::ImageState {
                 state: DirectImageState::ChangeLog(_) | DirectImageState::Sync(_),
             } => {}
