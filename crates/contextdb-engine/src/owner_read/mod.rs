@@ -57,7 +57,7 @@ pub enum OwnerReadScaffoldError {
     #[error("read-contract prerequisite failed: {0}")]
     ReadContract(#[from] ReadContractViolation),
     #[error("local transport prerequisite failed: {0}")]
-    LocalTransport(#[from] LocalTransportError),
+    LocalTransport(LocalTransportError),
     #[error("owner request refused: {0:?}")]
     Refused(ReadFailure),
     #[error("database prerequisite failed: {0}")]
@@ -70,6 +70,10 @@ impl OwnerReadScaffoldError {
     }
 
     pub(crate) fn from_local(error: LocalTransportError) -> Self {
+        let error = match error.into_admission_error() {
+            Ok(error) => return Self::Database(error),
+            Err(error) => error,
+        };
         match error {
             LocalTransportError::Refusal(failure) => Self::Refused(failure),
             // A payload that is exactly what it claims to be and simply too
@@ -113,3 +117,7 @@ fn response_expectation(request: &LocalRequest) -> LocalResponseExpectation {
 }
 
 pub type OwnerReadScaffoldResult<T> = std::result::Result<T, OwnerReadScaffoldError>;
+
+impl From<LocalTransportError> for OwnerReadScaffoldError {
+    fn from(error: LocalTransportError) -> Self { Self::from_local(error) }
+}

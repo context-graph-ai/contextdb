@@ -148,3 +148,26 @@ pub fn authenticate_framed_stream_handshake<'a>(
     };
     handshake_with_deadline(clock, deadline_ms, operation)
 }
+
+#[cfg(unix)]
+pub(crate) fn authenticate_framed_stream_handshake_funded<'a>(
+    stream: &'a mut std::os::unix::net::UnixStream, expected: &'a LocalHandshake,
+    clock: &'a dyn DeadlineClock, deadline_ms: u64,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> DeadlineOperationWait<'a, AdmittedReader> {
+    super::deadline_operation_funded(clock, super::DeadlineStage::Handshake, deadline_ms, owner, || {
+        let peer = peer_user_from_stream(stream).and_then(|peer_user| {
+            authenticate_peer(expected.owner_user, Ok(peer_user)).map(|principal| (peer_user, principal))
+        });
+        let reader = peer.and_then(|peer| frame_readiness(stream).map(|reader| (peer, reader)));
+        async move {
+            let ((peer_user, principal), reader) = reader?;
+            let bytes = reader.await.map_err(|_| super::invalid_channel_data())?;
+            let presented = super::decode_handshake_exact(&bytes).map_err(|error| {
+                if matches!(error, LocalTransportError::Refusal(_)) { error } else { super::invalid_channel_data() }
+            })?;
+            validate_handshake(expected, &presented, peer_user)?;
+            Ok(AdmittedReader { principal, declared: presented.declared })
+        }
+    })
+}

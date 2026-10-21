@@ -19616,6 +19616,7 @@ pub(super) fn open_cursor(
         erased: std::sync::atomic::AtomicBool::new(false),
         active_cancellation: Mutex::new(OwnerReadCancellation::new()),
         expiry_watch: Mutex::new(None),
+        expiry_failure: Mutex::new(None),
     });
     db.register_writer_cursor(&execution)?;
     start_cursor_expiry_watch(&execution, read_memory.clone())?;
@@ -19634,7 +19635,7 @@ pub(super) fn open_cursor(
 pub(super) struct CursorExpiryWatch {
     execution: std::sync::Weak<BoundedCursorExecutionState>,
     clock: Arc<dyn DeadlineClock>,
-    wait: Mutex<Option<(u64, contextdb_core::read_contract::DeadlineWait<'static>)>>,
+    wait: Mutex<Option<(u64, contextdb_core::read_memory::ReadOwnedFuture<'static, contextdb_core::Result<()>>)>>,
     _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
 }
 
@@ -19644,7 +19645,7 @@ impl CursorExpiryWatch {
         drop(wait);
     }
 
-    pub(super) fn drive(self: &Arc<Self>) {
+    pub(super) fn drive(&self) {
         let Some(execution) = self.execution.upgrade() else {
             self.retire();
             return;
@@ -19681,34 +19682,52 @@ impl CursorExpiryWatch {
             return;
         };
         if wait.as_ref().is_none_or(|(armed, _)| *armed != deadline) {
-            let clock = self.clock.clone();
-            *wait = Some((
-                deadline,
-                Box::pin(async move { clock.wait_until(deadline).await }),
-            ));
+            match owned_cursor_expiry_wait(self.clock.clone(), deadline, self._read_memory.clone()) {
+                Ok(armed) => *wait = Some((deadline, armed)),
+                Err(error) => {
+                    drop(wait);
+                    self.refuse(&execution, error);
+                    return;
+                }
+            }
         }
-        let waker = std::task::Waker::from(self.clone());
+        // This method is called only through the paid watch or its native
+        // wake lease. Borrow that existing count without consuming it, then
+        // retain one real count for the Waker; no synthetic weak owner exists.
+        let borrowed = std::mem::ManuallyDrop::new(unsafe {
+            contextdb_core::read_memory::ReadShared::from_raw(self as *const Self)
+        });
+        let waker = (*borrowed).clone().into_read_waker();
         let mut context = std::task::Context::from_waker(&waker);
-        let ready = wait
-            .as_mut()
-            .is_some_and(|(_, wait)| wait.as_mut().poll(&mut context).is_ready());
-        if ready {
+        let outcome = wait.as_mut().map(|(_, wait)| std::pin::Pin::new(wait).poll(&mut context));
+        if let Some(std::task::Poll::Ready(Err(error))) = outcome {
+            let completed = wait.take(); drop(wait); drop(completed);
+            self.refuse(&execution, error);
+            return;
+        }
+        if matches!(outcome, Some(std::task::Poll::Ready(Ok(())))) {
             // Latch completion: a failed timer arm is also a one-shot. Reuse
             // the established monotonic timer for the remaining interval.
             let now = self.clock.now_ms();
             if now < deadline {
                 let remaining = deadline.saturating_sub(now);
-                *wait = Some((
-                    deadline,
-                    Box::pin(async move {
-                        let fallback = crate::local_transport::MonotonicDeadlineClock::new();
-                        fallback.wait_until(remaining).await;
-                    }),
-                ));
-                let fallback_ready = wait
-                    .as_mut()
-                    .is_some_and(|(_, fallback)| fallback.as_mut().poll(&mut context).is_ready());
-                if fallback_ready {
+                let owner = self._read_memory.clone();
+                let fallback = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(async move {
+                    let fallback = crate::local_transport::MonotonicDeadlineClock::new();
+                    crate::local_transport::wait_until_owned(&fallback, remaining, &owner)?.await;
+                    Ok(())
+                }));
+                match fallback {
+                    Ok(fallback) => *wait = Some((deadline, fallback)),
+                    Err(error) => { drop(wait); self.refuse(&execution, error); return; }
+                }
+                let fallback_outcome = wait.as_mut().map(|(_, fallback)| std::pin::Pin::new(fallback).poll(&mut context));
+                if let Some(std::task::Poll::Ready(Err(error))) = fallback_outcome {
+                    let completed = wait.take(); drop(wait); drop(completed);
+                    self.refuse(&execution, error);
+                    return;
+                }
+                if matches!(fallback_outcome, Some(std::task::Poll::Ready(Ok(())))) {
                     let completed = wait.take();
                     drop(wait);
                     drop(completed);
@@ -19740,13 +19759,32 @@ impl CursorExpiryWatch {
         }
     }
 }
-impl std::task::Wake for CursorExpiryWatch {
-    fn wake(self: Arc<Self>) {
-        self.drive();
+impl contextdb_core::read_memory::NativeReadWake for CursorExpiryWatch {
+    fn wake_read(&self) { self.drive(); }
+}
+impl CursorExpiryWatch {
+    fn refuse(&self, execution: &BoundedCursorExecutionState, error: Error) {
+        let mut lifecycle = execution.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        if let BoundedCursorLifecycle::Open(state) = &mut *lifecycle {
+            let failure = BoundedExecutionError::Engine(error);
+            state.finish_plugin_error(&failure);
+            release_cursor_lifecycle(&mut lifecycle, BoundedCursorTerminalReason::Refused);
+            if let BoundedExecutionError::Engine(error) = failure {
+                *execution.expiry_failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
+            }
+        }
+        drop(lifecycle);
+        execution.retire_expiry();
     }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.drive();
-    }
+}
+fn owned_cursor_expiry_wait(
+    clock: Arc<dyn DeadlineClock>, deadline: u64,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> contextdb_core::Result<contextdb_core::read_memory::ReadOwnedFuture<'static, contextdb_core::Result<()>>> {
+    contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(async move {
+        crate::local_transport::wait_until_owned(clock.as_ref(), deadline, &owner)?.await;
+        Ok(())
+    }))
 }
 
 fn start_cursor_expiry_watch(
@@ -19765,12 +19803,17 @@ fn start_cursor_expiry_watch(
         };
         state.context.clock.clone()
     };
-    let watch = Arc::new(CursorExpiryWatch {
-        execution: Arc::downgrade(execution),
-        clock,
-        wait: Mutex::new(None),
-        _read_memory: (read_memory).into(),
-    });
+    let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
+        read_memory.clone(), contextdb_core::read_memory::ReadShared::<CursorExpiryWatch>::layout().size(),
+        "reader", "cursor_expiry_control", "Raise the reader memory limit.")?;
+    let watch = contextdb_core::read_memory::ReadShared::try_from_prepaid_with_native(invoice, || {
+        Ok::<_, Error>(CursorExpiryWatch {
+            execution: Arc::downgrade(execution), clock, wait: Mutex::new(None), _read_memory: read_memory,
+        })
+    }).map_err(|error| match error {
+        contextdb_core::read_memory::NativeProduce::Refused(error) => Error::NativeEngineOther(error),
+        contextdb_core::read_memory::NativeProduce::Producer(error) => error,
+    })?;
     *execution
         .expiry_watch
         .lock()
@@ -20067,6 +20110,9 @@ pub(super) fn fetch_cursor(
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+    if let Some(error) = cursor._state.expiry_failure.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        return Err(BoundedExecutionError::Engine(error));
+    }
     let public_page = crate::owned_cursor_page::take_public_page_request();
     // A request cancelled before it starts consumes no continuation state.
     // Do not attach its already-fired listener to the parked cursor: that
@@ -20936,6 +20982,7 @@ pub(crate) struct NativeReadOpenContext {
     context: ControlWeak<RequestContext>,
 }
 impl NativeReadExecutionEntry {
+    #[cfg(feature = "sync-orchestration")]
     pub(crate) fn try_new_native(
         operation: &crate::owner_read::NativeReadRequest,
         limits: ReadLimits,

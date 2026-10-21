@@ -340,15 +340,16 @@ pub(crate) fn promote_event_status_item(
             _ => 0,
         }
     };
-    let Some(kind) = text("kind") else {
+    let Some(Value::Text(kind)) = fields.get("kind") else {
         return;
     };
     // The published name carries the kind it belongs to, so that one sorted
     // list can be cut anywhere; the name itself is what follows the colon.
     let named = |prefix: &str| -> String {
-        text("name")
-            .and_then(|name| name.strip_prefix(prefix).map(str::to_owned))
-            .unwrap_or_default()
+        match fields.get("name") {
+            Some(Value::Text(name)) => name.strip_prefix(prefix).map(str::to_owned).unwrap_or_default(),
+            _ => String::new(),
+        }
     };
     match kind.as_str() {
         "event_type" => status.event_types.push(DirectEventTypeStatus {
@@ -518,4 +519,55 @@ pub(crate) fn events_of(page: &MetadataPage) -> DirectEventsStatus {
         }
     }
     status
+}
+
+/// Admit only the actual new promotion buffers; original page storage retains
+/// its separate original decode/source invoice throughout this borrow.
+pub(crate) fn table_names_of_funded(
+    page: &MetadataPage, memory: &crate::read_image_memory::ImageMemoryHandle,
+) -> contextdb_core::Result<Vec<String>> {
+    let names = page.items.iter().filter_map(|item| match item { MetadataItem::Table(name) => Some(name), _ => None });
+    let count = names.clone().count();
+    let mut bytes = count.checked_mul(std::mem::size_of::<String>()).ok_or_else(promotion_size_error)?;
+    for name in names.clone() { bytes = bytes.checked_add(name.len()).ok_or_else(promotion_size_error)?; }
+    memory.reserve(bytes)?;
+    let mut output = Vec::with_capacity(count);
+    for name in names { output.push(name.clone()); }
+    Ok(output)
+}
+fn promotion_size_error() -> contextdb_core::Error {
+    contextdb_core::Error::Other("metadata promotion size overflow".into())
+}
+pub(crate) fn events_of_funded(
+    page: &MetadataPage, memory: &crate::read_image_memory::ImageMemoryHandle,
+) -> contextdb_core::Result<DirectEventsStatus> {
+    let mut counts = [0usize; 4];
+    let mut bytes = 0usize;
+    let mut add = |value: usize| -> contextdb_core::Result<()> {
+        bytes = bytes.checked_add(value).ok_or_else(promotion_size_error)?; Ok(())
+    };
+    for item in &page.items {
+        let MetadataItem::EventStatus(fields) = item else { continue; };
+        let Some(Value::Text(kind)) = fields.get("kind") else { continue; };
+        let (slot, prefix, width, texts): (usize, &str, usize, &[&str]) = match kind.as_str() {
+            "event_type" => (0, "event_type:", std::mem::size_of::<DirectEventTypeStatus>(), &["trigger", "table"]),
+            "sink" => (1, "sink:", std::mem::size_of::<DirectSinkStatus>(), &["sink_type"]),
+            "route" => (2, "route:", std::mem::size_of::<DirectRouteStatus>(), &["event_type", "sink"]),
+            "schedule" => (3, "schedule:", std::mem::size_of::<DirectScheduleStatus>(), &["every", "callback"]),
+            _ => continue,
+        };
+        counts[slot] = counts[slot].checked_add(1).ok_or_else(promotion_size_error)?;
+        add(width)?;
+        if let Some(Value::Text(name)) = fields.get("name") { add(name.strip_prefix(prefix).map_or(0, str::len))?; }
+        for key in texts { if let Some(Value::Text(text)) = fields.get(*key) { add(text.len())?; } }
+    }
+    memory.reserve(bytes)?;
+    let mut status = DirectEventsStatus {
+        event_types: Vec::with_capacity(counts[0]), sinks: Vec::with_capacity(counts[1]),
+        routes: Vec::with_capacity(counts[2]), schedules: Vec::with_capacity(counts[3]),
+    };
+    for item in &page.items {
+        if let MetadataItem::EventStatus(fields) = item { promote_event_status_item(fields, &mut status); }
+    }
+    Ok(status)
 }

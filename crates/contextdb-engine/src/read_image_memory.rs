@@ -1174,7 +1174,8 @@ impl QueryAnswerCharge {
         match self {
             Self::Image(charge) => Some(charge.image.value.owner()),
             Self::Receiver(image) => Some(image.owner()),
-            _ => None,
+            Self::Reader(credit) => Some(credit.owner()),
+            Self::None => None,
         }
     }
     pub(crate) fn held(&self) -> usize {

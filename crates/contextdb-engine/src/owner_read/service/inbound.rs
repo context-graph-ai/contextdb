@@ -270,8 +270,12 @@ impl OwnerReadService {
         // This is a worker dispatch input, not a synthetic wire Query. The
         // ordinary authenticated handler owns limit/draining/admission/registry
         // precedence and its original ActiveRequest/RequestLease unwind chain.
+        let read_memory = match &cause {
+            DeferredCause::Acquired { _owner, .. } => _owner.funding_owner(),
+            DeferredCause::MissingChild(_) => registration.owner(),
+        };
         self.handle_authenticated(connection_id, principal, limits,
-            AuthenticatedWork::Refused(cause), None, registration)
+            AuthenticatedWork::Refused(cause), None, registration, read_memory)
             .unwrap_or_else(CompletedOwnerRequest::terminal)
     }
 

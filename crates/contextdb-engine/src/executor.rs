@@ -1436,7 +1436,7 @@ fn published_page(
         read_memory.clone(), "reader", "encode_cursor_page", "Raise the reader memory limit to encode this page.")
         .map_err(crate::read_image::history_answer_error)?;
     let canonical_credit = contextdb_core::read_memory::ReadCredit::try_new(
-        read_memory,
+        read_memory.clone(),
         size,
         "read_channel",
         "encode_cursor_page",
@@ -1446,21 +1446,25 @@ fn published_page(
     let mut canonical_bytes = vec![0u8; size];
     let written =
         bincode::serde::encode_into_slice(body, &mut canonical_bytes, bincode::config::standard())
-            .map_err(|error| {
-                crate::direct_file_reader::DirectFileReaderError::Engine(
-                    contextdb_core::error::DiagnosticText::from_shared(encoding_diagnostic.publish(error)))
-            })?;
+            .map_err(|error| crate::direct_file_reader::DirectFileReaderError::Engine(
+                contextdb_core::error::DiagnosticText::from_shared(encoding_diagnostic.publish(error))))?;
     if written != size {
         return Err(crate::direct_file_reader::DirectFileReaderError::Engine(
             "cursor page encoding size changed".into(),
         ));
     }
+    let canonical_bytes = crate::read_contract::EncodedReadBytes::from_funded(
+        crate::local_transport::query_funding::Funded { value: canonical_bytes, credit: Some(canonical_credit) },
+        u64::MAX,
+    ).map_err(|error| match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => crate::read_image::history_answer_error(error),
+        _ => crate::direct_file_reader::DirectFileReaderError::Engine("invalid funded cursor output".into()),
+    })?;
     Ok(crate::direct_file_reader::DirectCursorPage {
         page,
         observation,
         canonical_bytes,
         snapshot,
-        canonical_credit: Some(canonical_credit),
     })
 }
 
@@ -2852,10 +2856,7 @@ impl ReadExecutionTarget for Database {
             crate::read_contract::encode_query_result_funded(
                 &complete.result, read_memory, limits.memory,
             ).and_then(|bytes| crate::read_contract::EncodedReadBytes::from_funded(bytes, limits.memory))
-            .map_err(|error| {
-                crate::direct_file_reader::DirectFileReaderError::Engine(
-                    contextdb_core::error::DiagnosticText::from_shared(encoding_diagnostic.publish(error)))
-            })?;
+            .map_err(|error| crate::read_image::encoding_answer_error(error, encoding_diagnostic))?;
         Ok((complete.result, canonical, complete.publication))
     }
 
@@ -3437,7 +3438,8 @@ pub(crate) struct BoundedCursorExecutionState {
     pub(crate) publication: ReadPublicationScope,
     erased: std::sync::atomic::AtomicBool,
     active_cancellation: std::sync::Mutex<OwnerReadCancellation>,
-    expiry_watch: std::sync::Mutex<Option<Arc<bounded::CursorExpiryWatch>>>,
+    expiry_watch: std::sync::Mutex<Option<contextdb_core::read_memory::ReadShared<bounded::CursorExpiryWatch>>>,
+    expiry_failure: std::sync::Mutex<Option<contextdb_core::Error>>,
 }
 
 impl BoundedCursorExecutionState {

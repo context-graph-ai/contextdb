@@ -727,6 +727,16 @@ impl CompletedOwnerRequest {
         }
     }
 
+    fn funded(
+        responses: crate::local_transport::query_funding::Funded<Vec<LocalResponse>>,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Self {
+        let mut completed = Self::immediate(responses.value);
+        completed.response_credit = responses.credit;
+        completed.query_memory = Some(owner);
+        completed
+    }
+
     fn authoritative(
         responses: Vec<LocalResponse>,
         publication: crate::executor::ReadPublicationScope,
@@ -1420,6 +1430,8 @@ impl OwnerReadService {
         stream: &mut std::os::unix::net::UnixStream,
         connection_id: [u8; 16],
     ) -> OwnerReadScaffoldResult<()> {
+        let connection_owner = self.reading_handle(connection_id)
+            .declared_read_request_provider().request_budget().map_err(OwnerReadScaffoldError::Database)?;
         let owner_limits = self.spec.config.limits.limits;
         let carrier = UnixLocalCarrier;
         let handshake_deadline_ms = self.request_deadline_ms()?;
@@ -1436,11 +1448,12 @@ impl OwnerReadService {
                 0,
                 "handshake",
             );
-            authenticate_framed_stream_handshake(
+            crate::local_transport::authenticate_framed_stream_handshake_funded(
                 stream,
                 &self.spec.expected_handshake,
                 self.spec.clock.as_ref(),
                 handshake_deadline_ms,
+                connection_owner.clone(),
             )
             .await
         };
@@ -1454,6 +1467,7 @@ impl OwnerReadService {
                     self.declare_connection_visibility(connection_id, admitted.declared)
                 {
                     let boundary = LocalProtocolBoundary::with_effective_limits(owner_limits);
+                boundary.set_query_funding(Some(connection_owner.clone()));
                     let _answered = UnixLocalCarrier::send_message(
                         &carrier,
                         stream,
@@ -1471,8 +1485,9 @@ impl OwnerReadService {
                 // A refused peer still gets told which of its recorded owner
                 // facts did not match; silence would read to the caller as an
                 // owner that went away.
-                let response = refusal_response(OwnerReadScaffoldError::from_local(error));
+                let response = refusal_response(OwnerReadScaffoldError::from_local(error), connection_owner.clone())?;
                 let boundary = LocalProtocolBoundary::with_effective_limits(owner_limits);
+                boundary.set_query_funding(Some(connection_owner.clone()));
                 let _answered = UnixLocalCarrier::send_message(
                     &carrier,
                     stream,
@@ -1527,11 +1542,13 @@ impl OwnerReadService {
         let reader_inbox = inbox.clone();
         #[cfg(any(test, feature = "test-seams"))]
         let reader_received = Arc::clone(&self.received_requests);
+        let reader_owner = connection_owner.clone();
         let reader_thread = std::thread::Builder::new()
             .name("contextdb-owner-reader".to_owned())
             .spawn(move || {
                 let mut reader_stream = reader_stream;
                 let boundary = LocalProtocolBoundary::with_effective_limits(owner_limits);
+                boundary.set_query_funding(Some(reader_owner.clone()));
                 loop {
                     let inbound = inbound::receive(&mut reader_stream, &boundary, &reading, &reader_inbox);
                     match inbound {
@@ -1561,6 +1578,7 @@ impl OwnerReadService {
             match inbox.blocking_next() {
                 ConnectionEvent::ServiceStopping => {
                     let boundary = LocalProtocolBoundary::with_effective_limits(owner_limits);
+                boundary.set_query_funding(Some(connection_owner.clone()));
                     let response = LocalResponse::Failure {
                         failure: simple_failure(ReadFailureKind::OwnerNotServing),
                     };
@@ -1614,6 +1632,7 @@ impl OwnerReadService {
                         // which loop happens to take the frame off the inbox
                         // is not something a caller can see or influence.
                         let boundary = LocalProtocolBoundary::with_effective_limits(owner_limits);
+                boundary.set_query_funding(Some(connection_owner.clone()));
                         let carrier = UnixLocalCarrier;
                         let _answered = UnixLocalCarrier::send_message(
                             &carrier,
@@ -1683,7 +1702,7 @@ impl OwnerReadService {
         // These external keepers outlive every worker/slot alias, including
         // early returns and panic. Acquired refusals keep their genuine child
         // invoices; only MissingChild selects the standing connection controls.
-        let (envelope, deferred, query_keeper, _node_credit, request_controls, requested_limits) =
+        let (envelope, deferred, query_keeper, _node_credit, mut request_controls, requested_limits) =
             match received {
                 ConnectionEvent::Request(received) => {
                     let limits = received.envelope.limits;
@@ -1700,6 +1719,23 @@ impl OwnerReadService {
                 }
                 _ => unreachable!("only requests enter the request pipeline"),
             };
+        let request_owner = if let Some(query) = query_keeper.as_ref() {
+            query.budget.clone()
+        } else if let Some(inbound::DeferredCause::Acquired { _owner, .. }) = deferred.as_ref() {
+            _owner.funding_owner()
+        } else if deferred.is_some() {
+            inbox.refusal_controls.lock().expect("standing refusal controls")
+                .as_ref().expect("authenticated connection controls").registration.owner()
+        } else {
+            self.reading_handle(connection_id).declared_read_request_provider().request_budget()
+                .map_err(OwnerReadScaffoldError::Database)?
+        };
+        if request_controls.is_none() && deferred.is_none() {
+            let invoice = ReadCredit::try_new_owned(request_owner.clone(), RequestControls::bytes(),
+                "reader", "request_controls", "Raise the reader memory limit.")
+                .map_err(OwnerReadScaffoldError::Database)?;
+            request_controls = Some(RequestControls::from_prepaid(invoice, request_owner.clone()));
+        }
         let is_deferred = deferred.is_some();
         let query_terminal = is_deferred || query_keeper.is_some();
 
@@ -1715,6 +1751,7 @@ impl OwnerReadService {
             OwnerAdmission::effective_limits(requested_limits, self.spec.config.limits)
                 .unwrap_or(requested_limits);
         let boundary = LocalProtocolBoundary::with_effective_limits(effective_limits);
+        boundary.set_query_funding(Some(request_owner.clone()));
         let deadline_ms = self.request_deadline_ms()?;
         let cursor_fetch_id = match envelope.as_ref().map(|envelope| &envelope.request) {
             Some(LocalRequest::CursorFetch { cursor_id, .. }) => Some(*cursor_id),
@@ -1760,6 +1797,7 @@ impl OwnerReadService {
             connection_id, principal, envelope,
         });
         let worker_query = query_keeper.clone();
+        let worker_owner = request_owner.clone();
         let request_worker = std::thread::Builder::new()
             .name("contextdb-owner-request".to_owned())
             .spawn(move || {
@@ -1797,7 +1835,7 @@ impl OwnerReadService {
                                     requested_limits, cause, registration)
                             } else {
                                 worker_service.dispatch_authenticated_for_carrier(
-                                    request.expect("ordinary request envelope"), worker_query.clone(), registration)
+                                    request.expect("ordinary request envelope"), worker_query.clone(), registration, worker_owner.clone())
                             }
                         });
                         if completed.cursor_page.is_some() {
@@ -1841,12 +1879,10 @@ impl OwnerReadService {
                             Err(error) => CompletedOwnerRequest::terminal(OwnerReadScaffoldError::Database(error)),
                         };
                     }
-                    CompletedOwnerRequest::immediate(vec![refusal_response(
-                        OwnerReadScaffoldError::Database(contextdb_core::Error::Other((format!(
-                            "the owner's read ended unexpectedly: {}",
-                            panic_reason(&payload)
-                        )).into())),
-                    )])
+                    match crate::local_transport::query_funding::owner_panic_responses(payload.as_ref(), worker_owner.clone()) {
+                        Ok(responses) => CompletedOwnerRequest::funded(responses, worker_owner.clone()),
+                        Err(error) => CompletedOwnerRequest::terminal(OwnerReadScaffoldError::Database(error)),
+                    }
                 });
                 let mut responses = responses;
                 if let Some(query) = worker_query {
@@ -1872,8 +1908,13 @@ impl OwnerReadService {
             effective_limits, slot: &slot, progress: &progress, inbox,
             ended: &ended, active_cursor_fetch: &active_cursor_fetch, cursor_fetch_id,
         }.run());
-        let served = serve_request_with_deadline(self.spec.clock.as_ref(), deadline_ms, operation)
-            .await.map_err(OwnerReadScaffoldError::from_local);
+        let served = match crate::local_transport::deadline_operation_owned(
+            self.spec.clock.as_ref(), crate::local_transport::DeadlineStage::Request,
+            deadline_ms, operation, &request_owner,
+        ) {
+            Ok(wait) => wait.await.map_err(OwnerReadScaffoldError::from_local),
+            Err(error) => Err(OwnerReadScaffoldError::from_local(error)),
+        };
         if ended.load(Ordering::SeqCst) {
             return Ok(ServedRequest::ConnectionEnded);
         }
@@ -1902,7 +1943,7 @@ impl OwnerReadService {
                     // A serving refusal belongs to this exchange. Publish its
                     // typed outcome before withdrawing the failed connection,
                     // so the caller receives the cause rather than bare EOF.
-                    let response = refusal_response(error);
+                    let response = refusal_response(error, request_owner.clone())?;
                     let boundary = LocalProtocolBoundary::with_effective_limits(effective_limits);
                     let sent = UnixLocalCarrier::send_message(
                         &carrier,
@@ -1918,7 +1959,7 @@ impl OwnerReadService {
                     return Ok(ServedRequest::ConnectionEnded);
                 }
                 let refusal = self.signal_request_timeout(connection_id);
-                let response = refusal_response(refusal);
+                let response = refusal_response(refusal, request_owner.clone())?;
                 let boundary = LocalProtocolBoundary::with_effective_limits(effective_limits);
                 UnixLocalCarrier::send_message(
                     &carrier,
@@ -1944,15 +1985,16 @@ impl OwnerReadService {
         request: InboundOwnerRequest,
         query: Option<ReadShared<QueryIngress>>,
         registration: CancellationRegistration,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> CompletedOwnerRequest {
         let mut completed = match self.handle_authenticated(
             request.connection_id, request.principal, request.envelope.limits,
-            inbound::AuthenticatedWork::Request(request.envelope.request), query.clone(), registration,
+            inbound::AuthenticatedWork::Request(request.envelope.request), query.clone(), registration, read_memory.clone(),
         ) {
             Ok(responses) => responses,
-            Err(error) if query.is_some() => CompletedOwnerRequest::terminal(error),
-            Err(error) => CompletedOwnerRequest::immediate(vec![refusal_response(error)]),
+            Err(error) => CompletedOwnerRequest::terminal(error),
         };
+        completed.query_memory = Some(read_memory);
         if let Some(query) = query {
             completed.query_memory = Some(query.budget.clone());
             completed.query_control = Some(query);
@@ -2030,6 +2072,7 @@ impl OwnerReadService {
         local_request: inbound::AuthenticatedWork,
         query: Option<ReadShared<QueryIngress>>,
         registration: CancellationRegistration,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<CompletedOwnerRequest> {
         use inbound::AuthenticatedWork;
         let connection = ConnectionState::authenticated(
@@ -2041,11 +2084,12 @@ impl OwnerReadService {
             crate::read_work_probe::note_owner_graph_path("status");
             // Carrier dispatch remains inside the executing request worker's
             // graph observation guard, including this admission-free status.
-            return Ok(CompletedOwnerRequest::immediate(vec![
-                LocalResponse::OwnerStatus {
-                    status: self.status_response()?,
-                },
-            ]));
+            let status = self.status_response()?;
+            let responses = crate::local_transport::query_funding::Funded::allocate_owned(
+                Some(read_memory.clone()), std::mem::size_of::<LocalResponse>(),
+                || vec![LocalResponse::OwnerStatus { status }],
+            ).map_err(OwnerReadScaffoldError::Database)?;
+            return Ok(CompletedOwnerRequest::funded(responses, read_memory));
         }
         if matches!(&local_request, AuthenticatedWork::Request(LocalRequest::CancelInFlight { .. })) {
             self.cancel_in_flight(connection.connection_id());
@@ -2059,11 +2103,11 @@ impl OwnerReadService {
 
         match local_request {
             AuthenticatedWork::Request(LocalRequest::CursorFetch { cursor_id, rows }) => {
-                self.fetch_cursor(&connection, cursor_id, rows)
+                self.fetch_cursor(&connection, cursor_id, rows, read_memory)
             }
             AuthenticatedWork::Request(LocalRequest::CursorClose { cursor_id }) => self
-                .close_cursor(&connection, cursor_id)
-                .map(CompletedOwnerRequest::immediate),
+                .close_cursor(&connection, cursor_id, read_memory.clone())
+                .map(|responses| CompletedOwnerRequest::funded(responses, read_memory)),
             request => {
                 let lease = self.admission.try_acquire(
                     connection.effective_limits(),
@@ -2083,7 +2127,7 @@ impl OwnerReadService {
                 };
                 match request {
                     AuthenticatedWork::Request(request) =>
-                        self.handle_admitted(connection, lease, request, query),
+                        self.handle_admitted(connection, lease, request, query, read_memory),
                     AuthenticatedWork::Refused(cause) => {
                         drop(lease);
                         Err(cause.into_error())
@@ -2250,6 +2294,7 @@ impl OwnerReadService {
         lease: RequestLease,
         request: LocalRequest,
         mut query_control: Option<ReadShared<QueryIngress>>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<CompletedOwnerRequest> {
         // ROWS come from the handle this connection declared itself into, so
         // every statement it runs -- of every shape -- and every page of every
@@ -2285,6 +2330,7 @@ impl OwnerReadService {
                     let canonical = crate::read_contract::encode_query_result_funded(
                         &outcome.result, read_memory.clone(), connection.effective_limits().memory,
                     ).map_err(|error| match error {
+                        crate::read_contract::ReadEncodingError::Admission(error) => OwnerReadScaffoldError::Database(error),
                         crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } =>
                             OwnerReadScaffoldError::from_local(crate::local_transport::LocalTransportError::Payload(
                                 crate::local_transport::PayloadViolation::MemoryCeilingExceeded { ceiling, required: None })),
@@ -2302,11 +2348,11 @@ impl OwnerReadService {
                     Ok(answered) => answered,
                     Err(payload) => {
                         query_control.as_ref().expect("unwound query retains its original control").terminal();
-                        let responses = crate::local_transport::query_funding::owner_panic_responses(
-                            payload.as_ref(), read_memory.clone(),
-                        ).map_err(OwnerReadScaffoldError::Database)?;
-                        return Ok(CompletedOwnerRequest::failed_query(responses,
-                            query_control.take().expect("unwound query retains its original control")));
+                        let mut completed = CompletedOwnerRequest::immediate(Vec::new());
+                        completed.terminal_panic = Some(payload);
+                        completed.query_memory = Some(read_memory.clone());
+                        completed.query_control = query_control.take();
+                        return Ok(completed);
                     }
                 };
                 return match answered {
@@ -2317,18 +2363,15 @@ impl OwnerReadService {
                         let error = query_control.as_ref().and_then(|q| q.take_stop())
                             .map(OwnerReadScaffoldError::Database).unwrap_or(error);
                         query_control.as_ref().expect("failed query retains its original control").terminal();
-                        let responses = crate::local_transport::query_funding::owner_failure_responses(
-                            error, read_memory.clone(),
-                        ).map_err(OwnerReadScaffoldError::Database)?;
-                        Ok(CompletedOwnerRequest::failed_query(responses,
-                            query_control.take().expect("failed query keeps its original control")))
+                        let mut completed = CompletedOwnerRequest::terminal(error);
+                        completed.query_memory = Some(read_memory.clone());
+                        completed.query_control = query_control.take();
+                        Ok(completed)
                     }
                 };
             }
             request => request,
         };
-        let read_memory = reading.declared_read_request_provider().request_budget()
-            .map_err(OwnerReadScaffoldError::Database)?;
         match request {
             LocalRequest::Query { .. } => unreachable!("query returned above"),
             LocalRequest::CursorOpen { statement, params } => {
@@ -2538,7 +2581,7 @@ impl OwnerReadService {
                         vector_search,
                     }, read_memory.clone(), connection.effective_limits().memory,
                 )
-                .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical explain encoding"))?;
+                .map_err(owner_encoding_error)?;
                 self.admit_metadata_payload(&payload.value, lease.effective_limits())?;
                 let responses =
                     crate::local_transport::split_payload_answer_funded(
@@ -2577,7 +2620,10 @@ impl OwnerReadService {
                 let envelope = LocalResponse::Custom { payload: response };
                 response_is_encodable(&envelope).map_err(OwnerReadScaffoldError::from_local)?;
                 drop(lease);
-                Ok(CompletedOwnerRequest::immediate(vec![envelope]))
+                let responses = crate::local_transport::query_funding::Funded::allocate_owned(
+                    Some(read_memory.clone()), std::mem::size_of::<LocalResponse>(), || vec![envelope],
+                ).map_err(OwnerReadScaffoldError::Database)?;
+                Ok(CompletedOwnerRequest::funded(responses, read_memory))
             }
             LocalRequest::OwnerStatus => unreachable!("status bypasses owner admission"),
             LocalRequest::CancelInFlight { .. } => {
@@ -2789,6 +2835,7 @@ impl OwnerReadService {
         connection: &ConnectionState,
         cursor_id: [u8; 16],
         rows: Option<NonZeroU64>,
+        request_owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<CompletedOwnerRequest> {
         if self
             .exhausted_cursors
@@ -2797,8 +2844,8 @@ impl OwnerReadService {
             .contains(&(connection.connection_id(), cursor_id))
         {
             return self
-                .empty_exhausted_cursor_page()
-                .map(CompletedOwnerRequest::immediate);
+                .empty_exhausted_cursor_page(request_owner.clone(), connection.effective_limits().memory)
+                .map(|responses| CompletedOwnerRequest::funded(responses, request_owner));
         }
 
         let mut entry = self.take_cursor(connection.connection_id(), cursor_id)?;
@@ -2952,8 +2999,8 @@ impl OwnerReadService {
                 }
                 self.store_cursor(entry, CursorRegistration::Returning)?;
                 let responses =
-                    self.cancelled_cursor_responses(connection.connection_id(), cursor_id)?;
-                return Ok(CompletedOwnerRequest::immediate(responses));
+                    self.cancelled_cursor_responses(connection.connection_id(), cursor_id, request_owner.clone())?;
+                return Ok(CompletedOwnerRequest::funded(responses, request_owner));
             }
             Err(error) => {
                 let mapped = map_bounded_error(error);
@@ -3173,37 +3220,22 @@ impl OwnerReadService {
         &self,
         connection: &ConnectionState,
         cursor_id: [u8; 16],
-    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+        request_owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<crate::local_transport::query_funding::Funded<Vec<LocalResponse>>> {
         if self
             .exhausted_cursors
             .lock()
             .expect("owner exhausted cursor registry")
             .contains(&(connection.connection_id(), cursor_id))
         {
-            return self.cursor_closed_response();
+            return self.cursor_closed_response(request_owner);
         }
         let entry = self.take_cursor(connection.connection_id(), cursor_id)?;
         let retained_memory_bytes = entry.retained_memory_bytes;
         let close = entry.close();
         self.release_cursor_resources(retained_memory_bytes);
         close?;
-        self.cursor_closed_response()
-    }
-
-    fn cursor_page_response(
-        &self,
-        page: &CursorPage,
-        observation: &crate::executor::CursorObservation,
-    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
-        // Exhausted cursor identities no longer retain a read owner. Keep
-        // this existing standalone boundary separate from live cursor output.
-        let payload = encode_observed_cursor_page(page, observation)
-            .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical cursor-page encoding"))?;
-        let responses = split_payload_answer(payload, |payload| LocalResponse::CursorPage {
-            page: CursorPageResponse { payload },
-        })?;
-        for response in &responses { response_is_encodable(response)?; }
-        Ok(responses)
+        self.cursor_closed_response(request_owner)
     }
 
     fn cursor_page_response_with_size(
@@ -3216,7 +3248,7 @@ impl OwnerReadService {
         let payload = crate::read_contract::cursor_observation::encode_observed_cursor_page_funded(
             page, observation, owner, memory_ceiling,
         )
-            .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical cursor-page encoding"))?;
+            .map_err(owner_encoding_error)?;
         let payload_bytes = payload.value.len();
         let responses = crate::local_transport::split_payload_answer_funded(
             payload, |payload| LocalResponse::CursorPage {
@@ -3233,35 +3265,47 @@ impl OwnerReadService {
         &self,
         connection_id: [u8; 16],
         cursor_id: [u8; 16],
-    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<crate::local_transport::query_funding::Funded<Vec<LocalResponse>>> {
         // Keep the unpublished page for replay, but refuse this fetch with
         // the same typed cancellation returned by the bounded kernel.
         let entry = self.take_cursor(connection_id, cursor_id)?;
         self.store_cursor(entry, CursorRegistration::Returning)?;
-        Ok(vec![refusal_response(map_bounded_error(
-            BoundedExecutionError::Cancelled,
-        ))])
+        crate::local_transport::query_funding::owner_failure_responses(
+            map_bounded_error(BoundedExecutionError::Cancelled), owner,
+        ).map_err(OwnerReadScaffoldError::Database)
     }
 
-    fn empty_exhausted_cursor_page(&self) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+    fn empty_exhausted_cursor_page(
+        &self, owner: contextdb_core::read_memory::ReadMemoryOwner, memory_ceiling: u64,
+    ) -> OwnerReadScaffoldResult<crate::local_transport::query_funding::Funded<Vec<LocalResponse>>> {
         let page = CursorPage::from_parts(Vec::new(), Vec::new(), false);
-        self.cursor_page_response(
-            &page,
-            &crate::executor::CursorObservation {
-                trace: Arc::new(crate::QueryTrace::scan()),
-                rows_examined: 0,
-                charge: None,
-                group_page_returns: None,
-            },
-        )
+        // The empty trace's real native control is admitted before allocation.
+        let trace_credit = ReadCredit::try_new_owned(owner.clone(),
+            crate::local_transport::query_funding::arc_bytes::<crate::QueryTrace>(),
+            "reader", "terminal_cursor_trace", "Raise the reader memory limit.")
+            .map_err(OwnerReadScaffoldError::Database)?;
+        let observation = crate::executor::CursorObservation {
+            trace: Arc::new(crate::QueryTrace::scan()), rows_examined: 0,
+            charge: None, group_page_returns: None,
+        };
+        let result = self.cursor_page_response_with_size(&page, &observation, owner, memory_ceiling)
+            .map(|(responses, _)| responses);
+        drop(observation);
+        drop(trace_credit);
+        result
     }
 
-    fn cursor_closed_response(&self) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+    fn cursor_closed_response(
+        &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> OwnerReadScaffoldResult<crate::local_transport::query_funding::Funded<Vec<LocalResponse>>> {
         let response = LocalResponse::CursorClosed {
             acknowledgement: CursorCloseAcknowledgement { closed: true },
         };
         response_is_encodable(&response)?;
-        Ok(vec![response])
+        crate::local_transport::query_funding::Funded::allocate_owned(
+            Some(owner), std::mem::size_of::<LocalResponse>(), || vec![response],
+        ).map_err(OwnerReadScaffoldError::Database)
     }
 
     fn metadata_response(
@@ -3294,9 +3338,7 @@ impl OwnerReadService {
             PreparedOwnerMetadata::CanonicalPage(page) => {
                 crate::read_contract::encode_metadata_page_funded(
                     &page, read_memory.clone(), lease.effective_limits().memory,
-                ).map_err(|_| {
-                    OwnerReadScaffoldError::unimplemented("canonical metadata-page encoding")
-                })?
+                ).map_err(owner_encoding_error)?
             }
             PreparedOwnerMetadata::CanonicalComplete(payload) => payload,
         };
@@ -3337,9 +3379,7 @@ impl OwnerReadService {
                 )
                 .map_err(OwnerReadScaffoldError::Database)?;
                 let payload = crate::read_contract::encode_metadata_body_funded(
-                    &body, read_memory.clone(), effective_limits.memory).map_err(|_| {
-                    OwnerReadScaffoldError::unimplemented("custody metadata encoding")
-                })?;
+                    &body, read_memory.clone(), effective_limits.memory).map_err(owner_encoding_error)?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
             }
             LocalMetadataRequest::DeliveryOutcome {
@@ -3357,9 +3397,7 @@ impl OwnerReadService {
                 )
                 .map_err(OwnerReadScaffoldError::Database)?;
                 let payload = crate::read_contract::encode_metadata_body_funded(
-                    &body, read_memory.clone(), effective_limits.memory).map_err(|_| {
-                    OwnerReadScaffoldError::unimplemented("custody metadata encoding")
-                })?;
+                    &body, read_memory.clone(), effective_limits.memory).map_err(owner_encoding_error)?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
             }
             LocalMetadataRequest::Tables { continuation } => {
@@ -3386,7 +3424,7 @@ impl OwnerReadService {
                         schema: crate::read_image::project_schema(&table, &meta),
                     }, read_memory.clone(), effective_limits.memory,
                 )
-                .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical schema encoding"))?;
+                .map_err(owner_encoding_error)?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
             }
             LocalMetadataRequest::EventsStatus { continuation } => {
@@ -3424,9 +3462,7 @@ impl OwnerReadService {
                         indexes,
                     }, read_memory.clone(), effective_limits.memory,
                 )
-                .map_err(|_| {
-                    OwnerReadScaffoldError::unimplemented("canonical history-verification encoding")
-                })?;
+                .map_err(owner_encoding_error)?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
             }
             LocalMetadataRequest::MaintenanceStatus => {
@@ -3447,9 +3483,7 @@ impl OwnerReadService {
                         },
                     }, read_memory.clone(), effective_limits.memory,
                 )
-                .map_err(|_| {
-                    OwnerReadScaffoldError::unimplemented("canonical maintenance-status encoding")
-                })?;
+                .map_err(owner_encoding_error)?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
             }
         }
@@ -3650,7 +3684,11 @@ impl OwnerReadService {
         // channel included, still refusing new work; a later close or final
         // drop can finish the accepted work.
         let mut stop_error = None;
-        let operation: LocalDeadlineOperation<'_> = Box::pin(std::future::poll_fn(|context| {
+        let owner = self.spec.database.declared_read_request_provider().request_budget()
+            .map_err(OwnerReadScaffoldError::Database)?;
+        let operation = crate::local_transport::deadline_operation_funded(self.spec.clock.as_ref(),
+            crate::local_transport::DeadlineStage::ShutdownDrain, deadline_ms, owner,
+            || std::future::poll_fn(|context| {
             if self.poll_requests_drained(context).is_pending() {
                 return Poll::Pending;
             }
@@ -3668,13 +3706,11 @@ impl OwnerReadService {
             #[cfg(not(unix))]
             Poll::Ready(Ok(()))
         }));
-        let drained = wait_for_local_completion(drain_shutdown_with_deadline(
-            self.spec.clock.as_ref(),
-            deadline_ms,
-            operation,
-        ))
-        .map_err(|_| {
-            OwnerReadScaffoldError::Database(contextdb_core::Error::OwnerReadDrainTimeout)
+        let drained = wait_for_local_completion(operation).map_err(|error| match error {
+            error @ (crate::local_transport::LocalTransportError::MemoryAdmission { .. }
+                | crate::local_transport::LocalTransportError::NativeAdmission(_)
+                | crate::local_transport::LocalTransportError::OriginalAdmission(_)) => OwnerReadScaffoldError::from_local(error),
+            _ => OwnerReadScaffoldError::Database(contextdb_core::Error::OwnerReadDrainTimeout),
         });
         if let Some(error) = stop_error {
             return Err(error);
@@ -4193,7 +4229,8 @@ async fn send_authoritative_response(
         ));
     }
     let write_budget = publication.budget.clone();
-    let send = carrier.send_message_async(
+    let owner = publication.read_memory.as_ref().expect("authoritative response retains its request owner");
+    let send = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(carrier.send_message_async(
         stream,
         boundary,
         LocalOutboundMessage::Response {
@@ -4211,43 +4248,36 @@ async fn send_authoritative_response(
             }
             Ok(())
         },
-    );
-    await_authoritative_response_send(&publication.budget, send).await
+    ))) .map_err(|error| crate::local_transport::query_funding::transport_error(error, u64::MAX))?;
+    await_authoritative_response_send(&publication.budget, send, publication.read_memory.as_ref()
+        .expect("authoritative response retains its request owner")).await
 }
 
 #[cfg(unix)]
 async fn await_authoritative_response_send<T>(
     budget: &crate::executor::ReadPublicationBudget,
-    mut send: crate::local_transport::LocalDeadlineOperation<'_, T>,
+    mut send: impl std::future::Future<Output = Result<T, crate::local_transport::LocalTransportError>> + Unpin,
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<T, crate::local_transport::LocalTransportError> {
-    let mut expiry = budget.clock.wait_until(budget.deadline_ms());
+    let mut expiry = crate::local_transport::wait_until_owned(budget.clock.as_ref(), budget.deadline_ms(), owner)
+        .map_err(|error| crate::local_transport::query_funding::transport_error(error, u64::MAX))?;
     let mut expiry_completed = false;
     let waiting_thread = std::thread::current();
     let _cancellation = budget
         .cancellation
         .try_tell_on_cancel(move || waiting_thread.unpark())
-        .map_err(|error| match error {
-            contextdb_core::Error::MemoryBudgetExceeded { budget_limit_bytes, .. } =>
-                crate::local_transport::LocalTransportError::Refusal(
-                    crate::local_transport::memory_ceiling_read_failure(
-                        u64::try_from(budget_limit_bytes).unwrap_or(u64::MAX),
-                        None)),
-            contextdb_core::Error::ReadFailure(failure) =>
-                crate::local_transport::LocalTransportError::Refusal(failure),
-            contextdb_core::Error::ReadCancelled => crate::local_transport::owner_disconnected(),
-            _ => crate::local_transport::LocalTransportError::Unimplemented,
-        })?;
+        .map_err(|error| crate::local_transport::query_funding::transport_error(error, u64::MAX))?;
     std::future::poll_fn(|context| {
         loop {
             if !expiry_completed {
-                expiry_completed = std::future::Future::poll(expiry.as_mut(), context).is_ready();
+                expiry_completed = std::future::Future::poll(std::pin::Pin::new(&mut expiry), context).is_ready();
             }
             // A completed frame has already published its answer. The caller
             // can advance its clock after receiving it, before this owner
             // thread observes completion; that later deadline cannot withdraw
             // the answer or disconnect the next request. Pending sends remain
             // subject to their original cancellation and active-time budget.
-            if let Poll::Ready(result) = std::future::Future::poll(send.as_mut(), context) {
+            if let Poll::Ready(result) = std::future::Future::poll(std::pin::Pin::new(&mut send), context) {
                 return Poll::Ready(result);
             }
             if budget.cancellation.is_cancelled() {
@@ -4479,18 +4509,22 @@ impl RequestPublication<'_, '_> {
                             .cancelled_cursor_responses(
                                 connection_id,
                                 cursor_fetch_id.expect("cursor fetch request"),
+                                boundary.query_funding().expect("request boundary retains owner"),
                             )
-                            .unwrap_or_else(|error| vec![refusal_response(error)]);
+                            .or_else(|error| crate::local_transport::query_funding::owner_failure_responses(
+                                error, boundary.query_funding().expect("request boundary retains owner"))
+                                .map_err(OwnerReadScaffoldError::Database))
+                            .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
                         drop(
                             active_cursor_fetch
                                 .lock()
                                 .expect("owner active cursor fetch guard")
                                 .take(),
                         );
-                        if cancelled.len() > 1 {
+                        if cancelled.value.len() > 1 {
                             boundary.answer_spans_frames();
                         }
-                        for response in &cancelled {
+                        for response in &cancelled.value {
                             UnixLocalCarrier::send_message(
                                 &carrier,
                                 &mut publish_stream,
@@ -4581,7 +4615,8 @@ impl RequestPublication<'_, '_> {
                                         .expect("owner active cursor fetch guard")
                                         .take(),
                                 );
-                                let response = refusal_response(error);
+                                let response = refusal_response(error, boundary.query_funding().expect("request boundary retains its owner"))
+                                    .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
                                 UnixLocalCarrier::send_message(
                                     &carrier,
                                     &mut publish_stream,
@@ -4607,7 +4642,8 @@ impl RequestPublication<'_, '_> {
                                         .expect("owner active cursor fetch guard")
                                         .take(),
                                 );
-                                let response = refusal_response(error);
+                                let response = refusal_response(error, boundary.query_funding().expect("request boundary retains its owner"))
+                                    .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
                                 UnixLocalCarrier::send_message(
                                     &carrier,
                                     &mut publish_stream,
@@ -4674,18 +4710,22 @@ impl RequestPublication<'_, '_> {
                                 .cancelled_cursor_responses(
                                     connection_id,
                                     publication.cursor_id,
+                                    boundary.query_funding().expect("request boundary retains owner"),
                                 )
-                                .unwrap_or_else(|error| vec![refusal_response(error)]);
+                                .or_else(|error| crate::local_transport::query_funding::owner_failure_responses(
+                                    error, boundary.query_funding().expect("request boundary retains owner"))
+                                    .map_err(OwnerReadScaffoldError::Database))
+                                .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
                             drop(
                                 active_cursor_fetch
                                     .lock()
                                     .expect("owner active cursor fetch guard")
                                     .take(),
                             );
-                            if cancelled.len() > 1 {
+                            if cancelled.value.len() > 1 {
                                 boundary.answer_spans_frames();
                             }
-                            for response in &cancelled {
+                            for response in &cancelled.value {
                                 UnixLocalCarrier::send_message(
                                     &carrier,
                                     &mut publish_stream,
@@ -4740,7 +4780,8 @@ impl RequestPublication<'_, '_> {
                 inbound::send_terminal_error(&mut publish_stream, &error)
                     .map_err(|_| crate::local_transport::owner_disconnected())?;
             } else {
-                let response = refusal_response(error);
+                let response = refusal_response(error, boundary.query_funding().expect("request boundary retains its owner"))
+                                    .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
                 UnixLocalCarrier::send_message(&carrier, &mut publish_stream, &boundary,
                     LocalOutboundMessage::Response { response: &response, expectation: &expectation })?;
             }
@@ -5175,29 +5216,14 @@ fn panic_reason(payload: &Box<dyn std::any::Any + Send>) -> String {
     "no reason recorded".to_owned()
 }
 
-fn refusal_response(error: OwnerReadScaffoldError) -> LocalResponse {
-    match error {
-        OwnerReadScaffoldError::Refused(failure) => LocalResponse::Failure { failure },
-        OwnerReadScaffoldError::Database(error) => LocalResponse::EngineFailure {
-            failure: LocalEngineFailure::from_error(&error),
-        },
-        OwnerReadScaffoldError::LocalTransport(error) => {
-            match OwnerReadScaffoldError::from_local(error) {
-                OwnerReadScaffoldError::Refused(failure) => LocalResponse::Failure { failure },
-                other => engine_failure_response(&other),
-            }
-        }
-        other => engine_failure_response(&other),
-    }
-}
-
-/// An owner-side outcome with no engine error of its own still reaches the
-/// caller as an engine answer, carrying what happened in the one variant that
-/// holds prose.
-fn engine_failure_response(error: &OwnerReadScaffoldError) -> LocalResponse {
-    LocalResponse::EngineFailure {
-        failure: LocalEngineFailure::from_error(&contextdb_core::Error::Other((error.to_string()).into())),
-    }
+fn refusal_response(
+    error: OwnerReadScaffoldError, owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> OwnerReadScaffoldResult<LocalResponse> {
+    // The immutable engine-error document retains its own invoice after the
+    // one-element response container is freed here.
+    let mut responses = crate::local_transport::query_funding::owner_failure_responses(error, owner)
+        .map_err(OwnerReadScaffoldError::Database)?;
+    Ok(responses.value.pop().expect("one terminal refusal response"))
 }
 
 /// Failed publication must not turn an already exhausted first page into an
@@ -5241,5 +5267,16 @@ fn map_bounded_error(error: BoundedExecutionError) -> OwnerReadScaffoldError {
             OwnerReadScaffoldError::Database(contextdb_core::Error::ReadCancelled)
         }
         BoundedExecutionError::Engine(error) => OwnerReadScaffoldError::Database(error),
+    }
+}
+
+fn owner_encoding_error(error: crate::read_contract::ReadEncodingError) -> OwnerReadScaffoldError {
+    match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => OwnerReadScaffoldError::Database(error),
+        crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } =>
+            OwnerReadScaffoldError::from_local(crate::local_transport::LocalTransportError::Payload(
+                crate::local_transport::PayloadViolation::MemoryCeilingExceeded { ceiling, required: None })),
+        _ => OwnerReadScaffoldError::from_local(crate::local_transport::LocalTransportError::Payload(
+            crate::local_transport::PayloadViolation::Malformed)),
     }
 }

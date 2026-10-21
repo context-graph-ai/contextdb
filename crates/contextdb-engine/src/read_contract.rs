@@ -544,6 +544,9 @@ fn serialize_query_result_cascade<S: serde::Serializer>(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReadEncodingError {
+    /// Original admission error, moved intact through output encoding.
+    #[error("canonical output admission failed: {0}")]
+    Admission(contextdb_core::Error),
     #[error("canonical read encoding is not implemented")]
     Unimplemented,
     #[error("canonical read payload is invalid")]
@@ -570,12 +573,15 @@ fn encoding_error_from_transport(
     }
 }
 
-pub fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncodingError> {
-    encode_query_view(&CanonicalQueryResultView::from(result))
-}
-fn encode_query_view(view: &CanonicalQueryResultView<'_>) -> Result<Vec<u8>, ReadEncodingError> {
-    validate_query_view(view)?;
-    encode(view)
+pub fn encode_query_result(
+    result: &QueryResult,
+    caller_owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<EncodedReadBytes, ReadEncodingError> {
+    let owner = result.encoding_owner().unwrap_or(caller_owner);
+    let view = CanonicalQueryResultView::from(result);
+    validate_query_view(&view)?;
+    let bytes = encode_transport_funded(&view, Some(owner), u64::MAX)?;
+    EncodedReadBytes::from_funded(bytes, u64::MAX)
 }
 fn validate_query_view(view: &CanonicalQueryResultView<'_>) -> Result<(), ReadEncodingError> {
     for row in view.rows {
@@ -896,7 +902,7 @@ pub(crate) fn encode_transport_funded<T: Serialize>(
     let len = encoded_size(value)?;
     let mut output = crate::local_transport::query_funding::Funded::allocate_owned(owner,
         len, || vec![0; len])
-        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+        .map_err(|error| ReadEncodingError::Admission(error))?;
     // A fixed slice cannot silently grow beyond the admitted allocation if a
     // serializer writes a different size on its second visit.
     let written = bincode::serde::encode_into_slice(value, &mut output.value, standard())
@@ -961,10 +967,9 @@ pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEnco
 /// render alike.
 pub fn encode_metadata_body(
     body: &crate::direct_file_reader::DirectMetadataBody,
-) -> Result<Vec<u8>, ReadEncodingError> {
-    let mut bytes = CanonicalWriter::default();
-    crate::read_image::write_metadata_body(&mut bytes, body);
-    Ok(bytes.finish())
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<EncodedReadBytes, ReadEncodingError> {
+    EncodedReadBytes::from_funded(encode_metadata_body_funded(body, owner, u64::MAX)?, u64::MAX)
 }
 
 /// How many bytes [`encode_metadata_body`] produces for `body`, measured
@@ -988,28 +993,42 @@ pub(crate) fn encode_metadata_body_funded(
     let len = encoded_metadata_body_len(body);
     let mut output = crate::local_transport::query_funding::Funded::allocate_owned(
         Some(owner), len, || Vec::with_capacity(len),
-    ).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    ).map_err(|error| ReadEncodingError::Admission(error))?;
     let mut writer = CanonicalWriter {
         bytes: std::mem::take(&mut output.value), len: 0, counting: false,
+        credit: None, overflowed: false,
     };
     crate::read_image::write_metadata_body(&mut writer, body);
     if writer.len() != len { return Err(ReadEncodingError::InvalidPayload); }
-    output.value = writer.finish();
+    output.value = writer.finish_raw()?;
     #[cfg(any(test, feature = "test-seams"))]
     crate::read_image::answer_encoded_for_test();
     Ok(output)
 }
 
 /// A deterministic, self-delimiting byte writer for canonical documents.
-#[derive(Default)]
 pub struct CanonicalWriter {
     bytes: Vec<u8>,
     len: usize,
     /// Measure only: count what would be written and keep none of it.
     counting: bool,
+    credit: Option<contextdb_core::read_memory::ReadCredit>,
+    overflowed: bool,
 }
 
 impl CanonicalWriter {
+    /// Admit the exact output capacity on the original caller owner. Writing
+    /// beyond this capacity refuses at finish instead of growing uncharged.
+    pub fn try_new(
+        owner: contextdb_core::read_memory::ReadMemoryOwner, capacity: usize,
+    ) -> Result<Self, ReadEncodingError> {
+        let bytes = crate::local_transport::query_funding::Funded::allocate_owned(
+            Some(owner), capacity, || Vec::with_capacity(capacity),
+        ).map_err(ReadEncodingError::Admission)?;
+        Ok(Self { bytes: bytes.value, len: 0, counting: false,
+            credit: bytes.credit, overflowed: false })
+    }
+
     /// A writer that measures a document's encoded length without keeping
     /// its bytes.
     pub fn counting() -> Self {
@@ -1017,6 +1036,7 @@ impl CanonicalWriter {
             bytes: Vec::new(),
             len: 0,
             counting: true,
+            credit: None, overflowed: false,
         }
     }
 
@@ -1030,9 +1050,14 @@ impl CanonicalWriter {
     }
 
     fn put(&mut self, bytes: &[u8]) {
-        self.len = self.len.saturating_add(bytes.len());
-        if !self.counting {
-            self.bytes.extend_from_slice(bytes);
+        let Some(len) = self.len.checked_add(bytes.len()) else {
+            self.overflowed = true;
+            return;
+        };
+        self.len = len;
+        if !self.counting && !self.overflowed {
+            if len > self.bytes.capacity() { self.overflowed = true; }
+            else { self.bytes.extend_from_slice(bytes); }
         }
     }
 
@@ -1095,8 +1120,16 @@ impl CanonicalWriter {
         self
     }
 
-    pub fn finish(self) -> Vec<u8> {
-        self.bytes
+    fn finish_raw(self) -> Result<Vec<u8>, ReadEncodingError> {
+        if self.overflowed { return Err(ReadEncodingError::InvalidPayload); }
+        Ok(self.bytes)
+    }
+
+    pub fn finish(self) -> Result<EncodedReadBytes, ReadEncodingError> {
+        if self.counting || self.overflowed { return Err(ReadEncodingError::InvalidPayload); }
+        EncodedReadBytes::from_funded(crate::local_transport::query_funding::Funded {
+            value: self.bytes, credit: self.credit,
+        }, u64::MAX)
     }
 }
 
@@ -1121,28 +1154,14 @@ pub(crate) fn decode_metadata_body_with_memory(
     memory: &crate::read_image_memory::ImageMemoryHandle,
     ceiling: u64,
 ) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
-    let bound = bytes
-        .len()
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(4096))
-        .ok_or(ReadEncodingError::MemoryCeilingExceeded { ceiling })?;
-    let transient = contextdb_core::read_memory::ReadCredit::try_new_owned(
-        memory.owner(),
-        bound,
-        "reader",
-        "metadata_body",
-        "Raise reader memory to decode this metadata body.",
-    )
-    .map_err(|error| encoding_error_from_core(error, ceiling))?;
+    // Canonical fields now admit their exact text/vector destinations before
+    // allocation. There is no separate wire-length-multiple container bank.
     let result = memory.scope(|| {
-        let mut reader = CanonicalReader::new(bytes);
+        let mut reader = CanonicalReader::with_memory(bytes, memory.clone());
         let body = crate::read_image::read_metadata_body(&mut reader)?;
         reader.finish()?;
         Ok(body)
     });
-    // The body keeps its admitted JSON payload on this same owner; its
-    // construction-only input/container upper bound ends here.
-    drop(transient);
     result.map_err(|error| match error {
         ReadEncodingError::MemoryCeilingExceeded { .. } => {
             ReadEncodingError::MemoryCeilingExceeded { ceiling }
@@ -1158,13 +1177,25 @@ pub(crate) fn decode_metadata_body_with_memory(
 /// prefix taken from the payload can never be trusted into an allocation or a
 /// slice: a claim the bytes do not back is refused here, not acted on.
 pub struct CanonicalReader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+    bytes: &'a [u8], at: usize,
+    memory: Option<crate::read_image_memory::ImageMemoryHandle>,
 }
 
 impl<'a> CanonicalReader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self { bytes, at: 0, memory: None }
+    }
+    pub(crate) fn with_memory(bytes: &'a [u8], memory: crate::read_image_memory::ImageMemoryHandle) -> Self {
+        Self { bytes, at: 0, memory: Some(memory) }
+    }
+    pub(crate) fn vector<T>(&self, count: usize) -> Result<Vec<T>, ReadEncodingError> {
+        let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or(ReadEncodingError::InvalidPayload)?;
+        self.admit(bytes)?;
+        Ok(Vec::with_capacity(count))
+    }
+    pub(crate) fn admit(&self, bytes: usize) -> Result<(), ReadEncodingError> {
+        if let Some(memory) = &self.memory { memory.reserve(bytes).map_err(ReadEncodingError::Admission)?; }
+        Ok(())
     }
 
     fn take(&mut self, length: usize) -> Result<&'a [u8], ReadEncodingError> {
@@ -1216,7 +1247,9 @@ impl<'a> CanonicalReader<'a> {
         let length =
             usize::try_from(self.count()?).map_err(|_| ReadEncodingError::InvalidPayload)?;
         let bytes = self.take(length)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| ReadEncodingError::InvalidPayload)
+        let text = std::str::from_utf8(bytes).map_err(|_| ReadEncodingError::InvalidPayload)?;
+        self.admit(bytes.len())?;
+        Ok(text.to_owned())
     }
 
     pub fn optional_text(&mut self) -> Result<Option<String>, ReadEncodingError> {
@@ -1252,10 +1285,13 @@ pub(crate) fn encode_owned_cursor_page_for_test(
     encode(page)
 }
 
-pub fn encode_cursor_page(page: &CursorPage) -> Result<Vec<u8>, ReadEncodingError> {
-    page.validate()
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    encode(page)
+pub fn encode_cursor_page(
+    page: &CursorPage,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<EncodedReadBytes, ReadEncodingError> {
+    let owner = page.encoding_owner().unwrap_or(owner);
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    EncodedReadBytes::from_funded(encode_transport_funded(page, Some(owner), u64::MAX)?, u64::MAX)
 }
 
 /// See [`decode_query_result`]: the shipped default is the backstop for a
@@ -1348,10 +1384,11 @@ pub(crate) fn encode_metadata_page_funded(
     encode_transport_funded(&MetadataPageView::from(page), Some(owner), memory_ceiling)
 }
 
-pub fn encode_metadata_page(page: &MetadataPage) -> Result<Vec<u8>, ReadEncodingError> {
-    page.validate()
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    encode(&MetadataPageView::from(page))
+pub fn encode_metadata_page(
+    page: &MetadataPage,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<EncodedReadBytes, ReadEncodingError> {
+    EncodedReadBytes::from_funded(encode_metadata_page_funded(page, owner, u64::MAX)?, u64::MAX)
 }
 
 /// See [`decode_query_result`]: the shipped default is the backstop for a
@@ -1366,13 +1403,16 @@ pub fn decode_metadata_page_under_memory_ceiling(
     bytes: &[u8],
     memory_ceiling: u64,
 ) -> Result<MetadataPage, ReadEncodingError> {
-    preflight_metadata_page_payload(bytes, memory_ceiling)
-        .map_err(encoding_error_from_transport)?;
-    let memory = decoder_memory(memory_ceiling)
-        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
-    let page: MetadataPage = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
-    page.validate()
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    let memory = decoder_memory(memory_ceiling).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    decode_metadata_page_with_memory(bytes, &memory, memory_ceiling)
+}
+
+pub(crate) fn decode_metadata_page_with_memory(
+    bytes: &[u8], memory: &crate::read_image_memory::ImageMemoryHandle, memory_ceiling: u64,
+) -> Result<MetadataPage, ReadEncodingError> {
+    preflight_metadata_page_payload(bytes, memory_ceiling).map_err(encoding_error_from_transport)?;
+    let page: MetadataPage = decode_exact_with_memory(bytes, memory, memory_ceiling)?;
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(page)
 }
 

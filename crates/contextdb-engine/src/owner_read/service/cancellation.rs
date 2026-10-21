@@ -25,7 +25,7 @@ struct RegistrationLinks {
     next: Option<RegistrationHandle>,
 }
 #[derive(Clone)]
-pub(super) struct CancellationRegistration { node: RegistrationHandle }
+pub(super) struct CancellationRegistration { node: RegistrationHandle, owner: Option<ReadMemoryOwner> }
 impl std::fmt::Debug for CancellationRegistration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <OwnerReadCancellation as std::fmt::Debug>::fmt(&self.node.cancellation, f)
@@ -38,14 +38,17 @@ impl CancellationRegistration {
     pub(super) fn from_prepaid(owner: ReadMemoryOwner, mut credit: ReadCredit) -> Self {
         let token = credit.try_split_off(OwnerReadCancellation::funded_bytes())
             .expect("prepaid exact cancellation layout");
-        let cancellation = OwnerReadCancellation::from_prepaid(owner, token);
+        let cancellation = OwnerReadCancellation::from_prepaid(owner.clone(), token);
         Self { node: RegistrationHandle::Paid(ReadPaidArc::from_prepaid(
-            RegistrationCell { cancellation, links: Mutex::new(RegistrationLinks::default()) }, credit)) }
+            RegistrationCell { cancellation, links: Mutex::new(RegistrationLinks::default()) }, credit)), owner: Some(owner) }
     }
     pub(super) fn host(cancellation: OwnerReadCancellation) -> Self {
         Self { node: RegistrationHandle::Host(Arc::new(RegistrationCell {
             cancellation, links: Mutex::new(RegistrationLinks::default()),
-        })) }
+        })), owner: None }
+    }
+    pub(super) fn owner(&self) -> ReadMemoryOwner {
+        self.owner.clone().expect("engine request keeps its original registration owner")
     }
     pub(super) fn cancellation(&self) -> OwnerReadCancellation { self.node.cancellation.clone() }
     pub(super) fn rearm_standing(&mut self) {

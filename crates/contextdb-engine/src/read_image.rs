@@ -239,6 +239,17 @@ fn direct_quantization(quantization: VectorQuantization) -> DirectVectorQuantiza
     }
 }
 
+/// Output refusal preserves the original typed engine budget and diagnostic fields.
+pub(crate) fn encoding_answer_error(
+    error: crate::read_contract::ReadEncodingError,
+    diagnostic: contextdb_core::read_memory::ReadPrepared<crate::read_contract::ReadEncodingError>,
+) -> DirectFileReaderError {
+    match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => history_answer_error(error),
+        error => DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(diagnostic.publish(error))),
+    }
+}
+
 /// The reading surface's diagnosis of a history request the engine refused:
 /// damage is the typed corrupt-store answer and a memory refusal is the typed
 /// budget answer, so neither is flattened into an untyped engine message.
@@ -1271,7 +1282,7 @@ fn read_vector_search_disclosure(
         usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?;
     let auto_expansion_ceiling_source = bytes.text()?;
     let column_count = bytes.element_count()?;
-    let mut partition_key_columns = Vec::with_capacity(column_count);
+    let mut partition_key_columns = bytes.vector(column_count)?;
     for _ in 0..column_count {
         partition_key_columns.push(bytes.text()?);
     }
@@ -1316,7 +1327,7 @@ fn read_vector_search_disclosure(
         _ => return Err(invalid_metadata_payload()),
     };
     let partition_count = bytes.element_count()?;
-    let mut partition_hnsw = Vec::with_capacity(partition_count);
+    let mut partition_hnsw = bytes.vector(partition_count)?;
     for _ in 0..partition_count {
         partition_hnsw.push(crate::database::VectorPartitionHnswDisclosure {
             partition: bytes.text()?,
@@ -1543,7 +1554,7 @@ pub(crate) fn read_metadata_body(
     match bytes.tag()? {
         0 => {
             let count = bytes.element_count()?;
-            let mut items = Vec::new();
+            let mut items = bytes.vector(count)?;
             for _ in 0..count {
                 items.push(bytes.text()?);
             }
@@ -1591,7 +1602,7 @@ pub(crate) fn read_metadata_body(
         8 => {
             let table = bytes.text()?;
             let count = bytes.element_count()?;
-            let mut indexes = Vec::new();
+            let mut indexes = bytes.vector(count)?;
             for _ in 0..count {
                 indexes.push(crate::HistoricalIndexVerification {
                     index: bytes.text()?,
@@ -1647,7 +1658,7 @@ fn read_image_state(
         0 => {
             let watermark = Lsn(bytes.count()?);
             let source_count = bytes.element_count()?;
-            let mut sources = Vec::new();
+            let mut sources = bytes.vector(source_count)?;
             for _ in 0..source_count {
                 let row_lsn = Lsn(bytes.count()?);
                 let source_lsn = match bytes.tag()? {
@@ -1661,7 +1672,7 @@ fn read_image_state(
                 });
             }
             let table_count = bytes.element_count()?;
-            let mut tables = Vec::new();
+            let mut tables = bytes.vector(table_count)?;
             for _ in 0..table_count {
                 tables.push(DirectTableSyncPolicy {
                     table: bytes.text()?,
@@ -1680,7 +1691,7 @@ fn read_image_state(
             let committed_watermark = TxId(bytes.count()?);
             let next_tx = TxId(bytes.count()?);
             let index_count = bytes.element_count()?;
-            let mut commit_index = Vec::new();
+            let mut commit_index = bytes.vector(index_count)?;
             for _ in 0..index_count {
                 commit_index.push((Lsn(bytes.count()?), TxId(bytes.count()?)));
             }
@@ -1689,7 +1700,7 @@ fn read_image_state(
             let vectors = read_rendered(bytes)?;
             let ddl = read_rendered(bytes)?;
             let lsn_count = bytes.element_count()?;
-            let mut ddl_lsn = Vec::new();
+            let mut ddl_lsn = bytes.vector(lsn_count)?;
             for _ in 0..lsn_count {
                 ddl_lsn.push(Lsn(bytes.count()?));
             }
@@ -1717,7 +1728,7 @@ fn read_image_state(
                 _ => return Err(invalid_metadata_payload()),
             };
             let schema_count = bytes.element_count()?;
-            let mut schemas = Vec::new();
+            let mut schemas = bytes.vector(schema_count)?;
             for _ in 0..schema_count {
                 schemas.push(read_schema(bytes)?);
             }
@@ -1745,7 +1756,7 @@ fn read_rendered<T: serde::de::DeserializeOwned>(
             )
         })?;
     let count = bytes.element_count()?;
-    let mut values = Vec::new();
+    let mut values = bytes.vector(count)?;
     for _ in 0..count {
         let rendered = bytes.raw()?;
         values.push(
@@ -1764,7 +1775,7 @@ fn read_labels_list(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<Vec<String>, crate::read_contract::ReadEncodingError> {
     let count = bytes.element_count()?;
-    let mut labels = Vec::with_capacity(count);
+    let mut labels = bytes.vector(count)?;
     for _ in 0..count {
         labels.push(bytes.text()?);
     }
@@ -1777,7 +1788,7 @@ fn read_schema(
     let table = bytes.text()?;
     let immutable = bytes.flag()?;
     let column_count = bytes.element_count()?;
-    let mut columns = Vec::new();
+    let mut columns = bytes.vector(column_count)?;
     for _ in 0..column_count {
         let name = bytes.text()?;
         let data_type = bytes.text()?;
@@ -1870,7 +1881,7 @@ fn read_schema(
             _ => return Err(invalid_metadata_payload()),
         };
         let partition_key_count = bytes.element_count()?;
-        let mut partition_key_columns = Vec::with_capacity(partition_key_count);
+        let mut partition_key_columns = bytes.vector(partition_key_count)?;
         for _ in 0..partition_key_count {
             partition_key_columns.push(bytes.text()?);
         }
@@ -1905,16 +1916,16 @@ fn read_schema(
         });
     }
     let primary_key_count = bytes.element_count()?;
-    let mut primary_key = Vec::new();
+    let mut primary_key = bytes.vector(primary_key_count)?;
     for _ in 0..primary_key_count {
         primary_key.push(bytes.text()?);
     }
     let index_count = bytes.element_count()?;
-    let mut indexes = Vec::new();
+    let mut indexes = bytes.vector(index_count)?;
     for _ in 0..index_count {
         let name = bytes.text()?;
         let column_count = bytes.element_count()?;
-        let mut index_columns = Vec::new();
+        let mut index_columns = bytes.vector(column_count)?;
         for _ in 0..column_count {
             let column = bytes.text()?;
             let direction = match bytes.tag()? {
@@ -1934,11 +1945,15 @@ fn read_schema(
         1 => {
             let column = bytes.text()?;
             let transition_count = bytes.element_count()?;
+            // Native B-tree node capacity is admitted before insertion on
+            // this same decoder owner; strings and target vectors are separate.
+            bytes.admit(crate::local_transport::query_funding::tree_bytes::<String, Vec<String>>(transition_count)
+                .map_err(crate::read_contract::ReadEncodingError::Admission)?)?;
             let mut transitions = BTreeMap::new();
             for _ in 0..transition_count {
                 let from = bytes.text()?;
                 let target_count = bytes.element_count()?;
-                let mut targets = Vec::new();
+                let mut targets = bytes.vector(target_count)?;
                 for _ in 0..target_count {
                     targets.push(bytes.text()?);
                 }
@@ -1965,12 +1980,12 @@ fn read_schema(
     let sync_direction = bytes.optional_text()?;
     let conflict_policy = bytes.optional_text()?;
     let edge_type_count = bytes.element_count()?;
-    let mut dag_edge_types = Vec::new();
+    let mut dag_edge_types = bytes.vector(edge_type_count)?;
     for _ in 0..edge_type_count {
         dag_edge_types.push(bytes.text()?);
     }
     let rule_count = bytes.element_count()?;
-    let mut propagate = Vec::new();
+    let mut propagate = bytes.vector(rule_count)?;
     for _ in 0..rule_count {
         propagate.push(match bytes.tag()? {
             0 => DirectPropagationRule::Edge {
@@ -2018,7 +2033,7 @@ fn read_events(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectEventsStatus, crate::read_contract::ReadEncodingError> {
     let type_count = bytes.element_count()?;
-    let mut event_types = Vec::new();
+    let mut event_types = bytes.vector(type_count)?;
     for _ in 0..type_count {
         event_types.push(DirectEventTypeStatus {
             name: bytes.text()?,
@@ -2027,7 +2042,7 @@ fn read_events(
         });
     }
     let sink_count = bytes.element_count()?;
-    let mut sinks = Vec::new();
+    let mut sinks = bytes.vector(sink_count)?;
     for _ in 0..sink_count {
         sinks.push(DirectSinkStatus {
             name: bytes.text()?,
@@ -2042,7 +2057,7 @@ fn read_events(
         });
     }
     let route_count = bytes.element_count()?;
-    let mut routes = Vec::new();
+    let mut routes = bytes.vector(route_count)?;
     for _ in 0..route_count {
         routes.push(DirectRouteStatus {
             name: bytes.text()?,
@@ -2051,7 +2066,7 @@ fn read_events(
         });
     }
     let schedule_count = bytes.element_count()?;
-    let mut schedules = Vec::new();
+    let mut schedules = bytes.vector(schedule_count)?;
     for _ in 0..schedule_count {
         let name = bytes.text()?;
         let every = bytes.text()?;
@@ -2084,18 +2099,16 @@ fn read_events(
     })
 }
 
-fn write_rendered<T: serde::Serialize>(
-    bytes: &mut crate::read_contract::CanonicalWriter,
-    values: &[T],
+fn write_rendered<T: history_json::HistoryJson>(
+    bytes: &mut crate::read_contract::CanonicalWriter, values: &[T],
 ) {
     bytes.count(values.len() as u64);
-    for value in values {
-        let rendered = serde_json::to_value(value)
-            .and_then(|document| serde_json::to_vec(&document))
-            .unwrap_or_default();
-        bytes.raw(&rendered);
-    }
+    for value in values { bytes.json_text(&history_json::Canonical(value)); }
 }
+
+mod history_json;
+mod metadata_clone;
+use metadata_clone::CloneHeapBytes;
 
 fn write_labels_list(bytes: &mut crate::read_contract::CanonicalWriter, labels: &[String]) {
     bytes.count(labels.len() as u64);
@@ -2378,9 +2391,13 @@ pub(crate) fn project_metadata_from_database(
     clock: Arc<dyn DeadlineClock>,
     continuation: Option<&str>,
     cancellation: &OwnerReadCancellation,
-) -> std::result::Result<(DirectMetadataBody, Option<String>), DirectFileReaderError> {
+) -> std::result::Result<(DirectMetadataBody, Option<String>, crate::read_image_memory::ImageMemoryHandle), DirectFileReaderError> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+    let charge = crate::read_image_memory::ImageMemory::admitted_reader_for(
+        crate::executor::ReadExecutionTarget::bounded_read_accountant(database), read_memory.clone(),
+        "reader", "metadata_body", "Raise the reader memory limit.",
+    ).map_err(history_answer_error)?;
     let _read_scope = database.enter_writer_read(None, read_memory.clone());
     // An inventory is bounded a page at a time by the pager below. Everything
     // else arrives whole, so whether it fits is decided once it is built.
@@ -2404,9 +2421,10 @@ pub(crate) fn project_metadata_from_database(
                 limits.result_bytes,
                 crate::metadata_page::metadata_table_key,
             )?;
+            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
             resume_at = page.continuation.clone();
             DirectMetadataBody::Tables {
-                items: crate::metadata_page::table_names_of(&page),
+                items: crate::metadata_page::table_names_of_funded(&page, &charge).map_err(history_answer_error)?,
                 has_more: page.has_more,
             }
         }
@@ -2439,9 +2457,10 @@ pub(crate) fn project_metadata_from_database(
                 limits.result_bytes,
                 crate::metadata_page::metadata_event_key,
             )?;
+            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
             resume_at = page.continuation.clone();
             DirectMetadataBody::EventsStatus {
-                status: crate::metadata_page::events_of(&page),
+                status: crate::metadata_page::events_of_funded(&page, &charge).map_err(history_answer_error)?,
                 has_more: page.has_more,
                 continuation: page.continuation.clone(),
             }
@@ -2486,7 +2505,7 @@ pub(crate) fn project_metadata_from_database(
     if arrives_whole {
         admit_complete(&body, limits.result_bytes)?;
     }
-    Ok((body, resume_at))
+    Ok((body, resume_at, charge))
 }
 
 /// The stable word a caller branches on for the inspection asked for here.
@@ -2534,10 +2553,10 @@ pub(crate) fn project_metadata(
     // What this answer costs the reader's memory while it is built, encoded
     // and then held by the caller: released when the last copy of the
     // response is dropped.
-    let charge = crate::read_image_memory::ImageMemory::charging_reader(
-        target.bounded_read_accountant(),
-        read_memory.clone(),
-    );
+    let charge = crate::read_image_memory::ImageMemory::admitted_reader_for(
+        target.bounded_read_accountant(), read_memory.clone(),
+        "reader", "metadata_body", "Raise the reader memory limit.",
+    ).map_err(history_answer_error)?;
     // A history this request has to read is walked record by record; the walk
     // stops at the request's cancellation or its active-time budget instead
     // of finishing a history nobody is waiting for.
@@ -2582,9 +2601,10 @@ pub(crate) fn project_metadata(
                 limits.result_bytes,
                 crate::metadata_page::metadata_table_key,
             )?;
+            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
             resume_at = page.continuation.clone();
             DirectMetadataBody::Tables {
-                items: crate::metadata_page::table_names_of(&page),
+                items: crate::metadata_page::table_names_of_funded(&page, &charge).map_err(history_answer_error)?,
                 has_more: page.has_more,
             }
         }
@@ -2594,11 +2614,11 @@ pub(crate) fn project_metadata(
                 .schemas
                 .iter()
                 .find(|schema| schema.table == table)
-                .cloned()
                 .ok_or_else(|| {
                     engine_message(read_memory.clone(), format_args!("table not found: {table}"))
                 })?;
-            DirectMetadataBody::Schema { schema }
+            charge.reserve(schema.clone_heap_bytes().map_err(history_answer_error)?).map_err(history_answer_error)?;
+            DirectMetadataBody::Schema { schema: schema.clone() }
         }
         DirectMetadataRequest::Explain { sql, params } => explained_statement(
             target,
@@ -2618,15 +2638,17 @@ pub(crate) fn project_metadata(
                 limits.result_bytes,
                 crate::metadata_page::metadata_event_key,
             )?;
+            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
             resume_at = page.continuation.clone();
             DirectMetadataBody::EventsStatus {
-                status: crate::metadata_page::events_of(&page),
+                status: crate::metadata_page::events_of_funded(&page, &charge).map_err(history_answer_error)?,
                 has_more: page.has_more,
                 continuation: page.continuation.clone(),
             }
         }
-        DirectMetadataRequest::MaintenanceStatus => DirectMetadataBody::MaintenanceStatus {
-            status: image.maintenance.clone(),
+        DirectMetadataRequest::MaintenanceStatus => {
+            charge.reserve(image.maintenance.clone_heap_bytes().map_err(history_answer_error)?).map_err(history_answer_error)?;
+            DirectMetadataBody::MaintenanceStatus { status: image.maintenance.clone() }
         },
         DirectMetadataRequest::VerifyHistory { table } => DirectMetadataBody::VerifyHistory {
             indexes: target
@@ -2647,7 +2669,7 @@ pub(crate) fn project_metadata(
                 DirectImageMetadataKind::Configuration => {
                     // The copy is admitted at the size of what it copies.
                     charge
-                        .reserve(configuration_state_bytes(&image.configuration))
+                        .reserve(image.configuration.clone_heap_bytes().map_err(history_answer_error)?)
                         .map_err(history_answer_error)?;
                     DirectImageState::Configuration(image.configuration.clone())
                 }
@@ -2672,39 +2694,17 @@ pub(crate) fn project_metadata(
         read_memory.clone(), "reader", "encode_metadata", "Raise the reader memory limit to encode metadata.")
         .map_err(history_answer_error)?;
     let canonical_bytes = crate::read_contract::encode_metadata_body_funded(
-        &body, read_memory, limits.memory,
+        &body, read_memory.clone(), limits.memory,
     ).and_then(|bytes| crate::read_contract::EncodedReadBytes::from_funded(bytes, limits.memory))
-        .map_err(|error| DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(encoding_diagnostic.publish(error))))?;
+        .map_err(|error| encoding_answer_error(error, encoding_diagnostic))?;
     if reads_history {
         // A request cancelled, or out of active time, while its answer was
         // being encoded is refused rather than answered.
         history_checkpoint().map_err(history_answer_error)?;
     }
-    Ok(DirectMetadataResponse {
-        body,
-        canonical_bytes,
-        snapshot: image.snapshot,
-        continuation: resume_at,
-        charge: crate::read_image_memory::AnswerCharge::holding(charge),
-    })
-}
-
-/// What one copy of a committed image's configuration holds: its schemas,
-/// measured by their canonical encoding -- which visits every field once --
-/// and tripled, because a decoded copy costs more than its wire bytes once
-/// its containers are counted.
-fn configuration_state_bytes(configuration: &DirectConfigurationState) -> usize {
-    64usize.saturating_add(
-        configuration
-            .schemas
-            .iter()
-            .map(|schema| {
-                let mut counter = crate::read_contract::CanonicalWriter::counting();
-                write_schema(&mut counter, schema);
-                counter.len().saturating_mul(3)
-            })
-            .sum::<usize>(),
-    )
+    let metadata = crate::read_session::MetadataAnswer::try_new(body, resume_at,
+        crate::read_image_memory::AnswerCharge::holding(charge), read_memory).map_err(history_answer_error)?;
+    Ok(DirectMetadataResponse { metadata, canonical_bytes, snapshot: image.snapshot })
 }
 
 /// What the engine would do with this statement, without running it.

@@ -367,6 +367,26 @@ impl QueryMemory {
             "Reduce simultaneous query memory or raise the declared reader limit.", (), control)?;
         Ok(Self { memory })
     }
+    /// A new request limiter forwards to the genuine supplied connection/read
+    /// owner. It creates no root, independent budget, or replacement ceiling.
+    pub(crate) fn with_original_owner(parent: ReadMemoryOwner, limit: u64) -> contextdb_core::Result<Self> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let bytes = ReadMemoryOwner::native_layout::<QueryOperationBudget, ReadCredit>().size();
+        if bytes > limit { return Err(query_limit_error(limit)); }
+        let invoice = ReadCredit::try_new_owned(parent.clone(), bytes, "reader", "query_owner",
+            "Raise the declared reader limit to admit a query owner.")?;
+        let payload = QueryOperationBudget { parent, limit,
+            held: std::sync::atomic::AtomicUsize::new(bytes),
+            checkpoint: std::sync::Mutex::new(None), terminal: std::sync::atomic::AtomicBool::new(false),
+            pending_stop: std::sync::Mutex::new(None) };
+        let control = ReadMemoryOwner::try_native_typed(payload, invoice)
+            .map_err(contextdb_core::Error::NativeEngineOther)?;
+        let budget = control.owner();
+        let handle = crate::memory_accounting::AccountantHandle::reader(Some(limit), budget.clone(), false)?;
+        let memory = ImageMemory::native_reader_with_checkpoint(handle, budget, "reader", "materialize_answer",
+            "Reduce simultaneous query memory or raise the declared reader limit.", (), Some(control))?;
+        Ok(Self { memory })
+    }
     pub(crate) fn image(&self) -> crate::read_image_memory::ImageMemoryHandle { self.memory.clone() }
     pub(crate) fn bind_client(&self,
         clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>, deadline_ms: u64,
@@ -625,8 +645,8 @@ pub(crate) fn owner_failure_responses(
         }
         E::LocalTransport(error) => {
             return match E::from_local(error) {
-                E::Refused(failure) => owner_failure_responses(E::Refused(failure), owner),
-                other => owner_diagnostic_response(&other, owner),
+                other @ E::LocalTransport(_) => owner_diagnostic_response(&other, owner),
+                other => owner_failure_responses(other, owner),
             };
         }
         other => return owner_diagnostic_response(&other, owner),
@@ -681,14 +701,20 @@ pub(crate) fn owner_panic_responses(
     owner_diagnostic_response(&Diagnostic(payload), owner)
 }
 
-pub(crate) fn transport_error(error: contextdb_core::Error, ceiling: u64) -> super::LocalTransportError {
+pub(crate) fn transport_error(error: contextdb_core::Error, _ceiling: u64) -> super::LocalTransportError {
     match error {
         contextdb_core::Error::ReadFailure(failure) => super::LocalTransportError::Refusal(failure),
         contextdb_core::Error::ReadCancelled => super::owner_disconnected(),
-        error if crate::read_image_memory::is_memory_refusal(&error) =>
-            super::LocalTransportError::Payload(super::PayloadViolation::MemoryCeilingExceeded {
-                ceiling, required: None,
-            }),
-        _ => super::invalid_channel_data(),
+        contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint } =>
+            super::LocalTransportError::MemoryAdmission { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint },
+        contextdb_core::Error::NativeEngineOther(error) => super::LocalTransportError::NativeAdmission(error),
+        other => super::LocalTransportError::OriginalAdmission(other),
     }
+}
+
+/// Exact native Arc backing layout, admitted before engine control creation.
+pub(crate) fn arc_bytes<T>() -> usize {
+    std::alloc::Layout::new::<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>()
+        .extend(std::alloc::Layout::new::<T>()).expect("Arc control layout")
+        .0.pad_to_align().size()
 }

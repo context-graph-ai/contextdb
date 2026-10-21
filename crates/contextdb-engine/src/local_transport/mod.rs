@@ -158,8 +158,24 @@ pub const LOCAL_PROTOCOL_VERSION: u16 = 4;
 /// A complete local payload may be no larger than four mebibytes.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum LocalTransportError {
+    /// A genuine provider's original non-budget error moves unchanged.
+    #[error("reader operation admission failed: {0}")]
+    OriginalAdmission(contextdb_core::Error),
+    /// Original output/control admission fields. This is private transport
+    /// plumbing; the existing engine-error document carries it on the wire.
+    #[error("reader memory admission failed for {subsystem}/{operation}: requested {requested_bytes}, available {available_bytes}, limit {budget_limit_bytes}; {hint}")]
+    MemoryAdmission {
+        subsystem: contextdb_core::error::DiagnosticLabel,
+        operation: contextdb_core::error::DiagnosticLabel,
+        requested_bytes: usize,
+        available_bytes: usize,
+        budget_limit_bytes: usize,
+        hint: contextdb_core::error::DiagnosticLabel,
+    },
+    #[error("native reader admission failed: {0:?}")]
+    NativeAdmission(contextdb_core::read_memory::NativeRefusal),
     #[error("local transport is not implemented")]
     Unimplemented,
     #[error("peer credentials are unavailable")]
@@ -183,6 +199,15 @@ pub enum LocalTransportError {
 }
 
 impl LocalTransportError {
+    pub(crate) fn into_admission_error(self) -> Result<contextdb_core::Error, Self> {
+        match self {
+            Self::OriginalAdmission(error) => Ok(error),
+            Self::MemoryAdmission { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint } =>
+                Ok(contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint }),
+            Self::NativeAdmission(error) => Ok(contextdb_core::Error::NativeEngineOther(error)),
+            other => Err(other),
+        }
+    }
     #[allow(dead_code)]
     pub(crate) const fn unimplemented() -> Self {
         Self::Unimplemented
@@ -205,6 +230,7 @@ pub(crate) fn invalid_channel_data() -> LocalTransportError {
 /// framing and payloads still name invalid channel data.
 pub(crate) fn response_decode_refusal(error: LocalTransportError) -> LocalTransportError {
     match error {
+        LocalTransportError::MemoryAdmission { .. } | LocalTransportError::NativeAdmission(_) | LocalTransportError::OriginalAdmission(_) => error,
         LocalTransportError::Payload(framing::PayloadViolation::MemoryCeilingExceeded {
             ..
         }) => error,
@@ -268,3 +294,33 @@ pub(crate) fn frame_read_refusal(error: LocalTransportError) -> LocalTransportEr
         other => other,
     }
 }
+
+pub(crate) use deadlines::{OperationDeadlineWait, wait_until_owned, deadline_operation_owned, deadline_operation_funded};
+
+impl PartialEq for LocalTransportError {
+    fn eq(&self, other: &Self) -> bool {
+        use LocalTransportError::*;
+        match (self, other) {
+            (Unimplemented, Unimplemented) | (CredentialsUnavailable, CredentialsUnavailable)
+            | (PlatformUnsupported, PlatformUnsupported) | (StaleChannelUnverifiable, StaleChannelUnverifiable) => true,
+            (FilesystemInspection(a), FilesystemInspection(b)) => a == b,
+            (RuntimeRoot(a), RuntimeRoot(b)) => a == b,
+            (ChannelPath(a), ChannelPath(b)) => a == b,
+            (Frame(a), Frame(b)) => a == b,
+            (Payload(a), Payload(b)) => a == b,
+            (Refusal(a), Refusal(b)) => a == b,
+            (NativeAdmission(a), NativeAdmission(b)) => a == b,
+            // Original Error is deliberately move-only and has no value Eq.
+            // Preserve its unique identity without formatting/copying it.
+            (OriginalAdmission(a), OriginalAdmission(b)) => std::ptr::eq(a, b),
+            (MemoryAdmission { subsystem: a, operation: b, requested_bytes: c, available_bytes: d, budget_limit_bytes: e, hint: f },
+             MemoryAdmission { subsystem: g, operation: h, requested_bytes: i, available_bytes: j, budget_limit_bytes: k, hint: l }) =>
+                &**a == &**g && &**b == &**h && c == i && d == j && e == k && &**f == &**l,
+            _ => false,
+        }
+    }
+}
+impl Eq for LocalTransportError {}
+
+#[cfg(unix)]
+pub(crate) use authentication::authenticate_framed_stream_handshake_funded;
