@@ -34795,6 +34795,7 @@ impl Database {
             read_memory.clone(),
         )?;
         crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, |image| {
+            let _decode_scope = image.enter();
             let mut answer_copy = image.vector_copy(0)?;
             #[cfg(any(test, feature = "test-seams"))]
             observe_read_execution_convergence(ReadExecutionConvergenceEvent::PublicExecuteEntered);
@@ -36964,6 +36965,7 @@ impl Database {
             read_memory.clone(),
         )?;
         crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, |image| {
+            let _decode_scope = image.enter();
             let mut answer_copy = image.vector_copy(0)?;
             let scope = QueryRowsExaminedScope::enter(self);
             let mut result = self.execute_in_tx_with_rows_examined_scope(
