@@ -407,8 +407,8 @@ impl RetainedReadSource {
             return Ok(None);
         };
         before()?;
-        if !self
-            .authenticate_relational_row(table, meta, &row)
+        if !memory
+            .scope(|| self.authenticate_relational_row(table, meta, &row))
             .map_err(E::from)?
         {
             return Ok(None);

@@ -808,6 +808,26 @@ fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
+// Row leaves already have sorted field names. Every non-vector Value is
+// scalar or a one-key enum object; Json is its existing encoded string.
+// Streaming that closed shape preserves canonical bytes without cloning all
+// text into a temporary serde_json::Value graph. Vector values are excluded
+// by the row projection below, including their f32-to-JSON widening.
+fn canonical_row_json_admitted(
+    values: &BTreeMap<&String, &Value>,
+    owner: &crate::read_image_memory::ImageMemoryHandle,
+) -> Result<Vec<u8>> {
+    let failure = |error: serde_json::Error| {
+        Error::Other(format!("cannot encode logical identity leaf: {error}").into())
+    };
+    let mut measured = EncodedLength(0);
+    serde_json::to_writer(&mut measured, values).map_err(failure)?;
+    owner.reserve(measured.0)?;
+    let mut encoded = Vec::with_capacity(measured.0);
+    serde_json::to_writer(&mut encoded, values).map_err(failure)?;
+    Ok(encoded)
+}
+
 fn canonical_json_admitted<T: Serialize + ?Sized>(
     value: &T,
     owner: &crate::read_image_memory::ImageMemoryHandle,
@@ -917,7 +937,7 @@ fn row_mutation_with_owner(
         // twice while it is written.
         .collect::<BTreeMap<&String, &Value>>();
     let encoded = match owner {
-        Some(owner) => canonical_json_admitted(&values, owner)?,
+        Some(owner) => canonical_row_json_admitted(&values, owner)?,
         None => canonical_json(&values)?,
     };
     let mut mutation = ContentIdentityMutation::put(LogicalFamily::Relational, key, encoded);

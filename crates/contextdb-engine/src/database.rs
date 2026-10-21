@@ -26902,6 +26902,13 @@ impl MaintenanceContext {
     ) -> Result<VectorPartitionPublicationOutcome> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        // Metadata and membership decoders share the caller's original
+        // operation capability before any partition construction can enter them.
+        let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader_per_call(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            read_memory.clone(),
+        )?.enter();
+
         let mut maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
         let Some(persistence) = self.persistence.as_ref() else {
