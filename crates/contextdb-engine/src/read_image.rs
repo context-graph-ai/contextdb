@@ -2413,19 +2413,13 @@ pub(crate) fn project_metadata_from_database(
                 .map_err(history_answer_error)?
         }
         DirectMetadataRequest::Tables => {
-            let page = paged(
-                read_memory.clone(),
-                MetadataPageVocabulary::Tables,
-                crate::metadata_page::table_items(database.table_names()),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_table_key,
-            )?;
-            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
-            resume_at = page.continuation.clone();
+            let page = funded_paging(read_memory.clone(), database.metadata_table_page(
+                read_memory.clone(), continuation, limits.result_bytes))?;
+            charge.reserve(page.value.continuation.as_ref().map_or(0, |text| text.len())).map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::Tables {
-                items: crate::metadata_page::table_names_of_funded(&page, &charge).map_err(history_answer_error)?,
-                has_more: page.has_more,
+                items: crate::metadata_page::table_names_of_funded(&page.value, &charge).map_err(history_answer_error)?,
+                has_more: page.value.has_more,
             }
         }
         DirectMetadataRequest::Schema { table } => {
@@ -2446,23 +2440,15 @@ pub(crate) fn project_metadata_from_database(
             cancellation,
         )?,
         DirectMetadataRequest::EventsStatus => {
-            let page = paged(
-                read_memory.clone(),
-                MetadataPageVocabulary::EventsStatus,
-                crate::metadata_page::event_status_items(
-                    &database.event_bus_status(),
-                    &database.cron_status(),
-                ),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_event_key,
-            )?;
-            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
-            resume_at = page.continuation.clone();
+            let source = database.direct_events_status_funded(read_memory.clone()).map_err(history_answer_error)?;
+            let page = funded_paging(read_memory.clone(), crate::metadata_page::borrowed_event_page(
+                read_memory.clone(), &source.value, continuation, limits.result_bytes))?;
+            charge.reserve(page.value.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::EventsStatus {
-                status: crate::metadata_page::events_of_funded(&page, &charge).map_err(history_answer_error)?,
-                has_more: page.has_more,
-                continuation: page.continuation.clone(),
+                status: crate::metadata_page::events_of_funded(&page.value, &charge).map_err(history_answer_error)?,
+                has_more: page.value.has_more,
+                continuation: page.value.continuation.clone(),
             }
         }
         DirectMetadataRequest::MaintenanceStatus => {
@@ -2586,26 +2572,14 @@ pub(crate) fn project_metadata(
         DirectMetadataRequest::Tables => {
             // Cut by the same pager the owner uses, so an inventory read from
             // the file breaks at exactly the places it breaks over a channel.
-            let page = paged(
-                read_memory.clone(),
-                MetadataPageVocabulary::Tables,
-                crate::metadata_page::table_items(
-                    image
-                        .configuration
-                        .schemas
-                        .iter()
-                        .map(|schema| schema.table.clone())
-                        .collect(),
-                ),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_table_key,
-            )?;
-            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
-            resume_at = page.continuation.clone();
+            let page = funded_paging(read_memory.clone(), crate::metadata_page::borrowed_table_page(
+                read_memory.clone(), image.configuration.schemas.iter().map(|schema| schema.table.as_str()),
+                continuation, limits.result_bytes))?;
+            charge.reserve(page.value.continuation.as_ref().map_or(0, |text| text.len())).map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::Tables {
-                items: crate::metadata_page::table_names_of_funded(&page, &charge).map_err(history_answer_error)?,
-                has_more: page.has_more,
+                items: crate::metadata_page::table_names_of_funded(&page.value, &charge).map_err(history_answer_error)?,
+                has_more: page.value.has_more,
             }
         }
         DirectMetadataRequest::Schema { table } => {
@@ -2630,20 +2604,14 @@ pub(crate) fn project_metadata(
             cancellation,
         )?,
         DirectMetadataRequest::EventsStatus => {
-            let page = paged(
-                read_memory.clone(),
-                MetadataPageVocabulary::EventsStatus,
-                crate::metadata_page::event_status_items_of(&image.events),
-                continuation,
-                limits.result_bytes,
-                crate::metadata_page::metadata_event_key,
-            )?;
-            charge.reserve(page.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
-            resume_at = page.continuation.clone();
+            let page = funded_paging(read_memory.clone(), crate::metadata_page::borrowed_event_page(
+                read_memory.clone(), &image.events, continuation, limits.result_bytes))?;
+            charge.reserve(page.value.continuation.as_ref().map_or(0, |text| text.len().saturating_mul(2))).map_err(history_answer_error)?;
+            resume_at = page.value.continuation.clone();
             DirectMetadataBody::EventsStatus {
-                status: crate::metadata_page::events_of_funded(&page, &charge).map_err(history_answer_error)?,
-                has_more: page.has_more,
-                continuation: page.continuation.clone(),
+                status: crate::metadata_page::events_of_funded(&page.value, &charge).map_err(history_answer_error)?,
+                has_more: page.value.has_more,
+                continuation: page.value.continuation.clone(),
             }
         }
         DirectMetadataRequest::MaintenanceStatus => {
@@ -2757,6 +2725,18 @@ pub(crate) fn explained_statement(
         index: answered.0.trace.index_used.clone(),
         vector_search: None,
         sql,
+    })
+}
+
+fn funded_paging(
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    page: std::result::Result<crate::local_transport::query_funding::Funded<contextdb_core::read_contract::MetadataPage>, crate::metadata_page::MetadataPagingError>,
+) -> std::result::Result<crate::local_transport::query_funding::Funded<contextdb_core::read_contract::MetadataPage>, DirectFileReaderError> {
+    page.map_err(|error| match error {
+        crate::metadata_page::MetadataPagingError::Continuation(failure)
+        | crate::metadata_page::MetadataPagingError::Oversized(failure) => DirectFileReaderError::ReadFailure(failure),
+        crate::metadata_page::MetadataPagingError::Encoding(crate::read_contract::ReadEncodingError::Admission(error)) => history_answer_error(error),
+        crate::metadata_page::MetadataPagingError::Encoding(error) => engine_message(read_memory, format_args!("{error}")),
     })
 }
 

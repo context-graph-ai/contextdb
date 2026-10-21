@@ -222,7 +222,7 @@ impl WriterSnapshot {
         names
     }
 
-    pub(crate) fn captured_table_metadata(&self) -> impl Iterator<Item = (&str, &TableMeta)> {
+    pub(crate) fn captured_table_metadata(&self) -> impl ExactSizeIterator<Item = (&str, &TableMeta)> {
         self.schema
             .tables
             .iter()

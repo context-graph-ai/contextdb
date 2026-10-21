@@ -71,7 +71,10 @@ impl OwnerReadScaffoldError {
 
     pub(crate) fn from_local(error: LocalTransportError) -> Self {
         let error = match error.into_admission_error() {
-            Ok(error) => return Self::Database(error),
+            Ok(error) => return match crate::local_transport::query_funding::memory_refusal_ceiling(&error) {
+                Some(ceiling) => Self::Refused(crate::local_transport::memory_ceiling_read_failure(ceiling, None)),
+                None => Self::from_local(crate::local_transport::invalid_channel_data()),
+            },
             Err(error) => error,
         };
         match error {

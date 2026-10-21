@@ -495,6 +495,16 @@ pub trait DeadlineClock: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Paid intrusive waits are driven by the existing caller/connection.
+    #[doc(hidden)]
+    fn native_next_deadline_ms(&self) -> Option<u64> { None }
+    #[doc(hidden)]
+    fn drive_native_deadlines(&self) {}
+    #[doc(hidden)]
+    fn native_driver_started(&self) {}
+    #[doc(hidden)]
+    fn native_driver_ended(&self) {}
+
     #[doc(hidden)]
     fn try_native_source(
         &self,
@@ -547,10 +557,7 @@ impl NativeClockBinding {
         if !source.is_funded_by(standing) {
             return Err(crate::Error::ReadSessionNotImplemented);
         }
-        Ok(Self {
-            source,
-            clock: Arc::clone(clock),
-        })
+        Ok(Self { source, clock: Arc::clone(clock) })
     }
 
     #[doc(hidden)]
@@ -560,11 +567,14 @@ impl NativeClockBinding {
 
     #[doc(hidden)]
     pub fn park_until(&self, deadline_ms: u64, park: &dyn NativeDriverPark) -> crate::Result<()> {
+        let deadline_ms = self.clock.native_next_deadline_ms()
+            .map_or(deadline_ms, |next| next.min(deadline_ms));
         let now_ms = self.clock.now_ms();
-        if now_ms >= deadline_ms {
-            return Ok(());
+        if now_ms < deadline_ms {
+            self.source.park_until(now_ms, deadline_ms, park)?;
         }
-        self.source.park_until(now_ms, deadline_ms, park)
+        self.clock.drive_native_deadlines();
+        Ok(())
     }
 }
 

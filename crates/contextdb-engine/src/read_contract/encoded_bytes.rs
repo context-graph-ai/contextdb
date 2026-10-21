@@ -14,7 +14,7 @@ pub struct EncodedReadBytes {
 impl EncodedReadBytes {
     pub(crate) fn from_funded(
         bytes: Funded<Vec<u8>>,
-        _memory_ceiling: u64,
+        memory_ceiling: u64,
     ) -> Result<Self, ReadEncodingError> {
         let owner = bytes.credit.as_ref()
             .ok_or(ReadEncodingError::InvalidPayload)?.owner();
@@ -24,9 +24,9 @@ impl EncodedReadBytes {
             owner, ReadShared::<Funded<Vec<u8>>>::layout().size(),
             "reader", "query_buffer",
             "Reduce simultaneous query working memory or raise the declared reader limit.",
-        ).map_err(|error| ReadEncodingError::Admission(error))?;
+        ).map_err(|error| super::encoding_error_from_core(error, memory_ceiling))?;
         let bytes = ReadShared::try_from_prepaid_native(bytes, invoice)
-            .map_err(|error| ReadEncodingError::Admission(contextdb_core::Error::NativeEngineOther(error)))?;
+            .map_err(|error| super::encoding_error_from_core(contextdb_core::Error::NativeEngineOther(error), memory_ceiling))?;
         Ok(Self { bytes })
     }
 

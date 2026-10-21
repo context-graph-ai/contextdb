@@ -409,6 +409,8 @@ impl Drop for ManualDeadlineWait {
 #[derive(Debug)]
 pub struct MonotonicDeadlineClock {
     origin: std::time::Instant,
+    owned_waits: Mutex<MonotonicWaitList>,
+    native_drivers: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-seams")]
     thread_lifecycle: Option<DeadlineThreadLifecycle>,
     #[cfg(any(test, feature = "test-seams"))]
@@ -442,6 +444,8 @@ impl MonotonicDeadlineClock {
     pub fn new() -> Self {
         Self {
             origin: std::time::Instant::now(),
+            owned_waits: Mutex::new(MonotonicWaitList::default()),
+            native_drivers: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
             thread_lifecycle: None,
             #[cfg(any(test, feature = "test-seams"))]
@@ -463,6 +467,8 @@ impl MonotonicDeadlineClock {
     ) -> Self {
         Self {
             origin: std::time::Instant::now(),
+            owned_waits: Mutex::new(MonotonicWaitList::default()),
+            native_drivers: std::sync::atomic::AtomicUsize::new(0),
             thread_lifecycle: Some(DeadlineThreadLifecycle { started, exited }),
             fail_timer_arm: false,
             timer_arm_failure_waits: AtomicUsize::new(0),
@@ -479,6 +485,8 @@ impl MonotonicDeadlineClock {
     pub fn with_timer_arm_failure_for_test() -> Self {
         Self {
             origin: std::time::Instant::now(),
+            owned_waits: Mutex::new(MonotonicWaitList::default()),
+            native_drivers: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
             thread_lifecycle: None,
             fail_timer_arm: true,
@@ -527,38 +535,64 @@ impl DeadlineClock for MonotonicDeadlineClock {
     fn try_owned_wait(
         &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
-        // The complete concrete frame is admitted before state, name, source,
-        // or worker creation. Genuine custom clocks use the trait default.
+        if self.native_drivers.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return self.legacy_owned_wait(deadline_ms, owner);
+        }
         contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
-            let remaining = deadline_ms.saturating_sub(self.now_ms());
-            if remaining == 0 { return Ok(OwnedMonotonicWait::Ready); }
-            #[cfg(any(test, feature = "test-seams"))]
-            if self.fail_timer_arm || FAILED_TIMER_ARMS.with(|remaining| {
-                let count = remaining.get(); remaining.set(count.saturating_sub(1)); count != 0
-            }) {
-                self.timer_arm_failure_waits.fetch_add(1, Ordering::SeqCst);
-                return Ok(OwnedMonotonicWait::Injected(InjectedTimerArmFailureWait {
-                    completed: false, polls: &self.timer_arm_failure_polls,
-                }));
-            }
-            let state = owned_shared(owner.clone(), || Ok((Mutex::new(TimerState::default()), std::sync::Condvar::new())))?;
-            let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
-                owner.clone(), std::mem::size_of::<OwnedTimerSource>(),
-                "reader", "deadline_thread_source", "Raise the reader memory limit.")?;
-            let source = contextdb_core::read_memory::OwnedReadBox::try_from_prepaid_with(invoice, || Ok(OwnedTimerSource {
-                state: state.clone(), remaining,
-                #[cfg(feature = "test-seams")] lifecycle: self.thread_lifecycle.clone(),
-            }))?;
-            // This internal worker needs no owned debug-name allocation.
-            // Public host-created waits keep their existing named path.
-            match std::thread::Builder::new().spawn(move || source.run()) {
-                Ok(thread) => {
-                    #[cfg(any(test, feature = "test-seams"))] note_timer_thread_started_for_test();
-                    Ok(OwnedMonotonicWait::Timer(OwnedTimerWait { state, thread: Some(thread) }))
-                }
-                Err(_) => Ok(OwnedMonotonicWait::Ready),
-            }
+            Ok(OwnedMonotonicWait {
+                clock: self,
+                node: MonotonicWaitNode {
+                    deadline_ms,
+                    links: std::cell::UnsafeCell::new(MonotonicWaitLinks {
+                        next: std::ptr::null(), linked: false, waker: None,
+                    }),
+                    _pin: std::marker::PhantomPinned,
+                },
+            })
         }).map(Some)
+    }
+
+    fn native_driver_started(&self) { self.native_drivers.fetch_add(1, std::sync::atomic::Ordering::AcqRel); }
+    fn native_driver_ended(&self) { self.native_drivers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+
+    fn native_next_deadline_ms(&self) -> Option<u64> {
+        let list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = None;
+        let mut node = list.head;
+        // Every node remains pinned until unlink under this same mutex.
+        unsafe {
+            while !node.is_null() {
+                let deadline = (*node).deadline_ms;
+                next = Some(next.map_or(deadline, |old: u64| old.min(deadline)));
+                node = (*(*node).links.get()).next;
+            }
+        }
+        next
+    }
+
+    fn drive_native_deadlines(&self) {
+        loop {
+            let waker = {
+                let mut list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+                let now = self.now_ms();
+                let mut node = list.head;
+                let mut due = None;
+                unsafe {
+                    while !node.is_null() {
+                        if (*node).deadline_ms <= now {
+                            list.unlink(node);
+                            due = (*(*node).links.get()).waker.take();
+                            break;
+                        }
+                        node = (*(*node).links.get()).next;
+                    }
+                }
+                due
+            };
+            let Some(waker) = waker else { return; };
+            // A callback may re-enter the clock or retire its own wait.
+            waker.wake();
+        }
     }
 
     #[doc(hidden)]
@@ -961,6 +995,231 @@ impl Drop for OwnedManualWait {
         unsafe { state.native_parked.unlink(&self.node); }
     }
 }
+// All links and wakers are protected by the clock mutex. The owning future
+// is pinned in an admitted frame before linking and unlinks before free.
+#[derive(Debug, Default)]
+struct MonotonicWaitList { head: *const MonotonicWaitNode }
+unsafe impl Send for MonotonicWaitList {}
+struct MonotonicWaitLinks {
+    next: *const MonotonicWaitNode,
+    linked: bool,
+    waker: Option<Waker>,
+}
+struct MonotonicWaitNode {
+    deadline_ms: u64,
+    links: std::cell::UnsafeCell<MonotonicWaitLinks>,
+    _pin: std::marker::PhantomPinned,
+}
+impl MonotonicWaitList {
+    unsafe fn unlink(&mut self, target: *const MonotonicWaitNode) {
+        let mut link = &mut self.head as *mut *const MonotonicWaitNode;
+        unsafe {
+            while !(*link).is_null() {
+                let node = *link;
+                if node == target {
+                    *link = (*(*node).links.get()).next;
+                    (*(*node).links.get()).linked = false;
+                    (*(*node).links.get()).next = std::ptr::null();
+                    return;
+                }
+                link = &mut (*(*node).links.get()).next;
+            }
+        }
+    }
+}
+struct OwnedMonotonicWait<'a> {
+    clock: &'a MonotonicDeadlineClock,
+    node: MonotonicWaitNode,
+}
+unsafe impl Send for OwnedMonotonicWait<'_> {}
+impl Future for OwnedMonotonicWait<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let next_waker = cx.waker().clone();
+        let mut list = this.clock.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+        if this.clock.now_ms() >= this.node.deadline_ms {
+            unsafe { list.unlink(&this.node); }
+            return Poll::Ready(());
+        }
+        unsafe {
+            let links = &mut *this.node.links.get();
+            let previous = links.waker.replace(next_waker);
+            if !links.linked {
+                links.next = list.head;
+                links.linked = true;
+                list.head = &this.node;
+            }
+            drop(list);
+            drop(previous);
+        }
+        Poll::Pending
+    }
+}
+impl Drop for OwnedMonotonicWait<'_> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut list = self.clock.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+            unsafe { list.unlink(&self.node); (*self.node.links.get()).waker.take() }
+        };
+        drop(waker);
+    }
+}
+
+pub(crate) fn deadline_operation_owned<'a, T: Send + 'a>(
+    clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
+    operation: LocalDeadlineOperation<'a, T>,
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<DeadlineOperationWait<'a, T>, LocalTransportError> {
+    let deadline = wait_until_owned(clock, deadline_ms, owner)
+        .map_err(|error| super::query_funding::transport_error(error, u64::MAX))?;
+    Ok(DeadlineOperationWait { stage, inner: Some(DeadlineInner::Host(operation)), admission_error: None, clock, deadline_ms, deadline: Some(deadline) })
+}
+
+enum DeadlineInner<'a, T> {
+    Host(LocalDeadlineOperation<'a, T>),
+    Engine(contextdb_core::read_memory::ReadOwnedFuture<'a, Result<T, LocalTransportError>>),
+}
+impl<T> Future for DeadlineInner<'_, T> {
+    type Output = Result<T, LocalTransportError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Host(future) => future.as_mut().poll(cx),
+            Self::Engine(future) => Pin::new(future).poll(cx),
+        }
+    }
+}
+pub(crate) fn deadline_operation_funded<'a, T, F>(
+    clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
+    owner: contextdb_core::read_memory::ReadMemoryOwner, make: impl FnOnce() -> F,
+) -> DeadlineOperationWait<'a, T>
+where T: Send + 'a, F: Future<Output = Result<T, LocalTransportError>> + Send + 'a {
+    let prepared = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(make()))
+        .and_then(|future| wait_until_owned(clock, deadline_ms, &owner).map(|deadline| (future, deadline)));
+    match prepared {
+        Ok((future, deadline)) => DeadlineOperationWait { stage, inner: Some(DeadlineInner::Engine(future)),
+            admission_error: None, clock, deadline_ms, deadline: Some(deadline) },
+        Err(error) => DeadlineOperationWait { stage, inner: None,
+            admission_error: Some(super::query_funding::transport_error(error, u64::MAX)),
+            clock, deadline_ms, deadline: None },
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct NativeDriverLease(Arc<dyn DeadlineClock>);
+#[cfg(target_os = "linux")]
+impl Drop for NativeDriverLease {
+    fn drop(&mut self) { self.0.native_driver_ended(); }
+}
+
+// The complete driver, including binding, clock lease, wake handle and the
+// concrete operation, occupies one prepaid pinned frame. The operation is
+// destroyed before its driver lease and before the frame's physical free.
+#[cfg(target_os = "linux")]
+struct DrivenLocalFuture<F> {
+    future: F,
+    binding: Option<contextdb_core::read_contract::NativeClockBinding>,
+    park: super::native_driver::NativeCallerPark,
+    _driving: Option<NativeDriverLease>,
+}
+#[cfg(target_os = "linux")]
+impl<F, T> Future for DrivenLocalFuture<F>
+where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> {
+    type Output = crate::owner_read::OwnerReadScaffoldResult<T>;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        use contextdb_core::read_contract::NativeDriverPark;
+        // F is never moved after this prepaid frame is pinned. There is no
+        // Drop implementation that could move it during destruction.
+        let this = unsafe { self.get_unchecked_mut() };
+        let waker = this.park.waker();
+        let mut cx = Context::from_waker(&waker);
+        match unsafe { Pin::new_unchecked(&mut this.future) }.poll(&mut cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => {
+                let result = match &this.binding {
+                    Some(binding) => binding.park_until(u64::MAX, &this.park),
+                    None => this.park.park(),
+                };
+                match result {
+                    Ok(()) => Poll::Pending,
+                    Err(error) => Poll::Ready(Err(crate::owner_read::OwnerReadScaffoldError::from_local(
+                        super::LocalTransportError::OriginalAdmission(error)))),
+                }
+            }
+        }
+    }
+}
+
+/// Drive an admitted operation on the caller's existing thread. Engine clock
+/// waits contribute their earliest deadline; host waits retain their own wake.
+#[cfg(target_os = "linux")]
+pub(crate) fn drive_local<F, T>(
+    future: F, clock: &Arc<dyn DeadlineClock>,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> crate::owner_read::OwnerReadScaffoldResult<T>
+where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
+    use contextdb_core::read_contract::NativeClockBinding;
+    use crate::owner_read::OwnerReadScaffoldError as E;
+    let mut driver = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
+        let binding = match NativeClockBinding::try_select(clock, &owner) {
+            Ok(binding) => Some(binding),
+            Err(contextdb_core::Error::ReadSessionNotImplemented) => None,
+            Err(error) => return Err(error),
+        };
+        let park = super::native_driver::NativeCallerPark::try_new(owner)?;
+        // A selected source alone is not an active driver. This admitted
+        // poll-and-park frame is the actual caller/connection responsible.
+        let driving = binding.as_ref().map(|_| {
+            clock.native_driver_started();
+            NativeDriverLease(clock.clone())
+        });
+        Ok(DrivenLocalFuture { future, binding, park, _driving: driving })
+    }).map_err(|error| E::from_local(super::LocalTransportError::OriginalAdmission(error)))?;
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(result) = Pin::new(&mut driver).poll(&mut cx) { return result; }
+    }
+}
+
+impl MonotonicDeadlineClock {
+    fn legacy_owned_wait(
+        &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
+        // The complete concrete frame is admitted before state, name, source,
+        // or worker creation. Genuine custom clocks use the trait default.
+        contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
+            let remaining = deadline_ms.saturating_sub(self.now_ms());
+            if remaining == 0 { return Ok(LegacyMonotonicWait::Ready); }
+            #[cfg(any(test, feature = "test-seams"))]
+            if self.fail_timer_arm || FAILED_TIMER_ARMS.with(|remaining| {
+                let count = remaining.get(); remaining.set(count.saturating_sub(1)); count != 0
+            }) {
+                self.timer_arm_failure_waits.fetch_add(1, Ordering::SeqCst);
+                return Ok(LegacyMonotonicWait::Injected(InjectedTimerArmFailureWait {
+                    completed: false, polls: &self.timer_arm_failure_polls,
+                }));
+            }
+            let state = owned_shared(owner.clone(), || Ok((Mutex::new(TimerState::default()), std::sync::Condvar::new())))?;
+            let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
+                owner.clone(), std::mem::size_of::<OwnedTimerSource>(),
+                "reader", "deadline_thread_source", "Raise the reader memory limit.")?;
+            let source = contextdb_core::read_memory::OwnedReadBox::try_from_prepaid_with(invoice, || Ok(OwnedTimerSource {
+                state: state.clone(), remaining,
+                #[cfg(feature = "test-seams")] lifecycle: self.thread_lifecycle.clone(),
+            }))?;
+            // This internal worker needs no owned debug-name allocation.
+            // Public host-created waits keep their existing named path.
+            match std::thread::Builder::new().spawn(move || source.run()) {
+                Ok(thread) => {
+                    #[cfg(any(test, feature = "test-seams"))] note_timer_thread_started_for_test();
+                    Ok(LegacyMonotonicWait::Timer(OwnedTimerWait { state, thread: Some(thread) }))
+                }
+                Err(_) => Ok(LegacyMonotonicWait::Ready),
+            }
+        }).map(Some)
+    }
+
+}
 struct OwnedTimerSource {
     state: contextdb_core::read_memory::ReadShared<(Mutex<TimerState>, std::sync::Condvar)>,
     remaining: u64,
@@ -1009,13 +1268,13 @@ impl Drop for OwnedTimerWait {
         }
     }
 }
-enum OwnedMonotonicWait<'a> {
+enum LegacyMonotonicWait<'a> {
     Ready,
     Timer(OwnedTimerWait),
     #[cfg(any(test, feature = "test-seams"))] Injected(InjectedTimerArmFailureWait<'a>),
     #[cfg(not(any(test, feature = "test-seams")))] Lifetime(std::marker::PhantomData<&'a ()>),
 }
-impl Future for OwnedMonotonicWait<'_> {
+impl Future for LegacyMonotonicWait<'_> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         match self.get_mut() {
@@ -1026,41 +1285,23 @@ impl Future for OwnedMonotonicWait<'_> {
     }
 }
 
-pub(crate) fn deadline_operation_owned<'a, T: Send + 'a>(
-    clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
-    operation: LocalDeadlineOperation<'a, T>,
-    owner: &contextdb_core::read_memory::ReadMemoryOwner,
-) -> Result<DeadlineOperationWait<'a, T>, LocalTransportError> {
-    let deadline = wait_until_owned(clock, deadline_ms, owner)
-        .map_err(|error| super::query_funding::transport_error(error, u64::MAX))?;
-    Ok(DeadlineOperationWait { stage, inner: Some(DeadlineInner::Host(operation)), admission_error: None, clock, deadline_ms, deadline: Some(deadline) })
-}
-
-enum DeadlineInner<'a, T> {
-    Host(LocalDeadlineOperation<'a, T>),
-    Engine(contextdb_core::read_memory::ReadOwnedFuture<'a, Result<T, LocalTransportError>>),
-}
-impl<T> Future for DeadlineInner<'_, T> {
-    type Output = Result<T, LocalTransportError>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.get_mut() {
-            Self::Host(future) => future.as_mut().poll(cx),
-            Self::Engine(future) => Pin::new(future).poll(cx),
-        }
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn drive_local<F, T>(
+    future: F, _clock: &Arc<dyn DeadlineClock>, _owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> crate::owner_read::OwnerReadScaffoldResult<T>
+where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
+    struct Caller(std::thread::Thread);
+    impl std::task::Wake for Caller {
+        fn wake(self: Arc<Self>) { self.0.unpark(); }
+        fn wake_by_ref(self: &Arc<Self>) { self.0.unpark(); }
     }
-}
-pub(crate) fn deadline_operation_funded<'a, T, F>(
-    clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
-    owner: contextdb_core::read_memory::ReadMemoryOwner, make: impl FnOnce() -> F,
-) -> DeadlineOperationWait<'a, T>
-where T: Send + 'a, F: Future<Output = Result<T, LocalTransportError>> + Send + 'a {
-    let prepared = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(make()))
-        .and_then(|future| wait_until_owned(clock, deadline_ms, &owner).map(|deadline| (future, deadline)));
-    match prepared {
-        Ok((future, deadline)) => DeadlineOperationWait { stage, inner: Some(DeadlineInner::Engine(future)),
-            admission_error: None, clock, deadline_ms, deadline: Some(deadline) },
-        Err(error) => DeadlineOperationWait { stage, inner: None,
-            admission_error: Some(super::query_funding::transport_error(error, u64::MAX)),
-            clock, deadline_ms, deadline: None },
+    let waker = Waker::from(Arc::new(Caller(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => std::thread::park(),
+        }
     }
 }

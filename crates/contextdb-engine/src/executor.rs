@@ -3450,7 +3450,7 @@ impl BoundedCursorExecutionState {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some(watch) = watch {
-            watch.drive();
+            bounded::CursorExpiryWatch::drive(&watch);
         }
     }
 

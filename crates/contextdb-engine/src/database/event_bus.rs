@@ -2079,6 +2079,55 @@ impl Database {
     /// delivery metrics and whether a callback is currently registered), and
     /// route. Backs the CLI's `.events status` introspection and is a real
     /// public accessor, not a test seam.
+    pub(crate) fn direct_events_status_funded(
+        &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<crate::local_transport::query_funding::Funded<crate::direct_file_reader::DirectEventsStatus>> {
+        use crate::direct_file_reader::{DirectEventsStatus, DirectEventTypeStatus, DirectSinkStatus, DirectRouteStatus};
+        let _operation = self.assert_open_operation();
+        let schedules = self.direct_cron_status_funded(owner.clone())?;
+        // Keep the captured definitions borrowed through count/reserve/build.
+        let definitions = self.event_bus.definitions.lock();
+        let callbacks = self.event_bus.callbacks.read();
+        let mut bytes = 0usize;
+        let mut add = |amount: usize| -> Result<()> {
+            bytes = bytes.checked_add(amount).ok_or_else(|| Error::Other("event status size overflow".into()))?; Ok(())
+        };
+        for event in definitions.event_types.values() {
+            add(std::mem::size_of::<DirectEventTypeStatus>())?;
+            add(event.name.len())?; add(event.table.len())?; add(event.trigger.as_ddl_trigger().len())?;
+        }
+        for sink in definitions.sinks.values() {
+            add(std::mem::size_of::<DirectSinkStatus>())?;
+            add(sink.name.len())?; add(sink.sink_type.as_ddl_sink_type().len())?;
+        }
+        for route in definitions.routes.values() {
+            add(std::mem::size_of::<DirectRouteStatus>())?;
+            add(route.name.len())?; add(route.event_type.len())?; add(route.sink.len())?;
+        }
+        let mut status = crate::local_transport::query_funding::Funded::allocate_owned(Some(owner), bytes, || {
+            let mut status = DirectEventsStatus {
+                event_types: Vec::with_capacity(definitions.event_types.len()), sinks: Vec::with_capacity(definitions.sinks.len()),
+                routes: Vec::with_capacity(definitions.routes.len()), schedules: schedules.value,
+            };
+            for event in definitions.event_types.values() {
+                status.event_types.push(DirectEventTypeStatus { name: event.name.clone(),
+                    trigger: event.trigger.as_ddl_trigger().to_owned(), table: event.table.clone() });
+            }
+            for sink in definitions.sinks.values() {
+                let metrics = self.sink_metrics(&sink.name);
+                status.sinks.push(DirectSinkStatus { name: sink.name.clone(), sink_type: sink.sink_type.as_ddl_sink_type().to_owned(),
+                    callback_registered: callbacks.contains_key(&sink.name), delivered: metrics.delivered, queued: metrics.queued,
+                    retried: metrics.retried, uncertain: metrics.uncertain, permanent_failures: metrics.permanent_failures, examined: metrics.examined });
+            }
+            for route in definitions.routes.values() {
+                status.routes.push(DirectRouteStatus { name: route.name.clone(), event_type: route.event_type.clone(), sink: route.sink.clone() });
+            }
+            status
+        })?;
+        if let Some(credit) = schedules.credit { status.credit.as_mut().expect("event inventory owns credit").try_merge_prepaid(credit)?; }
+        Ok(status)
+    }
+
     pub fn event_bus_status(&self) -> EventBusStatus {
         let _operation = self.assert_open_operation();
         let definitions = self.event_bus.definitions.lock().clone();

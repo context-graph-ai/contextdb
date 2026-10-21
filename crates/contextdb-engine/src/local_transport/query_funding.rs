@@ -638,6 +638,10 @@ pub(crate) fn owner_failure_responses(
     use crate::owner_read::OwnerReadScaffoldError as E;
     let response = match error {
         E::Refused(failure) => Funded::external(super::LocalResponse::Failure { failure }),
+        E::Database(error) if memory_refusal_ceiling(&error).is_some() => {
+            Funded::external(super::LocalResponse::Failure { failure:
+                super::memory_ceiling_read_failure(memory_refusal_ceiling(&error).expect("classified memory refusal"), None) })
+        }
         E::Database(error) => {
             let failure = super::LocalEngineFailure::from_query_error(&error, owner.clone())?;
             Funded { value: super::LocalResponse::EngineFailure { failure: failure.value },
@@ -701,14 +705,34 @@ pub(crate) fn owner_panic_responses(
     owner_diagnostic_response(&Diagnostic(payload), owner)
 }
 
-pub(crate) fn transport_error(error: contextdb_core::Error, _ceiling: u64) -> super::LocalTransportError {
+pub(crate) fn memory_refusal_ceiling(error: &contextdb_core::Error) -> Option<u64> {
+    use contextdb_core::{Error, read_memory::NativeRefusal};
+    match error.engine_diagnostic() {
+        Error::MemoryBudgetExceeded { budget_limit_bytes, .. }
+        | Error::NativeEngineOther(NativeRefusal::MemoryBudgetExceeded { budget_limit_bytes, .. }
+            | NativeRefusal::ProcessMemoryBudgetExceeded { budget_limit_bytes, .. }) => Some(*budget_limit_bytes as u64),
+        Error::ReadFailure(failure) => match failure.detail() {
+            contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
+                if detail.limit == contextdb_core::read_contract::ReadFailureLimit::Memory => Some(detail.value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn transport_error(error: contextdb_core::Error, ceiling: u64) -> super::LocalTransportError {
+    // Internal producers retain their original diagnostics. At the transport
+    // boundary a real memory refusal keeps the established actionable tag.
+    if crate::read_image_memory::is_memory_refusal(&error) {
+        let ceiling = if ceiling == u64::MAX { memory_refusal_ceiling(&error).unwrap_or(ceiling) } else { ceiling };
+        return super::LocalTransportError::Payload(super::PayloadViolation::MemoryCeilingExceeded {
+            ceiling, required: None,
+        });
+    }
     match error {
         contextdb_core::Error::ReadFailure(failure) => super::LocalTransportError::Refusal(failure),
         contextdb_core::Error::ReadCancelled => super::owner_disconnected(),
-        contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint } =>
-            super::LocalTransportError::MemoryAdmission { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint },
-        contextdb_core::Error::NativeEngineOther(error) => super::LocalTransportError::NativeAdmission(error),
-        other => super::LocalTransportError::OriginalAdmission(other),
+        _ => super::invalid_channel_data(),
     }
 }
 

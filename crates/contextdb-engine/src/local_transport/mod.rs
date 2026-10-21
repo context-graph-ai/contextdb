@@ -33,7 +33,9 @@
 mod address;
 mod authentication;
 mod carrier;
-mod deadlines;
+#[cfg(target_os = "linux")]
+pub(crate) mod native_driver;
+pub(crate) mod deadlines;
 mod engine_answer;
 mod framing;
 pub(crate) mod inbound_query;
