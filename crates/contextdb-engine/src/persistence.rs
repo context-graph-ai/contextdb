@@ -36584,22 +36584,33 @@ graph_commit_result }.map_err(Self::storage_error)?;
         else {
             return Ok((Vec::new(), covered_lsn));
         };
-        self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let journal = match read_txn.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Ok((Vec::new(), covered_lsn));
+        self.prepare_proof_owner()?;
+        self.with_db_handle_loan(|db| {
+            let read_txn =
+                self.with_storage_admission(|| db.begin_read().map_err(Self::storage_error))?;
+            let journal = self.with_storage_admission(|| {
+                match read_txn.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
+                    Ok(table) => Ok(Some(table)),
+                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+                    Err(error) => Err(Self::storage_error(error)),
                 }
-                Err(error) => return Err(Self::storage_error(error)),
+            })?;
+            let Some(journal) = journal else {
+                return Ok((Vec::new(), covered_lsn));
             };
             let mut identities = BTreeSet::new();
             let mut replayed_through_lsn = covered_lsn;
-            for entry in journal
-                .range(lower.as_slice()..upper.as_slice())
-                .map_err(Self::storage_error)?
+            let mut range = self.with_storage_admission(|| {
+                journal
+                    .range(lower.as_slice()..upper.as_slice())
+                    .map_err(Self::storage_error)
+            })?;
+            while let Some((key, value)) = self
+                .with_storage_admission(|| range.next().transpose().map_err(Self::storage_error))?
             {
-                let (key, value) = entry.map_err(Self::storage_error)?;
+                // Native page/record receipts retain the real payer themselves.
+                // The IO admission control is physically gone before the codec.
+
                 #[cfg(test)]
                 bounded_journal_suffix_tests::note_examined();
                 let record: VectorPartitionJournalRecord = self
@@ -36633,18 +36644,35 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     ));
                 }
             }
+            drop(range);
+            drop(journal);
             if identities.is_empty() {
                 return Ok((Vec::new(), replayed_through_lsn));
             }
-            let vectors = read_txn
-                .open_byte_table_bounded(VECTORS_TABLE)
-                .map_err(Self::storage_error)?;
+            let vectors = self.with_storage_admission(|| {
+                read_txn
+                    .open_byte_table_bounded(VECTORS_TABLE)
+                    .map_err(Self::storage_error)
+            })?;
             let mut tail = Vec::with_capacity(identities.len());
             for (row_id, created_tx, lsn) in identities {
-                let key = Self::vector_identity_key(index, row_id, created_tx, lsn);
-                let value = vectors
-                    .get_bounded(key.as_slice())
-                    .map_err(Self::storage_error)?
+                let key_bytes = index
+                    .table
+                    .len()
+                    .checked_add(index.column.len())
+                    .and_then(|bytes| bytes.checked_add(34))
+                    .ok_or_else(|| Error::Other("vector identity key size overflow".into()))?;
+                let key = crate::local_transport::query_funding::Funded::allocate_owned(
+                    Some(crate::read_image_memory::active_owner()?.owner()),
+                    key_bytes,
+                    || Self::vector_identity_key(index, row_id, created_tx, lsn),
+                )?;
+                let value = self
+                    .with_storage_admission(|| {
+                        vectors
+                            .get_bounded(key.value.as_slice())
+                            .map_err(Self::storage_error)
+                    })?
                     .ok_or_else(|| {
                         self.vector_partition_corruption(
                             "journal tail points to a missing immutable vector",
@@ -47983,6 +48011,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
     // Borrow the same open native handle for byte-only operations. No codec
     // owner is created here; the caller retains its actual read/page owner.
     fn with_db_handle<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
+        self.with_db_handle_loan(|db| self.with_storage_admission(|| f(db)))
+    }
+
+    // The same open-handle loan, separated from native IO admission so a
+    // byte guard may keep its own original receipts after IO completes.
+    fn with_db_handle_loan<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
         #[cfg(test)]
         PERSISTENCE_OWNERSHIP_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
         // Operations borrow shared handle ownership. A writer waiting inside
@@ -48001,10 +48035,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let db = database
             .as_ref()
             .ok_or_else(|| Error::Other(("database persistence is closed".to_string()).into()))?;
+        f(db)
+    }
+
+    fn with_storage_admission<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         // A caller's already installed capability owns native misses and any
         // pending map created here. Never replace its original payer.
         if redb::native_storage_active() {
-            return f(db);
+            return operation();
         }
         // Decode-only read callers carry their operation child on the existing
         // image owner. Bridge that same child instead of selecting the writer.
@@ -48014,7 +48052,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let storage_scope =
                 native_storage_admission::StorageAdmissionScope::reader_operation(memory)
                     .map_err(native_storage_admission::original_storage_error)?;
-            return storage_scope.run_original_unqualified(|| f(db));
+            return storage_scope.run_original_unqualified(operation);
         }
         // Only unscoped internal maintenance/bootstrap uses the attach-time
         // writer handle. Owned publication installed its explicit original above.
@@ -48027,9 +48065,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let original = crate::memory_accounting::reserve_storage_from_original_handle(&handle)?;
             let storage_scope =
                 native_storage_admission::StorageAdmissionScope::writer_original(&original)?;
-            storage_scope.run_original_unqualified(|| f(db))
+            storage_scope.run_original_unqualified(operation)
         } else {
-            f(db)
+            operation()
         }
     }
 }

@@ -9,7 +9,9 @@
 //! re-derived beside it.
 
 use crate::OwnerReadCancellation;
-use crate::cli_render::{render_column_type, render_table_meta};
+use crate::cli_render::render_column_type;
+#[cfg(any(test, feature = "test-seams"))]
+use crate::cli_render::render_table_meta;
 use crate::database::{Database, MaintenancePolicy};
 use crate::direct_file_reader::{
     DirectChangeFrontiers, DirectChangeState, DirectColumnReference, DirectConfigurationState,
@@ -133,7 +135,7 @@ fn build_committed_image(
     )?;
 
     // The metadata projection is read back before any narrowing is applied.
-    let mut image = project_owned_image(&database)?;
+    let mut image = project_owned_image(&database, &memory)?;
     image.configuration.memory_limit_bytes = declared_memory_limit;
     let image = DirectOwnedImage {
         snapshot: DirectSnapshot {
@@ -152,6 +154,10 @@ fn build_committed_image(
     }
 
     open_context.checkpoint()?;
+    let header = std::alloc::Layout::new::<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>();
+    let target_bytes = header.extend(std::alloc::Layout::new::<Database>()).map_err(|_| Error::Other("image target layout overflow".into()))?.0.pad_to_align().size();
+    let image_bytes = header.extend(std::alloc::Layout::new::<DirectOwnedImage>()).map_err(|_| Error::Other("owned image layout overflow".into()))?.0.pad_to_align().size();
+    memory.reserve(target_bytes.checked_add(image_bytes).ok_or_else(|| Error::Other("image controls size overflow".into()))?)?;
     Ok(CommittedImage {
         target: Arc::new(database) as Arc<dyn ReadExecutionTarget>,
         image: Arc::new(image),
@@ -160,18 +166,40 @@ fn build_committed_image(
     })
 }
 
-fn project_owned_image(database: &Database) -> Result<DirectOwnedImage> {
-    let mut table_names = database.table_names();
-    table_names.sort();
-
-    let schemas = table_names
-        .iter()
-        .filter_map(|table| {
-            database
-                .table_meta(table)
-                .map(|meta| project_schema(table, &meta))
-        })
-        .collect::<Vec<_>>();
+fn project_owned_image(
+    database: &Database,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
+) -> Result<DirectOwnedImage> {
+    use crate::local_transport::query_funding::Funded;
+    let schemas = database.with_metadata_catalog(|catalog| -> Result<Vec<DirectSchema>> {
+        let bytes = catalog
+            .len()
+            .checked_mul(std::mem::size_of::<(&str, &contextdb_core::TableMeta)>())
+            .ok_or_else(|| Error::Other("image catalog size overflow".into()))?;
+        let mut source = Funded::allocate_owned(Some(memory.owner()), bytes, || {
+            // A trait-object iterator does not carry TrustedLen. Collect would
+            // choose Vec's minimum capacity for a short catalog; allocate the
+            // admitted exact count explicitly instead.
+            let mut source = Vec::with_capacity(catalog.len());
+            source.extend(catalog);
+            source
+        })?;
+        source
+            .value
+            .sort_unstable_by(|left, right| left.0.cmp(right.0));
+        memory.reserve(
+            source
+                .value
+                .len()
+                .checked_mul(std::mem::size_of::<DirectSchema>())
+                .ok_or_else(|| Error::Other("image schema inventory size overflow".into()))?,
+        )?;
+        let mut schemas = Vec::with_capacity(source.value.len());
+        for (table, meta) in &source.value {
+            schemas.push(project_schema_funded(table, meta, memory.owner())?.into_retained());
+        }
+        Ok(schemas)
+    })?;
 
     // Open authenticates the committed root, but it must not point-load every
     // historical row to manufacture metadata no caller requested. The target
@@ -182,21 +210,51 @@ fn project_owned_image(database: &Database) -> Result<DirectOwnedImage> {
         committed_watermark: database.committed_watermark(),
         next_tx: database.next_tx(),
     };
+    let policy_bytes = schemas.iter().try_fold(
+        schemas
+            .len()
+            .checked_mul(std::mem::size_of::<DirectTableSyncPolicy>())
+            .ok_or_else(|| Error::Other("image policy size overflow".into()))?,
+        |bytes, schema| {
+            bytes
+                .checked_add(schema.table.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(schema.sync_direction.as_deref().unwrap_or("two_way").len())
+                })
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        schema
+                            .conflict_policy
+                            .as_deref()
+                            .unwrap_or("keep_first")
+                            .len(),
+                    )
+                })
+                .ok_or_else(|| Error::Other("image policy size overflow".into()))
+        },
+    )?;
+    memory.reserve(policy_bytes)?;
     let policies = schemas
         .iter()
         .map(|schema| DirectTableSyncPolicy {
             table: schema.table.clone(),
             direction: schema
                 .sync_direction
-                .clone()
-                .unwrap_or_else(|| "two_way".to_owned()),
+                .as_deref()
+                .unwrap_or("two_way")
+                .to_owned(),
             conflict_policy: schema
                 .conflict_policy
-                .clone()
-                .unwrap_or_else(|| "keep_first".to_owned()),
+                .as_deref()
+                .unwrap_or("keep_first")
+                .to_owned(),
         })
         .collect();
-    let sync = direct_sync_state(database, policies, HashMap::new());
+    let sync = DirectSyncState {
+        watermark: database.sync_watermark(),
+        sources: Vec::new(),
+        tables: policies,
+    };
 
     let configuration = DirectConfigurationState {
         memory_limit_bytes: database.memory_limit(),
@@ -204,12 +262,19 @@ fn project_owned_image(database: &Database) -> Result<DirectOwnedImage> {
         schemas,
     };
 
-    let events = project_events(database);
+    let events = database
+        .direct_events_status_funded(memory.owner())?
+        .into_retained();
 
     // Runtime fields are the fresh handle's own: this session started no
     // maintenance and inherits no caller's policy. Retention and currency are
     // declarations, so they come from the image's own schemas.
     let status = database.maintenance_status();
+    let policy = match status.policy {
+        MaintenancePolicy::EngineOwned => "engine_owned",
+        MaintenancePolicy::CallerDriven => "caller_driven",
+    };
+    memory.reserve(policy.len())?;
     let maintenance = DirectMaintenanceStatus {
         policy: match status.policy {
             MaintenancePolicy::EngineOwned => "engine_owned".to_owned(),
@@ -615,6 +680,7 @@ fn direct_change_state(
 /// One projection serves both the committed image and a live database,
 /// because it is the same question: what event types, sinks, routes and
 /// schedules does this store declare.
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn project_events(database: &Database) -> DirectEventsStatus {
     let bus = database.event_bus_status();
     DirectEventsStatus {
@@ -685,26 +751,264 @@ fn project_scope_label(kind: &ScopeLabelKind) -> DirectScopeLabelKind {
     }
 }
 
+/// Price the concrete schema clone before making its first allocation. The
+/// DDL and type strings use counted writers, and transitions are inserted in
+/// sorted order under the existing native map node envelope.
+pub(crate) fn project_schema_funded(
+    table: &str,
+    meta: &contextdb_core::TableMeta,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<crate::local_transport::query_funding::Funded<DirectSchema>> {
+    use crate::cli_render::{MetadataColumnType, metadata_text_len};
+    use contextdb_core::read_memory::ReadCredit;
+    let mut ddl = crate::cli_render::render_table_meta_funded(owner.clone(), table, meta)?;
+    let mut bytes = 0usize;
+    let overflow = || Error::Other("schema projection size overflow".into());
+    let mut add = |amount: usize| -> Result<()> {
+        bytes = bytes.checked_add(amount).ok_or_else(overflow)?;
+        Ok(())
+    };
+    fn list_bytes(values: &[String]) -> Option<usize> {
+        values.iter().try_fold(
+            values.len().checked_mul(std::mem::size_of::<String>())?,
+            |bytes, value| bytes.checked_add(value.len()),
+        )
+    }
+    add(table.len())?;
+    add(meta
+        .columns
+        .len()
+        .checked_mul(std::mem::size_of::<DirectSchemaColumn>())
+        .ok_or_else(overflow)?)?;
+    for column in &meta.columns {
+        add(column.name.len())?;
+        add(metadata_text_len(format_args!(
+            "{}",
+            MetadataColumnType(&column.column_type)
+        ))?)?;
+        if let Some(default) = &column.default {
+            add(default.len())?;
+        }
+        if let Some(reference) = &column.references {
+            add(reference.table.len())?;
+            add(reference.column.len())?;
+            if let Some(PropagationRule::ForeignKey { trigger_state, target_state, .. }) = meta.propagation_rules.iter().find(|rule|
+                matches!(rule, PropagationRule::ForeignKey { fk_column, .. } if fk_column == &column.name)) {
+                add(trigger_state.len())?; add(target_state.len())?;
+            }
+        }
+        if let Some(keys) = &column.partition_key_columns {
+            add(list_bytes(keys).ok_or_else(overflow)?)?;
+        }
+        if let Some(rank) = &column.rank_policy {
+            for text in [
+                &rank.sort_key,
+                &rank.formula,
+                &rank.joined_table,
+                &rank.joined_column,
+            ] {
+                add(text.len())?;
+            }
+        }
+        if let Some(scope) = &column.scope_label {
+            match scope {
+                ScopeLabelKind::Simple { write_labels } => {
+                    add(list_bytes(write_labels).ok_or_else(overflow)?)?
+                }
+                ScopeLabelKind::Split {
+                    read_labels,
+                    write_labels,
+                } => {
+                    add(list_bytes(read_labels).ok_or_else(overflow)?)?;
+                    add(list_bytes(write_labels).ok_or_else(overflow)?)?;
+                }
+            }
+        }
+        if let Some(acl) = &column.acl_ref {
+            add(acl.ref_table.len())?;
+            add(acl.ref_column.len())?;
+        }
+    }
+    if meta.primary_key_columns.is_empty() {
+        let count = meta
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .count();
+        add(count
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(overflow)?)?;
+        for column in meta.columns.iter().filter(|column| column.primary_key) {
+            add(column.name.len())?;
+        }
+    } else {
+        add(list_bytes(&meta.primary_key_columns).ok_or_else(overflow)?)?;
+    }
+    let index_count = meta
+        .indexes
+        .iter()
+        .filter(|index| index.kind != IndexKind::Auto)
+        .count();
+    add(index_count
+        .checked_mul(std::mem::size_of::<DirectSchemaIndex>())
+        .ok_or_else(overflow)?)?;
+    for index in meta
+        .indexes
+        .iter()
+        .filter(|index| index.kind != IndexKind::Auto)
+    {
+        add(index.name.len())?;
+        add(index
+            .columns
+            .len()
+            .checked_mul(std::mem::size_of::<DirectIndexColumn>())
+            .ok_or_else(overflow)?)?;
+        for (column, _) in &index.columns {
+            add(column.len())?;
+        }
+    }
+    if let Some(state) = &meta.state_machine {
+        add(state.column.len())?;
+        add(crate::local_transport::query_funding::tree_bytes::<
+            String,
+            Vec<String>,
+        >(state.transitions.len())?)?;
+        for (from, to) in &state.transitions {
+            add(from.len())?;
+            add(list_bytes(to).ok_or_else(overflow)?)?;
+        }
+    }
+    if meta.default_ttl_seconds.is_some() {
+        add(meta
+            .retain_declared_unit
+            .unwrap_or(RetainUnit::Seconds)
+            .sql()
+            .len())?;
+    }
+    if let Some(history) = meta.history_policy {
+        add(match history {
+            HistoryPolicy::All => "ALL",
+            HistoryPolicy::CurrentOnly => "CURRENT_ONLY",
+        }
+        .len())?;
+    }
+    if let Some(direction) = meta.sync_direction {
+        add(sync_direction_str(direction).len())?;
+    }
+    if let Some(conflict) = conflict_policy_str(meta) {
+        add(conflict.len())?;
+    }
+    add(list_bytes(&meta.dag_edge_types).ok_or_else(overflow)?)?;
+    add(meta
+        .propagation_rules
+        .len()
+        .checked_mul(std::mem::size_of::<DirectPropagationRule>())
+        .ok_or_else(overflow)?)?;
+    for rule in &meta.propagation_rules {
+        match rule {
+            PropagationRule::Edge {
+                edge_type,
+                direction,
+                trigger_state,
+                target_state,
+                ..
+            } => {
+                add(edge_type.len())?;
+                add(trigger_state.len())?;
+                add(target_state.len())?;
+                add(match direction {
+                    Direction::Incoming => "INCOMING",
+                    Direction::Outgoing => "OUTGOING",
+                    Direction::Both => "BOTH",
+                }
+                .len())?;
+            }
+            PropagationRule::VectorExclusion { trigger_state } => add(trigger_state.len())?,
+            PropagationRule::ForeignKey {
+                fk_column,
+                referenced_table,
+                referenced_column,
+                trigger_state,
+                target_state,
+                ..
+            } => {
+                for text in [
+                    fk_column,
+                    referenced_table,
+                    referenced_column,
+                    trigger_state,
+                    target_state,
+                ] {
+                    add(text.len())?;
+                }
+            }
+        }
+    }
+    let mut credit = ReadCredit::try_new_owned(
+        owner,
+        bytes,
+        "reader",
+        "schema_projection",
+        "Raise the declared memory limit to inspect this schema.",
+    )?;
+    if let Some(ddl_credit) = ddl.credit.take() {
+        credit.try_merge_prepaid(ddl_credit)?;
+    }
+    let schema = project_schema_with_ddl(table, meta, ddl.value);
+    Ok(crate::local_transport::query_funding::Funded {
+        value: schema,
+        credit: Some(credit),
+    })
+}
+fn sync_direction_str(direction: SyncDirection) -> &'static str {
+    match direction {
+        SyncDirection::None => "sync_off",
+        SyncDirection::Push => "push_only",
+        SyncDirection::Pull => "pull_only",
+        SyncDirection::Both => "two_way",
+    }
+}
+fn conflict_policy_str(meta: &contextdb_core::TableMeta) -> Option<&'static str> {
+    meta.conflict_policy
+        .and_then(|policy| policy.declared_clause())
+        .map(|clause| match clause {
+            "SYNC CONFLICT KEEP FIRST" => "keep_first",
+            "SYNC CONFLICT KEEP LATEST" => "keep_latest",
+            other => other,
+        })
+}
+
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> DirectSchema {
+    project_schema_with_ddl(table, meta, render_table_meta(table, meta))
+}
+
+fn project_schema_with_ddl(
+    table: &str,
+    meta: &contextdb_core::TableMeta,
+    ddl: String,
+) -> DirectSchema {
     let columns = meta
         .columns
         .iter()
         .map(|column| {
-            let propagation = meta.propagation_rules.iter().find_map(|rule| match rule {
-                PropagationRule::ForeignKey {
-                    fk_column,
-                    trigger_state,
-                    target_state,
-                    max_depth,
-                    abort_on_failure,
-                    ..
-                } if fk_column == &column.name => Some(DirectReferencePropagation {
-                    on_state: trigger_state.clone(),
-                    set_state: target_state.clone(),
-                    max_depth: *max_depth,
-                    abort_on_failure: *abort_on_failure,
-                }),
-                _ => None,
+            let propagation = column.references.as_ref().and_then(|_| {
+                meta.propagation_rules.iter().find_map(|rule| match rule {
+                    PropagationRule::ForeignKey {
+                        fk_column,
+                        trigger_state,
+                        target_state,
+                        max_depth,
+                        abort_on_failure,
+                        ..
+                    } if fk_column == &column.name => Some(DirectReferencePropagation {
+                        on_state: trigger_state.clone(),
+                        set_state: target_state.clone(),
+                        max_depth: *max_depth,
+                        abort_on_failure: *abort_on_failure,
+                    }),
+                    _ => None,
+                })
             });
             DirectSchemaColumn {
                 name: column.name.clone(),
@@ -744,19 +1048,34 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
         })
         .collect::<Vec<_>>();
     let primary_key = if meta.primary_key_columns.is_empty() {
-        meta.columns
-            .iter()
-            .filter(|column| column.primary_key)
-            .map(|column| column.name.clone())
-            .collect()
+        let mut keys = Vec::with_capacity(
+            meta.columns
+                .iter()
+                .filter(|column| column.primary_key)
+                .count(),
+        );
+        keys.extend(
+            meta.columns
+                .iter()
+                .filter(|column| column.primary_key)
+                .map(|column| column.name.clone()),
+        );
+        keys
     } else {
         meta.primary_key_columns.clone()
     };
-    let indexes = meta
+    let mut indexes = Vec::with_capacity(
+        meta.indexes
+            .iter()
+            .filter(|index| index.kind != IndexKind::Auto)
+            .count(),
+    );
+    for index in meta
         .indexes
         .iter()
         .filter(|index| index.kind != IndexKind::Auto)
-        .map(|index| DirectSchemaIndex {
+    {
+        indexes.push(DirectSchemaIndex {
             name: index.name.clone(),
             columns: index
                 .columns
@@ -769,15 +1088,24 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
                     },
                 })
                 .collect(),
-        })
-        .collect();
-    let state_machine = meta.state_machine.as_ref().map(|state| DirectStateMachine {
-        column: state.column.clone(),
-        transitions: state
+        });
+    }
+    let state_machine = meta.state_machine.as_ref().map(|state| {
+        let mut transitions = BTreeMap::new();
+        let mut previous: Option<&str> = None;
+        while let Some((from, to)) = state
             .transitions
             .iter()
-            .map(|(from, to)| (from.clone(), to.clone()))
-            .collect(),
+            .filter(|(key, _)| previous.is_none_or(|previous| key.as_str() > previous))
+            .min_by(|left, right| left.0.cmp(right.0))
+        {
+            transitions.insert(from.clone(), to.clone());
+            previous = Some(from);
+        }
+        DirectStateMachine {
+            column: state.column.clone(),
+            transitions,
+        }
     });
     let retain = meta.default_ttl_seconds.map(|seconds| {
         let (window, unit) = match meta.retain_declared_unit {
@@ -843,7 +1171,16 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
             },
         })
         .collect::<Vec<_>>();
-    propagate.sort_by_key(propagation_sort_key);
+    // Preserve equal-key order without sort scratch or cloned comparison keys.
+    for at in 1..propagate.len() {
+        let mut next = at;
+        while next != 0
+            && propagation_sort_key(&propagate[next]) < propagation_sort_key(&propagate[next - 1])
+        {
+            propagate.swap(next, next - 1);
+            next -= 1;
+        }
+    }
     DirectSchema {
         table: table.to_owned(),
         immutable: meta.immutable,
@@ -857,7 +1194,7 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
         conflict_policy: conflict_policy_word(meta),
         dag_edge_types: meta.dag_edge_types.clone(),
         propagate,
-        ddl: render_table_meta(table, meta),
+        ddl,
     }
 }
 
@@ -881,17 +1218,17 @@ fn conflict_policy_word(meta: &contextdb_core::TableMeta) -> Option<String> {
         })
 }
 
-fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, String, String) {
+fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, &str, &str) {
     match rule {
         DirectPropagationRule::Edge {
             edge_type,
             on_state,
             ..
-        } => (0, on_state.clone(), edge_type.clone()),
+        } => (0, on_state.as_str(), edge_type.as_str()),
         DirectPropagationRule::ForeignKey {
             column, on_state, ..
-        } => (1, on_state.clone(), column.clone()),
-        DirectPropagationRule::VectorExclusion { on_state } => (2, on_state.clone(), String::new()),
+        } => (1, on_state.as_str(), column.as_str()),
+        DirectPropagationRule::VectorExclusion { on_state } => (2, on_state.as_str(), ""),
     }
 }
 
@@ -2423,12 +2760,9 @@ pub(crate) fn project_metadata_from_database(
             }
         }
         DirectMetadataRequest::Schema { table } => {
-            let meta = database.table_meta(&table).ok_or_else(|| {
-                engine_message(read_memory.clone(), format_args!("table not found: {table}"))
-            })?;
-            DirectMetadataBody::Schema {
-                schema: project_schema(&table, &meta),
-            }
+            let schema = database.metadata_schema(&table, charge.owner()).map_err(history_answer_error)?
+                .ok_or_else(|| engine_message(read_memory.clone(), format_args!("table not found: {table}")))?;
+            DirectMetadataBody::Schema { schema: schema.into_retained() }
         }
         DirectMetadataRequest::Explain { sql, params } => explained_statement(
             database,

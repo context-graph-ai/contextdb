@@ -63921,6 +63921,55 @@ impl Database {
         })
     }
 
+    pub(crate) fn metadata_schema(
+        &self,
+        table: &str,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<
+        Option<
+            crate::local_transport::query_funding::Funded<crate::direct_file_reader::DirectSchema>,
+        >,
+    > {
+        if let Some(captured) = self.captured_graph_decisions() {
+            return captured
+                .catalog
+                .get(table)
+                .map(|meta| crate::read_image::project_schema_funded(table, meta, owner))
+                .transpose();
+        }
+        let _operation = self.assert_open_operation();
+        let answer = if let Some(root) = self.scoped_writer_root() {
+            root.borrow_captured_table_meta(table)
+                .map(|meta| crate::read_image::project_schema_funded(table, meta, owner))
+                .transpose()
+        } else {
+            self.relational_store
+                .table_meta
+                .read()
+                .get(table)
+                .map(|meta| crate::read_image::project_schema_funded(table, meta, owner))
+                .transpose()
+        }?;
+        if answer.is_none()
+            && let Some(access) = &self.received_staging_access
+        {
+            access.record(table);
+        }
+        Ok(answer)
+    }
+
+    pub(crate) fn with_metadata_catalog<R>(
+        &self,
+        consume: impl FnOnce(&mut dyn ExactSizeIterator<Item = (&str, &TableMeta)>) -> R,
+    ) -> R {
+        let _operation = self.assert_open_operation();
+        if let Some(root) = self.scoped_writer_root() {
+            return consume(&mut root.captured_table_metadata());
+        }
+        let catalog = self.relational_store.table_meta.read();
+        consume(&mut catalog.iter().map(|(name, meta)| (name.as_str(), meta)))
+    }
+
     pub fn table_names(&self) -> Vec<String> {
         let _operation = self.assert_open_operation();
         if let Some(root) = self.scoped_writer_root() {
@@ -100992,13 +101041,6 @@ fn sql_type_for_ast_column(
     ty
 }
 
-pub(crate) fn sql_type_for_display_column(
-    col: &contextdb_core::ColumnDef,
-    rules: &[PropagationRule],
-) -> String {
-    sql_type_for_meta_column(col, rules)
-}
-
 pub(crate) fn sql_type_for_meta_column(
     col: &contextdb_core::ColumnDef,
     rules: &[PropagationRule],
@@ -101007,115 +101049,13 @@ pub(crate) fn sql_type_for_meta_column(
 }
 
 fn render_meta_column(col: &contextdb_core::ColumnDef, rules: &[PropagationRule]) -> String {
-    let mut ty = match col.column_type {
-        ColumnType::Integer => "INTEGER".to_string(),
-        ColumnType::Real => "REAL".to_string(),
-        ColumnType::Text => "TEXT".to_string(),
-        ColumnType::Boolean => "BOOLEAN".to_string(),
-        ColumnType::Json => "JSON".to_string(),
-        ColumnType::Uuid => "UUID".to_string(),
-        ColumnType::Vector(dim) => format!("VECTOR({dim})"),
-        ColumnType::Timestamp => "TIMESTAMP".to_string(),
-        ColumnType::TxId => "TXID".to_string(),
-    };
-    append_core_quantization(&mut ty, col.quantization);
-    append_core_vector_declaration(&mut ty, col);
-    if col.context_id {
-        ty.push_str(" CONTEXT_ID");
-    }
-    if let Some(scope) = &col.scope_label {
-        match scope {
-            ScopeLabelKind::Simple { write_labels } => {
-                append_scope_label(&mut ty, None, write_labels)
-            }
-            ScopeLabelKind::Split {
-                read_labels,
-                write_labels,
-            } => append_scope_label(&mut ty, Some(read_labels), write_labels),
-        }
-    }
-
-    let fk_rules = rules
-        .iter()
-        .filter_map(|rule| match rule {
-            PropagationRule::ForeignKey {
-                fk_column,
-                referenced_table,
-                referenced_column,
-                trigger_state,
-                target_state,
-                max_depth,
-                abort_on_failure,
-            } if fk_column == &col.name => Some((
-                referenced_table,
-                referenced_column,
-                trigger_state,
-                target_state,
-                *max_depth,
-                *abort_on_failure,
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(reference) = &col.references {
-        ty.push_str(&format!(
-            " REFERENCES {}({})",
-            reference.table, reference.column
-        ));
-    } else if let Some((referenced_table, referenced_column, ..)) = fk_rules.first() {
-        ty.push_str(&format!(
-            " REFERENCES {}({})",
-            referenced_table, referenced_column
-        ));
-    }
-
-    if col.references.is_some() || !fk_rules.is_empty() {
-        for (_, _, trigger_state, target_state, max_depth, abort_on_failure) in fk_rules {
-            ty.push_str(&format!(
-                " ON STATE {} PROPAGATE SET {}",
-                trigger_state, target_state
-            ));
-            if max_depth != 10 {
-                ty.push_str(&format!(" MAX DEPTH {max_depth}"));
-            }
-            if abort_on_failure {
-                ty.push_str(" ABORT ON FAILURE");
-            }
-        }
-    }
-    if let Some(acl) = &col.acl_ref {
-        append_acl_reference(&mut ty, &acl.ref_table, &acl.ref_column);
-    }
-    if col.primary_key {
-        ty.push_str(" PRIMARY KEY");
-    }
-    if !col.nullable && !col.primary_key {
-        ty.push_str(" NOT NULL");
-    }
-    if let Some(default) = &col.default {
-        ty.push_str(&format!(" DEFAULT {default}"));
-    }
-    if col.unique {
-        ty.push_str(" UNIQUE");
-    }
-    if col.expires {
-        ty.push_str(" EXPIRES");
-    }
-    if col.immutable {
-        ty.push_str(" IMMUTABLE");
-    }
-    if let Some(policy) = &col.rank_policy {
-        ty.push_str(&format!(
-            " RANK_POLICY (JOIN {} ON {}, FORMULA '{}', SORT_KEY {})",
-            policy.joined_table,
-            policy.joined_column,
-            sql_quote(&policy.formula),
-            policy.sort_key
-        ));
-    }
-
-    ty
+    let column = crate::cli_render::MetadataColumn(col, rules);
+    let text = format_args!("{column}");
+    let bytes =
+        crate::cli_render::metadata_text_len(text).expect("column declaration fits a String");
+    let mut output = String::with_capacity(bytes);
+    std::fmt::write(&mut output, text).expect("String rendering");
+    output
 }
 
 fn append_ast_quantization(
@@ -101128,15 +101068,6 @@ fn append_ast_quantization(
         contextdb_parser::ast::VectorQuantization::SQ4 => "SQ4",
     };
     ty.push_str(&format!(" WITH (quantization = '{quantization}')"));
-}
-
-fn append_core_quantization(ty: &mut String, quantization: contextdb_core::VectorQuantization) {
-    if !matches!(quantization, contextdb_core::VectorQuantization::F32) {
-        ty.push_str(&format!(
-            " WITH (quantization = '{}')",
-            quantization.as_str()
-        ));
-    }
 }
 
 fn append_ast_vector_declaration(ty: &mut String, col: &contextdb_parser::ast::ColumnDef) {
@@ -101254,70 +101185,6 @@ fn append_ast_consolidation_declaration(
     .collect::<Vec<_>>();
     if !members.is_empty() {
         ty.push_str(&format!(" CONSOLIDATION ({})", members.join(", ")));
-    }
-}
-
-fn append_core_vector_declaration(ty: &mut String, col: &contextdb_core::ColumnDef) {
-    if !matches!(col.column_type, ColumnType::Vector(_)) {
-        return;
-    }
-    if let Some(partition_key_columns) = col.partition_key_columns.as_ref()
-        && !partition_key_columns.is_empty()
-    {
-        ty.push_str(&format!(
-            " PARTITION_KEY ({})",
-            partition_key_columns.join(", ")
-        ));
-        ty.push_str(&format!(
-            " MAX_PARTITIONS {}",
-            col.effective_max_partitions()
-                .unwrap_or(DEFAULT_VECTOR_MAX_PARTITIONS)
-        ));
-    }
-    if !matches!(col.search_mode, contextdb_core::VectorSearchMode::Auto) {
-        ty.push_str(&format!(" SEARCH_MODE {}", col.search_mode));
-    }
-    if let Some(auto_index_at) = col.auto_index_at {
-        ty.push_str(&format!(" AUTO_INDEX_AT {auto_index_at}"));
-    }
-    if let Some(ceiling) = col.auto_expansion_ceiling {
-        ty.push_str(&format!(" AUTO_EXPANSION_CEILING {ceiling}"));
-    }
-    if let Some(flat_below) = col.flat_below {
-        ty.push_str(&format!(" FLAT_BELOW {flat_below}"));
-    }
-    let mut hnsw = Vec::new();
-    if let Some(value) = col.hnsw_m {
-        hnsw.push(format!("M = {value}"));
-    }
-    if let Some(value) = col.hnsw_ef_construction {
-        hnsw.push(format!("EF_CONSTRUCTION = {value}"));
-    }
-    if let Some(value) = col.hnsw_ef_search {
-        hnsw.push(format!("EF_SEARCH = {value}"));
-    }
-    if let Some(value) = col.hnsw_search_radius_millionths {
-        hnsw.push(format!(
-            "SEARCH_RADIUS = {}",
-            contextdb_core::render_search_radius_millionths(value)
-        ));
-    }
-    if !hnsw.is_empty() {
-        ty.push_str(&format!(" HNSW ({})", hnsw.join(", ")));
-    }
-    if col.consolidation_disabled {
-        ty.push_str(" CONSOLIDATION NONE");
-        return;
-    }
-    let mut consolidation = Vec::new();
-    if let Some(value) = col.consolidation_change_percent {
-        consolidation.push(format!("CHANGE_PERCENT = {value}"));
-    }
-    if let Some(value) = col.consolidation_tombstone_percent {
-        consolidation.push(format!("TOMBSTONE_PERCENT = {value}"));
-    }
-    if !consolidation.is_empty() {
-        ty.push_str(&format!(" CONSOLIDATION ({})", consolidation.join(", ")));
     }
 }
 
