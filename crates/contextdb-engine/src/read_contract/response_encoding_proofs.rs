@@ -330,12 +330,20 @@ fn encoded_response_field_escape_keeps_exact_original_invoices_until_physical_fr
         } else {
             prior_query_bytes(&data)
         };
+        let pre_fixture = accountant.usage().used;
+        // Fund the real input before measuring only output allocation and escape.
+        // Keep it live until both output invoices have been physically released.
+        let metadata_fixture = metadata.then(|| {
+            crate::read_session::MetadataAnswer::try_new(
+                body, None, Default::default(), owner.clone(),
+            ).unwrap()
+        });
         let baseline = accountant.usage().used;
         let admitted = accountant.admitted_bytes_for_test();
         let counter = accountant.used_counter_for_observation();
         let (encoded, requests, count) = physical::source_requests_for_test(counter, || {
             let funded = if metadata {
-                encode_metadata_body_funded(&body, owner.clone(), CEILING)
+                encode_metadata_body_funded(&metadata_fixture.as_ref().unwrap().body, owner.clone(), CEILING)
             } else {
                 encode_query_result_funded(&data, owner.clone(), CEILING)
             }
@@ -374,9 +382,7 @@ fn encoded_response_field_escape_keeps_exact_original_invoices_until_physical_fr
             let alias = encoded.clone();
             let escaped = if metadata {
                 let response = DirectMetadataResponse {
-                    metadata: crate::read_session::MetadataAnswer::try_new(
-                        body, None, Default::default(), owner.clone(),
-                    ).unwrap(),
+                    metadata: metadata_fixture.as_ref().unwrap().clone(),
                     canonical_bytes: encoded,
                     snapshot,
                 };
@@ -420,6 +426,9 @@ fn encoded_response_field_escape_keeps_exact_original_invoices_until_physical_fr
             "native control physically freed before control invoice refunds"
         );
         assert_eq!(accountant.usage().used, baseline);
+        drop(metadata_fixture);
+        assert_eq!(accountant.usage().used, pre_fixture);
+        assert_eq!(accountant.usage().used, 0);
         assert_eq!(accountant.underflow_count_for_test(), 0);
     }
 }
