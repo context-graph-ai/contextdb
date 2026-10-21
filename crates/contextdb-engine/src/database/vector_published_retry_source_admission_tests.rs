@@ -59,8 +59,10 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         .unwrap();
     assert_ne!(catalog, old);
     let query = "SELECT id FROM retry_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3";
-    let fixture_answer_60 = db.execute(query, &HashMap::new()).unwrap();
-    let old_rows = fixture_answer_60.rows();
+    let old_rows = {
+        let fixture_answer_60 = db.execute(query, &HashMap::new()).unwrap();
+        fixture_answer_60.rows().to_vec()
+    };
     // Give the task-owned snapshot its own writer identity, then carry the
     // exact published generation and pending journal bytes into it. The
     // logical export deliberately omits these rebuildable generation tables.

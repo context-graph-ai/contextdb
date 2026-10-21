@@ -12,7 +12,7 @@
 //! than a second shape that merely decodes alike.
 
 use contextdb_core::{Lsn, TxId, VectorSearchMode};
-use contextdb_engine::read_contract::{decode_metadata_body, encode_metadata_body};
+use contextdb_engine::read_contract::{decode_metadata_body, encode_metadata_body as encode_metadata_body_native};
 use contextdb_engine::{
     DdlChange, DirectColumnReference, DirectEventTypeStatus, DirectEventsStatus, DirectImageState,
     DirectIndexColumn, DirectIndexDirection, DirectMaintenanceStatus, DirectPropagationRule,
@@ -27,6 +27,11 @@ use std::collections::BTreeMap;
 
 /// Read one body back and require it to be the body that was written, in both
 /// directions: the same value, and the same bytes.
+fn encode_metadata_body(body: &MetadataBody) -> Result<Vec<u8>, contextdb_engine::read_contract::ReadEncodingError> {
+    encode_metadata_body_native(body, super::read_contract_encoding::fixture_encoding_owner())
+        .map(|bytes| bytes.as_slice().to_vec())
+}
+
 fn survives_the_wire(body: &MetadataBody) {
     let written = encode_metadata_body(body).expect("encode the metadata body");
     let read = decode_metadata_body(&written).expect("read the metadata body back");

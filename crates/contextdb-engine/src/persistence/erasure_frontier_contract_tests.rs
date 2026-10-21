@@ -558,14 +558,15 @@ fn crashed_discard_is_atomic(committed: bool) {
     let db = Database::open(&path).unwrap();
     let recovered_lsn = db.current_lsn();
     for table in ["items", "unrelated"] {
-        let fixture_answer_103 = db
+        let rows = {
+            let fixture_answer_103 = db
             .execute(
                 &format!("SELECT id FROM {table} ORDER BY id"),
                 &HashMap::new(),
             )
             .unwrap();
-        let rows = fixture_answer_103
-            .rows();
+            fixture_answer_103.rows().to_vec()
+        };
         assert_eq!(
             rows,
             if committed {

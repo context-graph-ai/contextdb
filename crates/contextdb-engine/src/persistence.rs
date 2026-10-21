@@ -52975,11 +52975,12 @@ mod empty_declared_index_readiness_tests {
         let source_pin = control_source.storage_identity();
         drop(_fixture_decode_scope_43155);
         let session_image = control_session.file_snapshot_for_test().unwrap();
-        let fixture_answer_101 = control_session
+        let row_answer = {
+            let fixture_answer_101 = control_session
             .execute("SELECT body FROM removed_rows", &HashMap::new())
             .unwrap();
-        let row_answer = fixture_answer_101
-            .rows();
+            fixture_answer_101.rows().to_vec()
+        };
         assert_eq!(
             row_answer,
             vec![vec![Value::Text(
@@ -52994,7 +52995,7 @@ mod empty_declared_index_readiness_tests {
                 None,
             )
             .unwrap()
-            .body;
+            .body.clone();
         let directory_before = directory_pinned_view(&control_session);
         assert_eq!(
             directory_before,

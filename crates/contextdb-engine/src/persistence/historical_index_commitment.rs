@@ -1677,7 +1677,7 @@ mod verification_tests {
             None,
             &cancellation,
         )
-        .map(|(body, _)| body);
+        .map(|(body, _, _)| body);
         (answer, clock.reads.load(Ordering::SeqCst))
     }
 

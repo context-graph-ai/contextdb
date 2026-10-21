@@ -826,7 +826,7 @@ fn reader_startup_memory_ceiling_admits_loaded_state_without_rewriting_store_con
             .unwrap();
         let MetadataBody::ImageState {
             state: DirectImageState::Configuration(configuration),
-        } = configuration.body
+        } = configuration.body.clone()
         else {
             panic!("configuration inspection must keep its typed body");
         };

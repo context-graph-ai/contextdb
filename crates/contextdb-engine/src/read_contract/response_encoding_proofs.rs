@@ -374,11 +374,11 @@ fn encoded_response_field_escape_keeps_exact_original_invoices_until_physical_fr
             let alias = encoded.clone();
             let escaped = if metadata {
                 let response = DirectMetadataResponse {
-                    body,
+                    metadata: crate::read_session::MetadataAnswer::try_new(
+                        body, None, Default::default(), owner.clone(),
+                    ).unwrap(),
                     canonical_bytes: encoded,
                     snapshot,
-                    continuation: None,
-                    charge: Default::default(),
                 };
                 response.canonical_bytes
             } else {
@@ -523,7 +523,7 @@ fn original_budget_refuses_each_response_leaf_before_its_output_allocation() {
         bincode::serde::encode_to_vec(&metadata, standard())
             .unwrap()
             .len(),
-        encode_metadata_body(&body).unwrap().len(),
+        encoded_metadata_body_len(&body),
         cursor_observation::encode_observed_cursor_page(&page, &observation)
             .unwrap()
             .len(),
@@ -750,7 +750,9 @@ fn funded_output_rolls_back_on_second_pass_serializer_failure_and_unwind() {
 fn encoded_output_retains_the_original_native_request_without_an_observer_alias() {
     let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(CEILING).unwrap();
     let root_only = parent.retained_bytes_for_test();
-    let child = parent.child().unwrap();
+    let (child, _) = crate::vector_read_memory::statement_child_proof::observe(
+        &parent, CEILING, || parent.child().unwrap(),
+    );
     let observer = crate::vector_read_memory::declared_child_observer(child.clone()).unwrap();
     let standing = parent.retained_bytes_for_test();
     let initial = observer.sample();

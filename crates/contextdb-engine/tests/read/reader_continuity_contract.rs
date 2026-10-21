@@ -617,13 +617,16 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     let baseline = ReadSession::with_runtime_directory_for_test(&runtime, || {
         fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()))
     });
-    let fixture_answer_25 = baseline.execute(SQL, &q()).unwrap();
-    let before_auto = fixture_answer_25.rows();
-    let fixture_answer_26 = baseline
+    let before_auto = {
+        let fixture_answer_25 = baseline.execute(SQL, &q()).unwrap();
+        fixture_answer_25.rows().to_vec()
+    };
+    let before_indexed = {
+        let fixture_answer_26 = baseline
         .execute(&SQL.replace("AUTO", "INDEXED"), &q())
         .unwrap();
-    let before_indexed = fixture_answer_26
-        .rows();
+        fixture_answer_26.rows().to_vec()
+    };
     drop(baseline);
     let auto_routes = Arc::new(fixture::Routes::default());
     let indexed_routes = Arc::new(fixture::Routes::default());
@@ -911,11 +914,12 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
     let runtime = fixture::runtime(root.path());
     seed(&path);
     let baseline = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
-    let fixture_answer_28 = baseline
+    let expected = {
+        let fixture_answer_28 = baseline
         .execute(&SQL.replace("AUTO", "EXACT"), &q())
         .unwrap();
-    let expected = fixture_answer_28
-        .rows();
+        fixture_answer_28.rows().to_vec()
+    };
     drop(baseline);
     let (tx, reached) = mpsc::channel();
     let park = Arc::new(Park {

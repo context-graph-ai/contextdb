@@ -106,14 +106,15 @@ fn exercise(route: ReadRoute, operation: Operation) {
     .unwrap();
     assert_eq!(reader.route(), route);
     let snapshot = reader.file_snapshot_for_test();
-    let fixture_answer_29 = reader
+    let baseline = {
+        let fixture_answer_29 = reader
         .execute(
             "SELECT id, payload FROM expiry_rows ORDER BY id",
             &HashMap::new(),
         )
         .unwrap();
-    let baseline = fixture_answer_29
-        .rows();
+        fixture_answer_29.rows().to_vec()
+    };
     match operation {
         Operation::Statement => {
             advance.armed.store(true, Ordering::SeqCst);

@@ -34,11 +34,11 @@ impl PerRequestReader {
         parent
     }
 }
-impl crate::vector_read_memory::ReadRequestBudgetProvider for PerRequestReader {
-    fn request_budget(
+impl crate::vector_read_memory::NativeReadRequestBudgetProvider for PerRequestReader {
+    fn request_budget_owner_native(
         &self,
-    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
-        self.next().child()
+    ) -> Result<crate::vector_read_memory::RequestReadOwner, crate::vector_read_memory::RequestOwnerFailure> {
+        self.next().request_budget_owner_native()
     }
 }
 
@@ -110,7 +110,7 @@ async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
             TenantId::from(TENANT),
             hub_node,
             hub_identity,
-            provider.clone(),
+            crate::vector_read_memory::ReadRequestProvider::native(provider.clone()),
         )
         .expect("hub"),
     );

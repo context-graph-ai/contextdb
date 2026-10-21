@@ -105,14 +105,15 @@ fn reads_decode_only_under_the_declared_reader_never_the_writer() {
     watch_budget_ledger_for_test();
     watch_reader_budget_ledger_for_test();
     let history = db.trigger_audit_history(Default::default()).unwrap();
-    let fixture_answer_47 = db
+    let nearest = {
+        let fixture_answer_47 = db
         .execute(
             "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
             &HashMap::from([("q".into(), Value::Vector(vector(1000)))]),
         )
         .unwrap();
-    let nearest = fixture_answer_47
-        .rows();
+        fixture_answer_47.rows().to_vec()
+    };
     let inspection = inspector.inspect_sync_apply_state();
     let writer = take_budget_ledger_for_test();
     let reader = take_reader_budget_ledger_for_test();

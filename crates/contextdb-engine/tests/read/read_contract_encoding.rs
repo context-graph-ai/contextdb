@@ -8,7 +8,7 @@ use contextdb_engine::read_contract::{
     CanonicalCascadeReport, CanonicalIndexCandidate, CanonicalQueryResult, CanonicalQueryTrace,
     CanonicalVectorPartitionHnswDisclosure, CanonicalVectorSearchDisclosure, ReadEncodingError,
     cursor_page_encoded_size, decode_cursor_page, decode_metadata_page, decode_query_result,
-    encode_cursor_page, encode_metadata_page, encode_query_result, metadata_page_encoded_size,
+    encode_cursor_page as encode_cursor_page_native, encode_metadata_page as encode_metadata_page_native, encode_query_result as encode_query_result_native, metadata_page_encoded_size,
     query_result_encoded_size,
 };
 use contextdb_engine::{
@@ -21,6 +21,25 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+
+// Standalone codec inputs are application fixtures with the same explicit
+// unbounded ceiling already declared by QueryFixture and cursor_fixture.
+pub(super) fn fixture_encoding_owner() -> contextdb_core::read_memory::ReadMemoryOwner {
+    contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+        .expect("codec fixture root").child().expect("codec fixture child")
+}
+pub(super) fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncodingError> {
+    encode_query_result_native(result, result.encoding_owner_for_test())
+        .map(|bytes| bytes.as_slice().to_vec())
+}
+fn encode_cursor_page(page: &CursorPage) -> Result<Vec<u8>, ReadEncodingError> {
+    encode_cursor_page_native(page, page.encoding_owner().expect("funded actual page fixture"))
+        .map(|bytes| bytes.as_slice().to_vec())
+}
+fn encode_metadata_page(page: &MetadataPage) -> Result<Vec<u8>, ReadEncodingError> {
+    encode_metadata_page_native(page, fixture_encoding_owner())
+        .map(|bytes| bytes.as_slice().to_vec())
+}
 
 struct QueryFixture {
     columns: Vec<String>, rows: Vec<Vec<Value>>, rows_affected: u64,

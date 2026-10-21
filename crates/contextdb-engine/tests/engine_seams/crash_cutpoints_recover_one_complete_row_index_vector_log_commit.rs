@@ -168,14 +168,15 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
             },
         )
         .unwrap();
-        let fixture_answer_36 = recovered
+        let rows = {
+            let fixture_answer_36 = recovered
             .execute(
                 "SELECT id FROM atomic_items WHERE scope = 42 ORDER BY id",
                 &params,
             )
             .unwrap();
-        let rows = fixture_answer_36
-            .rows();
+            fixture_answer_36.rows().to_vec()
+        };
         let old = vec![vec![Value::Int64(1)]];
         let new = vec![vec![Value::Int64(1)], vec![Value::Int64(2)]];
         assert!(

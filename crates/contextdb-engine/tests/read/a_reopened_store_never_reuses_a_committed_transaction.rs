@@ -69,7 +69,7 @@ fn read_committed_history(path: &std::path::Path) {
             kind: DirectImageMetadataKind::ChangeLog,
         })
         .expect("the store's own committed history must read back, not as damage")
-        .body
+        .body.clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(_),

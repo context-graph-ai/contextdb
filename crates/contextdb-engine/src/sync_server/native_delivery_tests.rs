@@ -449,12 +449,12 @@ fn handed_off(result: &crate::transport::WireResult<()>) -> Option<contextdb_cor
                     budget_limit_bytes,
                     hint,
                 } => contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.as_ref().to_owned().into(),
-                    operation: operation.as_ref().to_owned().into(),
+                    subsystem: subsystem.static_text().map(Into::into).unwrap_or_else(|| subsystem.as_ref().to_owned().into()),
+                    operation: operation.static_text().map(Into::into).unwrap_or_else(|| operation.as_ref().to_owned().into()),
                     requested_bytes: *requested_bytes,
                     available_bytes: *available_bytes,
                     budget_limit_bytes: *budget_limit_bytes,
-                    hint: hint.as_ref().to_owned().into(),
+                    hint: hint.static_text().map(Into::into).unwrap_or_else(|| hint.as_ref().to_owned().into()),
                 },
                 other => contextdb_core::Error::SyncError(other.to_string().into()),
             },
@@ -1649,22 +1649,7 @@ struct SwitchableProvider {
     tight: std::sync::Mutex<DeclaredReadRoot>,
     use_tight: AtomicBool,
 }
-impl crate::vector_read_memory::ReadRequestBudgetProvider for SwitchableProvider {
-    fn request_budget(
-        &self,
-    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
-        crate::vector_read_memory::ReadRequestBudgetProvider::request_budget(&self.roomy)
-    }
-    fn request_budget_owner(
-        &self,
-    ) -> contextdb_core::Result<crate::vector_read_memory::RequestReadOwner> {
-        let parent = if self.use_tight.load(Ordering::SeqCst) {
-            self.tight.lock().unwrap().clone()
-        } else {
-            self.roomy.clone()
-        };
-        parent.request_budget_owner()
-    }
+impl crate::vector_read_memory::NativeReadRequestBudgetProvider for SwitchableProvider {
     fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<
@@ -1709,7 +1694,7 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
             hub_db.clone(),
             &endpoint,
             tenant.clone(),
-            provider.clone().into(),
+            crate::vector_read_memory::ReadRequestProvider::native(provider.clone()),
         )
         .expect("hub"),
     );
@@ -2865,6 +2850,7 @@ fn the_page_bound_is_the_declared_page_bytes_unless_the_frame_ceiling_binds() {
 #[derive(Debug)]
 struct RouteSwitchProvider {
     parent: DeclaredReadRoot,
+    legacy_budget: Arc<crate::memory_accounting::MemoryAccountant>,
     legacy: AtomicBool,
 }
 #[cfg(feature = "iroh")]
@@ -2872,14 +2858,13 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for RouteSwitchProvide
     fn request_budget(
         &self,
     ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
-        self.parent.child()
+        Ok(self.legacy_budget.clone())
     }
     fn request_budget_owner(
         &self,
     ) -> contextdb_core::Result<crate::vector_read_memory::RequestReadOwner> {
         if self.legacy.load(Ordering::SeqCst) {
-            self.parent
-                .child()
+            self.request_budget()
                 .map(crate::vector_read_memory::RequestReadOwner::legacy)
         } else {
             self.parent.request_budget_owner()
@@ -2892,8 +2877,7 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for RouteSwitchProvide
         crate::vector_read_memory::RequestOwnerFailure,
     > {
         if self.legacy.load(Ordering::SeqCst) {
-            self.parent
-                .child()
+            self.request_budget()
                 .map(crate::vector_read_memory::RequestReadOwner::legacy)
                 .map_err(crate::vector_read_memory::RequestOwnerFailure::Legacy)
         } else {
@@ -2945,14 +2929,15 @@ async fn each_admitted_reply_is_classified_by_its_own_status_on_one_connection()
     .expect("rebind the hub endpoint");
     let provider = Arc::new(RouteSwitchProvider {
         parent: requests.clone(),
+        legacy_budget: Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(LIMIT as usize)),
         legacy: AtomicBool::new(false),
     });
     let server = Arc::new(
-        SyncServer::new_with_read_budget_provider_handle(
+        SyncServer::new_with_read_budget_provider(
             hub_db,
             &endpoint,
             TenantId::from(TENANT),
-            provider.clone().into(),
+            provider.clone(),
         )
         .expect("hub"),
     );
@@ -3152,7 +3137,7 @@ async fn every_hub_admission_site_refuses_before_its_allocation() {
         tight: std::sync::Mutex::new(DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root")),
         use_tight: AtomicBool::new(false),
     });
-    let hub = IrohHub::start_with(provider.clone(), None).await;
+    let hub = IrohHub::start_with(crate::vector_read_memory::ReadRequestProvider::native(provider.clone()), None).await;
     let accepted = || {
         hub._edge_db
             .delivery_status(ROOT_TABLE)
@@ -3635,17 +3620,7 @@ impl PerRequestProvider {
     }
 }
 #[cfg(feature = "iroh")]
-impl crate::vector_read_memory::ReadRequestBudgetProvider for PerRequestProvider {
-    fn request_budget(
-        &self,
-    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
-        self.next().child()
-    }
-    fn request_budget_owner(
-        &self,
-    ) -> contextdb_core::Result<crate::vector_read_memory::RequestReadOwner> {
-        self.next().request_budget_owner()
-    }
+impl crate::vector_read_memory::NativeReadRequestBudgetProvider for PerRequestProvider {
     fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<
@@ -3681,7 +3656,7 @@ async fn a_page_that_fits_is_built_alone_before_a_much_larger_excluded_outcome()
     });
     let provider = Arc::new(PerRequestProvider::new(LIMIT));
     let started = std::time::Instant::now();
-    let hub = IrohHub::start_seeded(provider.clone(), Some(PAGE_BYTES), 150).await;
+    let hub = IrohHub::start_seeded(crate::vector_read_memory::ReadRequestProvider::native(provider.clone()), Some(PAGE_BYTES), 150).await;
     eprintln!(
         "S4_EXCLUDED_PHASE seeded elapsed_ms={}",
         started.elapsed().as_millis()

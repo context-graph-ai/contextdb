@@ -104292,7 +104292,7 @@ mod currency_version_compaction_tests {
             #[derive(Debug)]
             struct MetadataOwner {
                 ordinary: contextdb_core::read_memory::ReadMemoryOwner,
-                refused: crate::vector_read_memory::DeclaredReadRoot,
+                refused: Arc<crate::memory_accounting::MemoryAccountant>,
                 refuse: bool,
                 answer_admissions: Arc<AtomicUsize>,
                 metadata_calls: AtomicUsize,
@@ -104432,9 +104432,7 @@ mod currency_version_compaction_tests {
                     let ordinary = db.declared_reader_memory().unwrap();
                     let owner = Arc::new(MetadataOwner {
                         ordinary: ordinary.clone(),
-                        refused: crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
-                            0,
-                        ),
+                        refused: Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(0)),
                         refuse: fault == "memory",
                         answer_admissions: answer_admissions.clone(),
                         metadata_calls: AtomicUsize::new(0),
