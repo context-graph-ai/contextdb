@@ -275,9 +275,9 @@ fn an_owner_only_open_serves_a_live_owner_exactly_as_an_ordinary_open_does() {
             .expect("the owner-only session reaches the same handler");
 
         assert_eq!(owner_only.route(), ReadRoute::Owner);
-        assert_eq!(owner_only_result.columns, ordinary_result.columns);
-        assert_eq!(owner_only_result.rows, ordinary_result.rows);
-        assert_eq!(owner_only_result.rows.len(), row_count);
+        assert_eq!(owner_only_result.columns(), ordinary_result.columns());
+        assert_eq!(owner_only_result.rows(), ordinary_result.rows());
+        assert_eq!(owner_only_result.rows().len(), row_count);
         assert_eq!(owner_only_response, expected_response);
         assert_eq!(owner_only_response, ordinary_response);
         assert_eq!(

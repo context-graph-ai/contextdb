@@ -270,7 +270,7 @@ fn a_metadata_answer_inside_the_declared_result_budget_is_served_over_the_owner_
         let session = owner_session(&owner_runtime, &path);
         session
             .metadata(MetadataRequest::Tables, None)
-            .map(|answer| answer.body)
+            .map(|answer| answer.body.clone())
     };
 
     drop(database);
@@ -280,7 +280,7 @@ fn a_metadata_answer_inside_the_declared_result_budget_is_served_over_the_owner_
         session
             .metadata(MetadataRequest::Tables, None)
             .expect("the committed file answers the table inventory")
-            .body
+            .body.clone()
     };
 
     let published = inventory_bytes(&from_the_file);

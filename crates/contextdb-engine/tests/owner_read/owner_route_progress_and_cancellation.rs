@@ -202,9 +202,9 @@ fn seed_ordered_rows(database: &Database) {
 }
 
 #[cfg(unix)]
-fn one_page_id(page: &contextdb_core::read_contract::CursorPage) -> i64 {
-    let [row] = page.rows.as_slice() else {
-        panic!("the one-row cursor page returned {:?}", page.rows);
+fn one_page_id(rows: &[Vec<Value>]) -> i64 {
+    let [row] = rows else {
+        panic!("the one-row cursor page returned {:?}", rows);
     };
     let [Value::Int64(id)] = row.as_slice() else {
         panic!("the cursor id projection returned {row:?}");
@@ -590,7 +590,7 @@ fn a_statement_over_the_owner_channel_reports_progress_before_the_result_returns
             &HashMap::new(),
         )
         .expect("the scan over the owner channel answers");
-    assert_eq!(answered.rows.len(), FIXTURE_ROWS as usize);
+    assert_eq!(answered.rows().len(), FIXTURE_ROWS as usize);
 
     let executing = recorder.of_phase(ReadPhase::Executing);
     assert!(
@@ -684,7 +684,7 @@ fn cancelling_a_statement_from_inside_the_owner_channel_observer_frees_the_owner
             "the SAME reader session's next statement succeeds: cancelling one statement did \
              not lose the session, its route, or its channel connection",
         );
-    assert_eq!(next.rows.len(), 1);
+    assert_eq!(next.rows().len(), 1);
 }
 
 #[test]
@@ -763,7 +763,7 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
         .fetch(None)
         .expect("the cursor survives the cancelled fetch and answers the next one");
     assert!(
-        !page.rows.is_empty() || !page.has_more,
+        !page.rows().is_empty() || !page.has_more(),
         "the cursor resumes cleanly after the cancelled fetch: {page:?}"
     );
 
@@ -859,7 +859,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     };
     let cursor_id = opened.cursor_id;
     let first_page = decode_cursor_page(&opened.payload).expect("decode the first cursor page");
-    assert_eq!(one_page_id(&first_page), 200);
+    assert_eq!(one_page_id(first_page.rows()), 200);
     assert!(first_page.has_more);
     let after_open = service.resources();
     assert_eq!(after_open.cursor_count, 1);
@@ -930,7 +930,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     };
     let replayed = decode_cursor_page(&replayed.payload).expect("decode the replayed page");
     assert_eq!(
-        one_page_id(&replayed),
+        one_page_id(replayed.rows()),
         2_500,
         "no withheld row may be skipped"
     );
@@ -967,7 +967,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     };
     let next = decode_cursor_page(&next.payload).expect("decode the continued page");
     assert_eq!(
-        one_page_id(&next),
+        one_page_id(next.rows()),
         3_500,
         "the replay must not duplicate a row"
     );
@@ -1034,7 +1034,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
     let direct_replay = direct_cursor
         .fetch(None)
         .expect("the direct cursor also remains usable after typed cancellation");
-    assert_eq!(one_page_id(&direct_replay), 2_500);
+    assert_eq!(one_page_id(direct_replay.rows()), 2_500);
     direct_cursor
         .close()
         .expect("close the direct parity cursor");
@@ -1068,7 +1068,7 @@ fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_t
             &HashMap::new(),
         )
         .expect("the large scan over the owner channel answers");
-    assert_eq!(big.rows.len(), FIXTURE_ROWS as usize);
+    assert_eq!(big.rows().len(), FIXTURE_ROWS as usize);
     let big_reporting_interval_crossings = recorder
         .of_phase(ReadPhase::Executing)
         .iter()
@@ -1090,7 +1090,7 @@ fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_t
             &HashMap::new(),
         )
         .expect("the tiny second scan over the owner channel answers");
-    assert_eq!(tiny.rows.len(), 1);
+    assert_eq!(tiny.rows().len(), 1);
     for report in recorder.of_phase(ReadPhase::Executing) {
         assert!(
             report.work < 1_000 && report.rows <= 1,
@@ -1282,7 +1282,7 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
         panic!("one cursor-open response");
     };
     assert_eq!(
-        one_page_id(&decode_cursor_page(&opened.payload).unwrap()),
+        one_page_id(decode_cursor_page(&opened.payload).unwrap().rows()),
         1
     );
     let cursor_id = opened.cursor_id;
@@ -1355,12 +1355,12 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
         assert_eq!(erased_resources.cursor_count, 0);
         assert_eq!(erased_resources.cursor_retained_bytes, 0);
         assert_eq!(erased_resources.buffered_bytes, 0);
-        assert!(database.execute("SELECT id FROM publication_wait_rows WHERE id = 2", &HashMap::new()).unwrap().rows.is_empty());
+        assert!(database.execute("SELECT id FROM publication_wait_rows WHERE id = 2", &HashMap::new()).unwrap().rows().is_empty());
         drop(client);
         service.shutdown_and_drain().unwrap();
         database.close().unwrap();
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows,
+        assert_eq!(reopened.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows(),
             vec![vec![Value::Int64(1)], vec![Value::Int64(3)]], "successful purge remains erased after reopen");
         reopened.close().unwrap();
         return;
@@ -1389,8 +1389,8 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
             limits, request: LocalRequest::CursorFetch { cursor_id, rows: None },
         })).expect("same cursor replays only after failed purge rollback");
         let [LocalResponse::CursorPage { page }] = replay.as_slice() else { panic!("one replay page"); };
-        assert_eq!(one_page_id(&decode_cursor_page(&page.payload).unwrap()), 2);
-        assert_eq!(database.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows,
+        assert_eq!(one_page_id(decode_cursor_page(&page.payload).unwrap().rows()), 2);
+        assert_eq!(database.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows(),
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)], vec![Value::Int64(3)]]);
     } else {
         pause.as_ref().unwrap().release();
@@ -1399,7 +1399,7 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
         let [LocalResponse::CursorPage { page }] = responses.as_slice() else {
             panic!("exactly one successful page: {responses:?}");
         };
-        assert_eq!(one_page_id(&decode_cursor_page(&page.payload).unwrap()), 2);
+        assert_eq!(one_page_id(decode_cursor_page(&page.payload).unwrap().rows()), 2);
     }
     fetch.join().unwrap();
     // A status exchange is an ordering fence after page publication and guard
@@ -1423,7 +1423,7 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
         panic!("one continuation page");
     };
     let next_page = decode_cursor_page(&page.payload).unwrap();
-    assert_eq!(one_page_id(&next_page), 3);
+    assert_eq!(one_page_id(next_page.rows()), 3);
     assert!(
         !next_page.has_more,
         "the opened snapshot excludes the writer's later row"
@@ -1459,7 +1459,7 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
     } else {
         vec![vec![Value::Int64(1)], vec![Value::Int64(2)], vec![Value::Int64(3)]]
     };
-    assert_eq!(reopened.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows,
+    assert_eq!(reopened.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows(),
         expected, "failed purge publishes no durable erasure; ordinary commit stays durable");
     reopened.close().unwrap();
 }
