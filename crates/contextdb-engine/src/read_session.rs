@@ -4623,7 +4623,11 @@ fn decode_observed_page(
     let available =
         cursor_receive_allowance(memory, retained_memory).saturating_sub(payload.len() as u64);
     crate::local_transport::observed_cursor_page_allocation_bytes(payload, available)
-        .map_err(read_encoding_error)?;
+        .map_err(|error| match error {
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. } =>
+                read_encoding_error(crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling: memory }),
+            other => read_encoding_error(other),
+        })?;
     let before = retained_memory.held();
     let decoded =
         crate::read_contract::cursor_observation::decode_observed_cursor_page_with_memory(
@@ -4631,7 +4635,11 @@ fn decode_observed_page(
             retained_memory,
             available,
         )
-        .map_err(read_encoding_error)?;
+        .map_err(|error| match error {
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. } =>
+                read_encoding_error(crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling: memory }),
+            other => read_encoding_error(other),
+        })?;
     // Move the actual decoder debit; do not pay a different owner for the
     // same live columns, rows, JSON trees, and canonical trace allocations.
     let bytes = retained_memory
