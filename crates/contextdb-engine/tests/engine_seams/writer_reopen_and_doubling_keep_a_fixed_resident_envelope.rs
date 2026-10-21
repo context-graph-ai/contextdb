@@ -551,7 +551,7 @@ fn writer_reopen_and_doubling_keep_a_fixed_resident_envelope() {
     if let Ok(n) = std::env::var(ARM) {
         let path = std::env::var(FIXTURE).unwrap();
         println!(
-            "ENVELOPE {}",
+            "\nENVELOPE {}",
             serde_json::to_string(&arm(Path::new(&path), n.parse().unwrap())).unwrap()
         );
         return;
