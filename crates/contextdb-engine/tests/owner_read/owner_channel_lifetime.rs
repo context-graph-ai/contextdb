@@ -8,15 +8,14 @@
 //! serving, and a reader that finds nobody listening concludes there is no
 //! owner and reads the file.
 
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame};
 use contextdb_core::read_contract::{
     OwnerReadCancellation, OwnerReadLimits, OwnerRequestHandler, OwnerServingState,
     ReadClientTimeouts, ReadFailureKind, ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Result, Value};
 use contextdb_engine::local_transport::{
-    LocalHandshake, ManualDeadlineClock, channel_filesystem_identity, encode_message,
-    encode_payload_frame,
-};
+    LocalHandshake, ManualDeadlineClock, channel_filesystem_identity, };
 use contextdb_engine::persistence::read_persistence_test_scaffold;
 use contextdb_engine::read_session::{ReadSessionEvent, ReadSessionTestObserver};
 use contextdb_engine::{

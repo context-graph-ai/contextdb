@@ -274,6 +274,7 @@ fn a_second_process_interrupt_ends_only_the_request_it_names() {
                 response_ms: 120_000,
             },
             clock,
+            super::wire_fixture_test_support::owner_for_bytes(ReadLimits::default().memory as usize),
         ))
         .expect("reach the independent owner over its real channel"),
     ));

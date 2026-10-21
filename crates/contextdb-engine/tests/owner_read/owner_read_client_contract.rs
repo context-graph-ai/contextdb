@@ -1,3 +1,4 @@
+use super::wire_fixture_test_support::{encode_query_result};
 use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_engine::local_transport::{
@@ -6,8 +7,9 @@ use contextdb_engine::local_transport::{
     ResultReceiveOutcome, ResultReceiveState, split_canonical_result,
 };
 use contextdb_engine::owner_read::{OwnerClient, OwnerReadScaffoldError};
-use contextdb_engine::read_contract::encode_query_result;
-use contextdb_engine::{QueryResult, QueryTrace};
+
+use contextdb_engine::QueryTrace;
+use super::wire_fixture_test_support::QueryFixture as QueryResult;
 use std::collections::BTreeMap;
 
 fn limits() -> ReadLimits {
@@ -82,7 +84,7 @@ fn oversized_custom_request_is_refused_by_production_framing_before_carrier_writ
             payload: vec![0x51; MAX_FRAME_BYTES + 1],
         },
     };
-    let error = OwnerClient::encode_envelope(&envelope)
+    let error = OwnerClient::encode_envelope(&envelope, super::wire_fixture_test_support::owner_for_serialized(&envelope, 4))
         .expect_err("the complete encoded request cannot cross the frame ceiling");
     assert!(matches!(
         error,
@@ -262,8 +264,8 @@ fn client_source_has_only_real_carrier_framing_and_named_deadline_paths() {
     for request in dynamic {
         OwnerClient::encode_envelope(&LocalRequestEnvelope {
             limits: limits(),
-            request,
-        })
+            request: request.clone(),
+        }, super::wire_fixture_test_support::owner_for_serialized(&LocalRequestEnvelope { limits: limits(), request }, 4))
         .expect("every dynamic request uses the canonical production codec");
     }
 }

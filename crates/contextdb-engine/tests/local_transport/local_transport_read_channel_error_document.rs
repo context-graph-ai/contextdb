@@ -15,6 +15,7 @@
 //! a declared memory ceiling; and a class the channel has no tag for still
 //! arrives carrying its name and its words.
 
+use super::wire_fixture_test_support::{encode_message};
 use contextdb_core::read_contract::{
     OwnerLimitExceededDetail, ReadFailure, ReadFailureDetail, ReadFailureKind, ReadFailureLimit,
     ReadLimits,
@@ -22,15 +23,14 @@ use contextdb_core::read_contract::{
 use contextdb_core::types::{ContextId, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
 use contextdb_core::{Error, VectorPartitionDeclarationIssue};
 use contextdb_engine::local_transport::{
-    ALL_TAGS, BodyField, LocalEngineFailure, ReadChannelError, TAG_ACL_DENIED,
+    ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED,
     TAG_BFS_DEPTH_EXCEEDED, TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND,
     TAG_INVALID_VECTOR_PARTITION_DECLARATION, TAG_MEMORY_BUDGET_EXCEEDED, TAG_READ_CANCELLED,
     TAG_SCOPE_LABEL_VIOLATION, TAG_TABLE_NOT_FOUND, TAG_UNKNOWN,
     TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
     TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE, TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
     TAG_VECTOR_PARTITION_LIMIT_EXCEEDED, TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, body_grammar,
-    decode_message_exact, encode_message,
-};
+    decode_message_exact, };
 use std::collections::BTreeSet;
 
 /// The ceiling a caller declares for an ordinary exchange in these proofs.
@@ -123,6 +123,10 @@ fn one_answer_per_named_class() -> Vec<Error> {
             predicate_columns: vec!["context_id".to_owned()],
         },
         Error::VectorWholeIndexInspectionDenied,
+        Error::VectorIndexedPartitionDisconnected {
+            index: VectorIndexRef::new("widgets", "embedding"),
+            partition: 7,
+        },
         Error::RankPolicyNotFound {
             index: "widgets_embedding".to_owned(),
             sort_key: "freshness".to_owned(),
@@ -180,11 +184,11 @@ fn one_answer_per_named_class() -> Vec<Error> {
             allowed: BTreeSet::from([ScopeLabel("edge".to_owned())]),
         },
         Error::StoreCorrupted {
-            path: "/store/widgets.db".to_owned(),
-            reason: "commit index missing".to_owned(),
+            path: "/store/widgets.db".to_owned().into(),
+            reason: "commit index missing".to_owned().into(),
         },
         Error::StoreIdentityUnprovable {
-            path: "/store/widgets.db".to_owned(),
+            path: "/store/widgets.db".to_owned().into(),
         },
         Error::LegacyVectorStoreDetected {
             found_format_marker: "0.9".to_owned(),
@@ -216,7 +220,7 @@ fn one_answer_per_named_class() -> Vec<Error> {
 /// document, the production encoder, the production decoder under the caller's
 /// declared ceiling, and back into an engine answer.
 fn over_the_channel(answer: &Error) -> Error {
-    LocalEngineFailure::from_error(answer).into_error(ceiling())
+    super::wire_fixture_test_support::engine_failure(answer).into_error(ceiling())
 }
 
 fn document_bytes(answer: &Error) -> Vec<u8> {
@@ -666,7 +670,7 @@ fn every_class_encodes_under_the_grammar_its_tag_declares() {
 #[test]
 fn a_document_is_admitted_against_the_ceiling_the_caller_declared() {
     let long = Error::Other("w".repeat(4_096).into());
-    let carried = LocalEngineFailure::from_error(&long);
+    let carried = super::wire_fixture_test_support::engine_failure(&long);
     assert_eq!(
         carried.clone().into_error(ceiling()).to_string(),
         long.to_string(),
@@ -744,8 +748,8 @@ fn representative_failures_carry_the_same_class_and_fields_across_routes() {
         Error::OwnerReadDrainTimeout,
         // The store underneath, not the query.
         Error::StoreCorrupted {
-            path: "/store/widgets.db".to_owned(),
-            reason: "commit index missing".to_owned(),
+            path: "/store/widgets.db".to_owned().into(),
+            reason: "commit index missing".to_owned().into(),
         },
         Error::DatabaseLocked {
             holder_pid: 4_321,
@@ -786,7 +790,7 @@ fn an_unnamed_class_arrives_as_prose_that_names_it() {
         "the prose names the class: {prose}",
     );
     assert!(
-        prose.ends_with(&words),
+        prose.to_string().ends_with(&words),
         "the prose repeats the words: {prose}"
     );
     assert_eq!(

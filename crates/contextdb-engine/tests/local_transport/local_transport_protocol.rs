@@ -1,3 +1,5 @@
+use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::{encode_message};
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, OwnerReadLimits, OwnerReadStatus, OwnerServiceTimeouts,
     OwnerServingReason, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
@@ -12,8 +14,7 @@ use contextdb_engine::local_transport::{
     LocalRequestEnvelope, LocalResponse, LocalResponseExpectation, LocalTransportError,
     MAX_FRAME_BYTES, MetadataResponse, OwnerAdmissionCounters, OwnerMemoryCounters,
     PayloadViolation, ResultChunk, TerminalSuccess, decode_handshake_exact, decode_message_exact,
-    encode_message,
-};
+    };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -295,7 +296,7 @@ fn assert_handshake_boundary(value: &LocalHandshake, fixture: &[u8]) {
     let boundary = protocol_boundary();
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Handshake(value))
+            .encode_fixture_frame(LocalOutboundMessage::Handshake(value))
             .expect("encode handshake through the production boundary"),
         literal_frame(fixture)
     );
@@ -313,7 +314,7 @@ fn assert_request_boundary(value: &LocalRequestEnvelope, fixture: &[u8]) {
     let boundary = protocol_boundary();
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Request(value))
+            .encode_fixture_frame(LocalOutboundMessage::Request(value))
             .expect("encode request through the production boundary"),
         literal_frame(fixture)
     );
@@ -335,7 +336,7 @@ fn assert_response_boundary(
     let boundary = protocol_boundary();
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Response {
+            .encode_fixture_frame(LocalOutboundMessage::Response {
                 response: value,
                 expectation: &expectation,
             })
@@ -821,7 +822,7 @@ fn illegal_caller_limit_relationships_are_rejected_at_the_typed_boundary() {
             request: base_request.clone(),
         };
         assert_eq!(
-            protocol_boundary().encode_frame(LocalOutboundMessage::Request(&request)),
+            protocol_boundary().encode_fixture_frame(LocalOutboundMessage::Request(&request)),
             Err(invalid_channel_data())
         );
     }
@@ -1287,7 +1288,7 @@ fn typed_boundary_admits_exactly_four_mebibytes_and_refuses_one_more() {
         payload: vec![0x5a; MAX_FRAME_BYTES - CUSTOM_RESPONSE_OVERHEAD],
     };
     let exact_frame = protocol_boundary()
-        .encode_frame(LocalOutboundMessage::Response {
+        .encode_fixture_frame(LocalOutboundMessage::Response {
             response: &exact,
             expectation: &expectation,
         })
@@ -1298,7 +1299,7 @@ fn typed_boundary_admits_exactly_four_mebibytes_and_refuses_one_more() {
         payload: vec![0x5a; MAX_FRAME_BYTES - CUSTOM_RESPONSE_OVERHEAD + 1],
     };
     assert_eq!(
-        protocol_boundary().encode_frame(LocalOutboundMessage::Response {
+        protocol_boundary().encode_fixture_frame(LocalOutboundMessage::Response {
             response: &oversized,
             expectation: &expectation,
         }),
@@ -1381,7 +1382,7 @@ fn successful_response_variants_cannot_cross_operation_expectations() {
     ];
     for (response, expectation) in mismatches {
         assert_eq!(
-            protocol_boundary().encode_frame(LocalOutboundMessage::Response {
+            protocol_boundary().encode_fixture_frame(LocalOutboundMessage::Response {
                 response: &response,
                 expectation: &expectation,
             }),
@@ -1624,7 +1625,7 @@ fn contradictory_owner_status_is_rejected_on_encode_and_complete_decode() {
     };
     let boundary = protocol_boundary();
     assert_eq!(
-        boundary.encode_frame(LocalOutboundMessage::Response {
+        boundary.encode_fixture_frame(LocalOutboundMessage::Response {
             response: &response,
             expectation: &LocalResponseExpectation::OwnerStatus,
         }),

@@ -1,3 +1,5 @@
+use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::{encode_cursor_page, encode_message, encode_query_result, encode_metadata_page};
 use contextdb_core::read_contract::{
     CursorExpiryKind, CursorPage, HeldByReadersDetail, HeldByWriterDetail, MetadataItem,
     MetadataPage, MetadataPageVocabulary, OwnerLimitExceededDetail, OwnerRouteUnsupportedDetail,
@@ -9,14 +11,13 @@ use contextdb_engine::local_transport::{
     CursorOpenedResponse, CursorPageResponse, FrameBufferAllocator, FrameReader, FrameViolation,
     LocalInboundKind, LocalInboundMessage, LocalOutboundMessage, LocalProtocolBoundary,
     LocalResponse, LocalResponseExpectation, LocalTransportError, MetadataResponse,
-    PayloadViolation, decode_message_exact, encode_message,
-};
+    PayloadViolation, decode_message_exact, };
 use contextdb_engine::read_contract::{
     CanonicalCascadeReport, CanonicalIndexCandidate, CanonicalQueryResult, CanonicalQueryTrace,
     ReadEncodingError, decode_cursor_page, decode_metadata_page, decode_query_result,
-    encode_cursor_page, encode_metadata_page, encode_query_result,
-};
-use contextdb_engine::{CascadeReport, IndexCandidate, QueryResult, QueryTrace};
+    };
+use contextdb_engine::{CascadeReport, IndexCandidate, QueryTrace};
+use super::wire_fixture_test_support::QueryFixture as QueryResult;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -136,7 +137,7 @@ fn assert_response_codec(
     frame.extend_from_slice(fixture);
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Response {
+            .encode_fixture_frame(LocalOutboundMessage::Response {
                 response: &value,
                 expectation: &expectation,
             })
@@ -858,7 +859,7 @@ fn every_failure_detail_field_changes_an_independent_literal_position() {
 }
 
 fn cursor_page() -> CursorPage {
-    CursorPage::from_parts(
+    super::wire_fixture_test_support::cursor_page(
         vec!["i".to_owned(), "t".to_owned()],
         vec![vec![Value::Int64(1), Value::TxId(TxId(42))]],
         true,

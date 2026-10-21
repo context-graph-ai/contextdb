@@ -190,6 +190,7 @@ impl LiveOwner {
             presented,
             self.client_timeouts,
             clock,
+            self._database.declared_reader_memory().expect("original reader owner").into(),
         ));
         let mut client = match connected {
             Ok(client) => client,

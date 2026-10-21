@@ -9,13 +9,14 @@
 //! index and a length are each a single byte below 251 — not by printing what
 //! the encoder produced.
 
+use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::{encode_message};
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_core::{Error, Value};
 use contextdb_engine::local_transport::{
-    FrameBufferAllocator, FrameReader, LocalEngineFailure, LocalInboundKind, LocalInboundMessage,
+    FrameBufferAllocator, FrameReader, LocalInboundKind, LocalInboundMessage,
     LocalOutboundMessage, LocalProtocolBoundary, LocalRequest, LocalRequestEnvelope, LocalResponse,
-    LocalResponseExpectation, LocalTransportError, decode_message_exact, encode_message,
-};
+    LocalResponseExpectation, LocalTransportError, decode_message_exact, };
 
 /// The caller limits every request carries, ahead of the request itself.
 const LIMITS_FIXTURE: &[u8] = &[
@@ -106,7 +107,7 @@ fn assert_request_boundary(envelope: &LocalRequestEnvelope, fixture: &[u8]) {
     framed.extend_from_slice(fixture);
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Request(envelope))
+            .encode_fixture_frame(LocalOutboundMessage::Request(envelope))
             .expect("encode the interrupt through the production boundary"),
         framed,
     );
@@ -129,7 +130,7 @@ fn assert_response_boundary(response: &LocalResponse, fixture: &[u8]) {
     framed.extend_from_slice(fixture);
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Response {
+            .encode_fixture_frame(LocalOutboundMessage::Response {
                 response,
                 expectation: &LocalResponseExpectation::Custom,
             })
@@ -152,7 +153,7 @@ fn assert_response_boundary(response: &LocalResponse, fixture: &[u8]) {
 
 fn engine_answer(error: Error) -> LocalResponse {
     LocalResponse::EngineFailure {
-        failure: LocalEngineFailure::from_error(&error),
+        failure: super::wire_fixture_test_support::engine_failure(&error),
     }
 }
 
@@ -257,8 +258,8 @@ fn every_class_a_read_can_meet_survives_the_round_trip_unchanged() {
         ),
         // The store underneath is the problem, not the query.
         Error::StoreCorrupted {
-            path: "/store/widgets.db".to_owned(),
-            reason: "commit index missing".to_owned(),
+            path: "/store/widgets.db".to_owned().into(),
+            reason: "commit index missing".to_owned().into(),
         },
         Error::DatabaseLocked {
             holder_pid: 4321,
@@ -307,7 +308,7 @@ fn an_answer_outside_the_read_surface_arrives_named_rather_than_lost() {
         panic!("an unnamed class arrives as prose, got {rebuilt:?}");
     };
     assert!(
-        prose.starts_with("SyncReplayOfAcceptedDelete: ") && prose.ends_with(&words),
+        prose.starts_with("SyncReplayOfAcceptedDelete: ") && prose.to_string().ends_with(&words),
         "the prose names the class and repeats the words: {prose}",
     );
 }

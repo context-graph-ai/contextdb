@@ -1,3 +1,4 @@
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame};
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, ReadFailure, ReadFailureDetail, ReadFailureKind,
     WriterRunNumber,
@@ -5,8 +6,7 @@ use contextdb_core::read_contract::{
 #[cfg(unix)]
 use contextdb_engine::local_transport::{
     AdmittedReader, DeadlineStage, ManualDeadlineClock, UnixLocalCarrier,
-    authenticate_framed_stream_handshake, encode_message, encode_payload_frame,
-    peer_user_from_stream,
+    authenticate_framed_stream_handshake, peer_user_from_stream,
 };
 use contextdb_engine::local_transport::{
     LocalHandshake, LocalTransportError, ReadPrincipal, authenticate_peer,

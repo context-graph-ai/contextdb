@@ -1,18 +1,19 @@
+use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame, encode_query_result};
 use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_engine::local_transport::{
     FrameBufferAllocator, FrameReader, FrameViolation, LocalInboundKind, LocalOutboundMessage,
     LocalProtocolBoundary, LocalResponse, LocalResponseExpectation, LocalTransportError,
     MAX_FRAME_BYTES, OrdinaryResultReceiver, PayloadViolation, ResultChunk, ResultReceiveOutcome,
-    ResultReceiveState, TerminalSuccess, decode_frame_exact, encode_message, encode_payload_frame,
-    frame_length_prefix, read_payload_with_admission, split_canonical_result,
+    ResultReceiveState, TerminalSuccess, decode_frame_exact, frame_length_prefix, read_payload_with_admission, split_canonical_result,
 };
 #[cfg(unix)]
 use contextdb_engine::local_transport::{ManualDeadlineClock, UnixLocalCarrier};
 use contextdb_engine::read_contract::{
-    CanonicalIndexCandidate, CanonicalQueryResult, decode_query_result, encode_query_result,
-};
-use contextdb_engine::{CascadeReport, IndexCandidate, QueryResult, QueryTrace};
+    CanonicalIndexCandidate, CanonicalQueryResult, decode_query_result, };
+use contextdb_engine::{CascadeReport, IndexCandidate, QueryTrace};
+use super::wire_fixture_test_support::QueryFixture as QueryResult;
 
 struct InstrumentedReader {
     prefix: [u8; 4],
@@ -408,7 +409,7 @@ fn canonical_result_crosses_frames_and_publishes_only_the_exact_terminal_assembl
         .map(|response| {
             let expectation = LocalResponseExpectation::OrdinaryResult;
             let frame = boundary
-                .encode_frame(LocalOutboundMessage::Response {
+                .encode_fixture_frame(LocalOutboundMessage::Response {
                     response,
                     expectation: &expectation,
                 })
@@ -494,7 +495,7 @@ fn splitter_accounts_for_the_response_envelope_at_both_chunk_boundaries() {
     for response in &responses {
         let expectation = LocalResponseExpectation::OrdinaryResult;
         let encoded = boundary
-            .encode_frame(LocalOutboundMessage::Response {
+            .encode_fixture_frame(LocalOutboundMessage::Response {
                 response,
                 expectation: &expectation,
             })
@@ -951,7 +952,7 @@ fn malformed_assembled_canonical_result_is_discarded_before_actual_decode() {
                 0
             );
         } else {
-            assert_eq!(received, Err(expected_error.clone()));
+            assert_eq!(received.as_ref(), Err(&expected_error));
             assert_eq!(receiver.state(), ResultReceiveState::Discarded);
             assert_eq!(receiver.buffered_byte_count(), 0);
             assert!(
@@ -1081,8 +1082,8 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
                 label = container.label()
             );
             assert_eq!(
-                received,
-                Err(expected_error.clone()),
+                received.as_ref(),
+                Err(&expected_error),
                 "the valid assembled {label} result must be rejected before nested serde allocation",
                 label = container.label()
             );
