@@ -723,6 +723,7 @@ pub struct ReadRouteResourceSnapshot {
 /// What one selected route is holding, counted as it is actually used.
 #[derive(Default)]
 struct RouteResources {
+    expiry: SessionExpiry,
     channel_identity: Mutex<Option<ChannelAddress>>,
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     owner_services_started: std::sync::atomic::AtomicU64,
@@ -742,6 +743,45 @@ struct RouteResources {
     /// so the owner's number is the only true one for this route.
     #[cfg(any(test, feature = "test-seams"))]
     channel_source_items: Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
+}
+
+
+/// Session-lifetime custody, also retained by every suspended cursor. Closing
+/// the session handle cannot stop expiry while one of its cursors remains.
+struct SessionExpiry {
+    clock: Arc<dyn DeadlineClock>,
+    #[cfg(target_os = "linux")]
+    native: Option<Arc<crate::local_transport::MonotonicDeadlineClock>>,
+    #[cfg(target_os = "linux")]
+    driver: Mutex<Option<crate::local_transport::deadlines::OwnedClockDriver>>,
+}
+impl Default for SessionExpiry {
+    fn default() -> Self {
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
+            return Self { clock,
+                #[cfg(target_os = "linux")] native: None,
+                #[cfg(target_os = "linux")] driver: Mutex::new(None),
+            };
+        }
+        let clock = Arc::new(crate::local_transport::MonotonicDeadlineClock::new());
+        Self { clock: clock.clone(),
+            #[cfg(target_os = "linux")] native: Some(clock),
+            #[cfg(target_os = "linux")] driver: Mutex::new(None),
+        }
+    }
+}
+impl SessionExpiry {
+    fn ensure_driver(&self, owner: contextdb_core::read_memory::ReadMemoryOwner) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(clock) = &self.native {
+            let mut driver = self.driver.lock().expect("session expiry worker");
+            if driver.is_none() { *driver = Some(clock.start_owned_driver(owner)?); }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = owner;
+        Ok(())
+    }
 }
 
 impl RouteResources {
@@ -1302,7 +1342,7 @@ fn attempt_route_once(
                     .declaring(declared)
             }
         };
-        let channel_clock = read_clock();
+        let channel_clock = resources.expiry.clock.clone();
         let channel_owner = crate::local_transport::query_funding::QueryMemory::new(options.limits.memory.min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)))
             .map_err(|error| RouteOpenRefusal { failure: ReadRouteOpenFailure::OwnerAuthentication, error })?.image().owner();
         match wait_for_local_answer(crate::owner_read::OwnerClient::connect(
@@ -1547,7 +1587,7 @@ fn open_direct_route(
     // the committed image it hydrates is narrowed before a single row is
     // answered from it.
     let mut config =
-        crate::direct_file_reader::DirectReaderConfig::new(options.limits, read_clock()).declaring(
+        crate::direct_file_reader::DirectReaderConfig::new(options.limits, resources.expiry.clock.clone()).declaring(
             options.contexts.clone(),
             options.scope_labels.clone(),
             options.principal.clone(),
@@ -1886,7 +1926,7 @@ impl ReadSession {
         if let Some(clock) = self.clock.as_ref() {
             return Arc::clone(clock);
         }
-        read_clock()
+        self.resources.expiry.clock.clone()
     }
 }
 
@@ -3395,6 +3435,7 @@ impl ReadSession {
                 Ok(cursor)
             }
             ReadSessionState::DirectFile(reader) => {
+                self.resources.expiry.ensure_driver(reader.expiry_memory_owner())?;
                 let rows = NonZeroUsize::new(
                     usize::try_from(self.options.limits.cursor_page_rows).unwrap_or(usize::MAX),
                 )

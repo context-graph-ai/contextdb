@@ -161,13 +161,18 @@ one of two routes when it opens. Ordinary reads keep that route for the session:
   unchanged. Several direct readers coexist on one store.
 
 The two directions see each other. A writable open of a store a writer already
-owns is refused with `held_by_writer`, and a writable open while direct readers
-are still hydrating is refused with `held_by_readers` — a reader takes a hold
-beside the store for exactly as long as it is hydrating, precisely so a starting
-writer waits rather than tearing the file out from under it, and publishes a
-best-effort record of itself so that refusal can name who to go and look at. A direct read that finds committed state a writable open
-would have to mend refuses with `direct_read_requires_writer` instead of serving
-something the file cannot back.
+owns is refused with `held_by_writer`. A starting direct reader holds writers out
+only while it selects and registers its committed snapshot, at fixed cost
+independent of store size. It releases that admission hold before loading the
+image; its session and cursors retain their registered snapshot afterward.
+
+A writable open waits exactly once for the operating-system store lock. There is
+no engine timeout and no application reopen/retry loop. Only actual caller
+cancellation or the caller's deadline can end that wait early. An already-expired
+caller deadline returns the immediate typed `held_by_readers` refusal, including
+the real observed count and identifiable reader names. A direct read that finds
+committed state a writable open would have to mend refuses with
+`direct_read_requires_writer` instead of serving something the file cannot back.
 
 An in-memory database has no backing file, companion, or owner channel.
 <!-- enforced by: crates/contextdb-cli/tests/read_cli_journeys_invocation.rs::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable -->

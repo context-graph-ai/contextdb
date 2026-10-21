@@ -1322,6 +1322,10 @@ fn fetch_backend_neutral_cursor(
 }
 
 impl DirectFileReader {
+    pub(crate) fn expiry_memory_owner(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
+        self.declared_read_memory.original_owner()
+    }
+
     pub(crate) fn request_query_read_owner(
         &self,
     ) -> Result<crate::vector_read_memory::RequestReadOwner, DirectFileReaderError> {
