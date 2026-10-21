@@ -104225,12 +104225,13 @@ mod currency_version_compaction_tests {
                             Ordering::SeqCst,
                         );
                         if self.refuse {
-                            let outcome =
-                                self.refused.try_reserve(bytes, subsystem, operation, hint);
-                            if let Err(error) = &outcome {
+                            if let Err(error) =
+                                self.refused.try_reserve(bytes, subsystem, operation, hint)
+                            {
                                 *self.original_error.lock().unwrap() = Some(format!("{error:?}"));
+                                return Err(error);
                             }
-                            return outcome;
+                            self.refused.release(bytes);
                         }
                     }
                     self.ordinary.try_reserve(bytes, subsystem, operation, hint)
@@ -104343,7 +104344,7 @@ mod currency_version_compaction_tests {
                     let ordinary = db.declared_reader_memory().unwrap();
                     let owner = Arc::new(MetadataOwner {
                         ordinary: ordinary.clone(),
-                        refused: Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(0)),
+                        refused: Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(1)),
                         refuse: fault == "memory",
                         answer_admissions: answer_admissions.clone(),
                         metadata_calls: AtomicUsize::new(0),

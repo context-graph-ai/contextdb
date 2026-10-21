@@ -328,24 +328,31 @@ pub fn open_cursor(
     let read_memory = db
         .declared_reader_memory()
         .map_err(|error| test_error(error.into()))?;
-    open_bounded_cursor(
-        db,
-        &request.sql,
-        &request.params,
-        read_memory,
-        request.limits,
-        Arc::clone(&request.clock),
-        request.cancellation.clone(),
-        adapted_probe(request),
-    )
-    .and_then(|outcome| Ok(TestCursorOpen {
-        cursor: TestCursor {
-            handle: outcome.cursor,
-            probe: request.probe.as_ref().map(Arc::clone),
-        },
-        first_page: outcome.first_page.into_public().map_err(BoundedExecutionError::from)?,
-        telemetry: outcome.telemetry.into(),
-    }))
+    crate::owned_cursor_page::with_public_page(|| {
+        open_bounded_cursor(
+            db,
+            &request.sql,
+            &request.params,
+            read_memory,
+            request.limits,
+            Arc::clone(&request.clock),
+            request.cancellation.clone(),
+            adapted_probe(request),
+        )
+    })
+    .and_then(|outcome| {
+        Ok(TestCursorOpen {
+            cursor: TestCursor {
+                handle: outcome.cursor,
+                probe: request.probe.as_ref().map(Arc::clone),
+            },
+            first_page: outcome
+                .first_page
+                .into_public()
+                .map_err(BoundedExecutionError::from)?,
+            telemetry: outcome.telemetry.into(),
+        })
+    })
     .map_err(test_error)
 }
 
@@ -359,12 +366,19 @@ impl TestCursor {
         let probe = self.probe.as_ref().map(|probe| {
             Arc::new(ProbeAdapter(Arc::clone(probe))) as Arc<dyn BoundedExecutionProbe>
         });
-        fetch_bounded_cursor(&mut self.handle, rows, cancellation, probe)
-            .and_then(|outcome| Ok(TestCursorFetch {
-                page: outcome.page.into_public().map_err(BoundedExecutionError::from)?,
+        crate::owned_cursor_page::with_public_page(|| {
+            fetch_bounded_cursor(&mut self.handle, rows, cancellation, probe)
+        })
+        .and_then(|outcome| {
+            Ok(TestCursorFetch {
+                page: outcome
+                    .page
+                    .into_public()
+                    .map_err(BoundedExecutionError::from)?,
                 telemetry: outcome.telemetry.into(),
-            }))
-            .map_err(test_error)
+            })
+        })
+        .map_err(test_error)
     }
 
     /// Replace only the proof observer used for subsequent fetches.  Cursor

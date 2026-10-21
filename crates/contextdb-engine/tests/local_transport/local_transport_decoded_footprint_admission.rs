@@ -322,8 +322,8 @@ fn an_ordinary_cursor_page_response_is_still_admitted() {
     let page_bytes = crafted_cursor_page_bytes(100, 8);
     let page = decode_message_exact::<CursorPage>(&page_bytes)
         .expect("an ordinary cursor page stays admissible");
-    assert_eq!(page.columns.len(), 8);
-    assert_eq!(page.rows.len(), 100);
+    assert_eq!(page.columns().len(), 8);
+    assert_eq!(page.rows().len(), 100);
 
     let frame = encode_message(&LocalResponse::CursorPage {
         page: CursorPageResponse {
