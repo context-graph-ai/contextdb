@@ -1066,14 +1066,15 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
     }
     drop(retirement_snapshot);
     let assert_serving_answers = || {
-        let fixture_answer_59 = db
+        let rows = {
+            let fixture_answer_59 = db
             .execute(
                 "SELECT id FROM slot_items WHERE scope = 0 ORDER BY v <=> [0,1,0] USE VECTOR INDEXED LIMIT 16",
                 &HashMap::new(),
             )
             .unwrap();
-        let rows = fixture_answer_59
-            .rows();
+            fixture_answer_59.rows().to_vec()
+        };
         assert_eq!(rows.len(), 16);
         for id in 0..16 {
             assert!(rows.contains(&vec![Value::Int64(id)]));

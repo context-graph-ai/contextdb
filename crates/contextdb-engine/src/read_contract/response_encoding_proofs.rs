@@ -374,11 +374,11 @@ fn encoded_response_field_escape_keeps_exact_original_invoices_until_physical_fr
             let alias = encoded.clone();
             let escaped = if metadata {
                 let response = DirectMetadataResponse {
-                    body,
+                    metadata: crate::read_session::MetadataAnswer::try_new(
+                        body, None, Default::default(), owner.clone(),
+                    ).unwrap(),
                     canonical_bytes: encoded,
                     snapshot,
-                    continuation: None,
-                    charge: Default::default(),
                 };
                 response.canonical_bytes
             } else {
@@ -523,7 +523,7 @@ fn original_budget_refuses_each_response_leaf_before_its_output_allocation() {
         bincode::serde::encode_to_vec(&metadata, standard())
             .unwrap()
             .len(),
-        encode_metadata_body(&body).unwrap().len(),
+        encoded_metadata_body_len(&body),
         cursor_observation::encode_observed_cursor_page(&page, &observation)
             .unwrap()
             .len(),

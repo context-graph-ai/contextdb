@@ -371,8 +371,14 @@ mod completed_query_refusal_tests {
         Value::Json(serde_json::Value::Array(vec![serde_json::json!(0); 8192]))
     }
 
+    // The sender is application-owned. Its wire construction never borrows
+    // the receiving engine's deliberately exhausted request budget.
+    fn host_wire_owner() -> contextdb_core::read_memory::ReadMemoryOwner {
+        Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()
+    }
+
     fn payload(value: Value, memory: u64) -> Vec<u8> {
-        encode_message(&envelope(value, memory)).expect("real request serializer")
+        encode_message(&envelope(value, memory), host_wire_owner()).expect("real request serializer").to_vec()
     }
 
     fn replace_once(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
@@ -464,7 +470,7 @@ mod completed_query_refusal_tests {
                 7 => request.limits.cursor_idle_ms = 0,
                 _ => request.limits.cursor_lifetime_ms = 0,
             }
-            cases.push(("zero limit", encode_message(&request).unwrap(), false));
+            cases.push(("zero limit", encode_message(&request, host_wire_owner()).unwrap().to_vec(), false));
         }
         for field in 0..3 {
             let mut request = envelope(Value::Null, limit);
@@ -473,7 +479,7 @@ mod completed_query_refusal_tests {
                 1 => request.limits.cursor_page_bytes = request.limits.result_bytes + 1,
                 _ => request.limits.cursor_idle_ms = request.limits.cursor_lifetime_ms + 1,
             }
-            cases.push(("limit relationship", encode_message(&request).unwrap(), false));
+            cases.push(("limit relationship", encode_message(&request, host_wire_owner()).unwrap().to_vec(), false));
         }
         for (name, bytes, valid) in cases {
             let decoded = typed(&bytes);
@@ -491,7 +497,7 @@ mod completed_query_refusal_tests {
             } else { drop(received); }
             assert_eq!(database.query_request_provider().charged_bytes(), before,
                 "request, partial DTO and child released: {name}");
-            let frame = encode_payload_frame(&bytes).unwrap();
+            let frame = encode_payload_frame(&bytes, host_wire_owner()).unwrap().to_vec();
             let mut input = Cursor::new(frame);
             let prefix = RequestPrefix::read(&mut input).expect("valid prefix in matrix");
             assert_eq!(prefix.discard_query(&mut input).is_ok(), valid,
@@ -502,7 +508,7 @@ mod completed_query_refusal_tests {
     fn receive_bytes(bytes: &[u8], database: &Database, inbox: &ConnectionInbox)
         -> Result<ConnectionEvent, LocalTransportError>
     {
-        let frame = encode_payload_frame(bytes).unwrap();
+        let frame = encode_payload_frame(bytes, host_wire_owner()).unwrap().to_vec();
         let mut input = Cursor::new(frame.clone());
         let result = receive(&mut input,
             &LocalProtocolBoundary::with_effective_limits(ReadLimits::default()), database, inbox);
@@ -602,7 +608,7 @@ mod completed_query_refusal_tests {
         let malformed = replace_once(&bytes, &json, &bad_json);
         let mut invalid_limits = envelope(expanded_json(), request_memory);
         invalid_limits.limits.work = 0;
-        for bad in [malformed, encode_message(&invalid_limits).unwrap()] {
+        for bad in [malformed, encode_message(&invalid_limits, host_wire_owner()).unwrap().to_vec()] {
             assert!(matches!(receive_bytes(&bad, &database, &inbox),
                 Err(LocalTransportError::Refusal(failure))
                     if failure.kind() == ReadFailureKind::InvalidChannelData));
@@ -626,7 +632,7 @@ mod completed_query_refusal_tests {
         let held = parent.charged_bytes();
         let inbox = ConnectionInbox::new(None);
         let bytes = payload(Value::Null, ReadLimits::SHIPPED_MEMORY);
-        let frame = encode_payload_frame(&bytes).unwrap();
+        let frame = encode_payload_frame(&bytes, host_wire_owner()).unwrap().to_vec();
         let mut frames = frame.clone();
         frames.extend_from_slice(&frame);
         let mut input = Cursor::new(frames);

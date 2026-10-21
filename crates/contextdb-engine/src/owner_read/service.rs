@@ -4351,6 +4351,7 @@ mod authoritative_response_send_tests {
 
     #[test]
     fn owner_response_send_keeps_the_exact_boundary_admissible() {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into();
         let clock = Arc::new(ReadyDeadlineClock {
             now_ms: 20,
             requested_deadline_ms: AtomicU64::new(0),
@@ -4359,6 +4360,7 @@ mod authoritative_response_send_tests {
         let result = wait_for_local_completion(await_authoritative_response_send(
             &budget(clock.clone(), 0, 20),
             Box::pin(async { Ok::<_, crate::local_transport::LocalTransportError>(7_u8) }),
+            &owner,
         ));
 
         assert_eq!(result.expect("the exact boundary remains admissible"), 7);
@@ -4372,6 +4374,7 @@ mod authoritative_response_send_tests {
 
     #[test]
     fn owner_response_send_timer_arm_failure_has_a_real_wake_without_retry() {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into();
         let clock = Arc::new(MonotonicDeadlineClock::with_timer_arm_failure_for_test());
         let operation_polls = Arc::new(AtomicUsize::new(0));
         let thread_clock = clock.clone();
@@ -4385,6 +4388,7 @@ mod authoritative_response_send_tests {
                     thread_polls.fetch_add(1, Ordering::SeqCst);
                     Poll::<Result<u8, crate::local_transport::LocalTransportError>>::Pending
                 })),
+                &owner,
             ));
             let _ = sent.send(result);
         });
@@ -4409,11 +4413,13 @@ mod authoritative_response_send_tests {
 
     #[test]
     fn owner_response_send_timer_arm_failure_does_not_veto_a_ready_send() {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into();
         let clock = Arc::new(MonotonicDeadlineClock::with_timer_arm_failure_for_test());
         let started_ms = clock.now_ms();
         let result = wait_for_local_completion(await_authoritative_response_send(
             &budget(clock.clone(), started_ms, 20),
             Box::pin(async { Ok::<_, crate::local_transport::LocalTransportError>(11_u8) }),
+            &owner,
         ));
 
         assert_eq!(result.expect("a ready send wins inside its budget"), 11);

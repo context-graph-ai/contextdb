@@ -1062,14 +1062,15 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
                 Ok(())
             })
             .unwrap();
-        let fixture_answer_66 = db
+        let exact = {
+            let fixture_answer_66 = db
             .execute(
                 "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR EXACT LIMIT 1",
                 &HashMap::new(),
             )
             .unwrap();
-        let exact = fixture_answer_66
-            .rows();
+            fixture_answer_66.rows().to_vec()
+        };
         assert_eq!(exact.len(), 1);
         let context = db.maintenance_context();
         for _ in 0..16 {
@@ -1790,15 +1791,18 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         );
         let query = "SELECT id FROM repair_items WHERE scope_id = $scope ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2";
         let healthy_params = HashMap::from([("scope".into(), Value::Int64(2))]);
-        let fixture_answer_67 = db.execute(query, &healthy_params).unwrap();
-        let healthy = fixture_answer_67.rows();
+        let healthy = {
+            let fixture_answer_67 = db.execute(query, &healthy_params).unwrap();
+            fixture_answer_67.rows().to_vec()
+        };
         assert_eq!(healthy.len(), 2);
         let a_params = HashMap::from([("scope".into(), Value::Int64(0))]);
-        let fixture_answer_68 = db
+        let exact = {
+            let fixture_answer_68 = db
             .execute(&query.replace("INDEXED", "EXACT"), &a_params)
             .unwrap();
-        let exact = fixture_answer_68
-            .rows();
+            fixture_answer_68.rows().to_vec()
+        };
         for _ in 0..32 {
             assert_eq!(db.execute(query, &healthy_params).unwrap().rows(), healthy);
             db.run_maintenance_cycle()
@@ -1980,8 +1984,10 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
             "SELECT id FROM reader_items ORDER BY v <=> [1,0,0] USE VECTOR EXACT LIMIT 2";
         let indexed_sql =
             "SELECT id FROM reader_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2";
-        let fixture_answer_69 = seed.execute(exact_sql, &HashMap::new()).unwrap();
-        let control = fixture_answer_69.rows();
+        let control = {
+            let fixture_answer_69 = seed.execute(exact_sql, &HashMap::new()).unwrap();
+            fixture_answer_69.rows().to_vec()
+        };
         seed.close().unwrap();
         drop(seed);
         let mut options = crate::DatabaseOpenOptions {
@@ -1995,8 +2001,10 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
             before, combined,
             "reopen leaves the old catalog selected until maintenance publishes"
         );
-        let fixture_answer_70 = reader.execute(indexed_sql, &HashMap::new()).unwrap();
-        let old_answer = fixture_answer_70.rows();
+        let old_answer = {
+            let fixture_answer_70 = reader.execute(indexed_sql, &HashMap::new()).unwrap();
+            fixture_answer_70.rows().to_vec()
+        };
         for _ in 0..64 {
             reader.run_maintenance_cycle().unwrap();
             if selected(&reader).base.generation_id != before.base.generation_id {
@@ -2005,8 +2013,10 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         }
         let replacement = selected(&reader);
         let replacement_format = format(&reader, replacement.base.generation_id);
-        let fixture_answer_71 = reader.execute(indexed_sql, &HashMap::new()).unwrap();
-        let replacement_answer = fixture_answer_71.rows();
+        let replacement_answer = {
+            let fixture_answer_71 = reader.execute(indexed_sql, &HashMap::new()).unwrap();
+            fixture_answer_71.rows().to_vec()
+        };
         let replacement_no_change = replacement.change.is_none();
         let replacement_changed = replacement.base.generation_id != before.base.generation_id;
         reader.close().unwrap();
@@ -2026,10 +2036,14 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         create(&fresh, false);
         let published = selected(&fresh);
         let published_format = format(&fresh, published.base.generation_id);
-        let fixture_answer_72 = fresh.execute(exact_sql, &HashMap::new()).unwrap();
-        let fresh_control = fixture_answer_72.rows();
-        let fixture_answer_73 = fresh.execute(indexed_sql, &HashMap::new()).unwrap();
-        let published_answer = fixture_answer_73.rows();
+        let fresh_control = {
+            let fixture_answer_72 = fresh.execute(exact_sql, &HashMap::new()).unwrap();
+            fixture_answer_72.rows().to_vec()
+        };
+        let published_answer = {
+            let fixture_answer_73 = fresh.execute(indexed_sql, &HashMap::new()).unwrap();
+            fixture_answer_73.rows().to_vec()
+        };
         fresh.close().unwrap();
         drop(fresh);
         let paged = crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
@@ -2097,11 +2111,12 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         db.execute("DELETE FROM items", &HashMap::new()).unwrap();
         let snapshot = db.snapshot();
         let pin = db.pin_snapshot(snapshot).unwrap();
-        let fixture_answer_74 = db
+        let old_rows = {
+            let fixture_answer_74 = db
             .execute_at_snapshot(sql, &HashMap::new(), snapshot)
             .unwrap();
-        let old_rows = fixture_answer_74
-            .rows();
+            fixture_answer_74.rows().to_vec()
+        };
         assert!(old_rows.is_empty());
         insert(2, 100);
         insert(3, 100);
@@ -2175,8 +2190,10 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         insert(5, 2_000_000);
         db.run_maintenance_cycle()
             .expect("reinsertion maintains the retained catalog successfully");
-        let fixture_answer_75 = db.execute(sql, &HashMap::new()).unwrap();
-        let rows = fixture_answer_75.rows();
+        let rows = {
+            let fixture_answer_75 = db.execute(sql, &HashMap::new()).unwrap();
+            fixture_answer_75.rows().to_vec()
+        };
         let ids = rows
             .iter()
             .map(|row| match row[0] {
@@ -2621,11 +2638,12 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         let pin = db.pin_snapshot(old_snapshot).unwrap();
         let query = "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
         let query_params = HashMap::new();
-        let fixture_answer_76 = db
+        let old_answer = {
+            let fixture_answer_76 = db
             .execute_at_snapshot(query, &query_params, old_snapshot)
             .unwrap();
-        let old_answer = fixture_answer_76
-            .rows();
+            fixture_answer_76.rows().to_vec()
+        };
         for value in [2, 3] {
             db.execute(&format!("UPDATE t SET v = '[{value}]'"), &HashMap::new())
                 .unwrap();
@@ -2635,14 +2653,17 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         }
         let before = catalog().unwrap();
         assert!(before.base.generation_id > original.base.generation_id);
-        let fixture_answer_77 = db
+        let exact = {
+            let fixture_answer_77 = db
             .execute(&query.replace("INDEXED", "EXACT"), &query_params)
             .unwrap();
-        let exact = fixture_answer_77
-            .rows();
+            fixture_answer_77.rows().to_vec()
+        };
         let healthy_sql = "SELECT id, v FROM healthy ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
-        let fixture_answer_78 = db.execute(healthy_sql, &HashMap::new()).unwrap();
-        let healthy = fixture_answer_78.rows();
+        let healthy = {
+            let fixture_answer_78 = db.execute(healthy_sql, &HashMap::new()).unwrap();
+            fixture_answer_78.rows().to_vec()
+        };
         let catalog_key = persistence
             .with_db(|storage| {
                 let read = storage.begin_read().unwrap();

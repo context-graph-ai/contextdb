@@ -789,14 +789,15 @@ fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
             )
         };
     let assert_visible = |db: &Database| {
-        let fixture_answer_61 = db
+        let actual = {
+            let fixture_answer_61 = db
             .execute(
                 "SELECT id, parent_id, previous_body, body FROM mixed_children ORDER BY id",
                 &HashMap::new(),
             )
             .unwrap();
-        let actual = fixture_answer_61
-            .rows();
+            fixture_answer_61.rows().to_vec()
+        };
         assert_eq!(
             actual,
             vec![
@@ -1635,17 +1636,21 @@ mod edge_column_owner_contract {
     // Use a surviving edge-shaped table to ask the global graph after links
     // loses its shape or is dropped. A missing-table error cannot mask a ghost.
     fn assert_links(db: &Database, count: usize) {
-        let fixture_answer_62 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
+        let actual = {
+            let fixture_answer_62 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
             &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap();
-        let actual = fixture_answer_62.rows();
+            fixture_answer_62.rows().to_vec()
+        };
         assert_eq!(
             actual,
             vec![vec![Value::Uuid(TARGET)]; count],
             "exact forward bindings including independent owners"
         );
-        let fixture_answer_63 = db.execute("SELECT s FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE b.id = $t COLUMNS (a.id AS s))",
+        let reverse = {
+            let fixture_answer_63 = db.execute("SELECT s FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE b.id = $t COLUMNS (a.id AS s))",
             &HashMap::from([("t".into(), Value::Uuid(TARGET))])).unwrap();
-        let reverse = fixture_answer_63.rows();
+            fixture_answer_63.rows().to_vec()
+        };
         assert_eq!(
             reverse,
             vec![vec![Value::Uuid(SOURCE)]; count],
@@ -1840,9 +1845,11 @@ mod edge_column_owner_contract {
                     let tx = db.begin().unwrap();
                     db.delete_edge(tx, SOURCE, TARGET, "LINK").unwrap();
                     db.commit(tx).unwrap();
-                    let fixture_answer_64 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
+                    let actual = {
+                        let fixture_answer_64 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
                         &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap();
-                    let actual = fixture_answer_64.rows();
+                        fixture_answer_64.rows().to_vec()
+                    };
                     assert_eq!(
                         actual,
                         if column == "note" {
@@ -2102,14 +2109,15 @@ mod edge_column_owner_contract {
                 } else {
                     "previous_body"
                 };
-                let fixture_answer_65 = handle
+                let actual = {
+                    let fixture_answer_65 = handle
                     .execute_in_tx(
                         context.tx,
                         &format!("SELECT {name} FROM prefix_notes WHERE id = $id"),
                         &HashMap::from([("id".into(), id.clone())]),
                     )?;
-                let actual = fixture_answer_65
-                    .rows();
+                    fixture_answer_65.rows().to_vec()
+                };
                 assert_eq!(
                     actual,
                     vec![vec![Value::Text("prefix".into())]],

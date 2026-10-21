@@ -503,14 +503,15 @@ fn ef_search_history_survives_later_shape_change_reopen_export_and_replay() {
         }
         let expected_schema = canonical(&db.table_meta("breadth_rows").unwrap());
         let expected_ddl = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
-        let fixture_answer_98 = db
+        let expected_rows = {
+            let fixture_answer_98 = db
             .execute(
                 "SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id",
                 &empty(),
             )
             .unwrap();
-        let expected_rows = fixture_answer_98
-            .rows();
+            fixture_answer_98.rows().to_vec()
+        };
         // Replay the source's exact ordered changes, never manufacture a new
         // CREATE with the final schema and compare unrelated history digests.
         let expected_identity = declared_identity(&db);
@@ -855,14 +856,15 @@ async fn authenticated_pull_preserves_the_same_authored_history_through_ef_searc
             canonical(&source.table_meta("breadth_rows").unwrap())
         );
         let receiver_ddl = canonical(&edge.ddl_log_since(Lsn(0)).unwrap());
-        let fixture_answer_99 = source
+        let expected_rows = {
+            let fixture_answer_99 = source
             .execute(
                 "SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id",
                 &empty(),
             )
             .unwrap();
-        let expected_rows = fixture_answer_99
-            .rows();
+            fixture_answer_99.rows().to_vec()
+        };
         assert_eq!(
             edge.execute(
                 "SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id",

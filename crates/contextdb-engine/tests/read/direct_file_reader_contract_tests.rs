@@ -1402,7 +1402,7 @@ fn metadata_responses(fixture: &Fixture, reader: &DirectFileReader) -> Vec<Direc
     for response in &responses {
         assert_eq!(
             response.canonical_bytes,
-            canonical_metadata_bytes_for_test(&response.body)
+            canonical_metadata_bytes_for_test(&response.body, reader.request_read_memory_for_test().expect("fixture operation owner"))
                 .expect("shared route-neutral metadata encoder supplies exact bytes")
         );
     }
@@ -1486,8 +1486,8 @@ fn assert_complete_public_image_state(
     image.snapshot
 }
 
-fn exact_empty_page(columns: &[String], snapshot: DirectSnapshot) -> DirectCursorPage {
-    DirectCursorPage::new_for_test(columns.to_vec(), snapshot)
+fn exact_empty_page(columns: &[String], snapshot: DirectSnapshot, reader: &DirectFileReader) -> DirectCursorPage {
+    DirectCursorPage::new_for_test(columns.to_vec(), snapshot, reader.request_read_memory_for_test().expect("fixture operation owner"))
 }
 
 fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCursorPage> {
@@ -1516,7 +1516,7 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
         );
     }
     let snapshot = pages[0].snapshot;
-    let empty = exact_empty_page(&fixture.cursor_columns, snapshot);
+    let empty = exact_empty_page(&fixture.cursor_columns, snapshot, reader);
     assert_eq!(
         opened
             .cursor
@@ -3979,7 +3979,7 @@ fn terminal_page_immediately_releases_image_memory_and_cursor_state() {
         retained
     );
     assert_cursor_resources_released(&witness);
-    let empty = exact_empty_page(&fixture.cursor_columns, terminal.snapshot);
+    let empty = exact_empty_page(&fixture.cursor_columns, terminal.snapshot, &reader);
     assert_eq!(
         opened
             .cursor

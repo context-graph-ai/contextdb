@@ -50,7 +50,8 @@ fn delivery_body_and_reply_move_without_a_copy_or_a_second_charge() {
     drop(body);
     assert_eq!(parent.retained_bytes_for_test(), start);
     drop(owner);
-    assert_eq!(parent.retained_bytes_for_test(), 0);
+    assert_eq!(parent.retained_bytes_for_test(), crate::vector_read_memory::native_control_layouts_for_test().0.size() as u64);
+    parent.assert_final_root_free_for_test();
 }
 
 #[test]

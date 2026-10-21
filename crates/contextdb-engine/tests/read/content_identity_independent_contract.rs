@@ -556,8 +556,10 @@ fn observe_with_root_comparison(path: &Path, compare_typed_root: bool) -> Observ
         );
     }
     let sql = "SELECT id, payload, embedding, sq8, sq4 FROM identity_rows ORDER BY id";
-    let fixture_answer_19 = file.execute(sql, &HashMap::new()).unwrap();
-    let file_rows = fixture_answer_19.rows();
+    let file_rows = {
+        let fixture_answer_19 = file.execute(sql, &HashMap::new()).unwrap();
+        fixture_answer_19.rows().to_vec()
+    };
     let file_snapshot = snapshots.0.lock().unwrap().last().copied().unwrap();
     assert_eq!(file_snapshot.0, ReadRoute::File);
     drop(file);

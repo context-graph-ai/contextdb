@@ -310,8 +310,10 @@ fn a_pinned_reader_keeps_its_answer_while_the_large_commit_is_rebuilt_and_publis
     let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
     let params = HashMap::from([("q".into(), Value::Vector(vector_for(1_000_123)))]);
     let pinned = db.begin().unwrap();
-    let fixture_answer_45 = db.execute_in_tx(pinned, query, &params).unwrap();
-    let before = fixture_answer_45.rows();
+    let before = {
+        let fixture_answer_45 = db.execute_in_tx(pinned, query, &params).unwrap();
+        fixture_answer_45.rows().to_vec()
+    };
     assert_eq!(before, vec![vec![Value::Int64(1_000_123)]]);
     assert!(db.persist_import_vector_tails().unwrap());
     db.execute(
@@ -327,8 +329,10 @@ fn a_pinned_reader_keeps_its_answer_while_the_large_commit_is_rebuilt_and_publis
         before,
         "the pinned reader keeps its original answer"
     );
-    let fixture_answer_46 = db.execute(query, &params).unwrap();
-    let fresh = fixture_answer_46.rows();
+    let fresh = {
+        let fixture_answer_46 = db.execute(query, &params).unwrap();
+        fixture_answer_46.rows().to_vec()
+    };
     assert_ne!(fresh, before, "a fresh reader sees the delete");
     assert_eq!(nearest(&db, 3_000_000), vec![vec![Value::Int64(3_000_000)]]);
     db.rollback(pinned).unwrap();

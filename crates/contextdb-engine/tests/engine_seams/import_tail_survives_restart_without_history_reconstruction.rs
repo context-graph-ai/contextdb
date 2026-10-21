@@ -60,24 +60,26 @@ fn run(history: usize) -> usize {
         append(&db, id, vec![1.0, 0.0, 0.0]);
         // A raw commit advances the operation root without changing saved
         // native pages. Both layers must still read that selected root.
-        let fixture_answer_38 = db
+        let before = {
+            let fixture_answer_38 = db
             .execute(
                 "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
             )
             .unwrap();
-        let before = fixture_answer_38
-            .rows();
+            fixture_answer_38.rows().to_vec()
+        };
         assert_eq!(before, vec![vec![Value::Int64(10_000)]]);
         assert!(db.persist_import_vector_tails().unwrap());
-        let fixture_answer_39 = db
+        let rows = {
+            let fixture_answer_39 = db
             .execute(
                 "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
             )
             .unwrap();
-        let rows = fixture_answer_39
-            .rows();
+            fixture_answer_39.rows().to_vec()
+        };
         assert_eq!(rows, vec![vec![Value::Int64(10_000)]]);
     }
     count.load(Ordering::SeqCst)
@@ -202,10 +204,14 @@ fn partition_status(db: &Database) -> HashMap<String, Value> {
 
 fn assert_required_recall(db: &Database) {
     let params = HashMap::from([("q".into(), Value::Vector(vec![0.0, 1.0, 0.0]))]);
-    let fixture_answer_40 = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 32", &params).unwrap();
-    let exact = fixture_answer_40.rows();
-    let fixture_answer_41 = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 32", &params).unwrap();
-    let indexed = fixture_answer_41.rows();
+    let exact = {
+        let fixture_answer_40 = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 32", &params).unwrap();
+        fixture_answer_40.rows().to_vec()
+    };
+    let indexed = {
+        let fixture_answer_41 = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 32", &params).unwrap();
+        fixture_answer_41.rows().to_vec()
+    };
     assert_eq!(
         indexed.len(),
         exact.len(),
@@ -403,8 +409,10 @@ fn native_tail_publications_preserve_an_existing_transaction_snapshot() {
     let snapshot = db.begin().unwrap();
     let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
     let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
-    let fixture_answer_42 = db.execute_in_tx(snapshot, query, &params).unwrap();
-    let before = fixture_answer_42.rows();
+    let before = {
+        let fixture_answer_42 = db.execute_in_tx(snapshot, query, &params).unwrap();
+        fixture_answer_42.rows().to_vec()
+    };
     append(&db, 10000, vec![1.0, 0.0, 0.0]);
     assert!(db.persist_import_vector_tails().unwrap());
     assert_eq!(
@@ -483,8 +491,10 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
     let snapshot = db.begin().unwrap();
     let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
     let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
-    let fixture_answer_43 = db.execute_in_tx(snapshot, query, &params).unwrap();
-    let held = fixture_answer_43.rows();
+    let held = {
+        let fixture_answer_43 = db.execute_in_tx(snapshot, query, &params).unwrap();
+        fixture_answer_43.rows().to_vec()
+    };
     // Pure adoption preserves the complete logical identity before any suffix.
     assert!(db.persist_import_vector_tails().unwrap());
     let index = contextdb_core::VectorIndexRef::new("points", "embedding");
@@ -508,8 +518,10 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
         .unwrap();
     assert_eq!(reopened.change.or(reopened.dormant_change), Some(before));
     let snapshot = db.begin().unwrap();
-    let fixture_answer_44 = db.execute_in_tx(snapshot, query, &params).unwrap();
-    let held = fixture_answer_44.rows();
+    let held = {
+        let fixture_answer_44 = db.execute_in_tx(snapshot, query, &params).unwrap();
+        fixture_answer_44.rows().to_vec()
+    };
     append(&db, 10000, vec![1.0, 0.0, 0.0]);
     assert!(db.persist_import_vector_tails().unwrap());
     let extended = db

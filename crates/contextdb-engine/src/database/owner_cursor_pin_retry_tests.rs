@@ -250,6 +250,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
                 ..ReadClientTimeouts::default()
             },
             clock.clone(),
+            db.declared_reader_memory().unwrap(),
         ))
         .unwrap();
     let cancelled = OwnerReadCancellation::new();
@@ -604,6 +605,7 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
                 ..ReadClientTimeouts::default()
             },
             clock.clone(),
+            db.declared_reader_memory().unwrap(),
         ))
         .unwrap();
     let cancelled = OwnerReadCancellation::new();

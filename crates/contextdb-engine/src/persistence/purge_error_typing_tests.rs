@@ -131,7 +131,7 @@ fn invalid_purge_generation_candidates_report_typed_store_corruption() {
     let mut projection = AuthoritativePurgePersistenceProjection {
         row_graph_entries: Vec::new(),
         row_graph_credit: contextdb_core::read_memory::ReadCredit::new(
-            crate::read_image_memory::ImageMemory::new(Some(0)),
+            persistence.require_decode_original().unwrap().wait_memory_owner().unwrap(),
         ),
         row_versions: Vec::new(),
         source_provenance: Vec::new(),

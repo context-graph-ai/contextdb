@@ -930,11 +930,12 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
             },
         )
         .expect("open reader before vector clear");
-        let fixture_answer_79 = old_reader
+        let old_before_clear = {
+            let fixture_answer_79 = old_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
             .expect("read committed vector before clear");
-        let old_before_clear = fixture_answer_79
-            .rows();
+            fixture_answer_79.rows().to_vec()
+        };
         let mut active_cursor = old_reader
             .open_cursor("SELECT v FROM items ORDER BY id", &HashMap::new())
             .expect("start the vector statement before clear");
@@ -945,47 +946,53 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
         );
         db.execute("UPDATE items SET v = NULL WHERE id = 1", &HashMap::new())
             .unwrap();
-        let fixture_answer_80 = db
+        let fresh_answer = {
+            let fixture_answer_80 = db
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
             .unwrap();
-        let fresh_answer = fixture_answer_80
-            .rows();
-        let fixture_answer_81 = active_cursor
+            fixture_answer_80.rows().to_vec()
+        };
+        let old_after_clear = {
+            let fixture_answer_81 = active_cursor
             .fetch(None)
             .expect("active statement keeps its vector after clear");
-        let old_after_clear = fixture_answer_81
-            .rows();
+            fixture_answer_81.rows().to_vec()
+        };
         active_cursor.close().unwrap();
-        let fixture_answer_82 = old_reader
+        let retained_session_after_clear = {
+            let fixture_answer_82 = old_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
             .expect("new statement on retained session sees clear");
-        let retained_session_after_clear = fixture_answer_82
-            .rows();
+            fixture_answer_82.rows().to_vec()
+        };
         let new_reader = crate::ReadSession::open(&path).expect("open reader after vector clear");
-        let fixture_answer_83 = new_reader
+        let new_after_clear = {
+            let fixture_answer_83 = new_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
             .expect("new reader sees the committed clear");
-        let new_after_clear = fixture_answer_83
-            .rows();
+            fixture_answer_83.rows().to_vec()
+        };
         drop(new_reader);
         drop(old_reader);
         db.close().unwrap();
         drop(db);
         let db = open();
-        let fixture_answer_84 = db
+        let reopened_answer = {
+            let fixture_answer_84 = db
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
             .unwrap();
-        let reopened_answer = fixture_answer_84
-            .rows();
+            fixture_answer_84.rows().to_vec()
+        };
         eprintln!(
             "VECTOR_MOVE_CLEAR_ANSWER arm={arm} phase=reopened-after-clear answer={reopened_answer:?}"
         );
         let reopened_reader = crate::ReadSession::open(&path).expect("open reader after reopen");
-        let fixture_answer_85 = reopened_reader
+        let reader_after_reopen = {
+            let fixture_answer_85 = reopened_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
             .expect("reopened reader sees the committed clear");
-        let reader_after_reopen = fixture_answer_85
-            .rows();
+            fixture_answer_85.rows().to_vec()
+        };
         drop(reopened_reader);
         db.close().unwrap();
         assert_eq!(
@@ -1091,11 +1098,12 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
     drop(db);
     // Reopen removes any staged payload and requires the persisted SQ8 body.
     let db = open();
-    let fixture_answer_86 = db
+    let live_answer = {
+        let fixture_answer_86 = db
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
         .expect("hydrate live quantized vector after reopen");
-    let live_answer = fixture_answer_86
-        .rows();
+        fixture_answer_86.rows().to_vec()
+    };
     let old_reader = crate::ReadSession::open_with_options(
         &path,
         crate::ReadSessionOptions {
@@ -1107,11 +1115,12 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
         },
     )
     .expect("capture live SQ8 reader");
-    let fixture_answer_87 = old_reader
+    let old_before_clear = {
+        let fixture_answer_87 = old_reader
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
         .expect("reader hydrates live quantized body");
-    let old_before_clear = fixture_answer_87
-        .rows();
+        fixture_answer_87.rows().to_vec()
+    };
     let mut active_cursor = old_reader
         .open_cursor("SELECT v FROM compact_items ORDER BY id", &HashMap::new())
         .expect("start SQ8 vector statement before clear");
@@ -1125,38 +1134,43 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
         &HashMap::new(),
     )
     .expect("commit quantized clear");
-    let fixture_answer_88 = db
+    let cleared_answer = {
+        let fixture_answer_88 = db
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
         .expect("read cleared quantized vector");
-    let cleared_answer = fixture_answer_88
-        .rows();
-    let fixture_answer_89 = active_cursor
+        fixture_answer_88.rows().to_vec()
+    };
+    let old_after_clear = {
+        let fixture_answer_89 = active_cursor
         .fetch(None)
         .expect("active statement keeps live quantized body");
-    let old_after_clear = fixture_answer_89
-        .rows();
+        fixture_answer_89.rows().to_vec()
+    };
     active_cursor.close().unwrap();
-    let fixture_answer_90 = old_reader
+    let retained_session_after_clear = {
+        let fixture_answer_90 = old_reader
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
         .expect("new SQ8 statement on retained session sees clear");
-    let retained_session_after_clear = fixture_answer_90
-        .rows();
+        fixture_answer_90.rows().to_vec()
+    };
     let new_reader = crate::ReadSession::open(&path).expect("capture cleared SQ8 reader");
-    let fixture_answer_91 = new_reader
+    let new_after_clear = {
+        let fixture_answer_91 = new_reader
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
         .expect("new reader sees quantized clear");
-    let new_after_clear = fixture_answer_91
-        .rows();
+        fixture_answer_91.rows().to_vec()
+    };
     drop(new_reader);
     drop(old_reader);
     db.close().unwrap();
     drop(db);
     let db = open();
-    let fixture_answer_92 = db
+    let reopened_answer = {
+        let fixture_answer_92 = db
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
         .expect("quantized clear stays NULL after reopen");
-    let reopened_answer = fixture_answer_92
-        .rows();
+        fixture_answer_92.rows().to_vec()
+    };
     db.close().unwrap();
     assert_eq!(
         live_answer, expected,

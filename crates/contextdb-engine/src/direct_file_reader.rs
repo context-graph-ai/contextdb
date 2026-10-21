@@ -611,17 +611,19 @@ impl DirectCursorPage {
     }
     /// Construct the existing empty private-page fixture from moved parts.
     #[doc(hidden)]
-    pub fn new_for_test(columns: Vec<String>, snapshot: DirectSnapshot) -> Self {
+    pub fn new_for_test(columns: Vec<String>, snapshot: DirectSnapshot, owner: contextdb_core::read_memory::ReadMemoryOwner) -> Self {
         let page = CursorPage::from_parts(columns, Vec::new(), false);
-        let canonical_bytes = crate::read_contract::encode_owned_cursor_page_for_test(&page)
-            .expect("shared encoder supplies empty terminal-page bytes");
+        let canonical_bytes = crate::read_contract::EncodedReadBytes::from_funded(
+            crate::read_contract::encode_transport_funded(&page, Some(owner), u64::MAX)
+                .expect("shared encoder supplies empty terminal-page bytes"), u64::MAX,
+        ).expect("retain the fixture's original encoding invoices");
         Self {
             page,
             observation: crate::executor::CursorObservation {
                 trace: std::sync::Arc::new(crate::database::QueryTrace::scan()),
                 rows_examined: 0, charge: None, group_page_returns: None,
             },
-            canonical_bytes, snapshot, canonical_credit: None,
+            canonical_bytes, snapshot,
         }
     }
 }
@@ -2048,8 +2050,10 @@ pub mod test_seams {
 
     pub fn canonical_metadata_bytes_for_test(
         body: &DirectMetadataBody,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Vec<u8>, DirectFileReaderError> {
-        crate::read_contract::encode_metadata_body(body)
+        crate::read_contract::encode_metadata_body(body, owner)
+            .map(|bytes| bytes.as_slice().to_vec())
             .map_err(|error| DirectFileReaderError::Engine(error.to_string().into()))
     }
 

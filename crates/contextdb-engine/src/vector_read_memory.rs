@@ -383,6 +383,14 @@ impl DeclaredReadMemory {
 
 }
 impl DeclaredReadRoot {
+    #[cfg(test)]
+    pub(crate) fn assert_final_root_free_for_test(self) {
+        let token = self.observation.expect("original root observation");
+        drop(self);
+        root_observations::assert_terminal_free(token);
+        assert_eq!(root_observations::sample(token), (false, 0, 0));
+    }
+
     pub(crate) fn acl_cache_budget(&self) -> Result<ReadMemoryOwner> {
         let bytes = ReadMemoryOwner::native_layout::<ReaderAclCacheBudget, ReaderAclCacheInvoice>().size();
         self.try_reserve_native(bytes, "reader_acl_cache", "budget_owner",
