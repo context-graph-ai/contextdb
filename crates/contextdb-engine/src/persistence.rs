@@ -9584,7 +9584,10 @@ impl RetainedReadSource {
         row: &VersionedRow,
         proof: &mut content_identity::ReadAuthenticationNodes,
     ) -> Result<bool> {
-        let mutation = content_identity::row_mutation(table, row, Some(meta))
+        // Authentication owns only temporary canonical evidence. Its invoice
+        // must end with that evidence, before the decoded row's credit moves.
+        let memory = crate::read_image_memory::active_owner()?.row_owner()?;
+        let mutation = memory.scope(|| content_identity::admitted_row_mutation(table, row, Some(meta)))
             .map_err(|error| self.content_identity_error(error))?;
         self.content_identity
             .verify_with_nodes(proof, &mutation)
