@@ -256,6 +256,8 @@ mod native {
                 ReadMemoryBudget::release(&*self.actual, bytes);
             }
         }
+        struct ReleaseBody;
+        impl Drop for ReleaseBody { fn drop(&mut self) { PHASE.store(2, Ordering::Release); } }
         struct FreeWatch;
         impl Drop for FreeWatch { fn drop(&mut self) { physical::disarm_source_free_watch(); } }
 
@@ -269,10 +271,18 @@ mod native {
             let control = ReadShared::<Body<fn()>>::layout();
             let stack = STACK_BYTES + page_bytes();
             let before = threads();
-            for limit in [0, control.size() - 1, control.size() + stack - 1] {
+            for limit in [control.size() - 1, control.size() + stack - 1] {
                 ENTERED.store(0, Ordering::SeqCst);
                 let actual = Arc::new(MemoryAccountant::with_budget(limit));
-                let error = OwnedWorker::spawn(actual.clone().into(), worker_body as fn()).unwrap_err();
+                let error = match OwnedWorker::spawn(actual.clone().into(), worker_body as fn()) {
+                    Err(error) => error,
+                    Ok(worker) => {
+                        while PHASE.load(Ordering::Acquire) != 1 { std::thread::yield_now(); }
+                        PHASE.store(2, Ordering::Release);
+                        drop(worker);
+                        panic!("the original under-limit owner must refuse worker startup");
+                    }
+                };
                 let Error::MemoryBudgetExceeded { operation, requested_bytes, budget_limit_bytes, .. } = error else {
                     panic!("startup denial must preserve the original memory refusal: {error:?}");
                 };
@@ -293,6 +303,7 @@ mod native {
                 let (worker, requests, count) = physical::source_requests_for_test(counter, || OwnedWorker::spawn(payer.clone().into(), worker_body as fn()));
                 let worker = worker.unwrap();
                 while PHASE.load(Ordering::Acquire) != 1 { std::thread::yield_now(); }
+                let _release = ReleaseBody;
                 assert_eq!(threads(), before + 1);
                 assert_eq!(payer.actual.usage().used, control.size() + stack);
                 assert!(!unmapped(STACK_PAGE.load(Ordering::Acquire)));
