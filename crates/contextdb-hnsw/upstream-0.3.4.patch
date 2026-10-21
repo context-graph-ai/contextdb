@@ -3013,7 +3013,7 @@
 @@ -1372 +1754 @@
 -            max_nb_connection: self.get_max_nb_connection(),
 +            max_nb_connection,
-@@ -1393,0 +1776,164 @@
+@@ -1393,0 +1776,218 @@
 +/// Stream a provider-backed graph using the existing owned graph layout. The
 +/// provider admits and authenticates one point at a time; no topology or
 +/// generation-sized encoded buffer is retained by this encoder.
@@ -3139,6 +3139,59 @@
 +    Ok(())
 +}
 +
++// The serving point decoder reserves each sequence once at its encoded
++// length. Native callers pre-admit these exact allocations plus conversion.
++struct ExactPointVec<T>(Vec<T>);
++impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ExactPointVec<T> {
++    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
++        struct V<T>(std::marker::PhantomData<T>);
++        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for V<T> {
++            type Value = ExactPointVec<T>;
++            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a bounded point sequence") }
++            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
++                let n = seq.size_hint().ok_or_else(|| serde::de::Error::custom("point sequence has no encoded length"))?;
++                let mut values = Vec::with_capacity(n);
++                for _ in 0..n {
++                    values.push(seq.next_element()?.ok_or_else(|| serde::de::Error::custom("short point sequence"))?);
++                }
++                std::result::Result::Ok(ExactPointVec(values))
++            }
++        }
++        d.deserialize_seq(V(std::marker::PhantomData))
++    }
++}
++#[derive(serde::Deserialize)]
++struct ExactGraphPoint<T> {
++    origin_id: usize,
++    point_id: OwnedPointId,
++    values: ExactPointVec<T>,
++    neighbours: ExactPointVec<ExactPointVec<OwnedNeighbour>>,
++}
++
++fn validate_point_sequence_lengths<T>(bytes: &[u8]) -> Result<()> {
++    let mut at = 13usize;
++    let count = |at: &mut usize| -> Result<usize> {
++        let end = at.checked_add(8).ok_or_else(|| anyhow!("point length overflow"))?;
++        let raw = bytes.get(*at..end).ok_or_else(|| anyhow!("short point length"))?;
++        *at = end;
++        usize::try_from(u64::from_le_bytes(raw.try_into().unwrap())).map_err(|_| anyhow!("point length overflow"))
++    };
++    let n = count(&mut at)?;
++    at = at.checked_add(n.checked_mul(std::mem::size_of::<T>().max(1)).ok_or_else(|| anyhow!("point values overflow"))?)
++        .ok_or_else(|| anyhow!("point values overflow"))?;
++    if at > bytes.len() { return Err(anyhow!("short point values")); }
++    let layers = count(&mut at)?;
++    if layers > 16 { return Err(anyhow!("invalid point layer count")); }
++    for _ in 0..layers {
++        let n = count(&mut at)?;
++        at = at.checked_add(n.checked_mul(17).ok_or_else(|| anyhow!("point links overflow"))?)
++            .ok_or_else(|| anyhow!("point links overflow"))?;
++        if at > bytes.len() { return Err(anyhow!("short point links")); }
++    }
++    if at != bytes.len() { return Err(anyhow!("point has trailing bytes")); }
++    Ok(())
++}
++
 +/// Decode one sealed-layout point after its page envelope was authenticated.
 +/// The byte limit is the caller's admitted finite decode window.
 +pub fn decode_paged_point<T: DeserializeOwned>(
@@ -3148,19 +3201,20 @@
 +    if bytes.len() > byte_limit {
 +        return Err(anyhow!("HNSW point exceeds its admitted decode window"));
 +    }
-+    let point: OwnedGraphPoint<T> = bincode::DefaultOptions::new()
++    validate_point_sequence_lengths::<T>(bytes)?;
++    let point: ExactGraphPoint<T> = bincode::DefaultOptions::new()
 +        .with_fixint_encoding()
 +        .with_limit(byte_limit as u64)
 +        .reject_trailing_bytes()
 +        .deserialize(bytes)?;
-+    if point.point_id.layer >= 16 || point.point_id.rank < 0 || point.neighbours.len() > 16 {
++    if point.point_id.layer >= 16 || point.point_id.rank < 0 || point.neighbours.0.len() > 16 {
 +        return Err(anyhow!("invalid HNSW point identity or layer count"));
 +    }
 +    let neighbours = point
-+        .neighbours
++        .neighbours.0
 +        .into_iter()
 +        .map(|layer| {
-+            layer
++            layer.0
 +                .into_iter()
 +                .map(|edge| crate::paged::PagedEdge {
 +                    point_id: PointId(edge.point_id.layer, edge.point_id.rank),
@@ -3173,12 +3227,12 @@
 +    Ok(crate::paged::PagedPoint {
 +        id: PointId(point.point_id.layer, point.point_id.rank),
 +        origin_id: point.origin_id,
-+        values: point.values,
++        values: point.values.0,
 +        neighbours,
 +    })
 +}
 +
-@@ -1396,0 +1943,150 @@
+@@ -1396,0 +1997,150 @@
 +    #[test]
 +    fn appended_links_keep_order_survive_encoding_and_need_declared_slack() {
 +        use super::*;
@@ -3329,10 +3383,10 @@
 +        );
 +    }
 +
-@@ -1401,2 +2096,0 @@
+@@ -1401,2 +2150,0 @@
 -    use log::error;
 -
-@@ -1413,0 +2108,41 @@
+@@ -1413,0 +2162,41 @@
 +    fn durable_roundtrip_fixture() -> Vec<(DataId, Vec<f32>)> {
 +        vec![
 +            (9_001, vec![0.0, 0.0, 0.0, 0.0]),
@@ -3374,9 +3428,9 @@
 +        }
 +    }
 +
-@@ -1416 +2150,0 @@
+@@ -1416 +2204,0 @@
 -        println!("\n\n test_dump_reload_1");
-@@ -1418,32 +2151,0 @@
+@@ -1418,32 +2205,0 @@
 -        // generate a random test
 -        let mut rng = rand::rng();
 -        let unif = Uniform::<f32>::new(0., 1.).unwrap();
@@ -3409,7 +3463,7 @@
 -        hnsw.dump_layer_info();
 -        // dump in a file.  Must take care of name as tests runs in // !!!
 -        let fname = "dumpreloadtest1";
-@@ -1451,10 +2153,7 @@
+@@ -1451,10 +2207,7 @@
 -        let _res = hnsw.file_dump(directory.path(), fname);
 -        //
 -        // reload
@@ -3427,9 +3481,9 @@
 +
 +        assert!(!loaded.is_mmap_backed());
 +        assert_loaded_roundtrip_search(&loaded);
-@@ -1465 +2163,0 @@
+@@ -1465 +2217,0 @@
 -        println!("\n\n test_dump_reload_myfn");
-@@ -1467,18 +2165 @@
+@@ -1467,18 +2219 @@
 -        // generate a random test
 -        let mut rng = rand::rng();
 -        let unif = Uniform::<f32>::new(0., 1.).unwrap();
@@ -3449,19 +3503,19 @@
 -        let ef_construct = 25;
 -        let nb_connection = 10;
 +        let fixture = durable_roundtrip_fixture();
-@@ -1486,3 +2167,3 @@
+@@ -1486,3 +2221,3 @@
 -        let hnsw = Hnsw::<f32, dist::DistPtr<f32, f32>>::new(
 -            nb_connection,
 -            nbcolumn,
 +        let hnsw = Hnsw::<f32, dist::DistPtr<f32, f32>>::new_with_seed(
 +            8,
 +            fixture.len(),
-@@ -1490 +2171 @@
+@@ -1490 +2225 @@
 -            ef_construct,
 +            32,
-@@ -1491,0 +2173 @@
+@@ -1491,0 +2227 @@
 +            0x5355_5050_4c49_4544,
-@@ -1493,6 +2175,3 @@
+@@ -1493,6 +2229,3 @@
 -        for (i, d) in data.iter().enumerate() {
 -            hnsw.insert((d, i));
 -        }
@@ -3471,7 +3525,7 @@
 +        for (external_id, vector) in &fixture {
 +            hnsw.insert((vector, *external_id));
 +        }
-@@ -1500,7 +2179,6 @@
+@@ -1500,7 +2233,6 @@
 -
 -        let _res = hnsw.file_dump(directory.path(), fname);
 -        // This will dump in 2 files named dumpreloadtest.hnsw.graph and dumpreloadtest.hnsw.data
@@ -3485,7 +3539,7 @@
 +        drop(hnsw);
 +
 +        let options = ReloadOptions::default().set_mmap(true);
-@@ -1508,2 +2186,9 @@
+@@ -1508,2 +2240,9 @@
 -        let _hnsw_loaded: Hnsw<f32, DistPtr<f32, f32>> =
 -            reloader.load_hnsw_with_dist(mydist).unwrap();
 +        let loaded = HnswIo::new_with_options(directory.path(), &dumpname, options)
@@ -3497,12 +3551,12 @@
 +            assert_eq!(found[0].d_id, external_id);
 +            assert!(found[0].distance.abs() <= f32::EPSILON);
 +        }
-@@ -1560 +2245 @@
+@@ -1560 +2299 @@
 -    // this tests reloads a dump with memory mapping of data, inserts new data and redump
 +    // The loaded graph owns its mmap and is searched after the source graph and loader are gone.
-@@ -1563 +2247,0 @@
+@@ -1563 +2301,0 @@
 -        println!("\n\n hnswio tests : reload_with_mmap");
-@@ -1565,35 +2248,0 @@
+@@ -1565,35 +2302,0 @@
 -        // generate a random test
 -        let mut rng = rand::rng();
 -        let unif = Uniform::<f32>::new(0., 1.).unwrap();
@@ -3538,7 +3592,7 @@
 -        hnsw.dump_layer_info();
 -        // dump in a file.  Must take care of name as tests runs in // !!!
 -        let fname = "mmapreloadtest";
-@@ -1601,67 +2250,8 @@
+@@ -1601,67 +2304,8 @@
 -        let dumpname = hnsw.file_dump(directory.path(), fname).unwrap();
 -        debug!("dump succeeded in file basename : {}", dumpname);
 -        //
