@@ -169,7 +169,8 @@ image; its session and cursors retain their registered snapshot afterward.
 A writable open waits exactly once for the operating-system store lock. There is
 no engine timeout and no application reopen/retry loop. Only actual caller
 cancellation or the caller's deadline can end that wait early. An already-expired
-caller deadline returns the immediate typed `held_by_readers` refusal, including
+caller deadline returns the immediate typed `held_by_readers` refusal while
+readers hold admission, including
 the real observed count and identifiable reader names. A direct read that finds
 committed state a writable open would have to mend refuses with
 `direct_read_requires_writer` instead of serving something the file cannot back.

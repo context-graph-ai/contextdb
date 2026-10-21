@@ -7892,9 +7892,27 @@ struct RetainedOrderedProof {
     snapshot: SnapshotId,
     cache: Arc<Mutex<VerifiedOrderedRunCacheState>>,
     epoch: u64,
-    _memory: Arc<VerifiedOrderedRunMemory>,
     proof: content_identity::ProofMemory,
     batch: content_identity::OrderedProofBatch,
+    _memory: Arc<VerifiedOrderedRunMemory>,
+}
+
+/// The cursor's opaque proof slot retains its original source reservation.
+/// Page reconciliation must preserve that invoice until the last proof holder
+/// frees the decoded pages. This observes admitted bytes, never a new reserve.
+pub(crate) fn ordered_cursor_proof_bytes(
+    cursor: &contextdb_relational::mem::BoundedOrderedRowCursor,
+) -> usize {
+    cursor
+        .source_proof()
+        .and_then(|slot| slot.0.downcast_ref::<Mutex<RetainedOrderedProof>>())
+        .map_or(0, |proof| {
+            proof
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                ._memory
+                .held()
+        })
 }
 
 /// The exact durable source captured with a checkpoint's logical watermark.
