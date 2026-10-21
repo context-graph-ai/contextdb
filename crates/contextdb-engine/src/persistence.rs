@@ -2380,6 +2380,7 @@ impl ReadPersistenceImage {
         &mut self,
         retained_source: &RetainedReadSource,
     ) -> Result<()> {
+        let _decode_scope = self.memory.enter();
         // History an open leaves in the store, read through the same
         // admitted, authenticated on-request path a reader uses.
         if self.history_on_request.is_some() {

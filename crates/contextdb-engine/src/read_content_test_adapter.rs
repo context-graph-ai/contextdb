@@ -611,6 +611,7 @@ pub fn committed_content_for_test(
     let maintained_digest = image.content_identity_for_test();
     image.hydrate_logical_content_for_test(&retained_source)?;
     let parts = image.into_runtime_parts(retained_source);
+    let _decode_scope = parts.memory.enter();
     let identity_table_meta = parts.table_meta.clone();
     let version_records = independently_reconstruct_version_records(
         parts
