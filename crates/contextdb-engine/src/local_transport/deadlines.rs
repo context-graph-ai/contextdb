@@ -410,7 +410,6 @@ impl Drop for ManualDeadlineWait {
 pub struct MonotonicDeadlineClock {
     origin: std::time::Instant,
     owned_waits: Mutex<MonotonicWaitList>,
-    native_drivers: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-seams")]
     thread_lifecycle: Option<DeadlineThreadLifecycle>,
     #[cfg(any(test, feature = "test-seams"))]
@@ -445,7 +444,6 @@ impl MonotonicDeadlineClock {
         Self {
             origin: std::time::Instant::now(),
             owned_waits: Mutex::new(MonotonicWaitList::default()),
-            native_drivers: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
             thread_lifecycle: None,
             #[cfg(any(test, feature = "test-seams"))]
@@ -468,7 +466,6 @@ impl MonotonicDeadlineClock {
         Self {
             origin: std::time::Instant::now(),
             owned_waits: Mutex::new(MonotonicWaitList::default()),
-            native_drivers: std::sync::atomic::AtomicUsize::new(0),
             thread_lifecycle: Some(DeadlineThreadLifecycle { started, exited }),
             fail_timer_arm: false,
             timer_arm_failure_waits: AtomicUsize::new(0),
@@ -486,7 +483,6 @@ impl MonotonicDeadlineClock {
         Self {
             origin: std::time::Instant::now(),
             owned_waits: Mutex::new(MonotonicWaitList::default()),
-            native_drivers: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-seams")]
             thread_lifecycle: None,
             fail_timer_arm: true,
@@ -535,16 +531,18 @@ impl DeadlineClock for MonotonicDeadlineClock {
     fn try_owned_wait(
         &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
-        if self.native_drivers.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        if self.owned_waits.lock().unwrap_or_else(|p| p.into_inner()).drivers == 0 {
             return self.legacy_owned_wait(deadline_ms, owner);
         }
         contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
             Ok(OwnedMonotonicWait {
                 clock: self,
+                owner: owner.clone(),
+                fallback: None,
                 node: MonotonicWaitNode {
                     deadline_ms,
                     links: std::cell::UnsafeCell::new(MonotonicWaitLinks {
-                        next: std::ptr::null(), linked: false, waker: None,
+                        next: std::ptr::null(), linked: false, driver_departed: false, waker: None,
                     }),
                     _pin: std::marker::PhantomPinned,
                 },
@@ -552,8 +550,55 @@ impl DeadlineClock for MonotonicDeadlineClock {
         }).map(Some)
     }
 
-    fn native_driver_started(&self) { self.native_drivers.fetch_add(1, std::sync::atomic::Ordering::AcqRel); }
-    fn native_driver_ended(&self) { self.native_drivers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+    fn native_driver_started(&self) {
+        let mut list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+        list.drivers = list.drivers.checked_add(1).expect("native driver count overflow");
+    }
+    fn native_driver_ended(&self) {
+        {
+            let mut list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+            list.drivers = list.drivers.checked_sub(1).expect("native driver lease missing");
+            if list.drivers != 0 { return; }
+            // Mark precisely this departure's pending set while registration
+            // and new driver entry are excluded. New registrations never join
+            // this drain, even if their callbacks re-enter the clock.
+            let mut node = list.head;
+            unsafe {
+                while !node.is_null() {
+                    (*(*node).links.get()).driver_departed = true;
+                    node = (*(*node).links.get()).next;
+                }
+            }
+        }
+        let mut panic = None;
+        loop {
+            let next = {
+                let mut list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+                let mut node = list.head;
+                let mut next = None;
+                unsafe {
+                    while !node.is_null() {
+                        if (*(*node).links.get()).driver_departed {
+                            list.unlink(node);
+                            next = Some((*(*node).links.get()).waker.take());
+                            break;
+                        }
+                        node = (*(*node).links.get()).next;
+                    }
+                }
+                next
+            };
+            let Some(waker) = next else { break; };
+            // No pinned node pointer survives unlock. Unlink before invoking
+            // arbitrary wake/drop code, and finish draining even on unwind.
+            if let Some(waker) = waker {
+                if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake())) {
+                    if panic.is_none() { panic = Some(error); }
+                }
+            }
+        }
+        if let Some(panic) = panic { std::panic::resume_unwind(panic); }
+    }
 
     fn native_next_deadline_ms(&self) -> Option<u64> {
         let list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
@@ -998,11 +1043,12 @@ impl Drop for OwnedManualWait {
 // All links and wakers are protected by the clock mutex. The owning future
 // is pinned in an admitted frame before linking and unlinks before free.
 #[derive(Debug, Default)]
-struct MonotonicWaitList { head: *const MonotonicWaitNode }
+struct MonotonicWaitList { head: *const MonotonicWaitNode, drivers: usize }
 unsafe impl Send for MonotonicWaitList {}
 struct MonotonicWaitLinks {
     next: *const MonotonicWaitNode,
     linked: bool,
+    driver_departed: bool,
     waker: Option<Waker>,
 }
 struct MonotonicWaitNode {
@@ -1029,6 +1075,8 @@ impl MonotonicWaitList {
 }
 struct OwnedMonotonicWait<'a> {
     clock: &'a MonotonicDeadlineClock,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    fallback: Option<contextdb_core::read_memory::ReadOwnedFuture<'a, ()>>,
     node: MonotonicWaitNode,
 }
 unsafe impl Send for OwnedMonotonicWait<'_> {}
@@ -1036,11 +1084,29 @@ impl Future for OwnedMonotonicWait<'_> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = unsafe { self.get_unchecked_mut() };
+        if let Some(fallback) = &mut this.fallback {
+            return Pin::new(fallback).poll(cx);
+        }
         let next_waker = cx.waker().clone();
         let mut list = this.clock.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
         if this.clock.now_ms() >= this.node.deadline_ms {
-            unsafe { list.unlink(&this.node); }
+            let previous = unsafe { list.unlink(&this.node); (*this.node.links.get()).waker.take() };
+            drop(list);
+            drop(previous);
             return Poll::Ready(());
+        }
+        if list.drivers == 0 || unsafe { (*this.node.links.get()).driver_departed } {
+            let previous = unsafe { list.unlink(&this.node); (*this.node.links.get()).waker.take() };
+            drop(list);
+            drop(previous);
+            // Preserve the existing autonomous timer, original owner, origin,
+            // deadline and one-shot arm-failure semantics. This inherited std
+            // thread route still owes proof of physical startup funding.
+            this.fallback = match this.clock.legacy_owned_wait(this.node.deadline_ms, &this.owner) {
+                Ok(wait) => wait,
+                Err(_) => return Poll::Ready(()),
+            };
+            return this.fallback.as_mut().map_or(Poll::Ready(()), |wait| Pin::new(wait).poll(cx));
         }
         unsafe {
             let links = &mut *this.node.links.get();
