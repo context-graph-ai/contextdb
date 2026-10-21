@@ -765,9 +765,13 @@ impl OwnerReadCancellation {
     }
     fn register(&self, callback: ListenerCallback, credit: Option<ReadCredit>) -> CancellationListener {
         let listener = NEXT_CANCELLATION_LISTENER.fetch_add(1, Ordering::SeqCst);
-        let mut entry = ListenerStorage { node: Box::new(ListenerNode {
+        let entry = ListenerStorage { node: Box::new(ListenerNode {
             identity: listener, born: 0, retired: None, callback: callback.clone(), next: None,
         }), _credit: credit };
+        self.register_entry(callback, entry)
+    }
+    fn register_entry(&self, callback: ListenerCallback, mut entry: ListenerStorage) -> CancellationListener {
+        let listener = entry.node.identity;
         {
             let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
             entry.node.born = directory.advance();
@@ -800,6 +804,50 @@ impl OwnerReadCancellation {
             Err(_) => std::alloc::handle_alloc_error(ReadShared::<F>::layout()),
         };
         Ok(self.register(ListenerCallback::Paid(callback), Some(invoice)))
+    }
+    /// Internal engine forwarders are paid by the originating operation even
+    /// when the token itself was created and funded by the host application.
+    /// Token identity, registration ordering and cancellation snapshots are kept.
+    #[doc(hidden)]
+    pub fn try_tell_on_cancel_with_owner<F: Fn() + Send + Sync + 'static>(
+        &self,
+        told: F,
+        owner: ReadMemoryOwner,
+    ) -> crate::Result<CancellationListener> {
+        let callback_credit = ReadCredit::try_new_owned(
+            owner.clone(),
+            ReadShared::<F>::layout().size(),
+            "storage",
+            "wait_cancellation_callback",
+            "Admit the operation's cancellation callback before registration.",
+        )?;
+        let node_credit = ReadCredit::try_new_owned(
+            owner,
+            std::mem::size_of::<ListenerNode>(),
+            "storage",
+            "wait_cancellation_listener",
+            "Admit the operation's cancellation listener before registration.",
+        )?;
+        let callback = ListenerCallback::Paid(
+            ReadShared::try_from_prepaid(told, callback_credit)?.into_cancellation_callback(),
+        );
+        let listener = NEXT_CANCELLATION_LISTENER.fetch_add(1, Ordering::SeqCst);
+        let (node, credit) = crate::read_memory::try_prepaid_box_with(node_credit, || {
+            Ok(ListenerNode {
+                identity: listener,
+                born: 0,
+                retired: None,
+                callback: callback.clone(),
+                next: None,
+            })
+        })?;
+        Ok(self.register_entry(
+            callback,
+            ListenerStorage {
+                node,
+                _credit: Some(credit),
+            },
+        ))
     }
     pub fn is_cancelled(&self) -> bool { self.token.cancelled.load(Ordering::SeqCst) }
     /// Clones retain one identity; separately minted tokens never share it.
@@ -2109,49 +2157,264 @@ impl std::fmt::Display for ReadFailure {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Immutable returned page. Cloning retains its original paid storage.
+#[derive(Clone)]
 pub struct CursorPage {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
-    pub has_more: bool,
+    storage: Option<CursorPageHandle>,
 }
 
-impl CursorPage {
-    /// Assemble a public terminal answer. Working credit belongs to the private engine page.
-    #[doc(hidden)]
-    pub fn from_parts(columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool) -> Self {
+/// Engine publication bridge. Implementations retain their original payload
+/// invoices and expose only borrows; no storage is extracted from a page.
+#[doc(hidden)]
+pub trait CursorPageStorage: std::fmt::Debug + Send + Sync + 'static {
+    fn columns(&self) -> &[String];
+    fn rows(&self) -> &[Vec<Value>];
+    fn has_more(&self) -> bool;
+}
+
+// This erased handle always owns one ReadShared<T> strong count. Its static
+// callbacks preserve the concrete type and exact layout without another cell.
+pub(crate) struct CursorPageHandle {
+    pub(crate) block: std::ptr::NonNull<()>,
+    pub(crate) view: unsafe fn(std::ptr::NonNull<()>) -> &'static dyn CursorPageStorage,
+    pub(crate) retain: unsafe fn(std::ptr::NonNull<()>),
+    pub(crate) release: unsafe fn(std::ptr::NonNull<()>),
+}
+// SAFETY: constructors require immutable Send + Sync storage and callbacks
+// manipulate only its atomic ReadShared count or borrow its retained payload.
+unsafe impl Send for CursorPageHandle {}
+unsafe impl Sync for CursorPageHandle {}
+impl Clone for CursorPageHandle {
+    fn clone(&self) -> Self {
+        // SAFETY: this handle keeps the concrete shared cell alive.
+        unsafe { (self.retain)(self.block) };
         Self {
-            columns,
-            rows,
-            has_more,
+            block: self.block,
+            view: self.view,
+            retain: self.retain,
+            release: self.release,
         }
     }
-    /// Public terminal copies retain the HEAD payload (rulings 76/78).
-    pub fn try_clone(
-        &self,
-        _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
-    ) -> crate::Result<Self> {
-        Ok(self.clone())
+}
+impl Drop for CursorPageHandle {
+    fn drop(&mut self) {
+        // SAFETY: consume precisely this handle's original strong count.
+        unsafe { (self.release)(self.block) };
     }
+}
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug)]
+struct FixtureCursorPage {
+    columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool,
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl CursorPageStorage for FixtureCursorPage {
+    fn columns(&self) -> &[String] { &self.columns }
+    fn rows(&self) -> &[Vec<Value>] { &self.rows }
+    fn has_more(&self) -> bool { self.has_more }
+}
+impl CursorPage {
+    /// Move test-owned parts into the real immutable carrier, including invalid
+    /// arity inputs for encoder rejection. No copy or uncharged control cell.
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
-    pub fn try_empty(
-        columns: &[String],
-        _owner: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+    pub fn from_owned_parts_for_test(
+        owner: crate::read_memory::ReadMemoryOwner,
+        columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool,
     ) -> crate::Result<Self> {
-        Ok(Self::from_parts(columns.to_vec(), Vec::new(), false))
+        let prepared = Self::try_prepare::<FixtureCursorPage>(owner)?;
+        Ok(prepared.publish(FixtureCursorPage { columns, rows, has_more }))
     }
 
+    pub fn empty() -> Self {
+        Self { storage: None }
+    }
+    fn storage(&self) -> Option<&dyn CursorPageStorage> {
+        // SAFETY: this borrow cannot outlive the strong handle in self.
+        self.storage
+            .as_ref()
+            .map(|handle| unsafe { (handle.view)(handle.block) })
+    }
+    pub fn columns(&self) -> &[String] {
+        self.storage().map_or(&[], |page| page.columns())
+    }
+    pub fn rows(&self) -> &[Vec<Value>] {
+        self.storage().map_or(&[], |page| page.rows())
+    }
+    pub fn has_more(&self) -> bool {
+        self.storage().is_some_and(|page| page.has_more())
+    }
+    /// Prepare the exact shared carrier before running the producer.
+    #[doc(hidden)]
+    pub fn try_prepare<T: CursorPageStorage>(
+        owner: crate::read_memory::ReadMemoryOwner,
+    ) -> crate::Result<PreparedCursorPage<T>> {
+        use crate::read_memory::{ReadCredit, ReadShared};
+        let credit = ReadCredit::try_new_owned(
+            owner,
+            ReadShared::<T>::layout().size(),
+            "reader",
+            "publish_cursor_page",
+            "Release retained pages or raise the declared reader memory limit.",
+        )?;
+        let storage =
+            ReadShared::try_prepare_native(credit).map_err(crate::Error::NativeEngineOther)?;
+        Ok(PreparedCursorPage { storage })
+    }
+    /// Prepare a cell whose original invoice also retains admission counters.
+    /// The producer prepays ReadShared::<T, I>::layout(), including I itself.
+    #[doc(hidden)]
+    pub fn try_prepare_invoice<T: CursorPageStorage, I: crate::read_memory::ReadSharedInvoice + 'static>(
+        invoice: I,
+    ) -> crate::Result<PreparedCursorPage<T, I>> {
+        let storage = crate::read_memory::ReadShared::try_prepare_invoice_native(invoice)
+            .map_err(crate::Error::NativeEngineOther)?;
+        Ok(PreparedCursorPage { storage })
+    }
     pub fn validate(&self) -> Result<(), ReadContractViolation> {
-        for (row, values) in self.rows.iter().enumerate() {
-            if values.len() != self.columns.len() {
+        for (row, values) in self.rows().iter().enumerate() {
+            if values.len() != self.columns().len() {
                 return Err(ReadContractViolation::CursorRowArityMismatch {
                     row,
-                    expected: self.columns.len(),
+                    expected: self.columns().len(),
                     actual: values.len(),
                 });
             }
         }
         Ok(())
+    }
+}
+/// Unpublished page control; publication only moves an already funded builder.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PreparedCursorPage<T: CursorPageStorage, I: Send + Sync + 'static = crate::read_memory::ReadCredit> {
+    storage: crate::read_memory::ReadPrepared<T, I>,
+}
+impl<T: CursorPageStorage, I: Send + Sync + 'static> PreparedCursorPage<T, I> {
+    #[doc(hidden)]
+    pub fn invoice(&self) -> &I { self.storage.invoice() }
+
+    pub fn publish(self, page: T) -> CursorPage {
+        CursorPage {
+            storage: Some(self.storage.publish(page).into_cursor_page_handle()),
+        }
+    }
+}
+impl std::fmt::Debug for CursorPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CursorPage")
+            .field("columns", &self.columns())
+            .field("rows", &self.rows())
+            .field("has_more", &self.has_more())
+            .finish()
+    }
+}
+impl PartialEq for CursorPage {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns() == other.columns()
+            && self.rows() == other.rows()
+            && self.has_more() == other.has_more()
+    }
+}
+impl Serialize for CursorPage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut page = serializer.serialize_struct("CursorPage", 3)?;
+        page.serialize_field("columns", self.columns())?;
+        page.serialize_field("rows", &CursorRowsView(self.rows()))?;
+        page.serialize_field("has_more", &self.has_more())?;
+        page.end()
+    }
+}
+
+/// Borrowed canonical row encoder shared with the engine's private builder.
+/// JSON's binary representation remains a length-prefixed UTF-8 document;
+/// human-readable serializers retain the existing Json string variant.
+#[doc(hidden)]
+pub struct CursorRowsView<'a>(pub &'a [Vec<Value>]);
+struct CursorRowView<'a>(&'a [Value]);
+struct CursorValueView<'a>(&'a Value);
+struct CursorJsonView<'a>(&'a serde_json::Value);
+impl Serialize for CursorRowsView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut rows = serializer.serialize_seq(Some(self.0.len()))?;
+        for row in self.0 {
+            rows.serialize_element(&CursorRowView(row))?;
+        }
+        rows.end()
+    }
+}
+impl Serialize for CursorRowView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut values = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 {
+            values.serialize_element(&CursorValueView(value))?;
+        }
+        values.end()
+    }
+}
+impl Serialize for CursorValueView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Value::Json(json) => {
+                serializer.serialize_newtype_variant("Value", 7, "Json", &CursorJsonView(json))
+            }
+            value => value.serialize(serializer),
+        }
+    }
+}
+struct CursorJsonSize(usize);
+impl std::io::Write for CursorJsonSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct CursorJsonSequence<S: serde::ser::SerializeSeq> {
+    sequence: S,
+    failure: Option<S::Error>,
+}
+impl<S: serde::ser::SerializeSeq> std::io::Write for CursorJsonSequence<S> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for byte in bytes {
+            if let Err(error) = self.sequence.serialize_element(byte) {
+                self.failure = Some(error);
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl Serialize for CursorJsonView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq};
+        if serializer.is_human_readable() {
+            // serde_json streams Display into its escaped string writer.
+            return serializer.collect_str(self.0);
+        }
+        let mut size = CursorJsonSize(0);
+        serde_json::to_writer(&mut size, self.0).map_err(S::Error::custom)?;
+        let mut output = CursorJsonSequence {
+            sequence: serializer.serialize_seq(Some(size.0))?,
+            failure: None,
+        };
+        let encoded = serde_json::to_writer(&mut output, self.0);
+        if let Some(error) = output.failure {
+            return Err(error);
+        }
+        encoded.map_err(S::Error::custom)?;
+        output.sequence.end()
     }
 }
 

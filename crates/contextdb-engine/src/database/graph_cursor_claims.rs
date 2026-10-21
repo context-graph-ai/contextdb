@@ -12,7 +12,7 @@ pub(super) struct GraphDecisionContext {
     legacy_rows: HashMap<String, Arc<contextdb_tx::StatementRows>>,
     pub(super) catalog: HashMap<String, TableMeta>,
     pub(super) root: Option<crate::persistence::WriterSnapshotHandle>,
-    pub(super) reader: Arc<dyn ReadMemoryBudget>,
+    pub(super) reader: contextdb_core::read_memory::ReadMemoryOwner,
     _memory: ReadCredit,
     _rows_memory: ReadCredit,
 }
@@ -39,8 +39,10 @@ impl GraphDecisionContext {
     pub(super) fn sealed_rows(
         &self,
         table: &str,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<contextdb_tx::staged_source::CanonicalStatementRows>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         self.directory
             .as_ref()
             .map(|directory| directory.table_rows(table, memory))
@@ -48,11 +50,13 @@ impl GraphDecisionContext {
     }
     fn capture_rows(
         ws: &WriteSet,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         HashMap<String, Arc<contextdb_tx::StatementRows>>,
         ReadCredit,
     )> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let bytes = ws
             .relational_inserts
             .iter()
@@ -105,8 +109,10 @@ impl Database {
         rows_memory: ReadCredit,
         root: Option<crate::persistence::WriterSnapshotHandle>,
         tx: TxId,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<GraphCursorReadGuard> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let catalog = self.relational_store.table_meta.read();
         // Only decisions and control metadata are copied. Row bodies and
         // vector/property payloads stay in their original admitted cells.
@@ -237,7 +243,7 @@ impl Database {
             legacy_rows,
             catalog,
             root: root.clone(),
-            reader: memory.clone(),
+            reader: (memory.clone()).into(),
             _memory: credit,
             _rows_memory: rows_memory,
         })))
@@ -246,8 +252,10 @@ impl Database {
         &self,
         ws: &WriteSet,
         tx: TxId,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<GraphCursorReadGuard> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let root = self.writer_read_root()?;
         let (rows, credit) = GraphDecisionContext::capture_rows(ws, memory.clone())?;
         self.capture_graph_decision_metadata(
@@ -264,8 +272,10 @@ impl Database {
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
         tx: TxId,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<GraphCursorReadGuard> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let root = self.writer_read_root()?;
         let directory = held.capture_sealed_directory(memory.clone())?;
         let (rows, credit) =
@@ -283,8 +293,10 @@ impl Database {
     pub(crate) fn graph_cursor_read_guard(
         &self,
         tx: Option<TxId>,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<GraphCursorReadGuard>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let Some(tx) = tx else {
             return Ok(None);
         };
@@ -376,8 +388,10 @@ impl Database {
         _tx: Option<TxId>,
         inner: contextdb_graph::mem::BoundedBfsCursor,
         lease: Option<GraphCursorReadGuard>,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<EngineGraphBfsCursor> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let mut credit = ReadCredit::new(memory);
         let mut forward = Vec::new();
         let mut reverse = Vec::new();

@@ -12,15 +12,17 @@ use std::sync::Arc;
 /// this seam never creates or substitutes a memory owner.
 #[doc(hidden)]
 pub struct ReadCommitContext<'a> {
-    pub read_memory: Arc<dyn ReadMemoryBudget>,
+    pub read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     pub checkpoint: &'a dyn Fn() -> Result<()>,
 }
 
 impl<'a> ReadCommitContext<'a> {
     pub fn new(
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &'a dyn Fn() -> Result<()>,
     ) -> Self {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Self {
             read_memory,
             checkpoint,
@@ -103,7 +105,7 @@ impl ReadCommitCursor for WritableReadCursor {
 /// Bounded callers pass their active context directly to ReadCommitCursor.
 pub(crate) struct CapturedLegacyCursor {
     cursor: Box<dyn ReadCommitCursor>,
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     _control: ReadCredit,
 }
 
@@ -112,8 +114,10 @@ impl CapturedLegacyCursor {
         directory: &dyn ReadCommitDirectory,
         lower: Bound<Lsn>,
         upper: Bound<Lsn>,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Box<dyn CommitDirectoryCursor>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let context = ReadCommitContext::new(read_memory.clone(), &|| Ok(()));
         let control = ReadCredit::try_new(
             read_memory.clone(),

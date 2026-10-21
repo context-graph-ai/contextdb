@@ -1,5 +1,5 @@
 //! Private query payloads retain their original invoice through physical
-//! destruction. Public DTO conversion is an explicit consumer handoff.
+//! destruction. Ordinary public answers also retain the original query controls.
 use crate::read_image_memory::ImageMemory;
 use contextdb_core::read_memory::{ReadMemoryBudget, ReadMemoryOwner, ReadCredit};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ impl<T> Funded<T> {
     pub(crate) fn external(value: T) -> Self { Self { value, credit: None } }
 
     pub(crate) fn allocate(
-        owner: Option<Arc<dyn ReadMemoryBudget>>,
+        owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
         bytes: usize,
         make: impl FnOnce() -> T,
     ) -> contextdb_core::Result<Self> {
@@ -23,6 +23,16 @@ impl<T> Funded<T> {
             owner, bytes, "reader", "query_buffer",
             "Reduce simultaneous query working memory or raise the declared reader limit.",
         )).transpose()?;
+        let value = make();
+        Ok(Self { value, credit })
+    }
+
+    pub(crate) fn allocate_owned(
+        owner: Option<ReadMemoryOwner>, bytes: usize, make: impl FnOnce() -> T,
+    ) -> contextdb_core::Result<Self> {
+        let credit = owner.map(|owner| ReadCredit::try_new_owned(owner, bytes,
+            "reader", "query_buffer",
+            "Reduce simultaneous query working memory or raise the declared reader limit.")).transpose()?;
         let value = make();
         Ok(Self { value, credit })
     }
@@ -47,7 +57,7 @@ impl AsMut<[u8]> for Funded<Vec<u8>> {
 pub(crate) struct FundedVec<T> {
     pub(crate) values: Vec<T>,
     credit: Option<ReadCredit>,
-    owner: Option<Arc<dyn ReadMemoryBudget>>,
+    owner: Option<ReadMemoryOwner>,
 }
 
 impl<T> Default for FundedVec<T> {
@@ -55,10 +65,13 @@ impl<T> Default for FundedVec<T> {
 }
 
 impl<T> FundedVec<T> {
-    pub(crate) fn new(owner: Option<Arc<dyn ReadMemoryBudget>>) -> Self {
+    pub(crate) fn new(owner: Option<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        Self::new_owned(owner)
+    }
+    pub(crate) fn new_owned(owner: Option<ReadMemoryOwner>) -> Self {
         Self { values: Vec::new(), credit: None, owner }
     }
-    pub(crate) fn owner(&self) -> Option<Arc<dyn ReadMemoryBudget>> { self.owner.clone() }
+    pub(crate) fn owner(&self) -> Option<ReadMemoryOwner> { self.owner.clone() }
     pub(crate) fn clear(&mut self) {
         // clear retains Vec capacity, so retain its invoice too.
         self.values.clear();
@@ -71,7 +84,7 @@ impl<T> FundedVec<T> {
             let bytes = capacity.checked_mul(std::mem::size_of::<T>())
                 .ok_or_else(|| contextdb_core::Error::Other("query container size overflow".into()))?;
             // The complete replacement coexists with the old allocation.
-            let mut replacement = Funded::allocate(self.owner.clone(), bytes,
+            let mut replacement = Funded::allocate_owned(self.owner.clone(), bytes,
                 || Vec::with_capacity(capacity))?;
             replacement.value.append(&mut self.values);
             let old = std::mem::replace(&mut self.values, replacement.value);
@@ -88,7 +101,7 @@ impl FundedVec<Funded<super::LocalResponse>> {
     pub(crate) fn into_public(mut self) -> contextdb_core::Result<Vec<super::LocalResponse>> {
         let bytes = self.values.len().checked_mul(std::mem::size_of::<super::LocalResponse>())
             .ok_or_else(|| contextdb_core::Error::Other("query handoff size overflow".into()))?;
-        let mut output = Funded::allocate(self.owner.clone(), bytes,
+        let mut output = Funded::allocate_owned(self.owner.clone(), bytes,
             || Vec::with_capacity(self.values.len()))?;
         for response in &mut self.values {
             let value = std::mem::replace(&mut response.value,
@@ -106,7 +119,7 @@ impl FundedVec<Funded<super::LocalResponse>> {
 /// precisely those original reservations, including through unwind; it never
 /// estimates an invoice from a returned DTO's length.
 struct DecodeCredit {
-    owner: Arc<ImageMemory>,
+    owner: crate::read_image_memory::ImageMemoryHandle,
     before: usize,
     armed: bool,
 }
@@ -118,7 +131,7 @@ impl Drop for DecodeCredit {
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
-    owner: &Arc<ImageMemory>,
+    owner: &crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<Funded<T>> {
     // Input is already funded by the carrier/assembly, never charged twice.
     let mut pending = DecodeCredit { owner: owner.clone(), before: owner.held(), armed: true };
@@ -127,7 +140,7 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(
         drop(value);
         return Err(contextdb_core::Error::Other("query decode trailing bytes".into()));
     }
-    let credit = ReadCredit::from_prepaid(owner.clone(), owner.held() - pending.before);
+    let credit = ReadCredit::from_prepaid_owned(owner.owner(), owner.held() - pending.before);
     pending.armed = false;
     Ok(Funded { value, credit: Some(credit) })
 }
@@ -136,7 +149,7 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(
 /// still reaches that exact child; the counter only enforces this request's
 /// narrower limit across the executor AND its later transport allocations.
 #[derive(Debug)]
-struct QueryOperationBudget {
+pub(crate) struct QueryOperationBudget {
     parent: ReadMemoryOwner,
     limit: usize,
     held: std::sync::atomic::AtomicUsize,
@@ -228,14 +241,12 @@ impl ReadMemoryBudget for QueryOperationBudget {
     }
 }
 
-/// External custody for the actual Arc allocation. All escaping budget aliases
-/// are nested under this keeper (the worker result carries it to publication).
-/// The original credit is not a field of the block it prices.
+/// Every alias owns the same native limiter cell. Its original invoice stays
+/// outside the payload destructor and settles only after actual physical free.
 #[derive(Debug)]
 pub(crate) struct QueryBudget {
-    pub(crate) budget: Arc<dyn ReadMemoryBudget>,
-    control: Arc<QueryOperationBudget>,
-    _control: ReadCredit,
+    pub(crate) budget: ReadMemoryOwner,
+    control: contextdb_core::read_memory::NativeReadMemory<QueryOperationBudget>,
 }
 
 impl QueryBudget {
@@ -283,7 +294,7 @@ impl AcquiredQueryOwner {
         Ok(credit)
     }
     pub(crate) fn native_with_controls(
-        parent: &Arc<crate::vector_read_memory::DeclaredReadMemory>, bytes: usize,
+        parent: &crate::vector_read_memory::DeclaredReadRoot, bytes: usize,
     ) -> Result<(Self, ReadCredit), contextdb_core::read_memory::NativeRefusal> {
         let (receipt, controls) = parent.native_child_with_controls(bytes)?;
         let control_bytes = receipt.control_bytes() + controls.bytes();
@@ -292,12 +303,12 @@ impl AcquiredQueryOwner {
 
 }
 pub(crate) fn acquired_owner(
-    provider: &dyn crate::vector_read_memory::ReadRequestBudgetProvider,
+    provider: &crate::vector_read_memory::ReadRequestProvider,
 ) -> contextdb_core::Result<AcquiredQueryOwner> {
     use crate::vector_read_memory::RequestReadRoute;
     Ok(match provider.request_budget_owner()?.into_route() {
         RequestReadRoute::Legacy(owner) => AcquiredQueryOwner {
-            owner: ReadMemoryOwner::from_legacy(owner), control_bytes: 0,
+            owner: ReadMemoryOwner::from(owner), control_bytes: 0,
         },
         RequestReadRoute::Native(receipt) => {
             let control_bytes = receipt.control_bytes();
@@ -318,7 +329,7 @@ pub(crate) fn query_operation_retained(
     acquired: &AcquiredQueryOwner, limit: u64,
 ) -> contextdb_core::Result<QueryBudget> {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let bytes = std::mem::size_of::<QueryOperationBudget>() + 2 * std::mem::size_of::<usize>();
+    let bytes = ReadMemoryOwner::native_layout::<QueryOperationBudget, ReadCredit>().size();
     let held = bytes.checked_add(acquired.control_bytes).ok_or_else(size_error)?;
     if held > limit { return Err(query_limit_error(limit)); }
     let parent = acquired.owner.clone();
@@ -327,47 +338,142 @@ pub(crate) fn query_operation_retained(
     parent.constrain_operation_memory(limit);
     let control = ReadCredit::try_new_owned(parent.clone(), bytes, "reader", "query_owner",
         "Raise the declared reader limit to admit a query owner.")?;
-    let budget = Arc::new(QueryOperationBudget { parent, limit,
+    let payload = QueryOperationBudget { parent, limit,
         held: std::sync::atomic::AtomicUsize::new(held),
         checkpoint: std::sync::Mutex::new(None),
         terminal: std::sync::atomic::AtomicBool::new(false),
-        pending_stop: std::sync::Mutex::new(None) });
-    Ok(QueryBudget { budget: budget.clone(), control: budget, _control: control })
+        pending_stop: std::sync::Mutex::new(None) };
+    let control = ReadMemoryOwner::try_native_typed(payload, control)
+        .map_err(contextdb_core::Error::NativeEngineOther)?;
+    Ok(QueryBudget { budget: control.owner(), control })
 }
 
-/// Kept on the terminal caller's stack, outside every allocation it funds.
-/// Declaration order makes the ImageMemory Arc, accountant and all nested
-/// controls physically disappear before their ORIGINAL control credit settles.
 #[derive(Debug)]
 pub(crate) struct QueryMemory {
-    memory: Funded<Arc<ImageMemory>>,
-    _accountant: Funded<Arc<crate::memory_accounting::MemoryAccountant>>,
-    _operation: QueryBudget,
-    _root: crate::vector_read_memory::QueryReadRoot,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl QueryMemory {
     pub(crate) fn new(limit: u64) -> contextdb_core::Result<Self> {
         let root = crate::vector_read_memory::DeclaredReadMemory::query_root(limit)?;
-        let acquired = acquired_owner(&root.root)?;
+        let provider = crate::vector_read_memory::ReadRequestProvider::from(root.root.clone());
+        let acquired = acquired_owner(&provider)?;
         let operation = query_operation(acquired, limit)?;
         let budget = operation.budget.clone();
-        let controls = std::mem::size_of::<crate::memory_accounting::MemoryAccountant>()
-            + std::mem::size_of::<std::sync::atomic::AtomicUsize>()
-            + std::mem::size_of::<crate::memory_accounting::WriterCounter>()
-            + 6 * std::mem::size_of::<usize>();
-        let accountant = Funded::allocate(Some(budget.clone()), controls, ||
-            Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
-                usize::try_from(limit).unwrap_or(usize::MAX))))?;
-        let memory = ImageMemory::query_reader_for(accountant.value.clone().into(), budget)?;
-        Ok(Self { memory, _accountant: accountant, _operation: operation, _root: root })
+        let handle = crate::memory_accounting::AccountantHandle::reader(
+            Some(usize::try_from(limit).unwrap_or(usize::MAX)), budget.clone(), false)?;
+        let control = Some(operation.control.clone());
+        let memory = ImageMemory::native_reader_with_checkpoint(handle, budget,
+            "reader", "materialize_answer",
+            "Reduce simultaneous query memory or raise the declared reader limit.", (), control)?;
+        Ok(Self { memory })
     }
-    pub(crate) fn image(&self) -> Arc<ImageMemory> { self.memory.value.clone() }
+    pub(crate) fn image(&self) -> crate::read_image_memory::ImageMemoryHandle { self.memory.clone() }
     pub(crate) fn bind_client(&self,
         clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>, deadline_ms: u64,
         cancellation: Option<contextdb_core::read_contract::OwnerReadCancellation>,
-    ) { self._operation.bind_client(clock, deadline_ms, cancellation); }
-    pub(crate) fn terminal(&self) { self._operation.terminal(); }
-    pub(crate) fn take_stop(&self) -> Option<contextdb_core::Error> { self._operation.take_stop() }
+    ) {
+        *self.memory.query_control.as_ref().expect("original query checkpoint").checkpoint
+            .lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(QueryCheckpoint::Client { clock, deadline_ms, cancellation });
+    }
+    pub(crate) fn terminal(&self) {
+        self.memory.query_control.as_ref().expect("original query checkpoint")
+            .terminal.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(crate) fn take_stop(&self) -> Option<contextdb_core::Error> {
+        self.memory.query_control.as_ref().expect("original query checkpoint")
+            .pending_stop.lock().unwrap_or_else(|p| p.into_inner()).take().map(QueryStop::into_error)
+    }
+}
+
+/// The result's native funding capability keeps the original receiver stack
+/// outside every allocation that can retain an alias to it. Its invoice drops
+/// only after this forwarding cell and the public result cell physically free.
+#[derive(Debug)]
+struct RetainedQueryBudget {
+    budget: ReadMemoryOwner,
+}
+impl ReadMemoryBudget for RetainedQueryBudget {
+    fn try_reserve(&self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str) -> contextdb_core::Result<()> {
+        self.budget.try_reserve(bytes, subsystem, operation, hint)
+    }
+    fn release(&self, bytes: usize) { self.budget.release(bytes); }
+}
+#[derive(Debug)]
+struct RetainedQueryInvoice {
+    // On allocation refusal, the unpublished answer is physically destroyed
+    // before the forwarding debit and the original query controls retire.
+    unpublished: Option<crate::database::OwnedQueryResult>,
+    _cell: ReadCredit,
+    _memory: QueryMemory,
+}
+impl QueryMemory {
+    pub(crate) fn publish_result(self, result: crate::database::OwnedQueryResult)
+        -> contextdb_core::Result<crate::QueryResult> {
+        let budget = self.memory.reader_budget().expect("query image retains its reader");
+        let bytes = ReadMemoryOwner::native_layout::<RetainedQueryBudget, RetainedQueryInvoice>().size();
+        let credit = match ReadCredit::try_new_owned(budget.clone(), bytes, "reader", "retain_query_owner",
+            "Release retained answers or raise the declared reader memory limit.") {
+            Ok(credit) => credit,
+            Err(error) => {
+                drop(result);
+                drop(budget);
+                drop(self);
+                return Err(error);
+            }
+        };
+        drop(budget);
+        let invoice = RetainedQueryInvoice { unpublished: Some(result), _cell: credit, _memory: self };
+        let (owner, result) = ReadMemoryOwner::try_native_result_with(invoice, |invoice| {
+            let budget = invoice._memory.memory.reader_budget().expect("query image retains its reader");
+            let answer = invoice.unpublished.take().expect("receiver retains its unpublished answer");
+            (RetainedQueryBudget { budget: budget.into() }, answer)
+        }).map_err(contextdb_core::Error::NativeEngineOther)?;
+        result.into_public_with_owner(owner)
+    }
+}
+
+/// A cursor reuses one genuine receiving operation across all of its pages.
+/// Its forwarding owner retains the original stack once, outside every alias.
+#[derive(Debug)]
+struct RetainedCursorInvoice {
+    _cell: ReadCredit,
+    _memory: QueryMemory,
+}
+impl QueryMemory {
+    pub(crate) fn into_cursor_owner(
+        self,
+    ) -> contextdb_core::Result<(ReadMemoryOwner, crate::read_image_memory::ImageMemoryHandle)> {
+        let budget = self.memory.reader_budget().expect("query image retains its reader");
+        let bytes =
+            ReadMemoryOwner::native_layout::<RetainedQueryBudget, RetainedCursorInvoice>().size();
+        let credit = ReadCredit::try_new(
+            budget.clone(),
+            bytes,
+            "reader",
+            "retain_cursor_owner",
+            "Release retained pages or raise the declared reader memory limit.",
+        )?;
+        let invoice = RetainedCursorInvoice {
+            _cell: credit,
+            _memory: self,
+        };
+        // Clone the image only AFTER nullable allocation succeeds. Otherwise
+        // no external image alias can outlive the original invoice on null.
+        ReadMemoryOwner::try_native_result_with(invoice, |invoice| {
+            (RetainedQueryBudget { budget: budget.into() }, invoice._memory.image())
+        })
+        .map_err(contextdb_core::Error::NativeEngineOther)
+    }
+}
+/// The decoder debited the operation behind this exact forwarding capability.
+/// Move that prepaid debit (no refund or reservation) under its full keeper.
+/// Callers use only the owner returned with this decoder by into_cursor_owner.
+pub(crate) fn retain_cursor_credit(credit: ReadCredit, owner: ReadMemoryOwner) -> ReadCredit {
+    let bytes = credit.bytes();
+    credit.transfer();
+    ReadCredit::from_prepaid_owned(owner, bytes)
 }
 
 fn query_limit_error(limit: usize) -> contextdb_core::Error {
@@ -404,7 +510,7 @@ pub(crate) fn tree_bytes<K, V>(len: usize) -> contextdb_core::Result<usize> {
 pub(crate) fn query_request(
     statement: &str,
     params: &std::collections::HashMap<String, contextdb_core::Value>,
-    memory: Arc<ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<Funded<super::LocalRequest>> {
     let mut bytes = add(statement.len(), tree_bytes::<String, contextdb_core::Value>(params.len())?)?;
     for (key, value) in params {
@@ -417,7 +523,7 @@ pub(crate) fn query_request(
         };
         bytes = add(bytes, heap)?;
     }
-    Funded::allocate(Some(memory), bytes, || {
+    Funded::allocate_owned(Some(memory.owner()), bytes, || {
         let statement = statement.to_owned();
         let mut copied = std::collections::BTreeMap::new();
         for (key, value) in params { copied.insert(key.clone(), value.clone()); }
@@ -430,15 +536,17 @@ pub(crate) fn query_request(
 /// coexist until the source iterator has physically destroyed every node.
 pub(crate) fn query_params(
     params: std::collections::BTreeMap<String, contextdb_core::Value>,
-    owner: Arc<dyn ReadMemoryBudget>,
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<std::collections::HashMap<String, contextdb_core::Value>>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     let len = params.len();
     let buckets = if len == 0 { 0 } else if len < 4 { 4 } else if len < 8 { 8 }
         else { (mul(len, 8)? / 7).checked_next_power_of_two().ok_or_else(size_error)? };
     let bytes = if buckets == 0 { 0 } else {
         add(mul(buckets, std::mem::size_of::<(String, contextdb_core::Value)>())?, add(buckets, 32)?)?
     };
-    Funded::allocate(Some(owner), bytes, || {
+    Funded::allocate_owned(Some(owner), bytes, || {
         let mut output = std::collections::HashMap::with_capacity(len);
         for (key, value) in params { output.insert(key, value); }
         output
@@ -454,13 +562,13 @@ impl std::fmt::Write for DisplaySize {
 }
 /// Format diagnostics only after their exact UTF-8 destination is admitted.
 pub(crate) fn display_error(
-    value: &impl std::fmt::Display, memory: &Arc<ImageMemory>,
+    value: &impl std::fmt::Display, memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Funded<contextdb_core::Error> {
     let mut size = DisplaySize(0);
     if std::fmt::write(&mut size, format_args!("{value}")).is_err() {
         return Funded::external(size_error());
     }
-    let mut text = match Funded::allocate(Some(memory.clone()), size.0,
+    let mut text = match Funded::allocate_owned(Some(memory.owner()), size.0,
         || String::with_capacity(size.0)) {
         Ok(text) => text,
         Err(error) => return Funded::external(error),
@@ -475,7 +583,7 @@ pub(crate) fn display_error(
 /// The original decoded failure invoice stays live beside the original wire
 /// document while its nested error is decoded by the SAME query ImageMemory.
 pub(crate) fn query_error(
-    failure: Funded<super::LocalEngineFailure>, memory: &Arc<ImageMemory>, ceiling: u64,
+    failure: Funded<super::LocalEngineFailure>, memory: &crate::read_image_memory::ImageMemoryHandle, ceiling: u64,
 ) -> Funded<contextdb_core::Error> {
     match failure.value.decode_query_error(memory, ceiling) {
         Ok(error) => error,
@@ -503,8 +611,10 @@ pub(crate) fn error_conversion_bytes(
 
 pub(crate) fn owner_failure_responses(
     error: crate::owner_read::OwnerReadScaffoldError,
-    owner: Arc<dyn ReadMemoryBudget>,
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<Vec<super::LocalResponse>>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     use crate::owner_read::OwnerReadScaffoldError as E;
     let response = match error {
         E::Refused(failure) => Funded::external(super::LocalResponse::Failure { failure }),
@@ -524,11 +634,13 @@ pub(crate) fn owner_failure_responses(
     one_response(response, owner)
 }
 fn owner_diagnostic_response(
-    error: &impl std::fmt::Display, owner: Arc<dyn ReadMemoryBudget>,
+    error: &impl std::fmt::Display, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<Vec<super::LocalResponse>>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     let mut size = DisplaySize(0);
     std::fmt::write(&mut size, format_args!("{error}")).map_err(|_| size_error())?;
-    let mut text = Funded::allocate(Some(owner.clone()), size.0, || String::with_capacity(size.0))?;
+    let mut text = Funded::allocate_owned(Some(owner.clone()), size.0, || String::with_capacity(size.0))?;
     use std::fmt::Write;
     write!(&mut text.value, "{error}").map_err(|_| size_error())?;
     let error = Funded { value: contextdb_core::Error::Other(text.value.into()), credit: text.credit };
@@ -538,9 +650,11 @@ fn owner_diagnostic_response(
         credit: failure.credit }, owner)
 }
 fn one_response(
-    mut response: Funded<super::LocalResponse>, owner: Arc<dyn ReadMemoryBudget>,
+    mut response: Funded<super::LocalResponse>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<Vec<super::LocalResponse>>> {
-    let mut output = Funded::allocate(Some(owner), std::mem::size_of::<super::LocalResponse>(),
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
+    let mut output = Funded::allocate_owned(Some(owner), std::mem::size_of::<super::LocalResponse>(),
         || Vec::with_capacity(1))?;
     output.value.push(response.value);
     if let Some(credit) = response.credit.take() {
@@ -551,8 +665,10 @@ fn one_response(
 }
 
 pub(crate) fn owner_panic_responses(
-    payload: &(dyn std::any::Any + Send), owner: Arc<dyn ReadMemoryBudget>,
+    payload: &(dyn std::any::Any + Send), owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<Vec<super::LocalResponse>>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     struct Diagnostic<'a>(&'a (dyn std::any::Any + Send));
     impl std::fmt::Display for Diagnostic<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -2,6 +2,7 @@
 //! follows the image through sessions and cursors after persistence is released.
 use crate::memory_accounting::MemoryAccountant;
 use contextdb_core::{Error, Result};
+use contextdb_core::read_memory::{ReadMemoryOwner, ReadMemoryBudget};
 use serde::de::{self, DeserializeSeed, Visitor};
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -16,28 +17,49 @@ pub(crate) struct ImageMemory {
     subsystem: &'static str,
     operation: &'static str,
     hint: &'static str,
-    reader_budget: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
-    _reader_control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    reader_budget: Option<ReadMemoryOwner>,
     held: AtomicUsize,
     control_bytes: usize,
+    pub(crate) query_control: Option<contextdb_core::read_memory::NativeReadMemory<crate::local_transport::query_funding::QueryOperationBudget>>,
     /// The pending refusal: an owned error, or (on an admitted reader) a
     /// refusal kept by value, with no owned error text, until it is taken.
     failure: parking_lot::Mutex<Option<Pending>>,
     /// Present on an owner whose every top-level decode call is charged to
     /// its own writer owner: the slot holds the latest call's owner until the
     /// next call begins or this owner drops.
-    per_call: Option<parking_lot::Mutex<Option<Arc<ImageMemory>>>>,
+    per_call: Option<parking_lot::Mutex<Option<crate::read_image_memory::ImageMemoryHandle>>>,
     // Each original child invoice is outside the child Arc it prices.
     query_per_call: Option<parking_lot::Mutex<Option<
-        crate::local_transport::query_funding::Funded<Arc<ImageMemory>>>>>,
+        crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>>>>,
     /// Decoded outputs a caller already admitted elsewhere -- an import's
     /// workspace for the vectors it keeps. An output admission under this
     /// owner, or a per-call owner it creates, adopts that credit instead of
     /// charging the same bytes a second time.
-    prepaid_output: Option<Arc<PrepaidOutput>>,
-    // Last custody field pins the original writer epoch through image refund.
+    prepaid_output: Option<contextdb_core::read_memory::ReadShared<PrepaidOutput, ImageControlInvoice>>,
+    // Last custody field pins the original role through image payload refund.
     _writer_custody: Option<crate::memory_accounting::StoreAccountantHandle>,
 }
+#[derive(Debug)]
+struct ImageControlInvoice {
+    // Settle the debit while the original epoch is still pinned.
+    _credit: crate::memory_accounting::ControlCredit,
+    _original: crate::memory_accounting::StoreAccountantHandle,
+}
+impl ImageControlInvoice {
+    fn admit(original: crate::memory_accounting::StoreAccountantHandle, bytes: usize,
+        open_residue: bool, subsystem: &'static str, operation: &'static str,
+        hint: &'static str) -> Result<Self> {
+        let credit = if open_residue {
+            crate::memory_accounting::ControlCredit::admit_open_residue(&original, bytes,
+                "writer_decode_open_residue")?
+        } else {
+            crate::memory_accounting::ControlCredit::admit_from_handle(&original, bytes,
+                subsystem, operation, hint)?
+        };
+        Ok(Self { _credit: credit, _original: original })
+    }
+}
+
 #[derive(Debug)]
 struct PrepaidOutput {
     remaining: AtomicUsize,
@@ -70,14 +92,14 @@ impl Drop for CandidateDecodeRestore {
 /// vector codec, under the exact same reader adapter, can consume this bounded
 /// part of the window. Metadata/proof decodes outside that codec do not adopt it.
 pub(crate) fn with_candidate_decode_credit<T>(bytes: usize, body: impl FnOnce() -> T) -> T {
-    let reader = current_reader_budget().map(|reader| Arc::as_ptr(&reader) as *const () as usize);
+    let reader = current_reader_budget().map(|reader| reader.accounting_identity());
     let _restore = CandidateDecodeRestore(CANDIDATE_DECODE.with(|slot| slot.replace(
         reader.map(|reader| CandidateDecodeCredit { reader, remaining: bytes, decoding: false }))));
     body()
 }
 fn candidate_reader_matches(owner: &ImageMemory, credit: CandidateDecodeCredit) -> bool {
     owner.reader_budget.as_ref().is_some_and(|reader|
-        Arc::as_ptr(reader) as *const () as usize == credit.reader)
+        reader.accounting_identity() == credit.reader)
 }
 fn adopt_candidate_decode(owner: &ImageMemory, bytes: usize) -> bool {
     CANDIDATE_DECODE.with(|slot| {
@@ -90,7 +112,102 @@ fn adopt_candidate_decode(owner: &ImageMemory, bytes: usize) -> bool {
     })
 }
 
+
+/// Private strong capability. Native images retain their exact original
+/// factory invoice in the native block; cloning never unwraps a raw Arc.
+#[derive(Debug, Clone)]
+pub(crate) enum ImageMemoryHandle {
+    Arc(Arc<ImageMemory>),
+    Native(contextdb_core::read_memory::NativeReadMemory<ImageMemory>),
+}
+impl std::ops::Deref for ImageMemoryHandle {
+    type Target = ImageMemory;
+    fn deref(&self) -> &ImageMemory {
+        match self { Self::Arc(image) => image, Self::Native(image) => image }
+    }
+}
+impl AsRef<ImageMemory> for ImageMemoryHandle {
+    fn as_ref(&self) -> &ImageMemory { self }
+}
+impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemoryHandle {
+    fn try_reserve(&self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str) -> Result<()> {
+        contextdb_core::read_memory::ReadMemoryBudget::try_reserve(
+            &**self, bytes, subsystem, operation, hint)
+    }
+    fn release(&self, bytes: usize) { ImageMemory::release(self, bytes); }
+}
+impl From<ImageMemoryHandle> for contextdb_core::read_memory::ReadMemoryOwner {
+    fn from(image: ImageMemoryHandle) -> Self { image.owner() }
+}
+
+impl ImageMemoryHandle {
+    fn arc_new(image: ImageMemory) -> Self { Self::Arc(Arc::new(image)) }
+    fn get_mut(image: &mut Self) -> Option<&mut ImageMemory> {
+        match image { Self::Arc(image) => Arc::get_mut(image), Self::Native(_) => None }
+    }
+    pub(crate) fn owner(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
+        use contextdb_core::read_memory::ReadMemoryOwner;
+        match self {
+            Self::Arc(image) => ReadMemoryOwner::from_legacy(image.clone()),
+            Self::Native(image) => image.owner(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, Copy)]
+pub struct ImageMemoryObservation {
+    image: crate::vector_read_memory::root_observations::Token,
+    accountant: crate::vector_read_memory::root_observations::Token,
+    identity: usize,
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl ImageMemoryObservation {
+    pub(crate) fn new(image: &ImageMemory) -> Self {
+        use crate::vector_read_memory::root_observations as records;
+        let identity = image as *const _ as usize;
+        let payer = image.reader_budget.as_ref().or_else(|| image.accountant.original_reader_for_observation())
+            .map(ReadMemoryOwner::accounting_identity);
+        Self { image: records::producer(identity, 1, 0, image.held(), image.retained_payload_bytes(), payer),
+            accountant: records::producer(image.accountant.as_ptr() as usize, image.accountant.observation_kind(),
+                image.accountant.used_counter_for_observation(), image.accountant.usage().used, 0,
+                image.accountant.control_payer_for_observation()),
+            identity }
+    }
+    pub(crate) fn identity(self) -> usize { self.identity }
+    pub fn is_alive(self) -> bool { self.sample().0 }
+    pub fn is_physically_freed(self) -> bool {
+        crate::vector_read_memory::root_observations::producer_sample(self.image).3
+    }
+    pub fn accountant_is_physically_freed(self) -> bool {
+        crate::vector_read_memory::root_observations::producer_sample(self.accountant).3
+    }
+    pub(crate) fn sample(self) -> (bool, usize, bool, usize) {
+        use crate::vector_read_memory::root_observations as records;
+        let image = records::producer_sample(self.image);
+        let accountant = records::producer_sample(self.accountant);
+        (image.0, image.1, accountant.0, accountant.1)
+    }
+    pub(crate) fn retained_payload_bytes(self) -> usize {
+        crate::vector_read_memory::root_observations::producer_sample(self.image).2
+    }
+}
+#[cfg(any(test, feature = "test-seams"))]
+struct ImageSample<'a>(&'a ImageMemory);
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for ImageSample<'_> {
+    fn drop(&mut self) {
+        let image = self.0;
+        crate::vector_read_memory::root_observations::producer_update(
+            image as *const _ as usize, 1, image.held(), image.retained_payload_bytes());
+    }
+}
+
 impl ImageMemory {
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&self) -> usize { self.held.load(Ordering::SeqCst) }
+
     /// Pin output provenance before constructing an escaping container.
     pub(crate) fn preparation_original(
         &self,
@@ -100,25 +217,93 @@ impl ImageMemory {
             .ok_or_else(|| Error::Other("posting outputs require a pinned writer image".into()))?
             .preparation_original()
     }
-    pub(crate) fn new(limit: Option<usize>) -> Arc<Self> {
-        Arc::new(Self {
-            accountant: Arc::new(match limit {
-                Some(limit) => MemoryAccountant::with_budget(limit),
-                None => MemoryAccountant::no_limit(),
-            })
-            .into(),
-            subsystem: "direct_read",
-            operation: "hydrate_owned_image",
+    pub(crate) fn new(limit: Option<usize>) -> Result<ImageMemoryHandle> {
+        let accountant = crate::memory_accounting::AccountantHandle::standalone(limit, true)?;
+        Self::funded_for(accountant, "direct_read", "hydrate_owned_image",
+            "Raise MEMORY_LIMIT to admit the complete committed read image.")
+    }
+
+    fn writer_payload(accountant: crate::memory_accounting::AccountantHandle,
+        subsystem: &'static str, operation: &'static str, hint: &'static str) -> Self {
+        let active = active_owner().ok()
+            .filter(|active| std::ptr::eq(active.accountant.as_ptr(), accountant.as_ptr()));
+        let original = match active {
+            Some(active) => active._writer_custody.clone().unwrap_or_else(||
+                crate::memory_accounting::StoreAccountantHandle::from_original_nonwriter(&accountant)),
+            None => crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant)
+                .unwrap_or_else(|| crate::memory_accounting::StoreAccountantHandle::from_original_nonwriter(&accountant)),
+        };
+        Self::original_payload(original, subsystem, operation, hint)
+    }
+    fn original_payload(original: crate::memory_accounting::StoreAccountantHandle,
+        subsystem: &'static str, operation: &'static str, hint: &'static str) -> Self {
+        Self { accountant: original.as_handle(), subsystem, operation, hint,
+            reader_budget: None, held: AtomicUsize::new(0), control_bytes: 0,
+            query_control: None, failure: parking_lot::Mutex::new(None),
+            per_call: None, query_per_call: None, prepaid_output: None,
+            _writer_custody: Some(original) }
+    }
+    /// A writer/unscoped decoder keeps the same original accountant and role;
+    /// its independent control invoice is settled after native physical free.
+    pub(crate) fn funded_for(accountant: crate::memory_accounting::AccountantHandle,
+        subsystem: &'static str, operation: &'static str, hint: &'static str)
+        -> Result<ImageMemoryHandle> {
+        Self::funded_writer_payload(Self::writer_payload(accountant, subsystem, operation, hint), false)
+    }
+    pub(crate) fn funded_for_original(original: crate::memory_accounting::StoreAccountantHandle,
+        subsystem: &'static str, operation: &'static str, hint: &'static str)
+        -> Result<ImageMemoryHandle> {
+        let accountant = original.as_handle();
+        if !original.is_writer() {
+            let reader = accountant.query_reader_original().or_else(|| active_owner().ok()
+                .filter(|active| std::ptr::eq(active.accountant.as_ptr(), accountant.as_ptr()))
+                .and_then(|active| active.reader_budget()));
+            if let Some(reader) = reader {
+                return Self::admitted_reader_for(accountant, reader, subsystem, operation, hint);
+            }
+        }
+        Self::funded_writer_payload(Self::original_payload(original, subsystem, operation, hint), false)
+    }
+    fn funded_writer_payload(mut payload: Self, open_residue: bool) -> Result<ImageMemoryHandle> {
+        let original = payload._writer_custody.clone().unwrap_or_else(||
+            crate::memory_accounting::StoreAccountantHandle::from_original_nonwriter(&payload.accountant));
+        payload._writer_custody = Some(original.clone());
+        let bytes = ReadMemoryOwner::native_layout::<Self, ImageControlInvoice>().size();
+        let invoice = ImageControlInvoice::admit(original, bytes, open_residue,
+            payload.subsystem, payload.operation, payload.hint)?;
+        ReadMemoryOwner::try_native_typed(payload, invoice)
+            .map(ImageMemoryHandle::Native).map_err(Error::NativeEngineOther)
+    }
+    /// Direct image controls and every later accountant allocation use the
+    /// already acquired original reader. The accountant counter is a mirror,
+    /// not an additional allowance or a second source of credit.
+    pub(crate) fn new_direct_reader(
+        limit: Option<usize>, original: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<ImageMemoryHandle> {
+        use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner};
+        let accountant = crate::memory_accounting::AccountantHandle::reader(
+            limit, original.clone(), true)?;
+        let payload = Self {
+            accountant,
+            subsystem: "direct_read", operation: "hydrate_owned_image",
             hint: "Raise MEMORY_LIMIT to admit the complete committed read image.",
             reader_budget: None,
-            _reader_control_invoice: None,
-            held: AtomicUsize::new(0),
-            control_bytes: 0,
-            failure: parking_lot::Mutex::new(None),
-            per_call: None, query_per_call: None,
-            prepaid_output: None,
-            _writer_custody: None,
-        })
+            held: AtomicUsize::new(0), control_bytes: 0, query_control: None,
+            failure: parking_lot::Mutex::new(None), per_call: None, query_per_call: None,
+            prepaid_output: None, _writer_custody: None,
+        };
+        let bytes = ReadMemoryOwner::native_layout::<Self, ReadCredit>().size();
+        let credit = match ReadCredit::try_new_owned_native(original.clone(), bytes,
+            "direct_read", "hydrate_owned_image",
+            "Raise MEMORY_LIMIT to admit the complete committed read image.") {
+            Ok(credit) => credit,
+            Err(error) => {
+                drop(payload);
+                return Err(Error::NativeEngineOther(error));
+            }
+        };
+        ReadMemoryOwner::try_native_typed(payload, credit)
+            .map(ImageMemoryHandle::Native).map_err(Error::NativeEngineOther)
     }
     /// Admission into an accountant that already exists -- a reading
     /// session's own -- so what is decoded under [`Self::scope`] is charged
@@ -127,7 +312,7 @@ impl ImageMemory {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn charging(
         accountant: impl Into<crate::memory_accounting::AccountantHandle>,
-    ) -> Arc<Self> {
+    ) -> ImageMemoryHandle {
         Self::charging_for(
             accountant.into(),
             "direct_read",
@@ -140,18 +325,17 @@ impl ImageMemory {
         subsystem: &'static str,
         operation: &'static str,
         hint: &'static str,
-    ) -> Arc<Self> {
+    ) -> ImageMemoryHandle {
         let writer_custody =
             crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant);
-        Arc::new(Self {
+        ImageMemoryHandle::arc_new(Self {
             accountant,
             subsystem,
             operation,
             hint,
             reader_budget: None,
-            _reader_control_invoice: None,
             held: AtomicUsize::new(0),
-            control_bytes: 0,
+            control_bytes: 0, query_control: None,
             failure: parking_lot::Mutex::new(None),
             per_call: None, query_per_call: None,
             prepaid_output: None,
@@ -162,17 +346,17 @@ impl ImageMemory {
     /// Internal writer operations continue to own their scratch directly.
     pub(crate) fn charging_reader(
         accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+        reader_budget: impl Into<ReadMemoryOwner>,
+    ) -> ImageMemoryHandle {
+        let reader_budget = reader_budget.into();
+        ImageMemoryHandle::arc_new(Self {
             accountant,
             subsystem: "reader",
             operation: "materialize_answer",
             hint: "Reduce the statement's output or raise the declared reader memory limit.",
-            _reader_control_invoice: reader_budget.control_invoice(),
             reader_budget: Some(reader_budget),
             held: AtomicUsize::new(0),
-            control_bytes: 0,
+            control_bytes: 0, query_control: None,
             failure: parking_lot::Mutex::new(None),
             per_call: None, query_per_call: None,
             prepaid_output: None,
@@ -185,20 +369,20 @@ impl ImageMemory {
     /// always uses the required reader capability.
     pub(crate) fn charging_reader_for(
         accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader_budget: impl Into<ReadMemoryOwner>,
         subsystem: &'static str,
         operation: &'static str,
         hint: &'static str,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> ImageMemoryHandle {
+        let reader_budget = reader_budget.into();
+        ImageMemoryHandle::arc_new(Self {
             accountant,
             subsystem,
             operation,
             hint,
-            _reader_control_invoice: reader_budget.control_invoice(),
             reader_budget: Some(reader_budget),
             held: AtomicUsize::new(0),
-            control_bytes: 0,
+            control_bytes: 0, query_control: None,
             failure: parking_lot::Mutex::new(None),
             per_call: None, query_per_call: None,
             prepaid_output: None,
@@ -215,36 +399,36 @@ impl ImageMemory {
     /// decode at a time instead of every value it has already freed.
     pub(crate) fn charging_reader_per_call(
         accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Arc<Self> {
+        reader_budget: impl Into<ReadMemoryOwner>,
+    ) -> ImageMemoryHandle {
+        let reader_budget = reader_budget.into();
         let mut owner = Self::charging_reader(accountant, reader_budget);
-        Arc::get_mut(&mut owner)
+        ImageMemoryHandle::get_mut(&mut owner)
             .expect("new reader owner is exclusive")
             .per_call = Some(parking_lot::Mutex::new(None));
         owner
     }
 
-    /// The executing kernel retains this original fixed invoice externally.
-    /// The private slot owns the original per-call child invoice until its
-    /// scope has cleared all TLS aliases and the actual child Arc is freed.
+    /// The original fixed invoice is moved into the native allocation.
+    /// Each per-call native image keeps its own invoice through all TLS and
+    /// escaping aliases, independently of the private slot's lifetime.
     pub(crate) fn query_vector_per_call_prepaid(
         accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader_budget: impl Into<ReadMemoryOwner>,
         credit: contextdb_core::read_memory::ReadCredit,
-    ) -> Result<crate::local_transport::query_funding::Funded<Arc<Self>>> {
+    ) -> Result<crate::local_transport::query_funding::Funded<ImageMemoryHandle>> {
+        let reader_budget = reader_budget.into();
+        use contextdb_core::read_memory::ReadMemoryOwner;
         if credit.bytes() != Self::admitted_control_bytes() {
             return Err(Error::Other("query decoder control layout differs from invoice".into()));
         }
-        let value = Arc::new(Self {
-            accountant, subsystem: "reader", operation: "materialize_answer",
-            hint: "Reduce simultaneous query memory or raise the declared reader limit.",
-            _reader_control_invoice: reader_budget.control_invoice(),
-            reader_budget: Some(reader_budget), held: AtomicUsize::new(0),
-            control_bytes: ADMITTED_TAG, failure: parking_lot::Mutex::new(None),
-            per_call: None, query_per_call: Some(parking_lot::Mutex::new(None)),
-            prepaid_output: None, _writer_custody: None,
-        });
-        Ok(crate::local_transport::query_funding::Funded { value, credit: Some(credit) })
+        let mut payload = Self::reader_payload(accountant, reader_budget,
+            "reader", "materialize_answer",
+            "Reduce simultaneous query memory or raise the declared reader limit.");
+        payload.query_per_call = Some(parking_lot::Mutex::new(None));
+        let value = ImageMemoryHandle::Native(ReadMemoryOwner::try_native_typed(payload, credit)
+            .map_err(Error::NativeEngineOther)?);
+        Ok(crate::local_transport::query_funding::Funded::external(value))
     }
     pub(crate) fn release_query_vector_call(&self) {
         if let Some(slot) = &self.query_per_call {
@@ -275,192 +459,144 @@ impl ImageMemory {
         }
     }
 
-    /// Enter this owner for one top-level decode call. A per-call owner
-    /// returns its previous call's charge and admits the call under a fresh
-    /// owner with the same funder and labels; any other owner is entered
-    /// as is.
-    pub(crate) fn enter_call(self: &Arc<Self>) -> Result<ImageMemoryScope> {
-        if CANDIDATE_DECODE.with(|slot| slot.get()).is_some_and(|credit|
-            credit.decoding && candidate_reader_matches(self, credit)) {
-            return Ok(self.enter());
-        }
-        if let Some(slot) = &self.query_per_call {
-            let mut slot = slot.lock();
-            drop(slot.take());
-            let call = Self::query_reader_for(self.accountant.clone(),
-                self.reader_budget.as_ref().expect("query decoder retains its reader").clone())?;
-            // Enter before publication while the local keeper owns the original
-            // credit. Assignment then moves that keeper without refund/readmit.
-            let scope = call.value.enter();
-            *slot = Some(call);
-            return Ok(scope);
-        }
-        let Some(slot) = &self.per_call else {
-            return Ok(self.enter());
-        };
-        let mut slot = slot.lock();
-        // The previous call returned before this one began; its stored body
-        // and codec growth are already dropped.
-        drop(slot.take());
-        let call = match &self.reader_budget {
-            Some(reader) => Self::charging_reader_for(
-                self.accountant.clone(),
-                reader.clone(),
-                self.subsystem,
-                self.operation,
-                self.hint,
-            ),
-            None => {
-                let mut call = Self::operation_writer(self.accountant.clone())?;
-                Arc::get_mut(&mut call)
-                    .expect("new writer owner is exclusive")
-                    .prepaid_output = self.prepaid_output.clone();
-                call
-            }
-        };
-        *slot = Some(call.clone());
-        Ok(call.enter())
-    }
 
-    /// The admitted form of [`Self::charging_reader_for`]: the shared
-    /// owner's own control is admitted to the reader before the owner is
-    /// allocated, and the final holder releases it from Drop. A refusal is
-    /// kept by value until the caller takes it, and a malformed input answers
-    /// the bounded static class text [`ADMITTED_CODEC_ERROR`]. The control is
-    /// refunded in Drop just before the shared allocation is freed: a fixed
-    /// residue of `size_of::<ImageMemory>() + 2 * size_of::<usize>()` bytes
-    /// for that instant, freed rather than retained.
+
+    /// Admit the exact native control layout before allocation. Its original
+    /// invoice survives payload destruction and the last physical block free.
     pub(crate) fn admitted_reader_for(
         accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        subsystem: &'static str,
-        operation: &'static str,
-        hint: &'static str,
-    ) -> Result<Arc<Self>> {
-        let control = Self::admitted_control_bytes();
-        reader_budget.try_reserve(control, subsystem, operation, hint)?;
-        Ok(Arc::new(Self {
-            accountant,
-            subsystem,
-            operation,
-            hint,
-            _reader_control_invoice: reader_budget.control_invoice(),
-            reader_budget: Some(reader_budget),
-            held: AtomicUsize::new(control),
-            control_bytes: control | ADMITTED_TAG,
-            failure: parking_lot::Mutex::new(None),
-            per_call: None, query_per_call: None,
-            prepaid_output: None,
-            _writer_custody: None,
-        }))
+        reader_budget: impl Into<ReadMemoryOwner>,
+        subsystem: &'static str, operation: &'static str, hint: &'static str,
+    ) -> Result<ImageMemoryHandle> {
+        let reader_budget = reader_budget.into();
+        Self::native_reader_with_factory(accountant, reader_budget,
+            subsystem, operation, hint, ())
     }
-    /// Private query supplier: the caller retains this original invoice
-    /// OUTSIDE the Arc until every decoder/answer alias has been destroyed or
-    /// handed to its real public consumer. No fixed credit lives in the Arc.
+    /// Private query supplier. The typed native handle retains its original
+    /// control invoice through every clone; no raw image Arc escapes it.
     pub(crate) fn query_reader_for(
         accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<crate::local_transport::query_funding::Funded<Arc<Self>>> {
-        crate::local_transport::query_funding::Funded::allocate(
-            Some(reader_budget.clone()), Self::admitted_control_bytes(), || Arc::new(Self {
-                accountant,
-                subsystem: "reader", operation: "materialize_answer",
-                hint: "Reduce simultaneous query memory or raise the declared reader limit.",
-                _reader_control_invoice: reader_budget.control_invoice(),
+        reader_budget: impl Into<ReadMemoryOwner>,
+    ) -> Result<crate::local_transport::query_funding::Funded<ImageMemoryHandle>> {
+        let reader_budget = reader_budget.into();
+        Ok(crate::local_transport::query_funding::Funded::external(
+            Self::native_reader_with_factory(accountant, reader_budget,
+                "reader", "materialize_answer",
+                "Reduce simultaneous query memory or raise the declared reader limit.", ())?))
+    }
+
+    fn reader_payload(
+        accountant: crate::memory_accounting::AccountantHandle,
+        reader_budget: impl Into<ReadMemoryOwner>,
+        subsystem: &'static str, operation: &'static str, hint: &'static str,
+    ) -> Self {
+        let reader_budget = reader_budget.into();
+        Self {
+            accountant, subsystem, operation, hint,
             reader_budget: Some(reader_budget), held: AtomicUsize::new(0),
-                control_bytes: ADMITTED_TAG,
-                failure: parking_lot::Mutex::new(None), per_call: None, query_per_call: None,
-                prepaid_output: None, _writer_custody: None,
-            }),
-        )
+            control_bytes: ADMITTED_TAG, query_control: None, failure: parking_lot::Mutex::new(None),
+            per_call: None, query_per_call: None, prepaid_output: None,
+            _writer_custody: None,
+        }
+    }
+    pub(crate) fn native_reader_with_factory<I: Send + Sync + 'static>(
+        accountant: crate::memory_accounting::AccountantHandle,
+        reader_budget: impl Into<ReadMemoryOwner>,
+        subsystem: &'static str, operation: &'static str, hint: &'static str,
+        factory: I,
+    ) -> Result<ImageMemoryHandle> {
+        let reader_budget = reader_budget.into();
+        Self::native_reader_with_checkpoint(accountant, reader_budget,
+            subsystem, operation, hint, factory, None)
+    }
+    pub(crate) fn native_reader_with_checkpoint<I: Send + Sync + 'static>(
+        accountant: crate::memory_accounting::AccountantHandle,
+        reader_budget: impl Into<ReadMemoryOwner>,
+        subsystem: &'static str, operation: &'static str, hint: &'static str,
+        factory: I,
+        query_control: Option<contextdb_core::read_memory::NativeReadMemory<crate::local_transport::query_funding::QueryOperationBudget>>,
+    ) -> Result<ImageMemoryHandle> {
+        let reader_budget = reader_budget.into();
+        use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner};
+        let bytes = ReadMemoryOwner::native_layout::<Self, (ReadCredit, I)>().size();
+        let mut payload = Self::reader_payload(accountant, reader_budget.clone(), subsystem, operation, hint);
+        payload.query_control = query_control;
+        let credit = match ReadCredit::try_new_owned(reader_budget.clone(), bytes, subsystem, operation, hint) {
+            Ok(credit) => credit,
+            Err(error) => {
+                drop(payload);
+                drop(reader_budget);
+                drop(factory);
+                return Err(error);
+            }
+        };
+        drop(reader_budget);
+        ReadMemoryOwner::try_native_typed(payload, (credit, factory))
+            .map(ImageMemoryHandle::Native).map_err(Error::NativeEngineOther)
     }
 
     /// The shared allocation an admitted reader admits before it exists.
     pub(crate) fn admitted_control_bytes() -> usize {
-        std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()
+        contextdb_core::read_memory::ReadMemoryOwner::native_layout::<Self,
+            contextdb_core::read_memory::ReadCredit>().size()
     }
 
     pub(crate) fn reader_budget(
         &self,
-    ) -> Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    ) -> Option<ReadMemoryOwner> {
         self.reader_budget.clone()
     }
 
-    /// A fallible operation bridge funded by the already declared read child.
-    /// Its own Arc control is admitted before creating the scope owner.
+    /// A fallible operation bridge funded by the same declared read child.
+    /// The exact native control is admitted before creating the scope owner.
     pub(crate) fn operation_reader(
         accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Arc<Self>> {
-        let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
-        reader_budget.try_reserve(
-            control,
-            "reader",
-            "decode_owner",
-            "Reduce simultaneous reads or raise the declared reader memory limit.",
-        )?;
-        Ok(Arc::new(Self {
-            accountant,
-            subsystem: "reader",
-            operation: "materialize_answer",
-            hint: "Reduce the statement's output or raise the declared reader memory limit.",
-            _reader_control_invoice: reader_budget.control_invoice(),
-            reader_budget: Some(reader_budget),
-            held: AtomicUsize::new(control),
-            control_bytes: control,
-            failure: parking_lot::Mutex::new(None),
-            per_call: None, query_per_call: None,
-            prepaid_output: None,
-            _writer_custody: None,
-        }))
+        reader_budget: impl Into<ReadMemoryOwner>,
+    ) -> Result<ImageMemoryHandle> {
+        let reader_budget = reader_budget.into();
+        Self::native_reader_with_factory(accountant, reader_budget,
+            "reader", "materialize_answer",
+            "Reduce the statement's output or raise the declared reader memory limit.", ())
     }
 
     /// Actual write-side decoding borrows the existing writer accountant;
     /// the operation owner holds and releases only its own admitted payloads.
     pub(crate) fn operation_writer(
         accountant: crate::memory_accounting::AccountantHandle,
-    ) -> Result<Arc<Self>> {
-        let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
-        // Fixed decode control is named open residue; growing payloads below
-        // still use this writer's declared working-memory limit.
-        crate::memory_accounting::admit_open_residue(control, "writer_decode_open_residue")?;
-        let writer_custody =
-            crate::memory_accounting::StoreAccountantHandle::retain_if_writer(&accountant);
-        Ok(Arc::new(Self {
-            accountant,
-            subsystem: "writer_source",
-            operation: "decode_stored_value",
-            hint: "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
-            reader_budget: None,
-            _reader_control_invoice: None,
-            held: AtomicUsize::new(0),
-            control_bytes: control | crate::memory_accounting::OPEN_RESIDUE_TAG,
-            failure: parking_lot::Mutex::new(None),
-            per_call: None, query_per_call: None,
-            prepaid_output: None,
-            _writer_custody: writer_custody,
-        }))
+    ) -> Result<ImageMemoryHandle> {
+        let reader = accountant.query_reader_original().or_else(|| active_owner().ok()
+            .filter(|active| std::ptr::eq(active.accountant.as_ptr(), accountant.as_ptr()))
+            .and_then(|active| active.reader_budget()));
+        if let Some(reader) = reader {
+            return Self::admitted_reader_for(accountant, reader,
+                "writer_source", "decode_stored_value",
+                "Raise MEMORY_LIMIT to decode this writer operation's stored values.");
+        }
+        Self::funded_writer_payload(Self::writer_payload(accountant,
+            "writer_source", "decode_stored_value",
+            "Raise MEMORY_LIMIT to decode this writer operation's stored values."), true)
     }
 
-    /// A writer owner for a loop that decodes one stored value per call and
-    /// whose retained results are already paid for by the caller's own
-    /// workspace. Each top-level decode call under it gets a fresh writer
-    /// owner, and the previous call's owner -- the stored body it decoded and
-    /// dropped, its codec growth and its copy -- is returned when the next
-    /// call begins. Its charges are therefore live for exactly one value at a
-    /// time instead of accumulating across values that are already freed.
+    /// Each call keeps its own image; the shared prepaid-output counter also
+    /// owns an independent exact original invoice through its final free.
     pub(crate) fn operation_writer_per_call(
         accountant: crate::memory_accounting::AccountantHandle,
         prepaid_output_bytes: usize,
-    ) -> Result<Arc<Self>> {
-        let mut owner = Self::operation_writer(accountant)?;
-        let owner_mut = Arc::get_mut(&mut owner).expect("new writer owner is exclusive");
-        owner_mut.per_call = Some(parking_lot::Mutex::new(None));
-        owner_mut.prepaid_output = Some(Arc::new(PrepaidOutput {
-            remaining: AtomicUsize::new(prepaid_output_bytes),
-            adopted: AtomicUsize::new(0),
-        }));
-        Ok(owner)
+    ) -> Result<ImageMemoryHandle> {
+        use contextdb_core::read_memory::ReadShared;
+        let mut payload = Self::writer_payload(accountant,
+            "writer_source", "decode_stored_value",
+            "Raise MEMORY_LIMIT to decode this writer operation's stored values.");
+        let original = payload._writer_custody.clone().unwrap_or_else(||
+            crate::memory_accounting::StoreAccountantHandle::from_original_nonwriter(&payload.accountant));
+        let invoice = ImageControlInvoice::admit(original,
+            ReadShared::<PrepaidOutput, ImageControlInvoice>::layout().size(), true,
+            payload.subsystem, payload.operation, payload.hint)?;
+        payload.prepaid_output = Some(ReadShared::try_from_invoice_native(PrepaidOutput {
+            remaining: AtomicUsize::new(prepaid_output_bytes), adopted: AtomicUsize::new(0),
+        }, invoice).map_err(Error::NativeEngineOther)?);
+        payload.per_call = Some(parking_lot::Mutex::new(None));
+        Self::funded_writer_payload(payload, true)
     }
 
     /// Prepaid output bytes this owner's per-call decodes adopted.
@@ -507,13 +643,10 @@ impl ImageMemory {
 
     /// A standalone call uses the engine's default open ceiling and keeps
     /// its accountant private, outside the registered Database writer domain.
-    pub(crate) fn default_decode_accountant() -> crate::memory_accounting::AccountantHandle {
+    pub(crate) fn default_decode_accountant() -> Result<crate::memory_accounting::AccountantHandle> {
+        if let Ok(owner) = active_owner() { return Ok(owner.accountant.clone()); }
         let limit = crate::read_session::DatabaseOpenOptions::default().memory_limit;
-        Arc::new(match limit {
-            Some(bytes) => MemoryAccountant::with_budget(bytes),
-            None => MemoryAccountant::no_limit(),
-        })
-        .into()
+        crate::memory_accounting::AccountantHandle::standalone(limit, true)
     }
 
     /// Reuse an operation's owner; otherwise admit a fresh call-local owner.
@@ -523,7 +656,7 @@ impl ImageMemory {
         }
         #[cfg(any(test, feature = "test-seams"))]
         crate::vector_read_memory::note_unowned_decode_for_test();
-        Self::enter_writer_operation(Self::default_decode_accountant())
+        Self::enter_writer_operation(Self::default_decode_accountant()?)
     }
 
     pub(crate) fn enter_writer_operation(
@@ -542,23 +675,44 @@ impl ImageMemory {
     /// that escaping credit instead of borrowing the payload's source epoch.
     pub(crate) fn source_box_budget(
         &self,
-    ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    ) -> Result<ReadMemoryOwner> {
         match &self.reader_budget {
             Some(reader) => Ok(reader.clone()),
-            None => self.accountant.read_budget(),
+            None => match &self._writer_custody {
+                Some(original) => original.read_budget(),
+                None => self.accountant.read_budget(),
+            },
         }
     }
 
-    pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
-        match &self.reader_budget {
-            Some(budget) => budget.try_reserve(bytes, self.subsystem, self.operation, self.hint)?,
-            None => self.accountant.try_allocate_for(
-                bytes,
-                self.subsystem,
-                self.operation,
-                self.hint,
-            )?,
+    /// Diagnostic preparation uses the existing original native writer helper,
+    /// or the already captured reader. It never acquires another read request.
+    pub(crate) fn diagnostic_budget(&self) -> Result<ReadMemoryOwner> {
+        if let Some(reader) = &self.reader_budget { return Ok(reader.clone()); }
+        match &self._writer_custody {
+            Some(original) => original.wait_memory_owner().map_err(|error|
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error))),
+            None => self.source_box_budget(),
         }
+    }
+
+    /// Genuine source-accountant invoice for native cache preparation. This
+    /// stays distinct from this image's page reserve and the declared read child.
+    pub(crate) fn direct_source_native_credit(
+        &self,
+        bytes: usize,
+    ) -> std::result::Result<crate::memory_accounting::ControlCredit,
+                           contextdb_core::read_memory::NativeRefusal> {
+        assert!(self.reader_budget.is_none(), "direct source original accountant");
+        self.accountant.try_allocate_for_native(bytes, self.subsystem, self.operation, self.hint)?;
+        Ok(crate::memory_accounting::ControlCredit::from_admitted(&self.accountant, bytes))
+    }
+
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _sample = ImageSample(self);
+        self.reserve_funding(bytes)?;
         self.held.fetch_add(bytes, Ordering::SeqCst);
         Ok(())
     }
@@ -579,6 +733,8 @@ impl ImageMemory {
     }
 
     pub(crate) fn release(&self, bytes: usize) {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _sample = ImageSample(self);
         self.held.fetch_sub(bytes, Ordering::SeqCst);
         match &self.reader_budget {
             Some(budget) => budget.release(bytes),
@@ -591,6 +747,8 @@ impl ImageMemory {
         &self,
         bytes: usize,
     ) -> Result<crate::memory_accounting::ControlCredit> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _sample = ImageSample(self);
         assert!(
             self.reader_budget.is_none(),
             "direct source owns its original accountant credit"
@@ -607,36 +765,15 @@ impl ImageMemory {
             bytes,
         ))
     }
-    /// Detach only the caller's explicitly prepaid copy credit. No funding
-    /// is returned or admitted while the consuming bridge changes ownership.
-    pub(crate) fn vector_copy(self: &Arc<Self>, prepaid_bytes: usize) -> Result<ImageVectorCopy> {
-        self.held
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                held.checked_sub(prepaid_bytes)
-            })
-            .map_err(|_| Error::Other("vector copy exceeds its prepaid image credit".into()))?;
-        let accountant: Arc<dyn contextdb_vector::MemoryBudget> =
-            Arc::new(ImageVectorBudget(self.clone()));
-        let charge = ImageVectorCharge {
-            accountant: accountant.clone(),
-            image: self.clone(),
-            bytes: prepaid_bytes,
-        };
-        let owner =
-            contextdb_vector::VectorCopyAdmission::from_prepaid(accountant.clone(), charge)?;
-        Ok(ImageVectorCopy {
-            owner,
-            accountant,
-            image: self.clone(),
-        })
-    }
+
 
     fn reserve_funding(&self, bytes: usize) -> Result<()> {
         match &self.reader_budget {
             Some(budget) => budget.try_reserve(bytes, self.subsystem, self.operation, self.hint),
-            None => {
-                self.accountant
-                    .try_allocate_for(bytes, self.subsystem, self.operation, self.hint)
+            None => match &self._writer_custody {
+                Some(original) => original.try_allocate_for_original(
+                    bytes, self.subsystem, self.operation, self.hint),
+                None => self.accountant.try_allocate_for(bytes, self.subsystem, self.operation, self.hint),
             }
         }
     }
@@ -648,15 +785,18 @@ impl ImageMemory {
         }
     }
 
-    pub(crate) fn adopt_reader_credit(
+    pub(crate) fn adopt_reader_credit<B: Clone + Into<ReadMemoryOwner>>(
         &self,
-        budget: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        budget: &B,
         bytes: usize,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _sample = ImageSample(self);
+        let budget = budget.clone().into();
         if !self
             .reader_budget
             .as_ref()
-            .is_some_and(|reader| Arc::ptr_eq(reader, budget))
+            .is_some_and(|reader| reader.same_owner(&budget))
         {
             return Err(Error::Other(
                 "answer credit has a different reader budget".into()));
@@ -669,42 +809,7 @@ impl ImageMemory {
         Ok(())
     }
 
-    /// Decode under this already funded image owner. Any admission failure
-    /// remains the shared typed refusal instead of becoming a codec error.
-    pub(crate) fn decode_msgpack<T: de::DeserializeOwned>(
-        self: &Arc<Self>,
-        bytes: &[u8],
-    ) -> Result<T> {
-        let before = self.held();
-        let result = self.scope(|| {
-            let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes);
-            // Take this thread-local answer before the core guard restores
-            // its enclosing scope's sideband.
-            Seed(PhantomData::<T>).deserialize(&mut decoder)
-        });
-        if let Some(error) = self.take_failure() {
-            drop(result);
-            self.release(self.held() - before);
-            return Err(error);
-        }
-        match result {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                // The decoder's error is alive under this owner's charges
-                // (its text was bounded and admitted as it was built). The
-                // returned error is rendered bounded before the decoder's is
-                // dropped, and the charges are released only after that.
-                let returned = if self.admitted() {
-                    Error::SyncError(ADMITTED_CODEC_ERROR.into())
-                } else {
-                    Error::SyncError((bounded_text("MessagePack decode error: ", &error)).into())
-                };
-                drop(error);
-                self.release(self.held() - before);
-                Err(returned)
-            }
-        }
-    }
+
 
     pub(crate) fn funded_by_writer(
         &self,
@@ -719,6 +824,8 @@ impl ImageMemory {
         &self,
         bytes: usize,
     ) -> Result<contextdb_core::read_memory::ReadCredit> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _sample = ImageSample(self);
         let budget = self
             .reader_budget
             .as_ref()
@@ -729,7 +836,7 @@ impl ImageMemory {
                     .filter(|remaining| *remaining >= self.control_bytes & !ADMITTED_TAG)
             })
             .map_err(|_| Error::Other("row move exceeds its retained payload credit".into()))?;
-        Ok(contextdb_core::read_memory::ReadCredit::from_prepaid(
+        Ok(contextdb_core::read_memory::ReadCredit::from_prepaid_owned(
             budget.clone(),
             bytes,
         ))
@@ -780,53 +887,13 @@ impl ImageMemory {
         }
         *self.failure.lock() = Some(Pending::Owned(error));
     }
-    /// A separate row lifetime funded by this operation's existing capability.
-    /// The parent remains live while a selected row is being replaced.
-    /// A decoded row transferred directly into a detached write projection
-    /// is a staged write copy. It keeps the same preallocation funder and
-    /// receipt shape while naming that copy's admission at the payload boundary.
-    pub(crate) fn staged_row_copy_owner(self: &Arc<Self>) -> Result<Arc<Self>> {
-        let mut owner = self.row_owner()?;
-        let memory = Arc::get_mut(&mut owner).expect("new row owner is exclusive");
-        memory.subsystem = "sync";
-        memory.operation = "stage_received_unit_row_image";
-        memory.hint = "Raise MEMORY_LIMIT to stage this received row copy.";
-        Ok(owner)
-    }
 
-    pub(crate) fn row_owner(self: &Arc<Self>) -> Result<Arc<Self>> {
-        let control = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
-        self.reserve_funding(control)?;
-        Ok(Arc::new(Self {
-            accountant: self.accountant.clone(),
-            subsystem: self.subsystem,
-            operation: self.operation,
-            hint: self.hint,
-            reader_budget: self.reader_budget.clone(),
-            _reader_control_invoice: self._reader_control_invoice.clone(),
-            held: AtomicUsize::new(control),
-            control_bytes: control | (self.control_bytes & ADMITTED_TAG),
-            failure: parking_lot::Mutex::new(None),
-            per_call: None, query_per_call: None,
-            prepaid_output: None,
-            _writer_custody: self._writer_custody.clone(),
-        }))
-    }
 
-    pub(crate) fn enter(self: &Arc<Self>) -> ImageMemoryScope {
-        let previous = ACTIVE.with(|active| active.replace(Some(self.clone())));
-        let budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = self.clone();
-        let json = contextdb_core::types::JsonReadAdmissionGuard::enter(budget);
-        ImageMemoryScope {
-            previous,
-            _json: json,
-        }
-    }
 
-    pub(crate) fn scope<T>(self: &Arc<Self>, operation: impl FnOnce() -> T) -> T {
-        let _scope = self.enter();
-        operation()
-    }
+
+
+
+
 }
 // The already captured image/session charge is itself the required read
 // capability; callers do not reconstruct one from a vector-copy adapter.
@@ -862,6 +929,8 @@ impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemory {
                         budget_limit_bytes: *budget_limit_bytes,
                         hint: self.hint.into(),
                     }));
+                } else if let Error::NativeEngineOther(refusal) = &error {
+                    *self.failure.lock() = Some(Pending::Owned(Error::NativeEngineOther(*refusal)));
                 } else if let Error::ReadFailure(failure) = &error {
                     use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
                     if let ReadFailureDetail::OwnerLimitExceeded(detail) = failure.detail()
@@ -924,6 +993,7 @@ struct Refused {
 }
 impl Refused {
     fn of(error: &Error) -> Option<Self> {
+        let error = error.engine_diagnostic();
         if let Error::MemoryBudgetExceeded {
             requested_bytes,
             available_bytes,
@@ -936,6 +1006,16 @@ impl Refused {
                 available: *available_bytes,
                 limit: *budget_limit_bytes,
             });
+        }
+        if let Error::NativeEngineOther(
+            contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                requested_bytes, available_bytes, budget_limit_bytes, ..
+            } | contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded {
+                requested_bytes, available_bytes, budget_limit_bytes, ..
+            }) = error
+        {
+            return Some(Self { requested: *requested_bytes,
+                available: *available_bytes, limit: *budget_limit_bytes });
         }
         if let Error::ReadFailure(failure) = error {
             use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
@@ -960,7 +1040,13 @@ impl Refused {
 
 impl Drop for ImageMemory {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::vector_read_memory::root_observations::producer_dropped(
+            self as *const _ as usize, 1, self.held(), self.retained_payload_bytes());
         self.release(self.held.load(Ordering::SeqCst));
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::vector_read_memory::root_observations::producer_dropped(
+            self as *const _ as usize, 1, self.held(), self.retained_payload_bytes());
         if self.control_bytes & crate::memory_accounting::OPEN_RESIDUE_TAG != 0 {
             crate::memory_accounting::refund_open_residue(
                 self.control_bytes & !(crate::memory_accounting::OPEN_RESIDUE_TAG | ADMITTED_TAG),
@@ -969,23 +1055,31 @@ impl Drop for ImageMemory {
     }
 }
 #[derive(Debug)]
-struct ImageVectorBudget(Arc<ImageMemory>);
-impl contextdb_vector::MemoryBudget for ImageVectorBudget {
-    fn try_allocate_for(&self, bytes: usize, _: &str, _: &str, _: &str) -> Result<()> {
+struct ImageVectorBudget(crate::read_image_memory::ImageMemoryHandle);
+impl ReadMemoryBudget for ImageVectorBudget {
+    fn try_reserve(&self, bytes: usize, _: &'static str, _: &'static str,
+        _: &'static str) -> Result<()> {
         self.0.reserve_funding(bytes)
     }
-    fn release(&self, bytes: usize) {
-        self.0.release_funding(bytes);
-    }
+    fn release(&self, bytes: usize) { self.0.release_funding(bytes); }
+}
+// This invoice is moved outside the native block before its payload drops.
+// Fixed control funding is independent of the image's prepaid payload credit.
+struct ImageVectorInvoice {
+    image: ImageMemoryHandle,
+    bytes: usize,
+}
+impl Drop for ImageVectorInvoice {
+    fn drop(&mut self) { self.image.release_funding(self.bytes); }
 }
 
 struct ImageVectorCharge {
-    accountant: Arc<dyn contextdb_vector::MemoryBudget>,
-    image: Arc<ImageMemory>,
+    accountant: contextdb_vector::MemoryBudgetOwner,
+    image: crate::read_image_memory::ImageMemoryHandle,
     bytes: usize,
 }
 impl contextdb_vector::PrepaidVectorCopyCharge for ImageVectorCharge {
-    fn accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> {
+    fn accountant(&self) -> contextdb_vector::MemoryBudgetOwner {
         self.accountant.clone()
     }
     fn retained_bytes(&self) -> usize {
@@ -1003,20 +1097,85 @@ impl Drop for ImageVectorCharge {
 
 pub(crate) struct ImageVectorCopy {
     pub(crate) owner: contextdb_vector::VectorCopyAdmission,
-    accountant: Arc<dyn contextdb_vector::MemoryBudget>,
-    image: Arc<ImageMemory>,
+    accountant: contextdb_vector::MemoryBudgetOwner,
+    image: crate::read_image_memory::ImageMemoryHandle,
 }
 impl ImageVectorCopy {
-    pub(crate) fn accountant(&self) -> &Arc<dyn contextdb_vector::MemoryBudget> {
+    pub(crate) fn accountant(&self) -> &contextdb_vector::MemoryBudgetOwner {
         &self.accountant
     }
     /// The returned answer's existing image owner adopts the complete charge
     /// once. The bridge is consumed, and no budget admission occurs here.
     pub(crate) fn into_image(self) {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _sample = ImageSample(&self.image);
         self.image
             .held
             .fetch_add(self.owner.retained_bytes(), Ordering::SeqCst);
         self.owner.transfer();
+    }
+}
+
+/// Unique query custody. Public clones share the enclosing result cell;
+/// nested execution retains each original image and its external invoice.
+#[derive(Debug, Default)]
+pub(crate) enum QueryAnswerCharge {
+    #[default]
+    None,
+    Reader(contextdb_core::read_memory::ReadCredit),
+    Image(contextdb_core::read_memory::ReadShared<QueryImageCharge>),
+    Receiver(crate::read_image_memory::ImageMemoryHandle),
+}
+#[derive(Debug)]
+pub(crate) struct QueryImageCharge {
+    previous: QueryAnswerCharge,
+    image: crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
+}
+impl QueryAnswerCharge {
+    /// Admit and allocate the retention node BEFORE execution. A nested
+    /// answer's original charge moves into it without a refund or new debit.
+    pub(crate) fn execute_with_image(
+        image: crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
+        run: impl FnOnce(&crate::read_image_memory::ImageMemoryHandle) -> Result<crate::database::OwnedQueryResult>,
+    ) -> Result<crate::database::OwnedQueryResult> {
+        use contextdb_core::read_memory::{NativeProduce, ReadCredit, ReadShared};
+        let owner = image.value.owner();
+        let invoice = ReadCredit::try_new_owned(owner, ReadShared::<QueryImageCharge>::layout().size(),
+            "reader", "retain_answer_image",
+            "Release retained answers or raise the declared reader memory limit.")?;
+        let mut published = None;
+        let charge = ReadShared::try_from_prepaid_with_native(invoice, || {
+            let mut result = run(&image.value)?;
+            let previous = std::mem::take(&mut result.vector_copy_charge);
+            published = Some(result);
+            Ok(QueryImageCharge { previous, image })
+        }).map_err(|error| match error {
+            NativeProduce::Refused(refusal) => Error::NativeEngineOther(refusal),
+            NativeProduce::Producer(error) => error,
+        })?;
+        let mut result = published.expect("successful image publication produced its answer");
+        result.vector_copy_charge = Self::Image(charge);
+        Ok(result)
+    }
+    // The receiver's original external keeper moves into the result owner.
+    pub(crate) fn holding(image: crate::read_image_memory::ImageMemoryHandle) -> Self { Self::Receiver(image) }
+    pub(crate) fn holding_reader(reader: contextdb_core::read_memory::ReadCredit) -> Result<Self> {
+        Ok(Self::Reader(reader))
+    }
+    pub(crate) fn owner(&self) -> Option<contextdb_core::read_memory::ReadMemoryOwner> {
+        match self {
+            Self::Image(charge) => Some(charge.image.value.owner()),
+            Self::Receiver(image) => Some(image.owner()),
+            _ => None,
+        }
+    }
+    pub(crate) fn held(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Reader(credit) => credit.bytes(),
+            Self::Image(charge) => charge.previous.held() + charge.image.value.held(),
+            Self::Receiver(image) => image.held(),
+        }
     }
 }
 
@@ -1025,12 +1184,12 @@ impl ImageVectorCopy {
 /// bookkeeping, not content, so it never makes two answers unequal.
 #[derive(Clone, Default)]
 pub(crate) struct AnswerCharge {
-    image: Option<Arc<ImageMemory>>,
-    reader: Option<Arc<contextdb_core::read_memory::ReadCredit>>,
+    image: Option<crate::read_image_memory::ImageMemoryHandle>,
+    reader: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
 impl AnswerCharge {
-    pub(crate) fn holding(charge: Arc<ImageMemory>) -> Self {
+    pub(crate) fn holding(charge: crate::read_image_memory::ImageMemoryHandle) -> Self {
         Self {
             image: Some(charge),
             reader: None,
@@ -1042,23 +1201,29 @@ impl AnswerCharge {
     pub(crate) fn holding_reader(
         mut credit: contextdb_core::read_memory::ReadCredit,
     ) -> Result<Self> {
-        let control_bytes = std::mem::size_of::<contextdb_core::read_memory::ReadCredit>()
-            + 2 * std::mem::size_of::<usize>();
+        use contextdb_core::read_memory::ReadShared;
+        let control_bytes = ReadShared::<contextdb_core::read_memory::ReadCredit>::layout().size();
         credit.try_grow_for(
             control_bytes,
             "bounded_read",
             "retain_answer_credit",
             "Reduce the statement's output or raise the declared reader memory limit.",
         )?;
+        // Split the newly admitted control from the same original debit. The
+        // payload credit may refund during destruction; the native cell's
+        // separate invoice settles only after its actual physical free.
+        let invoice = credit.try_split_off(control_bytes)?;
         Ok(Self {
             image: None,
-            reader: Some(Arc::new(credit)),
+            reader: Some(ReadShared::try_from_prepaid_native(credit, invoice)
+                .map_err(Error::NativeEngineOther)?),
         })
     }
 
     pub(crate) fn held(&self) -> usize {
         self.image.as_ref().map_or(0, |charge| charge.held())
-            + self.reader.as_ref().map_or(0, |charge| charge.bytes())
+            + self.reader.as_ref().map_or(0, |charge| charge.bytes()
+                + contextdb_core::read_memory::ReadShared::<contextdb_core::read_memory::ReadCredit>::layout().size())
     }
 }
 
@@ -1078,7 +1243,7 @@ impl PartialEq for AnswerCharge {
 }
 
 thread_local! {
-    static ACTIVE: RefCell<Option<Arc<ImageMemory>>> = const { RefCell::new(None) };
+    static ACTIVE: RefCell<Option<crate::read_image_memory::ImageMemoryHandle>> = const { RefCell::new(None) };
     static NATIVE_DECODE: std::cell::Cell<Option<std::ptr::NonNull<NativeDecodeMemory>>> =
         const { std::cell::Cell::new(None) };
 }
@@ -1228,7 +1393,7 @@ pub(crate) fn decode_msgpack_native<T: de::DeserializeOwned>(
 /// Inline restoration preserves nested owners and failure unwinding without a
 /// heap-allocated context stack.
 pub(crate) struct ImageMemoryScope {
-    previous: Option<Arc<ImageMemory>>,
+    previous: Option<crate::read_image_memory::ImageMemoryHandle>,
     _json: contextdb_core::types::JsonReadAdmissionGuard,
 }
 impl Drop for ImageMemoryScope {
@@ -1239,22 +1404,24 @@ impl Drop for ImageMemoryScope {
     }
 }
 
-pub(crate) fn active_owner() -> Result<Arc<ImageMemory>> {
+pub(crate) fn active_owner() -> Result<crate::read_image_memory::ImageMemoryHandle> {
     ACTIVE
         .with(|active| active.borrow().clone())
         .ok_or_else(|| Error::Other("engine decode requires an operation memory owner".into()))
 }
 
 pub(crate) fn is_missing_decode_owner(error: &Error) -> bool {
-    matches!(error, Error::Other(reason) if matches!(reason.as_ref(),
-        "engine decode requires an operation memory owner"
-        | "writer decode requires its declared memory accountant"
-        | "checkpoint source requires its installed accountant identity"))
+    matches!(error.engine_diagnostic(), Error::Other(reason) if
+        reason == "engine decode requires an operation memory owner"
+        || reason == "writer decode requires its declared memory accountant"
+        || reason == "checkpoint source requires its installed accountant identity")
 }
 
 pub(crate) fn is_memory_refusal(error: &Error) -> bool {
-    match error {
+    match error.engine_diagnostic() {
         Error::MemoryBudgetExceeded { .. } => true,
+        Error::NativeEngineOther(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded { .. }
+            | contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded { .. }) => true,
         Error::ReadFailure(failure) => matches!(failure.detail(),
             contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
                 if detail.limit == contextdb_core::read_contract::ReadFailureLimit::Memory),
@@ -1263,7 +1430,7 @@ pub(crate) fn is_memory_refusal(error: &Error) -> bool {
 }
 
 pub(crate) fn current_reader_budget()
--> Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+-> Option<ReadMemoryOwner> {
     ACTIVE.with(|active| {
         active
             .borrow()
@@ -1499,7 +1666,7 @@ const ADMISSION_REFUSED: &str = "read image admission refused";
 #[derive(Debug)]
 struct BoundedDecodeError {
     text: Option<String>,
-    charge: Option<(Arc<ImageMemory>, usize)>,
+    charge: Option<(crate::read_image_memory::ImageMemoryHandle, usize)>,
 }
 impl BoundedDecodeError {
     fn refused() -> Self {
@@ -1597,6 +1764,10 @@ pub(crate) fn decode_exact_buffers<T: de::DeserializeOwned>(bytes: &[u8]) -> Res
     decode_with_control(bytes, 0)
 }
 fn decode_with_control<T: de::DeserializeOwned>(bytes: &[u8], control: usize) -> Result<(T, usize)> {
+    #[cfg(test)]
+    let _capture_decode = crate::memory_accounting::compaction_admission_capture::Phase::enter(
+        "writer-or-reader-decode", "read_image_memory::decode_with_control",
+        std::any::type_name::<T>(), None);
     let _decode_scope = ImageMemory::enter_decode_call()?;
     let owner = active_owner()?;
     owner.reserve(control)?;
@@ -1640,8 +1811,8 @@ pub(crate) fn decode_json<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         .checked_mul(4)
         .and_then(|n| n.checked_add(7232))
         .ok_or_else(|| Error::Other("rendered JSON admission size overflow".into()))?;
-    let scratch = contextdb_core::read_memory::ReadCredit::try_new(
-        owner.clone(),
+    let scratch = contextdb_core::read_memory::ReadCredit::try_new_owned(
+        owner.owner(),
         bound,
         "json_decode",
         "rendered_record",
@@ -2291,7 +2462,7 @@ impl RowReadAdmission<'_> {
                     .ok_or_else(|| Error::Other("row move requires reader funding".into()))?;
                 if owner
                     .reader_budget()
-                    .is_some_and(|budget| Arc::ptr_eq(&budget, &source_budget))
+                    .is_some_and(|budget| budget.same_owner(&source_budget))
                 {
                     let credit = memory.take_retained_credit(bytes)?;
                     owner.adopt_reader_credit(&source_budget, bytes)?;
@@ -2317,6 +2488,191 @@ impl RowReadAdmission<'_> {
             Self::Move(memory) => credit
                 .try_merge_prepaid(memory.take_retained_credit(memory.retained_payload_bytes())?),
         }
+    }
+}
+
+
+impl ImageMemoryHandle {
+    pub(crate) fn enter_call(&self) -> Result<ImageMemoryScope> {
+        if CANDIDATE_DECODE.with(|slot| slot.get()).is_some_and(|credit|
+            credit.decoding && candidate_reader_matches(self, credit)) {
+            return Ok(self.enter());
+        }
+        if let Some(slot) = &self.query_per_call {
+            let mut slot = slot.lock();
+            drop(slot.take());
+            let call = ImageMemory::query_reader_for(self.accountant.clone(),
+                self.reader_budget.as_ref().expect("query decoder retains its reader").clone())?;
+            // Enter before publication while the local keeper owns the original
+            // credit. Assignment then moves that keeper without refund/readmit.
+            let scope = call.value.enter();
+            *slot = Some(call);
+            return Ok(scope);
+        }
+        let Some(slot) = &self.per_call else {
+            return Ok(self.enter());
+        };
+        let mut slot = slot.lock();
+        // The previous call returned before this one began; its stored body
+        // and codec growth are already dropped.
+        drop(slot.take());
+        let call = match &self.reader_budget {
+            Some(reader) => ImageMemory::charging_reader_for(
+                self.accountant.clone(),
+                reader.clone(),
+                self.subsystem,
+                self.operation,
+                self.hint,
+            ),
+            None => {
+                let mut payload = ImageMemory::writer_payload(self.accountant.clone(),
+                    "writer_source", "decode_stored_value",
+                    "Raise MEMORY_LIMIT to decode this writer operation's stored values.");
+                payload.prepaid_output = self.prepaid_output.clone();
+                ImageMemory::funded_writer_payload(payload, true)?
+            }
+        };
+        *slot = Some(call.clone());
+        Ok(call.enter())
+    }
+
+    /// Admit the independent adapter control, then detach the caller's exact
+    /// prepaid payload credit without refunding or admitting that payload again.
+    pub(crate) fn vector_copy(&self, prepaid_bytes: usize) -> Result<ImageVectorCopy> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _sample = ImageSample(self);
+        let bytes = ReadMemoryOwner::native_layout::<ImageVectorBudget, ImageVectorInvoice>().size();
+        self.reserve_funding(bytes)?;
+        let invoice = ImageVectorInvoice { image: self.clone(), bytes };
+        let accountant = contextdb_vector::MemoryBudgetOwner::from(
+            ReadMemoryOwner::try_native_result(ImageVectorBudget(self.clone()), invoice)
+                .map_err(Error::NativeEngineOther)?)
+            .preserving_read_copy_errors();
+        self.held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_sub(prepaid_bytes)
+            })
+            .map_err(|_| Error::Other("vector copy exceeds its prepaid image credit".into()))?;
+        let charge = ImageVectorCharge {
+            accountant: accountant.clone(),
+            image: self.clone(),
+            bytes: prepaid_bytes,
+        };
+        let owner =
+            contextdb_vector::VectorCopyAdmission::from_prepaid(accountant.clone(), charge)?;
+        Ok(ImageVectorCopy {
+            owner,
+            accountant,
+            image: self.clone(),
+        })
+    }
+
+    /// Decode under this already funded image owner. Any admission failure
+    /// remains the shared typed refusal instead of becoming a codec error.
+    pub(crate) fn decode_msgpack<T: de::DeserializeOwned>(
+        &self,
+        bytes: &[u8],
+    ) -> Result<T> {
+        let before = self.held();
+        let result = self.scope(|| {
+            let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes);
+            // Take this thread-local answer before the core guard restores
+            // its enclosing scope's sideband.
+            Seed(PhantomData::<T>).deserialize(&mut decoder)
+        });
+        if let Some(error) = self.take_failure() {
+            drop(result);
+            self.release(self.held() - before);
+            return Err(error);
+        }
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // The decoder's error is alive under this owner's charges
+                // (its text was bounded and admitted as it was built). The
+                // returned error is rendered bounded before the decoder's is
+                // dropped, and the charges are released only after that.
+                let returned = if self.admitted() {
+                    Error::SyncError(ADMITTED_CODEC_ERROR.into())
+                } else {
+                    Error::SyncError((bounded_text("MessagePack decode error: ", &error)).into())
+                };
+                drop(error);
+                self.release(self.held() - before);
+                Err(returned)
+            }
+        }
+    }
+
+    /// A separate row lifetime funded by this operation's existing capability.
+    /// The parent remains live while a selected row is being replaced.
+    /// A decoded row transferred directly into a detached write projection
+    /// is a staged write copy. It keeps the same preallocation funder and
+    /// receipt shape while naming that copy's admission at the payload boundary.
+    pub(crate) fn staged_row_copy_owner(&self) -> Result<ImageMemoryHandle> {
+        self.row_owner_for("sync", "stage_received_unit_row_image",
+            "Raise MEMORY_LIMIT to stage this received row copy.")
+    }
+    pub(crate) fn row_owner(&self) -> Result<ImageMemoryHandle> {
+        self.row_owner_for(self.subsystem, self.operation, self.hint)
+    }
+    fn row_owner_for(&self, subsystem: &'static str,
+        operation: &'static str, hint: &'static str) -> Result<ImageMemoryHandle> {
+        if let Self::Native(_) = self {
+            if let Some(reader) = &self.reader_budget {
+                return ImageMemory::native_reader_with_factory(self.accountant.clone(),
+                    reader.clone(), subsystem, operation, hint, self.clone());
+            }
+            if let Some(original) = &self._writer_custody {
+                return ImageMemory::funded_for_original(original.clone(), subsystem, operation, hint);
+            }
+            // A direct image's counter already mirrors its original reader.
+            // Keep that payer for detached rows instead of requiring a query
+            // limiter or inventing another child. The row's actual control
+            // invoice survives its own physical free, then releases its parent.
+            use crate::memory_accounting::ControlCredit;
+            let bytes = ReadMemoryOwner::native_layout::<ImageMemory,
+                (ControlCredit, ImageMemoryHandle)>().size();
+            let credit = self.direct_source_native_credit(bytes)
+                .map_err(Error::NativeEngineOther)?;
+            let payload = ImageMemory {
+                accountant: self.accountant.clone(), subsystem, operation, hint,
+                reader_budget: None, held: AtomicUsize::new(0),
+                control_bytes: 0, query_control: None,
+                failure: parking_lot::Mutex::new(None), per_call: None, query_per_call: None,
+                prepaid_output: None, _writer_custody: None,
+            };
+            return ReadMemoryOwner::try_native_typed(payload, (credit, self.clone()))
+                .map(ImageMemoryHandle::Native).map_err(Error::NativeEngineOther);
+        }
+        let control = std::mem::size_of::<ImageMemory>() + 2 * std::mem::size_of::<usize>();
+        self.reserve_funding(control)?;
+        Ok(ImageMemoryHandle::arc_new(ImageMemory {
+            accountant: self.accountant.clone(), subsystem, operation, hint,
+            reader_budget: self.reader_budget.clone(),
+            held: AtomicUsize::new(control),
+            control_bytes: control | (self.control_bytes & ADMITTED_TAG), query_control: None,
+            failure: parking_lot::Mutex::new(None), per_call: None, query_per_call: None,
+            prepaid_output: None, _writer_custody: self._writer_custody.clone(),
+        }))
+    }
+
+    /// Enter this owner for one top-level decode call. A per-call owner
+    /// returns its previous call's charge and admits the call under a fresh
+    /// owner with the same funder and labels; any other owner is entered
+    /// as is.
+    pub(crate) fn enter(&self) -> ImageMemoryScope {
+        let previous = ACTIVE.with(|active| active.replace(Some(self.clone())));
+        let json = contextdb_core::types::JsonReadAdmissionGuard::enter_owned(self.owner());
+        ImageMemoryScope {
+            previous,
+            _json: json,
+        }
+    }
+
+    pub(crate) fn scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _scope = self.enter();
+        operation()
     }
 }
 
@@ -2509,9 +2865,9 @@ mod admitted_reader_tests {
             limit,
         })
     }
-    fn reader(budget: &Arc<Counted>) -> Result<Arc<ImageMemory>> {
+    fn reader(budget: &Arc<Counted>) -> Result<ImageMemoryHandle> {
         ImageMemory::admitted_reader_for(
-            ImageMemory::default_decode_accountant(),
+            ImageMemory::default_decode_accountant()?,
             budget.clone(),
             "reader",
             "decode_custody_metadata",

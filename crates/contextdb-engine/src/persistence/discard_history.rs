@@ -68,7 +68,7 @@ impl OriginalDiscardHistory {
             let mut commits = write.open_table(COMMITS).map_err(RedbPersistence::storage_error)?;
             if !commits.is_empty().map_err(RedbPersistence::storage_error)? { return Err(invalid()); }
             let owner = writer_source::SourceWindowOwner::Read(
-                crate::memory_accounting::persistence_original_projection(original)?.read_budget()?);
+                crate::memory_accounting::persistence_original_projection(original)?.read_budget()?.into());
             let mut cursor = root.commit_cursor(owner, Lsn(0), root.lsn, false)?;
             while let Some((lsn, tx)) = cursor.next()? {
                 if commits.get(tx.0).map_err(RedbPersistence::storage_error)?.is_none() {
@@ -143,7 +143,7 @@ impl OriginalDiscardHistory {
         let actual: AdjEntry = window.decode(body.value())?;
         if actual != *edge { return Err(invalid()); }
         let owner = writer_source::SourceWindowOwner::Read(
-            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?);
+            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?.into());
         self.root.verify_graph_edge_at_root(&physical, body.value(), edge, false, &owner)?;
         let receipt_key = graph_history_record::lifecycle_key(&physical)?;
         let receipts = self.write.open_table(graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE)
@@ -188,7 +188,7 @@ impl OriginalDiscardHistory {
         self.write.require_store(store)?;
         self.root.require_working_store(store)?;
         let owner = writer_source::SourceWindowOwner::Read(
-            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?);
+            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?.into());
         // This cursor is constructed here, from begin's exact root and Original.
         // No caller can supply a decoded witness, occurrence id or coordinate.
         let mut cursor = self.root.change_log_cursor(owner, Lsn(0), self.root.lsn)?;
@@ -534,10 +534,10 @@ impl RedbPersistence {
             let mut reverse = write.open_table(GRAPH_REV_TABLE).map_err(Self::storage_error)?;
             {
                 let body = forward.get(observed_graph_key!("graph_fwd","get",forward_key.as_slice())).map_err(Self::storage_error)?
-                    .ok_or_else(||Error::StoreCorrupted {path:self.path.display().to_string(),reason:"purged graph forward projection missing".into()})?;
+                    .ok_or_else(||crate::funded_error::corruption_text(crate::funded_error::original_budget(original.original), self.path.display(), "purged graph forward projection missing".into()))?;
                 let other = reverse.get(observed_graph_key!("graph_rev","get",reverse_key.as_slice())).map_err(Self::storage_error)?
-                    .ok_or_else(||Error::StoreCorrupted {path:self.path.display().to_string(),reason:"purged graph reverse projection missing".into()})?;
-                if body.value() != other.value() { return Err(Error::StoreCorrupted {path:self.path.display().to_string(),reason:"purged graph projections disagree".into()}); }
+                    .ok_or_else(||crate::funded_error::corruption_text(crate::funded_error::original_budget(original.original), self.path.display(), "purged graph reverse projection missing".into()))?;
+                if body.value() != other.value() { return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original.original), self.path.display(), "purged graph projections disagree".into())); }
                 let actual: AdjEntry = window.decode(body.value())?;
                 if actual != *entry { return Err(Error::SyncError("authoritative purge selected graph predecessor changed before durable commit".into())); }
                 Self::reclaim_graph_creation_in_write(write,&forward_key,body.value())?;
@@ -707,9 +707,7 @@ impl RedbPersistence {
                     let _image = self.original_graph_window(&window)?;
                     let decoded = decode_relational_index_entry(&self.path,Some(item.map_err(Self::storage_error)?))?.ok_or_else(invalid)?;
                     let (_,position,deleted_tx) = decoded;
-                    Self::validated_index_position(&declaration,meta,&position).map_err(|reason|Error::StoreCorrupted {
-                        path:self.path.display().to_string(),reason,
-                    })?;
+                    Self::validated_index_position(&declaration,meta,&position).map_err(|reason|crate::funded_error::corruption_display(crate::funded_error::original_budget(original.original), self.path.display(), reason))?;
                     if deleted_tx.is_none() {
                         window.reserve(position.key.iter().map(|part| match part {
                             DirectedValue::Asc(TotalOrdAsc(value)) | DirectedValue::Desc(TotalOrdDesc(value)) => value.estimated_bytes(),

@@ -11,8 +11,10 @@ impl Database {
         &self,
         root: &RowRef,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Digest>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(&root.table) else {
             return Ok(None);
         };

@@ -301,8 +301,10 @@ impl Database {
     pub fn cron_run_due_now_for_test(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         // Bounded at 1s: comfortably covers the short-but-not-instant
         // intervals a real test schedule uses (e.g. "EVERY '200
@@ -461,8 +463,10 @@ impl Database {
         &self,
         manual: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let reserved_runs = self.reserve_due_cron_runs()?;
         let mut successful_fires = 0u64;
         let mut fail_loud_error = None;
@@ -550,8 +554,10 @@ impl Database {
         successful_fires: &mut u64,
         fail_loud_error: &mut Option<Error>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let schedule = run.schedule;
         let decision = run.decision;
         for _ in 0..decision.missed_skipped {
@@ -619,8 +625,10 @@ impl Database {
         &self,
         callback: CronCallback,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
 
@@ -1341,7 +1349,7 @@ impl Database {
                         self.tx_mgr.vector_executor(
                             self.vector_store.clone(),
                             Arc::new(OnceLock::new()),
-                            Arc::clone(&self.finalization.vector_accountant),
+                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                         ),
                     );
                     construction.initialized[46] = true;

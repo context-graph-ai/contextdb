@@ -28,8 +28,10 @@ impl SourceRegistration {
         &self,
         db: &Database,
         ws: &mut dyn CommitWriteSource,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<Record>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         prepare_manifest(
             db,
             ws,
@@ -249,8 +251,10 @@ pub(crate) fn final_row(
     ws: &dyn CommitWriteSource,
     reference: &RowRef,
     require_write: bool,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<FinalRow> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if ws.owns_staged_bodies() {
         if let Some(owned) = final_staged_row_owned(db, ws, reference)? {
             return Ok(FinalRow { row: owned.value, _original: Some(owned._debit) });
@@ -316,8 +320,10 @@ pub(crate) fn random_digest() -> [u8; 32] {
 pub(crate) fn next_state(
     db: &Database,
     incarnation: Incarnation,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<StateRecord> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let records = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
@@ -373,8 +379,10 @@ pub(crate) fn state_records(
     state: StateRecord,
     tenant: &TenantId,
     hub: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<Record>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let existing = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
@@ -439,8 +447,10 @@ pub(crate) fn normalized(
 pub(crate) fn binding(
     db: &Database,
     edge: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<SignedBinding> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let records = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
@@ -470,8 +480,10 @@ pub(crate) fn binding(
 pub(crate) fn actual_row(
     db: &Database,
     r: &RowRef,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<contextdb_core::VersionedRow> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     // Indexed natural-key lookup, never a table scan per member.
     db.custody_row(r, read_memory.clone())?.ok_or_else(|| {
         Error::SyncError((format!(
@@ -484,8 +496,10 @@ pub(crate) fn actual_row(
 pub(crate) fn actual_policy(
     db: &Database,
     table: &str,
-    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ApplicationTablePolicy> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
     let m = db
         .table_meta(table)
         .ok_or_else(|| Error::TableNotFound(table.into()))?;
@@ -517,8 +531,10 @@ pub(crate) fn validate_registration(
     db: &Database,
     ws: &dyn CommitWriteSource,
     input: &SourceRegistration,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let fail = || Error::ManifestIncomplete {
         table: input.root.table.clone(),
     };
@@ -575,8 +591,10 @@ pub(crate) fn prepare_manifest(
     edge: &str,
     input: DeliveryManifest<'_>,
     signer: &LineageSigner,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<Record>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let prior = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
@@ -886,8 +904,10 @@ pub(crate) fn prepare_terminal(
     edge: String,
     request: TerminalInput,
     signer: &LineageSigner,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<Record>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     prepare_terminal_at(
         db,
         ws,
@@ -913,8 +933,10 @@ fn prepare_terminal_at(
     signer: &LineageSigner,
     reserved_state: Option<StateRecord>,
     ordinal: u32,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<Record>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
@@ -1179,8 +1201,10 @@ pub(crate) fn committed_certificate(
     namespace: &Namespace,
     state: &StateRef,
     signer: &LineageSigner,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Certificate> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let records = custody_hold.retain(db.custody_authority(read_memory.clone())?)?;
@@ -1227,8 +1251,10 @@ fn edge_authority(
     db: &Database,
     namespace: &Namespace,
     state: &StateRef,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<EdgeAuthority> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let birth = BirthRef::from(state);
@@ -1270,8 +1296,10 @@ pub(crate) fn commit_binding(
     request: BindingInput,
     signer: &LineageSigner,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<SignedBindingPacket> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     if request.tenant_id != tenant_id {
@@ -1437,8 +1465,10 @@ pub(crate) fn admit_binding(
     edge: &str,
     packet: &SignedBindingPacket,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let b = &packet.binding;
@@ -1550,8 +1580,10 @@ pub(crate) fn current_manifest(
     db: &Database,
     table: &str,
     key: &NaturalKey,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<ManifestRecord>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let records = custody_hold.retain(db.custody_root(
@@ -1597,8 +1629,10 @@ pub(crate) fn commit_terminal(
     request: TerminalInput,
     signer: &LineageSigner,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<SignedOutcomePacket> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
@@ -1766,8 +1800,10 @@ pub(crate) fn admit_terminal(
     hub: &str,
     edge: &str,
     packet: &SignedOutcomePacket,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
     let vector_copy_owner = &mut retained_vector_copy;
 
@@ -1791,8 +1827,10 @@ pub(crate) fn admit_terminals(
     edge: &str,
     packets: &[SignedOutcomePacket],
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     if packets.is_empty() {
@@ -1875,8 +1913,10 @@ pub(crate) fn commit_terminal_batch(
     requests: Vec<TerminalInput>,
     signer: &LineageSigner,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if requests.is_empty()
         || requests.iter().any(|r| {
             r.kind != 0

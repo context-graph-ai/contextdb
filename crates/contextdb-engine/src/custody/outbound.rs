@@ -9,8 +9,10 @@ pub(crate) fn units(
     changes: ChangeSet,
     confirmed: Lsn,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<OutboundSyncUnit>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut manifests = Vec::new();
     let mut seen = BTreeSet::new();
     for row in &changes.rows {

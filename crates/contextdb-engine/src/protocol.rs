@@ -742,8 +742,10 @@ pub(crate) fn encode_for_version_with_read_owner<T: Serialize>(
     version: u8,
     message_type: MessageType,
     message: &T,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<(Vec<u8>, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if !supports_protocol_version(version) {
         return Err(contextdb_core::Error::SyncError((
             SyncError::ProtocolVersionMismatch {

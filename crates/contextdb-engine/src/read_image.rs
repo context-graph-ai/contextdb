@@ -42,7 +42,7 @@ pub(crate) struct CommittedImage {
     pub(crate) target: Arc<dyn ReadExecutionTarget>,
     pub(crate) image: Arc<DirectOwnedImage>,
     pub(crate) digest: DirectTypedImageDigest,
-    pub(crate) memory: Arc<crate::read_image_memory::ImageMemory>,
+    pub(crate) memory: crate::read_image_memory::ImageMemoryHandle,
 }
 
 /// What a read session declared about who it reads as and which part of the
@@ -70,12 +70,12 @@ impl crate::persistence::ReadPersistenceImage {
     /// with the owned projection and identity that ride alongside it.
     pub(crate) fn into_committed_image(
         self,
-        retained_source: Arc<crate::persistence::RetainedReadSource>,
+        retained_source: crate::persistence::RetainedReadSource,
         memory_limit: Option<usize>,
         contexts: Option<BTreeSet<ContextId>>,
         scope_labels: Option<BTreeSet<ScopeLabel>>,
         principal: Option<Principal>,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     ) -> std::result::Result<CommittedImage, DirectFileReaderError> {
         build_committed_image(
             self.into_runtime_parts(retained_source),
@@ -95,7 +95,7 @@ fn build_committed_image(
     parts: ReadPersistenceImageParts,
     memory_limit: Option<usize>,
     declared: DeclaredReadVisibility,
-    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+    declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
 ) -> Result<CommittedImage> {
     let digest = parts.content_identity.clone();
     let memory = parts.memory.clone();
@@ -246,7 +246,7 @@ pub(crate) fn history_answer_error(error: Error) -> DirectFileReaderError {
     match error {
         Error::StoreCorrupted { path, reason } => DirectFileReaderError::CorruptStore(
             crate::direct_file_reader::DirectStoreDiagnostic::MalformedRecord,
-            format!("store {path} is corrupt: {reason}"),
+            format!("store {path} is corrupt: {reason}").into(),
         ),
         Error::MemoryBudgetExceeded {
             subsystem,
@@ -256,16 +256,19 @@ pub(crate) fn history_answer_error(error: Error) -> DirectFileReaderError {
             budget_limit_bytes,
             hint,
         } => DirectFileReaderError::MemoryBudget {
-            subsystem: subsystem.into_owned(),
-            operation: operation.into_owned(),
+            subsystem,
+            operation,
             requested_bytes,
             available_bytes,
             budget_limit_bytes,
-            hint: hint.into_owned(),
+            hint,
         },
         Error::ReadCancelled => DirectFileReaderError::Cancelled,
         Error::ReadFailure(failure) => DirectFileReaderError::ReadFailure(failure),
-        other => DirectFileReaderError::Engine(other.to_string()),
+        Error::Other(reason) => DirectFileReaderError::Engine(reason),
+        Error::NativeEngineOther(refusal) => DirectFileReaderError::Engine(refusal.into()),
+        Error::FundedEngine(owner) => DirectFileReaderError::Engine(owner.into()),
+        other => DirectFileReaderError::Engine(other.to_string().into()),
     }
 }
 
@@ -276,7 +279,7 @@ fn image_history_answer_error(error: crate::database::ImageHistoryError) -> Dire
     match error {
         crate::database::ImageHistoryError::Engine(error) => history_answer_error(error),
         crate::database::ImageHistoryError::Store { diagnosis, .. } => {
-            (*diagnosis).into_direct_reader_error()
+            diagnosis.into_direct_reader_error()
         }
     }
 }
@@ -320,7 +323,7 @@ pub(crate) fn answer_encoded_for_test() {
 /// the answer itself is not, and it stays charged for as long as its
 /// response is held.
 fn settle_answer_charge(
-    charge: &Arc<crate::read_image_memory::ImageMemory>,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
     retained: usize,
 ) -> Result<()> {
     let held = charge.held();
@@ -341,7 +344,7 @@ fn settle_answer_charge(
 pub(crate) fn project_change_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &Arc<crate::read_image_memory::ImageMemory>,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
 ) -> std::result::Result<DirectChangeState, DirectFileReaderError> {
     // The history is read here, with its refusal reported, before the
     // inspection below that would answer an unreadable history as empty.
@@ -361,9 +364,11 @@ pub(crate) fn project_change_state(
 fn project_loaded_change_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &Arc<crate::read_image_memory::ImageMemory>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<DirectChangeState> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let admit = |bytes: usize| charge.reserve(bytes);
     let release = |bytes: usize| {
         charge.release(bytes);
@@ -448,7 +453,7 @@ fn change_state_bytes(state: &DirectChangeState) -> usize {
 pub(crate) fn project_sync_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &Arc<crate::read_image_memory::ImageMemory>,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
 ) -> std::result::Result<DirectSyncState, DirectFileReaderError> {
     let read_memory = match charge.reader_budget() {
         Some(memory) => memory,
@@ -465,7 +470,7 @@ pub(crate) fn project_sync_state(
 fn project_loaded_sync_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
-    charge: &Arc<crate::read_image_memory::ImageMemory>,
+    charge: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<DirectSyncState> {
     let admit = |bytes: usize| charge.reserve(bytes);
     let release = |bytes: usize| {
@@ -1389,13 +1394,13 @@ pub(crate) fn write_metadata_body(
             bytes
                 .tag(6)
                 .flag(*has_more)
-                .text(&serde_json::to_string(counts).expect("finite custody counts serialize"));
+                .json_text(counts);
         }
         DirectMetadataBody::DeliveryOutcome { outcome, has_more } => {
             bytes
                 .tag(7)
                 .flag(*has_more)
-                .text(&serde_json::to_string(outcome).expect("custody projection serializes"));
+                .json_text(outcome);
         }
         DirectMetadataBody::Tables { items, has_more } => {
             bytes.tag(0).count(items.len() as u64);
@@ -2367,13 +2372,15 @@ fn write_events(bytes: &mut crate::read_contract::CanonicalWriter, events: &Dire
 /// answered emptily -- see [`project_metadata`] for the image's own version.
 pub(crate) fn project_metadata_from_database(
     database: &Database,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     request: DirectMetadataRequest,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     continuation: Option<&str>,
     cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<(DirectMetadataBody, Option<String>), DirectFileReaderError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let _read_scope = database.enter_writer_read(None, read_memory.clone());
     // An inventory is bounded a page at a time by the pager below. Everything
     // else arrives whole, so whether it fits is decided once it is built.
@@ -2390,6 +2397,7 @@ pub(crate) fn project_metadata_from_database(
         }
         DirectMetadataRequest::Tables => {
             let page = paged(
+                read_memory.clone(),
                 MetadataPageVocabulary::Tables,
                 crate::metadata_page::table_items(database.table_names()),
                 continuation,
@@ -2404,7 +2412,7 @@ pub(crate) fn project_metadata_from_database(
         }
         DirectMetadataRequest::Schema { table } => {
             let meta = database.table_meta(&table).ok_or_else(|| {
-                DirectFileReaderError::Engine(format!("table not found: {table}"))
+                engine_message(read_memory.clone(), format_args!("table not found: {table}"))
             })?;
             DirectMetadataBody::Schema {
                 schema: project_schema(&table, &meta),
@@ -2421,6 +2429,7 @@ pub(crate) fn project_metadata_from_database(
         )?,
         DirectMetadataRequest::EventsStatus => {
             let page = paged(
+                read_memory.clone(),
                 MetadataPageVocabulary::EventsStatus,
                 crate::metadata_page::event_status_items(
                     &database.event_bus_status(),
@@ -2470,7 +2479,7 @@ pub(crate) fn project_metadata_from_database(
         // this projection; this arm keeps the match honest if it ever does.
         DirectMetadataRequest::ImageState { .. } => {
             return Err(DirectFileReaderError::Engine(
-                "the state of a committed image is a question about a file".to_owned(),
+                "the state of a committed image is a question about a file".into(),
             ));
         }
     };
@@ -2502,7 +2511,7 @@ pub(crate) fn image_state_is_a_file_question() -> Error {
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
 pub(crate) fn project_metadata(
     target: &dyn ReadExecutionTarget,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     request: DirectMetadataRequest,
     image: &DirectOwnedImage,
     limits: ReadLimits,
@@ -2510,6 +2519,8 @@ pub(crate) fn project_metadata(
     continuation: Option<&str>,
     cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<DirectMetadataResponse, DirectFileReaderError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let arrives_whole = !matches!(
         request,
         DirectMetadataRequest::Tables | DirectMetadataRequest::EventsStatus
@@ -2557,6 +2568,7 @@ pub(crate) fn project_metadata(
             // Cut by the same pager the owner uses, so an inventory read from
             // the file breaks at exactly the places it breaks over a channel.
             let page = paged(
+                read_memory.clone(),
                 MetadataPageVocabulary::Tables,
                 crate::metadata_page::table_items(
                     image
@@ -2584,7 +2596,7 @@ pub(crate) fn project_metadata(
                 .find(|schema| schema.table == table)
                 .cloned()
                 .ok_or_else(|| {
-                    DirectFileReaderError::Engine(format!("table not found: {table}"))
+                    engine_message(read_memory.clone(), format_args!("table not found: {table}"))
                 })?;
             DirectMetadataBody::Schema { schema }
         }
@@ -2599,6 +2611,7 @@ pub(crate) fn project_metadata(
         )?,
         DirectMetadataRequest::EventsStatus => {
             let page = paged(
+                read_memory.clone(),
                 MetadataPageVocabulary::EventsStatus,
                 crate::metadata_page::event_status_items_of(&image.events),
                 continuation,
@@ -2651,12 +2664,17 @@ pub(crate) fn project_metadata(
         {
             return Err(DirectFileReaderError::ReadFailure(failure));
         }
-        charge.reserve(encoded_len).map_err(history_answer_error)?;
     }
     if reads_history {
         history_checkpoint().map_err(history_answer_error)?;
     }
-    let canonical_bytes = crate::read_contract::encode_metadata_body_measured(&body, encoded_len);
+    let encoding_diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared::<crate::read_contract::ReadEncodingError>(
+        read_memory.clone(), "reader", "encode_metadata", "Raise the reader memory limit to encode metadata.")
+        .map_err(history_answer_error)?;
+    let canonical_bytes = crate::read_contract::encode_metadata_body_funded(
+        &body, read_memory, limits.memory,
+    ).and_then(|bytes| crate::read_contract::EncodedReadBytes::from_funded(bytes, limits.memory))
+        .map_err(|error| DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(encoding_diagnostic.publish(error))))?;
     if reads_history {
         // A request cancelled, or out of active time, while its answer was
         // being encoded is refused rather than answered.
@@ -2701,16 +2719,20 @@ fn configuration_state_bytes(configuration: &DirectConfigurationState) -> usize 
 /// count and route this answer reports.
 pub(crate) fn explained_statement(
     target: &dyn ReadExecutionTarget,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     sql: String,
     params: &HashMap<String, Value>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<DirectMetadataBody, DirectFileReaderError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let parse_diagnostic = crate::direct_file_reader::PreparedEngineDiagnostic::new(read_memory.clone()).map_err(history_answer_error)?;
     let statement = contextdb_parser::parse(&sql)
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
+        .map_err(|error| parse_diagnostic.engine(error))?;
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+    let explain_diagnostic = crate::direct_file_reader::PreparedEngineDiagnostic::new(read_memory.clone()).map_err(history_answer_error)?;
     let explained = target
         .explain_output_without_running_it(
             &sql,
@@ -2718,7 +2740,7 @@ pub(crate) fn explained_statement(
             &mut vector_copy_owner,
             read_memory.clone(),
         )
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
+        .map_err(|error| explain_diagnostic.engine(error))?;
     if contextdb_parser::statement_effect(&statement) != contextdb_parser::StatementEffect::Read
         || explained.vector_search.is_some()
     {
@@ -2740,12 +2762,16 @@ pub(crate) fn explained_statement(
 
 /// One page of an inventory, cut by the shared pager.
 fn paged(
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     vocabulary: MetadataPageVocabulary,
     items: Vec<contextdb_core::read_contract::MetadataItem>,
     continuation: Option<&str>,
     page_bytes: u64,
     key: fn(&contextdb_core::read_contract::MetadataItem) -> String,
 ) -> std::result::Result<contextdb_core::read_contract::MetadataPage, DirectFileReaderError> {
+    let diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared::<crate::read_contract::ReadEncodingError>(
+        read_memory, "reader", "metadata_page", "Raise the reader memory limit to encode this page.")
+        .map_err(history_answer_error)?;
     crate::metadata_page::continuation_page(vocabulary, items, continuation, page_bytes, key)
         .map_err(|error| match error {
             // A misused continuation and a page that cannot fit are both
@@ -2756,7 +2782,7 @@ fn paged(
                 DirectFileReaderError::ReadFailure(failure)
             }
             crate::metadata_page::MetadataPagingError::Encoding(encoding) => {
-                DirectFileReaderError::Engine(encoding.to_string())
+                DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(diagnostic.publish(encoding)))
             }
         })
 }
@@ -2770,9 +2796,8 @@ fn admit_complete(
     body: &DirectMetadataBody,
     result_bytes: u64,
 ) -> std::result::Result<(), DirectFileReaderError> {
-    let payload = crate::read_contract::encode_metadata_body(body)
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
-    match crate::metadata_page::admit_complete_metadata(payload.len(), result_bytes) {
+    let encoded_len = crate::read_contract::encoded_metadata_body_len(body);
+    match crate::metadata_page::admit_complete_metadata(encoded_len, result_bytes) {
         Some(failure) => Err(DirectFileReaderError::ReadFailure(failure)),
         None => Ok(()),
     }
@@ -2799,4 +2824,12 @@ pub(crate) fn request_checkpoint(
         )));
     }
     Ok(())
+}
+
+fn engine_message(owner: contextdb_core::read_memory::ReadMemoryOwner,
+    value: impl std::fmt::Display) -> DirectFileReaderError {
+    match crate::funded_error::diagnostic_text(owner, value) {
+        Ok(text) => DirectFileReaderError::Engine(text),
+        Err(error) => history_answer_error(error),
+    }
 }

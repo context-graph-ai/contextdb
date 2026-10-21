@@ -3,7 +3,7 @@ use super::graph_history_record::*;
 use super::*;
 
 thread_local! {
-    static ORIGINAL_GRAPH_MEMORY: std::cell::RefCell<Option<(usize,Arc<crate::read_image_memory::ImageMemory>)>> = const {
+    static ORIGINAL_GRAPH_MEMORY: std::cell::RefCell<Option<(usize,crate::read_image_memory::ImageMemoryHandle)>> = const {
         std::cell::RefCell::new(None)
     };
 }
@@ -12,8 +12,8 @@ thread_local! {
 /// inner image controls and this record's original-derived lease are gone.
 pub(super) struct OriginalGraphWindow<'a,'o> {
     scope: Option<crate::read_image_memory::ImageMemoryScope>,
-    previous: Option<(usize,Arc<crate::read_image_memory::ImageMemory>)>,
-    _memory: Arc<crate::read_image_memory::ImageMemory>,
+    previous: Option<(usize,crate::read_image_memory::ImageMemoryHandle)>,
+    _memory: crate::read_image_memory::ImageMemoryHandle,
     _store: &'a RedbPersistence,
     _frame: &'a OriginalPersistenceFrame<'o>,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -33,10 +33,10 @@ const MATCH_FINAL: TableDefinition<&[u8], &[u8]> =
 const MATCH_CONSUMED: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("graph_history_match_consumed_scratch");
 
-fn corrupt(reason: impl Into<String>) -> Error {
+fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "graph_history".into(),
-        reason: reason.into(),
+        reason: reason.into().into(),
     }
 }
 fn lifecycle(bytes: &[u8]) -> Result<(TxId, u64, u8)> {
@@ -147,15 +147,9 @@ impl RedbPersistence {
             .filter(|(host,_)| *host == self as *const Self as usize).map(|(_,memory)| memory.clone())) {
             return memory.scope(f);
         }
-        let memory = match self.proof_accountant() {
-            Some(accountant) => crate::read_image_memory::ImageMemory::charging_for(
-                accountant,
-                "writer_source",
-                "graph_history_window",
-                "Raise MEMORY_LIMIT to admit graph history publication.",
-            ),
-            None => crate::read_image_memory::ImageMemory::new(None),
-        };
+        let memory = crate::read_image_memory::ImageMemory::funded_for_original(
+            self.require_decode_original()?, "writer_source", "graph_history_window",
+            "Raise MEMORY_LIMIT to admit graph history publication.")?;
         memory.scope(f)
     }
     fn connected_graph_end_in_write(write: &redb::WriteTransaction, lsn: Lsn) -> Result<Option<Lsn>> {
@@ -1361,15 +1355,9 @@ impl RedbPersistence {
         }
         let mut after = None::<[u8; 8]>;
         loop {
-            let memory = match self.proof_accountant() {
-                Some(a) => crate::read_image_memory::ImageMemory::charging_for(
-                    a,
-                    "writer_source",
-                    "history_correspondence",
-                    "Raise MEMORY_LIMIT to match this history occurrence.",
-                ),
-                None => crate::read_image_memory::ImageMemory::new(None),
-            };
+            let memory = crate::read_image_memory::ImageMemory::funded_for_original(
+                self.require_decode_original()?, "writer_source", "history_correspondence",
+                "Raise MEMORY_LIMIT to match this history occurrence.")?;
             let next = memory.scope(|| {
                 let finals = write.open_table(MATCH_FINAL).map_err(Self::storage_error)?;
                 let mut range = finals
@@ -1464,15 +1452,9 @@ impl RedbPersistence {
         // never in this domain.
         let mut after = None::<[u8; 16]>;
         loop {
-            let memory = match self.proof_accountant() {
-                Some(a) => crate::read_image_memory::ImageMemory::charging_for(
-                    a,
-                    "writer_source",
-                    "history_detach",
-                    "Raise MEMORY_LIMIT to publish this history occurrence.",
-                ),
-                None => crate::read_image_memory::ImageMemory::new(None),
-            };
+            let memory = crate::read_image_memory::ImageMemory::funded_for_original(
+                self.require_decode_original()?, "writer_source", "history_detach",
+                "Raise MEMORY_LIMIT to publish this history occurrence.")?;
             let next = memory.scope(|| {
                 let source = write
                     .open_table(if whole {

@@ -44,8 +44,10 @@ impl MemoryErasureFrontiers {
     pub(super) fn copy_into(
         &self,
         destination: &RedbPersistence,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let Some(root) = &self.0 else {
             return Ok(());
         };

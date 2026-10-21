@@ -717,7 +717,12 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // persisted encodings (a_truncated_or_overlong_stored_vector_is_refused_as_corruption).
     // Serializer cleanup coverage (+22): 13 runtime cleanup journeys, four
     // last-reader cleanup units and five purge-publication cleanup units.
-    ("contextdb-engine", 4954, RSN_TEST_COUNT),
+    // Inventory (+4): a fresh snapshot pin captures its own physical root (1),
+    // and plugin, decoder and overlapping storage failures retain their original
+    // diagnosis and paid storage through final release (3).
+    // Inventory (+1): historical vector public queries reject damaged selected-root
+    // companions and global controls while retained healthy roots still answer.
+    ("contextdb-engine", 4959, RSN_TEST_COUNT),
     //  - Inventory (+6): an oversized pending unit pushes from a reopened source whose read
     //    limit is smaller than the unit, the hub refuses a unit its writer can never fit before
     //    it transfers, a transiently refused unit stays pending and lands on retry, and a second

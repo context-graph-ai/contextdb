@@ -2160,9 +2160,9 @@ struct Pre2Database {
     image_history: Option<Arc<ImageHistory>>,
     /// Descriptor-backed relational pages for a committed image whose rows
     /// were deliberately left out of memory at open.
-    retained_relational_source: Option<Arc<crate::persistence::RetainedReadSource>>,
+    retained_relational_source: Option<crate::persistence::RetainedReadSource>,
     // Descriptor-backed graph pages retained for the committed image.
-    retained_graph_source: Option<Arc<crate::persistence::RetainedReadSource>>,
+    retained_graph_source: Option<crate::persistence::RetainedReadSource>,
     /// Engine-owned media repository. File-backed databases share their
     /// existing Redb; memory databases own a temporary file-backed Redb so
     /// large media never becomes process-resident merely because rows do.
@@ -2235,7 +2235,7 @@ struct Pre2Database {
     owner_thread: thread::ThreadId,
     plugin: Arc<dyn DatabasePlugin>,
     owner_read_config: Arc<OwnerReadConfig>,
-    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+    declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     /// The live owner-inspection service this open started, when it started
     /// one. It holds a shared handle onto the same stores rather than this
     /// value, so releasing the database releases the service with it.
@@ -2443,7 +2443,7 @@ struct Pre2Database {
     finalization: Arc<StoreFinalization>,
     // Last to drop: every derived execution target owns the image admission
     // until its stores and suspended reads have released their allocations.
-    read_image_memory: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    read_image_memory: Option<crate::read_image_memory::ImageMemoryHandle>,
 }
 
 #[cfg(test)]

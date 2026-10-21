@@ -47,10 +47,7 @@ impl RedbPersistence {
         // neither decoded history nor a table-sized key list is materialized.
         for entry in source.iter().map_err(Self::storage_error)? {
             let (key, value) = entry.map_err(Self::storage_error)?;
-            let raw: [u8; 24] = key.value().try_into().map_err(|_| Error::StoreCorrupted {
-                path: logical.into(),
-                reason: "invalid authored row key".into(),
-            })?;
+            let raw: [u8; 24] = key.value().try_into().map_err(|_| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), logical, "invalid authored row key".into()))?;
             let mut admission = self.proof_admission();
             admission.admit(logical.len().saturating_mul(2).saturating_add(128))?;
             let addressed = body_key(logical, &raw);
@@ -115,21 +112,19 @@ impl RedbPersistence {
                         || record.index != index || record.partition_key != partition
                         || record.row_id != row.row_id || record.row_created_tx != row.created_tx
                         || record.row_lsn != row.lsn {
-                        return Err(Error::StoreCorrupted { path: table.into(), reason: "authored vector placement names another occurrence".into() });
+                        return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), table, "authored vector placement names another occurrence".into()));
                     }
                     Ok(record)
                 }).transpose()?;
                 if entries.next().transpose().map_err(Self::storage_error)?
                     .is_some_and(|(key, _)| key.value().starts_with(&prefix)) {
-                    return Err(Error::StoreCorrupted { path: table.into(), reason: "authored vector occurrence has duplicate placements".into() });
+                    return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), table, "authored vector occurrence has duplicate placements".into()));
                 }
                 Ok(membership)
             })?;
             let Some(membership) = membership else { continue; };
             let mut bodies = self.load_vector_entries_for_memberships(&[membership], dimension, Some(column.quantization))?;
-            let body = bodies.pop().ok_or_else(|| Error::StoreCorrupted {
-                path: table.into(), reason: "authored vector placement lost its canonical body".into(),
-            })?;
+            let body = bodies.pop().ok_or_else(|| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), table, "authored vector placement lost its canonical body".into()))?;
             row.values.insert(column.name.clone(), Value::Vector(body.vector));
         }
         Ok(())

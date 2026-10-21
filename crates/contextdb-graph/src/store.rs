@@ -134,8 +134,10 @@ impl GraphStore {
     pub fn capture_source(
         &self,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Arc<dyn GraphSnapshot>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.source
             .as_ref()
             .map(|source| source.capture(snapshot, read_memory))

@@ -53,9 +53,11 @@ impl Database {
         &self,
         since: Lsn,
         page_bytes: usize,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         inspect: impl FnOnce(&ChangeSet, Option<Lsn>) -> T,
     ) -> Result<T> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut vector_copy = crate::vector_read_memory::admission(read_memory.clone());
         let mut credit = ReadCredit::new(read_memory.clone());
         let through = std::cell::Cell::new(None);
@@ -79,8 +81,10 @@ impl Database {
 
     pub(super) fn capture_resident_pull_history(
         &self,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ResidentHistoryGuard> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let slot = self.snapshot_registry.acquire_pin_slot(memory)?;
         #[cfg(any(test, feature = "test-seams"))]
         self.snapshot_registry.pull_capture_test_pause.maybe_pause();
@@ -124,7 +128,7 @@ pub(super) struct ResidentHistoryCursor<T> {
     position: Option<(Lsn, usize)>,
     lsn: fn(&T) -> Lsn,
     copy_bytes: fn(&T) -> usize,
-    memory: Arc<dyn ReadMemoryBudget>,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
 }
 
 impl<T: Clone> ResidentHistoryCursor<T> {
@@ -135,8 +139,10 @@ impl<T: Clone> ResidentHistoryCursor<T> {
         end: Option<(Lsn, usize)>,
         lsn: fn(&T) -> Lsn,
         copy_bytes: fn(&T) -> usize,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Self {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         Self {
             entries,
             since,

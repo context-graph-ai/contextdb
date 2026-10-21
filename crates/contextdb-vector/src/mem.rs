@@ -745,6 +745,33 @@ pub fn with_selected_partition_prefixes<T>(
     operation()
 }
 
+// capture969 begin
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static TRACE_HANDOFF_CUT: std::cell::Cell<Option<fn(&'static str, usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn set_trace_handoff_observer_for_test(callback: Option<fn(&'static str, usize, usize, usize)>) {
+    TRACE_HANDOFF_CUT.with(|slot| slot.set(callback));
+}
+#[cfg(feature = "test-seams")]
+pub(crate) fn trace_handoff_cut_for_test(site: &'static str, address: usize, bytes: usize, payer: usize) {
+    if let Some(callback) = TRACE_HANDOFF_CUT.with(std::cell::Cell::get) {
+        callback(site, address, bytes, payer);
+    }
+}
+#[cfg(feature = "test-seams")]
+struct TracePendingBoundaryForTest((usize, usize, usize));
+#[cfg(feature = "test-seams")]
+impl Drop for TracePendingBoundaryForTest {
+    fn drop(&mut self) {
+        // Saved scalar address is an observation, never dereferenced here.
+        trace_handoff_cut_for_test("pending-scope-exit", self.0.0, self.0.1, self.0.2);
+    }
+}
+// capture969 end
 /// Scores and their store charge have one owner, including while a caller ranks
 /// or consumes them. Capacity is admitted before allocation and never grows
 /// through an uncharged `Vec::push`.
@@ -760,19 +787,21 @@ pub struct SearchScores {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ScoreCredit {
-    budget: Arc<dyn MemoryBudget>,
+    budget: crate::memory_budget::MemoryBudgetOwner,
     bytes: usize,
     _control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 impl ScoreCredit {
-    fn holding(budget: Arc<dyn MemoryBudget>, bytes: usize) -> Self {
+    fn holding(budget: impl Into<crate::memory_budget::MemoryBudgetOwner>, bytes: usize) -> Self {
+        let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
+
         let control_invoice = budget.control_invoice();
         Self { budget, bytes, _control_invoice: control_invoice }
     }
 }
 
 impl crate::PrepaidVectorCopyCharge for ScoreCredit {
-    fn accountant(&self) -> Arc<dyn MemoryBudget> {
+    fn accountant(&self) -> crate::memory_budget::MemoryBudgetOwner {
         self.budget.clone()
     }
     fn retained_bytes(&self) -> usize {
@@ -785,16 +814,23 @@ impl crate::PrepaidVectorCopyCharge for ScoreCredit {
 
 impl Drop for ScoreCredit {
     fn drop(&mut self) {
+// capture969 begin
+        #[cfg(feature = "test-seams")]
+        trace_handoff_cut_for_test("score-credit-drop", self as *const Self as usize,
+            self.bytes, self.budget.stable_funder_identity());
+// capture969 end
         self.budget.release(self.bytes);
     }
 }
 
 impl SearchScores {
-    pub fn new(index: &VectorIndexRef, budget: Arc<dyn MemoryBudget>) -> Result<Self> {
+    pub fn new(index: &VectorIndexRef, budget: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Result<Self> {
+        let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
+
         let (index, bytes) = allocate_vector_index(
             index,
             &mut |bytes| {
-                budget.try_allocate_for(
+                budget.try_allocate_for_static(
                     bytes,
                     "vector_search",
                     "score_identity",
@@ -815,7 +851,7 @@ impl SearchScores {
     /// must consume this charge through the matched prepaid admission bridge.
     pub fn into_prepaid(
         self,
-        destination: &Arc<dyn MemoryBudget>,
+        destination: &crate::memory_budget::MemoryBudgetOwner,
     ) -> Result<(Vec<(RowId, f32)>, ScoreCredit)> {
         if !crate::memory_budget::same_funder(destination.as_ref(), self.credit.budget.as_ref()) {
             return Err(Error::Other(
@@ -827,9 +863,11 @@ impl SearchScores {
     fn from_charged(
         rows: Vec<(RowId, f32)>,
         index: &VectorIndexRef,
-        budget: Arc<dyn MemoryBudget>,
+        budget: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         bytes: usize,
     ) -> Result<Self> {
+        let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
+
         // Attach ownership before a fallible additional identity allocation.
         let mut scores = Self {
             rows,
@@ -840,7 +878,7 @@ impl SearchScores {
         let (index, index_bytes) = allocate_vector_index(
             index,
             &mut |bytes| {
-                scores.credit.budget.try_allocate_for(
+                scores.credit.budget.try_allocate_for_static(
                     bytes,
                     "vector_search",
                     "score_identity",
@@ -1589,6 +1627,60 @@ pub struct VectorSearchBudgetReceipt {
     pub budget_terminal: &'static str,
 }
 
+/// Fixed borrowed invoice. Zero-capacity buffers have no native allocation.
+/// The Arc payload address is an identity, NOT an invented Arc allocation Layout.
+#[cfg(feature = "test-seams")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct TraceInvoiceForTest {
+    // table, column, routes, candidates, final rows, selected generations
+    pub allocations: [(usize, usize, usize); 6],
+    pub capacities: [usize; 6],
+    pub original_payer: usize,
+    pub forwarding_payer: usize,
+    pub owner_control_invoice_present: bool,
+    pub owner_payload_pointer: usize,
+    pub prepaid_control: (usize, usize, usize),
+    pub prepaid_bytes: usize,
+    pub additional_bytes: usize,
+    pub prepaid_control_bytes: usize,
+    pub score_credit_bytes: usize,
+    pub admission_control_invoice_present: bool,
+}
+#[cfg(feature = "test-seams")]
+impl TraceInvoiceForTest {
+    pub fn payload_layout_bytes(&self) -> usize {
+        self.allocations.iter().map(|allocation| allocation.1).sum()
+    }
+    /// Trace carrier debit only. The provider Arc and its external native
+    /// keeper are separate allocations; this partial receipt excludes them.
+    /// Qualification must also reconcile their actual allocator requests.
+    pub fn complete_debit(&self) -> usize {
+        self.prepaid_bytes + self.additional_bytes + self.prepaid_control_bytes + self.score_credit_bytes
+    }
+}
+#[cfg(feature = "test-seams")]
+fn trace_capacities_for_test(trace: &VectorSearchDebugTrace) -> [usize; 6] {
+    [trace.index.table.capacity(), trace.index.column.capacity(),
+        trace.partition_routes.capacity(), trace.hnsw_candidate_row_ids.capacity(),
+        trace.final_row_ids.capacity(), trace.selected_generations.capacity()]
+}
+#[cfg(feature = "test-seams")]
+fn trace_allocations_for_test(trace: &VectorSearchDebugTrace) -> [(usize, usize, usize); 6] {
+    fn buffer<T>(pointer: *const T, capacity: usize) -> (usize, usize, usize) {
+        let layout = std::alloc::Layout::array::<T>(capacity).unwrap();
+        (pointer as usize, layout.size(), layout.align())
+    }
+    [
+        buffer(trace.index.table.as_ptr(), trace.index.table.capacity()),
+        buffer(trace.index.column.as_ptr(), trace.index.column.capacity()),
+        buffer(trace.partition_routes.as_ptr(), trace.partition_routes.capacity()),
+        buffer(trace.hnsw_candidate_row_ids.as_ptr(), trace.hnsw_candidate_row_ids.capacity()),
+        buffer(trace.final_row_ids.as_ptr(), trace.final_row_ids.capacity()),
+        buffer(trace.selected_generations.as_ptr(), trace.selected_generations.capacity()),
+    ]
+}
+
 /// Public materialized trace and the executing owner's retained charge.
 /// Borrowed observations cannot deep-clone the admitted trace.
 #[derive(Debug)]
@@ -1605,14 +1697,36 @@ impl OwnedVectorSearchTrace {
     #[doc(hidden)]
     pub fn from_admitted(
         trace: VectorSearchDebugTrace,
-        executing_owner: Arc<dyn MemoryBudget>,
+        executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         admission: crate::VectorCopyAdmission,
     ) -> OwnedVectorSearchTrace {
+        let executing_owner: crate::memory_budget::MemoryBudgetOwner = executing_owner.into();
+
         OwnedVectorSearchTrace {
             trace,
             credit: ScoreCredit::holding(executing_owner, 0),
             admission: Some(admission),
         }
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    // Visit the actual retained payer only for proofs that already pin it.
+    // Scalar-only observations pass a no-op and acquire no ownership.
+    pub fn complete_invoice_for_test(&self,
+        visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner)) -> TraceInvoiceForTest {
+        let mut receipt = TraceInvoiceForTest {
+            allocations: trace_allocations_for_test(&self.trace),
+            capacities: trace_capacities_for_test(&self.trace),
+            score_credit_bytes: self.credit.bytes,
+            ..Default::default()
+        };
+        if let Some(admission) = self.admission.as_ref() {
+            if let Some(original) = admission.complete_invoice_for_test(&mut receipt) {
+                visit(original);
+            }
+        }
+        receipt
     }
 
     pub fn hnsw_len(&self) -> Option<usize> {
@@ -1654,8 +1768,10 @@ impl OwnedVectorSearchTrace {
         reason: &'static str,
         hnsw_len: Option<usize>,
         routes: Vec<VectorPartitionSearchTrace>,
-        budget: Arc<dyn MemoryBudget>,
+        budget: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<Self> {
+        let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
+
         Self::brute_force_with_owner(
             index,
             rows,
@@ -1710,7 +1826,9 @@ impl OwnedVectorSearchTrace {
         })
     }
 
-    fn from_charged(trace: BoundedVectorSearchTrace, budget: Arc<dyn MemoryBudget>) -> Self {
+    fn from_charged(trace: BoundedVectorSearchTrace, budget: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Self {
+        let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
+
         let bytes = trace.retained_bytes();
         Self {
             trace: trace.into_trace(),
@@ -1725,7 +1843,7 @@ impl OwnedVectorSearchTrace {
             "exact trace final rows",
             &mut || Ok::<(), Error>(()),
             &mut |bytes| {
-                self.credit.budget.try_allocate_for(
+                self.credit.budget.try_allocate_for_static(
                     bytes,
                     "vector_search",
                     "trace",
@@ -1765,7 +1883,7 @@ impl OwnedVectorSearchTrace {
     /// against its actual owner and adopts the charge exactly once before transfer.
     pub fn into_prepaid(
         mut self,
-        destination: &Arc<dyn MemoryBudget>,
+        destination: &crate::memory_budget::MemoryBudgetOwner,
     ) -> Result<(VectorSearchDebugTrace, ScoreCredit)> {
         if !crate::memory_budget::same_funder(destination.as_ref(), self.credit.budget.as_ref()) {
             return Err(Error::Other(
@@ -2131,6 +2249,17 @@ pub struct BoundedVectorSearchTrace {
 }
 
 impl BoundedVectorSearchTrace {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn allocation_invoice_for_test(&self) -> TraceInvoiceForTest {
+        TraceInvoiceForTest {
+            allocations: trace_allocations_for_test(&self.trace),
+            capacities: trace_capacities_for_test(&self.trace),
+            prepaid_bytes: self.retained_bytes,
+            ..Default::default()
+        }
+    }
+
     /// Bytes admitted for this trace, already included in the owning result's
     /// `retained_bytes`.
     pub fn retained_bytes(&self) -> usize {
@@ -2167,29 +2296,42 @@ impl BoundedVectorSearchTrace {
     /// token until output drop or a consuming matched destination transfer.
     pub fn into_owned<C: crate::PrepaidVectorCopyCharge + 'static>(
         self,
-        executing_owner: Arc<dyn MemoryBudget>,
+        executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         charge: C,
     ) -> Result<OwnedVectorSearchTrace> {
-        if charge.retained_bytes() < self.retained_bytes {
-            drop(self);
-            drop(charge);
+        let executing_owner: crate::memory_budget::MemoryBudgetOwner = executing_owner.into();
+
+        // Field order also covers provider callback unwind: destroy the real
+        // buffers before returning the prepaid payload invoice to its funder.
+        struct PendingTrace<C> {
+            trace: BoundedVectorSearchTrace,
+            charge: Option<C>,
+        }
+        let mut pending = PendingTrace { trace: self, charge: Some(charge) };
+// capture969 begin
+        #[cfg(feature = "test-seams")]
+        let _pending_boundary = {
+            let charge = pending.charge.as_ref().unwrap();
+            let tuple = (charge.credit_address_for_test(), charge.retained_bytes(),
+                charge.original_payer_identity_for_test());
+            trace_handoff_cut_for_test("pending-credit", tuple.0, tuple.1, tuple.2);
+            TracePendingBoundaryForTest(tuple)
+        };
+// capture969 end
+        if pending.charge.as_ref().unwrap().retained_bytes() < pending.trace.retained_bytes {
+            drop(pending);
             return Err(Error::Other(
                 "vector trace prepaid charge is smaller than its retained allocation".into()));
         }
-        // Validate while both payload and prepaid owner are still here, so
-        // a rejected transfer drops the payload before returning its credit.
-        if !crate::memory_budget::same_funder(
-            executing_owner.as_ref(), charge.accountant().as_ref(),
-        ) {
-            drop(self);
-            drop(charge);
-            return Err(Error::Other(
-                "vector copy prepaid charge has a different accountant".into()));
-        }
-        let admission = crate::VectorCopyAdmission::from_prepaid(executing_owner.clone(), charge)?;
+        // Complete all provider callbacks before moving the prepaid charge.
+        // A failed Box admission leaves that charge beside the live buffers.
+        let credit = ScoreCredit::holding(executing_owner.clone(), 0);
+        let admission = crate::VectorCopyAdmission::from_prepaid_retaining_charge(
+            executing_owner, &mut pending.charge,
+        )?;
         Ok(OwnedVectorSearchTrace {
-            trace: self.trace,
-            credit: ScoreCredit::holding(executing_owner, 0),
+            trace: pending.trace.trace,
+            credit,
             admission: Some(admission),
         })
     }
@@ -3174,7 +3316,7 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
 pub struct MemVectorExecutor<S: WriteSetApplicator> {
     store: Arc<VectorStore>,
     tx_mgr: ExecutorTransactions<S>,
-    _accountant: Arc<dyn MemoryBudget>,
+    _accountant: crate::memory_budget::MemoryBudgetOwner,
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
@@ -3196,8 +3338,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         store: Arc<VectorStore>,
         transactions: contextdb_tx::manager::EngineTransactionHandle<S>,
         _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Self {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         Self {
             store,
             tx_mgr: ExecutorTransactions::Owned(transactions),
@@ -3238,8 +3382,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         store: Arc<VectorStore>,
         tx_mgr: Arc<TransactionManager<S>>,
         hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Self {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         Self::new_with_accountant(store, tx_mgr, hnsw, accountant)
     }
 
@@ -3247,8 +3393,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         store: Arc<VectorStore>,
         tx_mgr: Arc<TransactionManager<S>>,
         _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Self {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         Self {
             store,
             tx_mgr: ExecutorTransactions::Legacy(tx_mgr),
@@ -3990,14 +4138,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             })?;
             return Ok(BoundedVectorStep::Row(row_id, score));
         }
-        // Exhaustive comparison reads each page once.
+        // Exhaustive membership, authentication and body reads share the
+        // same cache-growth allowance across every resumed step and partition.
         let state = cursor
             .snapshot_sources
             .get(cursor.source_position)
             .map(|source| source.state.clone());
-        let _one_pass = state
-            .filter(|state| state.durable_membership_source().is_none())
-            .and_then(|state| state.one_pass_reads(&mut cursor.one_pass));
+        let _one_pass = state.and_then(|state| state.one_pass_reads(&mut cursor.one_pass));
 
         if let Some(candidate) = cursor.pending_score {
             if admit_row.is_some() {
@@ -7199,7 +7346,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             Ok(())
         };
         let mut partition_count = 0usize;
+        let mut session = crate::store::OnePassSession::default();
         for source in sources {
+            // Include historical/cache-load preflight in the same allowance
+            // as the streamed memberships and bodies of every partition.
+            let _one_pass = source.state.one_pass_reads(&mut session);
             let mut source_has_rows = false;
             let mut source_consider = |score| {
                 source_has_rows = true;
@@ -7317,7 +7468,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     ) -> Result<()> {
         let accountant = owner.accountant().clone();
         let mut before_retain = |bytes: usize| -> Result<()> {
-            accountant.try_allocate_for(
+            accountant.try_allocate_for_static(
                 bytes,
                 "vector_search",
                 "exhaustive_body_read",
@@ -7331,12 +7482,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         } else {
             crate::store::RawVectorBodyReads::one_pass()
         };
-        let mut session = crate::store::OnePassSession::default();
-        let _one_pass = if durable.is_none() {
-            source.state.one_pass_reads(&mut session)
-        } else {
-            None
-        };
+        // The caller holds one scan scope across preflight and every source.
         if let Some(memberships) = durable {
             let mut window = owner.scratch();
             let mut interrupted = None;
@@ -7664,8 +7810,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         mode: contextdb_core::VectorSearchMode,
-        executing_owner: Arc<dyn MemoryBudget>,
+        executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let executing_owner: crate::memory_budget::MemoryBudgetOwner = executing_owner.into();
+
         self.search_with_mode_owned(index, query, k, candidates, snapshot, mode, executing_owner)
     }
 
@@ -7678,8 +7826,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         mode: contextdb_core::VectorSearchMode,
-        executing_owner: Arc<dyn MemoryBudget>,
+        executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let executing_owner: crate::memory_budget::MemoryBudgetOwner = executing_owner.into();
+
         let route_owner = crate::VectorCopyAdmission::new(executing_owner.clone());
         self.search_with_mode_route(
             index,
@@ -7720,7 +7870,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot_mode: (SnapshotId, contextdb_core::VectorSearchMode),
-        owners: (Arc<dyn MemoryBudget>, crate::VectorCopyAdmission),
+        owners: (crate::memory_budget::MemoryBudgetOwner, crate::VectorCopyAdmission),
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
         let (snapshot, mode) = snapshot_mode;
         let (executing_owner, mut route_owner) = owners;
@@ -7876,7 +8026,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 .maybe_pause(&index, crate::test_seam::PauseWindow::Search);
             let accountant = executing_owner.clone();
             let mut before_retain = |bytes: usize| -> Result<()> {
-                accountant.try_allocate_for(
+                accountant.try_allocate_for_static(
                     bytes,
                     "vector_search",
                     "graph_scratch",
@@ -8037,8 +8187,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-        executing_owner: Arc<dyn MemoryBudget>,
+        executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let executing_owner: crate::memory_budget::MemoryBudgetOwner = executing_owner.into();
+
         self.search_with_mode(
             index,
             query,
@@ -8058,8 +8210,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-        executing_owner: Arc<dyn MemoryBudget>,
+        executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let executing_owner: crate::memory_budget::MemoryBudgetOwner = executing_owner.into();
+
         self.search_with_strategy(index, query, k, candidates, snapshot, executing_owner)
     }
 
@@ -8257,7 +8411,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 }
 
 impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
-    type SearchOwner = Arc<dyn MemoryBudget>;
+    type SearchOwner = crate::memory_budget::MemoryBudgetOwner;
     type SearchOutput = SearchScores;
     fn search(
         &self,
@@ -8892,7 +9046,7 @@ mod indexed_row_check_empty_merge_tests {
         fn apply(
             &self,
             writes: &WriteSet,
-            _read_memory: Arc<dyn ReadMemoryBudget>,
+            _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         ) -> Result<()> {
             let owner = Arc::new(NoLimit);
             let admission = crate::VectorCopyAdmission::new(owner);

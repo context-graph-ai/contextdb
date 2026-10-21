@@ -269,12 +269,37 @@ impl AllocatorPager {
 
     /// Admit the window set a `cache_bytes` share funds. A smaller set spills
     /// its surplus dirty windows to scratch before releasing them.
-    pub(super) fn set_cache_budget(&self, cache_bytes: usize) -> io::Result<()> {
+    pub(super) fn set_cache_budget(&self, cache_bytes: usize) -> crate::Result<()> {
         let capacity = Self::capacity_for_cache(cache_bytes);
         let mut inner = self.inner.lock().unwrap();
         if capacity == inner.capacity {
             return Ok(());
         }
+        // Admit all planned simultaneous replacement backings before changing
+        // the existing set. The old set/index remains paid until physical free;
+        // an allocation refusal leaves capacity, slots and windows unchanged.
+        use std::alloc::Layout;
+        let quote_array =
+            |layout: std::result::Result<Layout, std::alloc::LayoutError>| -> crate::Result<()> {
+                crate::read_admission::prepare_cache_allocation(
+                    layout.map_err(|_| StorageError::ValueTooLarge(capacity))?,
+                )
+            };
+        if capacity < inner.windows.len() {
+            quote_array(Layout::array::<Box<Window>>(inner.windows.len() - capacity))?;
+        }
+        if inner.windows.capacity() != capacity {
+            quote_array(Layout::array::<Box<Window>>(capacity))?;
+        }
+        if inner.vacant.capacity() != capacity {
+            quote_array(Layout::array::<usize>(capacity))?;
+        }
+        for _ in inner.windows.len()..capacity {
+            crate::read_admission::prepare_cache_allocation(Layout::new::<Window>())?;
+        }
+        let buckets = (2 * capacity).next_power_of_two();
+        quote_array(Layout::array::<u64>(buckets))?;
+        quote_array(Layout::array::<u32>(buckets))?;
         let mut released = Vec::new();
         if capacity < inner.windows.len() {
             // Unlink the surplus before any spill can fail, so no index or

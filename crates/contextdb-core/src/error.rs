@@ -2,6 +2,415 @@ use crate::types::{ContextId, Principal, RowId, ScopeLabel, TxId, Value, VectorI
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
+/// Text that keeps its actual producer's native storage alive. Legacy text
+/// moves without copying; the native arm retains the same original invoice.
+/// This carrier does not qualify allocations nested inside a foreign producer.
+pub struct DiagnosticText(DiagnosticTextStorage);
+enum DiagnosticTextStorage {
+    StaticParts { prefix: &'static str, text: &'static str, suffix: &'static str },
+    Unsigned { prefix: &'static str, value: u64, suffix: &'static str },
+    Text(Cow<'static, str>),
+    Native(FundedEngineError),
+    Refusal(crate::read_memory::NativeRefusal),
+}
+impl DiagnosticText {
+    /// Compose immutable text without creating engine-owned storage.
+    #[doc(hidden)]
+    pub fn from_static_parts(prefix: &'static str, text: &'static str, suffix: &'static str) -> Self {
+        Self(DiagnosticTextStorage::StaticParts { prefix, text, suffix })
+    }
+    /// A scalar diagnosis owns no heap allocation and borrows only constants.
+    #[doc(hidden)]
+    pub fn from_unsigned(prefix: &'static str, value: u64, suffix: &'static str) -> Self {
+        Self(DiagnosticTextStorage::Unsigned { prefix, value, suffix })
+    }
+
+    /// Move an already admitted native diagnostic into an outer error field.
+    /// Construction allocates nothing and preserves the original cell.
+    #[doc(hidden)]
+    pub fn from_shared<T, I>(value: crate::read_memory::ReadShared<T, I>) -> Self
+    where
+        T: std::fmt::Display + Send + Sync + 'static,
+        I: Send + Sync + 'static,
+    {
+        use crate::read_memory::ReadShared;
+        unsafe fn inspect(_: std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool) {
+            (None, false)
+        }
+        unsafe fn display<T: std::fmt::Display, I>(pointer: std::ptr::NonNull<()>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let owner = std::mem::ManuallyDrop::new(unsafe { ReadShared::<T, I>::from_raw(pointer.as_ptr().cast()) });
+            std::fmt::Display::fmt(&**owner, f)
+        }
+        unsafe fn release<T, I>(pointer: std::ptr::NonNull<()>) {
+            drop(unsafe { ReadShared::<T, I>::from_raw(pointer.as_ptr().cast()) });
+        }
+        let pointer = std::ptr::NonNull::new(value.into_raw().cast_mut().cast()).expect("native diagnostic");
+        // SAFETY: ReadShared supplies the live immutable Send+Sync payload and
+        // finalizer. Its existing NativeFreeGuard frees the block before invoices.
+        let value = unsafe { FundedEngineError::from_owned(pointer, inspect, display::<T, I>, release::<T, I>) };
+        Self(DiagnosticTextStorage::Native(value))
+    }
+    /// Borrow existing text only; deferred diagnostics are rendered by Display.
+    pub fn as_text(&self) -> Option<&str> {
+        match &self.0 { DiagnosticTextStorage::Text(text) => Some(text), _ => None }
+    }
+    pub fn static_text(&self) -> Option<&'static str> {
+        match &self.0 {
+            DiagnosticTextStorage::Text(Cow::Borrowed(text)) => Some(*text),
+            _ => None,
+        }
+    }
+    /// Inspect complete deferred text without allocating or detaching its owner.
+    pub fn contains(&self, needle: &str) -> bool {
+        if let Some(text) = self.as_text() { return text.contains(needle); }
+        if needle.is_empty() { return true; }
+        struct Search<'a> { needle: &'a [u8], matched: usize, found: bool }
+        impl std::fmt::Write for Search<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                for byte in text.bytes() {
+                    if self.found { break; }
+                    while self.matched != 0 && self.needle[self.matched] != byte {
+                        // Find the longest proper prefix that is also a suffix
+                        // of the matched prefix. Recompute from borrowed bytes;
+                        // no pattern table or diagnostic copy is allocated.
+                        self.matched = (1..self.matched).rev().find(|&length|
+                            self.needle[..self.matched].ends_with(&self.needle[..length]))
+                            .unwrap_or(0);
+                    }
+                    if self.needle[self.matched] == byte { self.matched += 1; }
+                    if self.matched == self.needle.len() { self.found = true; }
+                }
+                Ok(())
+            }
+        }
+        let mut search = Search { needle: needle.as_bytes(), matched: 0, found: false };
+        std::fmt::write(&mut search, format_args!("{self}")).is_ok() && search.found
+    }
+    /// Inspect the prefix of the complete Display text without allocating or
+    /// detaching its owner, including prefixes split across formatting chunks.
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        if let Some(text) = self.as_text() { return text.starts_with(prefix); }
+        if prefix.is_empty() { return true; }
+        struct Prefix<'a> { prefix: &'a [u8], matched: usize, matches: bool }
+        impl std::fmt::Write for Prefix<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let length = text.len().min(self.prefix.len() - self.matched);
+                let end = self.matched + length;
+                self.matches &= text.as_bytes()[..length] == self.prefix[self.matched..end];
+                self.matched = end;
+                Ok(())
+            }
+        }
+        let mut inspect = Prefix { prefix: prefix.as_bytes(), matched: 0, matches: true };
+        std::fmt::write(&mut inspect, format_args!("{self}")).is_ok()
+            && inspect.matches && inspect.matched == inspect.prefix.len()
+    }
+    fn equals_text(&self, expected: &str) -> bool {
+        struct Equal<'a> { expected: &'a [u8], offset: usize, equal: bool }
+        impl std::fmt::Write for Equal<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let end = self.offset.checked_add(text.len()).ok_or(std::fmt::Error)?;
+                self.equal &= self.expected.get(self.offset..end) == Some(text.as_bytes());
+                self.offset = end;
+                Ok(())
+            }
+        }
+        let mut equal = Equal { expected: expected.as_bytes(), offset: 0, equal: true };
+        std::fmt::write(&mut equal, format_args!("{self}")).is_ok()
+            && equal.equal && equal.offset == equal.expected.len()
+    }
+    fn admit(
+        owner: crate::read_memory::ReadMemoryOwner, bytes: usize,
+        subsystem: &'static str, operation: &'static str, hint: &'static str,
+    ) -> crate::Result<crate::read_memory::ReadCredit> {
+        use crate::read_memory::{NativeRefusal, ReadCredit, ReadMemoryBudget};
+        // Engine suppliers with scalar admission do not format on refusal.
+        // A genuine application provider keeps its ordinary contract and its
+        // original error, unchanged; there is no unsupported fallback or skip.
+        if owner.native_reserve_supported() {
+            ReadCredit::try_new_owned_native(owner, bytes, subsystem, operation, hint)
+                .map_err(|error| match error {
+                    NativeRefusal::MemoryBudgetExceeded { subsystem, operation, requested_bytes,
+                        available_bytes, budget_limit_bytes, hint } => Error::MemoryBudgetExceeded {
+                        subsystem: subsystem.into(), operation: operation.into(), requested_bytes,
+                        available_bytes, budget_limit_bytes, hint: hint.into(),
+                    },
+                    NativeRefusal::Other(reason) => Error::Other(reason.into()),
+                    other => Error::NativeEngineOther(other),
+                })
+        } else {
+            ReadCredit::try_new_owned(owner, bytes, subsystem, operation, hint)
+        }
+    }
+    /// Prepare native diagnostic storage on its actual existing payer before
+    /// invoking the producer. Failure has no engine-owned formatted backing.
+    #[doc(hidden)]
+    pub fn try_prepare_shared<T>(
+        owner: crate::read_memory::ReadMemoryOwner,
+        subsystem: &'static str, operation: &'static str, hint: &'static str,
+    ) -> crate::Result<crate::read_memory::ReadPrepared<T>> {
+        use crate::read_memory::ReadShared;
+        let invoice = Self::admit(owner, ReadShared::<T>::layout().size(), subsystem, operation, hint)?;
+        ReadShared::try_prepare_native(invoice).map_err(Error::NativeEngineOther)
+    }
+    /// Admit both the exact output buffer and native cell before allocating.
+    #[doc(hidden)]
+    pub fn try_format(
+        owner: crate::read_memory::ReadMemoryOwner, value: impl std::fmt::Display,
+        subsystem: &'static str, operation: &'static str, hint: &'static str,
+    ) -> crate::Result<Self> {
+        use crate::read_memory::{NativeProduce, NativeRefusal, ReadShared};
+        struct Count(usize);
+        impl std::fmt::Write for Count {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        std::fmt::write(&mut count, format_args!("{value}"))
+            .map_err(|_| Error::NativeEngineOther(NativeRefusal::Other("diagnostic text size overflow")))?;
+        let text_layout = std::alloc::Layout::array::<u8>(count.0)
+            .map_err(|_| Error::NativeEngineOther(NativeRefusal::Other("diagnostic text layout overflow")))?;
+        let bytes = ReadShared::<String>::layout().size().checked_add(count.0)
+            .ok_or(Error::NativeEngineOther(NativeRefusal::Other("diagnostic text layout overflow")))?;
+        let invoice = Self::admit(owner, bytes, subsystem, operation, hint)?;
+        let shared = ReadShared::try_from_prepaid_payload_with_native(invoice, || {
+            // Do not let an inconsistent Display grow past its admitted buffer.
+            struct Output(String);
+            impl std::fmt::Write for Output {
+                fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                    if text.len() > self.0.capacity() - self.0.len() { return Err(std::fmt::Error); }
+                    self.0.push_str(text);
+                    Ok(())
+                }
+            }
+            let text = if count.0 == 0 { String::new() } else {
+                // The original invoice is already outside the native cell. Use
+                // this exact raw layout, never an allocator-selected growth cap.
+                let raw = unsafe { std::alloc::alloc(text_layout) };
+                let pointer = std::ptr::NonNull::new(raw).ok_or(
+                    Error::NativeEngineOther(NativeRefusal::AllocatorFailed {
+                        site: "diagnostic text", layout: text_layout }))?;
+                // SAFETY: the global allocator supplied count.0 uninitialized
+                // bytes with byte alignment; a zero-length String owns that
+                // exact capacity and will free it through the same allocator.
+                unsafe { String::from_raw_parts(pointer.as_ptr(), 0, count.0) }
+            };
+            let mut output = Output(text);
+            std::fmt::write(&mut output, format_args!("{value}"))
+                .map_err(|_| Error::NativeEngineOther(NativeRefusal::Other("diagnostic display exceeded its admitted size")))?;
+            Ok::<_, Error>(output.0)
+        }).map_err(|error| match error {
+            NativeProduce::Refused(error) => Error::NativeEngineOther(error),
+            NativeProduce::Producer(error) => error,
+        })?;
+        Ok(Self::from_shared(shared))
+    }
+}
+impl From<String> for DiagnosticText {
+    fn from(text: String) -> Self { Self(DiagnosticTextStorage::Text(Cow::Owned(text))) }
+}
+impl From<&'static str> for DiagnosticText {
+    fn from(text: &'static str) -> Self { Self(DiagnosticTextStorage::Text(Cow::Borrowed(text))) }
+}
+impl From<Cow<'static, str>> for DiagnosticText {
+    fn from(text: Cow<'static, str>) -> Self { Self(DiagnosticTextStorage::Text(text)) }
+}
+impl From<crate::read_memory::NativeRefusal> for DiagnosticText {
+    fn from(refusal: crate::read_memory::NativeRefusal) -> Self { Self(DiagnosticTextStorage::Refusal(refusal)) }
+}
+impl From<FundedEngineError> for DiagnosticText {
+    fn from(owner: FundedEngineError) -> Self { Self(DiagnosticTextStorage::Native(owner)) }
+}
+impl std::fmt::Display for DiagnosticText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            DiagnosticTextStorage::StaticParts { prefix, text, suffix } => write!(f, "{prefix}{text}{suffix}"),
+            DiagnosticTextStorage::Unsigned { prefix, value, suffix } => write!(f, "{prefix}{value}{suffix}"),
+            DiagnosticTextStorage::Text(text) => std::fmt::Display::fmt(text, f),
+            DiagnosticTextStorage::Native(value) => std::fmt::Display::fmt(value, f),
+            DiagnosticTextStorage::Refusal(refusal) => std::fmt::Display::fmt(refusal, f),
+        }
+    }
+}
+impl PartialEq<str> for DiagnosticText {
+    fn eq(&self, other: &str) -> bool { self.equals_text(other) }
+}
+impl PartialEq<&str> for DiagnosticText {
+    fn eq(&self, other: &&str) -> bool { self.equals_text(other) }
+}
+impl std::fmt::Debug for DiagnosticText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Preserve String's quoted Debug envelope without materializing text.
+        struct Escape<'a, 'b>(&'a mut std::fmt::Formatter<'b>);
+        impl std::fmt::Write for Escape<'_, '_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                for ch in text.chars() {
+                    if ch == '\'' { self.0.write_str("'")?; }
+                    else { for escaped in ch.escape_debug() { std::fmt::Write::write_char(self.0, escaped)?; } }
+                }
+                Ok(())
+            }
+        }
+        f.write_str("\"")?;
+        std::fmt::write(&mut Escape(f), format_args!("{self}"))?;
+        f.write_str("\"")
+    }
+}
+
+/// A contiguous operation label. Native labels retain the original invoice;
+/// ordinary externally supplied Strings move unchanged. There is deliberately
+/// no allocating Clone implementation.
+pub struct DiagnosticLabel(DiagnosticLabelStorage);
+enum DiagnosticLabelStorage {
+    Text(Cow<'static, str>),
+    Native {
+        pointer: std::ptr::NonNull<()>,
+        text: unsafe fn(std::ptr::NonNull<()>) -> *const str,
+        release: unsafe fn(std::ptr::NonNull<()>),
+    },
+}
+// SAFETY: native constructors accept only immutable Send+Sync shared storage.
+unsafe impl Send for DiagnosticLabel {}
+unsafe impl Sync for DiagnosticLabel {}
+impl DiagnosticLabel {
+    #[doc(hidden)]
+    pub fn from_shared<I: Send + Sync + 'static>(value: crate::read_memory::ReadShared<String, I>) -> Self {
+        unsafe fn text<I>(pointer: std::ptr::NonNull<()>) -> *const str {
+            let owner = std::mem::ManuallyDrop::new(unsafe {
+                crate::read_memory::ReadShared::<String, I>::from_raw(pointer.as_ptr().cast())
+            });
+            owner.as_str() as *const str
+        }
+        unsafe fn release<I>(pointer: std::ptr::NonNull<()>) {
+            drop(unsafe { crate::read_memory::ReadShared::<String, I>::from_raw(pointer.as_ptr().cast()) });
+        }
+        Self(DiagnosticLabelStorage::Native {
+            pointer: std::ptr::NonNull::new(value.into_raw().cast_mut().cast()).expect("native label"),
+            text: text::<I>, release: release::<I>,
+        })
+    }
+    /// Count without materializing, then admit the exact buffer and control
+    /// layout on the supplier's existing payer before either allocation.
+    #[doc(hidden)]
+    pub fn try_format_with_invoice<I: Send + Sync + 'static>(
+        value: impl std::fmt::Display,
+        admit: impl FnOnce(usize) -> crate::Result<I>,
+    ) -> crate::Result<Self> {
+        use crate::read_memory::{NativeRefusal, ReadShared};
+        struct Count(usize);
+        impl std::fmt::Write for Count {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        std::fmt::write(&mut count, format_args!("{value}"))
+            .map_err(|_| Error::NativeEngineOther(NativeRefusal::Other("diagnostic label size overflow")))?;
+        let layout = std::alloc::Layout::array::<u8>(count.0)
+            .map_err(|_| Error::NativeEngineOther(NativeRefusal::Other("diagnostic label layout overflow")))?;
+        let bytes = ReadShared::<String, I>::layout().size().checked_add(count.0)
+            .ok_or(Error::NativeEngineOther(NativeRefusal::Other("diagnostic label layout overflow")))?;
+        let invoice = admit(bytes)?;
+        let text = if count.0 == 0 { String::new() } else {
+            let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) })
+                .ok_or(Error::NativeEngineOther(NativeRefusal::AllocatorFailed {
+                    site: "diagnostic label", layout }))?;
+            // SAFETY: exact byte-aligned global allocation, initially empty.
+            unsafe { String::from_raw_parts(pointer.as_ptr(), 0, count.0) }
+        };
+        struct Output(String);
+        impl std::fmt::Write for Output {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                if text.len() > self.0.capacity() - self.0.len() { return Err(std::fmt::Error); }
+                self.0.push_str(text);
+                Ok(())
+            }
+        }
+        let mut output = Output(text);
+        std::fmt::write(&mut output, format_args!("{value}"))
+            .map_err(|_| Error::NativeEngineOther(NativeRefusal::Other("diagnostic label exceeded its admitted size")))?;
+        let shared = ReadShared::try_from_invoice_native(output.0, invoice)
+            .map_err(Error::NativeEngineOther)?;
+        Ok(Self::from_shared(shared))
+    }
+    pub fn static_text(&self) -> Option<&'static str> {
+        match &self.0 {
+            DiagnosticLabelStorage::Text(Cow::Borrowed(text)) => Some(*text),
+            _ => None,
+        }
+    }
+    /// Explicit terminal materialization, matching the old Cow receiver.
+    /// Native producer paths move the label instead of calling this method.
+    pub fn into_owned(mut self) -> String {
+        match &mut self.0 {
+            DiagnosticLabelStorage::Text(text) => std::mem::replace(text, Cow::Borrowed("")).into_owned(),
+            DiagnosticLabelStorage::Native { pointer, text, .. } => unsafe { &*text(*pointer) }.to_owned(),
+        }
+    }
+}
+impl Drop for DiagnosticLabelStorage {
+    fn drop(&mut self) {
+        if let Self::Native { pointer, release, .. } = self {
+            unsafe { release(*pointer) };
+        }
+    }
+}
+impl From<&'static str> for DiagnosticLabel {
+    fn from(text: &'static str) -> Self { Self(DiagnosticLabelStorage::Text(Cow::Borrowed(text))) }
+}
+impl From<String> for DiagnosticLabel {
+    fn from(text: String) -> Self { Self(DiagnosticLabelStorage::Text(Cow::Owned(text))) }
+}
+impl From<Cow<'static, str>> for DiagnosticLabel {
+    fn from(text: Cow<'static, str>) -> Self { Self(DiagnosticLabelStorage::Text(text)) }
+}
+impl AsRef<str> for DiagnosticLabel {
+    fn as_ref(&self) -> &str {
+        match &self.0 {
+            DiagnosticLabelStorage::Text(text) => text,
+            // SAFETY: this handle retains the immutable native cell and its
+            // original invoice for the entire returned borrow.
+            DiagnosticLabelStorage::Native { pointer, text, .. } => unsafe { &*text(*pointer) },
+        }
+    }
+}
+impl serde::Serialize for DiagnosticLabel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_ref())
+    }
+}
+impl std::ops::Deref for DiagnosticLabel {
+    type Target = str;
+    fn deref(&self) -> &str { self.as_ref() }
+}
+impl std::fmt::Display for DiagnosticLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_ref()) }
+}
+impl std::fmt::Debug for DiagnosticLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(self.as_ref(), f) }
+}
+impl PartialEq<str> for DiagnosticLabel {
+    fn eq(&self, other: &str) -> bool { self.as_ref() == other }
+}
+impl PartialEq<&str> for DiagnosticLabel {
+    fn eq(&self, other: &&str) -> bool { self.as_ref() == *other }
+}
+impl PartialEq<String> for DiagnosticLabel {
+    fn eq(&self, other: &String) -> bool { self.as_ref() == other.as_str() }
+}
+
+/// The helper's complete exit diagnosis needs no owned text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderWaitHelperExit { Exited(i32), Killed, Unknown }
+impl std::fmt::Display for ReaderWaitHelperExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the writer's acquisition helper ended without the store: {self:?}")
+    }
+}
+
 /// Distinguishes which callback context produced a callback-active error.
 ///
 /// Contract: final `Display` for callback-active errors must be alloc-free
@@ -205,6 +614,15 @@ pub enum StorageCompactionDeclarationIssue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Engine-produced diagnostic whose admitted backing survives until the
+    /// caller destroys it. Application/plugin errors keep their original form.
+    #[doc(hidden)]
+    #[error(transparent)]
+    FundedEngine(FundedEngineError),
+    /// Allocation-free native diagnostics with the existing Other wire class.
+    #[doc(hidden)]
+    #[error("{0}")]
+    NativeEngineOther(crate::read_memory::NativeRefusal),
     /// Native cancellation identities are never reused. This is a local,
     /// typed construction refusal rather than a channel or wire condition.
     #[doc(hidden)]
@@ -228,7 +646,7 @@ pub enum Error {
     /// The helper a writable open's cancellable wait started ended without
     /// handing over the store; the open is refused and holds nothing.
     #[error("the wait for starting readers failed: {0}")]
-    ReaderWaitHelperFailed(String),
+    ReaderWaitHelperFailed(ReaderWaitHelperExit),
     /// A writable open's acquisition helper could not be confirmed dead after
     /// its wait was ended. This process keeps the store held, so nothing the
     /// helper might still be granted can reach anyone else; a later open or
@@ -236,7 +654,7 @@ pub enum Error {
     #[error(
         "the store at {path} is held by this process until an ended reader wait is confirmed; restart the process if it persists"
     )]
-    ReaderWaitQuarantined { path: String },
+    ReaderWaitQuarantined { path: DiagnosticText },
     #[error("{0}")]
     ReadFailure(crate::read_contract::ReadFailure),
     #[error("table not found: {0}")]
@@ -422,13 +840,13 @@ pub enum Error {
         expected_release: String,
     },
     #[error("corrupt store at {path}: {reason}")]
-    StoreCorrupted { path: String, reason: String },
+    StoreCorrupted { path: DiagnosticText, reason: DiagnosticText },
     #[error("vector metadata I/O failed during {operation}: {reason}")]
-    VectorMetadataIo { operation: String, reason: String },
+    VectorMetadataIo { operation: DiagnosticLabel, reason: DiagnosticText },
     #[error(
         "no store at {path}: this open was asked to change a store that already exists, so it created nothing — point it at an existing store, or open it with the creating disposition if a new one is wanted"
     )]
-    StoreMissing { path: String },
+    StoreMissing { path: DiagnosticText },
     #[error(
         "the store's identity could not be proven, so its fingerprint identifies nothing: more than one name resolves to the file at {path}"
     )]
@@ -601,12 +1019,12 @@ pub enum Error {
         "memory budget exceeded: {subsystem}/{operation} requested {requested_bytes} bytes, {available_bytes} available of {budget_limit_bytes} budget. Hint: {hint}"
     )]
     MemoryBudgetExceeded {
-        subsystem: Cow<'static, str>,
-        operation: Cow<'static, str>,
+        subsystem: DiagnosticLabel,
+        operation: DiagnosticLabel,
         requested_bytes: usize,
         available_bytes: usize,
         budget_limit_bytes: usize,
-        hint: Cow<'static, str>,
+        hint: DiagnosticLabel,
     },
     #[error(
         "disk budget exceeded: {operation} - file is {current_bytes} bytes, limit is {budget_limit_bytes} bytes. Hint: {hint}"
@@ -817,13 +1235,122 @@ pub enum Error {
     )]
     PublicationInterrupted,
     #[error("{0}")]
-    Other(Cow<'static, str>),
+    Other(DiagnosticText),
 }
 
 impl Error {
+    /// Borrow the logical diagnosis without releasing its physical owner.
+    #[doc(hidden)]
+    pub fn engine_diagnostic(&self) -> &Self {
+        let mut error = self;
+        while let Self::FundedEngine(owner) = error {
+            let Some(diagnostic) = owner.diagnostic() else { break };
+            error = diagnostic;
+        }
+        error
+    }
+
     pub const fn owner_read_drain_timeout() -> Self {
         Self::OwnerReadDrainTimeout
     }
+}
+
+/// An opaque bridge to the engine's already admitted diagnostic storage, or
+/// an inline native OS diagnosis. Construction neither allocates nor admits bytes.
+#[doc(hidden)]
+pub struct FundedEngineError {
+    pointer: std::ptr::NonNull<()>,
+    inspect: unsafe fn(std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool),
+    display: unsafe fn(std::ptr::NonNull<()>, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+    release: unsafe fn(std::ptr::NonNull<()>),
+}
+impl FundedEngineError {
+    /// An allocation-free native OS diagnosis of the existing Other class.
+    /// The nonzero errno is scalar data, never a pointer to owned storage.
+    /// This companion does not change the owned producer bridge below.
+    #[doc(hidden)]
+    pub fn from_os_error(errno: std::num::NonZeroI32) -> Self {
+        unsafe fn inspect(_: std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool) {
+            (None, true)
+        }
+        unsafe fn display(
+            code: std::ptr::NonNull<()>,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            let errno = code.addr().get() as i32;
+            std::fmt::Display::fmt(&std::io::Error::from_raw_os_error(errno), f)
+        }
+        unsafe fn release(_: std::ptr::NonNull<()>) {}
+        // Strict-provenance scalar encoding. None of these callbacks ever
+        // dereferences this address, and signed nonzero values round-trip.
+        let scalar = std::num::NonZeroUsize::new(errno.get() as isize as usize)
+            .expect("nonzero errno remains nonzero at pointer width");
+        Self {
+            pointer: std::ptr::NonNull::without_provenance(scalar),
+            inspect,
+            display,
+            release,
+        }
+    }
+    /// Transfer one strong owner of producer-prepared diagnostic storage.
+    ///
+    /// # Safety
+    /// The pointer must own initialized, Send + Sync diagnostic storage whose
+    /// complete carrier allocation and control invoices were admitted before
+    /// allocation. It must retain the payload's actual producer invoices; this
+    /// bridge does not certify a foreign diagnostic's allocation provenance.
+    /// `inspect` must return the same live logical Error on every call, or None
+    /// only for a deferred diagnostic of the existing Other class. Its boolean
+    /// may be true only if the original source owns no unpaid allocation and
+    /// its actual producer invoices remain retained through physical free.
+    /// A foreign or inherited diagnostic is not qualified by this carrier.
+    /// `display`
+    /// must render the original diagnosis without copying it. Neither may refer
+    /// back to this carrier. `release` must destroy the payload, then free its
+    /// storage, then release its invoices exactly once, including on unwind.
+    /// No borrowed pointer may outlive this owner. The owner must not contain
+    /// this carrier.
+    pub unsafe fn from_owned(
+        pointer: std::ptr::NonNull<()>,
+        inspect: unsafe fn(std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool),
+        display: unsafe fn(std::ptr::NonNull<()>, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+        release: unsafe fn(std::ptr::NonNull<()>),
+    ) -> Self {
+        Self { pointer, inspect, display, release }
+    }
+    fn diagnostic(&self) -> Option<&Error> {
+        unsafe { (self.inspect)(self.pointer).0.map(|pointer| pointer.as_ref()) }
+    }
+    /// Source qualification supplied by the actual opaque producer, never
+    /// inferred from the carrier's existence or from a later reservation.
+    #[doc(hidden)]
+    pub fn source_is_qualified(&self) -> bool {
+        unsafe { (self.inspect)(self.pointer).1 }
+    }
+}
+// Owned storage requires Send + Sync and shared-only access; native errno is scalar.
+unsafe impl Send for FundedEngineError {}
+unsafe impl Sync for FundedEngineError {}
+impl std::fmt::Debug for FundedEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.diagnostic() {
+            Some(error) => std::fmt::Debug::fmt(error, f),
+            None => std::fmt::Display::fmt(self, f),
+        }
+    }
+}
+impl std::fmt::Display for FundedEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe { (self.display)(self.pointer, f) }
+    }
+}
+impl std::error::Error for FundedEngineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.diagnostic().and_then(std::error::Error::source)
+    }
+}
+impl Drop for FundedEngineError {
+    fn drop(&mut self) { unsafe { (self.release)(self.pointer) } }
 }
 
 impl From<crate::read_contract::ReadFailure> for Error {

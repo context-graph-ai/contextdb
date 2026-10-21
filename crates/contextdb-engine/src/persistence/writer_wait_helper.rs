@@ -19,7 +19,78 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use super::physical_admission::WriterAcquireRefusal;
+use super::physical_admission::{
+    HelperExit as ReapedStatus, HelperFailure, WaitIo, WriterAcquireRefusal,
+};
+use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner, ReadShared};
+
+fn wait_credit(owner: &ReadMemoryOwner, bytes: usize) -> Result<ReadCredit, WriterAcquireRefusal> {
+    ReadCredit::try_new_owned(
+        owner.clone(),
+        bytes,
+        "storage",
+        "handoff_wait",
+        "Admit the original operation's wait storage.",
+    )
+    .map_err(WriterAcquireRefusal::Memory)
+}
+
+struct HelperAdmission {
+    plan: contextdb_core::read_memory::ReadPrepared<HelperPlan>,
+    stack: HelperStack,
+}
+impl HelperAdmission {
+    fn new(owner: &ReadMemoryOwner) -> Result<Self, WriterAcquireRefusal> {
+        let plan = wait_credit(owner, ReadShared::<HelperPlan>::layout().size())?;
+        let stack = wait_credit(owner, HELPER_STACK_BYTES)?;
+        let plan = ReadShared::try_prepare_native(plan).map_err(|error| {
+            WriterAcquireRefusal::Memory(contextdb_core::Error::NativeEngineOther(error))
+        })?;
+        let stack = HelperStack::map(stack).map_err(WriterAcquireRefusal::Io)?;
+        Ok(Self { plan, stack })
+    }
+}
+
+/// The invoice remains outside the mapping until munmap completes, including
+/// setup failure and unwinding before a helper has started.
+struct HelperStack {
+    address: *mut c_void,
+    _credit: ReadCredit,
+}
+impl HelperStack {
+    fn map(credit: ReadCredit) -> io::Result<Self> {
+        // SAFETY: a private anonymous mapping of the exact admitted extent.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HELPER_STACK_BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+                -1,
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(any(test, feature = "test-seams"))]
+        HELPER_STACKS_MAPPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Self {
+            address,
+            _credit: credit,
+        })
+    }
+}
+impl Drop for HelperStack {
+    fn drop(&mut self) {
+        // SAFETY: unpublished, failed launch, or confirmed reaped helper only.
+        unsafe {
+            libc::munmap(self.address, HELPER_STACK_BYTES);
+        }
+        #[cfg(any(test, feature = "test-seams"))]
+        HELPER_STACKS_MAPPED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 const HELPER_STACK_BYTES: usize = 64 * 1024;
 /// Exit statuses the helper answers with. `0` means every requested lock is
@@ -75,6 +146,16 @@ struct HelperPlan {
     count: usize,
     offsets: [i64; 3],
     lock_type: libc::c_short,
+    // Parent-only links and retained resources occupy the same exact admitted
+    // plan allocation. The raw helper reads only the request fields above.
+    quarantine: std::sync::Mutex<QuarantineSlot>,
+}
+
+#[derive(Default)]
+struct QuarantineSlot {
+    identity: (u64, u64),
+    retained: Option<(File, Helper)>,
+    next: Option<ReadShared<HelperPlan>>,
 }
 
 #[inline(always)]
@@ -160,10 +241,10 @@ impl Drop for SignalsBlocked {
 pub(crate) struct Helper {
     pidfd: OwnedFd,
     pid: i32,
-    stack: *mut c_void,
+    stack: std::mem::ManuallyDrop<Option<HelperStack>>,
     // Kept alive until the helper is reaped: it reads this plan.
-    _plan: std::mem::ManuallyDrop<Box<HelperPlan>>,
-    _read_funding: std::mem::ManuallyDrop<Option<ReadWaitFunding>>,
+    _plan: std::mem::ManuallyDrop<ReadShared<HelperPlan>>,
+    _read_memory: std::mem::ManuallyDrop<Option<crate::read_image_memory::ImageMemoryHandle>>,
     _read_descriptor: std::mem::ManuallyDrop<Option<File>>,
 }
 
@@ -180,70 +261,49 @@ impl std::fmt::Debug for Helper {
 unsafe impl Send for Helper {}
 
 impl Helper {
-    fn spawn(file: &File, offsets: &[i64]) -> io::Result<Self> {
-        Self::spawn_mode(file, offsets, libc::F_WRLCK as libc::c_short)
-    }
-
-    fn spawn_mode(file: &File, offsets: &[i64], lock_type: libc::c_short) -> io::Result<Self> {
-        let mut plan = Box::new(HelperPlan {
+    fn spawn_mode(
+        file: &File,
+        offsets: &[i64],
+        lock_type: libc::c_short,
+        admission: HelperAdmission,
+    ) -> io::Result<Self> {
+        let mut plan = HelperPlan {
             descriptor: file.as_raw_fd(),
             // SAFETY: getpid cannot fail.
             parent: unsafe { libc::getpid() },
             count: offsets.len().min(3),
             offsets: [0; 3],
             lock_type,
-        });
-        plan.offsets[..plan.count].copy_from_slice(&offsets[..plan.count]);
-        // SAFETY: a private anonymous mapping; checked below.
-        let stack = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                HELPER_STACK_BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
-                -1,
-                0,
-            )
+            quarantine: std::sync::Mutex::new(QuarantineSlot::default()),
         };
-        if stack == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        #[cfg(any(test, feature = "test-seams"))]
-        HELPER_STACKS_MAPPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        plan.offsets[..plan.count].copy_from_slice(&offsets[..plan.count]);
+        let plan = admission.plan.publish(plan);
+        let stack = admission.stack;
         let mut pidfd: libc::c_int = -1;
         let spawned = {
             let _blocked = SignalsBlocked::now()?;
-            // SAFETY: the stack is a fresh writable mapping and grows down
-            // from its top; the plan outlives the helper (it is kept in the
-            // returned value until reap); flags request a shared descriptor
-            // table, a pidfd, and no exit signal to the host.
+            // SAFETY: a fresh writable stack; the immutable shared plan is
+            // retained until reap. The helper has its own copied address space.
             unsafe {
                 libc::clone(
                     helper_main,
-                    (stack as *mut u8).add(HELPER_STACK_BYTES) as *mut c_void,
+                    (stack.address as *mut u8).add(HELPER_STACK_BYTES) as *mut c_void,
                     libc::CLONE_FILES | libc::CLONE_PIDFD,
-                    std::ptr::addr_of_mut!(*plan) as *mut c_void,
+                    std::ptr::from_ref(&*plan) as *mut c_void,
                     std::ptr::addr_of_mut!(pidfd),
                 )
             }
         };
         if spawned == -1 {
-            let error = io::Error::last_os_error();
-            // SAFETY: the mapping was made above and nothing uses it.
-            unsafe {
-                libc::munmap(stack, HELPER_STACK_BYTES);
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            HELPER_STACKS_MAPPED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         Ok(Self {
             // SAFETY: CLONE_PIDFD stored a fresh descriptor this call owns.
             pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
             pid: spawned,
-            stack,
+            stack: std::mem::ManuallyDrop::new(Some(stack)),
             _plan: std::mem::ManuallyDrop::new(plan),
-            _read_funding: std::mem::ManuallyDrop::new(None),
+            _read_memory: std::mem::ManuallyDrop::new(None),
             _read_descriptor: std::mem::ManuallyDrop::new(None),
         })
     }
@@ -315,23 +375,9 @@ impl Helper {
     }
 
     fn release_stack(&mut self) {
-        if !self.stack.is_null() {
-            // SAFETY: the helper is reaped, so nothing runs on this stack.
-            unsafe {
-                libc::munmap(self.stack, HELPER_STACK_BYTES);
-            }
-            self.stack = std::ptr::null_mut();
-            #[cfg(any(test, feature = "test-seams"))]
-            HELPER_STACKS_MAPPED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        // Only called after confirmed reap: unmap before settling its invoice.
+        drop(self.stack.take());
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReapedStatus {
-    Exited(i32),
-    Killed,
-    Unknown,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -376,18 +422,18 @@ fn end(mut helper: Helper) -> Ended {
 
 impl Drop for Helper {
     fn drop(&mut self) {
-        if !self.stack.is_null()
+        if self.stack.is_some()
             && let Ok(Some(_)) = self.reap(false)
         {
             self.release_stack();
         }
-        if self.stack.is_null() {
+        if self.stack.is_none() {
             // The helper cannot access its plan/descriptor after confirmed
             // death. Free those before returning their original payer's credit.
             unsafe {
                 std::mem::ManuallyDrop::drop(&mut self._plan);
                 std::mem::ManuallyDrop::drop(&mut self._read_descriptor);
-                std::mem::ManuallyDrop::drop(&mut self._read_funding);
+                std::mem::ManuallyDrop::drop(&mut self._read_memory);
             }
         }
         // An unconfirmed helper retains its plan, exact descriptor and payer
@@ -472,21 +518,7 @@ fn park_once(pidfd: RawFd, wake: RawFd, timeout_ms: Option<u64>) -> io::Result<(
 struct PipePark {
     pidfd: RawFd,
     read: RawFd,
-    wake: contextdb_core::read_memory::ReadShared<PipeWake>,
-}
-
-struct PipeWake {
-    write: RawFd,
-}
-
-impl contextdb_core::read_memory::NativeReadWake for PipeWake {
-    fn wake_read(&self) {
-        let byte = 1u8;
-        // SAFETY: one byte to a pipe whose write end outlives the park.
-        unsafe {
-            libc::write(self.write, std::ptr::addr_of!(byte).cast(), 1);
-        }
-    }
+    wake: ReadShared<WakePipe>,
 }
 
 impl contextdb_core::read_memory::NativeReadWake for PipePark {
@@ -495,15 +527,24 @@ impl contextdb_core::read_memory::NativeReadWake for PipePark {
     }
 }
 
+// park_once returns only last_os_error after a failed raw syscall. Keep the
+// actual errno in the existing native Other bridge, with no String or I/O box.
+fn native_park_error(error: io::Error) -> contextdb_core::Error {
+    let errno =
+        std::num::NonZeroI32::new(error.raw_os_error().expect("failed ppoll has an OS error"))
+            .expect("failed ppoll has nonzero errno");
+    contextdb_core::Error::FundedEngine(contextdb_core::error::FundedEngineError::from_os_error(
+        errno,
+    ))
+}
+
 impl contextdb_core::read_contract::NativeDriverPark for PipePark {
     fn park(&self) -> contextdb_core::Result<()> {
-        park_once(self.pidfd, self.read, None)
-            .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))
+        park_once(self.pidfd, self.read, None).map_err(native_park_error)
     }
 
     fn park_for_ms(&self, ms: u64) -> contextdb_core::Result<()> {
-        park_once(self.pidfd, self.read, Some(ms))
-            .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))
+        park_once(self.pidfd, self.read, Some(ms)).map_err(native_park_error)
     }
 
     fn wake_lease(&self) -> contextdb_core::read_memory::NativeReadWakeLease {
@@ -523,7 +564,10 @@ thread_local! {
 /// this thread holds, so if the kill is refused, giving that byte back lets
 /// the helper be granted it and exit by itself, and the reap that follows is
 /// certain. No outcome leaves a child behind.
-fn preflight(store_path: &std::path::Path) -> bool {
+fn preflight(
+    store_path: &std::path::Path,
+    owner: &ReadMemoryOwner,
+) -> Result<bool, WriterAcquireRefusal> {
     #[cfg(any(test, feature = "test-seams"))]
     let kill_denied = super::read_persistence_test_scaffold::wait_fault_for_test(store_path)
         == Some(super::read_persistence_test_scaffold::WaitFault::PreflightFails);
@@ -531,8 +575,10 @@ fn preflight(store_path: &std::path::Path) -> bool {
     let kill_denied = false;
     let _ = store_path;
     if !kill_denied && let Some(known) = PREFLIGHT.with(std::cell::Cell::get) {
-        return known;
+        return Ok(known);
     }
+    // Admission failures are real memory refusals, never platform refusals.
+    let admission = HelperAdmission::new(owner)?;
     let proven = (|| -> io::Result<bool> {
         let (holder, asker) = tempfile_for_preflight()?;
         let mut held: libc::flock = unsafe { std::mem::zeroed() };
@@ -543,7 +589,8 @@ fn preflight(store_path: &std::path::Path) -> bool {
         if unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_OFD_SETLK, &mut held) } == -1 {
             return Err(io::Error::last_os_error());
         }
-        let mut helper = Helper::spawn(&asker, &[0])?;
+        let mut helper =
+            Helper::spawn_mode(&asker, &[0], libc::F_WRLCK as libc::c_short, admission)?;
         #[cfg(any(test, feature = "test-seams"))]
         super::read_persistence_test_scaffold::note_reader_release_block_for_test(
             super::read_persistence_test_scaffold::ReaderReleaseBlockForTest::HelperSpawned {
@@ -574,14 +621,13 @@ fn preflight(store_path: &std::path::Path) -> bool {
     if !kill_denied {
         PREFLIGHT.with(|cell| cell.set(Some(proven)));
     }
-    proven
+    Ok(proven)
 }
 
 /// Two descriptions of one anonymous file: the first holds a byte, the
 /// helper asks for it through the second and so blocks.
 fn tempfile_for_preflight() -> io::Result<(File, File)> {
-    let name = std::ffi::CString::new("contextdb-writer-wait-preflight")
-        .map_err(|_| io::Error::other("preflight name"))?;
+    let name = c"contextdb-writer-wait-preflight";
     // SAFETY: a valid name; MFD_CLOEXEC.
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if fd == -1 {
@@ -589,11 +635,18 @@ fn tempfile_for_preflight() -> io::Result<(File, File)> {
     }
     // SAFETY: fresh descriptor.
     let first = unsafe { File::from_raw_fd(fd) };
-    let path = format!("/proc/self/fd/{fd}");
+    // Format a nonnegative descriptor entirely on the caller's stack.
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut path = [0u8; b"/proc/self/fd/".len() + RawFd::BITS as usize];
+    let capacity = path.len();
+    let mut remaining = &mut path[..];
+    write!(&mut remaining, "/proc/self/fd/{fd}")?;
+    let written = capacity - remaining.len();
     let second = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(path)?;
+        .open(std::ffi::OsStr::from_bytes(&path[..written]))?;
     Ok((first, second))
 }
 
@@ -616,12 +669,13 @@ pub(crate) fn wait_for_helper(
     stop: Option<&contextdb_core::read_contract::OwnerReadCancellation>,
     deadline: Option<(Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64)>,
     store_path: &std::path::Path,
+    payer: Option<&crate::memory_accounting::StoreAccountantHandle>,
 ) -> WaitEnded {
-    wait_for_helper_mode(file, offsets, stop, deadline, store_path, None)
+    wait_for_helper_mode(file, offsets, stop, deadline, store_path, None, payer)
 }
 
 struct ReadWaitFunding {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     bytes: usize,
 }
 impl Drop for ReadWaitFunding {
@@ -630,12 +684,19 @@ impl Drop for ReadWaitFunding {
     }
 }
 
+// The fallback API still returns an already allocated opaque future. Once its
+// existing reservation succeeds, keep physical-free ordering on unwind too.
+struct ReadWaitFuture<'a> {
+    future: contextdb_core::read_contract::DeadlineWait<'a>,
+    _funding: ReadWaitFunding,
+}
+
 pub(crate) fn wait_for_shared_hold(
     file: &File,
     stop: &contextdb_core::read_contract::OwnerReadCancellation,
     deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
     store_path: &std::path::Path,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 ) -> WaitEnded {
     wait_for_helper_mode(
         file,
@@ -644,6 +705,7 @@ pub(crate) fn wait_for_shared_hold(
         Some(deadline),
         store_path,
         Some(memory),
+        None,
     )
 }
 
@@ -653,26 +715,9 @@ fn wait_for_helper_mode(
     stop: Option<&contextdb_core::read_contract::OwnerReadCancellation>,
     deadline: Option<(Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64)>,
     store_path: &std::path::Path,
-    read_memory: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    read_memory: Option<crate::read_image_memory::ImageMemoryHandle>,
+    writer_payer: Option<&crate::memory_accounting::StoreAccountantHandle>,
 ) -> WaitEnded {
-    let funding = if let Some(memory) = &read_memory {
-        let bytes = HELPER_STACK_BYTES
-            + std::mem::size_of::<HelperPlan>()
-            + std::mem::size_of::<WakePipe>()
-            + std::mem::size_of::<PipeFutureWake>()
-            + 16 * std::mem::size_of::<usize>();
-        if let Err(error) = memory.reserve(bytes) {
-            return WaitEnded::Refused(WriterAcquireRefusal::Io(io::Error::other(
-                error.to_string(),
-            )));
-        }
-        Some(ReadWaitFunding {
-            memory: Arc::clone(memory),
-            bytes,
-        })
-    } else {
-        None
-    };
     if stop.is_some_and(|stop| stop.is_cancelled()) {
         return WaitEnded::Refused(WriterAcquireRefusal::Cancelled);
     }
@@ -682,8 +727,32 @@ fn wait_for_helper_mode(
     {
         return WaitEnded::Refused(WriterAcquireRefusal::DeadlineExpired);
     }
-    if !preflight(store_path) {
-        return WaitEnded::Refused(WriterAcquireRefusal::CancellableWaitUnsupported);
+    let owner = match &read_memory {
+        Some(memory) => memory
+            .reader_budget()
+            .ok_or_else(|| {
+                contextdb_core::Error::Other(
+                    "reader publication wait has no original reader payer".into(),
+                )
+            }),
+        None => writer_payer
+            .ok_or_else(|| {
+                contextdb_core::Error::Other("writer wait has no original writer payer".into())
+            })
+            .and_then(|payer| {
+                payer
+                    .wait_memory_owner()
+                    .map_err(contextdb_core::Error::NativeEngineOther)
+            }),
+    };
+    let owner = match owner {
+        Ok(owner) => owner,
+        Err(error) => return WaitEnded::Refused(WriterAcquireRefusal::Memory(error)),
+    };
+    match preflight(store_path, &owner) {
+        Ok(true) => {}
+        Ok(false) => return WaitEnded::Refused(WriterAcquireRefusal::CancellableWaitUnsupported),
+        Err(refusal) => return WaitEnded::Refused(refusal),
     }
     #[cfg(any(test, feature = "test-seams"))]
     let _kill_fault = KillFault::arm(
@@ -692,16 +761,36 @@ fn wait_for_helper_mode(
                 super::read_persistence_test_scaffold::WaitFault::KillFailsAndHelperUnconfirmed,
             ),
     );
+    let prepared_pipe =
+        wait_credit(&owner, ReadShared::<WakePipe>::layout().size()).and_then(|invoice| {
+            ReadShared::try_prepare_native(invoice).map_err(|error| {
+                WriterAcquireRefusal::Memory(contextdb_core::Error::NativeEngineOther(error))
+            })
+        });
+    let prepared_pipe = match prepared_pipe {
+        Ok(pipe) => pipe,
+        Err(refusal) => return WaitEnded::Refused(refusal),
+    };
     let pipe = match WakePipe::new() {
-        Ok(pipe) => Arc::new(pipe),
+        Ok(pipe) => prepared_pipe.publish(pipe),
         Err(error) => return WaitEnded::Refused(WriterAcquireRefusal::Io(error)),
     };
-    // Armed before the helper exists, so a cancellation at any later instant
-    // is already a readable byte when the one park begins.
-    let _listener = stop.map(|stop| {
-        let pipe = Arc::clone(&pipe);
-        stop.tell_on_cancel(move || pipe.poke())
-    });
+    // Register before the helper exists. Even a host-created cancellation
+    // token charges this engine-created node and callback to the operation.
+    let _listener = match stop
+        .map(|stop| {
+            let pipe = pipe.clone();
+            stop.try_tell_on_cancel_with_owner(move || pipe.poke(), owner.clone())
+        })
+        .transpose()
+    {
+        Ok(listener) => listener,
+        Err(error) => return WaitEnded::Refused(WriterAcquireRefusal::Memory(error)),
+    };
+    let admission = match HelperAdmission::new(&owner) {
+        Ok(admission) => admission,
+        Err(refusal) => return WaitEnded::Refused(refusal),
+    };
     let descriptor = if read_memory.is_some() {
         match file.try_clone() {
             Ok(file) => Some(file),
@@ -718,12 +807,13 @@ fn wait_for_helper_mode(
         } else {
             libc::F_WRLCK as libc::c_short
         },
+        admission,
     ) {
         Ok(helper) => helper,
         Err(error) => return WaitEnded::Refused(WriterAcquireRefusal::Io(error)),
     };
     *helper._read_descriptor = descriptor;
-    *helper._read_funding = funding;
+    *helper._read_memory = read_memory.clone();
     #[cfg(any(test, feature = "test-seams"))]
     super::read_persistence_test_scaffold::note_reader_release_block_for_test(
         super::read_persistence_test_scaffold::ReaderReleaseBlockForTest::HelperSpawned {
@@ -740,9 +830,9 @@ fn wait_for_helper_mode(
         super::read_persistence_test_scaffold::WriterAdmissionEvent::Waiting,
     );
     let parked = if let Some(memory) = &read_memory {
-        park_read(&helper, &pipe, stop, deadline.as_ref(), memory)
+        park_read(&helper, &pipe, stop, deadline.as_ref(), memory, &owner)
     } else {
-        park(&helper, &pipe, deadline.as_ref())
+        park(&helper, &pipe, deadline.as_ref(), &owner)
     };
     #[cfg(any(test, feature = "test-seams"))]
     super::read_persistence_test_scaffold::note_reader_release_block_for_test(
@@ -758,8 +848,8 @@ fn wait_for_helper_mode(
         Ended::Confirmed => WaitEnded::Refused(refusal),
         Ended::Unconfirmed(helper) => WaitEnded::Quarantine(helper),
     };
-    if let Err(error) = parked {
-        return abort(helper, WriterAcquireRefusal::Io(error));
+    if let Err(refusal) = parked {
+        return abort(helper, refusal);
     }
     if cancelled() {
         return abort(helper, WriterAcquireRefusal::Cancelled);
@@ -791,93 +881,75 @@ fn wait_for_helper_mode(
                     WaitEnded::Refused(WriterAcquireRefusal::DeadlineExpired)
                 }
                 ReapedStatus::Exited(0) => WaitEnded::Granted,
-                other => WaitEnded::Refused(WriterAcquireRefusal::HelperFailed(format!(
-                    "the writer's acquisition helper ended without the store: {other:?}"
-                ))),
+                other => {
+                    WaitEnded::Refused(WriterAcquireRefusal::HelperFailed(HelperFailure(other)))
+                }
             }
         }
         Ok(None) if expired() => abort(helper, WriterAcquireRefusal::DeadlineExpired),
         Ok(None) => abort(
             helper,
-            WriterAcquireRefusal::Io(io::Error::other(
-                "the writer's wait woke before its helper, its caller or its deadline",
-            )),
+            WriterAcquireRefusal::NativeIo(WaitIo::Static {
+                kind: io::ErrorKind::Other,
+                reason: "the writer's wait woke before its helper, its caller or its deadline",
+            }),
         ),
         Err(error) => abort(helper, WriterAcquireRefusal::Io(error)),
     }
 }
 
-struct PipeFutureWake(Arc<WakePipe>);
-impl std::task::Wake for PipeFutureWake {
-    fn wake(self: Arc<Self>) {
-        self.0.poke();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.poke();
+impl contextdb_core::read_memory::NativeReadWake for WakePipe {
+    fn wake_read(&self) {
+        self.poke();
     }
 }
 
 fn park_read(
     helper: &Helper,
-    pipe: &Arc<WakePipe>,
+    pipe: &ReadShared<WakePipe>,
     stop: Option<&contextdb_core::read_contract::OwnerReadCancellation>,
     deadline: Option<&(Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64)>,
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
-) -> io::Result<()> {
+    memory: &crate::read_image_memory::ImageMemoryHandle,
+    owner: &ReadMemoryOwner,
+) -> Result<(), WriterAcquireRefusal> {
     let Some((clock, deadline)) = deadline else {
-        return park_once(helper.pidfd.as_raw_fd(), pipe.read.as_raw_fd(), None);
+        return park_once(helper.pidfd.as_raw_fd(), pipe.read.as_raw_fd(), None)
+            .map_err(WriterAcquireRefusal::Io);
     };
-    let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(
-        memory
-            .source_box_budget()
-            .map_err(|error| io::Error::other(error))?,
-    );
     if let Some(source) = clock
-        .try_native_source(&owner)
-        .map_err(|error| io::Error::other(error))?
+        .try_native_source(owner)
+        .map_err(WriterAcquireRefusal::Memory)?
     {
-        if !source.is_funded_by(&owner) {
-            return Err(io::Error::other(
-                "deadline source has different memory ownership",
-            ));
+        if !source.is_funded_by(owner) {
+            return Err(WriterAcquireRefusal::NativeIo(WaitIo::Static {
+                kind: io::ErrorKind::Other,
+                reason: "deadline source has different memory ownership",
+            }));
         }
-        let layout = contextdb_core::read_memory::ReadShared::<PipeWake>::layout();
-        let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
-            owner,
-            layout.size(),
-            "reader",
-            "publication wait",
-            "admit the reader deadline wake",
-        )
-        .map_err(|error| io::Error::other(error))?;
-        let wake = contextdb_core::read_memory::ReadShared::try_from_prepaid(
-            PipeWake {
-                write: pipe.write.as_raw_fd(),
-            },
-            invoice,
-        )
-        .map_err(|error| io::Error::other(error))?;
         let park = PipePark {
             pidfd: helper.pidfd.as_raw_fd(),
             read: pipe.read.as_raw_fd(),
-            wake,
+            wake: pipe.clone(),
         };
         return source
             .park_until(clock.now_ms(), *deadline, &park)
-            .map_err(|error| io::Error::other(error));
+            .map_err(WriterAcquireRefusal::Memory);
     }
     // The future belongs to this same clock and absolute deadline. Its waker
     // feeds the kernel wait; only a clock wake causes an event-driven repoll.
-    let mut future = clock.wait_until(*deadline);
+    let future = clock.wait_until(*deadline);
     let bytes = std::mem::size_of_val(&*future);
     memory
         .reserve(bytes)
-        .map_err(|error| io::Error::other(error))?;
-    let funding = ReadWaitFunding {
-        memory: Arc::clone(memory),
-        bytes,
+        .map_err(WriterAcquireRefusal::Memory)?;
+    let mut future = ReadWaitFuture {
+        future,
+        _funding: ReadWaitFunding {
+            memory: memory.clone(),
+            bytes,
+        },
     };
-    let waker = std::task::Waker::from(Arc::new(PipeFutureWake(Arc::clone(pipe))));
+    let waker = pipe.clone().into_read_waker();
     let mut context = std::task::Context::from_waker(&waker);
     let result = loop {
         // Drain before polling, so a wake during poll remains readable.
@@ -888,11 +960,11 @@ fn park_read(
         if stop.is_some_and(|stop| stop.is_cancelled()) || clock.now_ms() >= *deadline {
             break Ok(());
         }
-        if future.as_mut().poll(&mut context).is_ready() {
+        if future.future.as_mut().poll(&mut context).is_ready() {
             break Ok(());
         }
         if let Err(error) = park_once(helper.pidfd.as_raw_fd(), pipe.read.as_raw_fd(), None) {
-            break Err(error);
+            break Err(WriterAcquireRefusal::Io(error));
         }
         let mut event = libc::pollfd {
             fd: helper.pidfd.as_raw_fd(),
@@ -905,54 +977,40 @@ fn park_read(
     };
     drop(future);
     drop(waker);
-    drop(funding);
     result
 }
 
 fn park(
     helper: &Helper,
-    pipe: &Arc<WakePipe>,
+    pipe: &ReadShared<WakePipe>,
     deadline: Option<&(Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64)>,
-) -> io::Result<()> {
+    owner: &ReadMemoryOwner,
+) -> Result<(), WriterAcquireRefusal> {
     let Some((clock, deadline)) = deadline else {
-        return park_once(helper.pidfd.as_raw_fd(), pipe.read.as_raw_fd(), None);
+        return park_once(helper.pidfd.as_raw_fd(), pipe.read.as_raw_fd(), None)
+            .map_err(WriterAcquireRefusal::Io);
     };
-    let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(
-        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(64 * 1024)
-            .child()
-            .map_err(|error| io::Error::other(error.to_string()))?,
-    );
-    let binding = contextdb_core::read_contract::NativeClockBinding::try_select(clock, &owner)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the caller's deadline clock offers no native park",
-            )
+    let binding = contextdb_core::read_contract::NativeClockBinding::try_select(clock, owner)
+        .map_err(|error| match error {
+            error @ contextdb_core::Error::MemoryBudgetExceeded { .. }
+            | error @ contextdb_core::Error::NativeEngineOther(
+                contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded { .. }
+                | contextdb_core::read_memory::NativeRefusal::ProcessMemoryBudgetExceeded { .. }
+                | contextdb_core::read_memory::NativeRefusal::AllocatorFailed { .. },
+            ) => WriterAcquireRefusal::Memory(error),
+            _ => WriterAcquireRefusal::NativeIo(WaitIo::Static {
+                kind: io::ErrorKind::Unsupported,
+                reason: "the caller's deadline clock offers no native park",
+            }),
         })?;
-    let layout = contextdb_core::read_memory::ReadShared::<PipeWake>::layout();
-    let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
-        owner,
-        layout.size(),
-        "writer",
-        "reader wait wake",
-        "admit the writer's deadline wake",
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    let wake = contextdb_core::read_memory::ReadShared::try_from_prepaid(
-        PipeWake {
-            write: pipe.write.as_raw_fd(),
-        },
-        invoice,
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
     let park = PipePark {
         pidfd: helper.pidfd.as_raw_fd(),
         read: pipe.read.as_raw_fd(),
-        wake,
+        wake: pipe.clone(),
     };
     binding
         .park_until(*deadline, &park)
-        .map_err(|error| io::Error::other(error.to_string()))
+        .map_err(|error| WriterAcquireRefusal::NativeIo(WaitIo::Clock(error)))
 }
 
 /// For one wait, a kill that fails and a helper whose death cannot be seen.
@@ -977,46 +1035,97 @@ impl Drop for KillFault {
 /// Stores whose writer's helper could not be confirmed dead: the writer's
 /// description stays open here, holding every byte the helper could still be
 /// granted, until a later open or close of the same store sees it gone.
-type Quarantined = std::collections::HashMap<(u64, u64), Vec<(File, Helper)>>;
+// Only the endpoints are static. Every link and retained entry is prepaid inside
+// its helper's actual plan cell, before mmap/clone. No registry capacity or
+// failure-time allocation is needed, and no global payer funds these entries.
+type QuarantineLink = Option<ReadShared<HelperPlan>>;
+struct Quarantined {
+    head: QuarantineLink,
+    tail: QuarantineLink,
+}
 
-static QUARANTINE: std::sync::OnceLock<std::sync::Mutex<Quarantined>> = std::sync::OnceLock::new();
+static QUARANTINE: std::sync::Mutex<Quarantined> = std::sync::Mutex::new(Quarantined {
+    head: None,
+    tail: None,
+});
 
 fn quarantined() -> std::sync::MutexGuard<'static, Quarantined> {
     QUARANTINE
-        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Keep `file` and `helper` until the helper is confirmed dead.
+/// Keep `file` and `helper` until the helper is confirmed dead. Publishing the
+/// prepaid slot only moves owners and links; even an exhausted payer can do it.
 pub(crate) fn enter_quarantine(identity: (u64, u64), file: File, helper: Helper) {
-    quarantined()
-        .entry(identity)
-        .or_default()
-        .push((file, helper));
+    let plan = ReadShared::clone(&helper._plan);
+    let mut registry = quarantined();
+    {
+        let mut slot = plan.quarantine.lock().unwrap_or_else(|p| p.into_inner());
+        slot.identity = identity;
+        slot.retained = Some((file, helper));
+    }
+    // Constant-time append preserves the existing per-store insertion order.
+    // Both static handles only retain the same paid cells; neither allocates.
+    if let Some(tail) = &registry.tail {
+        tail.quarantine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next = Some(plan.clone());
+    } else {
+        registry.head = Some(plan.clone());
+    }
+    registry.tail = Some(plan);
 }
 
-/// Whether this store is still quarantined: one non-blocking death check.
-/// A confirmed death releases the retained description and with it every
-/// lock it held. Serialized by the registry's lock, so no second helper is
-/// started for a store whose first one is unresolved.
+/// Whether this store is still quarantined: one non-blocking death check per
+/// retained helper of this store, serialized with insertion. Other stores'
+/// helpers are never polled. A detached node has no next link, so final free
+/// cannot recursively destroy the registry's remaining chain.
 pub(crate) fn still_quarantined(identity: (u64, u64)) -> bool {
     let mut registry = quarantined();
-    let Some(helpers) = registry.get_mut(&identity) else {
-        return false;
-    };
-    helpers.retain_mut(|(_, helper)| {
-        if let Ok(Some(_)) = helper.reap(false) {
-            helper.release_stack();
-            false
-        } else {
-            true
+    let mut previous: QuarantineLink = None;
+    let mut current = registry.head.clone();
+    let mut remains = false;
+    while let Some(plan) = current {
+        let mut slot = plan.quarantine.lock().unwrap_or_else(|p| p.into_inner());
+        let mut remove = false;
+        if slot.identity == identity {
+            if let Some((_, helper)) = &mut slot.retained {
+                if let Ok(Some(_)) = helper.reap(false) {
+                    helper.release_stack();
+                    remove = true;
+                } else {
+                    remains = true;
+                }
+            }
         }
-    });
-    if helpers.is_empty() {
-        registry.remove(&identity);
-        false
-    } else {
-        true
+        current = slot.next.clone();
+        if remove {
+            let next = slot.next.take();
+            if next.is_none() {
+                registry.tail = previous.clone();
+            }
+            if let Some(previous) = &previous {
+                previous
+                    .quarantine
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .next = next;
+            } else {
+                registry.head = next;
+            }
+            // Break the rooted self-reference before dropping the helper. Its
+            // confirmed-death Drop releases the plan, descriptor and reader
+            // owner; this traversal's plan handle retains the original credit
+            // until the node's final physical deallocation.
+            let retained = slot.retained.take();
+            drop(slot);
+            drop(retained);
+        } else {
+            drop(slot);
+            previous = Some(plan);
+        }
     }
+    remains
 }

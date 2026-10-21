@@ -4,6 +4,8 @@
 //! handle, owner channel, or route. The local protocol layer owns framing and byte-level fixtures.
 
 pub(crate) mod cursor_observation;
+mod encoded_bytes;
+pub use encoded_bytes::EncodedReadBytes;
 pub(crate) use cursor_observation::{decode_observed_cursor_page, encode_observed_cursor_page};
 
 use crate::local_transport::{
@@ -417,7 +419,7 @@ impl From<&QueryTrace> for CanonicalQueryTrace {
                 .collect(),
             sort_elided: trace.sort_elided,
             query_vector_source: trace.query_vector_source.clone(),
-            vector_search: trace.vector_search.as_ref().map(Into::into),
+            vector_search: trace.vector_search.as_deref().map(Into::into),
             rows_examined: trace.rows_examined,
             groups: trace.groups.to_vec(),
             maintained_count: trace.maintained_count.as_deref().map(|disclosure| {
@@ -479,44 +481,65 @@ pub struct CanonicalQueryResult {
 #[derive(Debug, Serialize)]
 pub struct CanonicalQueryResultView<'result> {
     pub columns: &'result [String],
+    #[serde(serialize_with = "serialize_query_result_rows")]
     pub rows: &'result [Vec<Value>],
     pub rows_affected: u64,
-    pub trace: CanonicalQueryTrace,
-    pub cascade: Option<CanonicalCascadeReport>,
+    #[serde(serialize_with = "serialize_query_result_trace")]
+    pub trace: &'result QueryTrace,
+    #[serde(serialize_with = "serialize_query_result_cascade")]
+    pub cascade: Option<&'result crate::database::CascadeReport>,
 }
 
 impl<'result> From<&'result QueryResult> for CanonicalQueryResultView<'result> {
     fn from(result: &'result QueryResult) -> Self {
         Self {
-            columns: &result.columns,
-            rows: &result.rows,
-            rows_affected: result.rows_affected,
-            trace: CanonicalQueryTrace::from(&result.trace),
-            cascade: result
-                .cascade
-                .as_ref()
-                .map(|cascade| CanonicalCascadeReport {
-                    dropped_indexes: cascade.dropped_indexes.clone(),
-                }),
+            columns: result.columns(), rows: result.rows(), rows_affected: result.rows_affected(),
+            trace: result.trace(),
+            cascade: result.cascade(),
+        }
+    }
+}
+impl<'result> From<&'result crate::database::QueryResultData> for CanonicalQueryResultView<'result> {
+    fn from(result: &'result crate::database::QueryResultData) -> Self {
+        Self {
+            columns: &result.columns, rows: &result.rows, rows_affected: result.rows_affected,
+            trace: &result.trace,
+            cascade: result.cascade.as_ref(),
         }
     }
 }
 
+// This explicit application DTO conversion preserves the consumer copy
+// boundary. Engine execution and serializers use the borrowed view above.
 impl From<&QueryResult> for CanonicalQueryResult {
     fn from(result: &QueryResult) -> Self {
         Self {
-            columns: result.columns.clone(),
-            rows: result.rows.clone(),
-            rows_affected: result.rows_affected,
-            trace: CanonicalQueryTrace::from(&result.trace),
-            cascade: result
-                .cascade
-                .as_ref()
-                .map(|cascade| CanonicalCascadeReport {
-                    dropped_indexes: cascade.dropped_indexes.clone(),
-                }),
+            columns: result.columns().to_vec(),
+            rows: result.rows().to_vec(),
+            rows_affected: result.rows_affected(),
+            trace: CanonicalQueryTrace::from(result.trace()),
+            cascade: result.cascade().map(|cascade| CanonicalCascadeReport {
+                dropped_indexes: cascade.dropped_indexes.clone(),
+            }),
         }
     }
+}
+fn serialize_query_result_rows<S: serde::Serializer>(
+    rows: &[Vec<Value>], serializer: S,
+) -> Result<S::Ok, S::Error> {
+    QueryRows(rows).serialize(serializer)
+}
+
+fn serialize_query_result_trace<S: serde::Serializer>(
+    trace: &QueryTrace, serializer: S,
+) -> Result<S::Ok, S::Error> {
+    QueryTraceView::from(trace).serialize(serializer)
+}
+fn serialize_query_result_cascade<S: serde::Serializer>(
+    cascade: &Option<&crate::database::CascadeReport>, serializer: S,
+) -> Result<S::Ok, S::Error> {
+    cascade.map(|cascade| QueryCascadeView { dropped_indexes: &cascade.dropped_indexes })
+        .serialize(serializer)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -548,15 +571,17 @@ fn encoding_error_from_transport(
 }
 
 pub fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncodingError> {
-    // Encoded from the borrowed view, which writes the same bytes as the owned
-    // canonical form: building the owned form first would copy every row of
-    // the answer only to hand the copy to the encoder.
-    for row in &result.rows {
-        if row.len() != result.columns.len() {
-            return Err(ReadEncodingError::InvalidPayload);
-        }
+    encode_query_view(&CanonicalQueryResultView::from(result))
+}
+fn encode_query_view(view: &CanonicalQueryResultView<'_>) -> Result<Vec<u8>, ReadEncodingError> {
+    validate_query_view(view)?;
+    encode(view)
+}
+fn validate_query_view(view: &CanonicalQueryResultView<'_>) -> Result<(), ReadEncodingError> {
+    for row in view.rows {
+        if row.len() != view.columns.len() { return Err(ReadEncodingError::InvalidPayload); }
     }
-    encode(&CanonicalQueryResultView::from(result))
+    Ok(())
 }
 
 // Stack-only views of the existing canonical fields, in the identical
@@ -772,7 +797,7 @@ impl<'a> From<&'a QueryTrace> for QueryTraceView<'a> {
             predicates_pushed: &trace.predicates_pushed,
             indexes_considered: QueryCandidateSequence(&trace.indexes_considered),
             sort_elided: trace.sort_elided, query_vector_source: trace.query_vector_source.as_ref(),
-            vector_search: trace.vector_search.as_ref().map(Into::into), rows_examined: trace.rows_examined,
+            vector_search: trace.vector_search.as_deref().map(Into::into), rows_examined: trace.rows_examined,
             maintained_count: trace.maintained_count.as_deref().map(Into::into), groups: &trace.groups,
         }
     }
@@ -819,10 +844,12 @@ impl<'a> From<&'a VectorSearchDisclosure> for QueryVectorView<'a> {
 
 
 pub(crate) fn encode_query_result_funded(
-    result: &QueryResult,
-    owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    result: &crate::database::QueryResultData,
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     for row in &result.rows {
         if row.len() != result.columns.len() { return Err(ReadEncodingError::InvalidPayload); }
     }
@@ -851,7 +878,7 @@ impl Serialize for QueryParamsView<'_> {
 }
 pub(crate) fn encode_request_funded(
     request: &crate::local_transport::LocalRequestEnvelope,
-    owner: Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
     if let crate::local_transport::LocalRequest::Query { statement, params } = &request.request {
@@ -863,24 +890,24 @@ pub(crate) fn encode_request_funded(
 
 pub(crate) fn encode_transport_funded<T: Serialize>(
     value: &T,
-    owner: Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
-    let mut measured = bincode::enc::write::SizeWriter::default();
-    bincode::serde::encode_into_writer(value, &mut measured, standard())
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    let mut output = crate::local_transport::query_funding::Funded::allocate(owner,
-        measured.bytes_written, || Vec::with_capacity(measured.bytes_written))
+    let len = encoded_size(value)?;
+    let mut output = crate::local_transport::query_funding::Funded::allocate_owned(owner,
+        len, || vec![0; len])
         .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
-    bincode::serde::encode_into_std_write(value, &mut output.value, standard())
+    // A fixed slice cannot silently grow beyond the admitted allocation if a
+    // serializer writes a different size on its second visit.
+    let written = bincode::serde::encode_into_slice(value, &mut output.value, standard())
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    if output.value.len() != measured.bytes_written { return Err(ReadEncodingError::InvalidPayload); }
+    if written != len { return Err(ReadEncodingError::InvalidPayload); }
     Ok(output)
 }
 
 pub(crate) fn decode_query_result_funded(
     bytes: &[u8],
-    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<CanonicalQueryResult>, ReadEncodingError> {
     #[cfg(feature = "test-seams")]
@@ -919,7 +946,9 @@ pub fn decode_query_result_under_memory_ceiling(
 }
 
 pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEncodingError> {
-    Ok(encode_query_result(result)?.len())
+    let view = CanonicalQueryResultView::from(result);
+    validate_query_view(&view)?;
+    encoded_size(&view)
 }
 
 /// Canonical bytes for one metadata answer.
@@ -949,21 +978,26 @@ pub(crate) fn encoded_metadata_body_len(
     counter.len()
 }
 
-/// [`encode_metadata_body`] into a buffer allocated once at `len`, the size
-/// [`encoded_metadata_body_len`] measured and the caller admitted.
-pub(crate) fn encode_metadata_body_measured(
+/// Encode on the actual request owner; the returned allocation keeps its
+/// original credit through payload destruction, including on failed callers.
+pub(crate) fn encode_metadata_body_funded(
     body: &crate::direct_file_reader::DirectMetadataBody,
-    len: usize,
-) -> Vec<u8> {
-    let mut bytes = CanonicalWriter {
-        bytes: Vec::with_capacity(len),
-        len: 0,
-        counting: false,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    memory_ceiling: u64,
+) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
+    let len = encoded_metadata_body_len(body);
+    let mut output = crate::local_transport::query_funding::Funded::allocate_owned(
+        Some(owner), len, || Vec::with_capacity(len),
+    ).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let mut writer = CanonicalWriter {
+        bytes: std::mem::take(&mut output.value), len: 0, counting: false,
     };
-    crate::read_image::write_metadata_body(&mut bytes, body);
+    crate::read_image::write_metadata_body(&mut writer, body);
+    if writer.len() != len { return Err(ReadEncodingError::InvalidPayload); }
+    output.value = writer.finish();
     #[cfg(any(test, feature = "test-seams"))]
     crate::read_image::answer_encoded_for_test();
-    bytes.finish()
+    Ok(output)
 }
 
 /// A deterministic, self-delimiting byte writer for canonical documents.
@@ -1022,6 +1056,29 @@ impl CanonicalWriter {
         self
     }
 
+    /// Preserve the length-prefixed JSON text without allocating a temporary
+    /// String, including when this writer only measures an answer.
+    pub(crate) fn json_text<T: Serialize>(&mut self, value: &T) -> &mut Self {
+        let mut size = QueryJsonSize(0);
+        serde_json::to_writer(&mut size, value).expect("canonical metadata JSON serializes");
+        self.count(size.0 as u64);
+        if self.counting {
+            self.len = self.len.saturating_add(size.0);
+        } else {
+            struct JsonSink<'a>(&'a mut CanonicalWriter);
+            impl std::io::Write for JsonSink<'_> {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.put(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            serde_json::to_writer(JsonSink(&mut *self), value)
+                .expect("canonical metadata JSON serializes");
+        }
+        self
+    }
+
     pub fn optional_text(&mut self, text: Option<&str>) -> &mut Self {
         match text {
             Some(text) => {
@@ -1061,7 +1118,7 @@ pub fn decode_metadata_body(
 
 pub(crate) fn decode_metadata_body_with_memory(
     bytes: &[u8],
-    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     ceiling: u64,
 ) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
     let bound = bytes
@@ -1069,8 +1126,8 @@ pub(crate) fn decode_metadata_body_with_memory(
         .checked_mul(4)
         .and_then(|n| n.checked_add(4096))
         .ok_or(ReadEncodingError::MemoryCeilingExceeded { ceiling })?;
-    let transient = contextdb_core::read_memory::ReadCredit::try_new(
-        memory.clone(),
+    let transient = contextdb_core::read_memory::ReadCredit::try_new_owned(
+        memory.owner(),
         bound,
         "reader",
         "metadata_body",
@@ -1187,6 +1244,14 @@ impl<'a> CanonicalReader<'a> {
     }
 }
 
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn encode_owned_cursor_page_for_test(
+    page: &crate::owned_cursor_page::OwnedCursorPage,
+) -> Result<Vec<u8>, ReadEncodingError> {
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    encode(page)
+}
+
 pub fn encode_cursor_page(page: &CursorPage) -> Result<Vec<u8>, ReadEncodingError> {
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1206,22 +1271,87 @@ pub fn decode_cursor_page_under_memory_ceiling(
     memory_ceiling: u64,
 ) -> Result<CursorPage, ReadEncodingError> {
     preflight_cursor_page_payload(bytes, memory_ceiling).map_err(encoding_error_from_transport)?;
-    let memory = decoder_memory(memory_ceiling)
+    let (owner, memory) = crate::local_transport::query_funding::QueryMemory::new(memory_ceiling)
+        .and_then(|memory| memory.into_cursor_owner())
         .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
-    let page: CursorPage = decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
-    page.validate()
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    Ok(page)
+    let prepared = crate::owned_cursor_page::OwnedCursorPage::try_prepare_public(owner.clone())
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let before = memory.held();
+    let page: crate::owned_cursor_page::OwnedCursorPage =
+        decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    let credit = memory.take_retained_credit(memory.held() - before)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let credit = crate::local_transport::query_funding::retain_cursor_credit(credit, owner.clone());
+    let mut page = crate::local_transport::query_funding::Funded { value: page, credit: Some(credit) };
+    if page.value.rows.capacity() != 0 {
+        page.credit.as_mut().expect("decoded page owns credit").try_grow_for(
+            crate::owned_cursor_page::SharedRows::allocation_header_bytes(),
+            "reader", "publish_cursor_root", "Reduce retained pages or raise the reader memory limit.",
+        ).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    }
+    page.value.with_credit(page.credit.take().expect("decoded page owns credit"))
+        .and_then(|mut page| {
+            page.attach_publication(prepared);
+            page.into_public()
+        })
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))
 }
 
 pub fn cursor_page_encoded_size(page: &CursorPage) -> Result<usize, ReadEncodingError> {
-    Ok(encode_cursor_page(page)?.len())
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    let mut measured = bincode::enc::write::SizeWriter::default();
+    bincode::serde::encode_into_writer(page, &mut measured, standard())
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    Ok(measured.bytes_written)
+}
+
+// Match MetadataPage/MetadataItem field and variant order while borrowing
+// values through the same streaming JSON view as ordinary query answers.
+#[derive(Serialize)]
+struct MetadataPageView<'a> {
+    vocabulary: contextdb_core::read_contract::MetadataPageVocabulary,
+    items: MetadataItemsView<'a>,
+    has_more: bool,
+    continuation: Option<&'a str>,
+}
+struct MetadataItemsView<'a>(&'a [contextdb_core::read_contract::MetadataItem]);
+impl Serialize for MetadataItemsView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use contextdb_core::read_contract::MetadataItem;
+        use serde::ser::SerializeSeq;
+        #[derive(Serialize)]
+        enum Item<'a> { Table(&'a str), EventStatus(QueryParamsView<'a>) }
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for item in self.0 {
+            let view = match item {
+                MetadataItem::Table(name) => Item::Table(name),
+                MetadataItem::EventStatus(status) => Item::EventStatus(QueryParamsView(status)),
+            };
+            sequence.serialize_element(&view)?;
+        }
+        sequence.end()
+    }
+}
+impl<'a> From<&'a MetadataPage> for MetadataPageView<'a> {
+    fn from(page: &'a MetadataPage) -> Self {
+        Self { vocabulary: page.vocabulary, items: MetadataItemsView(&page.items),
+            has_more: page.has_more, continuation: page.continuation.as_deref() }
+    }
+}
+pub(crate) fn encode_metadata_page_funded(
+    page: &MetadataPage,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    memory_ceiling: u64,
+) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    encode_transport_funded(&MetadataPageView::from(page), Some(owner), memory_ceiling)
 }
 
 pub fn encode_metadata_page(page: &MetadataPage) -> Result<Vec<u8>, ReadEncodingError> {
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    encode(page)
+    encode(&MetadataPageView::from(page))
 }
 
 /// See [`decode_query_result`]: the shipped default is the backstop for a
@@ -1247,7 +1377,8 @@ pub fn decode_metadata_page_under_memory_ceiling(
 }
 
 pub fn metadata_page_encoded_size(page: &MetadataPage) -> Result<usize, ReadEncodingError> {
-    Ok(encode_metadata_page(page)?.len())
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    encoded_size(&MetadataPageView::from(page))
 }
 
 fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodingError> {
@@ -1257,6 +1388,13 @@ fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodi
         }
     }
     Ok(())
+}
+
+pub(crate) fn encoded_size<T: Serialize>(value: &T) -> Result<usize, ReadEncodingError> {
+    let mut measured = bincode::enc::write::SizeWriter::default();
+    bincode::serde::encode_into_writer(value, &mut measured, standard())
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    Ok(measured.bytes_written)
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
@@ -1272,39 +1410,12 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
     Ok(encoded)
 }
 
-/// Use the existing declared reader root as the standalone codec's host
-/// capability boundary. Every engine-created native control is admitted to
-/// its operation child before the corresponding Arc allocations.
+/// The standalone codec retains its original factory in its typed image
+/// capability, including through escaping page and decoded-payload aliases.
 pub(crate) fn decoder_memory(
     memory_ceiling: u64,
-) -> contextdb_core::Result<std::sync::Arc<crate::read_image_memory::ImageMemory>> {
-    let root = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(memory_ceiling);
-    let child = root.child()?;
-    let controls = std::mem::size_of::<crate::memory_accounting::MemoryAccountant>()
-        + 2 * std::mem::size_of::<usize>()
-        + 2 * (std::mem::size_of::<std::sync::atomic::AtomicUsize>()
-            + 2 * std::mem::size_of::<usize>());
-    child.try_reserve(
-        controls,
-        "reader",
-        "decode_accountant",
-        "Reduce the payload or raise the declared reader memory limit.",
-    )?;
-    let accountant = std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
-        usize::try_from(memory_ceiling).unwrap_or(usize::MAX),
-    ));
-    let memory = match crate::read_image_memory::ImageMemory::operation_reader(
-        accountant.into(),
-        child.clone(),
-    ) {
-        Ok(memory) => memory,
-        Err(error) => {
-            child.release(controls);
-            return Err(error);
-        }
-    };
-    memory.adopt_reader_credit(&child, controls)?;
-    Ok(memory)
+) -> contextdb_core::Result<crate::read_image_memory::ImageMemoryHandle> {
+    Ok(crate::local_transport::query_funding::QueryMemory::new(memory_ceiling)?.image())
 }
 
 pub(crate) fn encoding_error_from_core(
@@ -1325,11 +1436,11 @@ pub(crate) fn encoding_error_from_core(
 /// temporary; payload credit stays on the same owner until its DTO boundary.
 pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
     bytes: &[u8],
-    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     memory_ceiling: u64,
 ) -> Result<T, ReadEncodingError> {
-    let input = contextdb_core::read_memory::ReadCredit::try_new(
-        memory.clone(),
+    let input = contextdb_core::read_memory::ReadCredit::try_new_owned(
+        memory.owner(),
         bytes.len(),
         "reader",
         "decode_input",
@@ -1351,7 +1462,7 @@ pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
 
 pub(crate) fn decode_query_result_with_memory(
     bytes: &[u8],
-    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     memory_ceiling: u64,
 ) -> Result<CanonicalQueryResult, ReadEncodingError> {
     #[cfg(feature = "test-seams")]
@@ -1363,3 +1474,7 @@ pub(crate) fn decode_query_result_with_memory(
     validate_query_result(&result)?;
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "read_contract/response_encoding_proofs.rs"]
+mod response_encoding_proofs;

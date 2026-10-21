@@ -369,7 +369,7 @@ pub struct BoundedByteCursor<'a> {
     hint: PageHint,
     next: Option<(PageNumber, Checksum)>,
     branches: Vec<(PageImpl, usize)>,
-    navigation_invoice: Option<crate::ReadPageCharge>,
+    navigation_invoice: Option<crate::read_admission::ReadMemoryCharge>,
     leaf: Option<(PageImpl, usize)>,
     failed: bool,
     authenticated: bool,

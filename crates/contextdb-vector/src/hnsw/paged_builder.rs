@@ -417,13 +417,13 @@ pub trait PagedVectorReader: Send {
 /// Stack adapter carrying the executing query funder, never TLS state.
 pub(crate) struct AdmittedPagedReader<'a> {
     reader: &'a mut dyn PagedVectorReader,
-    owner: Option<Arc<dyn MemoryBudget>>,
+    owner: Option<crate::memory_budget::MemoryBudgetOwner>,
     reclaim: Option<&'a dyn Fn() -> bool>,
 }
 impl<'a> AdmittedPagedReader<'a> {
     pub(crate) fn with_reclamation(
         reader: &'a mut dyn PagedVectorReader,
-        owner: Option<Arc<dyn MemoryBudget>>,
+        owner: Option<crate::memory_budget::MemoryBudgetOwner>,
         reclaim: &'a dyn Fn() -> bool,
     ) -> Self {
         Self {
@@ -439,9 +439,9 @@ impl<'a> AdmittedPagedReader<'a> {
             let Some(owner) = owner else {
                 return Ok(None);
             };
-            let mut token = VectorCopyAdmission::new(Arc::clone(owner));
+            let mut token = VectorCopyAdmission::new(owner.clone());
             loop {
-                match token.reserve_for(
+                match token.reserve_for_static(
                     bytes,
                     "vector_index",
                     "read_paged_vector_window",
@@ -587,7 +587,7 @@ struct PointAdapter<'a> {
     max_node_bytes: usize,
     dimension: usize,
     quantization: VectorQuantization,
-    accountant: &'a Arc<dyn MemoryBudget>,
+    accountant: &'a crate::memory_budget::MemoryBudgetOwner,
     live_workspace: &'a Arc<AtomicUsize>,
 }
 fn point_bytes<T>(point: &PagedPoint<T>) -> Option<usize> {
@@ -616,8 +616,8 @@ impl PointAdapter<'_> {
             .checked_add(std::mem::size_of::<PagedPoint<T>>())
             .and_then(|node| node.checked_mul(points))
             .ok_or_else(workspace_overflow)?;
-        VectorWorkspaceReservation::try_new(
-            Arc::clone(self.accountant),
+        VectorWorkspaceReservation::try_new_static(
+            self.accountant.clone(),
             Arc::clone(self.live_workspace),
             bytes,
             "paged_vector_selection",
@@ -904,12 +904,14 @@ where
 }
 
 struct PagedRootCharge {
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
     bytes: usize,
 }
 impl PagedRootCharge {
-    fn new(accountant: Arc<dyn MemoryBudget>, bytes: usize) -> Result<Self> {
-        accountant.try_allocate_for(
+    fn new(accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>, bytes: usize) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        accountant.try_allocate_for_static(
             bytes,
             "vector_index",
             "retain_paged_vector_root",
@@ -1037,7 +1039,7 @@ pub struct PagedVectorTail {
     quantization: VectorQuantization,
     persistence: Arc<dyn PagedVectorPersistence>,
     source: Arc<dyn PagedVectorGraphSource>,
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
     live_workspace: Arc<AtomicUsize>,
     root_charge: Arc<PagedRootCharge>,
 }
@@ -1051,9 +1053,11 @@ impl PagedVectorTail {
         quantization: VectorQuantization,
         persistence: Arc<dyn PagedVectorPersistence>,
         source: Arc<dyn PagedVectorGraphSource>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_workspace: Arc<AtomicUsize>,
     ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         if dimension == 0 || !graph_policy(policy, quantization).validate() {
             return Err(Error::Other("invalid paged vector tail definition".into()));
         }
@@ -1074,9 +1078,9 @@ impl PagedVectorTail {
                 )
             })
             .ok_or_else(workspace_overflow)?;
-        let partition_charge = PagedRootCharge::new(Arc::clone(&accountant), partition_bytes)?;
+        let partition_charge = PagedRootCharge::new(accountant.clone(), partition_bytes)?;
         let root_charge = Arc::new(PagedRootCharge::new(
-            Arc::clone(&accountant),
+            accountant.clone(),
             root_control_bytes(&progress, source.as_ref())?,
         )?);
         #[cfg(feature = "test-seams")]
@@ -1157,15 +1161,15 @@ impl PagedVectorTail {
     fn reserve(
         &self,
         plan: PagedVectorBatchPlan,
-        operation: &str,
+        operation: &'static str,
     ) -> Result<VectorWorkspaceReservation> {
         plan.validate(
             graph_policy(self.policy, self.quantization),
             self.dimension,
             self.quantization,
         )?;
-        VectorWorkspaceReservation::try_new(
-            Arc::clone(&self.accountant),
+        VectorWorkspaceReservation::try_new_static(
+            self.accountant.clone(),
             Arc::clone(&self.live_workspace),
             plan.workspace_bytes()?,
             operation,
@@ -1175,15 +1179,15 @@ impl PagedVectorTail {
     fn reserve_construction(
         &self,
         plan: PagedVectorBatchPlan,
-        operation: &str,
+        operation: &'static str,
     ) -> Result<VectorWorkspaceReservation> {
         plan.validate(
             graph_policy(self.policy, self.quantization),
             self.dimension,
             self.quantization,
         )?;
-        VectorWorkspaceReservation::try_new(
-            Arc::clone(&self.accountant),
+        VectorWorkspaceReservation::try_new_static(
+            self.accountant.clone(),
             Arc::clone(&self.live_workspace),
             plan.construction_workspace_bytes()?,
             operation,
@@ -1239,7 +1243,7 @@ impl PagedVectorTail {
             .checked_add(plan.progress_bytes)
             .ok_or_else(workspace_overflow)?;
         let mut next_root_charge =
-            PagedRootCharge::new(Arc::clone(&self.accountant), retained_bound)?;
+            PagedRootCharge::new(self.accountant.clone(), retained_bound)?;
         let mut invoked = false;
         let mut produced = None;
         let mut batch = |transaction: &mut dyn PagedVectorTransaction| {
@@ -1617,7 +1621,7 @@ impl PagedVectorTail {
                     .capacity()
                     .checked_mul(std::mem::size_of::<(RowId, f32)>())
                     .ok_or_else(workspace_overflow)?;
-                reservation.resize(
+                reservation.resize_static(
                     bytes,
                     "retain_paged_vector_search_result",
                     "retain the result reservation with its rows",
@@ -1770,7 +1774,7 @@ impl PagedVectorTail {
             .capacity()
             .checked_mul(std::mem::size_of::<(RowId, f32)>())
             .ok_or_else(workspace_overflow)?;
-        reservation.resize(
+        reservation.resize_static(
             bytes,
             "retain_paged_vector_search_result",
             "retain the result reservation with its rows",
@@ -1960,7 +1964,7 @@ pub struct PagedGenerationBuilder {
     dimension: usize,
     quantization: VectorQuantization,
     persistence: Arc<dyn PagedGenerationPersistence>,
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
     live_workspace: Arc<AtomicUsize>,
     _partition_charge: PagedRootCharge,
 }
@@ -1995,11 +1999,13 @@ impl PagedGenerationBuilder {
         dimension: usize,
         quantization: VectorQuantization,
         persistence: Arc<dyn PagedGenerationPersistence>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_workspace: Arc<AtomicUsize>,
     ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let partition_charge =
-            PagedRootCharge::new(Arc::clone(&accountant), partition_heap_bytes(&partition)?)?;
+            PagedRootCharge::new(accountant.clone(), partition_heap_bytes(&partition)?)?;
         Self::resume_admitted(
             partition,
             progress,
@@ -2020,13 +2026,15 @@ impl PagedGenerationBuilder {
         dimension: usize,
         quantization: VectorQuantization,
         persistence: Arc<dyn PagedGenerationPersistence>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_workspace: Arc<AtomicUsize>,
     ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         // Admit the catalog-key copy before creating it. Registry key ownership
         // is independent of this restartable builder's retained copy.
         let mut partition_charge =
-            PagedRootCharge::new(Arc::clone(&accountant), partition_heap_bytes(partition)?)?;
+            PagedRootCharge::new(accountant.clone(), partition_heap_bytes(partition)?)?;
         let partition = partition.clone();
         partition_charge.shrink(partition_heap_bytes(&partition)?);
         Self::resume_admitted(
@@ -2049,10 +2057,12 @@ impl PagedGenerationBuilder {
         dimension: usize,
         quantization: VectorQuantization,
         persistence: Arc<dyn PagedGenerationPersistence>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_workspace: Arc<AtomicUsize>,
         partition_charge: PagedRootCharge,
     ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         if dimension == 0
             || !graph_policy(policy, quantization).validate()
             || progress.graph.points > progress.total_points
@@ -2074,7 +2084,7 @@ impl PagedGenerationBuilder {
                 "invalid paged generation restart record".into()));
         }
         let progress_charge =
-            PagedRootCharge::new(Arc::clone(&accountant), builder_progress_bytes(&progress)?)?;
+            PagedRootCharge::new(accountant.clone(), builder_progress_bytes(&progress)?)?;
         Ok(Self {
             partition,
             progress: Arc::new(PagedBuilderProgress {
@@ -2154,8 +2164,8 @@ impl PagedGenerationBuilder {
                     "paged generation cursor exceeds its admitted key window".into()));
             }
         }
-        let _reservation = VectorWorkspaceReservation::try_new(
-            Arc::clone(&self.accountant),
+        let _reservation = VectorWorkspaceReservation::try_new_static(
+            self.accountant.clone(),
             Arc::clone(&self.live_workspace),
             plan.construction_workspace_bytes()?,
             "advance_paged_vector_generation",
@@ -2165,7 +2175,7 @@ impl PagedGenerationBuilder {
             .checked_add(2 * std::mem::size_of::<usize>())
             .and_then(|n| n.checked_add(plan.progress_bytes))
             .ok_or_else(workspace_overflow)?;
-        let mut next_charge = PagedRootCharge::new(Arc::clone(&self.accountant), retained_bound)?;
+        let mut next_charge = PagedRootCharge::new(self.accountant.clone(), retained_bound)?;
         checkpoint()?;
         let previous = self.progress.value.clone();
         let mut work = Some(work);
@@ -2526,8 +2536,8 @@ impl PagedGenerationBuilder {
             return Err(Error::Other(
                 "abandon marker exceeds admitted progress workspace".into()));
         }
-        let _reservation = VectorWorkspaceReservation::try_new(
-            Arc::clone(&self.accountant),
+        let _reservation = VectorWorkspaceReservation::try_new_static(
+            self.accountant.clone(),
             Arc::clone(&self.live_workspace),
             plan.progress_bytes,
             "abandon_paged_vector_generation",
@@ -2537,7 +2547,7 @@ impl PagedGenerationBuilder {
             .checked_add(2 * std::mem::size_of::<usize>())
             .and_then(|n| n.checked_add(plan.progress_bytes))
             .ok_or_else(workspace_overflow)?;
-        let mut next_charge = PagedRootCharge::new(Arc::clone(&self.accountant), retained_bound)?;
+        let mut next_charge = PagedRootCharge::new(self.accountant.clone(), retained_bound)?;
         checkpoint()?;
         let previous = self.progress.value.clone();
         let mut next = previous.clone();

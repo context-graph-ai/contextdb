@@ -14,8 +14,10 @@ impl Database {
     pub(crate) fn discard_policy(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(String, EdgeDiscardMode)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Stopping the server does not remove durable hub authority.
         if self.sync_relay_mode_enabled()
             || self
@@ -84,8 +86,10 @@ impl Database {
         tx: TxId,
         tables: &[(String, Vec<(NaturalKey, RowId)>)],
 
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<QueryResult> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<QueryResultData> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let authority = self.custody_authority(read_memory.clone())?;
         let hub = self.retention_sync_peer();
@@ -95,7 +99,7 @@ impl Database {
             }
             _ => None,
         });
-        let mut result = QueryResult::empty();
+        let mut result = QueryResultData::empty();
         result.columns = vec![
             "table".into(),
             "rows_affected".into(),
@@ -345,8 +349,10 @@ impl Database {
 
     pub(super) fn capture_original_discard_blob_hashes(
         &self, host:&EngineDatabaseTransactions, selections:&[AuthoritativePurgeSelection],
-        reader:Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Arc<crate::persistence::blob_selector::FrozenBlobSelector>> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         host.events.with_owned_persistence_original(|original| {
             let published=self.tx_mgr.capture_published_read();
             let root=writer_read::durable_root(published.handle)?.ok_or_else(EngineMetadataJournal::identity_error)?;
@@ -359,9 +365,11 @@ impl Database {
     }
     fn original_discard_selected_blob_hashes(
         &self, selections:&[AuthoritativePurgeSelection],
-        reader:Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         hashes:&mut crate::persistence::blob_selector::BlobSelectorBuilder,
     ) -> Result<()> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let snapshot = self.snapshot_for_read();
 
         for selected in selections.iter().filter(|selected| selected.table == "work_jobs") {
@@ -395,8 +403,10 @@ impl Database {
     pub(super) fn visit_original_discard_selected_versions(
         &self, table: &str, selected: RowId,
         mut visit: impl FnMut(&VersionedRow) -> Result<bool>,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let root = self.writer_read_root()?.ok_or_else(EngineMetadataJournal::identity_error)?;
         let owner = crate::persistence::writer_source::SourceWindowOwner::Read(reader);
         // The retired pool is keyed by exact occurrence. Match the existing
@@ -422,8 +432,10 @@ impl Database {
 
     fn visit_original_discard_work_rows(
         &self, mut visit: impl FnMut(&VersionedRow) -> Result<bool>,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         match self.visit_writer_rows("work_jobs", |row| {
             if visit(row).map_err(OriginalDiscardRowVisit::Error)? { Ok(()) }
             else { Err(OriginalDiscardRowVisit::Stop) }
@@ -442,9 +454,11 @@ impl Database {
         &self, host:&EngineDatabaseTransactions, original:&OwnedMemoryReservation,
         selections:&[AuthoritativePurgeSelection],
         selected:&Arc<crate::persistence::blob_selector::FrozenBlobSelector>,
-        reader:Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         staged:&contextdb_tx::manager::EngineGuard<'_>,
     ) -> Result<Arc<crate::persistence::blob_selector::FrozenBlobSelector>> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let root=self.writer_read_root()?.ok_or_else(EngineMetadataJournal::identity_error)?;
         let persistence=self.persistence.clone().ok_or_else(EngineMetadataJournal::identity_error)?;
         let mut survivors=crate::persistence::blob_selector::BlobSelectorBuilder::new(persistence,root,&host.events,original)?;
@@ -569,8 +583,10 @@ impl Database {
         guard: &crate::blob_repository::BlobExclusiveHashSetGuard,
         read_publication: &AuthoritativePurgePublicationGuard,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitStageRegistration<Stage>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let lsn = ws
             .commit_lsn
             .ok_or_else(crate::custody::canonical::invalid)?;
@@ -801,9 +817,11 @@ impl Database {
 impl StartupState<'_> {
     pub(crate) fn with_owned_encoded_event_source<R>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         f: impl for<'s> FnOnce(&'s crate::persistence::OwnedEncodedEventSource<'s>) -> Result<R>,
     ) -> Result<R> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match self {
             Self::Durable(persistence) => {
                 persistence.with_owned_encoded_event_source(read_memory, f)
@@ -1112,7 +1130,9 @@ impl Database {
         held: &mut contextdb_tx::manager::EngineGuard<'_>, selections: &[AuthoritativePurgeSelection],
         drain: event_bus::AuthoritativePurgeQueueDrainGuard, guard: &crate::blob_repository::BlobExclusiveSelectorGuard,
         read_publication: &AuthoritativePurgePublicationGuard, append: &mut event_bus::OwnedPreparedSinkEvents,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<OriginalDiscardStageHolder> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<OriginalDiscardStageHolder> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut holder: Option<OriginalDiscardStageHolder> = None;
         let mut preparation_slot: Option<OwnedMemoryReservation> = None;
         self.validate_owned_event_host(&host.events, host)?;

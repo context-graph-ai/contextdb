@@ -117,6 +117,11 @@ pub mod backends;
 pub mod commit_work;
 mod complex_types;
 mod db;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::NativeStorageBackend;
+#[doc(hidden)]
+pub use native_storage_admission::{NativeBackendError, NativeIoCause};
 mod error;
 mod multimap_table;
 mod sealed;
@@ -183,3 +188,24 @@ pub use db::FreeTotalsSaveForTest;
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
 pub use transactions::{NativeReadView, TableRootEvent};
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use tree_store::CacheReserveOwner;
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use read_admission::{with_cache_preparation_admission, with_retained_cache_preparation_admission};
+
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use tree_store::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use read_admission::{OwnedReadPageCharge, with_owned_read_page_charge_storage};
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub use tree_store::CheckedWriterBackendForTest;

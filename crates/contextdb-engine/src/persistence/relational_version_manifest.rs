@@ -155,10 +155,7 @@ impl RedbPersistence {
     }
 
     pub(super) fn relational_manifest_damage(&self, reason: impl std::fmt::Display) -> Error {
-        Error::StoreCorrupted {
-            path: self.path.display().to_string(),
-            reason: format!("relational version manifest: {reason}"),
-        }
+        crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), format_args!("relational version manifest: {reason}"))
     }
     pub(super) fn relational_manifest_error(&self, error: Error) -> Error {
         match error {
@@ -246,12 +243,14 @@ impl RetainedReadSource {
     pub(super) fn manifest_next<E>(
         &self,
         start: Vec<u8>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<ManifestKey>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let owner = ReadHistoryProofOwner::new(read_memory.clone()).map_err(E::from)?;
         let proof = content_identity::ProofMemory::growable(0, owner.clone());
         let mut found = None;
@@ -323,7 +322,7 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before: &mut dyn FnMut() -> std::result::Result<(), E>,
         mut observed: Option<&mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>>,
         before_clone: &mut dyn FnMut(
@@ -331,10 +330,12 @@ impl RetainedReadSource {
         ) -> std::result::Result<(), E>,
         last: &mut Option<[u8; 24]>,
     ) -> std::result::Result<Option<VersionedRow>, E> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         before()?;
         let _controls = contextdb_core::read_memory::ReadCredit::try_new(
             read_memory.clone(),
-            std::mem::size_of::<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>>(
+            std::mem::size_of::<Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>>(
             ) + 2
                 * (std::mem::size_of::<crate::read_image_memory::ImageMemory>()
                     + 2 * std::mem::size_of::<usize>()),
@@ -425,7 +426,7 @@ impl RetainedReadSource {
         row_id: RowId,
         snapshot: SnapshotId,
         exact_lsn: Option<Lsn>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         observed: Option<&mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>>,
         before_clone: &mut dyn FnMut(
@@ -436,6 +437,8 @@ impl RetainedReadSource {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let witness_names = crate::read_image_memory::ImageMemory::charging_reader(
             self._source_memory.memory.accountant.clone(),
             read_memory.clone(),
@@ -484,7 +487,7 @@ impl RetainedReadSource {
         row_id: RowId,
         snapshot: SnapshotId,
         exact_lsn: Option<Lsn>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         mut observed: Option<&mut dyn FnMut(&VersionedRow) -> std::result::Result<(), E>>,
         before_clone: &mut dyn FnMut(
@@ -495,6 +498,8 @@ impl RetainedReadSource {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         before_touch()?;
         // Preserve the first-history-use gate on the very same capture.
         let checkpoint_error = std::cell::RefCell::new(None);
@@ -514,7 +519,7 @@ impl RetainedReadSource {
         let controls = std::mem::size_of::<
             Option<(
                 VersionedRow,
-                Arc<crate::read_image_memory::ImageMemory>,
+                crate::read_image_memory::ImageMemoryHandle,
                 contextdb_core::read_memory::ReadCredit,
             )>,
         >()
@@ -575,7 +580,7 @@ impl RetainedReadSource {
         let touch = std::cell::RefCell::new(&mut *before_touch);
         let mut selected = None::<(
             VersionedRow,
-            Arc<crate::read_image_memory::ImageMemory>,
+            crate::read_image_memory::ImageMemoryHandle,
             contextdb_core::read_memory::ReadCredit,
         )>;
         let mut previous_identity = None::<[u8; 24]>;
@@ -805,9 +810,11 @@ impl CheckpointReadSource {
     pub(crate) fn verify_relational_version_manifests(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         checkpoint()?;
         let _controls = contextdb_core::read_memory::ReadCredit::try_new(
             read_memory.clone(),
@@ -1196,9 +1203,11 @@ impl RetainedReadSource {
         meta: &TableMeta,
         declaration: &IndexDecl,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before: &mut dyn FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if snapshot == self.logical_frontier {
             return Ok(());
         }
@@ -1228,9 +1237,11 @@ impl RetainedReadSource {
         meta: &TableMeta,
         declaration: &IndexDecl,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if snapshot.0 > self.logical_frontier.0 {
             return Err(Error::Other(
                 "index snapshot exceeds captured frontier".into()));
@@ -1502,7 +1513,7 @@ impl RetainedReadSource {
         &self,
         key: &[u8],
         value: &[u8],
-        memory: &Arc<crate::read_image_memory::ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<(RelationalIndexPosition, Option<TxId>)> {
         memory.scope(|| {
@@ -1706,10 +1717,12 @@ impl RedbPersistence {
         &self,
         tx: TxId,
         tables: &[&str],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         accountant: crate::memory_accounting::AccountantHandle,
         mut visitor: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let owner = writer_source::SourceWindowOwner::Read(read_memory.clone());
         let _controls = owner.reserve(
             std::mem::size_of::<content_identity::ContentIdentityReadVerifier>()

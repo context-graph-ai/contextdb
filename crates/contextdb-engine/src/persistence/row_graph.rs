@@ -6,7 +6,7 @@ use contextdb_tx::OwnedAdjEntry;
 pub(super) const FORWARD: TableDefinition<&[u8], &[u8]> = TableDefinition::new("row_graph_fwd");
 pub(super) const REVERSE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("row_graph_rev");
 
-fn corruption(reason: &str) -> Error {
+fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "row-derived adjacency".into(),
         reason: reason.into(),
@@ -116,7 +116,7 @@ impl RedbPersistence {
         let database = redb_builder().open(path).map_err(Self::storage_error)?;
         // Authenticate the deliberately damaged physical image so refusal
         // exercises exact owner/reciprocal validation, not a stale root proof.
-        let memory = crate::read_image_memory::ImageMemory::new(None);
+        let memory = crate::read_image_memory::ImageMemory::new(None)?;
         let _scope = memory.enter();
         let write = Self::begin_history_write(&database)?;
         {
@@ -224,7 +224,7 @@ impl RedbPersistence {
         &self, write: &redb::WriteTransaction, table: &str,
         original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
     ) -> Result<()> {
-        let mut after: Option<(Vec<u8>, Arc<crate::read_image_memory::ImageMemory>, Option<crate::memory_accounting::OwnedMemoryReservation>)> = None;
+        let mut after: Option<(Vec<u8>, crate::read_image_memory::ImageMemoryHandle, Option<crate::memory_accounting::OwnedMemoryReservation>)> = None;
         loop {
             let frame = original.map(OriginalPersistenceFrame::new).transpose()?;
             let memory = match frame.as_ref() {

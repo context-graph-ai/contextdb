@@ -18,8 +18,10 @@ impl Database {
         tenant: &TenantId,
         peer: Option<&str>,
         requested: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<HiddenPullScan>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(peer) = peer else {
             return Ok(None);
         };

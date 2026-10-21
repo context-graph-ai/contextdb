@@ -21,13 +21,35 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+
+struct QueryFixture {
+    columns: Vec<String>, rows: Vec<Vec<Value>>, rows_affected: u64,
+    trace: QueryTrace, cascade: Option<CascadeReport>,
+}
+impl QueryFixture {
+    fn empty() -> Self { Self { columns: vec![], rows: vec![], rows_affected: 0,
+        trace: QueryTrace::scan(), cascade: None } }
+    fn finish(self) -> QueryResult {
+        let owner = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+            .expect("codec fixture root").child().expect("codec fixture child");
+        QueryResult::from_owned_parts_for_test(owner, self.columns, self.rows,
+            self.rows_affected, self.trace, self.cascade).expect("funded actual result fixture")
+    }
+}
+fn cursor_fixture(columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool) -> CursorPage {
+    let owner = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+        .expect("codec fixture root").child().expect("codec fixture child");
+    CursorPage::from_owned_parts_for_test(owner, columns, rows, has_more)
+        .expect("funded actual page fixture")
+}
+
 fn standard_bytes<T: Serialize>(value: &T) -> Vec<u8> {
     encode_to_vec(value, standard()).expect("bincode standard encoding")
 }
 
-fn result_with_every_value_kind() -> QueryResult {
+fn rich_parts() -> QueryFixture {
     {
-        let mut query_fixture = QueryResult::empty();
+        let mut query_fixture = QueryFixture::empty();
         query_fixture.columns = vec![
             "null".to_owned(),
             "bool".to_owned(),
@@ -75,9 +97,9 @@ fn result_with_every_value_kind() -> QueryResult {
     }
 }
 
-fn materially_different_result() -> QueryResult {
+fn sparse_parts() -> QueryFixture {
     {
-        let mut query_fixture = QueryResult::empty();
+        let mut query_fixture = QueryFixture::empty();
         query_fixture.columns = vec!["count".to_owned()];
         query_fixture.rows = vec![vec![Value::Int64(0)], vec![Value::Int64(1)]];
         query_fixture.rows_affected = 0;
@@ -97,6 +119,9 @@ fn materially_different_result() -> QueryResult {
         query_fixture
     }
 }
+
+fn result_with_every_value_kind() -> QueryResult { rich_parts().finish() }
+fn materially_different_result() -> QueryResult { sparse_parts().finish() }
 
 fn expected_result_with_every_value_kind() -> CanonicalQueryResult {
     CanonicalQueryResult {
@@ -197,7 +222,7 @@ fn canonical_query_projection_preserves_every_success_field() {
 fn query_result_encoding_is_canonical_dynamic_and_route_neutral() {
     let rich = result_with_every_value_kind();
     let sparse = materially_different_result();
-    assert_eq!(rich.rows[0].len(), 10, "every Value kind must be covered");
+    assert_eq!(rich.rows()[0].len(), 10, "every Value kind must be covered");
 
     let rich_dto = expected_result_with_every_value_kind();
     let sparse_dto = expected_materially_different_result();
@@ -234,24 +259,24 @@ fn query_result_encoding_is_canonical_dynamic_and_route_neutral() {
 
 #[test]
 fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
-    let rich = result_with_every_value_kind();
+    let rich = rich_parts();
     let rich_expected = expected_result_with_every_value_kind();
-    let sparse = materially_different_result();
+    let sparse = sparse_parts();
     let sparse_expected = expected_materially_different_result();
 
-    let mut renamed_columns = result_with_every_value_kind();
+    let mut renamed_columns = rich_parts();
     let mut renamed_columns_expected = rich_expected.clone();
     renamed_columns.columns[0] = "null_value".to_owned();
     renamed_columns_expected.columns[0] = "null_value".to_owned();
 
-    let mut additional_column = result_with_every_value_kind();
+    let mut additional_column = rich_parts();
     let mut additional_column_expected = rich_expected.clone();
     additional_column.columns.push("extra".to_owned());
     additional_column.rows[0].push(Value::Text("present".to_owned()));
     additional_column_expected.columns.push("extra".to_owned());
     additional_column_expected.rows[0].push(Value::Text("present".to_owned()));
 
-    let mut additional_row = result_with_every_value_kind();
+    let mut additional_row = rich_parts();
     let mut additional_row_expected = rich_expected.clone();
     let second_row = vec![
         Value::Null,
@@ -268,12 +293,12 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     additional_row.rows.push(second_row.clone());
     additional_row_expected.rows.push(second_row);
 
-    let mut rows_affected = result_with_every_value_kind();
+    let mut rows_affected = rich_parts();
     let mut rows_affected_expected = rich_expected.clone();
     rows_affected.rows_affected = 17;
     rows_affected_expected.rows_affected = 17;
 
-    let mut trace_text = result_with_every_value_kind();
+    let mut trace_text = rich_parts();
     let mut trace_text_expected = rich_expected.clone();
     trace_text.trace.physical_plan = "NestedLoop";
     trace_text.trace.index_used = Some("events_payload_idx".to_owned());
@@ -282,7 +307,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     trace_text_expected.trace.index_used = Some("events_payload_idx".to_owned());
     trace_text_expected.trace.rows_examined = 91;
 
-    let mut more_predicates = result_with_every_value_kind();
+    let mut more_predicates = rich_parts();
     let mut more_predicates_expected = rich_expected.clone();
     more_predicates
         .trace
@@ -293,7 +318,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         .predicates_pushed
         .push("id > 7".to_owned());
 
-    let mut more_candidates = result_with_every_value_kind();
+    let mut more_candidates = rich_parts();
     let mut more_candidates_expected = rich_expected.clone();
     more_candidates
         .trace
@@ -310,7 +335,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
             rejected_reason: "ordering is incompatible".to_owned(),
         });
 
-    let mut trace_flags = result_with_every_value_kind();
+    let mut trace_flags = rich_parts();
     let mut trace_flags_expected = rich_expected.clone();
     trace_flags.trace.sort_elided = false;
     trace_flags.trace.query_vector_source = Some(VectorIndexRef::new("events", "alternate"));
@@ -318,9 +343,9 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     trace_flags_expected.trace.query_vector_source =
         Some(VectorIndexRef::new("events", "alternate"));
 
-    let mut vector_trace = result_with_every_value_kind();
+    let mut vector_trace = rich_parts();
     let mut vector_trace_expected = rich_expected.clone();
-    vector_trace.trace.vector_search = Some(VectorSearchDisclosure {
+    vector_trace.trace.vector_search = Some(Box::new(VectorSearchDisclosure {
         route_evidence: VectorSearchRouteEvidence::Executed,
         requested_mode: VectorSearchMode::Auto,
         resolved_mode: VectorSearchMode::Exact,
@@ -360,7 +385,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
             ef_search_source: "column".to_owned(),
             policy_revision: 3,
         }],
-    });
+    }));
     vector_trace_expected.trace.vector_search = Some(CanonicalVectorSearchDisclosure {
         route_evidence: "executed".to_owned(),
         requested_mode: "AUTO".to_owned(),
@@ -403,7 +428,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         }],
     });
 
-    let mut more_dropped_indexes = result_with_every_value_kind();
+    let mut more_dropped_indexes = rich_parts();
     let mut more_dropped_indexes_expected = rich_expected.clone();
     more_dropped_indexes
         .cascade
@@ -465,6 +490,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         ),
     ];
     for (name, result, expected) in cases {
+        let result = result.finish();
         assert_query_codec_case(&result, &expected);
         assert_eq!(
             encode_query_result(&result).expect("repeat route-neutral encoding"),
@@ -504,7 +530,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
     let invalid_cases = [
         (
             {
-                let mut query_fixture = QueryResult::empty();
+                let mut query_fixture = QueryFixture::empty();
                 query_fixture.columns = vec!["id".to_owned(), "payload".to_owned()];
                 query_fixture.rows = vec![vec![Value::Int64(7)]];
                 query_fixture.rows_affected = 0;
@@ -521,7 +547,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     groups: Default::default(),
                 };
                 query_fixture.cascade = None;
-                query_fixture
+                query_fixture.finish()
             },
             CanonicalQueryResult {
                 columns: vec!["id".to_owned(), "payload".to_owned()],
@@ -544,7 +570,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
         ),
         (
             {
-                let mut query_fixture = QueryResult::empty();
+                let mut query_fixture = QueryFixture::empty();
                 query_fixture.columns = vec!["id".to_owned()];
                 query_fixture.rows = vec![vec![
                     Value::Int64(8),
@@ -564,7 +590,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     groups: Default::default(),
                 };
                 query_fixture.cascade = None;
-                query_fixture
+                query_fixture.finish()
             },
             CanonicalQueryResult {
                 columns: vec!["id".to_owned()],
@@ -610,7 +636,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
 #[test]
 fn cursor_encoding_covers_nonempty_more_and_empty_exhausted_pages() {
     let pages = [
-        CursorPage::from_parts(
+        cursor_fixture(
             vec!["id".to_owned(), "payload".to_owned()],
             vec![vec![
                 Value::Int64(7),
@@ -618,7 +644,7 @@ fn cursor_encoding_covers_nonempty_more_and_empty_exhausted_pages() {
             ]],
             true,
         ),
-        CursorPage::from_parts(vec!["id".to_owned(), "payload".to_owned()], vec![], false),
+        cursor_fixture(vec!["id".to_owned(), "payload".to_owned()], vec![], false),
     ];
 
     let mut encodings = Vec::new();
@@ -683,19 +709,19 @@ fn cursor_codec_mutation_matrix_covers_columns_rows_values_and_valid_page_shapes
     .map(str::to_owned)
     .collect::<Vec<_>>();
     let cases = [
-        CursorPage::from_parts(columns.clone(), vec![full_row.clone()], true),
-        CursorPage::from_parts(
+        cursor_fixture(columns.clone(), vec![full_row.clone()], true),
+        cursor_fixture(
             columns.clone(),
             vec![full_row.clone(), full_row.clone()],
             false,
         ),
-        CursorPage::from_parts(
+        cursor_fixture(
             vec!["renamed".to_owned()],
             vec![vec![Value::Text("different value".to_owned())]],
             false,
         ),
-        CursorPage::from_parts(vec!["id".to_owned()], vec![], true),
-        CursorPage::from_parts(vec!["id".to_owned(), "payload".to_owned()], vec![], false),
+        cursor_fixture(vec!["id".to_owned()], vec![], true),
+        cursor_fixture(vec!["id".to_owned(), "payload".to_owned()], vec![], false),
     ];
     for page in cases {
         assert_cursor_codec_case(&page);
@@ -704,7 +730,7 @@ fn cursor_codec_mutation_matrix_covers_columns_rows_values_and_valid_page_shapes
 
 #[test]
 fn cursor_decoding_requires_one_complete_payload() {
-    let page = CursorPage::from_parts(
+    let page = cursor_fixture(
         vec!["id".to_owned(), "payload".to_owned()],
         vec![vec![
             Value::Int64(7),
@@ -736,7 +762,7 @@ fn cursor_decoding_requires_one_complete_payload() {
 
 #[test]
 fn cursor_codec_rejects_wrong_row_arity_at_every_boundary() {
-    let invalid = CursorPage::from_parts(
+    let invalid = cursor_fixture(
         vec!["id".to_owned(), "payload".to_owned()],
         vec![vec![Value::Int64(7)]],
         true,

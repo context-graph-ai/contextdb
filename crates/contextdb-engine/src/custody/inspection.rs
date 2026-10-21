@@ -42,8 +42,10 @@ impl<'a> CurrentAuthority<'a> {
 pub(crate) fn status(
     db: &Database,
     table: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<DeliveryStatusCounts> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let mut status = DeliveryStatusCounts::default();
@@ -137,8 +139,10 @@ pub(crate) fn outcome(
     db: &Database,
     table: &str,
     key: &crate::sync_types::NaturalKey,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<DeliveryOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     if !db.delivery_root_visible(table, key, read_memory.clone())? {
@@ -201,8 +205,10 @@ pub(crate) fn show(
     limit: Option<usize>,
     offset: usize,
     params: &std::collections::HashMap<String, contextdb_core::Value>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-) -> Result<crate::database::QueryResult> {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<crate::database::QueryResultData> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     super::policy::require_admin(db, read_memory.clone())?;
@@ -296,8 +302,10 @@ pub(crate) fn show(
 pub(crate) fn metadata(
     db: &Database,
     request: crate::direct_file_reader::DirectMetadataRequest,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     use crate::direct_file_reader::{DirectMetadataBody as Body, DirectMetadataRequest as Request};
     match request {
         Request::DeliveryStatus { root_table } => Ok(Body::DeliveryStatus {

@@ -5376,7 +5376,7 @@ async fn serve_native_subject(
             else {
                 return Err(TransportError::NoResponder.into());
             };
-            let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(reader);
+            let owner = contextdb_core::read_memory::ReadMemoryOwner::from(reader);
             let body = super::BoundedWireBody::from_legacy_reply(payload, owner)?;
             let finish: super::StreamResponder = Box::new(move |body| {
                 Box::pin(async move {

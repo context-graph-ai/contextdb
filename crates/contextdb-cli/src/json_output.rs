@@ -469,8 +469,8 @@ pub(crate) fn tables_document(
 pub(crate) fn result_document(result: &QueryResult) -> Value {
     json!({
         "result": {
-            "columns": result.columns,
-            "rows": crate::formatter::rows_as_objects(&result.columns, &result.rows),
+            "columns": result.columns(),
+            "rows": crate::formatter::rows_as_objects(result.columns(), result.rows()),
         }
     })
 }
@@ -480,9 +480,9 @@ pub(crate) fn result_document(result: &QueryResult) -> Value {
 pub(crate) fn cursor_page_document(page: &CursorPage) -> Value {
     json!({
         "cursor": {
-            "columns": page.columns,
-            "rows": crate::formatter::rows_as_objects(&page.columns, &page.rows),
-            "has_more": page.has_more,
+            "columns": page.columns(),
+            "rows": crate::formatter::rows_as_objects(page.columns(), page.rows()),
+            "has_more": page.has_more(),
         }
     })
 }
@@ -1056,11 +1056,11 @@ pub(crate) fn print_trace(trace: &QueryTrace, rows_examined: u64) {
 /// bounded reader actually took. `runtime_trace` distinguishes this receipt
 /// from passive vector metadata and static write planning.
 pub(crate) fn explain_document(result: &QueryResult) -> Value {
-    let mut body = trace_body(&result.trace);
-    body.insert("sort_elided".to_string(), json!(result.trace.sort_elided));
+    let mut body = trace_body(result.trace());
+    body.insert("sort_elided".to_string(), json!(result.trace().sort_elided));
     body.insert(
         "rows_examined".to_string(),
-        json!(result.trace.rows_examined),
+        json!(result.trace().rows_examined),
     );
     body.insert("runtime_trace".to_string(), json!(true));
     json!({ "explain": Value::Object(body) })
@@ -1162,7 +1162,7 @@ fn trace_body(trace: &QueryTrace) -> Map<String, Value> {
         "vector_search".to_string(),
         trace
             .vector_search
-            .as_ref()
+            .as_deref()
             .map_or(Value::Null, vector_search_document),
     );
     body

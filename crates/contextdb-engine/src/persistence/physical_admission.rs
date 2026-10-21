@@ -76,12 +76,27 @@ fn request(start: i64, len: i64, lock_type: libc::c_short) -> libc::flock {
 /// would alias OFD locks and could convert or release another operation's hold.
 #[cfg(target_os = "linux")]
 pub(super) fn reopen_independent(file: &File, writable: bool) -> io::Result<File> {
+    reopen_independent_native(file, writable).map_err(WaitIo::into_io)
+}
+
+/// Native companion for the publication wait: static diagnoses and OS facts
+/// travel inline instead of acquiring an opaque std I/O error allocation.
+#[cfg(target_os = "linux")]
+pub(super) fn reopen_independent_native(file: &File, writable: bool) -> Result<File, WaitIo> {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    let mut path = [0u8; b"/proc/self/fd/".len() + std::os::fd::RawFd::BITS as usize];
+    let capacity = path.len();
+    let mut remaining = &mut path[..];
+    write!(&mut remaining, "/proc/self/fd/{}", file.as_raw_fd()).map_err(WaitIo::Io)?;
+    let written = capacity - remaining.len();
     let opened = std::fs::OpenOptions::new()
         .read(true)
         .write(writable)
         .custom_flags(libc::O_CLOEXEC)
-        .open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        .open(std::ffi::OsStr::from_bytes(&path[..written]))
+        .map_err(WaitIo::Io)?;
     // SAFETY: both descriptors stay live and both stat buffers are writable.
     let (original, current) = unsafe {
         let mut original: libc::stat = std::mem::zeroed();
@@ -89,14 +104,15 @@ pub(super) fn reopen_independent(file: &File, writable: bool) -> io::Result<File
         if libc::fstat(file.as_raw_fd(), &mut original) != 0
             || libc::fstat(opened.as_raw_fd(), &mut current) != 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(WaitIo::Io(io::Error::last_os_error()));
         }
         (original, current)
     };
     if original.st_dev != current.st_dev || original.st_ino != current.st_ino {
-        return Err(io::Error::other(
-            "reopened reader coordination inode changed",
-        ));
+        return Err(WaitIo::Static {
+            kind: io::ErrorKind::Other,
+            reason: "reopened reader coordination inode changed",
+        });
     }
     Ok(opened)
 }
@@ -421,7 +437,7 @@ pub(crate) enum WriterAcquireRefusal {
     /// give it.
     CancellableWaitUnsupported,
     /// The helper ended without handing over the store.
-    HelperFailed(String),
+    HelperFailed(HelperFailure),
     /// The helper that was acquiring could not be confirmed dead: the caller
     /// must keep its description open, holding everything, in quarantine.
     #[cfg(all(
@@ -430,10 +446,96 @@ pub(crate) enum WriterAcquireRefusal {
     ))]
     Quarantined(super::writer_wait_helper::Helper),
     Io(io::Error),
+    NativeIo(WaitIo),
+    // Admission/allocation failures stay inline: no unpaid io::Error box and
+    // no conversion of a memory refusal into a platform Unsupported result.
+    Memory(contextdb_core::Error),
+}
+
+/// Private I/O transport. Native clock errors keep their original payload;
+/// static diagnoses and syscall errors require no new allocation here.
+#[derive(Debug)]
+pub(crate) enum WaitIo {
+    Io(io::Error),
+    Static {
+        kind: io::ErrorKind,
+        reason: &'static str,
+    },
+    Clock(contextdb_core::Error),
+}
+impl std::fmt::Display for WaitIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => std::fmt::Display::fmt(error, f),
+            Self::Static { reason, .. } => f.write_str(reason),
+            Self::Clock(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl WaitIo {
+    pub(super) fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::Io(error) => error.kind(),
+            Self::Static { kind, .. } => *kind,
+            Self::Clock(_) => io::ErrorKind::Other,
+        }
+    }
+    // The existing std-I/O receiver still owns an opaque allocation boundary.
+    // Private helper/reader transports never call this conversion. Its public
+    // diagnostic custody is intentionally not certified by this transport.
+    pub(super) fn into_io(self) -> io::Error {
+        match self {
+            Self::Io(error) => error,
+            Self::Static { kind, reason } => io::Error::new(kind, reason),
+            Self::Clock(error) => io::Error::other(error.to_string()),
+        }
+    }
+}
+
+pub(crate) use contextdb_core::error::ReaderWaitHelperExit as HelperExit;
+
+/// The source status stays scalar until a diagnostic consumer asks for text.
+#[derive(Clone, Copy)]
+pub(crate) struct HelperFailure(pub(crate) HelperExit);
+impl std::fmt::Display for HelperFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the writer's acquisition helper ended without the store: {:?}",
+            self.0
+        )
+    }
+}
+impl std::fmt::Debug for HelperFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Preserve the former String field's Debug representation without
+        // building that String (including the reader's diagnostic envelope).
+        write!(f, "\"{self}\"")
+    }
+}
+
+/// Scalar snapshot of the remaining reader-publication refusal diagnoses.
+/// It never retains a live helper in an escaping error carrier.
+#[derive(Debug)]
+pub(crate) enum PublicationWaitRefusal {
+    HeldByWriter,
+    CancellableWaitUnsupported,
+    HelperFailed(HelperFailure),
+    Quarantined(QuarantinedHelperDiagnostic),
+}
+
+pub(crate) struct QuarantinedHelperDiagnostic(pub(crate) u32);
+impl std::fmt::Debug for QuarantinedHelperDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Helper")
+            .field("pid", &self.0)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the caller allows a writer's wait for starting readers.
 pub(crate) struct WriterWait<'a> {
+    pub(crate) payer: Option<&'a crate::memory_accounting::StoreAccountantHandle>,
     pub(crate) stop: Option<&'a contextdb_core::read_contract::OwnerReadCancellation>,
     pub(crate) deadline: Option<(
         std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>,
@@ -443,6 +545,7 @@ pub(crate) struct WriterWait<'a> {
 
 impl WriterWait<'_> {
     pub(crate) const UNTIL_HANDED_OVER: WriterWait<'static> = WriterWait {
+        payer: None,
         stop: None,
         deadline: None,
     };
@@ -589,20 +692,32 @@ pub(crate) fn acquire_for_writer(
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         {
-            let mut missing = Vec::with_capacity(3);
+            let mut missing = [0; 3];
+            let mut count = 0;
             if !held.gate {
-                missing.push(GATE_OFFSET);
+                missing[count] = GATE_OFFSET;
+                count += 1;
             }
             if !held.reader_hold {
-                missing.push(READER_HOLD_OFFSET);
+                missing[count] = READER_HOLD_OFFSET;
+                count += 1;
             }
-            missing.push(DATA_OFFSET);
+            missing[count] = DATA_OFFSET;
+            count += 1;
+            let missing = &missing[..count];
             #[cfg(any(test, feature = "test-seams"))]
             count_for_test(file, |counts| {
                 counts.writer_hold_waits += missing.len() as u64
             });
             use super::writer_wait_helper::{WaitEnded, wait_for_helper};
-            match wait_for_helper(file, &missing, wait.stop, wait.deadline.clone(), store_path) {
+            match wait_for_helper(
+                file,
+                missing,
+                wait.stop,
+                wait.deadline.clone(),
+                store_path,
+                wait.payer,
+            ) {
                 WaitEnded::Granted => {
                     held.gate = true;
                     held.reader_hold = true;

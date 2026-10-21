@@ -317,6 +317,11 @@ impl Database {
                 .hold_row_page_for_test(table, id)
         })
     }
+    /// Explicit displacement setup only; ordinary hold calls preserve pinned residents.
+    #[doc(hidden)]
+    pub fn __detach_cached_row_page_for_test(&self, page: &redb::AccessGuard<'_, &'static [u8]>) -> Result<(u64, usize, usize, bool)> {
+        self.persistence.as_ref().expect("file-backed fixture").detach_cached_row_page_for_test(page)
+    }
     /// Deliberate checksummed-envelope corruption, only on a task fixture.
     #[doc(hidden)]
     pub fn __damage_membership_envelope_for_test(
@@ -351,7 +356,7 @@ pub struct SourceUnitCreditReport {
 
 #[derive(Debug)]
 struct SourceUnitCreditObserver {
-    source: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    source: contextdb_core::read_memory::ReadMemoryOwner,
     used: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
     cuts: Mutex<Vec<SourceUnitCreditCut>>,
@@ -486,7 +491,7 @@ impl Database {
         Ok(Box::new(ObservedReadCommitCursor {
             cursor,
             manager: self.tx_mgr.clone(),
-            image: self.read_image_memory.as_ref().map(Arc::downgrade),
+            image: self.read_image_memory.as_ref().map(|image| crate::read_image_memory::ImageMemoryObservation::new(image)),
         }))
     }
 
@@ -529,7 +534,7 @@ fn note_commit_directory_sample(manager: &DatabaseTransactionHost, durable_entri
 struct ObservedReadCommitCursor {
     cursor: Box<dyn contextdb_tx::ReadCommitCursor>,
     manager: DatabaseTransactionHost,
-    image: Option<std::sync::Weak<crate::read_image_memory::ImageMemory>>,
+    image: Option<crate::read_image_memory::ImageMemoryObservation>,
 }
 
 impl contextdb_tx::ReadCommitCursor for ObservedReadCommitCursor {
@@ -540,8 +545,8 @@ impl contextdb_tx::ReadCommitCursor for ObservedReadCommitCursor {
         self.manager.visit_captured_read_memory_for_test(
             crate::read_work_probe::note_commit_directory_open_funding,
         );
-        if let Some(image) = self.image.as_ref().and_then(std::sync::Weak::upgrade) {
-            crate::read_work_probe::note_commit_directory_image_memory(&image);
+        if let Some(image) = self.image {
+            crate::read_work_probe::note_commit_directory_image_observation(image);
         }
         crate::read_work_probe::note_commit_directory_request_funding(&context.read_memory);
         let entry = self.cursor.next_entry(context)?;
@@ -622,7 +627,7 @@ pub fn observe_source_unit_credit_for_test(
 pub struct SavedVectorRootForTest {
     manager: usize,
     writer: Option<crate::persistence::WriterSnapshotHandle>,
-    retained: Option<Arc<crate::persistence::RetainedReadSource>>,
+    retained: Option<crate::persistence::RetainedReadSource>,
     session: crate::read_session::ReadSession,
     pub snapshot: SnapshotId,
     pub storage: redb::StorageSnapshotIdentity,
@@ -646,7 +651,7 @@ impl SavedVectorRootForTest {
                     .as_ref()
                     .map(|startup| &startup.config_source)
             });
-            if !original.is_some_and(|source| Arc::ptr_eq(source, retained)) {
+            if !original.is_some_and(|source| crate::persistence::RetainedReadSource::ptr_eq(source, retained)) {
                 return Err(Error::Other(
                     "saved vector proof retained source changed".into()));
             }
@@ -756,7 +761,7 @@ impl Database {
         let retained = self.retained_relational_source.clone().or_else(|| {
             self.committed_image_startup
                 .as_ref()
-                .map(|startup| Arc::clone(&startup.config_source))
+                .map(|startup| startup.config_source.clone())
         });
         let (snapshot, storage) = if let Some(root) = &writer {
             (root.snapshot, root.storage_identity())

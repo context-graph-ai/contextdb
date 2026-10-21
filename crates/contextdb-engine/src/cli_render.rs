@@ -315,8 +315,10 @@ pub fn render_explain_with_read_memory(
     db: &Database,
     sql: &str,
     params: &std::collections::HashMap<String, Value>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<String> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let statement = contextdb_parser::parse(sql)?;
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
     match &statement {
@@ -328,7 +330,7 @@ pub fn render_explain_with_read_memory(
         }
         contextdb_parser::Statement::Select(_) => db
             .execute_with_read_memory(sql, params, read_memory.clone())
-            .map(|result| render_explain_trace(&result.trace)),
+            .map(|result| render_explain_trace(result.trace())),
         _ => db
             .explain_output_with_params(sql, params, &mut vector_copy_owner, read_memory.clone())
             .map(|explained| render_explain_output(&explained)),

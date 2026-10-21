@@ -27,14 +27,16 @@ pub(super) struct CarriedWriterTail {
     frontier: [u8; 32],
     layout: [u8; 32],
     tail: Option<WriterVectorTail>,
-    metadata_charge: Option<(Arc<dyn contextdb_vector::MemoryBudget>, usize)>,
+    metadata_charge: Option<(contextdb_vector::MemoryBudgetOwner, usize)>,
 }
 
 impl CarriedWriterTail {
     pub(super) fn recharge(
         &mut self,
-        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<()> {
+        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
+
         self.tail
             .as_mut()
             .expect("carried tail")

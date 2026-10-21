@@ -131,7 +131,7 @@ pub(crate) struct SinkQueue {
     entries: VecDeque<SinkQueueEntry>,
     /// Decoded bytes each resident entry holds on `owner`.
     credits: VecDeque<usize>,
-    owner: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    owner: Option<crate::read_image_memory::ImageMemoryHandle>,
     /// Durable entries; equals `entries.len()` while everything is resident.
     depth: u64,
     bounded: bool,
@@ -152,7 +152,7 @@ pub(crate) struct SinkWindow {
     pub(crate) entries: VecDeque<SinkQueueEntry>,
     pub(crate) credits: VecDeque<usize>,
     /// `None` for an empty window, which holds nothing.
-    pub(crate) owner: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    pub(crate) owner: Option<crate::read_image_memory::ImageMemoryHandle>,
 }
 
 impl SinkQueue {
@@ -307,12 +307,12 @@ fn with_rewritten_attempts<T>(
 /// window (a dispatcher checkout, a purge replacement), returned when they
 /// are gone.
 pub(crate) struct SinkWindowCopyCharge {
-    owner: Arc<crate::read_image_memory::ImageMemory>,
+    owner: crate::read_image_memory::ImageMemoryHandle,
     bytes: usize,
 }
 
 impl SinkWindowCopyCharge {
-    fn reserve(owner: &Arc<crate::read_image_memory::ImageMemory>, bytes: usize) -> Result<Self> {
+    fn reserve(owner: &crate::read_image_memory::ImageMemoryHandle, bytes: usize) -> Result<Self> {
         owner.reserve(bytes)?;
         Ok(Self {
             owner: owner.clone(),
@@ -772,7 +772,7 @@ pub(crate) struct PreparedAuthoritativePurgeEventBusPublication {
     durable_removed: BTreeMap<String, u64>,
     /// Credit of the purged resident entries, returned to their window owner
     /// only when this replacement is published.
-    deferred_releases: Vec<(Arc<crate::read_image_memory::ImageMemory>, usize)>,
+    deferred_releases: Vec<(crate::read_image_memory::ImageMemoryHandle, usize)>,
     /// Funding for the copied windows while the originals still live.
     _overlap: Vec<SinkWindowCopyCharge>,
     _queue_mutation_token: AuthoritativePurgeQueueMutationToken,
@@ -816,8 +816,8 @@ pub(crate) struct PreparedEventBusPublication {
     pub(crate) config_values: Vec<(String, Vec<u8>)>,
 }
 
-#[derive(Debug, Clone)]
 struct StagedEventBusDdlCommit {
+    memory_history: Option<super::PreparedSchemaHistory>,
     definitions: EventBusDefinitions,
     persistence: EventBusPersistenceCommit,
 }
@@ -1143,10 +1143,12 @@ impl EventBusState {
         lsn: Lsn,
         definitions: EventBusDefinitions,
         persistence: EventBusPersistenceCommit,
+        memory_history: Option<super::PreparedSchemaHistory>,
     ) {
         self.staged_ddl_for_persistence.lock().insert(
             lsn,
             StagedEventBusDdlCommit {
+                memory_history,
                 definitions,
                 persistence,
             },
@@ -1547,8 +1549,10 @@ impl Database {
     pub(super) fn apply_event_bus_ddl_from_user(
         &self,
         ddl: Vec<DdlChange>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.require_admin_event_bus_ddl()?;
         self.apply_event_bus_ddl_batch(ddl, read_memory.clone())
     }
@@ -1557,8 +1561,10 @@ impl Database {
         &self,
         lsn: Lsn,
         ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u32> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ddl.is_empty() {
             return Ok(0);
         }
@@ -1586,8 +1592,9 @@ impl Database {
             ddl: ddl.to_vec(),
             generation_sidecars,
         };
+        let memory_history = self.prepare_staged_memory_schema_history(lsn, 0, ddl, &persistence.generation_sidecars)?;
         self.event_bus
-            .stage_event_bus_ddl_commit(lsn, projected, persistence);
+            .stage_event_bus_ddl_commit(lsn, projected, persistence, memory_history);
         Ok(ddl_count)
     }
 
@@ -1605,22 +1612,10 @@ impl Database {
             .lock()
             .remove(&lsn);
         if let Some(staged) = staged {
-            self.publish_in_memory_ddl_generation_sidecars(
-                lsn,
-                0,
-                &staged.persistence.generation_sidecars,
-            );
             self.apply_event_bus_definitions_to_memory_under_queue_mutation_lease(
                 staged.definitions,
             );
-            let mut ddl_log = self.ddl_log.write();
-            ddl_log.extend(
-                staged
-                    .persistence
-                    .ddl
-                    .into_iter()
-                    .map(|change| (lsn, change)),
-            );
+            self.publish_memory_schema_history(staged.memory_history);
         }
     }
 
@@ -1634,8 +1629,10 @@ impl Database {
     pub(super) fn apply_event_bus_ddl_batch(
         &self,
         ddl: Vec<DdlChange>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ddl.is_empty() {
             return Ok(());
         }
@@ -2196,8 +2193,10 @@ impl Database {
     pub(super) fn prepare_sink_events_for_write_set(
         &self,
         ws: &contextdb_tx::WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<PreparedSinkEvent>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_sink_events_for_write_set_with_event_bus_ddl(ws, &[], read_memory)
     }
 
@@ -2205,8 +2204,10 @@ impl Database {
         &self,
         ws: &contextdb_tx::WriteSet,
         event_bus_ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<PreparedSinkEvent>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.private_prefix_effects_prepared(ws) { return Ok(Vec::new()); }
         if ws.relational_inserts.is_empty() && ws.relational_deletes.is_empty() {
             return Ok(Vec::new());
@@ -2422,7 +2423,9 @@ impl Database {
 
     pub(super) fn prepare_private_prefix_sink_events(&self, tx: TxId, lsn: Lsn,
         targets: &super::connected_replay::PrivateChangedRows, initial_len: usize,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The detached receiver alone owns this counter. Only END publishes
         // the cursor and entries to the actual receiver.
         let base = self.event_bus.next_action_id();
@@ -2466,7 +2469,9 @@ impl Database {
     fn append_private_prefix_sink_candidate(&self, tx: TxId, out: &mut Vec<PreparedSinkEvent>,
         definitions: &EventBusDefinitions, candidate: RowEventCandidateRef<'_>, lsn: Lsn,
         ws: &contextdb_tx::WriteSet, cache: &mut HashMap<String, EventGateSnapshot>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for event_type in definitions.event_types.values() {
             if event_type.table != candidate.table || event_type.trigger != candidate.trigger { continue; }
             let severity = candidate.values.get("severity").and_then(Value::as_text).unwrap_or("");
@@ -2498,8 +2503,10 @@ impl Database {
         lsn: Lsn,
         ws: &contextdb_tx::WriteSet,
         static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for event_type in definitions.event_types.values() {
             if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
                 continue;
@@ -2555,8 +2562,10 @@ impl Database {
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
         static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<EventGateSnapshot> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(gate) = static_gate_cache.get(table) {
             return Ok(gate.clone());
         }
@@ -2576,8 +2585,10 @@ impl Database {
         meta: &TableMeta,
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<EventGateSnapshot> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot();
         let mut gate = event_gate_snapshot_from_meta(meta);
         let acl = meta
@@ -2628,8 +2639,10 @@ impl Database {
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
         ws: &contextdb_tx::WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<EventGrantRows> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let prepare=|mut memory:crate::memory_accounting::OwnedMemoryReservation,original:bool| {
         let mut grants=Vec::new();
         let deleted=|row:RowId|ws.relational_deletes.iter().any(|(table,id,_)|
@@ -2894,8 +2907,10 @@ impl Database {
         &self,
         definitions: EventBusDefinitions,
         ddl: Vec<DdlChange>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if *self.event_bus.definitions.lock() == definitions {
             return Ok(());
         }
@@ -2905,8 +2920,10 @@ impl Database {
     fn commit_event_bus_ddl_changes(
         &self,
         ddl: Vec<DdlChange>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut projected = self.event_bus.definitions.lock().clone();
         for change in &ddl {
             self.apply_event_bus_ddl_to_definitions(&mut projected, change)?;
@@ -2926,6 +2943,7 @@ impl Database {
             // entering this closure. Keep this lease across the durable DDL
             // write and the matching in-memory queue-definition publication.
             let _queue_mutation = self.event_bus.begin_queue_mutation();
+            let memory_history = self.prepare_memory_ddl_append(lsn, &ddl, read_memory.clone())?;
             if let Some(persistence) = &self.persistence {
                 let mut config_values: Vec<(&str, Vec<u8>)> =
                     Self::encoded_event_bus_config_values(&projected)?
@@ -2944,13 +2962,9 @@ impl Database {
                     lsn,
                     &ddl,
                 )?;
-            } else {
-                self.record_ddl_generation_sidecars(lsn, &ddl, read_memory.clone())?;
             }
             self.apply_event_bus_definitions_to_memory_under_queue_mutation_lease(projected);
-            self.ddl_log
-                .write()
-                .extend(ddl.into_iter().map(|change| (lsn, change)));
+            self.publish_memory_schema_history(memory_history);
             Ok(())
         })
     }
@@ -3012,11 +3026,13 @@ impl Database {
     fn row_event_candidates(
         &self,
         ws: &contextdb_tx::WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         Vec<RowEventCandidate>,
         crate::memory_accounting::OwnedMemoryReservation,
     )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot();
         let delete_capacity = ws.relational_deletes.len();
         let candidate_capacity = ws.relational_inserts.len().saturating_add(delete_capacity);
@@ -4557,6 +4573,7 @@ pub(super) struct OwnedCommitEventStage {
     pub(super) schema: Option<OwnedDefinitionPublication>,
 }
 pub(super) struct OwnedStagedEventBusDdlCommit {
+    pub(super) memory_history: Option<super::PreparedSchemaHistory>,
     pub(super) persistence: EventBusPersistenceCommit,
     pub(super) persistence_credit: OwnedEncodedEventBusConfig,
     pub(super) publication: OwnedDefinitionPublication,
@@ -5943,30 +5960,40 @@ impl<T: Serialize> Serialize for OwnedEventSequence<'_, T> {
 }
 fn encode_owned_event_value<T: Serialize>(original: &OwnedMemoryReservation, value: &T,
 ) -> Result<OwnedEventBody<Vec<u8>, OwnedMemoryReservation>> {
+    let mut diagnostic = Some(OriginalError::prepare(original,
+        "relational", "statement_overlay", "Reduce prepared event bodies or raise MEMORY_LIMIT.")
+        .map_err(|failure| crate::persistence::native_storage_admission::original_storage_error(
+            crate::persistence::native_storage_admission::NativeStorageFailure::Refused(failure)))?);
     encode_owned_event_value_in(original, value,
-        |error| Error::Other(format!("bincode encode error: {error}").into()))
+        |error| diagnostic.take().expect("one failed encoding pass")
+            .encode(error, crate::memory_accounting::retain_preparation_original(original))
+            .into_public_prepared(), |error| error)
 }
 fn encode_owned_event_value_funded<T: Serialize>(original: &OwnedMemoryReservation, value: &T,
 ) -> OriginalResult<OwnedEventBody<Vec<u8>, OwnedMemoryReservation>> {
+    let diagnostic = OriginalError::prepare_route(original)?;
     encode_owned_event_value_in(original, value,
-        |error| OriginalError::encode(error, crate::memory_accounting::retain_preparation_original(original)))
+        |error| diagnostic.encode(error,
+            crate::memory_accounting::retain_preparation_original(original)),
+        |error| diagnostic.error(error))
 }
-fn encode_owned_event_value_in<T: Serialize, E: From<Error>>(
+fn encode_owned_event_value_in<T: Serialize, E>(
     original: &OwnedMemoryReservation,
     value: &T,
-    codec: impl Fn(bincode::error::EncodeError) -> E,
+    mut codec: impl FnMut(bincode::error::EncodeError) -> E,
+    existing: impl Fn(Error) -> E,
 ) -> std::result::Result<OwnedEventBody<Vec<u8>, OwnedMemoryReservation>, E> {
     let mut count = bincode::enc::write::SizeWriter::default();
     bincode::serde::encode_into_writer(value, &mut count, bincode::config::standard())
-        .map_err(&codec)?;
-    let (body, credit) = new_owned_native_vec::<u8>(original, count.bytes_written)?;
+        .map_err(&mut codec)?;
+    let (body, credit) = new_owned_native_vec::<u8>(original, count.bytes_written).map_err(&existing)?;
     let mut owner = OwnedEventBody { body, credit };
     owner.body.resize(count.bytes_written, 0);
     let written =
         bincode::serde::encode_into_slice(value, &mut owner.body, bincode::config::standard())
             .map_err(codec)?;
     if written != owner.body.len() {
-        return Err(Error::Other("event encoding size changed".into()).into());
+        return Err(existing(Error::Other("event encoding size changed".into())));
     }
     Ok(owner)
 }
@@ -6532,6 +6559,7 @@ pub(crate) struct OwnedQueueCommitCleanup {
 }
 pub(crate) struct OwnedNativeQueueFailure {
     error: Option<OriginalError>,
+    carrier: Option<crate::funded_error::PreparedDiagnosticRoute>,
     pub(crate) cleanup: OwnedQueueCommitCleanup,
     control: Option<OwnedMemoryReservation>,
     diagnostic: Option<OwnedMemoryReservation>,
@@ -6548,9 +6576,17 @@ impl std::fmt::Display for OwnedNativeQueueFailure {
 }
 impl OwnedNativeQueueFailure {
     fn prepare(original: &OwnedMemoryReservation) -> Self {
-        let failure = match reserve_owned_event_bytes(original, std::mem::size_of::<Self>()) {
+        let carrier = match OriginalError::prepare_route(original) {
+            Ok(carrier) => carrier,
+            Err(error) => return Self { error: Some(error), carrier: None,
+                cleanup: OwnedQueueCommitCleanup::default(), control: None, diagnostic: None },
+        };
+        let failure = match crate::memory_accounting::reserve_preparation_original_native(
+            original, std::mem::size_of::<Self>(), "relational", "statement_overlay",
+            "Reduce prepared event bodies or raise MEMORY_LIMIT.") {
             Ok(control) => Self {
                 error: None,
+                carrier: Some(carrier),
                 cleanup: OwnedQueueCommitCleanup::default(),
                 control: Some(control),
                 diagnostic: None,
@@ -6559,7 +6595,8 @@ impl OwnedNativeQueueFailure {
             // that exact refusal rather than allocating a replacement error.
             Err(error) => {
                 return Self {
-                    error: Some(error.into()),
+                    error: Some(OriginalError::native(error)),
+                    carrier: Some(carrier),
                     cleanup: OwnedQueueCommitCleanup::default(),
                     control: None,
                     diagnostic: None,
@@ -6569,9 +6606,11 @@ impl OwnedNativeQueueFailure {
         #[cfg(any(test, feature = "test-seams"))]
         {
             let mut failure = failure;
-            match reserve_owned_event_bytes(original, "injected currency cleanup failure".len()) {
+            match crate::memory_accounting::reserve_preparation_original_native(
+                original, "injected currency cleanup failure".len(), "relational", "statement_overlay",
+                "Reduce prepared event bodies or raise MEMORY_LIMIT.") {
                 Ok(credit) => failure.diagnostic = Some(credit),
-                Err(error) => failure.error = Some(error.into()),
+                Err(error) => failure.error = Some(OriginalError::native(error)),
             }
             failure
         }
@@ -6582,7 +6621,9 @@ impl OwnedNativeQueueFailure {
     }
     pub(crate) fn has_error(&self) -> bool { self.error.is_some() }
     pub(crate) fn capture(&mut self, result: Result<()>) {
-        self.capture_funded(result.map_err(OriginalError::unqualified));
+        let result = result.map_err(|error| self.carrier.take()
+            .expect("failure carrier prepared before callback").error(error));
+        self.capture_funded(result);
     }
     pub(crate) fn capture_funded(&mut self, result: OriginalResult<()>) {
         if let Err(error) = result {
@@ -6620,6 +6661,9 @@ impl OwnedEventBusHandle {
         sink: &str,
         lookup: &OwnedCheckoutLookup,
     ) -> Result<OwnedQueueMutationClaim> {
+        let queue_output = OriginalError::prepare_queue(&self.data().original, lookup.key.1)
+            .map_err(|refusal| crate::persistence::native_storage_admission::original_storage_error(
+                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(refusal)))?;
         let control = reserve_owned_event_bytes(
             &self.data().original,
             std::mem::size_of::<OwnedQueueMutationClaim>(),
@@ -6655,10 +6699,7 @@ impl OwnedEventBusHandle {
             if !current {
                 drop(queues);
                 drop(state);
-                return Err(Error::Other((format!(
-                    "pending sink action disappeared: {}",
-                    lookup.key.1
-                )).into()));
+                return Err(OriginalError::queue_public(queue_output, lookup.key.1, false));
             }
             if queues
                 .values
@@ -7027,6 +7068,10 @@ impl OwnedEventBusHandle {
             Ok(output) => output,
             Err(refusal) => return failure.finish(Err(OriginalError::native(refusal))),
         };
+        let diagnostic = match OriginalError::prepare_route(&self.data().original) {
+            Ok(diagnostic) => diagnostic,
+            Err(error) => return failure.finish(Err(error)),
+        };
         let mut retired = None;
         let mut old_lookup = None;
         let mut retired_publication = None;
@@ -7034,10 +7079,10 @@ impl OwnedEventBusHandle {
         let mut outer_claim = None;
         let mut outer_lease = None;
         let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-            tx_mgr.with_original_maintenance_publication(|publication| {
-            outer_lease = Some(self.data().common.begin_dispatcher_queue_mutation()?);
+            tx_mgr.with_original_maintenance_publication(&self.data().original, |publication| {
+            outer_lease = Some(self.data().common.begin_dispatcher_queue_mutation().map_err(|error| diagnostic.error(error))?);
             let entry_id = lookup.key.1;
-            outer_claim = Some(self.claim_owned_checked_out(sink, lookup)?);
+            outer_claim = Some(self.claim_owned_checked_out(sink, lookup).map_err(|error| diagnostic.error(error))?);
             let _claim = outer_claim.as_ref().expect("one actual source claim");
             // The lookup pins the ACTUAL checked-out entry, including its
             // original invoice. No new root/key lookup chooses a funding seed.
@@ -7060,7 +7105,7 @@ impl OwnedEventBusHandle {
             }
             let source = &lookup.source;
             let mut updated =
-                copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)?;
+                copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry).map_err(|error| diagnostic.error(error))?;
             let attempts = updated.entry.attempts & ATTEMPT_COUNT_MASK;
             updated.entry.attempts = if start {
                 if updated.entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
@@ -7083,7 +7128,7 @@ impl OwnedEventBusHandle {
                 updated,
                 &source.get().credit.metadata,
                 &self.data().funder,
-            )?;
+            ).map_err(|error| diagnostic.error(error))?;
             let prepared = persistence.prepare_update_funded(
                 &self.data().original,
                 sink,
@@ -7111,7 +7156,7 @@ impl OwnedEventBusHandle {
             }
             // Acquire every settlement lock before entering storage. The
             // source claim fixes this generation while the physical write runs.
-            let mut published = publication.prepare_exact_root()?;
+            let mut published = publication.prepare_exact_root().map_err(|error| diagnostic.error(error))?;
             let snapshot = published.snapshot();
             let lsn = published.lsn();
             let mut queues = self.data().queues.lock();
@@ -7145,7 +7190,7 @@ impl OwnedEventBusHandle {
             joint_control = Some(reserve_owned_event_bytes(&self.data().original,
                 std::mem::size_of_val(&settle) + std::mem::size_of::<contextdb_tx::manager::PreparedMaintenanceRead<'_>>()
                 + 2 * std::mem::size_of::<Option<OwnedEventShared<OwnedSinkQueueEntry>>>()
-                + std::mem::size_of::<Option<contextdb_tx::native_capture::CaptureHandle>>())?);
+                + std::mem::size_of::<Option<contextdb_tx::native_capture::CaptureHandle>>()).map_err(|error| diagnostic.error(error))?);
             let settle_joint = |root| (settle.borrow_mut())(root);
             let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
             persistence.commit_update_at_boundary(prepared, &token, &mut failure);
@@ -7191,13 +7236,17 @@ impl OwnedEventBusHandle {
             Ok(output) => output,
             Err(refusal) => return failure.finish(Err(OriginalError::native(refusal))),
         };
+        let diagnostic = match OriginalError::prepare_route(&self.data().original) {
+            Ok(diagnostic) => diagnostic,
+            Err(error) => return failure.finish(Err(error)),
+        };
         let mut retired_publication = None;
         let mut joint_control = None;
         let mut outer_claim = None;
         let mut outer_lease = None;
         let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-            tx_mgr.with_original_maintenance_publication(|publication| {
-            outer_lease = Some(self.data().common.begin_dispatcher_queue_mutation()?);
+            tx_mgr.with_original_maintenance_publication(&self.data().original, |publication| {
+            outer_lease = Some(self.data().common.begin_dispatcher_queue_mutation().map_err(|error| diagnostic.error(error))?);
             batch.removable.clear();
             // Qualify the actual first source before preparing any durable ack.
             // An absent prefix retains the original no-op behavior; an equal
@@ -7240,7 +7289,7 @@ impl OwnedEventBusHandle {
             if !front_matches {
                 return Err(OriginalError::queue(queue_output, first, false));
             }
-            outer_claim = Some(self.claim_owned_checked_out(sink, first_lookup)?);
+            outer_claim = Some(self.claim_owned_checked_out(sink, first_lookup).map_err(|error| diagnostic.error(error))?);
             let _claim = outer_claim.as_ref().expect("one actual source claim");
             let unconfirmed;
             let mut stale = None;
@@ -7294,10 +7343,10 @@ impl OwnedEventBusHandle {
                 sink,
                 &batch.removable,
                 unconfirmed,
-            )?;
+            ).map_err(|error| diagnostic.error(error))?;
             let removable = &batch.removable;
             let retired = &mut batch.retired;
-            let mut published = publication.prepare_exact_root()?;
+            let mut published = publication.prepare_exact_root().map_err(|error| diagnostic.error(error))?;
             let snapshot = published.snapshot();
             let lsn = published.lsn();
             let mut queues = self.data().queues.lock();
@@ -7330,7 +7379,7 @@ impl OwnedEventBusHandle {
             });
             joint_control = Some(reserve_owned_event_bytes(&self.data().original,
                 std::mem::size_of_val(&settle) + std::mem::size_of::<contextdb_tx::manager::PreparedMaintenanceRead<'_>>()
-                + std::mem::size_of::<Option<contextdb_tx::native_capture::CaptureHandle>>())?);
+                + std::mem::size_of::<Option<contextdb_tx::native_capture::CaptureHandle>>()).map_err(|error| diagnostic.error(error))?);
             let settle_joint = |root| (settle.borrow_mut())(root);
             let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
             persistence.commit_removals_at_boundary(prepared, &token, &mut failure);
@@ -7383,8 +7432,9 @@ pub(crate) trait OwnedSinkQueuePersistence {
         &self, original: &OwnedMemoryReservation,
         visit: impl for<'s> FnOnce(&crate::persistence::OwnedColdEventSource<'s>) -> OriginalResult<R>,
     ) -> OriginalResult<R> {
+        let diagnostic = OriginalError::prepare_route(original)?;
         self.with_cold_source(original, |source| Ok(visit(source)))
-            .map_err(OriginalError::unqualified)?
+            .map_err(|error| diagnostic.error(error))?
     }
     fn prepare_update<'o>(
         &self,
@@ -7398,8 +7448,9 @@ pub(crate) trait OwnedSinkQueuePersistence {
     fn prepare_update_funded<'o>(&self, original: &'o OwnedMemoryReservation,
         sink: &'o str, entry_id: u64, encoded: &[u8], uncertain: bool, unconfirmed_delta: i8,
     ) -> OriginalResult<Self::Update<'o>> {
+        let diagnostic = OriginalError::prepare_route(original)?;
         self.prepare_update(original, sink, entry_id, encoded, uncertain, unconfirmed_delta)
-            .map_err(OriginalError::unqualified)
+            .map_err(|error| diagnostic.error(error))
     }
     fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()>;
     fn commit_update_at_boundary(
@@ -8096,7 +8147,8 @@ pub(super) trait OwnedEventEntryDecoder {
         encoded: &[u8],
     ) -> Result<OwnedSinkQueueEntry>;
     fn decode_funded(&self, original: &OwnedMemoryReservation, encoded: &[u8]) -> OriginalResult<OwnedSinkQueueEntry> {
-        self.decode(original, encoded).map_err(OriginalError::unqualified)
+        let diagnostic = OriginalError::prepare_route(original)?;
+        self.decode(original, encoded).map_err(|error| diagnostic.error(error))
     }
 
 }
@@ -8140,8 +8192,9 @@ impl OwnedEncodedEventSource<OriginalError> for OwnedPersistentEventStartupSourc
         self.encoded.visit_funded(self.original, sink, visit)
     }
     fn unloaded_extent(&self, sink: &str) -> OriginalResult<Option<(u64, u64)>> {
+        let diagnostic = OriginalError::prepare_route(self.original)?;
         let (depth, newest, _) = self.encoded.cold_queue_source().extent_in(self.original, sink,
-            |error| RedbPersistence::storage_error_funded(self.original, error))?;
+            |error| diagnostic.storage(self.original, error), |error| diagnostic.error(error))?;
         Ok(Some((depth, newest)))
     }
     fn cold_source(&self) -> Option<crate::persistence::OwnedColdEventSource<'_>> {
@@ -8159,14 +8212,15 @@ impl OwnedEncodedEventSource<OriginalError> for OwnedPersistentEventStartupSourc
 
 fn new_owned_error_ring<T>(original: &OwnedMemoryReservation, required: usize,
 ) -> OriginalResult<(VecDeque<T>, OwnedMemoryReservation)> {
-    let (capacity, layout) = crate::memory_accounting::native_ring_plan::<T>(required)?;
+        let diagnostic = OriginalError::prepare_route(original)?;
+    let (capacity, layout) = crate::memory_accounting::native_ring_plan::<T>(required).map_err(|error| diagnostic.error(error))?;
     let memory = crate::memory_accounting::reserve_preparation_original_native(original, layout.size(),
         "relational", "statement_overlay", "Reduce prepared bodies or raise MEMORY_LIMIT.")
         .map_err(OriginalError::native)?;
     let ring = VecDeque::with_capacity(capacity);
     if let Err(error) = crate::memory_accounting::validate_native_ring_capacity(&ring, capacity) {
         drop(ring);
-        return Err(error.into());
+        return Err(diagnostic.error(error));
     }
     Ok((ring, memory))
 }
@@ -8183,17 +8237,18 @@ impl OwnedEventBusHandle {
         self.read_owned_cold_window_in(source, sink, after, upper,
             |original, bytes| OwnedPersistentEventEntryDecoder.decode(original, bytes),
             RedbPersistence::storage_error, new_owned_native_ring,
-            crate::read_image_memory::is_memory_refusal)
+            crate::read_image_memory::is_memory_refusal, |error| error)
     }
     fn read_owned_cold_window_funded(&self, source: &crate::persistence::OwnedColdEventSource<'_>,
         sink: &str, after: Option<u64>, upper: Option<u64>) -> OriginalResult<OwnedColdWindow<OriginalError>> {
+        let diagnostic = OriginalError::prepare_route(&self.data().original)?;
         self.read_owned_cold_window_in(source, sink, after, upper,
             |original, bytes| OwnedPersistentEventEntryDecoder.decode_funded(original, bytes),
-            |error| RedbPersistence::storage_error_funded(&self.data().original, error),
-            new_owned_error_ring, OriginalError::is_memory_refusal)
+            |error| diagnostic.storage(&self.data().original, error),
+            new_owned_error_ring, OriginalError::is_memory_refusal, |error| diagnostic.error(error))
     }
 
-    fn read_owned_cold_window_in<E: From<Error>>(
+    fn read_owned_cold_window_in<E>(
         &self,
         source: &crate::persistence::OwnedColdEventSource<'_>,
         sink: &str,
@@ -8204,9 +8259,10 @@ impl OwnedEventBusHandle {
         ring: impl Fn(&OwnedMemoryReservation, usize) -> std::result::Result<
             (VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, OwnedMemoryReservation), E>,
         is_memory: fn(&E) -> bool,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<OwnedColdWindow<E>, E> {
         let original = &self.data().original;
-        let (depth, newest, root) = source.extent_in(original, sink, &storage)?;
+        let (depth, newest, root) = source.extent_in(original, sink, &storage, &existing)?;
         let upper = upper.unwrap_or(newest);
         let capacity = SINK_WINDOW_ENTRIES.min(usize::try_from(depth).unwrap_or(usize::MAX));
         let (entries, buffer, refusal) = match ring(original, capacity) {
@@ -8238,7 +8294,7 @@ impl OwnedEventBusHandle {
                 Err(error) => return Err(error),
             };
             if entry.entry.id != id {
-                return Err(E::from(Error::Other("sink queue key/content identity mismatch".into())));
+                return Err(existing(Error::Other("sink queue key/content identity mismatch".into())));
             }
             let bytes = entry.credit.metadata.bytes();
             if !window.entries.is_empty() && held.saturating_add(bytes) > SINK_WINDOW_BYTES {
@@ -8247,7 +8303,7 @@ impl OwnedEventBusHandle {
                 return Ok(false);
             }
             entry.entry.event.action_id = id;
-            let pin = match OwnedEventShared::try_new(entry, original, &self.data().funder).map_err(E::from) {
+            let pin = match OwnedEventShared::try_new(entry, original, &self.data().funder).map_err(&existing) {
                 Ok(pin) => pin,
                 Err(error) if is_memory(&error) => {
                     if window.entries.is_empty() { window.refusal = Some(error); }
@@ -8259,7 +8315,7 @@ impl OwnedEventBusHandle {
             window.entries.push_back(pin);
             window.state.through = id;
             Ok(true)
-        }, &storage)?;
+        }, &storage, &existing)?;
         if exhausted { window.state.through = upper; }
         Ok(window)
     }
@@ -8299,7 +8355,7 @@ impl OwnedEventBusHandle {
         // be dispatched in the interval before its rows/root are published.
         // Acquire the commit boundary BEFORE the mutation lease, as purge's
         // commit-locked freeze waits for leases to drain.
-        let result = tx_mgr.with_original_maintenance_publication(|_| {
+        let result = tx_mgr.with_original_maintenance_publication(&self.data().original, |_| {
             self.refill_owned_sink_window_at_boundary(persistence, sink, access)
         });
         if let Err(error) = &result
@@ -8323,11 +8379,12 @@ impl OwnedEventBusHandle {
         sink: &str,
         access: &AccessConstraints,
     ) -> OriginalResult<bool> {
+        let diagnostic = OriginalError::prepare_route(&self.data().original)?;
         // The lease spans the pinned read, all copied bodies, installation and
         // physical retirement. Purge cannot certify erasure in that interval.
-        let _lease = self.data().common.begin_dispatcher_queue_mutation()?;
+        let _lease = self.data().common.begin_dispatcher_queue_mutation().map_err(|error| diagnostic.error(error))?;
         let control = reserve_owned_event_bytes(&self.data().original,
-            std::mem::size_of::<OwnedColdRefillClaim>())?;
+            std::mem::size_of::<OwnedColdRefillClaim>()).map_err(|error| diagnostic.error(error))?;
         let claim = {
             let state = self.data().common.queue_mutation_state.lock();
             // Never wait for checkout admission while holding a mutation lease:
@@ -8462,7 +8519,7 @@ fn decode_owned_startup_definitions_funded<T: serde::de::DeserializeOwned>(
     match source.decode_owned_config_funded(original, key)? {
         Some(decoded) => Ok(decoded),
         None => Ok(crate::persistence::OriginalDecoded {
-            value: Vec::new(), allocation: reserve_owned_event_bytes(original, 0)?,
+            value: Vec::new(), allocation: crate::memory_accounting::reserve_preparation_original_native(original, 0, "relational", "statement_overlay", "Reduce prepared event bodies or raise MEMORY_LIMIT.").map_err(OriginalError::native)?,
         }),
     }
 }
@@ -8478,21 +8535,22 @@ impl OwnedDefinitionsProjection {
                 decode_owned_startup_definitions::<EventTypeDef>(source, original, EVENT_TYPES_CONFIG_KEY)?,
                 decode_owned_startup_definitions::<SinkDef>(source, original, SINKS_CONFIG_KEY)?,
                 decode_owned_startup_definitions::<RouteDef>(source, original, ROUTES_CONFIG_KEY)?,
-            )))
+            )), |error| error)
     }
     fn decode_persistent_startup_funded(
         source: &crate::persistence::OwnedEncodedEventSource<'_>,
         original: &OwnedMemoryReservation,
         live_tables: &HashMap<String, TableMeta>,
     ) -> OriginalResult<Self> {
+        let diagnostic = OriginalError::prepare_route(original)?;
         Self::decode_persistent_startup_in(source, original, live_tables,
             |source, original| Ok((
                 decode_owned_startup_definitions_funded::<EventTypeDef>(source, original, EVENT_TYPES_CONFIG_KEY)?,
                 decode_owned_startup_definitions_funded::<SinkDef>(source, original, SINKS_CONFIG_KEY)?,
                 decode_owned_startup_definitions_funded::<RouteDef>(source, original, ROUTES_CONFIG_KEY)?,
-            )))
+            )), |error| diagnostic.error(error))
     }
-    fn decode_persistent_startup_in<E: From<Error>>(
+    fn decode_persistent_startup_in<E>(
         source: &crate::persistence::OwnedEncodedEventSource<'_>,
         original: &OwnedMemoryReservation,
         live_tables: &HashMap<String, TableMeta>,
@@ -8502,52 +8560,53 @@ impl OwnedDefinitionsProjection {
                 crate::persistence::OriginalDecoded<Vec<SinkDef>>,
                 crate::persistence::OriginalDecoded<Vec<RouteDef>>,
             ), E>,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<Self, E> {
         // Declare the final invoice BEFORE all temporary decoded containers:
         // their buffers/remaining bodies die first on refusal and unwind, even
         // after their admissions have been merged into the final projection.
         let mut projection = Self {
             definitions: EventBusDefinitions::default(),
-            allocation: reserve_owned_event_bytes(original, 0)?,
+            allocation: reserve_owned_event_bytes(original, 0).map_err(&existing)?,
         };
         let (mut types, mut sinks, mut routes) = decode(source, original)?;
         // The existing BTree node plan requires ascending insertion. Stable
         // sorting also preserves the last declaration for duplicate names.
         // Each sort's temporary buffer is at most the sequence's full array;
         // the three sorts run sequentially under one maximum-sized invoice.
-        let sort_bytes = owned_event_array::<EventTypeDef>(types.value.len())?
-            .max(owned_event_array::<SinkDef>(sinks.value.len())?)
-            .max(owned_event_array::<RouteDef>(routes.value.len())?);
-        let sort_workspace = reserve_owned_event_bytes(original, sort_bytes)?;
+        let sort_bytes = owned_event_array::<EventTypeDef>(types.value.len()).map_err(&existing)?
+            .max(owned_event_array::<SinkDef>(sinks.value.len()).map_err(&existing)?)
+            .max(owned_event_array::<RouteDef>(routes.value.len()).map_err(&existing)?);
+        let sort_workspace = reserve_owned_event_bytes(original, sort_bytes).map_err(&existing)?;
         types.value.sort_by(|left, right| left.name.cmp(&right.name));
         sinks.value.sort_by(|left, right| left.name.cmp(&right.name));
         routes.value.sort_by(|left, right| left.name.cmp(&right.name));
         drop(sort_workspace);
         let mut bytes = owned_event_add(
-            owned_event_btree_bytes::<String, EventTypeDef>(types.value.len())?,
-            owned_event_btree_bytes::<String, SinkDef>(sinks.value.len())?,
-        )?;
-        bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, RouteDef>(routes.value.len())?)?;
+            owned_event_btree_bytes::<String, EventTypeDef>(types.value.len()).map_err(&existing)?,
+            owned_event_btree_bytes::<String, SinkDef>(sinks.value.len()).map_err(&existing)?,
+        ).map_err(&existing)?;
+        bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, RouteDef>(routes.value.len()).map_err(&existing)?).map_err(&existing)?;
         for name in types.value.iter().map(|def| &def.name)
             .chain(sinks.value.iter().map(|def| &def.name))
             .chain(routes.value.iter().map(|def| &def.name))
         {
-            bytes = owned_event_add(bytes, name.len())?;
+            bytes = owned_event_add(bytes, name.len()).map_err(&existing)?;
         }
         // Admit the BTree nodes and independent map keys before allocating.
-        let mut maps = reserve_owned_event_bytes(original, bytes)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut maps)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut types.allocation)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut sinks.allocation)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut routes.allocation)?;
+        let mut maps = reserve_owned_event_bytes(original, bytes).map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut maps).map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut types.allocation).map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut sinks.allocation).map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut routes.allocation).map_err(&existing)?;
         for def in types.value.drain(..) {
-            projection.definitions.event_types.insert(copy_owned_prepaid_text(&def.name)?, def);
+            projection.definitions.event_types.insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
         }
         for def in sinks.value.drain(..) {
-            projection.definitions.sinks.insert(copy_owned_prepaid_text(&def.name)?, def);
+            projection.definitions.sinks.insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
         }
         for def in routes.value.drain(..) {
-            projection.definitions.routes.insert(copy_owned_prepaid_text(&def.name)?, def);
+            projection.definitions.routes.insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
         }
         // Same sanitation as ordinary startup, without an unfunded table-name
         // set or a Legacy definition projection.
@@ -8559,9 +8618,11 @@ impl OwnedDefinitionsProjection {
 impl OwnedEventBusHandle {
     fn load_owned_persistent_startup_funded(
         &self, persistence: &RedbPersistence,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         live_tables: &HashMap<String, TableMeta>,
     ) -> OriginalResult<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         persistence.with_owned_encoded_event_source_funded(&self.data().original, read_memory,
             |source| self.install_owned_persistent_startup_funded(source, live_tables))
     }
@@ -8571,11 +8632,12 @@ impl OwnedEventBusHandle {
         live_tables: &HashMap<String, TableMeta>,
     ) -> OriginalResult<()> {
         let original = &self.data().original;
+        let diagnostic = OriginalError::prepare_route(original)?;
         let definitions = OwnedDefinitionsProjection::decode_persistent_startup_funded(encoded, original, live_tables)?;
         let source = OwnedPersistentEventStartupSource { encoded, original };
         let image = self.prepare_owned_event_bus_image_funded(
             &source, &OwnedPersistentEventEntryDecoder, definitions, true)?;
-        self.install_owned_event_bus_image(image)?;
+        self.install_owned_event_bus_image(image).map_err(|error| diagnostic.error(error))?;
         self.data().common.durable_windows.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -8621,36 +8683,38 @@ impl OwnedEventBusHandle {
     ) -> Result<OwnedEventStartupImage> {
         self.prepare_owned_event_bus_image_in(source, definitions, writable,
             |original, bytes| decoder.decode(original, bytes),
-            |cold, name| self.read_owned_cold_window(cold, name, None, None))
+            |cold, name| self.read_owned_cold_window(cold, name, None, None), |error| error)
     }
     fn prepare_owned_event_bus_image_funded<S: OwnedEncodedEventSource<OriginalError>, D: OwnedEventEntryDecoder>(
         &self, source: &S, decoder: &D, definitions: OwnedDefinitionsProjection, writable: bool,
     ) -> OriginalResult<OwnedEventStartupImage> {
+        let diagnostic = OriginalError::prepare_route(&self.data().original)?;
         self.prepare_owned_event_bus_image_in(source, definitions, writable,
             |original, bytes| decoder.decode_funded(original, bytes),
-            |cold, name| self.read_owned_cold_window_funded(cold, name, None, None))
+            |cold, name| self.read_owned_cold_window_funded(cold, name, None, None), |error| diagnostic.error(error))
     }
-    fn prepare_owned_event_bus_image_in<E: From<Error>, S: OwnedEncodedEventSource<E>>(
+    fn prepare_owned_event_bus_image_in<E, S: OwnedEncodedEventSource<E>>(
         &self, source: &S, definitions: OwnedDefinitionsProjection, writable: bool,
         decode: impl Fn(&OwnedMemoryReservation, &[u8]) -> std::result::Result<OwnedSinkQueueEntry, E>,
         window: impl Fn(&crate::persistence::OwnedColdEventSource<'_>, &str)
             -> std::result::Result<OwnedColdWindow<E>, E>,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<OwnedEventStartupImage, E>
     where E: std::fmt::Display {
         let original = &self.data().original;
         let count = definitions.definitions.sinks.len();
-        let (queues, allocation) = new_owned_native_map(original, count)?;
+        let (queues, allocation) = new_owned_native_map(original, count).map_err(&existing)?;
         let queues = OwnedQueueMap {
             values: queues,
             allocation,
         };
-        let (body, credit) = new_owned_native_map(original, count)?;
+        let (body, credit) = new_owned_native_map(original, count).map_err(&existing)?;
         let metrics = OwnedEventBody { body, credit };
-        let (body, credit) = new_owned_native_vec(original, count)?;
+        let (body, credit) = new_owned_native_vec(original, count).map_err(&existing)?;
         let metric_keys = OwnedEventBody { body, credit };
-        let (body, credit) = new_owned_native_map(original, if writable { 0 } else { count })?;
+        let (body, credit) = new_owned_native_map(original, if writable { 0 } else { count }).map_err(&existing)?;
         let unloaded = OwnedEventBody { body, credit };
-        let (body, credit) = new_owned_native_vec(original, if writable { 0 } else { count })?;
+        let (body, credit) = new_owned_native_vec(original, if writable { 0 } else { count }).map_err(&existing)?;
         let unloaded_keys = OwnedEventBody { body, credit };
         let next_action_id = source.next_action_id()?.max(1);
         let mut image = OwnedEventStartupImage {
@@ -8675,24 +8739,24 @@ impl OwnedEventBusHandle {
             let extent = source.unloaded_extent(name)?;
             let cold_source = writable.then(|| source.cold_source()).flatten();
             if writable && extent.is_some() && cold_source.is_none() {
-                return Err(E::from(Error::Other(
+                return Err(existing(Error::Other(
                     "writable owning queue cannot retain an unloaded extent".into())));
             }
             let mut entries_count = 0usize;
             if extent.is_none() {
                 source.visit(name, |_, _| {
-                    entries_count = owned_event_add(entries_count, 1)?;
+                    entries_count = owned_event_add(entries_count, 1).map_err(&existing)?;
                     Ok(())
                 })?;
             }
-            let (body, credit) = copy_owned_native_string(original, name)?;
+            let (body, credit) = copy_owned_native_string(original, name).map_err(&existing)?;
             let key = OwnedEventBody { body, credit };
-            let (entries, buffer) = new_owned_native_ring(original, entries_count)?;
+            let (entries, buffer) = new_owned_native_ring(original, entries_count).map_err(&existing)?;
             let mut queue = OwnedSinkQueue {
                 cold: None,
                 entries,
                 buffer,
-                name: self.prepare_owned_queue_name(name)?,
+                name: self.prepare_owned_queue_name(name).map_err(&existing)?,
                 key: None,
                 pending: 0,
                 reservations: 0,
@@ -8718,24 +8782,24 @@ impl OwnedEventBusHandle {
             } else if extent.is_none() {
                 source.visit(name, |id, bytes| {
                     if queue.entries.len() == entries_count {
-                        return Err(E::from(Error::Other("pinned event source count changed".into())));
+                        return Err(existing(Error::Other("pinned event source count changed".into())));
                     }
                     let mut entry = decode(original, bytes)?;
                     if entry.entry.id != id {
-                        return Err(E::from(Error::Other(
+                        return Err(existing(Error::Other(
                             "sink queue key/content identity mismatch".into())));
                     }
                     entry.entry.event.action_id = entry.entry.id;
                     image.next_action_id = image.next_action_id.max(id.saturating_add(1));
-                    let pin = OwnedEventShared::try_new(entry, original, &self.data().funder)?;
+                    let pin = OwnedEventShared::try_new(entry, original, &self.data().funder).map_err(&existing)?;
                     queue.entries.push_back(pin);
                     Ok(())
                 })?;
                 if queue.entries.len() != entries_count {
-                    return Err(E::from(Error::Other("pinned event source count changed".into())));
+                    return Err(existing(Error::Other("pinned event source count changed".into())));
                 }
             } else {
-                let (key, credit) = copy_owned_native_string(original, name)?;
+                let (key, credit) = copy_owned_native_string(original, name).map_err(&existing)?;
                 let key = OwnedEventBody { body: key, credit };
                 let Some((depth, newest_id)) = extent else {
                     unreachable!("read image extent")
@@ -8746,7 +8810,7 @@ impl OwnedEventBusHandle {
             }
             queue.key = Some(key.credit);
             image.queues.values.insert(key.body, queue);
-            let (key, credit) = copy_owned_native_string(original, name)?;
+            let (key, credit) = copy_owned_native_string(original, name).map_err(&existing)?;
             image.metrics.insert(
                 key,
                 SinkMetricsState {
@@ -9462,8 +9526,10 @@ impl Database {
         events: &OwnedEventBusHandle,
         lsn: Lsn,
         ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(u32, Option<OwnedStagedEventBusDdlCommit>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ddl.is_empty() {
             return Ok((0, None));
         }
@@ -9530,9 +9596,11 @@ impl Database {
         };
         let empty_config = OwnedEncodedEventBusConfig::try_empty(original)?;
         let persistence_credit = std::mem::replace(&mut publication.config, empty_config);
+        let memory_history = self.prepare_staged_memory_schema_history(lsn, 0, &persistence.ddl, &persistence.generation_sidecars)?;
         Ok((
             count,
             Some(OwnedStagedEventBusDdlCommit {
+                memory_history,
                 persistence,
                 persistence_credit,
                 publication,
@@ -9547,8 +9615,10 @@ impl Database {
         events: &OwnedEventBusHandle,
         ddl: &[DdlChange],
         persistence: &P,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !matches!(&self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             return Err(Error::Other(
                 "owning event DDL requires its native database host".into()));
@@ -9571,6 +9641,7 @@ impl Database {
             let empty_events = events.prepare_owned_sink_events(&[])?;
             persistence.flush(lsn, &stage.persistence)?;
             let OwnedStagedEventBusDdlCommit {
+                memory_history,
                 persistence: bodies,
                 persistence_credit,
                 publication,
@@ -9588,6 +9659,7 @@ impl Database {
             events.publish_owned_definition_publication(publication, empty_events);
             // The native log adapter moves already-paid DDL/sidecars at the
             // original definitions-then-log position, with no new admission.
+            self.publish_memory_schema_history(memory_history);
             persistence.publish_log(log, lsn, bodies);
             Ok(())
         })
@@ -9783,8 +9855,10 @@ impl Database {
         events: &OwnedEventBusHandle,
         ddl: &[DdlChange],
         persistence: &P,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.require_admin_event_bus_ddl()?;
         self.commit_owned_event_bus_ddl_changes(events, ddl, persistence, read_memory)
     }
@@ -10108,6 +10182,7 @@ impl Database {
         persistence: &P,
     ) {
         let OwnedStagedEventBusDdlCommit {
+            memory_history,
             persistence: bodies,
             persistence_credit,
             publication,
@@ -10123,6 +10198,7 @@ impl Database {
             sidecar_array,
         };
         events.publish_owned_definition_only(publication);
+        self.publish_memory_schema_history(memory_history);
         persistence.publish_log(log, lsn, bodies);
     }
 }
@@ -10247,7 +10323,7 @@ struct OwnedOrdinaryEventCandidates<'a> {
     database: &'a Database,
     ws: &'a contextdb_tx::WriteSet,
     original: &'a OwnedMemoryReservation,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
 }
 impl OwnedEventCandidateSource for OwnedOrdinaryEventCandidates<'_> {
     fn visit(
@@ -10325,9 +10401,11 @@ impl Database {
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         f: impl for<'r> FnOnce(Option<&'r VersionedRow>) -> Result<R>,
     ) -> Result<R> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
                 root,
@@ -10356,9 +10434,11 @@ impl Database {
         snapshot: SnapshotId,
         ws: &contextdb_tx::WriteSet,
         deleted: &HashSet<RowId>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         mut visit: impl FnMut(&VersionedRow) -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let matches = |row: &VersionedRow| {
             row.visible_at(snapshot)
                 && !deleted.contains(&row.row_id)
@@ -10398,8 +10478,10 @@ impl Database {
         table: &str,
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedPreparedEventGate> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.with_owned_event_meta_pair(table, |meta, grant_meta| {
             let Some(meta) = meta else {
                 return OwnedPreparedEventGate::try_from_meta(original, None);
@@ -10507,8 +10589,10 @@ impl Database {
         host: &EngineDatabaseTransactions,
         guard: &contextdb_tx::manager::EngineGuard<'_>,
         event_bus_ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedPreparedSinkEvents> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_owned_event_host(events, host)?;
         guard.with_legacy(|ws| {
             let Some(lsn) = ws.commit_lsn else {
@@ -10541,7 +10625,7 @@ impl Database {
                 database: self,
                 ws,
                 original: &events.data().original,
-                read_memory: read_memory.clone(),
+                read_memory: (read_memory.clone()).into(),
             };
             let snapshot = self.snapshot();
             for (table, id, _) in &ws.relational_deletes {
@@ -10682,8 +10766,10 @@ impl Database {
         host: &EngineDatabaseTransactions,
         guard: &contextdb_tx::manager::EngineGuard<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedDeleteReleaseBytes> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_owned_event_host(events, host)?;
         events.with_owned_persistence_original(|original| {
             guard.with_legacy(|ws| {
@@ -10750,9 +10836,11 @@ impl Database {
         original: &OwnedMemoryReservation,
         ws: &contextdb_tx::WriteSet,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         mut visit: impl FnMut(bool, usize) -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = SnapshotId::from_raw_wire(u64::MAX);
         for (table, row_id, _) in &ws.relational_deletes {
             self.with_owned_event_meta_pair(table, |meta, _| {
@@ -10817,8 +10905,10 @@ impl Database {
         write:&crate::persistence::received_working::ReceivedWorkingWrite,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         mut next_queue_id:u64,owner:&mut contextdb_vector::VectorCopyAdmission,
-        read_memory:Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     )->Result<PreparedReceivedSinkEvents> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(lsn)=ws.commit_lsn else{return Ok(PreparedReceivedSinkEvents {events:Vec::new(),next_queue_id});};
         if definitions.event_types.is_empty() || definitions.routes.is_empty() {
             return Ok(PreparedReceivedSinkEvents {events:Vec::new(),next_queue_id});
@@ -10862,8 +10952,10 @@ impl Database {
         &self,out:&mut Vec<PreparedSinkEvent>,definitions:&EventBusDefinitions,
         candidate:RowEventCandidateRef<'_>,lsn:Lsn,cache:&mut HashMap<String,EventGateSnapshot>,
         next_queue_id:&mut u64,owner:&mut contextdb_vector::VectorCopyAdmission,
-        read_memory:Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     )->Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for event_type in definitions.event_types.values() {
             if event_type.table!=candidate.table || event_type.trigger!=candidate.trigger {continue;}
             let severity=candidate.values.get("severity").and_then(Value::as_text).unwrap_or("");
@@ -10901,17 +10993,11 @@ impl Database {
     // history is read from its durable root; no duplicate in-memory DDL body
     // population is retained after that history has consumed its invoice.
     pub(super) fn publish_owned_event_ddl_after_apply(&self, events: &OwnedEventBusHandle,
-        lsn: Lsn, stage: OwnedStagedEventBusDdlCommit) {
-        let OwnedStagedEventBusDdlCommit { persistence, persistence_credit, publication,
+        _lsn: Lsn, stage: OwnedStagedEventBusDdlCommit) {
+        let OwnedStagedEventBusDdlCommit { memory_history, persistence, persistence_credit, publication,
             buffers, ddl_array, sidecar_array } = stage;
-        self.publish_in_memory_ddl_generation_sidecars(lsn, 0, &persistence.generation_sidecars);
         events.publish_owned_definition_only(publication);
-        if self.persistence.is_none() {
-            // Public memory constructors still use the Legacy host. This
-            // compatibility branch requires independent standing-log custody
-            // before any future owning memory constructor can be selected.
-            self.ddl_log.write().extend(persistence.ddl.iter().cloned().map(|ddl| (lsn, ddl)));
-        }
+        self.publish_memory_schema_history(memory_history);
         drop(persistence);
         drop(persistence_credit); drop(buffers); drop(ddl_array); drop(sidecar_array);
     }

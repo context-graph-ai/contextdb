@@ -30,8 +30,10 @@ pub fn install_peer_directory_schema(db: &Database) -> Result<()> {
 /// Execute using the caller's existing operation read owner.
 pub fn install_peer_directory_schema_with_read_memory(
     db: &Database,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if !db.table_names().iter().any(|name| name == "peer_directory") {
         db.execute_with_read_memory(CREATE_PEER_DIRECTORY, &HashMap::new(), read_memory.clone())?;
         return Ok(());
@@ -104,8 +106,10 @@ pub fn register_peer_ticket_with_read_memory(
     node_id: &str,
     ticket: &str,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));
     params.insert("ticket".to_string(), Value::Text(ticket.to_string()));
@@ -130,8 +134,10 @@ pub fn lookup_peer_ticket(db: &Database, node_id: &str) -> Result<Option<String>
 pub fn lookup_peer_ticket_with_read_memory(
     db: &Database,
     node_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));
     let result = db.execute_with_read_memory(
@@ -139,11 +145,10 @@ pub fn lookup_peer_ticket_with_read_memory(
         &params,
         read_memory.clone(),
     )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
-    let ticket_idx = result
-        .columns
+    let ticket_idx = result.columns()
         .iter()
         .position(|c| c == "ticket")
         .ok_or_else(|| {

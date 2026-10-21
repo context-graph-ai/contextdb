@@ -40,7 +40,7 @@
 //! )?;
 //!
 //! let result = db.execute("SELECT body FROM notes", &params)?;
-//! assert_eq!(result.rows.len(), 1);
+//! assert_eq!(result.rows().len(), 1);
 //! # Ok(())
 //! # }
 //! ```
@@ -117,7 +117,8 @@ mod read_session;
 #[doc(hidden)]
 pub mod read_session;
 #[cfg(any(test, feature = "test-seams"))]
-mod read_work_probe;
+#[doc(hidden)]
+pub mod read_work_probe;
 pub mod schema_enforcer;
 pub mod sync;
 pub mod sync_types;

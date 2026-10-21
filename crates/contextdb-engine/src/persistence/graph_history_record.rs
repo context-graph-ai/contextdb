@@ -53,10 +53,10 @@ impl content_identity::HistoryRecord for StoredChangeLogEntry {
     }
 }
 
-fn malformed(reason: impl Into<String>) -> Error {
+fn malformed(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "graph_history".into(),
-        reason: reason.into(),
+        reason: reason.into().into(),
     }
 }
 

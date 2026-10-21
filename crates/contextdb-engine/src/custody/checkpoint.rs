@@ -112,8 +112,10 @@ fn read(
     db: &Database,
     key: &str,
     ws: Option<&dyn super::preparation::CommitWriteSource>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Record>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     if let Some((_, bytes)) =
@@ -129,8 +131,10 @@ fn read(
 pub(crate) fn current(
     db: &Database,
     ns: &Namespace,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Checkpoint>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     match read(db, &frontier_key(ns)?, None, read_memory.clone())? {
         Some(Record::CheckpointFrontier(f)) => Ok(Some(f.checkpoint)),
         None => Ok(None),
@@ -144,8 +148,10 @@ pub(crate) fn append(
     ws: &mut dyn super::preparation::CommitWriteSource,
     ns: &Namespace,
     signer: &LineageSigner,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let key = frontier_key(ns)?;
     let (old_count, mut peaks) = match read(db, &key, Some(ws), read_memory.clone())? {
         Some(Record::CheckpointFrontier(f)) => (f.checkpoint.count, f.peaks),
@@ -195,8 +201,10 @@ pub(crate) fn append(
 pub(crate) fn held(
     db: &Database,
     checkpoint: &Checkpoint,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let Some(current) = current(db, &checkpoint.namespace, read_memory.clone())? else {
         return Ok(false);
     };
@@ -234,8 +242,10 @@ pub(crate) fn edge_key(ns: &Namespace) -> Result<String> {
 pub(crate) fn admission(
     db: &Database,
     checkpoint: &Checkpoint,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Record>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     checkpoint.verify()?;
     if let Some(Record::EdgeCheckpoint(old)) = read(
         db,

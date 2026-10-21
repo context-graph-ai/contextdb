@@ -39,7 +39,7 @@ pub trait GraphExecutor: Send + Sync {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+        read_memory: crate::read_memory::ReadMemoryOwner,
     ) -> Result<TraversalResult>;
     #[allow(clippy::type_complexity)]
     fn neighbors(
@@ -48,7 +48,7 @@ pub trait GraphExecutor: Send + Sync {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+        read_memory: crate::read_memory::ReadMemoryOwner,
     ) -> Result<Vec<(NodeId, EdgeType, HashMap<String, Value>)>>;
     fn insert_edge(
         &self,
@@ -57,7 +57,7 @@ pub trait GraphExecutor: Send + Sync {
         target: NodeId,
         edge_type: EdgeType,
         properties: HashMap<String, Value>,
-        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+        read_memory: crate::read_memory::ReadMemoryOwner,
     ) -> Result<bool>;
     fn delete_edge(
         &self,
@@ -65,7 +65,7 @@ pub trait GraphExecutor: Send + Sync {
         source: NodeId,
         target: NodeId,
         edge_type: &str,
-        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+        read_memory: crate::read_memory::ReadMemoryOwner,
     ) -> Result<()>;
 }
 
@@ -103,7 +103,7 @@ pub trait TransactionManager: Send + Sync {
     fn commit(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn crate::read_memory::ReadMemoryBudget>,
+        read_memory: crate::read_memory::ReadMemoryOwner,
     ) -> Result<()>;
     fn rollback(&self, tx: TxId) -> Result<()>;
     fn snapshot(&self) -> SnapshotId;

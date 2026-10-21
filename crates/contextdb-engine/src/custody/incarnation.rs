@@ -17,8 +17,10 @@ pub(crate) fn probe(
     hub: &str,
     edge: &str,
     incarnation: Incarnation,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<StatusProbe> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let destination = custody_hold
@@ -58,8 +60,10 @@ pub(crate) fn check(
     edge: &str,
     probe: &StatusProbe,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Incarnation>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let Some(current) = db.existing_sync_incarnation(tenant, read_memory.clone())? else {
         return Ok(None);
     };
@@ -93,8 +97,10 @@ pub(crate) fn check(
 impl StatusProbe {
     pub(crate) fn pages(
         self,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(Vec<u8>, contextdb_core::read_memory::ReadCredit)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::protocol::{MessageType, PROTOCOL_VERSION, encode_for_version_with_read_owner};
         let (page, mut credit) = if self.checkpoint.is_none() {
             encode_for_version_with_read_owner(

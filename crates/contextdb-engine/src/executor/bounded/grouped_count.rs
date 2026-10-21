@@ -267,7 +267,7 @@ fn stored_counts_answer(
             .transaction_table_overlay(
                 tx,
                 table,
-                context.source_read_memory(BoundedWorkSource::TableScan),
+                context.source_read_memory(BoundedWorkSource::TableScan)?,
             )?
             .is_empty(),
     })
@@ -399,7 +399,7 @@ fn served_groups(
         list,
         prefix,
         snapshot,
-        context.source_read_memory(BoundedWorkSource::IndexRange),
+        context.source_read_memory(BoundedWorkSource::IndexRange)?,
         &mut || {
             context.charge(
                 BoundedWorkSource::IndexRange,

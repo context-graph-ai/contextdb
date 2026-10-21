@@ -394,7 +394,7 @@ impl Allocators {
 
     /// Size the window set from the writer's page-cache share. Returns the
     /// bytes it takes from that share, which the page cache gives up.
-    pub(super) fn set_window_budget(&mut self, cache_bytes: usize) -> io::Result<usize> {
+    pub(super) fn set_window_budget(&mut self, cache_bytes: usize) -> crate::Result<usize> {
         let Some(paged) = &self.paged else {
             return Ok(0);
         };

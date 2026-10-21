@@ -4,6 +4,8 @@ use super::*;
 use redb::ReadableTableMetadata;
 #[path = "native_metadata.rs"]
 mod metadata;
+#[cfg(test)]
+pub(crate) use metadata::codec_projection_contract_rows;
 use crate::persistence::{OriginalPersistenceFrame,discard_history::OriginalDiscardHistory};
 use crate::memory_accounting::OwnedMemoryReservation;
 

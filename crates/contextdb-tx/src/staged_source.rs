@@ -1395,8 +1395,10 @@ impl CanonicalStatementRows {
         root: Option<FundedArc<TableRoot>>,
         identity: CapturedIdentity,
         resolver: CaptureResolver,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let bytes = source_arc_layout::<CaptureDescriptor>()
             .size()
             .checked_add(source_arc_layout::<contextdb_core::read_memory::ReadCredit>().size())
@@ -4292,8 +4294,10 @@ impl CanonicalStatementDirectory {
     pub(crate) fn capture(
         root: &SourceRoot,
         identity: CapturedIdentity,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let credit = contextdb_core::read_memory::ReadCredit::try_new(
             reader,
             std::mem::size_of::<Self>(),
@@ -4310,8 +4314,10 @@ impl CanonicalStatementDirectory {
     pub fn table_rows(
         &self,
         table: &str,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CanonicalStatementRows> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         CanonicalStatementRows::capture(
             get_by(&self.tables, |name| table.cmp(name.as_str())).cloned(),
             CapturedIdentity {

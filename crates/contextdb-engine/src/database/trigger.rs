@@ -96,8 +96,8 @@ pub(crate) struct PreparedTriggerPublication {
     pub(crate) config_values: Vec<(String, Vec<u8>)>,
 }
 
-#[derive(Debug, Clone)]
 struct StagedTriggerDdlCommit {
+    memory_history: Option<super::PreparedSchemaHistory>,
     declarations: BTreeMap<String, TriggerDeclaration>,
     persistence: TriggerPersistenceCommit,
 }
@@ -493,10 +493,12 @@ impl TriggerState {
         lsn: Lsn,
         declarations: BTreeMap<String, TriggerDeclaration>,
         persistence: TriggerPersistenceCommit,
+        memory_history: Option<super::PreparedSchemaHistory>,
     ) {
         self.staged_ddl_for_persistence.lock().insert(
             lsn,
             StagedTriggerDdlCommit {
+                memory_history,
                 declarations,
                 persistence,
             },
@@ -789,8 +791,10 @@ impl Database {
     pub(super) fn apply_trigger_ddl_from_user(
         &self,
         ddl: DdlChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.require_admin_trigger_ddl(match &ddl {
             DdlChange::CreateTrigger { .. } | DdlChange::CreateTriggerIncludingSync { .. } => {
                 "CREATE TRIGGER"
@@ -1035,8 +1039,10 @@ impl Database {
     pub(super) fn apply_trigger_ddl_batch(
         &self,
         ddl: Vec<DdlChange>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ddl.is_empty() {
             return Ok(());
         }
@@ -1050,6 +1056,7 @@ impl Database {
             if current == projected && !transient_lifecycle {
                 return Ok(None);
             }
+            let memory_history = self.prepare_memory_ddl_append(lsn, &ddl, read_memory.clone())?;
             if let Some(persistence) = &self.persistence {
                 let mut config_values: Vec<(&str, Vec<u8>)> =
                     Self::encoded_trigger_config_values(&projected)?
@@ -1068,15 +1075,11 @@ impl Database {
                     lsn,
                     &ddl,
                 )?;
-            } else {
-                self.record_ddl_generation_sidecars(lsn, &ddl, read_memory.clone())?;
             }
             if current != projected {
                 self.apply_trigger_declarations_to_memory(projected);
             }
-            self.ddl_log
-                .write()
-                .extend(ddl.iter().cloned().map(|change| (lsn, change)));
+            self.publish_memory_schema_history(memory_history);
             Ok(Some(()))
         })?;
         Ok(())
@@ -1261,8 +1264,10 @@ impl Database {
         &self,
         tx: TxId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<TriggerDispatchOutcome, Box<TriggerDispatchFailure>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.dispatch_triggers_for_tx_from(
             tx,
             None,
@@ -1277,8 +1282,10 @@ impl Database {
         tx: TxId,
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<TriggerDispatchOutcome, Box<TriggerDispatchFailure>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.dispatch_triggers_for_tx_from(
             tx,
             declarations,
@@ -1292,8 +1299,10 @@ impl Database {
         &self, tx: TxId, targets: super::connected_replay::PrivateChangedRows,
         declarations: &BTreeMap<String, TriggerDeclaration>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<(TriggerDispatchOutcome, super::connected_replay::PrivateChangedRows, usize), Box<TriggerDispatchFailure>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let initial_len = self.tx_mgr.with_write_set(tx, |ws| ws.relational_inserts.len())
             .map_err(|error| Box::new(TriggerDispatchFailure { error, active_guards: Vec::new() }))?;
         let mut run = TriggerDispatchRun {
@@ -1357,8 +1366,10 @@ impl Database {
     pub(super) fn has_matching_local_trigger_for_tx(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             let snapshot = self.trigger_dispatch_snapshot_owned(tx, None, TriggerDispatchMode::Local)?;
             for ((table, row_id), index) in &snapshot.latest_insert_index {
@@ -1445,8 +1456,10 @@ impl Database {
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
         mode: TriggerDispatchMode,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<TriggerDispatchOutcome, Box<TriggerDispatchFailure>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self
             .trigger_declarations_from(declarations)
             .iter()
@@ -1502,8 +1515,10 @@ impl Database {
         &self,
         tx: TxId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             let conditional_update_guards = self.take_conditional_update_guards_for_tx(tx);
             let upsert_intents = self.pending_upsert_intents_for_tx(tx);
@@ -1570,8 +1585,10 @@ impl Database {
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
         mode: TriggerDispatchMode,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut private_snapshot_credit = self.private_replay_owner(tx)
             .map(contextdb_core::read_memory::ReadCredit::new);
         self.admit_private_trigger_snapshot(tx,declarations,private_snapshot_credit.as_mut())?;
@@ -1694,8 +1711,10 @@ impl Database {
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
         mode: TriggerDispatchMode,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if depth > TRIGGER_CASCADE_DEPTH_CAP {
             let entry = TriggerAuditEntry {
                 trigger_name: declaration.name.clone(),
@@ -2033,8 +2052,10 @@ impl Database {
         lsn: Lsn,
         projected_declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
 
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<TriggerAuditEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.committed_sync_pull_trigger_audits_with_source_order(
             ws, lsn, projected_declarations, None, None, read_memory,
         )
@@ -2047,8 +2068,10 @@ impl Database {
         projected_declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
         connected: Option<(&ChangeSet, &ConnectedCoordinates)>,
         additional: Option<&[super::connected_replay::PrivateSyntheticTriggerFiring]>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<TriggerAuditEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ws.relational_inserts.is_empty() && additional.is_none() {
             return Ok(Vec::new());
         }
@@ -2235,8 +2258,10 @@ impl Database {
         ws: &WriteSet,
         candidate_trigger_tables: &HashSet<String>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<String, Vec<VersionedRow>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let deleted_ids_by_table = ws.relational_deletes.iter().fold(
             HashMap::<String, HashSet<RowId>>::new(),
             |mut by_table, (table, row_id, _)| {
@@ -2347,8 +2372,10 @@ impl Database {
         lsn: Lsn,
         ddl: &[DdlChange],
         start_ordinal: u32,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ddl.is_empty() {
             return Ok(());
         }
@@ -2379,8 +2406,9 @@ impl Database {
             generation_sidecars,
             start_ordinal,
         };
+        let memory_history = self.prepare_staged_memory_schema_history(lsn, start_ordinal, ddl, &persistence.generation_sidecars)?;
         self.trigger
-            .stage_trigger_ddl_commit(lsn, projected, persistence);
+            .stage_trigger_ddl_commit(lsn, projected, persistence, memory_history);
         Ok(())
     }
 
@@ -2398,19 +2426,8 @@ impl Database {
     pub(super) fn publish_staged_trigger_ddl_commit(&self, lsn: Lsn) {
         let staged = self.trigger.staged_ddl_for_persistence.lock().remove(&lsn);
         if let Some(staged) = staged {
-            self.publish_in_memory_ddl_generation_sidecars(
-                lsn,
-                staged.persistence.start_ordinal,
-                &staged.persistence.generation_sidecars,
-            );
             self.apply_trigger_declarations_to_memory(staged.declarations);
-            self.ddl_log.write().extend(
-                staged
-                    .persistence
-                    .ddl
-                    .into_iter()
-                    .map(|change| (lsn, change)),
-            );
+            self.publish_memory_schema_history(staged.memory_history);
         }
     }
 
@@ -2422,8 +2439,10 @@ impl Database {
         &self,
         table: &str,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.log_drop_table_ddl_and_remove_triggers_with_prefix(
             table,
             lsn,
@@ -2437,8 +2456,10 @@ impl Database {
         table: &str,
         lsn: Lsn,
         prefix_trigger_ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let current = self.trigger.declarations.lock().clone();
         let mut projected = self.apply_trigger_ddl_batch_projection(prefix_trigger_ddl)?;
         let implicit_trigger_drops = projected
@@ -2479,6 +2500,7 @@ impl Database {
         let history = if self.persistence.is_none() {
             Some(self.relational_store.prepare_schema_generation(std::iter::once(table), self.engine_sync_read_memory()?)?)
         } else { None };
+        let memory_history = self.prepare_memory_ddl_append(lsn, &ddl, read_memory.clone())?;
         if let Some(persistence) = &self.persistence {
             persistence.remove_table_rewrite_aux_with_config_values_and_ddl_log(
                 table,
@@ -2487,8 +2509,6 @@ impl Database {
                 &ddl,
                 &row_graph_edges,
             )?;
-        } else {
-            self.record_ddl_generation_sidecars(lsn, &ddl, read_memory.clone())?;
         }
         self.apply_graph_edges_after_table_drop(graph_edges);
         self.remove_rank_formulas_for_table(table);
@@ -2501,9 +2521,7 @@ impl Database {
             self.apply_trigger_declarations_to_memory(projected);
         }
         self.apply_event_bus_definitions_without_table_to_memory(table);
-        self.ddl_log
-            .write()
-            .extend(ddl.into_iter().map(|change| (lsn, change)));
+        self.publish_memory_schema_history(memory_history);
         Ok(())
     }
 
@@ -2705,8 +2723,10 @@ impl Database {
         scope: &DatabaseCommitScope<'_, '_, '_>,
         tx: TxId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> PreparationResult<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         scope.prepare_temporary(
             tx,
             take_owned_conditions,
@@ -2799,8 +2819,10 @@ impl Database {
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
         mode: TriggerDispatchMode,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> PreparationResult<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut snapshot = self
             .trigger_dispatch_snapshot_owned(tx, declarations, mode)
             .map_err(TemporaryFailure::from_error)?;
@@ -3026,8 +3048,10 @@ impl Database {
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
         mode: TriggerDispatchMode,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> PreparationResult<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if depth > TRIGGER_CASCADE_DEPTH_CAP {
             let entry = TriggerAuditEntry {
                 trigger_name: declaration.name.clone(),
@@ -3420,7 +3444,9 @@ impl Database {
     pub(super) fn retain_private_plain_trigger_firings(&self, tx: TxId,
         targets: &super::connected_replay::PrivateChangedRows,initial_len: usize,lsn: Lsn,
         declarations: &BTreeMap<String,TriggerDeclaration>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.tx_mgr.with_write_set(tx,|ws| -> Result<()> {
             for (position,(table,row)) in ws.relational_inserts.iter().enumerate() {
                 if position < initial_len && !targets.contains(table,row.row_id) { continue; }
@@ -3449,8 +3475,10 @@ impl Database {
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>, including_sync: bool,
         run: &mut TriggerDispatchRun,
         vectors: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> PreparationResult<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mode = if including_sync { TriggerDispatchMode::IncludingSync } else { TriggerDispatchMode::Local };
         let count = self.tx_mgr.with_read(tx, |ws| ws.relational_inserts.len()).map_err(TemporaryFailure::from_error)?;
         self.dispatch_trigger_range_owned(scope, tx, 0, count, 1, run, declarations, mode, vectors, read_memory)
@@ -3466,7 +3494,9 @@ impl Database {
     pub(super) fn prepare_original_ordinary_audits(&self, original: &OwnedMemoryReservation,
         ws: &WriteSet, source: CommitSource, lsn: Lsn, pending: &[PendingTriggerAudit],
         projected: Option<&BTreeMap<String, TriggerDeclaration>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<OriginalOrdinaryAudits> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<OriginalOrdinaryAudits> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(projected) = projected {
             return self.prepare_original_ordinary_audits_from(original, ws, source, lsn, pending, projected, read_memory);
         }
@@ -3486,7 +3516,9 @@ impl Database {
     fn prepare_original_ordinary_audits_from(&self, original: &OwnedMemoryReservation,
         ws: &WriteSet, source: CommitSource, lsn: Lsn, pending: &[PendingTriggerAudit],
         declarations: &BTreeMap<String, TriggerDeclaration>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<OriginalOrdinaryAudits> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<OriginalOrdinaryAudits> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
         let Some(firing_tx) = write_set_visibility_tx(ws) else {
             return Ok(OriginalOrdinaryAudits { entries: Vec::new(), _memory: frame.into_reservation() });
@@ -4016,7 +4048,9 @@ impl Database {
     }
 
     fn apply_original_trigger_ddl_batch(&self, ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.with_preparation_original(|original| {
             self.allocate_ddl_lsn_maybe(|lsn| {
                 let published = self.tx_mgr.capture_published_read();
@@ -4035,17 +4069,14 @@ impl Database {
                     }
                 }
                 let provenance = self.ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?;
+                let memory_history = self.prepare_memory_ddl_append(lsn, ddl, read_memory.clone())?;
                 if let Some(persistence) = &self.persistence {
                     persistence.flush_original_encoded_config_and_ddl(original,
                         publication.publication.config_values.iter().chain(&provenance)
                             .map(|(key, bytes)| (key.as_str(), bytes.as_slice())), lsn, ddl)?;
-                } else {
-                    // Public memory constructors remain Legacy. Its future
-                    // owning history/mirror selection needs standing custody.
-                    self.record_ddl_generation_sidecars(lsn, ddl, read_memory.clone())?;
                 }
                 self.publish_original_trigger_publication(publication);
-                if self.persistence.is_none() { self.ddl_log.write().extend(ddl.iter().cloned().map(|change| (lsn, change))); }
+                self.publish_memory_schema_history(memory_history);
                 Ok(Some(()))
             })?;
             Ok(())
@@ -4055,6 +4086,7 @@ impl Database {
 
 
 pub(super) struct OriginalTriggerDdlStage {
+    memory_history: Option<super::PreparedSchemaHistory>,
     lsn: Lsn,
     identity: contextdb_tx::manager::EngineTerminalIdentity,
     publication: OriginalPreparedTriggerPublication,
@@ -4127,7 +4159,9 @@ impl Database {
     pub(super) fn stage_original_trigger_ddl(&self, host: &EngineDatabaseTransactions,
         original: &OwnedMemoryReservation, identity: contextdb_tx::manager::EngineTerminalIdentity,
         lsn: Lsn, ddl: &[DdlChange], start_ordinal: u32,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Option<OriginalTriggerDdlRegistration>> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<OriginalTriggerDdlRegistration>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ddl.is_empty() { return Ok(None); }
         let projection = self.prepare_original_trigger_projection(original, ddl)?;
         if projection.declarations == *self.trigger.declarations.lock() && !Self::trigger_ddl_has_transient_lifecycle(ddl) { return Ok(None); }
@@ -4153,7 +4187,8 @@ impl Database {
         config_values.extend(publication.publication.config_values.iter().cloned());
         config_values.extend(provenance);
         let persistence = TriggerPersistenceCommit { config_values, ddl: ddl.to_vec(), generation_sidecars, start_ordinal };
-        let stage = event_bus::OwnedEventShared::try_new(OriginalTriggerDdlStage { lsn, identity,
+        let memory_history = self.prepare_staged_memory_schema_history(lsn, start_ordinal, ddl, &persistence.generation_sidecars)?;
+        let stage = event_bus::OwnedEventShared::try_new(OriginalTriggerDdlStage { lsn, identity, memory_history,
             publication, persistence, next: Mutex::new(None), _memory: frame.into_reservation() }, original, &host.funder)?;
         let control = crate::memory_accounting::reserve_preparation_from_original(original,
             std::mem::size_of::<OriginalTriggerDdlRegistration>(), "trigger", "ddl_stage_registration",
@@ -4176,10 +4211,9 @@ impl Database {
             Ok(stage) => stage,
             Err(_) => panic!("committed trigger stage borrowed after immutable flush"),
         };
-        let OriginalTriggerDdlStage { lsn, publication, persistence, next, _memory, .. } = stage;
-        self.publish_in_memory_ddl_generation_sidecars(lsn, persistence.start_ordinal, &persistence.generation_sidecars);
+        let OriginalTriggerDdlStage { publication, persistence, next, _memory, memory_history, .. } = stage;
         self.publish_original_trigger_publication(publication);
-        if self.persistence.is_none() { self.ddl_log.write().extend(persistence.ddl.iter().cloned().map(|ddl| (lsn, ddl))); }
+        self.publish_memory_schema_history(memory_history);
         drop(persistence); drop(next); drop(_memory);
     }
 }

@@ -77,7 +77,7 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// resolver (the adapter never reads the ledger itself).
 #[derive(Debug)]
 pub(crate) enum FetchVerdict {
-    Allow(Arc<dyn ReadMemoryBudget>),
+    Allow(contextdb_core::read_memory::ReadMemoryOwner),
     SourceError(Error),
     Unentitled,
     PolicyForbidden,
@@ -173,7 +173,7 @@ async fn send_source_error<W: SendStream>(
 
 struct ControlledGetStreams {
     connection: iroh::endpoint::Connection,
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     failure: Arc<Mutex<Option<Error>>>,
 }
 
@@ -187,7 +187,7 @@ impl iroh_blobs::api::remote::GetStreamPair for ControlledGetStreams {
             connection_id,
             ControlledRecv {
                 inner: recv,
-                read_memory: self.read_memory,
+                read_memory: (self.read_memory).into(),
                 failure: self.failure,
                 checked: false,
             },
@@ -198,7 +198,7 @@ impl iroh_blobs::api::remote::GetStreamPair for ControlledGetStreams {
 
 struct ControlledRecv<R> {
     inner: R,
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     failure: Arc<Mutex<Option<Error>>>,
     checked: bool,
 }
@@ -2555,8 +2555,10 @@ async fn fetch_into_local_store(
     identity_path: &Path,
     ticket: &str,
     hash: &[u8; 32],
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<LocalFetchOutcome, FetchFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     // Fetch over the blob door, verified into the local store. There is no
     // separate preflight: the consumer dials the blob door directly, and a
     // policy refusal arrives as a typed reset; a source error arrives in the
@@ -2609,8 +2611,10 @@ pub(crate) async fn fetch_verified_into_local_store(
     identity_path: PathBuf,
     ticket: String,
     hash: [u8; 32],
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<LocalFetchOutcome, FetchFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     fetch_into_local_store(&store, &identity_path, &ticket, &hash, read_memory).await
 }
 
@@ -2668,12 +2672,14 @@ pub(crate) async fn fetch_into_sink(
     identity_path: &Path,
     ticket: &str,
     hash: &[u8; 32],
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     sink: &mut (dyn Write + Send),
     payload_moved: Option<&mut u64>,
     holder_node_id: Option<&mut String>,
     export_offset: u64,
 ) -> std::result::Result<FetchOutcome, FetchFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let outcome =
         match fetch_into_local_store(store, identity_path, ticket, hash, read_memory).await {
             Ok(outcome) => outcome,
@@ -2712,8 +2718,10 @@ async fn run_verified_fetch(
     peer: &PeerConnection,
     backend: Hash,
     hash: &[u8; 32],
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<u64, FetchFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     // Protect this hash from the store's GC sweep for as long as this node
     // might still be mid-transfer OR resuming later: an unprotected partial
     // (or even complete) fetched blob is exactly the hazard
@@ -2743,7 +2751,7 @@ async fn run_verified_fetch(
     let control_failure = Arc::new(Mutex::new(None));
     let streams = ControlledGetStreams {
         connection: peer.connection.clone(),
-        read_memory,
+        read_memory: read_memory.into(),
         failure: control_failure.clone(),
     };
     let progress = remote.fetch(streams, content);
@@ -2936,9 +2944,11 @@ pub(crate) async fn resume_into_sink(
     identity_path: &Path,
     ticket: &str,
     hash: &[u8; 32],
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     sink: &mut Vec<u8>,
 ) -> std::result::Result<u64, FetchFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let local_session = store
         .repository
         .open_read(*hash)

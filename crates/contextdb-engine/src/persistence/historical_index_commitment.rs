@@ -307,13 +307,20 @@ const TOUCHED_FIXED_BYTES: usize = 2 * STATE_BYTES + 256;
 /// owned-writer path a reservation drawn from that path's original.
 enum Funding {
     Writer {
-        owner: Arc<crate::read_image_memory::ImageMemory>,
+        owner: crate::read_image_memory::ImageMemoryHandle,
         held: usize,
     },
     Original(crate::memory_accounting::OwnedMemoryReservation),
 }
 
 impl Funding {
+    fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        match self {
+            Self::Writer { owner, .. } => owner.diagnostic_budget(),
+            Self::Original(original) => crate::funded_error::original_budget(original),
+        }
+    }
+
     fn admit(&mut self, bytes: usize, operation: &str) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if take_admission_refusal_for_test() {
@@ -678,10 +685,7 @@ impl CommitmentBatch {
                     .delete_table(definition)
                     .map_err(RedbPersistence::storage_error)?;
             } else {
-                return Err(Error::StoreCorrupted {
-                    path: name,
-                    reason: "a dropped historical index still holds postings".to_owned(),
-                });
+                return Err(crate::funded_error::corruption_text(self.funding.diagnostic_budget(), &name, "a dropped historical index still holds postings".into()));
             }
             for side in [Side::Postings, Side::Versions] {
                 states
@@ -704,12 +708,8 @@ impl CommitmentBatch {
                     .is_empty()
                     .map_err(RedbPersistence::storage_error)?
                 {
-                    return Err(Error::StoreCorrupted {
-                        path: name,
-                        reason: "rows were written past a historical index that already holds \
-                                 postings"
-                            .to_owned(),
-                    });
+                    return Err(crate::funded_error::corruption_display(self.funding.diagnostic_budget(), &name, "rows were written past a historical index that already holds \
+                                 postings"));
                 }
                 // The rebuild derives both states afresh; nothing is kept that
                 // a reader could mistake for a publication.
@@ -725,13 +725,10 @@ impl CommitmentBatch {
                 continue;
             }
             if touched.postings != touched.versions {
-                return Err(Error::StoreCorrupted {
-                    path: table.to_owned(),
-                    reason: format!(
+                return Err(crate::funded_error::corruption_display(self.funding.diagnostic_budget(), &table, format_args!(
                         "historical index {index} postings do not cover what its row versions \
                          cover"
-                    ),
-                });
+                    )));
             }
             for (side, state) in [
                 (Side::Postings, &touched.postings),
@@ -872,10 +869,7 @@ impl<'a> HistoricalPostings<'a> {
     }
 
     fn corrupt(&self, reason: &str) -> Error {
-        Error::StoreCorrupted {
-            path: RedbPersistence::relational_index_table_name(&self.table, &self.declaration.name),
-            reason: reason.to_owned(),
-        }
+        crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), super::DiagnosticIndexName { table: &self.table, index: &self.declaration.name }, reason)
     }
 
     fn end_at(&self, key: &DurableRelationalIndexKey) -> Result<Option<Option<TxId>>> {
@@ -1102,9 +1096,11 @@ pub(super) fn verify_in_read(
     verifier: &content_identity::ContentIdentityReadVerifier,
     table: &str,
     meta: &TableMeta,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     checkpoint: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<HistoricalIndexVerification>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     const OPERATION: &str = "historical_index_verification";
     const HINT: &str = "Raise MEMORY_LIMIT to verify this table's historical indexes.";
     let declaration_bytes = meta
@@ -1167,10 +1163,7 @@ pub(super) fn verify_in_read(
     let rows_name = RedbPersistence::rel_table_name(table);
     for declaration in &declarations {
         let index_name = RedbPersistence::relational_index_table_name(table, &declaration.name);
-        let corrupt = |path: &str, reason: String| Error::StoreCorrupted {
-            path: path.to_owned(),
-            reason,
-        };
+        let corrupt = |path: &str, reason: String| crate::funded_error::corruption_display(Ok(credit_budget.clone()), &path, reason);
         let identity = index_identity(declaration)?;
         let mut postings = BoundaryState::empty();
         let mut posting_count = 0_u64;
@@ -1395,9 +1388,11 @@ impl RedbPersistence {
         &self,
         table: &str,
         meta: &TableMeta,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Vec<HistoricalIndexVerification>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         // Funded by the requesting reader, never by the writer.
         let owner = crate::read_image_memory::ImageMemory::operation_reader(
             self.require_decode_accountant()?,
@@ -1422,9 +1417,11 @@ impl RetainedReadSource {
         &self,
         table: &str,
         meta: &TableMeta,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Vec<HistoricalIndexVerification>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         // Funded by the requesting reader.
         let owner = crate::read_image_memory::ImageMemory::operation_reader(
             self._source_memory.memory.accountant.clone(),
@@ -1761,7 +1758,7 @@ mod interval_invariant_tests {
             .create(directory.path().join("intervals.redb"))
             .unwrap();
         let _scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            crate::read_image_memory::ImageMemory::default_decode_accountant(),
+            crate::read_image_memory::ImageMemory::default_decode_accountant()?,
         )?;
         let write = database.begin_write().unwrap();
         let mut batch = CommitmentBatch::for_writer()?;

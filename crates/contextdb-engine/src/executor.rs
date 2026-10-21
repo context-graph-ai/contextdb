@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 use crate::database::{
-    Database, InsertRowResult, MaintenancePolicy, OwnedQueryResult, QueryResult, QueryTrace,
+    Database, InsertRowResult, MaintenancePolicy, OwnedQueryResult, QueryResultData, QueryTrace,
     UpdateReplacementContext, UpsertIntentDetails, VectorSearchDisclosure, rank_index_name,
 };
 pub(crate) use crate::memory_accounting::VectorLoadReservationTransfer;
@@ -61,7 +61,7 @@ pub(crate) struct ReadPublicationScope {
     // Purge publication and lineage validation still enclose its response.
     pub(crate) inspection: bool,
     pub(crate) budget: ReadPublicationBudget,
-    pub(crate) read_memory: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    pub(crate) read_memory: Option<contextdb_core::read_memory::ReadMemoryOwner>,
 }
 
 #[derive(Clone)]
@@ -170,7 +170,7 @@ impl ReadPublicationScope {
         let failure = if let Some(memory) = &self.read_memory {
             ReadFailure::try_funded_reason(
                 ReadFailureKind::AuthoritativeErasure,
-                contextdb_core::read_memory::ReadMemoryOwner::from_legacy(memory.clone()),
+                contextdb_core::read_memory::ReadMemoryOwner::from(memory.clone()),
                 bytes,
                 make_reason,
             )?
@@ -356,7 +356,7 @@ fn content_size_result(
             .map_err(|_| Error::Other("content size exceeds SQL integer range".into()))
     })
     .collect::<Result<Vec<_>>>()?;
-    Ok(OwnedQueryResult::new(QueryResult {
+    Ok(OwnedQueryResult::new(QueryResultData {
         columns: [
             "live_row_bytes",
             "live_vector_bytes",
@@ -389,7 +389,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn enter_writer_read(
         &self,
         _root: Option<crate::persistence::WriterSnapshotHandle>,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Option<crate::database::writer_read::WriterReadScope> {
         None
     }
@@ -406,7 +406,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         lsn: Lsn,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<Vec<f32>>>;
 
     #[allow(clippy::too_many_arguments)]
@@ -422,7 +422,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<f32>, BoundedExecutionError>;
 
     /// Which of a table's vector columns keep their value in the store alone.
@@ -442,7 +442,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         key_value: &Value,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<RowId>>;
 
     fn prepare_bounded_read_plan(
@@ -450,14 +450,14 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         parsed: &Statement,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<(Statement, PhysicalPlan)>;
 
     fn bounded_read_accountant(&self) -> crate::memory_accounting::AccountantHandle;
 
     fn declared_read_request_provider(
         &self,
-    ) -> Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>;
+    ) -> crate::vector_read_memory::ReadRequestProvider;
 
     /// Whether this target's single-column automatic indexes are ordered
     /// trees a bounded cursor can walk. A durable store keeps every posting in
@@ -483,7 +483,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn delivery_metadata(
         &self,
         request: crate::direct_file_reader::DirectMetadataRequest,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::direct_file_reader::DirectMetadataBody>;
 
     /// `checkpoint` is the asking request's own cancellation and active-time
@@ -494,28 +494,26 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn committed_change_state(
         &self,
         _checkpoint: &dyn Fn() -> Result<()>,
-        _charge: &Arc<crate::read_image_memory::ImageMemory>,
+        _charge: &crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectChangeState,
         crate::direct_file_reader::DirectFileReaderError,
     > {
         Err(crate::direct_file_reader::DirectFileReaderError::Engine(
-            Error::PlanError("bounded execution has no committed change history".to_string())
-                .to_string(),
+            "plan error: bounded execution has no committed change history".into(),
         ))
     }
 
     fn committed_sync_state(
         &self,
         _checkpoint: &dyn Fn() -> Result<()>,
-        _charge: &Arc<crate::read_image_memory::ImageMemory>,
+        _charge: &crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectSyncState,
         crate::direct_file_reader::DirectFileReaderError,
     > {
         Err(crate::direct_file_reader::DirectFileReaderError::Engine(
-            Error::PlanError("bounded execution has no committed sync provenance".to_string())
-                .to_string(),
+            "plan error: bounded execution has no committed sync provenance".into(),
         ))
     }
 
@@ -524,7 +522,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn historical_index_verification(
         &self,
         table: &str,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Vec<crate::HistoricalIndexVerification>> {
         let _ = (table, memory, checkpoint);
@@ -535,7 +533,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
     fn content_size_answer(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before_table: &mut dyn FnMut() -> Result<()>,
     ) -> Result<OwnedQueryResult> {
         let _ = (read_memory, before_table);
@@ -548,7 +546,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         plan: &PhysicalPlan,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<OwnedQueryResult> {
         let _ = (plan, vector_copy_owner, read_memory);
         Err(Error::PlanError(
@@ -563,7 +561,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         sql: &str,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<String> {
         let _ = sql;
         Err(Error::PlanError(
@@ -579,7 +577,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         sql: &str,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::database::ExplainOutput> {
         let _ = params;
         self.explain_plan_without_running_it(sql, vector_copy_owner, read_memory)
@@ -609,7 +607,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         tx: TxId,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<TransactionTableOverlay> {
         let _ = (tx, table, read_memory);
         Ok(TransactionTableOverlay::default())
@@ -688,7 +686,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<u64>> {
         let _ = (table, columns, prefix, snapshot, read_memory);
         Ok(None)
@@ -699,7 +697,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedReadSnapshotPin>>;
 
     fn bounded_cursor_snapshot_registration(
@@ -709,7 +707,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedCursorSnapshotPin>>;
 
     fn assert_table_read_allowed(&self, table: &str) -> Result<()>;
@@ -733,7 +731,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<(), BoundedExecutionError>;
 
     fn bounded_read_allowed_for_row(
@@ -745,7 +743,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<bool, BoundedExecutionError>;
 
     /// Whether this index pick PINS the row it is asking about -- an equality
@@ -797,7 +795,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<Error>, BoundedExecutionError>;
 
     /// One row named by its identity, read the bounded way.
@@ -808,7 +806,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// of every row, inspected and discarded, for each row published.
     fn bounded_row_by_identity(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -821,7 +819,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
     fn visit_bounded_row_by_identity(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -843,7 +841,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
     fn bounded_physical_table_row_next(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
@@ -857,7 +855,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn vector_read_preflight(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         copies: &mut contextdb_vector::VectorCopyAdmission,
         checkpoint: Option<bounded::ReadOpenContext>,
     ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>>;
@@ -865,7 +863,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn preflight_historical_graph(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError>;
 
@@ -874,7 +872,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         table: &str,
         index: &str,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError>;
 
@@ -882,7 +880,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn ordered_prefix_snapshot_is_current(
         &self,
         _snapshot: SnapshotId,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool> {
         Ok(false)
     }
@@ -890,7 +888,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn bounded_ordered_table_row_next_observed(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         column: &str,
         direction: contextdb_core::SortDirection,
@@ -915,7 +913,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         let _ = (table, index, snapshot, cursor, before_touch, visit);
         Ok(false)
@@ -932,7 +930,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_probe: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_native_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         let _ = (
             table,
@@ -951,7 +949,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn bounded_exact_index_row_next(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -990,7 +988,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         contextdb_vector::mem::BoundedVectorCandidateGroups,
         BoundedExecutionError,
@@ -1006,7 +1004,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<usize, BoundedExecutionError>;
 
     fn bounded_vector_entry_count(
@@ -1038,7 +1036,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<VectorSearchDisclosure>;
 
     fn publish_vector_search_trace(&self, trace: contextdb_vector::OwnedVectorSearchTrace);
@@ -1061,7 +1059,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
             BoundedExecutionError,
         >,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -1076,7 +1074,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>;
 
     /// The row checks a statement over `index` may spend checking its filter
@@ -1113,7 +1111,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -1133,7 +1131,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, BoundedExecutionError>>,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError>;
@@ -1149,7 +1147,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn bounded_rank_candidate(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         index: &VectorIndexRef,
         sort_key: &str,
         anchor_row_id: RowId,
@@ -1190,7 +1188,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         Option<crate::database::gate::CountedGraphScanEdge>,
         BoundedExecutionError,
@@ -1200,7 +1198,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn graph_cursor_read_guard(
         &self,
         _tx: Option<TxId>,
-        _memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<crate::database::GraphCursorReadGuard>, BoundedExecutionError>
     {
         Ok(None)
@@ -1219,7 +1217,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<crate::database::EngineGraphBfsCursor>, BoundedExecutionError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -1238,7 +1236,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         visited_cap: Option<usize>,
         tx: Option<TxId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         Option<contextdb_graph::mem::BoundedTraversalNode>,
         BoundedExecutionError,
@@ -1256,7 +1254,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         snapshot: SnapshotId,
         ctes: &[Cte],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Expr>;
 
     /// The in-process store, when this target is one. A subquery has to be
@@ -1280,7 +1278,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         snapshot: SnapshotId,
         start_alias: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<GraphStartResolution>;
 
     #[allow(clippy::too_many_arguments)]
@@ -1293,7 +1291,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         bindings: &HashMap<String, uuid::Uuid>,
         work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool>;
 
     fn coerce_into_column(
@@ -1320,12 +1318,12 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
-        (OwnedQueryResult, Vec<u8>, ReadPublicationScope),
+        (OwnedQueryResult, crate::read_contract::EncodedReadBytes, ReadPublicationScope),
         crate::direct_file_reader::DirectFileReaderError,
     >;
 
@@ -1344,7 +1342,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         self: Arc<Self>,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
@@ -1405,7 +1403,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// second description of it.
     fn read_metadata(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         request: crate::direct_file_reader::DirectMetadataRequest,
         image: &crate::direct_file_reader::DirectOwnedImage,
         limits: ReadLimits,
@@ -1423,15 +1421,20 @@ fn published_page(
     page: CursorPage,
     observation: CursorObservation,
     snapshot: crate::direct_file_reader::DirectSnapshot,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<
     crate::direct_file_reader::DirectCursorPage,
     crate::direct_file_reader::DirectFileReaderError,
 > {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     // The direct page's canonical body is the public page encoding. The
     // observation travels separately; only owner-channel frames include it.
     let body = &page;
-    let size = read_answer(bounded::serialized_size(body))?;
+    let size = read_answer(read_memory.clone(), || bounded::serialized_size(body))?;
+    let encoding_diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared::<bincode::error::EncodeError>(
+        read_memory.clone(), "reader", "encode_cursor_page", "Raise the reader memory limit to encode this page.")
+        .map_err(crate::read_image::history_answer_error)?;
     let canonical_credit = contextdb_core::read_memory::ReadCredit::try_new(
         read_memory,
         size,
@@ -1444,7 +1447,8 @@ fn published_page(
     let written =
         bincode::serde::encode_into_slice(body, &mut canonical_bytes, bincode::config::standard())
             .map_err(|error| {
-                crate::direct_file_reader::DirectFileReaderError::Engine(error.to_string())
+                crate::direct_file_reader::DirectFileReaderError::Engine(
+                    contextdb_core::error::DiagnosticText::from_shared(encoding_diagnostic.publish(error)))
             })?;
     if written != size {
         return Err(crate::direct_file_reader::DirectFileReaderError::Engine(
@@ -1464,11 +1468,13 @@ fn published_page(
 /// there is still more to come.
 fn drained_page(
     published: &crate::direct_file_reader::DirectCursorPage,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<
     Option<crate::direct_file_reader::DirectCursorPage>,
     crate::direct_file_reader::DirectFileReaderError,
 > {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if published.page.has_more {
         return Ok(None);
     }
@@ -1484,23 +1490,21 @@ fn drained_page(
 
 /// The reading surface's answer to one bounded-kernel outcome.
 pub(crate) fn read_answer<T>(
-    outcome: std::result::Result<T, BoundedExecutionError>,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    execute: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
 ) -> std::result::Result<T, crate::direct_file_reader::DirectFileReaderError> {
-    use crate::direct_file_reader::DirectFileReaderError;
+    use crate::direct_file_reader::{DirectFileReaderError, PreparedEngineDiagnostic};
 
-    outcome.map_err(|error| match error {
+    let diagnostic = PreparedEngineDiagnostic::new(owner)
+        .map_err(crate::read_image::history_answer_error)?;
+    execute().map_err(|error| match error {
         BoundedExecutionError::Refused(failure) => DirectFileReaderError::ReadFailure(failure),
         BoundedExecutionError::Cancelled => DirectFileReaderError::Cancelled,
         BoundedExecutionError::Unimplemented => {
-            DirectFileReaderError::Engine("this read has no approved bounded plan".to_owned())
+            DirectFileReaderError::Engine("this read has no approved bounded plan".into())
         }
-        BoundedExecutionError::Engine(Error::StoreCorrupted { path, reason }) => {
-            DirectFileReaderError::CorruptStore(
-                crate::direct_file_reader::DirectStoreDiagnostic::MalformedRecord,
-                format!("store {path} is corrupt: {reason}"),
-            )
-        }
-        BoundedExecutionError::Engine(engine) => DirectFileReaderError::Engine(engine.to_string()),
+        BoundedExecutionError::Engine(error @ Error::StoreCorrupted { .. }) => diagnostic.corruption(error),
+        BoundedExecutionError::Engine(engine) => diagnostic.engine(engine),
     })
 }
 
@@ -1508,7 +1512,7 @@ pub(crate) fn read_answer<T>(
 /// reading route retains one shape rather than two.
 pub(crate) struct BoundedCursorTarget {
     store: Arc<dyn ReadExecutionTarget>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     cursor: std::sync::Mutex<BoundedCursorHandle>,
     /// What the engine actually reserved to keep this read suspended, and
     /// therefore what is returned when it ends. It drops to zero on the
@@ -1525,8 +1529,10 @@ impl BoundedCursorTarget {
         cursor: BoundedCursorHandle,
         retained: u64,
         snapshot: crate::direct_file_reader::DirectSnapshot,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Arc<Self> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[cfg(any(test, feature = "test-seams"))]
         {
             crate::read_probe::note_cursor_opened();
@@ -1570,7 +1576,7 @@ impl BoundedCursorTarget {
             .cursor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        read_answer(act(&mut cursor))
+        read_answer(self.read_memory.clone(), || act(&mut cursor))
     }
 }
 
@@ -1591,7 +1597,7 @@ impl ReadExecutionTarget for Database {
     fn enter_writer_read(
         &self,
         root: Option<crate::persistence::WriterSnapshotHandle>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Option<crate::database::writer_read::WriterReadScope> {
         Some(Database::enter_writer_read(self, root, read_memory))
     }
@@ -1605,7 +1611,7 @@ impl ReadExecutionTarget for Database {
         lsn: Lsn,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<Vec<f32>>> {
         self.load_row_vector_for_column_identity(
             tx,
@@ -1632,7 +1638,7 @@ impl ReadExecutionTarget for Database {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
         Database::bounded_score_committed_vector_row(
             self,
@@ -1673,7 +1679,7 @@ impl ReadExecutionTarget for Database {
         key_value: &Value,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<RowId>> {
         Database::row_id_for_natural_key_in_tx(
             self,
@@ -1691,7 +1697,7 @@ impl ReadExecutionTarget for Database {
         parsed: &Statement,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<(Statement, PhysicalPlan)> {
         Database::prepare_bounded_read_plan(
             self,
@@ -1708,7 +1714,7 @@ impl ReadExecutionTarget for Database {
 
     fn declared_read_request_provider(
         &self,
-    ) -> Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider> {
+    ) -> crate::vector_read_memory::ReadRequestProvider {
         Database::declared_read_request_provider(self)
     }
 
@@ -1723,7 +1729,7 @@ impl ReadExecutionTarget for Database {
     fn delivery_metadata(
         &self,
         request: crate::direct_file_reader::DirectMetadataRequest,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
         crate::custody::inspection::metadata(self, request, read_memory)
     }
@@ -1731,7 +1737,7 @@ impl ReadExecutionTarget for Database {
     fn committed_change_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &Arc<crate::read_image_memory::ImageMemory>,
+        charge: &crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectChangeState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -1742,7 +1748,7 @@ impl ReadExecutionTarget for Database {
     fn committed_sync_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &Arc<crate::read_image_memory::ImageMemory>,
+        charge: &crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectSyncState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -1753,7 +1759,7 @@ impl ReadExecutionTarget for Database {
     fn historical_index_verification(
         &self,
         table: &str,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Vec<crate::HistoricalIndexVerification>> {
         self.verify_historical_indexes_within(table, memory, checkpoint)
@@ -1761,7 +1767,7 @@ impl ReadExecutionTarget for Database {
 
     fn content_size_answer(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before_table: &mut dyn FnMut() -> Result<()>,
     ) -> Result<OwnedQueryResult> {
         content_size_result(self.content_size_totals(read_memory, before_table)?)
@@ -1771,7 +1777,7 @@ impl ReadExecutionTarget for Database {
         &self,
         plan: &PhysicalPlan,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<OwnedQueryResult> {
         // The same arms the uncapped path runs, asked of the same handle:
         // one implementation, so a budget read over a channel and the same
@@ -1790,7 +1796,7 @@ impl ReadExecutionTarget for Database {
         &self,
         sql: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<String> {
         Database::explain_with_read_memory(self, sql, vector_copy_owner, read_memory)
     }
@@ -1800,7 +1806,7 @@ impl ReadExecutionTarget for Database {
         sql: &str,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::database::ExplainOutput> {
         Database::explain_output_with_params(self, sql, params, vector_copy_owner, read_memory)
     }
@@ -1813,7 +1819,7 @@ impl ReadExecutionTarget for Database {
         &self,
         tx: TxId,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<TransactionTableOverlay> {
         Database::transaction_table_overlay(self, tx, table, read_memory)
     }
@@ -1888,7 +1894,7 @@ impl ReadExecutionTarget for Database {
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<u64>> {
         Database::authenticated_relational_index_prefix_count(
             self,
@@ -1905,7 +1911,7 @@ impl ReadExecutionTarget for Database {
         needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
         Database::bounded_read_snapshot_registration_with_root(
             self,
@@ -1923,7 +1929,7 @@ impl ReadExecutionTarget for Database {
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
         Database::bounded_cursor_snapshot_registration_with_root(
             self,
@@ -1962,7 +1968,7 @@ impl ReadExecutionTarget for Database {
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<(), BoundedExecutionError> {
         Database::bounded_vector_visit_visible_ids(
             self,
@@ -1986,7 +1992,7 @@ impl ReadExecutionTarget for Database {
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         Database::bounded_read_allowed_for_row(
             self,
@@ -2009,7 +2015,7 @@ impl ReadExecutionTarget for Database {
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<Error>, BoundedExecutionError> {
         Database::bounded_read_denial_for_row(
             self,
@@ -2058,7 +2064,7 @@ impl ReadExecutionTarget for Database {
     fn vector_read_preflight(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         copies: &mut contextdb_vector::VectorCopyAdmission,
         checkpoint: Option<bounded::ReadOpenContext>,
     ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>> {
@@ -2068,7 +2074,7 @@ impl ReadExecutionTarget for Database {
     fn preflight_historical_graph(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         Database::preflight_historical_graph(self, snapshot, read_memory, before)
@@ -2079,7 +2085,7 @@ impl ReadExecutionTarget for Database {
         table: &str,
         index: &str,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         Database::preflight_historical_index(self, table, index, snapshot, read_memory, before)
@@ -2087,7 +2093,7 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_row_by_identity(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -2111,7 +2117,7 @@ impl ReadExecutionTarget for Database {
 
     fn visit_bounded_row_by_identity(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -2135,7 +2141,7 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_physical_table_row_next(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
@@ -2159,7 +2165,7 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_exact_index_row_next(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -2190,14 +2196,14 @@ impl ReadExecutionTarget for Database {
     fn ordered_prefix_snapshot_is_current(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool> {
         Database::ordered_prefix_snapshot_is_current(self, snapshot, read_memory)
     }
 
     fn bounded_ordered_table_row_next_observed(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         column: &str,
         direction: contextdb_core::SortDirection,
@@ -2236,7 +2242,7 @@ impl ReadExecutionTarget for Database {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         Database::bounded_visit_verified_ordered_identities(
             self,
@@ -2259,7 +2265,7 @@ impl ReadExecutionTarget for Database {
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_probe: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_native_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         Database::bounded_verified_index_prefixes_are_empty(
             self,
@@ -2304,7 +2310,7 @@ impl ReadExecutionTarget for Database {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         contextdb_vector::mem::BoundedVectorCandidateGroups,
         BoundedExecutionError,
@@ -2333,7 +2339,7 @@ impl ReadExecutionTarget for Database {
         before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<usize, BoundedExecutionError> {
         Database::bounded_vector_candidate_k(
             self,
@@ -2374,7 +2380,7 @@ impl ReadExecutionTarget for Database {
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<VectorSearchDisclosure> {
         Database::completed_vector_search_disclosure(
             self,
@@ -2419,7 +2425,7 @@ impl ReadExecutionTarget for Database {
             BoundedExecutionError,
         >,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError> {
         Database::with_row_vector_source(
             self,
@@ -2445,7 +2451,7 @@ impl ReadExecutionTarget for Database {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>
     {
         Database::bounded_brute_force_vector_cursor(
@@ -2499,7 +2505,7 @@ impl ReadExecutionTarget for Database {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError> {
         Database::bounded_brute_force_vector_step(
             self,
@@ -2533,7 +2539,7 @@ impl ReadExecutionTarget for Database {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, BoundedExecutionError>>,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
@@ -2564,7 +2570,7 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_rank_candidate(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         index: &VectorIndexRef,
         sort_key: &str,
         anchor_row_id: RowId,
@@ -2629,7 +2635,7 @@ impl ReadExecutionTarget for Database {
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         Option<crate::database::gate::CountedGraphScanEdge>,
         BoundedExecutionError,
@@ -2652,7 +2658,7 @@ impl ReadExecutionTarget for Database {
     fn graph_cursor_read_guard(
         &self,
         tx: Option<TxId>,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<crate::database::GraphCursorReadGuard>, BoundedExecutionError>
     {
         Database::graph_cursor_read_guard(self, tx, memory).map_err(Into::into)
@@ -2671,7 +2677,7 @@ impl ReadExecutionTarget for Database {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<crate::database::EngineGraphBfsCursor>, BoundedExecutionError>
     {
         Database::bounded_graph_bfs_cursor(
@@ -2705,7 +2711,7 @@ impl ReadExecutionTarget for Database {
         visited_cap: Option<usize>,
         tx: Option<TxId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         Option<contextdb_graph::mem::BoundedTraversalNode>,
         BoundedExecutionError,
@@ -2736,7 +2742,7 @@ impl ReadExecutionTarget for Database {
         snapshot: SnapshotId,
         ctes: &[Cte],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Expr> {
         resolve_graph_filter_at_snapshot(
             self,
@@ -2762,7 +2768,7 @@ impl ReadExecutionTarget for Database {
         snapshot: SnapshotId,
         start_alias: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<GraphStartResolution> {
         resolve_graph_start_nodes_from_filter(
             self,
@@ -2785,7 +2791,7 @@ impl ReadExecutionTarget for Database {
         bindings: &HashMap<String, uuid::Uuid>,
         work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool> {
         graph_filter_matches_bindings_with_work(
             self,
@@ -2818,17 +2824,17 @@ impl ReadExecutionTarget for Database {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
-        (OwnedQueryResult, Vec<u8>, ReadPublicationScope),
+        (OwnedQueryResult, crate::read_contract::EncodedReadBytes, ReadPublicationScope),
         crate::direct_file_reader::DirectFileReaderError,
     > {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_cancellation(crate::read_probe::CANCELLATION_EXECUTE, cancellation);
-        let complete = read_answer(bounded::execute(
+        let complete = read_answer(read_memory.clone(), || bounded::execute(
             self,
             sql,
             params,
@@ -2839,9 +2845,16 @@ impl ReadExecutionTarget for Database {
             #[cfg(any(test, feature = "test-seams"))]
             crate::read_session::session_kernel_probe_for_test(),
         ))?;
+        let encoding_diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared::<crate::read_contract::ReadEncodingError>(
+            read_memory.clone(), "reader", "encode_query_result", "Raise the reader memory limit to encode this answer.")
+            .map_err(crate::read_image::history_answer_error)?;
         let canonical =
-            crate::read_contract::encode_query_result(&complete.result).map_err(|error| {
-                crate::direct_file_reader::DirectFileReaderError::Engine(error.to_string())
+            crate::read_contract::encode_query_result_funded(
+                &complete.result, read_memory, limits.memory,
+            ).and_then(|bytes| crate::read_contract::EncodedReadBytes::from_funded(bytes, limits.memory))
+            .map_err(|error| {
+                crate::direct_file_reader::DirectFileReaderError::Engine(
+                    contextdb_core::error::DiagnosticText::from_shared(encoding_diagnostic.publish(error)))
             })?;
         Ok((complete.result, canonical, complete.publication))
     }
@@ -2850,7 +2863,7 @@ impl ReadExecutionTarget for Database {
         self: Arc<Self>,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
@@ -2870,7 +2883,7 @@ impl ReadExecutionTarget for Database {
             cancellation,
         );
         let store: Arc<dyn ReadExecutionTarget> = self;
-        let opened = read_answer(bounded::open_cursor(
+        let opened = read_answer(read_memory.clone(), || bounded::open_cursor(
             Arc::clone(&store),
             sql,
             params,
@@ -2944,7 +2957,7 @@ impl ReadExecutionTarget for Database {
 
     fn read_metadata(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         request: crate::direct_file_reader::DirectMetadataRequest,
         image: &crate::direct_file_reader::DirectOwnedImage,
         limits: ReadLimits,
@@ -2999,8 +3012,10 @@ fn execute_kernel_plan(
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     bounded::drain_chosen_plan(
         db,
         plan,
@@ -3028,8 +3043,10 @@ pub(crate) fn execute_plan(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if plan_contains_window(plan) {
         return execute_kernel_plan(db, plan, params, tx, read_memory);
     }
@@ -3053,8 +3070,10 @@ fn execute_plan_with_materialized_columns(
     materialized_columns: Option<&[String]>,
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     loop {
         match execute_plan_once(
             db,
@@ -3083,12 +3102,14 @@ pub(crate) fn execute_bounded(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     bounded::execute(
         db,
         sql,
@@ -3113,12 +3134,14 @@ pub(crate) fn execute_bounded_on_target(
     db: &dyn ReadExecutionTarget,
     sql: &str,
     params: &HashMap<String, Value>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     bounded::execute(
         db,
         sql,
@@ -3140,12 +3163,14 @@ pub(crate) fn open_bounded_cursor(
     db: Arc<Database>,
     sql: &str,
     params: &HashMap<String, Value>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     bounded::open_cursor(
         db,
         sql,
@@ -3201,6 +3226,17 @@ pub(crate) enum BoundedExecutionError {
     /// ordinary result.
     Cancelled,
     Engine(Error),
+}
+
+impl BoundedExecutionError {
+    pub(crate) fn into_engine_error(self) -> Error {
+        match self {
+            Self::Unimplemented => Error::ReadSessionNotImplemented,
+            Self::Refused(failure) => Error::ReadFailure(failure),
+            Self::Cancelled => Error::ReadCancelled,
+            Self::Engine(error) => error,
+        }
+    }
 }
 
 impl From<Error> for BoundedExecutionError {
@@ -3396,7 +3432,7 @@ impl std::fmt::Debug for BoundedCursorHandle {
 }
 
 pub(crate) struct BoundedCursorExecutionState {
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     lifecycle: std::sync::Mutex<BoundedCursorLifecycle>,
     pub(crate) publication: ReadPublicationScope,
     erased: std::sync::atomic::AtomicBool,
@@ -4410,8 +4446,10 @@ fn execute_create_table_plan(
     db: &Database,
     p: &contextdb_planner::plan::CreateTablePlan,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     require_admin_for_create_table(db)?;
     db.check_disk_budget("CREATE TABLE")?;
     // Foreign-key and duplicate-table validation below reads the
@@ -4725,15 +4763,181 @@ fn execute_create_table_plan(
     Ok(OwnedQueryResult::empty_with_affected(0))
 }
 
+// Exhaustive destructuring makes every new metadata field a compile-time
+// classification decision. Only query breadth may bypass the general projection.
+fn metadata_equal_except_ef_search(old: &TableMeta, new: &TableMeta) -> bool {
+    let TableMeta {
+        columns: old_columns,
+        immutable: old_immutable,
+        state_machine: old_state_machine,
+        dag_edge_types: old_dag_edge_types,
+        unique_constraints: old_unique_constraints,
+        natural_key_column: old_natural_key_column,
+        propagation_rules: old_propagation_rules,
+        default_ttl_seconds: old_default_ttl_seconds,
+        sync_safe: old_sync_safe,
+        expires_column: old_expires_column,
+        indexes: old_indexes,
+        composite_foreign_keys: old_composite_foreign_keys,
+        sync_direction: old_sync_direction,
+        retain_declared_unit: old_retain_declared_unit,
+        primary_key_columns: old_primary_key_columns,
+        conflict_policy: old_conflict_policy,
+        history_policy: old_history_policy,
+        delivery_manifest_tables: old_delivery_manifest_tables,
+        edge_discard: old_edge_discard,
+        maintained_counts: old_maintained_counts,
+    } = old;
+    let TableMeta {
+        columns: new_columns,
+        immutable: new_immutable,
+        state_machine: new_state_machine,
+        dag_edge_types: new_dag_edge_types,
+        unique_constraints: new_unique_constraints,
+        natural_key_column: new_natural_key_column,
+        propagation_rules: new_propagation_rules,
+        default_ttl_seconds: new_default_ttl_seconds,
+        sync_safe: new_sync_safe,
+        expires_column: new_expires_column,
+        indexes: new_indexes,
+        composite_foreign_keys: new_composite_foreign_keys,
+        sync_direction: new_sync_direction,
+        retain_declared_unit: new_retain_declared_unit,
+        primary_key_columns: new_primary_key_columns,
+        conflict_policy: new_conflict_policy,
+        history_policy: new_history_policy,
+        delivery_manifest_tables: new_delivery_manifest_tables,
+        edge_discard: new_edge_discard,
+        maintained_counts: new_maintained_counts,
+    } = new;
+    old_immutable == new_immutable
+        && old_state_machine == new_state_machine
+        && old_dag_edge_types == new_dag_edge_types
+        && old_unique_constraints == new_unique_constraints
+        && old_natural_key_column == new_natural_key_column
+        && old_propagation_rules == new_propagation_rules
+        && old_default_ttl_seconds == new_default_ttl_seconds
+        && old_sync_safe == new_sync_safe
+        && old_expires_column == new_expires_column
+        && old_indexes == new_indexes
+        && old_composite_foreign_keys == new_composite_foreign_keys
+        && old_sync_direction == new_sync_direction
+        && old_retain_declared_unit == new_retain_declared_unit
+        && old_primary_key_columns == new_primary_key_columns
+        && old_conflict_policy == new_conflict_policy
+        && old_history_policy == new_history_policy
+        && old_delivery_manifest_tables == new_delivery_manifest_tables
+        && old_edge_discard == new_edge_discard
+        && old_maintained_counts == new_maintained_counts
+        && old_columns.len() == new_columns.len()
+        && old_columns
+            .iter()
+            .zip(new_columns)
+            .all(|(old, new)| column_equal_except_ef_search(old, new))
+}
+
+fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
+    let ColumnDef {
+        name: old_name,
+        column_type: old_column_type,
+        nullable: old_nullable,
+        primary_key: old_primary_key,
+        unique: old_unique,
+        default: old_default,
+        references: old_references,
+        expires: old_expires,
+        immutable: old_immutable,
+        quantization: old_quantization,
+        rank_policy: old_rank_policy,
+        context_id: old_context_id,
+        scope_label: old_scope_label,
+        acl_ref: old_acl_ref,
+        partition_key_columns: old_partition_key_columns,
+        max_partitions: old_max_partitions,
+        search_mode: old_search_mode,
+        auto_index_at: old_auto_index_at,
+        flat_below: old_flat_below,
+        auto_expansion_ceiling: old_auto_expansion_ceiling,
+        hnsw_m: old_hnsw_m,
+        hnsw_ef_construction: old_hnsw_ef_construction,
+        hnsw_ef_search: _,
+        hnsw_search_radius_millionths: old_hnsw_search_radius_millionths,
+        vector_policy_revision: old_vector_policy_revision,
+        consolidation_change_percent: old_consolidation_change_percent,
+        consolidation_tombstone_percent: old_consolidation_tombstone_percent,
+        consolidation_disabled: old_consolidation_disabled,
+    } = old;
+    let ColumnDef {
+        name: new_name,
+        column_type: new_column_type,
+        nullable: new_nullable,
+        primary_key: new_primary_key,
+        unique: new_unique,
+        default: new_default,
+        references: new_references,
+        expires: new_expires,
+        immutable: new_immutable,
+        quantization: new_quantization,
+        rank_policy: new_rank_policy,
+        context_id: new_context_id,
+        scope_label: new_scope_label,
+        acl_ref: new_acl_ref,
+        partition_key_columns: new_partition_key_columns,
+        max_partitions: new_max_partitions,
+        search_mode: new_search_mode,
+        auto_index_at: new_auto_index_at,
+        flat_below: new_flat_below,
+        auto_expansion_ceiling: new_auto_expansion_ceiling,
+        hnsw_m: new_hnsw_m,
+        hnsw_ef_construction: new_hnsw_ef_construction,
+        hnsw_ef_search: _,
+        hnsw_search_radius_millionths: new_hnsw_search_radius_millionths,
+        vector_policy_revision: new_vector_policy_revision,
+        consolidation_change_percent: new_consolidation_change_percent,
+        consolidation_tombstone_percent: new_consolidation_tombstone_percent,
+        consolidation_disabled: new_consolidation_disabled,
+    } = new;
+    old_name == new_name
+        && old_column_type == new_column_type
+        && old_nullable == new_nullable
+        && old_primary_key == new_primary_key
+        && old_unique == new_unique
+        && old_default == new_default
+        && old_references == new_references
+        && old_expires == new_expires
+        && old_immutable == new_immutable
+        && old_quantization == new_quantization
+        && old_rank_policy == new_rank_policy
+        && old_context_id == new_context_id
+        && old_scope_label == new_scope_label
+        && old_acl_ref == new_acl_ref
+        && old_partition_key_columns == new_partition_key_columns
+        && old_max_partitions == new_max_partitions
+        && old_search_mode == new_search_mode
+        && old_auto_index_at == new_auto_index_at
+        && old_flat_below == new_flat_below
+        && old_auto_expansion_ceiling == new_auto_expansion_ceiling
+        && old_hnsw_m == new_hnsw_m
+        && old_hnsw_ef_construction == new_hnsw_ef_construction
+        && old_hnsw_search_radius_millionths == new_hnsw_search_radius_millionths
+        && old_vector_policy_revision == new_vector_policy_revision
+        && old_consolidation_change_percent == new_consolidation_change_percent
+        && old_consolidation_tombstone_percent == new_consolidation_tombstone_percent
+        && old_consolidation_disabled == new_consolidation_disabled
+}
+
 /// `ALTER TABLE`, off the recursing executor's own stack frame. See
 /// [`execute_create_table_plan`] for why.
 #[inline(never)]
 fn execute_alter_table_plan(
     db: &Database,
     p: &contextdb_planner::plan::AlterTablePlan,
+    tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     require_admin_for_ddl(db)?;
     db.check_disk_budget("ALTER TABLE")?;
     let store = db.relational_store();
@@ -4874,7 +5078,7 @@ fn execute_alter_table_plan(
                 )?;
                 let projected_indexes =
                     db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
-                db.persist_local_table_projection_and_ddl(
+                let memory_history = db.persist_local_table_projection_and_ddl(
                     &p.table,
                     &projected_meta,
                     &projected_rows,
@@ -4890,6 +5094,7 @@ fn execute_alter_table_plan(
                     &ddl,
                     projected_indexes,
                     &mut memory_swap,
+                    memory_history,
                 )?;
                 memory_swap.commit_after_swap();
                 if added_vector {
@@ -5070,7 +5275,7 @@ fn execute_alter_table_plan(
                     db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
                 let graph_shape_loss = db.prepare_graph_shape_loss(&p.table, &old_meta,
                     &projected_meta, vector_copy_owner, read_memory.clone())?;
-                db.persist_local_table_projection_and_ddl(
+                let memory_history = db.persist_local_table_projection_and_ddl(
                     &p.table,
                     &projected_meta,
                     &projected_rows,
@@ -5086,6 +5291,7 @@ fn execute_alter_table_plan(
                     &ddl,
                     projected_indexes,
                     &mut memory_swap,
+                    memory_history,
                 )?;
                 db.publish_graph_shape_loss(graph_shape_loss);
                 memory_swap.commit_after_swap();
@@ -5096,7 +5302,7 @@ fn execute_alter_table_plan(
                 Ok(())
             })?;
             db.clear_statement_cache();
-            return Ok(OwnedQueryResult::new(QueryResult {
+            return Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vec![],
                 rows: vec![],
                 rows_affected: 0,
@@ -5281,7 +5487,7 @@ fn execute_alter_table_plan(
                 };
                 let graph_shape_loss = db.prepare_graph_shape_loss(&p.table, &old_meta,
                     &projected_meta, vector_copy_owner, read_memory.clone())?;
-                db.persist_local_table_projection_and_ddl(
+                let memory_history = db.persist_local_table_projection_and_ddl(
                     &p.table,
                     &projected_meta,
                     &projected_rows,
@@ -5300,6 +5506,7 @@ fn execute_alter_table_plan(
                     &ddl,
                     projected_indexes,
                     &mut memory_swap,
+                    memory_history,
                 )?;
                 db.publish_graph_shape_loss(graph_shape_loss);
                 memory_swap.commit_after_swap();
@@ -5619,6 +5826,25 @@ fn execute_alter_table_plan(
                     read_memory.clone(),
                 )?;
             }
+            // Classify the resolved declaration, not the partial SET HNSW AST:
+            // DEFAULT can also clear topology or radius. Restatements still
+            // author a DDL occurrence even when the effective breadth is equal.
+            if tx.is_none()
+                && matches!(&p.action, AlterAction::SetVectorHnsw { .. })
+                && db.allows_local_ef_search_metadata_publication()
+                && metadata_equal_except_ef_search(&old_meta, &projected_meta)
+            {
+                let index = vector_layout_update.as_ref().expect("HNSW has an index");
+                return db.publish_local_ef_search_metadata(
+                    &p.table,
+                    &old_meta,
+                    &projected_meta,
+                    index,
+                    lsn,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                );
+            }
             let projected_rows = db.local_table_projection_rows(&p.table, &projected_meta)?;
             let ddl = vec![db.alter_table_ddl_for_meta(&p.table, &projected_meta, Vec::new())];
             let mut memory_swap = db.prepare_local_table_projection_memory(
@@ -5629,7 +5855,7 @@ fn execute_alter_table_plan(
             )?;
             let projected_indexes =
                 db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
-            db.persist_local_table_projection_and_ddl(
+            let memory_history = db.persist_local_table_projection_and_ddl(
                 &p.table,
                 &projected_meta,
                 &projected_rows,
@@ -5644,7 +5870,8 @@ fn execute_alter_table_plan(
                 lsn,
                 &ddl,
                 projected_indexes,
-                    &mut memory_swap,
+                &mut memory_swap,
+                memory_history,
             )?;
             memory_swap.commit_after_swap();
             if let Some(index) = &vector_layout_update {
@@ -5846,8 +6073,10 @@ fn execute_plan_once(
     materialized_columns: Option<&[String]>,
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     #[cfg(test)]
     let __frame_probe = 0u8;
     #[cfg(test)]
@@ -5908,7 +6137,7 @@ fn execute_plan_once(
             Ok(OwnedQueryResult::empty_with_affected(0))
         }
         PhysicalPlan::AlterTable(p) => {
-            execute_alter_table_plan(db, p, vector_copy_owner, read_memory.clone())
+            execute_alter_table_plan(db, p, tx, vector_copy_owner, read_memory.clone())
         }
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx, read_memory.clone()),
         PhysicalPlan::Purge(p) => {
@@ -5922,7 +6151,7 @@ fn execute_plan_once(
         }
         PhysicalPlan::Scan { table, filter, .. } => {
             if table == "dual" {
-                return Ok(OwnedQueryResult::new(QueryResult {
+                return Ok(OwnedQueryResult::new(QueryResultData {
                     columns: vec![],
                     rows: vec![vec![]],
                     rows_affected: 0,
@@ -6226,6 +6455,7 @@ fn execute_plan_once(
                 );
                 semantic_query.sort_key = Some(sort_key.clone());
                 semantic_query.search_mode = Some(resolved_search_mode);
+                let trace_owner = bounded::TraceMemoryOwner::try_new(read_memory.clone())?;
                 let search = || {
                     db.with_snapshot_override(snapshot, || {
                         db.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
@@ -6234,7 +6464,7 @@ fn execute_plan_once(
                             candidate_bitmap,
                             vector_copy_owner,
                             read_memory.clone(),
-                            Arc::new(bounded::TraceMemoryOwner::new(read_memory.clone())),
+                            (*trace_owner).clone(),
                         )
                     })
                 };
@@ -6310,7 +6540,7 @@ fn execute_plan_once(
                         vector_copy_owner,
                         read_memory.clone(),
                     )?);
-                return Ok(OwnedQueryResult::new(QueryResult {
+                return Ok(OwnedQueryResult::new(QueryResultData {
                     columns,
                     rows,
                     rows_affected: 0,
@@ -6318,6 +6548,7 @@ fn execute_plan_once(
                     cascade: None,
                 }));
             }
+            let trace_owner = bounded::TraceMemoryOwner::try_new(read_memory.clone())?;
             let mut search = || {
                 db.query_vector_strict_in_tx_with_strategy(
                     tx,
@@ -6329,7 +6560,7 @@ fn execute_plan_once(
                     resolved_search_mode,
                     vector_copy_owner,
                     read_memory.clone(),
-                    Arc::new(bounded::TraceMemoryOwner::new(read_memory.clone())),
+                    (*trace_owner).clone(),
                 )
             };
             let res = if let Some(prefixes) = partition_scope
@@ -6428,7 +6659,7 @@ fn execute_plan_once(
                     read_memory.clone(),
                 )?,
             );
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns,
                 rows,
                 rows_affected: 0,
@@ -6491,11 +6722,11 @@ fn execute_plan_once(
                     .map(AggregateState::finish)
                     .collect::<Result<Vec<_>>>()?;
 
-                return Ok(OwnedQueryResult::new(QueryResult {
+                return Ok(OwnedQueryResult::new(QueryResultData {
                     columns: project_output_columns(columns),
                     rows: vec![aggregate_row],
                     rows_affected: 0,
-                    trace: input_result.trace.clone(),
+                    trace: clone_vector_query_trace(&input_result.trace, vector_copy_owner)?,
                     cascade: None,
                 }));
             }
@@ -6516,11 +6747,11 @@ fn execute_plan_once(
                 output_rows.push(projected);
             }
 
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: output_columns,
                 rows: output_rows,
                 rows_affected: 0,
-                trace: input_result.trace.clone(),
+                trace: clone_vector_query_trace(&input_result.trace, vector_copy_owner)?,
                 cascade: None,
             }))
         }
@@ -6743,7 +6974,7 @@ fn execute_plan_once(
                 &right_prefix,
             );
 
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: output_columns,
                 rows,
                 rows_affected: 0,
@@ -6768,7 +6999,7 @@ fn execute_plan_once(
             // must walk the BTreeMap at the named index, apply visibility,
             // materialize rows, and populate the trace fully.
             let _ = (table, index);
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vec![],
                 rows: vec![],
                 rows_affected: 0,
@@ -6790,7 +7021,7 @@ fn execute_plan_once(
         }
         PhysicalPlan::ShowMemoryLimit => {
             let usage = db.accountant().usage();
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vec![
                     "limit".to_string(),
                     "used".to_string(),
@@ -6837,7 +7068,7 @@ fn execute_plan_once(
             let limit = db.disk_limit();
             let used = db.disk_file_size();
             let startup_ceiling = db.disk_limit_startup_ceiling();
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vec![
                     "limit".to_string(),
                     "used".to_string(),
@@ -6873,7 +7104,7 @@ fn execute_plan_once(
             db.set_vector_serving_cache_bytes(bytes.map(|bytes| bytes as usize))?;
             Ok(OwnedQueryResult::empty())
         }
-        PhysicalPlan::ShowVectorServingCache => Ok(OwnedQueryResult::new(QueryResult {
+        PhysicalPlan::ShowVectorServingCache => Ok(OwnedQueryResult::new(QueryResultData {
             columns: vec!["bytes".to_string()],
             rows: vec![vec![match db.vector_serving_cache_bytes() {
                 Some(bytes) => Value::Int64(i64::try_from(bytes).unwrap_or(i64::MAX)),
@@ -6915,7 +7146,7 @@ fn execute_plan_once(
                     ])
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vec![
                     "setting".to_string(),
                     "value".to_string(),
@@ -6927,7 +7158,7 @@ fn execute_plan_once(
                 cascade: None,
             }))
         }
-        PhysicalPlan::ShowMaintenancePollInterval => Ok(OwnedQueryResult::new(QueryResult {
+        PhysicalPlan::ShowMaintenancePollInterval => Ok(OwnedQueryResult::new(QueryResultData {
             columns: vec!["milliseconds".to_string()],
             rows: vec![vec![Value::Int64(
                 i64::try_from(db.maintenance_poll_interval().as_millis()).unwrap_or(i64::MAX),
@@ -6996,7 +7227,7 @@ fn execute_plan_once(
                     rows.push(vec![Value::Text(format!("{table}={word} (engine-owned)"))]);
                 }
             }
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vec!["policy".to_string()],
                 rows,
                 rows_affected: 0,
@@ -7013,7 +7244,7 @@ fn execute_plan_once(
                     vector_index_inspection_row(&declaration, info, &partitions, maintenance_policy)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vector_inspection_columns(VECTOR_INDEX_INSPECTION_COLUMNS),
                 rows,
                 rows_affected: 0,
@@ -7070,7 +7301,7 @@ fn execute_plan_once(
                 None => usize::MAX,
             };
             let rows = rows.into_iter().skip(offset).take(limit).collect();
-            Ok(OwnedQueryResult::new(QueryResult {
+            Ok(OwnedQueryResult::new(QueryResultData {
                 columns: vector_inspection_columns(VECTOR_PARTITION_INSPECTION_COLUMNS),
                 rows,
                 rows_affected: 0,
@@ -7098,8 +7329,10 @@ fn execute_materialized_cte(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     execute_plan(
         db,
         input,
@@ -7337,8 +7570,10 @@ fn exec_insert(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut vector_admission = crate::vector_read_memory::admission(read_memory.clone());
     let vector_copy_owner = &mut vector_admission;
     db.check_disk_budget("INSERT")?;
@@ -7692,8 +7927,10 @@ fn exec_discard(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let txid = tx.ok_or_else(|| Error::Other("missing transaction for discard".into()))?;
     let mut names = BTreeSet::new();
     for selection in &p.selections {
@@ -7763,8 +8000,13 @@ fn exec_purge(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    #[cfg(test)]
+    let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+        "exec_purge");
     // The authority refusal must precede every read, including subquery
     // evaluation, so an edge never learns predicate-selected hub rows.
     if let Some(hub_node_id) = db.retention_sync_peer() {
@@ -7862,8 +8104,10 @@ fn exec_delete(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let txid = tx.ok_or_else(|| Error::Other(("missing tx for delete".to_string()).into()))?;
     let _vector_schema = db.vector_schema_read_table(&p.table);
     let snapshot = db.snapshot_for_read();
@@ -8091,8 +8335,10 @@ fn trigger_bound_unique_update_rows(
     txid: TxId,
     lookup: TriggerUniqueUpdateLookup<'_>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Vec<VersionedRow>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let (Some(meta), Some(_where_clause), Some(predicates)) = (
         lookup.table_meta,
         lookup.resolved_where,
@@ -8123,8 +8369,10 @@ fn exec_update(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     db.check_disk_budget("UPDATE")?;
     let txid = tx.ok_or_else(|| Error::Other(("missing tx for update".to_string()).into()))?;
     let table_meta = db.table_meta(&p.table);
@@ -9407,8 +9655,10 @@ fn validate_filter_predicate_columns(
 fn exec_create_index(
     db: &Database,
     plan: &contextdb_planner::CreateIndexPlan,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let validated_schema = db.relational_store().table_meta.read().clone();
     // Reserved-prefix guard: user-declared indexes must not collide with the
     // auto-index namespace used for PRIMARY KEY / UNIQUE backing indexes.
@@ -9493,7 +9743,7 @@ fn exec_create_index(
         )?;
         let projected_indexes =
             db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
-        db.persist_local_table_projection_and_ddl(
+        let memory_history = db.persist_local_table_projection_and_ddl(
             &plan.table,
             &projected_meta,
             &projected_rows,
@@ -9508,7 +9758,8 @@ fn exec_create_index(
             lsn,
             &ddl,
             projected_indexes,
-                    &mut memory_swap,
+            &mut memory_swap,
+            memory_history,
         )?;
         memory_swap.commit_after_swap();
         Ok(())
@@ -9521,8 +9772,10 @@ fn exec_create_index(
 fn exec_drop_index(
     db: &Database,
     plan: &contextdb_planner::DropIndexPlan,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let validated_schema = db.relational_store().table_meta.read().clone();
     let meta = db
         .table_meta(&plan.table)
@@ -9572,7 +9825,7 @@ fn exec_drop_index(
         )?;
         let projected_indexes =
             db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
-        db.persist_local_table_projection_and_ddl(
+        let memory_history = db.persist_local_table_projection_and_ddl(
             &plan.table,
             &projected_meta,
             &projected_rows,
@@ -9587,7 +9840,8 @@ fn exec_drop_index(
             lsn,
             &ddl,
             projected_indexes,
-                    &mut memory_swap,
+            &mut memory_swap,
+            memory_history,
         )?;
         memory_swap.commit_after_swap();
         Ok(())
@@ -10155,7 +10409,7 @@ const INDEX_RANGE_PROBE_HINT: &str = "Raise MEMORY_LIMIT to compare the tied ind
 pub(crate) struct IndexRangeSizes<'a> {
     target: &'a dyn ReadExecutionTarget,
     snapshot: SnapshotId,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     memo: &'a IndexRangeMemo,
     pacing: &'a dyn IndexProbePacing,
 }
@@ -10164,10 +10418,12 @@ impl<'a> IndexRangeSizes<'a> {
     pub(crate) fn new(
         target: &'a dyn ReadExecutionTarget,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         memo: &'a IndexRangeMemo,
         pacing: &'a dyn IndexProbePacing,
     ) -> Self {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Self {
             target,
             snapshot,
@@ -10361,8 +10617,10 @@ impl RangeProbe {
         target: &dyn ReadExecutionTarget,
         table: &str,
         pick: &IndexPick,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Self, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The coerced copy of the pick and its expanded runs are admitted
         // before either is built, and stay charged while the probe lives.
         let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory);
@@ -10425,9 +10683,11 @@ impl RangeProbe {
         target: &dyn ReadExecutionTarget,
         table: &str,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         pacing: &dyn IndexProbePacing,
     ) -> std::result::Result<bool, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.empty {
             return Ok(false);
         }
@@ -11838,21 +12098,22 @@ pub fn execute_eager_for_test(
     sql: &str,
     params: &HashMap<String, Value>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-) -> Result<QueryResult> {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<crate::QueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let statement = contextdb_parser::parse(sql)?;
     let plan = contextdb_planner::plan(&statement)?;
     validate_plan_columns(db, &plan)?;
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
-    execute_plan(
+    crate::QueryResult::publish_with(read_memory.clone(), || execute_plan(
         db,
         &plan,
         params,
         db.active_read_transaction(),
         &mut vector_copy_owner,
         read_memory.clone(),
-    )
-    .map(OwnedQueryResult::into_public)
+    ))
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -12753,8 +13014,10 @@ fn execute_index_scan(
     residual_filter: Option<&Expr>,
     params: &HashMap<String, Value>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(Vec<VersionedRow>, u64)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     use contextdb_core::{DirectedValue, SortDirection, TotalOrdAsc, TotalOrdDesc};
     use std::ops::Bound;
 
@@ -13242,8 +13505,10 @@ fn execute_writer_index_scan(
     residual_filter: Option<&Expr>,
     params: &HashMap<String, Value>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(Vec<VersionedRow>, u64)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let pick = match coerce_pick_shape_to_column_type(db, table, pick) {
         Ok(pick) => pick,
         Err(_) => return Ok((Vec::new(), 0)),
@@ -13448,8 +13713,10 @@ fn try_elide_sort(
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<OwnedQueryResult>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     fn find_scan(plan: &PhysicalPlan) -> Option<(&String, &Option<String>, &Option<Expr>)> {
         match plan {
             PhysicalPlan::Scan {
@@ -13568,8 +13835,10 @@ fn run_index_scan_with_order(
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<OwnedQueryResult>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     use std::borrow::Cow;
     let snapshot = db.snapshot_for_read();
     let schema_columns = db.table_meta(table).map(|meta| {
@@ -13910,8 +14179,10 @@ pub(crate) fn estimate_drop_table_bytes(
     db: &Database,
     table: &str,
     _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<usize> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
     let retain_deleted = db.private_received_rows_hold_delete_invoices();
     let meta = db.table_meta(table);
     let metadata_bytes = meta
@@ -13984,7 +14255,7 @@ fn materialize_rows(
         })
         .collect();
 
-    Ok(OwnedQueryResult::new(QueryResult {
+    Ok(OwnedQueryResult::new(QueryResultData {
         columns,
         rows,
         rows_affected: 0,
@@ -13999,8 +14270,10 @@ fn scan_rows_for_select(
     snapshot: SnapshotId,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut rows = if let Some(tx) = tx {
         let rows =
             db.scan_in_tx_raw(tx, table, snapshot, vector_copy_owner, read_memory.clone())?;
@@ -14030,8 +14303,10 @@ fn scan_rows_for_select_statement(
     filter: Option<&Expr>,
     params: &HashMap<String, Value>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let Some(filter) = filter.filter(|filter| {
         db.table_meta(table)
             .is_some_and(|meta| statement_names_one_row(&meta, filter, params))
@@ -14057,8 +14332,10 @@ fn rows_by_row_id(
     tx: Option<TxId>,
     materialized_columns: Option<&[String]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if row_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -14086,8 +14363,10 @@ fn uuid_to_row_id_map(
     snapshot: SnapshotId,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<HashMap<uuid::Uuid, RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let rows = scan_rows_for_select(
         db,
         table,
@@ -14130,6 +14409,25 @@ fn trace_label_survives_sort(physical_plan: &str) -> bool {
         physical_plan,
         "IndexScan" | "AdjacencyProbe" | "EdgesScan" | "GraphBfs"
     )
+}
+
+// Eager execution's existing answer-copy owner keeps each internal trace
+// copy admitted until the operation hands its completed answer to the caller.
+fn clone_vector_query_trace(
+    trace: &QueryTrace,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+) -> Result<QueryTrace> {
+    if let Some(disclosure) = trace.vector_search.as_deref() {
+        let bytes = bounded::vector_search_disclosure_capacity_bytes(disclosure)
+            .map_err(|error| match error {
+                BoundedExecutionError::Engine(error) => error,
+                BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+                BoundedExecutionError::Cancelled => Error::ReadCancelled,
+                BoundedExecutionError::Unimplemented => Error::ReadSessionNotImplemented,
+            })?;
+        vector_copy_owner.reserve(bytes)?;
+    }
+    Ok(trace.clone())
 }
 
 fn vector_search_trace_with_source(
@@ -14846,9 +15144,11 @@ pub(crate) fn vector_candidate_bitmap(
     directory_route: bool,
     params: &HashMap<String, Value>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     before_bitmap: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<(Option<RoaringTreemap>, Option<QueryTrace>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut candidate_trace = None;
     let unrestricted_scan_candidates = !access_filter
         && (partition_scope.is_some_and(VectorPartitionScope::covers_filter_for_execution)
@@ -14888,7 +15188,7 @@ pub(crate) fn vector_candidate_bitmap(
                 read_memory.clone(),
             )
         })?;
-        candidate_trace = Some(qr.trace.clone());
+        candidate_trace = Some(clone_vector_query_trace(&qr.trace, vector_copy_owner)?);
         #[cfg(any(test, feature = "test-seams"))]
         db.__bump_candidate_rows_materialized_for_test(qr.rows.len() as u64);
         // The bitmap holds at most one id per materialized candidate row.
@@ -15957,8 +16257,10 @@ fn resolve_in_subqueries(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Expr> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     resolve_in_subqueries_with_ctes(
         db,
         expr,
@@ -15978,8 +16280,10 @@ fn resolve_graph_filter_at_snapshot(
     snapshot: SnapshotId,
     ctes: &[Cte],
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Expr> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     db.with_snapshot_override(snapshot, || {
         resolve_in_subqueries_with_ctes(
             db,
@@ -16001,8 +16305,10 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
     tx: Option<TxId>,
     ctes: &[Cte],
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Expr> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     // The eager door reads the inner answer the eager way: the whole result at
     // once, with no ceiling over it, which is exactly what it promises its
     // callers.
@@ -16498,8 +16804,10 @@ pub(crate) fn resolve_graph_start_nodes_from_filter(
     snapshot: contextdb_core::SnapshotId,
     start_alias: &str,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<GraphStartResolution> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut graph_materialized_columns = expression_columns(std::iter::once(filter));
     if !graph_materialized_columns
         .iter()
@@ -16578,11 +16886,13 @@ pub(crate) fn resolve_graph_start_nodes_with_reader<E>(
         Option<&IndexPick>,
     ) -> std::result::Result<(Vec<uuid::Uuid>, u64), E>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<GraphStartResolution, E>
 where
     E: From<Error>,
 {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]> =
         smallvec::SmallVec::new();
     let mut examined = 0_u64;
@@ -16699,8 +17009,10 @@ fn resolve_graph_start_nodes_from_plan(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<uuid::Uuid>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let result = db.with_snapshot_override(snapshot, || {
         execute_plan(db, plan, params, tx, vector_copy_owner, read_memory.clone())
     })?;
@@ -16728,8 +17040,10 @@ fn resolve_graph_start_ids_from_filter(
     snapshot: contextdb_core::SnapshotId,
     start_alias: &str,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Vec<uuid::Uuid>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     match filter {
         Expr::BinaryOp {
             left,
@@ -16898,14 +17212,16 @@ pub(crate) enum GraphPredicateWork {
 struct GraphValueCache<'a> {
     values: HashMap<(uuid::Uuid, String), Vec<Value>>,
     memory: contextdb_core::read_memory::ReadCredit,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     work: &'a mut dyn FnMut(GraphPredicateWork) -> Result<()>,
 }
 impl<'a> GraphValueCache<'a> {
     fn new(
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         work: &'a mut dyn FnMut(GraphPredicateWork) -> Result<()>,
     ) -> Self {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Self {
             values: HashMap::new(),
             memory: contextdb_core::read_memory::ReadCredit::new(read_memory.clone()),
@@ -16923,8 +17239,10 @@ fn graph_filter_matches_bindings(
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     graph_filter_matches_bindings_with_work(
         db,
         filter,
@@ -16947,8 +17265,10 @@ fn graph_filter_matches_bindings_with_work(
     bindings: &HashMap<String, uuid::Uuid>,
     work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut cache = GraphValueCache::new(read_memory.clone(), work);
     Ok(graph_eval_bool_expr(
         db,
@@ -16972,8 +17292,10 @@ fn graph_eval_bool_expr(
     bindings: &HashMap<String, uuid::Uuid>,
     cache: &mut GraphValueCache<'_>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<bool>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     (cache.work)(GraphPredicateWork::Checkpoint)?;
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
@@ -17210,8 +17532,10 @@ fn graph_eval_values(
     bindings: &HashMap<String, uuid::Uuid>,
     cache: &mut GraphValueCache<'_>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<Value>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     (cache.work)(GraphPredicateWork::Checkpoint)?;
     match expr {
         Expr::RowNumber(_) | Expr::WindowRank(_) => Err(Error::WindowFunctionNotSupported {
@@ -17342,8 +17666,10 @@ fn graph_column_values(
     bindings: &HashMap<String, uuid::Uuid>,
     cache: &mut GraphValueCache<'_>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<Value>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if let Some(alias) = column.table.as_ref() {
         let Some(node) = bindings.get(alias) else {
             return Ok(vec![Value::Null]);
@@ -17396,8 +17722,10 @@ fn graph_node_column_values(
     snapshot: contextdb_core::SnapshotId,
     cache: &mut GraphValueCache<'_>,
 
-    _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<Value>> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
     if column == "id" {
         return Ok(vec![Value::Uuid(node)]);
     }
@@ -17709,8 +18037,10 @@ fn resolve_query_vector_from_expr(
     tx: Option<TxId>,
     snapshot: SnapshotId,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(Vec<f32>, Option<contextdb_core::VectorIndexRef>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     match expr {
         Expr::RowVectorSource { table, column, key } => {
             let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
@@ -17738,8 +18068,10 @@ fn resolve_row_vector_source(
     tx: Option<TxId>,
     snapshot: SnapshotId,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<f32>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let meta = db
         .table_meta(&index.table)
         .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
@@ -21637,7 +21969,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         lsn: Lsn,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<Vec<f32>>> {
         self.store.load_row_vector_for_column(
             tx,
@@ -21664,7 +21996,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
         self.store.bounded_score_committed_vector_row(
             index,
@@ -21687,7 +22019,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn delivery_metadata(
         &self,
         request: crate::direct_file_reader::DirectMetadataRequest,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
         self.store.delivery_metadata(request, read_memory)
     }
@@ -21695,7 +22027,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn committed_change_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &Arc<crate::read_image_memory::ImageMemory>,
+        charge: &crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectChangeState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -21706,7 +22038,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn committed_sync_state(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        charge: &Arc<crate::read_image_memory::ImageMemory>,
+        charge: &crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectSyncState,
         crate::direct_file_reader::DirectFileReaderError,
@@ -21716,7 +22048,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn content_size_answer(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before_table: &mut dyn FnMut() -> Result<()>,
     ) -> Result<OwnedQueryResult> {
         self.store.content_size_answer(read_memory, before_table)
@@ -21726,7 +22058,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         &self,
         plan: &PhysicalPlan,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<OwnedQueryResult> {
         self.store
             .store_state_answer(plan, vector_copy_owner, read_memory.clone())
@@ -21736,7 +22068,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         &self,
         sql: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<String> {
         self.store
             .explain_plan_without_running_it(sql, vector_copy_owner, read_memory)
@@ -21747,7 +22079,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         sql: &str,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::database::ExplainOutput> {
         self.store
             .explain_output_without_running_it(sql, params, vector_copy_owner, read_memory)
@@ -21773,7 +22105,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         key_value: &Value,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<RowId>> {
         self.store.row_id_for_natural_key_in_tx(
             tx,
@@ -21790,7 +22122,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         parsed: &Statement,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<(Statement, PhysicalPlan)> {
         self.store
             .prepare_bounded_read_plan(parsed, params, vector_copy_owner, read_memory.clone())
@@ -21798,7 +22130,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn declared_read_request_provider(
         &self,
-    ) -> Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider> {
+    ) -> crate::vector_read_memory::ReadRequestProvider {
         self.store.declared_read_request_provider()
     }
 
@@ -21854,7 +22186,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn enter_writer_read(
         &self,
         root: Option<crate::persistence::WriterSnapshotHandle>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Option<crate::database::writer_read::WriterReadScope> {
         self.store.enter_writer_read(root, read_memory)
     }
@@ -21873,7 +22205,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<u64>> {
         self.store.authenticated_relational_index_prefix_count(
             table,
@@ -21889,7 +22221,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
         self.store.bounded_read_snapshot_registration(
             needs_vector_graph,
@@ -21906,7 +22238,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
         self.store.bounded_cursor_snapshot_registration(
             needs_vector_graph,
@@ -21944,7 +22276,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<(), BoundedExecutionError> {
         self.store.bounded_vector_visit_visible_ids(
             index,
@@ -21967,7 +22299,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         self.store.bounded_read_allowed_for_row(
             tx,
@@ -21989,7 +22321,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         snapshot: SnapshotId,
         before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<Error>, BoundedExecutionError> {
         self.store.bounded_read_denial_for_row(
             tx,
@@ -22005,7 +22337,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn vector_read_preflight(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         copies: &mut contextdb_vector::VectorCopyAdmission,
         checkpoint: Option<bounded::ReadOpenContext>,
     ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>> {
@@ -22016,7 +22348,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn preflight_historical_graph(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         self.store
@@ -22028,7 +22360,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         table: &str,
         index: &str,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         before: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<(), BoundedExecutionError> {
         self.store
@@ -22037,7 +22369,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_row_by_identity(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -22060,7 +22392,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn visit_bounded_row_by_identity(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -22084,7 +22416,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_physical_table_row_next(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
@@ -22107,7 +22439,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_exact_index_row_next(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -22137,7 +22469,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn ordered_prefix_snapshot_is_current(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool> {
         self.store
             .ordered_prefix_snapshot_is_current(snapshot, read_memory)
@@ -22145,7 +22477,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_ordered_table_row_next_observed(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         table: &str,
         column: &str,
         direction: contextdb_core::SortDirection,
@@ -22183,7 +22515,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<bool, BoundedExecutionError> {
         self.store.bounded_visit_verified_ordered_identities(
             table,
@@ -22205,7 +22537,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_probe: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_native_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<bool>, BoundedExecutionError> {
         self.store.bounded_verified_index_prefixes_are_empty(
             table,
@@ -22250,7 +22582,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         contextdb_vector::mem::BoundedVectorCandidateGroups,
         BoundedExecutionError,
@@ -22278,7 +22610,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<usize, BoundedExecutionError> {
         self.store.bounded_vector_candidate_k(
             index,
@@ -22319,7 +22651,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<VectorSearchDisclosure> {
         self.store.completed_vector_search_disclosure(
             index,
@@ -22363,7 +22695,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             BoundedExecutionError,
         >,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError> {
         self.store.with_bounded_row_vector(
             index,
@@ -22388,7 +22720,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>
     {
         self.store.bounded_brute_force_vector_cursor(
@@ -22436,7 +22768,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError> {
         self.store.bounded_brute_force_vector_step(
             cursor,
@@ -22469,7 +22801,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         release_retained: &mut dyn FnMut(usize),
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, BoundedExecutionError>>,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
@@ -22495,7 +22827,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_rank_candidate(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         index: &VectorIndexRef,
         sort_key: &str,
         anchor_row_id: RowId,
@@ -22554,7 +22886,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         Option<crate::database::gate::CountedGraphScanEdge>,
         BoundedExecutionError,
@@ -22576,7 +22908,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     fn graph_cursor_read_guard(
         &self,
         tx: Option<TxId>,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<crate::database::GraphCursorReadGuard>, BoundedExecutionError>
     {
         self.store.graph_cursor_read_guard(tx, memory)
@@ -22595,7 +22927,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<Option<crate::database::EngineGraphBfsCursor>, BoundedExecutionError>
     {
         self.store.bounded_graph_bfs_cursor(
@@ -22628,7 +22960,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         visited_cap: Option<usize>,
         tx: Option<TxId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<
         Option<contextdb_graph::mem::BoundedTraversalNode>,
         BoundedExecutionError,
@@ -22658,7 +22990,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         snapshot: SnapshotId,
         ctes: &[Cte],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Expr> {
         self.store.resolve_graph_filter_at_snapshot(
             expr,
@@ -22683,7 +23015,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         snapshot: SnapshotId,
         start_alias: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<GraphStartResolution> {
         self.store.resolve_graph_start_nodes_from_filter(
             filter,
@@ -22705,7 +23037,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         bindings: &HashMap<String, uuid::Uuid>,
         work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool> {
         self.store.graph_filter_matches_bindings_with_work(
             filter,
@@ -22738,12 +23070,12 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
-        (OwnedQueryResult, Vec<u8>, ReadPublicationScope),
+        (OwnedQueryResult, crate::read_contract::EncodedReadBytes, ReadPublicationScope),
         crate::direct_file_reader::DirectFileReaderError,
     > {
         self.store
@@ -22754,7 +23086,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         self: Arc<Self>,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
@@ -22877,7 +23209,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn read_metadata(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         request: crate::direct_file_reader::DirectMetadataRequest,
         image: &crate::direct_file_reader::DirectOwnedImage,
         limits: ReadLimits,
@@ -23024,7 +23356,7 @@ mod tests {
             disclosure
         };
         for result in [&eager, &pull] {
-            let disclosure = result.trace.vector_search.as_ref().unwrap();
+            let disclosure = result.trace.vector_search.as_deref().unwrap();
             assert_eq!(
                 disclosure.route_evidence,
                 VectorSearchRouteEvidence::Executed

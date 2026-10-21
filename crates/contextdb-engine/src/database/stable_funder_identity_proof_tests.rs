@@ -35,7 +35,7 @@ impl DurableRawColumnFactory for Credits {
 }
 struct Prepaid(VectorCopyAdmission);
 impl PrepaidVectorCopyCharge for Prepaid {
-    fn accountant(&self) -> Arc<dyn MemoryBudget> {
+    fn accountant(&self) -> contextdb_vector::MemoryBudgetOwner {
         self.0.funder()
     }
     fn retained_bytes(&self) -> usize {
@@ -45,7 +45,7 @@ impl PrepaidVectorCopyCharge for Prepaid {
         self.0.transfer();
     }
 }
-fn credit(budget: Arc<dyn MemoryBudget>, bytes: usize) -> Arc<VectorCopyAdmission> {
+fn credit(budget: impl Into<contextdb_vector::MemoryBudgetOwner>, bytes: usize) -> Arc<VectorCopyAdmission> {
     let mut credit = VectorCopyAdmission::new(budget);
     credit.reserve(bytes).unwrap();
     Arc::new(credit)
@@ -138,11 +138,13 @@ fn default_funder_identity_preserves_trait_data_address() {
     drop(adapter_b);
     drop(root);
     assert_eq!(first.usage().used, 0);
-    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000);
-    let reader = crate::vector_read_memory::budget(parent.child().unwrap());
+    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000).unwrap();
+    let child = parent.child().unwrap();
+    let child_identity = child.accounting_identity();
+    let reader = crate::vector_read_memory::budget(child);
     assert_eq!(
         reader.stable_funder_identity(),
-        Arc::as_ptr(&reader) as *const () as usize
+        child_identity
     );
     println!(
         "CDB127_DEFAULT_COMPAT raw_accountant=unchanged reader_impl=unchanged clones=equal distinct_objects=distinct"
@@ -197,7 +199,7 @@ fn independent_writer_invocations_keep_caller_credit_and_allocation_dedup() {
     let scores =
         contextdb_vector::mem::SearchScores::new(&VectorIndexRef::new("proof", "v"), first.clone())
             .unwrap();
-    let (rows, charge) = scores.into_prepaid(&second).unwrap();
+    let (rows, charge) = scores.into_prepaid(&second.clone().into()).unwrap();
     let prepaid_scores = VectorCopyAdmission::from_prepaid(second.clone(), charge).unwrap();
     drop(rows);
     drop(prepaid_scores);
@@ -215,7 +217,7 @@ fn independent_writer_invocations_keep_caller_credit_and_allocation_dedup() {
         )
         .unwrap();
     drop(scores);
-    let (trace, charge) = trace.into_prepaid(&second).unwrap();
+    let (trace, charge) = trace.into_prepaid(&second.clone().into()).unwrap();
     let trace_prepaid = VectorCopyAdmission::from_prepaid(second.clone(), charge).unwrap();
     drop(trace);
     drop(trace_prepaid);
@@ -309,7 +311,7 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     let scores =
         contextdb_vector::mem::SearchScores::new(&VectorIndexRef::new("proof", "v"), a.clone())
             .unwrap();
-    assert!(scores.into_prepaid(&b).is_err());
+    assert!(scores.into_prepaid(&b.clone().into()).is_err());
     assert_eq!(first.usage().used, first_baseline + 13);
     let (scores, trace) = db
         .vector
@@ -324,7 +326,7 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
         )
         .unwrap();
     drop(scores);
-    assert!(trace.into_prepaid(&b).is_err());
+    assert!(trace.into_prepaid(&b.clone().into()).is_err());
     assert_eq!(first.usage().used, first_baseline + 13);
     let payload = mixed_payload_owners(a.clone(), b.clone());
     assert!(
@@ -338,7 +340,7 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     drop(payload);
     assert_eq!(first.usage().used, first_baseline + 13);
     assert_eq!(second.usage().used, second_baseline + 29);
-    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000);
+    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000).unwrap();
     let reader_a = crate::vector_read_memory::budget(parent.child().unwrap());
     let reader_b = crate::vector_read_memory::budget(parent.child().unwrap());
     let controls = parent.retained_bytes_for_test();
@@ -406,10 +408,10 @@ fn embedded_graph_reader_scratch_rows() {
         }
     }
     struct ReaderSpy {
-        inner: Arc<dyn MemoryBudget>,
+        inner: contextdb_vector::MemoryBudgetOwner,
         child: DeclaredReadChildObserver,
         sibling: DeclaredReadChildObserver,
-        parent: Arc<DeclaredReadMemory>,
+        parent: crate::vector_read_memory::DeclaredReadRoot,
         graph_calls: AtomicUsize,
         debit: AtomicUsize,
         refund: AtomicUsize,
@@ -517,7 +519,8 @@ fn embedded_graph_reader_scratch_rows() {
         (contextdb_core::VectorSearchMode::Exact, 0),
     ] {
         let expected = if mode == contextdb_core::VectorSearchMode::Exact { &exact_control } else { &control };
-        let parent = DeclaredReadMemory::from_reader_limit(8 * 1024 * 1024);
+        let parent = DeclaredReadMemory::from_reader_limit(8 * 1024 * 1024).unwrap();
+        let root_baseline = parent.retained_bytes_for_test();
         let child = parent.child().unwrap();
         let sibling = parent.child().unwrap();
         let observer = declared_child_observer(&child).unwrap();
@@ -594,7 +597,7 @@ fn embedded_graph_reader_scratch_rows() {
         assert_eq!(db.accountant.usage().used, writer, "reader neither debits nor refunds writer");
         drop(physical_bodies);
         drop(spy); drop(child); drop(sibling);
-        assert_eq!(parent.retained_bytes_for_test(), 0, "operation controls also retire");
+        assert_eq!(parent.retained_bytes_for_test(), root_baseline, "operation controls also retire");
     }
     assert!(successful_graph_calls >= 3);
     }

@@ -13,7 +13,7 @@ const HINT: &str = "Raise the declared reader memory limit to read graph pages."
 #[derive(Clone)]
 pub(crate) enum CapturedGraphReadRoot<R> {
     Writer(R),
-    Image(Arc<RetainedReadSource>),
+    Image(RetainedReadSource),
 }
 pub(crate) type GraphReadRoot = CapturedGraphReadRoot<Arc<WriterSnapshot>>;
 pub(crate) type EngineGraphReadRoot = CapturedGraphReadRoot<WriterSnapshotHandle>;
@@ -29,8 +29,10 @@ where R: Clone + Into<WriterSnapshotHandle> + std::ops::Deref<Target = WriterSna
     pub(crate) fn snapshot(
         &self,
         snapshot: SnapshotId,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Arc<dyn GraphSnapshot>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         match self {
             Self::Writer(root) => {
                 let root: WriterSnapshotHandle = root.clone().into();
@@ -65,8 +67,10 @@ where R: Clone + Into<WriterSnapshotHandle> + std::ops::Deref<Target = WriterSna
         reverse: bool,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<GraphReadCursor> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         self.cursor_lane(reverse, false, lower, upper, memory)
     }
     pub(crate) fn cursor_lane(
@@ -75,8 +79,10 @@ where R: Clone + Into<WriterSnapshotHandle> + std::ops::Deref<Target = WriterSna
         row_owned: bool,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<GraphReadCursor> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         with_pages(memory.clone(), || {
             let _credit =
                 ReadCredit::try_new(memory.clone(), 130, "reader", "graph_root_binding", HINT)?;
@@ -203,12 +209,12 @@ impl GraphReadWindow {
     }
 }
 
-pub(crate) struct RetainedGraphSource(pub(crate) Arc<RetainedReadSource>);
+pub(crate) struct RetainedGraphSource(pub(crate) RetainedReadSource);
 impl GraphReadSource for RetainedGraphSource {
     fn capture(
         &self,
         snapshot: SnapshotId,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Arc<dyn GraphSnapshot>> {
         if snapshot.0 > self.0.logical_frontier.0 {
             return Err(Error::Other(
@@ -225,14 +231,14 @@ impl GraphReadSource for RetainedGraphSource {
         let control = credit(memory.clone(), std::mem::size_of::<RetainedGraphSnapshot>())?;
         Ok(Arc::new(RetainedGraphSnapshot {
             source: self.0.clone(),
-            memory,
+            memory: memory.into(),
             _control: control,
         }))
     }
 }
 struct RetainedGraphSnapshot {
-    source: Arc<RetainedReadSource>,
-    memory: Arc<dyn ReadMemoryBudget>,
+    source: RetainedReadSource,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
     _control: ReadCredit,
 }
 impl GraphSnapshot for RetainedGraphSnapshot {
@@ -395,7 +401,9 @@ struct Key {
     _credit: ReadCredit,
 }
 impl Key {
-    fn new(bytes: &[u8], memory: Arc<dyn ReadMemoryBudget>) -> Result<Self> {
+    fn new(bytes: &[u8], memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let credit = credit(memory, bytes.len())?;
         Ok(Self {
             bytes: Box::from(bytes),
@@ -403,12 +411,16 @@ impl Key {
         })
     }
 }
-fn credit(memory: Arc<dyn ReadMemoryBudget>, bytes: usize) -> Result<ReadCredit> {
+fn credit(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, bytes: usize) -> Result<ReadCredit> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     ReadCredit::try_new(memory, bytes, "graph_source", "read_window", HINT)
 }
 /// Admission for any stored page a persistence read faults in, graph or not.
 /// It names the budget that funds the read, not a graph window.
-fn page_credit(memory: Arc<dyn ReadMemoryBudget>, bytes: usize) -> Result<ReadCredit> {
+fn page_credit(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, bytes: usize) -> Result<ReadCredit> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     ReadCredit::try_new(
         memory,
         bytes,
@@ -417,7 +429,9 @@ fn page_credit(memory: Arc<dyn ReadMemoryBudget>, bytes: usize) -> Result<ReadCr
         "Raise the memory limit that funds this read to read its stored pages.",
     )
 }
-fn owned_bound(bound: Bound<&[u8]>, memory: Arc<dyn ReadMemoryBudget>) -> Result<Bound<Key>> {
+fn owned_bound(bound: Bound<&[u8]>, memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Bound<Key>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     Ok(match bound {
         Bound::Included(key) => Bound::Included(Key::new(key, memory)?),
         Bound::Excluded(key) => Bound::Excluded(Key::new(key, memory)?),
@@ -433,33 +447,37 @@ fn borrowed_bound(bound: &Bound<Key>) -> Bound<&[u8]> {
 }
 pub(crate) struct RetainedGraphCursor {
     row_owned: bool,
-    source: Arc<RetainedReadSource>,
+    source: RetainedReadSource,
     reverse: bool,
     lower: Bound<Key>,
     upper: Bound<Key>,
     after: Option<Key>,
     finished: bool,
-    memory: Arc<dyn ReadMemoryBudget>,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
     _control: ReadCredit,
 }
 impl RetainedGraphCursor {
     fn new(
-        source: Arc<RetainedReadSource>,
+        source: RetainedReadSource,
         reverse: bool,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         Self::new_lane(source, reverse, false, lower, upper, memory)
     }
     fn new_lane(
-        source: Arc<RetainedReadSource>,
+        source: RetainedReadSource,
         reverse: bool,
         row_owned: bool,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         with_pages(memory.clone(), || {
             let _binding = credit(memory.clone(), 130)?;
             source.with_read(|read| {
@@ -527,7 +545,7 @@ impl RetainedGraphCursor {
                             .content_identity_corruption("graph projection table missing"));
                     }
                     Err(error) => {
-                        return Err(diagnosis(self.source.as_ref(), read_table_error(error)));
+                        return Err(diagnosis(&self.source, read_table_error(error)));
                     }
                 };
                 #[cfg(any(test, feature = "test-seams"))]
@@ -540,11 +558,11 @@ impl RetainedGraphCursor {
                 );
                 let mut range = table
                     .range::<&[u8]>((lower, upper))
-                    .map_err(|error| diagnosis(self.source.as_ref(), read_storage_error(error)))?;
+                    .map_err(|error| diagnosis(&self.source, read_storage_error(error)))?;
                 let Some((key, value)) = range
                     .next()
                     .transpose()
-                    .map_err(|error| diagnosis(self.source.as_ref(), read_storage_error(error)))?
+                    .map_err(|error| diagnosis(&self.source, read_storage_error(error)))?
                 else {
                     return Ok(None);
                 };
@@ -589,11 +607,11 @@ impl RetainedGraphCursor {
                                 super::row_graph::REVERSE
                             })
                             .map_err(read_table_error)
-                            .map_err(|e| diagnosis(self.source.as_ref(), e))?;
+                            .map_err(|e| diagnosis(&self.source, e))?;
                         let matching = peer
                             .get(peer_key.as_slice())
                             .map_err(read_storage_error)
-                            .map_err(|e| diagnosis(self.source.as_ref(), e))?
+                            .map_err(|e| diagnosis(&self.source, e))?
                             .is_some_and(|v| v.value() == value.value());
                         if !matching {
                             return Err(self.source.content_identity_corruption(
@@ -603,7 +621,7 @@ impl RetainedGraphCursor {
                         Ok((owned.entry, Some(owned.owner)))
                     } else {
                         let edge = decode_edge(
-                            self.source.as_ref(),
+                            &self.source,
                             key.value(),
                             value.value(),
                             self.reverse,
@@ -667,7 +685,7 @@ pub(crate) struct RetainedGraphWindow {
     edge: AdjEntry,
     position: Box<[u8]>,
     _position_credit: ReadCredit,
-    _memory: Arc<crate::read_image_memory::ImageMemory>,
+    _memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl GraphEdgeWindow for RetainedGraphWindow {
     fn row_owner(&self) -> Option<&contextdb_tx::RowEdgeOwner> {
@@ -679,20 +697,29 @@ impl GraphEdgeWindow for RetainedGraphWindow {
 }
 
 trait GraphDiagnosis {
-    fn corruption(&self, reason: String) -> Error;
+    fn prepare_corruption(&self, owner: contextdb_core::read_memory::ReadMemoryOwner)
+        -> Result<PreparedGraphDiagnostic>;
     fn diagnose(&self, error: LoadReadImageError) -> Error;
 }
 impl GraphDiagnosis for RetainedReadSource {
-    fn corruption(&self, reason: String) -> Error {
-        self.content_identity_corruption(reason)
+    fn prepare_corruption(&self, owner: contextdb_core::read_memory::ReadMemoryOwner)
+        -> Result<PreparedGraphDiagnostic> {
+        use contextdb_core::error::DiagnosticText;
+        let path = DiagnosticText::try_format(owner.clone(), self.database_path.display(),
+            "graph", "diagnostic_path", "Raise reader memory to retain the graph diagnosis.")?;
+        PreparedGraphDiagnostic::new(owner, path, true)
     }
     fn diagnose(&self, error: LoadReadImageError) -> Error {
         image_diagnosis(self, error)
     }
 }
 impl GraphDiagnosis for GraphProofContext<'_> {
-    fn corruption(&self, reason: String) -> Error {
-        self.content_identity_corruption(reason)
+    fn prepare_corruption(&self, owner: contextdb_core::read_memory::ReadMemoryOwner)
+        -> Result<PreparedGraphDiagnostic> {
+        match self.image {
+            Some(source) => source.prepare_corruption(owner),
+            None => PreparedGraphDiagnostic::new(owner, "graph history".into(), false),
+        }
     }
     fn diagnose(&self, error: LoadReadImageError) -> Error {
         match self.image {
@@ -701,14 +728,43 @@ impl GraphDiagnosis for GraphProofContext<'_> {
         }
     }
 }
+struct PreparedGraphDiagnostic {
+    path: contextdb_core::error::DiagnosticText,
+    reason: contextdb_core::read_memory::ReadPrepared<GraphDiagnosticReason>,
+    prefixed: bool,
+}
+struct GraphDiagnosticReason {
+    reason: contextdb_core::error::DiagnosticText,
+    prefixed: bool,
+}
+impl std::fmt::Display for GraphDiagnosticReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.prefixed {
+            f.write_str("loaded content does not authenticate against the committed image root: ")?;
+        }
+        std::fmt::Display::fmt(&self.reason, f)
+    }
+}
+impl PreparedGraphDiagnostic {
+    fn new(owner: contextdb_core::read_memory::ReadMemoryOwner,
+        path: contextdb_core::error::DiagnosticText, prefixed: bool) -> Result<Self> {
+        let reason = contextdb_core::error::DiagnosticText::try_prepare_shared(owner,
+            "graph", "diagnostic_reason", "Raise reader memory to retain the graph diagnosis.")?;
+        Ok(Self { path, reason, prefixed })
+    }
+    fn corruption(self, reason: contextdb_core::error::DiagnosticText) -> Error {
+        Error::StoreCorrupted {
+            path: self.path,
+            reason: contextdb_core::error::DiagnosticText::from_shared(self.reason.publish(
+                GraphDiagnosticReason { reason, prefixed: self.prefixed })),
+        }
+    }
+}
 fn diagnosis(source: &(impl GraphDiagnosis + ?Sized), error: LoadReadImageError) -> Error {
     source.diagnose(error)
 }
 pub(super) fn image_diagnosis(source: &RetainedReadSource, error: LoadReadImageError) -> Error {
-    crate::database::ImageHistoryError::Store {
-        path: source.database_path.display().to_string(),
-        diagnosis: Box::new(error),
-    }
+    crate::database::ImageHistoryError::store(source.read_memory.clone(), source.database_path.display(), error)
     .into_engine_error()
 }
 fn decode_edge(
@@ -718,11 +774,13 @@ fn decode_edge(
     reverse: bool,
 ) -> Result<AdjEntry> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+    let owner = crate::read_image_memory::active_owner()?.diagnostic_budget()?;
+    let mut diagnostic = Some(source.prepare_corruption(owner)?);
     #[cfg(any(test, feature = "test-seams"))]
     crate::read_work_probe::note_graph("graph_payload", "payload_decode", key, None, None);
     let (edge, consumed): (AdjEntry, usize) =
         crate::read_image_memory::decode(bytes).map_err(|error| match error {
-            Error::Other(reason) => source.corruption(reason.into_owned()),
+            Error::Other(reason) => diagnostic.take().expect("one graph decode diagnosis").corruption(reason),
             other => other,
         })?;
     if consumed != bytes.len() {
@@ -733,7 +791,8 @@ fn decode_edge(
     }
     let expected_len = 49usize
         .checked_add(edge.edge_type.len())
-        .ok_or_else(|| source.corruption("graph key length overflow".into()))?;
+        .ok_or_else(|| diagnostic.take().expect("one graph key diagnosis")
+            .corruption("graph key length overflow".into()))?;
     let (first, second) = if reverse {
         (edge.target, edge.source)
     } else {
@@ -812,8 +871,10 @@ fn same_edge(left: &AdjEntry, right: &AdjEntry) -> bool {
 impl RetainedReadSource {
     fn graph_window_memory(
         &self,
-        memory: Arc<dyn ReadMemoryBudget>,
-    ) -> Arc<crate::read_image_memory::ImageMemory> {
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> crate::read_image_memory::ImageMemoryHandle {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         crate::read_image_memory::ImageMemory::charging_reader_for(
             self._source_memory.memory.accountant.clone(),
             memory,
@@ -829,8 +890,10 @@ impl RetainedReadSource {
         raw: &[u8],
         edge: &AdjEntry,
         reverse: bool,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         GraphProofContext::image(self, memory.clone())
             .verify_graph_edge_proof(read, key, raw, edge, reverse, memory)
@@ -839,8 +902,10 @@ impl RetainedReadSource {
         &self,
         key: &str,
         bytes: &[u8],
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         self.with_read(|read| self.verify_stored_graph_history_in_read(read, key, bytes, memory))
     }
@@ -849,8 +914,10 @@ impl RetainedReadSource {
         read: &redb::ReadTransaction,
         key: &str,
         bytes: &[u8],
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let scratch = self.graph_window_memory(memory.clone());
         with_pages(memory.clone(), || {
             scratch.scope(|| {
@@ -863,10 +930,10 @@ impl RetainedReadSource {
 
 pub(super) struct GraphProofContext<'a> {
     image: Option<&'a RetainedReadSource>,
-    proof_memory: Arc<dyn ReadMemoryBudget>,
+    proof_memory: contextdb_core::read_memory::ReadMemoryOwner,
     creation_reuse_eligible: bool,
     verifier: Option<&'a content_identity::ContentIdentityReadVerifier>,
-    scratch: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    scratch: Option<crate::read_image_memory::ImageMemoryHandle>,
     logical_frontier: SnapshotId,
     graph_lsn_frontier: Lsn,
     graph_retirement_frontier: u64,
@@ -881,7 +948,9 @@ struct VerifiedGraphCreation<'a> {
     _credit: ReadCredit,
 }
 impl<'a> GraphProofContext<'a> {
-    fn image(source: &'a RetainedReadSource, memory: Arc<dyn ReadMemoryBudget>) -> Self {
+    fn image(source: &'a RetainedReadSource, memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         Self {
             image: Some(source),
             proof_memory: memory,
@@ -898,10 +967,7 @@ impl<'a> GraphProofContext<'a> {
     fn content_identity_corruption(&self, reason: impl std::fmt::Display) -> Error {
         match self.image {
             Some(source) => source.content_identity_corruption(reason),
-            None => Error::StoreCorrupted {
-                path: "graph history".into(),
-                reason: reason.to_string(),
-            },
+            None => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), "graph history", reason),
         }
     }
     fn authenticate_mutation(
@@ -920,8 +986,10 @@ impl<'a> GraphProofContext<'a> {
     }
     fn graph_window_memory(
         &self,
-        memory: Arc<dyn ReadMemoryBudget>,
-    ) -> Arc<crate::read_image_memory::ImageMemory> {
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> crate::read_image_memory::ImageMemoryHandle {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         match self.image {
             Some(source) => source.graph_window_memory(memory),
             None => self
@@ -936,8 +1004,10 @@ impl<'a> GraphProofContext<'a> {
         read: &redb::ReadTransaction,
         edge: &AdjEntry,
         reverse: bool,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<[u8; 32]>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let mismatch = || {
             diagnosis(
                 self,
@@ -1150,9 +1220,11 @@ impl<'a> GraphProofContext<'a> {
         &self,
         read: &redb::ReadTransaction,
         a: Lsn,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         verified_creation: Option<&VerifiedGraphCreation<'_>>,
     ) -> Result<TxId> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let owner = writer_source::SourceWindowOwner::Read(memory.clone());
         let prefix = owner.endpoint(&[&[1], &a.0.to_be_bytes()], "graph_maximum")?;
         let end = owner.prefix_end(&prefix.key, "graph_maximum")?;
@@ -1328,8 +1400,10 @@ impl<'a> GraphProofContext<'a> {
         raw: &[u8],
         edge: &AdjEntry,
         reverse: bool,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         self.verify_graph_creation(edge)?;
         let counterpart_digest =
@@ -1384,8 +1458,10 @@ impl<'a> GraphProofContext<'a> {
         read: &redb::ReadTransaction,
         key: &str,
         bytes: &[u8],
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         #[cfg(any(test, feature = "test-seams"))]
         {
@@ -1514,17 +1590,21 @@ impl<'a> GraphProofContext<'a> {
 }
 
 pub(super) fn with_pages<T>(
-    memory: Arc<dyn ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     read: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     with_pages_result(memory, read, |error| error)
 }
 
 pub(super) fn with_pages_result<T, E>(
-    memory: Arc<dyn ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     read: impl FnOnce() -> std::result::Result<T, E>,
     refusal_error: impl FnOnce(Error) -> E,
 ) -> std::result::Result<T, E> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     // These shared controls belong to this executing reader, including the
     // closure's exact Arc allocation. Keep their credit outside both Arcs so
     // the allocations are freed before their funding returns.
@@ -1584,7 +1664,7 @@ impl WriterSnapshot {
         verify: impl FnOnce(
             &GraphProofContext<'_>,
             &redb::ReadTransaction,
-            Arc<dyn ReadMemoryBudget>,
+            contextdb_core::read_memory::ReadMemoryOwner,
         ) -> Result<T>,
     ) -> Result<T> {
         let read = self.owner_read()?;
@@ -1626,19 +1706,19 @@ pub(super) fn with_graph_proof_in_read<T>(
     read: &redb::ReadTransaction,
     logical_frontier: Option<SnapshotId>,
     owner: &writer_source::SourceWindowOwner,
-    scratch: Arc<crate::read_image_memory::ImageMemory>,
+    scratch: crate::read_image_memory::ImageMemoryHandle,
     verify: impl FnOnce(
         &GraphProofContext<'_>,
         &redb::ReadTransaction,
-        Arc<dyn ReadMemoryBudget>,
+        contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<T>,
 ) -> Result<T> {
     #[cfg(any(test, feature = "test-seams"))]
     crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
-    let memory: Arc<dyn ReadMemoryBudget> = match owner {
+    let memory: contextdb_core::read_memory::ReadMemoryOwner = match owner {
         writer_source::SourceWindowOwner::Read(memory) => memory.clone(),
         writer_source::SourceWindowOwner::Write(memory, original_use) => {
-            memory.read_budget_for_original(original_use.clone())?
+            memory.read_budget_for_original(original_use.clone())?.into()
         }
     };
     with_pages(memory.clone(), || {
@@ -1659,7 +1739,7 @@ pub(super) fn with_graph_proof_in_read<T>(
             )?;
             let context = GraphProofContext {
                 image: None,
-                proof_memory: memory.clone(),
+                proof_memory: (memory.clone()).into(),
                 creation_reuse_eligible: matches!(owner, writer_source::SourceWindowOwner::Read(_)),
                 verifier: Some(&verifier),
                 scratch: Some(scratch.clone()),

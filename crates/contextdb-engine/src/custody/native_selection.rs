@@ -33,6 +33,8 @@ impl From<NativeConfigFailure> for Failure {
             NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)) => {
                 Self::Unqualified(e)
             }
+            NativeConfigFailure::Storage(NativeStorageFailure::AllocatorFailed { site, layout }) =>
+                Self::ColdUnqualified(redb::NativeColdReadError::AllocatorFailed { site, layout }),
             NativeConfigFailure::ColdUnqualified(e) => Self::ColdUnqualified(e),
             NativeConfigFailure::InvalidStoredText | NativeConfigFailure::InvalidIncarnation => {
                 Self::Invalid(Invalid::Codec)
@@ -66,9 +68,7 @@ impl<T> NativeSelectionHold<T> {
             Vec::new()
         } else {
             let p = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }.cast::<T>())
-                .ok_or(Failure::Refused(NativeRefusal::Other(
-                    "custody selection allocation failed",
-                )))?;
+                .ok_or(Failure::Refused(NativeRefusal::AllocatorFailed { site: "custody selection", layout }))?;
             // The exact array is prepaid; only the empty initialized prefix is
             // adopted. retain never grows or reallocates the fixed capacity.
             unsafe { Vec::from_raw_parts(p.as_ptr(), 0, slots) }
@@ -122,7 +122,7 @@ impl NativeBuffer {
             Vec::new()
         } else {
             let p = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }).ok_or(
-                Failure::Refused(NativeRefusal::Other("custody buffer allocation failed")),
+                Failure::Refused(NativeRefusal::AllocatorFailed { site: "custody buffer", layout }),
             )?;
             unsafe {
                 std::ptr::write_bytes(p.as_ptr(), 0, len);

@@ -111,6 +111,18 @@ pub(super) fn paged_build_hooks(
     let closed = Arc::clone(resource_closed);
     let interrupted = Arc::clone(publication_interrupted);
     let gate_manager = tx_mgr.downgrade();
+    #[cfg(any(test, feature = "test-seams"))]
+    let insertion_pause = {
+        let vector = Arc::downgrade(_vector);
+        let partition = _partition.clone();
+        // A restored builder can be armed after open. Resolve the existing
+        // pause at insertion time rather than freezing its state at registration.
+        Arc::new(move |done| {
+            if let Some(vector) = vector.upgrade() {
+                vector.maybe_pause_paged_build_insertion_for_test(&partition, done);
+            }
+        })
+    };
     Ok(PagedBuildHooks {
         checkpoint: Arc::new(move || {
             if interrupted.load(Ordering::SeqCst) {
@@ -121,9 +133,11 @@ pub(super) fn paged_build_hooks(
             }
             Ok(())
         }),
-        // A failed batch rolls back its inserted points. Report only the
-        // committed restart record in advance_paged_vector_build, so a retry
-        // cannot make this build's reported completed count move backward.
+        // Only an armed existing test pause observes unfinished identities.
+        // Durable progress remains at the preceding complete batch until commit.
+        #[cfg(any(test, feature = "test-seams"))]
+        inserted: insertion_pause,
+        #[cfg(not(any(test, feature = "test-seams")))]
         inserted: Arc::new(|_| {}),
         gate: Arc::new(move |work| {
             let manager = gate_manager
@@ -428,8 +442,8 @@ impl MaintenanceContext {
         // Metadata only, under an admitted route workspace. A native base
         // stays native regardless of a small reader's per-request limit:
         // it is never repeatedly rebuilt for whole-graph serving feasibility.
-        let _metadata = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        let _metadata = self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             vector_route_metadata_workspace(partition)?.max(64 * 1024),
             "prepare_vector_generation",
             "Raise MEMORY_LIMIT before inspecting generation format.",
@@ -465,9 +479,11 @@ impl MaintenanceContext {
         &self,
         partition: &VectorPartitionRef,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         force_paged: bool,
     ) -> Result<Option<VectorPartitionPublicationOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.advance_paged_vector_build_bounded(
             partition,
             copy_owner,
@@ -485,9 +501,11 @@ impl MaintenanceContext {
         &self,
         partition: &VectorPartitionRef,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         target: (TxId, Lsn),
     ) -> Result<Option<VectorPartitionPublicationOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.advance_paged_vector_build_bounded(
             partition,
             copy_owner,
@@ -501,10 +519,12 @@ impl MaintenanceContext {
         &self,
         partition: &VectorPartitionRef,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         force_paged: bool,
         target: Option<(TxId, Lsn)>,
     ) -> Result<Option<VectorPartitionPublicationOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(None);
         };
@@ -524,8 +544,8 @@ impl MaintenanceContext {
                 .saturating_add(partition.index.column.len())
                 .saturating_add(1024)
                 .saturating_mul(64);
-            let _inventory = self.vector.reserve_workspace(
-                Arc::clone(&self.finalization.vector_accountant),
+            let _inventory = self.vector.reserve_workspace_static(
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 inventory_bytes,
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT before inspecting this maintained route.",
@@ -578,8 +598,8 @@ impl MaintenanceContext {
                 .unwrap_or(0);
             let declaration = declaration_for(&layout, &layout.resolve_policy(live.max(1), 1))?;
             let batch = paged_batch_plan(&declaration)?.construction_workspace_bytes()?;
-            drop(self.vector.reserve_workspace(
-                Arc::clone(&self.finalization.vector_accountant),
+            drop(self.vector.reserve_workspace_static(
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 batch,
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before compacting this maintained route.",
@@ -1227,11 +1247,13 @@ impl MaintenanceContext {
         workspace: &mut contextdb_vector::VectorWorkspaceReservation,
         workspace_plan: VectorGenerationWorkspacePlan,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<VectorPartitionPublicationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let declaration = declaration_for(layout, &policy)?;
         let plan = paged_batch_plan(&declaration)?;
-        workspace.resize(
+        workspace.resize_static(
             workspace_plan.resident_export_phase_bytes(plan.workspace_bytes()?),
             "prepare_vector_generation",
             "Free writer memory before exporting this graph.",
@@ -1334,7 +1356,7 @@ impl MaintenanceContext {
         drop(native);
         // There is no complete graph left while serving controls and candidate
         // copies are prepared. Keep metadata admitted until registration ends.
-        workspace.resize(
+        workspace.resize_static(
             workspace_plan
                 .durable_metadata_bytes
                 .saturating_add(64 * 1024),
@@ -1372,13 +1394,15 @@ impl MaintenanceContext {
         record: &PagedBuildRecord,
         progress: &PagedVectorProgress,
         plan: PagedVectorBatchPlan,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<VectorPartitionPublicationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let metadata_bytes = vector_route_metadata_workspace(partition)?
             .saturating_mul(8)
             .saturating_add(64 * 1024);
-        let mut candidate_workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        let mut candidate_workspace = self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             metadata_bytes,
             "prepare_vector_generation",
             "Free writer memory before preparing paged publication metadata.",
@@ -1439,14 +1463,14 @@ impl MaintenanceContext {
         let prepared = persistence.prepare_vector_partition_generation_candidate_with_admission(
             &candidate,
             |scan_bytes| {
-                candidate_workspace.resize(
+                candidate_workspace.resize_static(
                     metadata_bytes.saturating_add(scan_bytes),
                     "prepare_vector_generation",
                     "Free writer memory before preparing paged publication metadata.",
                 )
             },
         )?;
-        candidate_workspace.resize(
+        candidate_workspace.resize_static(
             metadata_bytes.saturating_add(prepared.stale_metadata_bytes()),
             "prepare_vector_generation",
             "Free writer memory before publishing paged metadata.",
@@ -1527,8 +1551,8 @@ impl MaintenanceContext {
         }
         let published_catalog = candidate.catalog;
         drop(candidate.base);
-        let mut workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        let mut workspace = self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             RedbPersistence::maintenance_vector_catalog_heap_bytes(&published_catalog),
             "truncate_vector_partition_journal",
             "Raise MEMORY_LIMIT before cleaning this maintained route.",
@@ -1615,8 +1639,8 @@ impl MaintenanceContext {
             || persistence.has_vector_repair_fence(),
         )?;
         let audit_scratch = if has_fence { 256 * 1024 } else { 0 };
-        let mut workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        let mut workspace = self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             audit_scratch,
             "reclaim_paged_vector_generation",
             "Free writer memory before reclaiming retired vector pages.",
@@ -1637,7 +1661,7 @@ impl MaintenanceContext {
                         if persistence.has_paged_cleanup()? {
                             publication.reserve()?;
                             persistence.paged_cleanup_step(PAGED_CLEANUP_KEYS, |bytes| {
-                        workspace.resize(audit_scratch + bytes, "reclaim_paged_vector_generation",
+                        workspace.resize_static(audit_scratch + bytes, "reclaim_paged_vector_generation",
                             "Free writer memory before reclaiming retired vector pages.")
                     }, || self.build_checkpoint())?;
                             publication.complete();

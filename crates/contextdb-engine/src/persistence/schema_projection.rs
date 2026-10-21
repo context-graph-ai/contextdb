@@ -19,10 +19,7 @@ impl ReceivedRetirementLog {
         table: TableDefinition<'static,u64,&'static [u8]>) -> Result<Self> {
         let source = write.open_table(table).map_err(RedbPersistence::storage_error)?;
         if !source.is_empty().map_err(RedbPersistence::storage_error)? {
-            return Err(Error::StoreCorrupted {
-                path: persistence.path.display().to_string(),
-                reason: "unpublished schema retirement log survived a transaction".into(),
-            });
+            return Err(crate::funded_error::corruption_text(persistence.require_decode_original().and_then(|original| original.read_budget()), persistence.path.display(), "unpublished schema retirement log survived a transaction".into()));
         }
         Ok(Self { next: 0, table })
     }
@@ -58,19 +55,13 @@ impl ReceivedRetirementLog {
             let (family, logical_key, logical_value, row_head): EncodedRetirement = row_memory.scope(|| {
                 let source = write.open_table(self.table).map_err(RedbPersistence::storage_error)?;
                 let encoded = source.get(ordinal).map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::StoreCorrupted {
-                        path: persistence.path.display().to_string(),
-                        reason: "schema retirement log lost a mutation".into(),
-                    })?;
+                    .ok_or_else(|| crate::funded_error::corruption_text(persistence.require_decode_original().and_then(|original| original.read_budget()), persistence.path.display(), "schema retirement log lost a mutation".into()))?;
                 window.admit(encoded.value().len().saturating_mul(8).saturating_add(1024))?;
                 RedbPersistence::decode_config_value_exact(encoded.value())
             })?;
             let family = content_identity::LogicalFamily::ALL.into_iter()
                 .find(|candidate| *candidate as u8 == family)
-                .ok_or_else(|| Error::StoreCorrupted {
-                    path: persistence.path.display().to_string(),
-                    reason: "schema retirement log has an invalid family".into(),
-                })?;
+                .ok_or_else(|| crate::funded_error::corruption_text(persistence.require_decode_original().and_then(|original| original.read_budget()), persistence.path.display(), "schema retirement log has an invalid family".into()))?;
             let mutation = content_identity::ContentIdentityMutation {
                 family, logical_key, logical_value, row_head,
             };
@@ -271,11 +262,11 @@ impl ReceivedSchemaRecordStream {
         if offset != limit { return Err(Self::io(std::io::ErrorKind::InvalidData.into())); }
         Ok(())
     }
-    pub(super) fn visit<T: serde::de::DeserializeOwned>(&self, memory: &Arc<crate::read_image_memory::ImageMemory>,
+    pub(super) fn visit<T: serde::de::DeserializeOwned>(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         self.visit_range(memory, (0,self.end,self.count), visit)
     }
-    fn visit_range<T: serde::de::DeserializeOwned>(&self, memory: &Arc<crate::read_image_memory::ImageMemory>,
+    fn visit_range<T: serde::de::DeserializeOwned>(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         range: (u64,u64,u64), mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         let (mut offset,limit,count) = range;
         for _ in 0..count {
@@ -354,7 +345,7 @@ impl ReceivedRowRecords {
         }
         Ok(())
     }
-    pub(super) fn visit(&self, memory: &Arc<crate::read_image_memory::ImageMemory>,
+    pub(super) fn visit(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         mut visit: impl FnMut(&str,&VersionedRow) -> Result<()>) -> Result<()> {
         for (table,range) in &self.tables { self.stream.visit_range(memory,*range,|row| visit(table,row))?; }
         Ok(())
@@ -380,7 +371,7 @@ impl ReceivedSyncSourceRecords {
             visit(&record.0,record.1,record.2,record.3)
         })
     }
-    pub(super) fn visit(&self, memory: &Arc<crate::read_image_memory::ImageMemory>,
+    pub(super) fn visit(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         mut visit: impl FnMut(&str,RowId,Lsn,u8) -> Result<()>) -> Result<()> {
         self.stream.visit(memory,|record: &(String,RowId,Lsn,u8)| {
             if record.3 > 2 { return Err(Error::Other("received source kind is invalid".into())); }
@@ -993,13 +984,12 @@ impl RedbPersistence {
             {
                 let output = write.open_table(temporary).map_err(Self::storage_error)?;
                 if !output.is_empty().map_err(Self::storage_error)? {
-                    return Err(Error::StoreCorrupted {
-                        path: name.into(),
-                        reason: "unpublished schema rows survived a transaction".into(),
-                    });
+                    return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), name, "unpublished schema rows survived a transaction".into()));
                 }
             }
             self.visit_relational_rows_in_write(&write, name, |source_row| {
+                #[cfg(test)]
+                crate::database::ef_search_metadata_contract_tests::note_projection_rows(1);
                 let mut window = self.proof_admission();
                 window.admit(source_row.estimated_bytes().saturating_mul(8)
                     .saturating_add(meta.estimated_bytes()).saturating_add(1024))?;
@@ -1114,10 +1104,7 @@ impl RedbPersistence {
                                     value.value().len().saturating_mul(8).saturating_add(1024),
                                 )?;
                                 let key: [u8; 24] =
-                                    key.value().try_into().map_err(|_| Error::StoreCorrupted {
-                                        path: name.into(),
-                                        reason: "invalid schema projection key".into(),
-                                    })?;
+                                    key.value().try_into().map_err(|_| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), name, "invalid schema projection key".into()))?;
                                 Self::decode_versioned_row(value.value(), None)
                                     .map(|row| (key, row))
                             })
@@ -1475,7 +1462,7 @@ impl<'o> OriginalProjectedIndexes<'o> {
                 };
                 let Some((coordinate, position, deleted)) = selected else { break; };
                 RedbPersistence::validated_index_position(declaration, meta, &position)
-                    .map_err(|reason| Error::StoreCorrupted { path: persistence.path.display().to_string(), reason })?;
+                    .map_err(|reason| crate::funded_error::corruption_display(crate::funded_error::original_budget(frame.original), persistence.path.display(), reason))?;
                 let required = coordinate.len().saturating_mul(2).saturating_add(128);
                 if required > coordinate_bytes {
                     coordinate_credit.reserve(required - coordinate_bytes)?;
@@ -1884,8 +1871,7 @@ impl RedbPersistence {
             .is_empty().map_err(Self::storage_error)?
             || !write.open_table(RECEIVED_HISTORY_SURVIVORS).map_err(Self::storage_error)?
                 .is_empty().map_err(Self::storage_error)? {
-            return Err(Error::StoreCorrupted { path: self.path.display().to_string(),
-                reason: "unpublished received history scratch survived a transaction".into() });
+            return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original.original), self.path.display(), "unpublished received history scratch survived a transaction".into()));
         }
         {
             let log = write.open_table(CHANGE_LOG_TABLE).map_err(Self::storage_error)?;

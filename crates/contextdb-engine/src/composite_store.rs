@@ -971,8 +971,10 @@ impl CompositeStore {
         partition_key: &VectorPartitionKey,
         accepted: &VersionedRow,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(TxId, Lsn)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (root, durable) = {
             let captured = self.precommit_vector_root.lock();
             (
@@ -1115,8 +1117,10 @@ impl CompositeStore {
         table_meta: &HashMap<String, TableMeta>,
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
             table_meta,
@@ -1140,8 +1144,10 @@ impl CompositeStore {
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
             table_meta,
@@ -1162,8 +1168,10 @@ impl CompositeStore {
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         registered_snapshots: &[SnapshotId],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_vector_partition_mutations_with_reclamation(
             ws,
             table_meta,
@@ -1209,8 +1217,10 @@ impl CompositeStore {
         resolving_staged_arrival: bool,
         defer_publication: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut vector_copy_owner = vector_copy_owner.scratch();
         let mut insert_copy_owner = contextdb_vector::VectorCopyAdmission::new(
             self.accountant.as_handle().vector_budget()?,
@@ -1798,8 +1808,10 @@ impl CompositeStore {
         reclaimable: HashSet<contextdb_vector::VectorPartitionRef>,
         snapshots: Option<&[SnapshotId]>,
         owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_vector_partition_mutations_with_reclamation(
             ws, table_meta, deleted_rows, reclaimable, snapshots, false, true, owner, read_memory,
         )
@@ -1846,8 +1858,10 @@ impl CompositeStore {
     pub(crate) fn apply_exact(
         &self,
         ws: &WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let registered_snapshots = self.take_vector_partition_snapshot_stage(ws.commit_lsn);
         // A received unit that declares a table in the same delivery that
         // carries that table's rows/vectors has not published its schema
@@ -2057,7 +2071,7 @@ impl WriteSetApplicator for CompositeStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         self.apply_exact(ws, read_memory)
     }

@@ -17,7 +17,7 @@ use contextdb_vector::store::{
     RawVectorInspectionSnapshot, ResolvedVectorPolicy,
 };
 
-fn refusal(reason: &str) -> Error {
+fn refusal(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "vector_partition_generations".into(),
         reason: reason.into(),
@@ -42,7 +42,7 @@ fn reserve(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool, bytes: usi
 
 enum CapturedRootHolder {
     Writer(WriterSnapshotHandle),
-    Retained(Arc<RetainedReadSource>),
+    Retained(RetainedReadSource),
 }
 
 /// One operation's captured root: the exact read the membership bridge
@@ -69,7 +69,7 @@ impl CapturedVectorRootLease {
 
     pub(crate) fn retained(
         read: Arc<redb::ReadTransaction>,
-        source: Arc<RetainedReadSource>,
+        source: RetainedReadSource,
     ) -> Result<Self> {
         if read.storage_snapshot_identity() != source.storage_identity() {
             return Err(refusal("serving read escaped its retained physical root"));
@@ -251,7 +251,7 @@ struct CapturedServingSupplier {
     quantization: VectorQuantization,
     layout: VectorIndexLayout,
     policy: ResolvedVectorPolicy,
-    funder: Arc<dyn MemoryBudget>,
+    funder: contextdb_vector::MemoryBudgetOwner,
     bindings: parking_lot::Mutex<Bindings>,
     _control: VectorCopyAdmission,
 }
@@ -335,7 +335,7 @@ impl CapturedServingSupplier {
             dimension: self.dimension,
             quantization: self.quantization,
             layout: self.layout.clone(),
-            funder: Arc::clone(&self.funder),
+            funder: (self.funder.clone()).into(),
             _control: control,
         });
         Ok(CapturedVectorGraphLayer { descriptor, loader })
@@ -466,7 +466,7 @@ impl CapturedVectorSuffixSource for CapturedServingSupplier {
             dimension: self.dimension,
             quantization: self.quantization,
             policy: self.policy,
-            funder: Arc::clone(&self.funder),
+            funder: (self.funder.clone()).into(),
             _control: control,
         });
         Ok(CapturedVectorSuffix {
@@ -540,7 +540,7 @@ pub(crate) fn captured_serving_selection(
         quantization: layout.quantization,
         policy,
         layout,
-        funder: owner.funder(),
+        funder: (owner.funder()).into(),
         bindings: parking_lot::Mutex::new(Bindings::default()),
         _control: control,
     });
@@ -593,7 +593,7 @@ struct CapturedLayerLoader {
     dimension: usize,
     quantization: VectorQuantization,
     layout: VectorIndexLayout,
-    funder: Arc<dyn MemoryBudget>,
+    funder: contextdb_vector::MemoryBudgetOwner,
     _control: VectorCopyAdmission,
 }
 
@@ -727,7 +727,7 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
                 self.dimension,
                 self.quantization,
                 &self.layout,
-                Arc::clone(&self.funder),
+                self.funder.clone(),
                 &graph_bytes,
                 self.is_base,
                 self.base.generation_id,
@@ -772,7 +772,7 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
         Ok(LoadedVectorGraphGeneration {
             graph,
             resident_bytes: current_resident,
-            accountant: Arc::clone(&self.funder),
+            accountant: (self.funder.clone()).into(),
             caller_adopted_bytes: current_resident,
             fresh_tail: None,
         })
@@ -789,7 +789,7 @@ struct CapturedSuffixLoader {
     dimension: usize,
     quantization: VectorQuantization,
     policy: ResolvedVectorPolicy,
-    funder: Arc<dyn MemoryBudget>,
+    funder: contextdb_vector::MemoryBudgetOwner,
     _control: VectorCopyAdmission,
 }
 
@@ -896,7 +896,7 @@ impl CapturedVectorSuffixLoader for CapturedSuffixLoader {
             tail: Some(LoadedVectorFreshTail {
                 graph,
                 resident_bytes: actual,
-                accountant: Arc::clone(&self.funder),
+                accountant: (self.funder.clone()).into(),
                 replayed_through_lsn,
             }),
             caller_adopted_bytes: actual,

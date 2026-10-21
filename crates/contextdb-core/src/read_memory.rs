@@ -10,11 +10,14 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
-/// Native admission failure contains no owned diagnostic allocation.
+/// Native admission and allocator failures contain no owned diagnostic allocation.
 /// This companion is opt-in and does not change the public Error contract.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum NativeRefusal {
+    /// The allocator returned null for this exact admitted layout.
+    /// This is an Other diagnostic, never a memory-budget refusal.
+    AllocatorFailed { site: &'static str, layout: Layout },
     MemoryBudgetExceeded {
         subsystem: &'static str,
         operation: &'static str,
@@ -161,6 +164,9 @@ impl std::fmt::Display for NativeRefusal {
                 f,
                 "native reader admission unsupported: {subsystem}/{operation}"
             ),
+            Self::AllocatorFailed { site, layout } => write!(f,
+                "native allocator failed at {site} (size={}, alignment={})",
+                layout.size(), layout.align()),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -204,6 +210,9 @@ pub trait ReadMemoryBudget: Debug + Send + Sync {
     fn native_reserve_supported(&self) -> bool {
         false
     }
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    fn native_allocation_for_test(&self, _layout: Layout) {}
     fn release(&self, bytes: usize);
 
     /// Test observations name a forwarding capability's actual funder.
@@ -212,6 +221,9 @@ pub trait ReadMemoryBudget: Debug + Send + Sync {
     fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
         None
     }
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    fn funding_owner_handle_for_test(&self) -> Option<&ReadMemoryOwner> { None }
 }
 
 /// An opaque strong owner. Legacy owners retain their original Arc identity;
@@ -243,6 +255,35 @@ impl Debug for OwnerKind {
     }
 }
 
+/// A typed projection of one native owner. Only this module constructs the
+/// projection function and pairs it with its monomorphized allocation. The
+/// shared borrow cannot outlive this strong handle; cloning allocates nothing.
+#[doc(hidden)]
+pub struct NativeReadMemory<T> {
+    owner: ReadMemoryOwner,
+    project: fn(&ReadMemoryOwner) -> &T,
+    _payload: std::marker::PhantomData<T>,
+}
+impl<T> Clone for NativeReadMemory<T> {
+    fn clone(&self) -> Self {
+        Self { owner: self.owner.clone(), project: self.project,
+            _payload: std::marker::PhantomData }
+    }
+}
+impl<T> Debug for NativeReadMemory<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReadMemory").field("owner", &self.owner).finish_non_exhaustive()
+    }
+}
+impl<T> std::ops::Deref for NativeReadMemory<T> {
+    type Target = T;
+    fn deref(&self) -> &T { (self.project)(&self.owner) }
+}
+impl<T> NativeReadMemory<T> {
+    /// The same strong capability, with no forwarding allocation or new child.
+    pub fn owner(&self) -> ReadMemoryOwner { self.owner.clone() }
+}
+
 struct NativeReadBlock<T, I> {
     owners: AtomicUsize,
     payload: ManuallyDrop<T>,
@@ -263,6 +304,7 @@ type NativeReserve = unsafe fn(
 ) -> std::result::Result<(), NativeRefusal>;
 
 struct NativeVtable {
+    native_reserve_supported: unsafe fn(NonNull<()>) -> bool,
     constrain_operation_memory: unsafe fn(NonNull<()>, usize),
     reserve_native: NativeReserve,
     reserve: unsafe fn(NonNull<()>, usize, &'static str, &'static str, &'static str) -> Result<()>,
@@ -319,6 +361,7 @@ impl<I> Drop for NativeFreeGuard<I> {
 
 impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T, I> {
     const VTABLE: NativeVtable = NativeVtable {
+        native_reserve_supported: Self::native_reserve_supported,
         constrain_operation_memory: Self::constrain_operation_memory,
         reserve_native: Self::reserve_native,
         reserve: Self::reserve,
@@ -326,6 +369,10 @@ impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T,
         clone_owner: Self::clone_owner,
         drop_owner: Self::drop_owner,
     };
+    unsafe fn native_reserve_supported(block: NonNull<()>) -> bool {
+        // SAFETY: the strong owner retains this exact monomorphized payload.
+        unsafe { block.cast::<Self>().as_ref().payload.native_reserve_supported() }
+    }
     unsafe fn constrain_operation_memory(block: NonNull<()>, limit: usize) {
         // SAFETY: the strong owner retains this monomorphized provider block.
         unsafe { block.cast::<Self>().as_ref().payload.constrain_operation_memory(limit) };
@@ -401,7 +448,35 @@ impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T,
     }
 }
 
+impl From<Arc<dyn ReadMemoryBudget>> for ReadMemoryOwner {
+    fn from(reader: Arc<dyn ReadMemoryBudget>) -> Self { Self::from_legacy(reader) }
+}
+impl<T: ReadMemoryBudget + 'static> From<Arc<T>> for ReadMemoryOwner {
+    fn from(reader: Arc<T>) -> Self { Self::from_legacy(reader) }
+}
+impl From<&Arc<dyn ReadMemoryBudget>> for ReadMemoryOwner {
+    fn from(reader: &Arc<dyn ReadMemoryBudget>) -> Self { Self::from_legacy(reader.clone()) }
+}
+impl<T: ReadMemoryBudget + 'static> From<&Arc<T>> for ReadMemoryOwner {
+    fn from(reader: &Arc<T>) -> Self { Self::from_legacy(reader.clone()) }
+}
+impl From<&ReadMemoryOwner> for ReadMemoryOwner {
+    fn from(reader: &ReadMemoryOwner) -> Self { reader.clone() }
+}
+
 impl ReadMemoryOwner {
+    /// Borrow through the existing test-only forwarding receipt. This never
+    /// manufactures a native owner from its address or acquires a strong count.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn original_native_owner_for_test(&self) -> Option<&ReadMemoryOwner> {
+        match &self.0 {
+            OwnerKind::Native(_) => Some(self),
+            OwnerKind::Legacy(reader, _) => reader.funding_owner_handle_for_test()
+                .and_then(ReadMemoryOwner::original_native_owner_for_test),
+        }
+    }
+
     pub fn from_legacy(reader: Arc<dyn ReadMemoryBudget>) -> Self {
         let invoice = reader.control_invoice();
         Self(OwnerKind::Legacy(reader, invoice))
@@ -422,6 +497,8 @@ impl ReadMemoryOwner {
         prepaid_invoice: I,
     ) -> Result<Self> {
         let layout = Self::native_layout::<T, I>();
+        #[cfg(feature = "test-seams")]
+        payload.native_allocation_for_test(layout);
         // SAFETY: the atomic count makes this layout nonzero; layout is exact.
         let allocation = unsafe { alloc(layout) };
         let Some(block) = NonNull::new(allocation.cast::<NativeReadBlock<T, I>>()) else {
@@ -446,6 +523,45 @@ impl ReadMemoryOwner {
         })))
     }
 
+    /// Typed companion to the existing native factory. The complete layout
+    /// and original prepaid invoice are identical to the erased cell. No raw
+    /// payload pointer, mutation or Weak capability leaves this module.
+    #[doc(hidden)]
+    pub fn try_native_typed<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static>(
+        payload: T, prepaid_invoice: I,
+    ) -> std::result::Result<NativeReadMemory<T>, NativeRefusal> {
+        let owner = Self::try_native_result(payload, prepaid_invoice)?;
+        Ok(Self::typed_native_owner::<T, I>(owner))
+    }
+
+    /// The same typed projection with the original unqualified Error terminal.
+    #[doc(hidden)]
+    pub fn try_native_typed_unqualified<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static>(
+        payload: T, prepaid_invoice: I,
+    ) -> Result<NativeReadMemory<T>> {
+        let owner = Self::try_native(payload, prepaid_invoice)?;
+        Ok(Self::typed_native_owner::<T, I>(owner))
+    }
+
+    // Only the factories immediately above supply an owner here, from the
+    // exact T/I monomorphization. No caller can forge a typed projection.
+    fn typed_native_owner<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static>(
+        owner: ReadMemoryOwner,
+    ) -> NativeReadMemory<T> {
+        fn project<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static>(
+            owner: &ReadMemoryOwner,
+        ) -> &T {
+            let OwnerKind::Native(native) = &owner.0 else { unreachable!() };
+            // SAFETY: this private projection is installed only beside the
+            // owner returned by the matching T/I factory. No caller can
+            // substitute either field. The borrow of owner retains its strong
+            // count and ties this shared payload reference to that borrow.
+            unsafe { &native.block.cast::<NativeReadBlock<T, I>>().as_ref().payload }
+        }
+        NativeReadMemory { owner, project: project::<T, I>,
+            _payload: std::marker::PhantomData }
+    }
+
     /// Native-result factory; the prepaid invoice survives payload destruction.
     #[doc(hidden)]
     pub fn try_native_result<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static>(
@@ -453,6 +569,8 @@ impl ReadMemoryOwner {
         prepaid_invoice: I,
     ) -> std::result::Result<Self, NativeRefusal> {
         let layout = Self::native_layout::<T, I>();
+        #[cfg(feature = "test-seams")]
+        payload.native_allocation_for_test(layout);
         // SAFETY: the atomic count makes this layout nonzero; layout is exact.
         let allocation = unsafe { alloc(layout) };
         let Some(block) = NonNull::new(allocation.cast::<NativeReadBlock<T, I>>()) else {
@@ -460,7 +578,7 @@ impl ReadMemoryOwner {
             // including unwinding, then refund the original admission.
             drop(payload);
             drop(prepaid_invoice);
-            return Err(NativeRefusal::Other("reader owner allocation failed"));
+            return Err(NativeRefusal::AllocatorFailed { site: "reader owner", layout });
         };
         // SAFETY: fresh aligned storage for precisely this type. All following
         // initialization and owner construction is infallible and nonallocating.
@@ -475,6 +593,46 @@ impl ReadMemoryOwner {
             block: block.cast(),
             vtable: &NativeReadBlock::<T, I>::VTABLE,
         })))
+    }
+
+    /// Allocate a native owner before moving its external custody into the
+    /// cell. The invoice may contain an unpublished answer: allocation refusal
+    /// destroys that answer before its original controls. A producer can return
+    /// it separately only after allocation succeeds, without exposing raw cell
+    /// storage. Unwind frees the block before dropping the external invoice.
+    /// The caller prepays native_layout::<T, I>() on the original funder.
+    #[doc(hidden)]
+    pub fn try_native_result_with<T, I, R>(
+        invoice: I,
+        make: impl FnOnce(&mut I) -> (T, R),
+    ) -> std::result::Result<(Self, R), NativeRefusal>
+    where
+        T: ReadMemoryBudget + 'static,
+        I: Send + Sync + 'static,
+    {
+        let layout = Self::native_layout::<T, I>();
+        // SAFETY: the native count makes this exact layout nonzero.
+        let allocation = unsafe { alloc(layout) };
+        let Some(block) = NonNull::new(allocation.cast::<NativeReadBlock<T, I>>()) else {
+            drop(make);
+            drop(invoice);
+            return Err(NativeRefusal::AllocatorFailed { site: "reader owner", layout });
+        };
+        let mut guard = NativeFreeGuard { block: block.cast(), layout, _invoice: invoice };
+        let (payload, returned) = make(&mut guard._invoice);
+        let guard = ManuallyDrop::new(guard);
+        // SAFETY: fresh storage is initialized once. Everything after producer
+        // success is infallible; the block adopts the original outside invoice.
+        unsafe {
+            block.as_ptr().write(NativeReadBlock {
+                owners: AtomicUsize::new(1),
+                payload: ManuallyDrop::new(payload),
+                invoice: ManuallyDrop::new(std::ptr::read(&guard._invoice)),
+            });
+        }
+        Ok((Self(OwnerKind::Native(NativeOwner {
+            block: block.cast(), vtable: &NativeReadBlock::<T, I>::VTABLE,
+        })), returned))
     }
 
     /// Admit only a payload that explicitly supports scalar native reservation.
@@ -493,6 +651,8 @@ impl ReadMemoryOwner {
             });
         }
         let layout = Self::native_layout::<T, I>();
+        #[cfg(feature = "test-seams")]
+        payload.native_allocation_for_test(layout);
         // SAFETY: the atomic count makes this layout nonzero; layout is exact.
         let allocation = unsafe { alloc(layout) };
         let Some(block) = NonNull::new(allocation.cast::<NativeReadBlock<T, I>>()) else {
@@ -500,7 +660,7 @@ impl ReadMemoryOwner {
             // including unwinding, then refund the original admission.
             drop(payload);
             drop(prepaid_invoice);
-            return Err(NativeRefusal::Other("reader owner allocation failed"));
+            return Err(NativeRefusal::AllocatorFailed { site: "reader owner", layout });
         };
         // SAFETY: fresh aligned storage for precisely this type. All following
         // initialization and owner construction is infallible and nonallocating.
@@ -542,7 +702,31 @@ impl ReadMemoryOwner {
         }
     }
 }
+impl AsRef<dyn ReadMemoryBudget> for ReadMemoryOwner {
+    fn as_ref(&self) -> &(dyn ReadMemoryBudget + 'static) { self }
+}
 impl ReadMemoryBudget for ReadMemoryOwner {
+    #[cfg(feature = "test-seams")]
+    fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
+        match &self.0 {
+            OwnerKind::Legacy(reader, _) => Some(reader),
+            OwnerKind::Native(_) => None,
+        }
+    }
+    fn control_invoice(&self) -> Option<ReadShared<ReadCredit>> {
+        match &self.0 {
+            OwnerKind::Legacy(_, invoice) => invoice.clone(),
+            OwnerKind::Native(_) => None,
+        }
+    }
+    fn native_reserve_supported(&self) -> bool {
+        match &self.0 {
+            OwnerKind::Legacy(reader, _) => reader.native_reserve_supported(),
+            // SAFETY: the strong owner pins this exact vtable payload.
+            OwnerKind::Native(owner) => unsafe { (owner.vtable.native_reserve_supported)(owner.block) },
+        }
+    }
+
     fn constrain_operation_memory(&self, limit: usize) {
         match &self.0 {
             OwnerKind::Legacy(reader, _) => reader.constrain_operation_memory(limit),
@@ -604,9 +788,13 @@ pub struct ReadCredit {
 }
 
 impl ReadCredit {
-    pub fn new(budget: Arc<dyn ReadMemoryBudget>) -> Self {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn original_payer_for_test(&self) -> &ReadMemoryOwner { &self.budget }
+
+    pub fn new(budget: impl Into<ReadMemoryOwner>) -> Self {
         Self {
-            budget: ReadMemoryOwner::from_legacy(budget),
+            budget: budget.into(),
             bytes: 0,
         }
     }
@@ -615,8 +803,15 @@ impl ReadCredit {
     /// transferring owner removes these bytes without releasing them first.
     /// This constructor neither reserves nor refunds nor allocates.
     #[doc(hidden)]
-    pub fn from_prepaid(budget: Arc<dyn ReadMemoryBudget>, bytes: usize) -> Self {
-        Self::from_prepaid_owned(ReadMemoryOwner::from_legacy(budget), bytes)
+    pub fn from_prepaid(budget: impl Into<ReadMemoryOwner>, bytes: usize) -> Self {
+        Self::from_prepaid_owned(budget.into(), bytes)
+    }
+
+    /// Borrowed identity of this credit's original payer; never retains it.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn original_payer_identity_for_test(&self) -> usize {
+        self.budget.accounting_identity()
     }
 
     pub fn bytes(&self) -> usize {
@@ -643,6 +838,10 @@ impl ReadCredit {
     pub fn try_shrink(&mut self, returned: usize) -> Result<()> {
         shrink_credit(&self.budget, &mut self.bytes, returned)
     }
+
+    /// Retain the exact original capability, including its external controls.
+    #[doc(hidden)]
+    pub fn owner(&self) -> ReadMemoryOwner { self.budget.clone() }
 
     /// Compare the actual retained funder without acquiring or reserving.
     #[doc(hidden)]
@@ -689,14 +888,14 @@ impl ReadCredit {
     }
 
     pub fn try_new(
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<ReadMemoryOwner>,
         bytes: usize,
         subsystem: &'static str,
         operation: &'static str,
         hint: &'static str,
     ) -> Result<Self> {
         Self::try_new_owned(
-            ReadMemoryOwner::from_legacy(budget),
+            budget.into(),
             bytes,
             subsystem,
             operation,
@@ -810,9 +1009,41 @@ impl ReadCredit {
     }
 }
 
+// capture969 begin
+// A passive callback for the selected retained-trace payer only. No token fields.
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static TRACE_CREDIT_DROP: std::cell::Cell<(usize, Option<fn(bool, usize, usize, usize)>)> =
+        const { std::cell::Cell::new((0, None)) };
+}
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn set_trace_credit_drop_observer_for_test(
+    payer: usize, callback: Option<fn(bool, usize, usize, usize)>,
+) {
+    TRACE_CREDIT_DROP.with(|slot| slot.set((payer, callback)));
+}
+// capture969 end
 impl Drop for ReadCredit {
     fn drop(&mut self) {
+// capture969 begin
+        #[cfg(feature = "test-seams")]
+        let trace_drop = TRACE_CREDIT_DROP.with(|slot| {
+            let (payer, callback) = slot.get();
+            if payer != 0 && payer == self.budget.accounting_identity() { callback } else { None }
+        });
+        #[cfg(feature = "test-seams")]
+        if let Some(callback) = trace_drop {
+            callback(false, self as *const Self as usize, self.budget.accounting_identity(), self.bytes);
+        }
+// capture969 end
         self.budget.release(self.bytes);
+// capture969 begin
+        #[cfg(feature = "test-seams")]
+        if let Some(callback) = trace_drop {
+            callback(true, self as *const Self as usize, self.budget.accounting_identity(), self.bytes);
+        }
+// capture969 end
     }
 }
 
@@ -935,18 +1166,51 @@ impl<T> Drop for ReadPaidArc<T> {
 /// One typed, weakless shared allocation. The external invoice survives payload
 /// destruction and physical block deallocation; cloning only retains this cell.
 #[doc(hidden)]
-pub struct ReadShared<T> {
-    block: NonNull<ReadSharedBlock<T>>,
+pub struct ReadShared<T, I = ReadCredit> {
+    block: NonNull<ReadSharedBlock<T, I>>,
 }
-struct ReadSharedBlock<T> {
+struct ReadSharedBlock<T, I = ReadCredit> {
     owners: AtomicUsize,
     payload: ManuallyDrop<T>,
-    invoice: ManuallyDrop<ReadCredit>,
+    invoice: ManuallyDrop<I>,
 }
 // SAFETY: a cross-thread handle requires both payload transfer and immutable
 // concurrent access to be safe. The count is the only unsynchronized mutation.
-unsafe impl<T: Send + Sync> Send for ReadShared<T> {}
-unsafe impl<T: Send + Sync> Sync for ReadShared<T> {}
+unsafe impl<T: Send + Sync, I: Send + Sync> Send for ReadShared<T, I> {}
+unsafe impl<T: Send + Sync, I: Send + Sync> Sync for ReadShared<T, I> {}
+
+impl<T, I> ReadShared<T, I> {
+    pub fn layout() -> Layout {
+        Layout::new::<ReadSharedBlock<T, I>>()
+    }
+}
+
+impl<T, I> ReadShared<T, I> {
+    /// Transfer one genuine strong count into a private packed handle. This
+    /// pointer owns the native cell and is never an Arc or a weak observer.
+    #[doc(hidden)]
+    pub fn into_raw(self) -> *const T {
+        let shared = ManuallyDrop::new(self);
+        std::ptr::addr_of!(unsafe { shared.block.as_ref() }.payload).cast::<T>()
+    }
+
+    /// Recover the exact strong count transferred by `into_raw`.
+    ///
+    /// # Safety
+    /// `payload` must name a live strong count transferred by
+    /// `ReadShared::<T, I>::into_raw` for these exact T and I. Dropping the recovered
+    /// value consumes that count exactly once. A temporary borrow for cloning
+    /// must use ManuallyDrop while its real strong owner remains alive.
+    /// Retired pointers and pointers from observers are forbidden.
+    #[doc(hidden)]
+    pub unsafe fn from_raw(payload: *const T) -> Self {
+        // SAFETY: the caller transfers a live count. The offset is that of our
+        // own concrete native block, never a guessed standard-library layout.
+        let block = unsafe { payload.cast::<u8>().sub(
+            std::mem::offset_of!(ReadSharedBlock<T, I>, payload)) };
+        Self { block: unsafe { NonNull::new_unchecked(block.cast_mut().cast()) } }
+    }
+}
 
 impl<T> ReadShared<T> {
     /// Borrow the immutable payload while this strong handle retains its cell.
@@ -957,8 +1221,11 @@ impl<T> ReadShared<T> {
         unsafe { &*std::ptr::addr_of!((*self.block.as_ptr()).payload).cast::<T>() }
     }
 
-    pub fn layout() -> Layout {
-        Layout::new::<ReadSharedBlock<T>>()
+    /// Borrow the one original invoice without acquiring another owner or cell.
+    #[doc(hidden)]
+    pub fn credit(&self) -> &ReadCredit {
+        // SAFETY: this strong handle keeps the immutable invoice alive.
+        unsafe { &self.block.as_ref().invoice }
     }
 
     /// Adopt an exact prepaid control invoice before allocating. No child is
@@ -1013,9 +1280,7 @@ impl<T> ReadShared<T> {
         let Some(block) = NonNull::new(storage.cast::<ReadSharedBlock<T>>()) else {
             drop(payload);
             drop(invoice);
-            return Err(NativeRefusal::Other(
-                "cannot allocate admitted shared control",
-            ));
+            return Err(NativeRefusal::AllocatorFailed { site: "admitted shared control", layout });
         };
         // SAFETY: initialize fresh storage once, before exposing any handle.
         unsafe {
@@ -1081,8 +1346,28 @@ impl<T> ReadShared<T> {
         invoice: ReadCredit,
         make: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<Self, NativeProduce<E>> {
+        Self::try_from_prepaid_with_native_inner(invoice, make, false)
+    }
+
+    /// A single original invoice covers both this cell and its nested payload.
+    /// The caller admits those payload allocations before constructing them.
+    #[doc(hidden)]
+    pub fn try_from_prepaid_payload_with_native<E>(
+        invoice: ReadCredit,
+        make: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<Self, NativeProduce<E>> {
+        Self::try_from_prepaid_with_native_inner(invoice, make, true)
+    }
+
+    fn try_from_prepaid_with_native_inner<E>(
+        invoice: ReadCredit,
+        make: impl FnOnce() -> std::result::Result<T, E>,
+        includes_payload: bool,
+    ) -> std::result::Result<Self, NativeProduce<E>> {
         let layout = Self::layout();
-        if invoice.bytes() != layout.size() {
+        if invoice.bytes() < layout.size()
+            || (!includes_payload && invoice.bytes() != layout.size())
+        {
             drop(make);
             drop(invoice);
             return Err(NativeProduce::Refused(NativeRefusal::Other(
@@ -1094,9 +1379,7 @@ impl<T> ReadShared<T> {
         let Some(block) = NonNull::new(storage.cast::<ReadSharedBlock<T>>()) else {
             drop(make);
             drop(invoice);
-            return Err(NativeProduce::Refused(NativeRefusal::Other(
-                "cannot allocate admitted shared control",
-            )));
+            return Err(NativeProduce::Refused(NativeRefusal::AllocatorFailed { site: "admitted shared control", layout }));
         };
         let guard = NativeFreeGuard {
             block: block.cast(),
@@ -1118,12 +1401,153 @@ impl<T> ReadShared<T> {
     }
 }
 
-impl<T> Debug for ReadShared<T> {
+/// A shared cell's original debit, with any inline lifetime bookkeeping.
+/// Metadata is part of the admitted cell layout, never another allocation.
+#[doc(hidden)]
+pub trait ReadSharedInvoice: Send + Sync {
+    fn credit(&self) -> &ReadCredit;
+}
+impl ReadSharedInvoice for ReadCredit {
+    fn credit(&self) -> &ReadCredit { self }
+}
+
+/// An exact admitted shared cell, allocated before its producer publishes.
+/// Uninitialized storage never escapes; Drop frees it before refunding credit.
+#[doc(hidden)]
+pub struct ReadPrepared<T, I = ReadCredit> {
+    guard: NativeFreeGuard<I>,
+    _payload: std::marker::PhantomData<T>,
+}
+// SAFETY: an unpublished cell has a unique allocation and invoice. Moving
+// or sharing its typed custody follows the eventual payload bounds.
+unsafe impl<T: Send, I: Send> Send for ReadPrepared<T, I> {}
+unsafe impl<T: Sync, I: Sync> Sync for ReadPrepared<T, I> {}
+impl<T, I> Debug for ReadPrepared<T, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadPrepared").finish_non_exhaustive()
+    }
+}
+impl<T> ReadShared<T> {
+    #[doc(hidden)]
+    pub fn try_prepare_native(
+        invoice: ReadCredit,
+    ) -> std::result::Result<ReadPrepared<T>, NativeRefusal> {
+        Self::try_prepare_invoice_native(invoice)
+    }
+}
+impl<T, I> ReadShared<T, I> {
+    /// Adopt an original non-reader invoice, already admitted for `layout()`.
+    /// This is the same physical-free guard as reader-credit cells; no scalar
+    /// reader admission or new budget is inferred from the representation.
+    #[doc(hidden)]
+    pub fn try_from_invoice_native(payload: T, invoice: I)
+        -> std::result::Result<Self, NativeRefusal> {
+        let layout = Self::layout();
+        // SAFETY: the strong count makes the exact native layout nonzero.
+        let storage = unsafe { alloc(layout) };
+        let Some(block) = NonNull::new(storage.cast::<ReadSharedBlock<T, I>>()) else {
+            drop(payload);
+            drop(invoice);
+            return Err(NativeRefusal::AllocatorFailed { site: "funded shared control", layout });
+        };
+        // SAFETY: initialize fresh exact storage once before publishing it.
+        unsafe { block.as_ptr().write(ReadSharedBlock {
+            owners: AtomicUsize::new(1), payload: ManuallyDrop::new(payload),
+            invoice: ManuallyDrop::new(invoice),
+        }); }
+        Ok(Self { block })
+    }
+
+    /// The caller prepays this exact layout, including its invoice metadata.
+    /// Custody stays external through failure, payload Drop and physical free.
+    #[doc(hidden)]
+    pub fn try_prepare_invoice_native(
+        invoice: I,
+    ) -> std::result::Result<ReadPrepared<T, I>, NativeRefusal>
+    where I: ReadSharedInvoice,
+    {
+        let layout = Self::layout();
+        if invoice.credit().bytes() != layout.size() {
+            return Err(NativeRefusal::Other("shared control invoice differs from layout"));
+        }
+        // SAFETY: the count makes the exact admitted layout nonzero.
+        let Some(block) = NonNull::new(unsafe { alloc(layout) }) else {
+            return Err(NativeRefusal::AllocatorFailed {
+                site: "prepared shared control",
+                layout,
+            });
+        };
+        Ok(ReadPrepared {
+            guard: NativeFreeGuard {
+                block: block.cast(),
+                layout,
+                _invoice: invoice,
+            },
+            _payload: std::marker::PhantomData,
+        })
+    }
+}
+impl<T, I> ReadPrepared<T, I> {
+    /// Borrow the original invoice; observing it neither retains nor allocates.
+    #[doc(hidden)]
+    pub fn invoice(&self) -> &I { &self.guard._invoice }
+
+    /// All fallible work finished before the producer ran.
+    pub fn publish(self, payload: T) -> ReadShared<T, I> {
+        let prepared = ManuallyDrop::new(self);
+        let block = prepared.guard.block.cast::<ReadSharedBlock<T, I>>();
+        // SAFETY: this unique exact allocation is initialized once, moving
+        // its invoice to the normal ReadShared physical-free finalizer.
+        unsafe {
+            block.as_ptr().write(ReadSharedBlock {
+                owners: AtomicUsize::new(1),
+                payload: ManuallyDrop::new(payload),
+                invoice: ManuallyDrop::new(std::ptr::read(&prepared.guard._invoice)),
+            });
+        }
+        ReadShared { block }
+    }
+}
+
+// Private, allocation-free erasure for the cross-crate cursor vocabulary.
+// No pointer, mutable projection or owning payload is exposed to callers.
+impl<T: crate::read_contract::CursorPageStorage, I: Send + Sync + 'static> ReadShared<T, I> {
+    pub(crate) fn into_cursor_page_handle(self) -> crate::read_contract::CursorPageHandle {
+        let shared = ManuallyDrop::new(self);
+        crate::read_contract::CursorPageHandle {
+            block: shared.block.cast(),
+            view: Self::cursor_view,
+            retain: Self::cursor_retain,
+            release: Self::cursor_release,
+        }
+    }
+    unsafe fn cursor_view(
+        block: NonNull<()>,
+    ) -> &'static dyn crate::read_contract::CursorPageStorage {
+        // SAFETY: the erased handle retains this concrete initialized cell.
+        unsafe {
+            &*std::ptr::addr_of!((*block.cast::<ReadSharedBlock<T, I>>().as_ptr()).payload).cast::<T>()
+        }
+    }
+    unsafe fn cursor_retain(block: NonNull<()>) {
+        let shared = ManuallyDrop::new(Self {
+            block: block.cast(),
+        });
+        let _retained = ManuallyDrop::new(Self::clone(&shared));
+    }
+    unsafe fn cursor_release(block: NonNull<()>) {
+        drop(Self {
+            block: block.cast(),
+        });
+    }
+}
+
+impl<T, I> Debug for ReadShared<T, I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadShared").field("block", &self.block).finish_non_exhaustive()
     }
 }
-impl<T> Clone for ReadShared<T> {
+impl<T, I> Clone for ReadShared<T, I> {
     fn clone(&self) -> Self {
         // SAFETY: this strong handle prevents concurrent final destruction.
         let count = unsafe { &self.block.as_ref().owners };
@@ -1138,14 +1562,14 @@ impl<T> Clone for ReadShared<T> {
         Self { block: self.block }
     }
 }
-impl<T> std::ops::Deref for ReadShared<T> {
+impl<T, I> std::ops::Deref for ReadShared<T, I> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: a strong handle retains the initialized immutable payload.
         unsafe { &self.block.as_ref().payload }
     }
 }
-impl<T> Drop for ReadShared<T> {
+impl<T, I> Drop for ReadShared<T, I> {
     fn drop(&mut self) {
         let ptr = self.block.as_ptr();
         // SAFETY: each strong holder consumes its count exactly once.
@@ -1337,7 +1761,7 @@ impl<T> Drop for ReadBoxInitGuard<T> {
     }
 }
 
-fn try_prepaid_box_with<T>(
+pub(crate) fn try_prepaid_box_with<T>(
     invoice: ReadCredit,
     make: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<(Box<T>, ReadCredit)> {
@@ -1406,9 +1830,7 @@ fn try_prepaid_box_with_native<T, E>(
         let Some(block) = NonNull::new(storage.cast::<T>()) else {
             drop(make);
             drop(invoice);
-            return Err(NativeProduce::Refused(NativeRefusal::Other(
-                "cannot allocate admitted boxed payload",
-            )));
+            return Err(NativeProduce::Refused(NativeRefusal::AllocatorFailed { site: "admitted boxed payload", layout }));
         };
         block
     };

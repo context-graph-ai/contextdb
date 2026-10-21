@@ -216,10 +216,7 @@ impl<'a> MaintenanceFrontier<'a> {
                     tail.map(|row| {
                         row.position_key()
                             .try_into()
-                            .map_err(|_| Error::StoreCorrupted {
-                                path: table.clone(),
-                                reason: "retention end position has the wrong length".into(),
-                            })
+                            .map_err(|_| crate::funded_error::corruption_text(self.owner.diagnostic_budget(), table, "retention end position has the wrong length".into()))
                     })
                     .transpose()?
                 };
@@ -242,10 +239,7 @@ impl<'a> MaintenanceFrontier<'a> {
                     let physical: [u8; 24] =
                         row.position_key()
                             .try_into()
-                            .map_err(|_| Error::StoreCorrupted {
-                                path: table.clone(),
-                                reason: "retention position has the wrong length".into(),
-                            })?;
+                            .map_err(|_| crate::funded_error::corruption_text(self.owner.diagnostic_budget(), table, "retention position has the wrong length".into()))?;
                     window.through = Some(physical);
                     next = Some(physical);
                     remaining -= 1;
@@ -775,10 +769,7 @@ impl<'a> MaintenanceFrontier<'a> {
                 window
                     .position_key()
                     .try_into()
-                    .map_err(|_| Error::StoreCorrupted {
-                        path: table.into(),
-                        reason: "cleanup row position has the wrong length".into(),
-                    })?;
+                    .map_err(|_| crate::funded_error::corruption_text(self.owner.diagnostic_budget(), table, "cleanup row position has the wrong length".into()))?;
             if row.lsn <= state.through && select(row, group.keeper.expect("cleanup keeper").0)? {
                 *removal_allowance -= 1;
             }

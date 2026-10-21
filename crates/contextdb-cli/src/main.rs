@@ -413,21 +413,18 @@ fn main() {
             canonical_help_signatures().contains(&operation.spelling()),
             "every operational spelling is part of the one discovery surface"
         );
-        let read_parent =
-            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
-                args.read_configuration().limits.memory,
-            );
         let exit_code = contextdb_cli::ops::run_operational(
             operation.spelling(),
             operation.arguments(),
             || {
-                read_parent
-                    .child()
-                    .map(|operation| (operation, read_parent.clone()))
+                let read_parent = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    args.read_configuration().limits.memory,
+                )?;
+                let operation = read_parent.child()?;
+                Ok((operation, read_parent))
             },
         )
         .expect("the command tree only resolves spellings the operations answer to");
-        drop(read_parent);
         std::process::exit(exit_code);
     }
 
@@ -484,9 +481,15 @@ fn main() {
             refuse_invocation(args.json, &format!("invalid --disk-limit: {err}"));
         });
 
-    let read_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+    let read_memory = match contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
         read.limits.memory,
-    );
+    ) {
+        Ok(root) => root,
+        Err(error) => {
+            output.report_error(ErrorClass::of(&error), &error.to_string());
+            std::process::exit(EXIT_ERROR);
+        }
+    };
 
     if !writes_permitted {
         // A reading session opens no database at all. There is no handle here

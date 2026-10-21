@@ -358,7 +358,7 @@ impl OwnerClient {
             })
         } else { None };
         boundary.set_query_funding(query_memory.as_ref().map(|memory|
-            memory.clone() as Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>));
+            memory.owner()));
         let carrier = UnixLocalCarrier;
         // An owner that refuses a connection answers it and then closes, so
         // the request going out and the answer coming back cross: the write
@@ -417,8 +417,8 @@ impl OwnerClient {
             _ => None,
         };
 
-        let mut unpublished = FundedVec::new(query_memory.as_ref().map(|m|
-            m.clone() as Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>));
+        let mut unpublished = FundedVec::new_owned(query_memory.as_ref().map(|m|
+            m.owner()));
         let mut ordinary_receiver = if expectation == LocalResponseExpectation::OrdinaryResult {
             Some(
                 OrdinaryResultReceiver::with_query_memory(
@@ -490,8 +490,8 @@ impl OwnerClient {
                 // Copy leading pieces only; the terminal's original invoice
                 // moves back out of validation with its unchanged bytes.
                 let retained_chunk = if let LocalResponse::ResultChunk { chunk } = &response.value {
-                    Some(Funded::allocate(query_memory.as_ref().map(|m|
-                        m.clone() as Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
+                    Some(Funded::allocate_owned(query_memory.as_ref().map(|m|
+                        m.owner()),
                         chunk.bytes.len(), || LocalResponse::ResultChunk {
                             chunk: crate::local_transport::ResultChunk { bytes: chunk.bytes.to_vec() },
                         }).map_err(OwnerReadScaffoldError::Database)?)

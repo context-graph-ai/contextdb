@@ -259,7 +259,7 @@ impl UnixLocalCarrier {
         &'a self,
         stream: &'a mut std::os::unix::net::UnixStream,
         boundary: &'a LocalProtocolBoundary,
-        memory: std::sync::Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         clock: &'a dyn DeadlineClock,
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a, Funded<LocalResponse>> {
@@ -267,7 +267,7 @@ impl UnixLocalCarrier {
         let allocator_memory = memory.clone();
         let ceiling = boundary.effective_limits().memory;
         let reader = frame_readiness_allocating(stream, None, move |length| {
-            Funded::allocate(Some(allocator_memory), length, || vec![0_u8; length])
+            Funded::allocate_owned(Some(allocator_memory.owner()), length, || vec![0_u8; length])
                 .map_err(|error| match crate::read_contract::encoding_error_from_core(error, ceiling) {
                     crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } =>
                         LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {

@@ -6,10 +6,10 @@ use crate::custody::{records::*, store::Store};
 thread_local! {
     static SKIP_CUSTODY_VALIDATION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CUSTODY_VALIDATION_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    static LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST: std::cell::RefCell<Option<Arc<crate::read_image_memory::ImageMemory>>> = const { std::cell::RefCell::new(None) };
+    static LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST: std::cell::RefCell<Option<crate::read_image_memory::ImageMemoryHandle>> = const { std::cell::RefCell::new(None) };
     static LAST_CUSTODY_RETAINED_BYTES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LAST_RETIRED_FUNDING_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static MEASURED_READER_FOR_TEST: std::cell::RefCell<Option<Arc<crate::read_image_memory::ImageMemory>>> = const { std::cell::RefCell::new(None) };
+    static MEASURED_READER_FOR_TEST: std::cell::RefCell<Option<crate::read_image_memory::ImageMemoryHandle>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A captured writer root held by a test.
@@ -43,8 +43,10 @@ impl Database {
         changes: ChangeSet,
         confirmed: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<OutboundSyncUnit>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut ordinary = ChangeSet::default();
         let mut connected = Vec::new();
         for (group,is_connected) in self.connected_delivery_groups(changes,vector_copy_owner,read_memory.clone())? {
@@ -70,8 +72,10 @@ impl Database {
         &self,
         row: &RowChange,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<crate::custody::records::RowRef>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut parents = Vec::new();
         if let Some(meta) = self.table_meta(&row.table) {
             let refs = meta
@@ -500,7 +504,7 @@ impl Database {
         limit: usize,
     ) -> (
         crate::memory_accounting::AccountantHandle,
-        Arc<crate::read_image_memory::ImageMemory>,
+        crate::read_image_memory::ImageMemoryHandle,
     ) {
         let accountant: crate::memory_accounting::AccountantHandle = Arc::new(
             crate::memory_accounting::MemoryAccountant::with_budget(limit),
@@ -665,7 +669,7 @@ impl Database {
         };
         let (accountant, memory) = Self::measured_memory_for_test(limit);
         MEASURED_READER_FOR_TEST.with(|reader| *reader.borrow_mut() = Some(memory.clone()));
-        let read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = memory.clone();
+        let read: contextdb_core::read_memory::ReadMemoryOwner = memory.clone().into();
         let answer = match caller {
             "select" => self.custody_records_in(&[arg.to_owned()], read),
             "authority" => self.custody_authority(read),
@@ -847,8 +851,10 @@ impl Database {
     }
     pub(crate) fn custody_records(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.custody_records_in_at(
             CustodyRoot::Operation,
             &["tenant_", "delivery_"],
@@ -858,16 +864,20 @@ impl Database {
     pub(crate) fn custody_records_in(
         &self,
         selectors: &[String],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.custody_records_in_at(CustodyRoot::Operation, selectors, read_memory)
     }
     /// The operation memory of one custody read: its own control is admitted
     /// to the reader before the shared owner exists.
     fn custody_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Arc<crate::read_image_memory::ImageMemory>> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<crate::read_image_memory::ImageMemoryHandle> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         crate::read_image_memory::ImageMemory::operation_reader(
             self.accountant.clone(),
             read_memory,
@@ -877,15 +887,17 @@ impl Database {
         &self,
         at: CustodyRoot,
         selectors: &[S],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let memory = self.custody_read_memory(read_memory)?;
         self.custody_select_at(at, memory, selectors)
     }
     fn custody_select_at<S: AsRef<str>>(
         &self,
         at: CustodyRoot,
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         selectors: &[S],
     ) -> Result<crate::custody::store::AdmittedRecords> {
         self.with_custody_store_at(at, |store| {
@@ -922,8 +934,10 @@ impl Database {
     pub(crate) fn custody_table(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let memory = self.custody_read_memory(read_memory.clone())?;
         self.with_custody_store(|store| {
             let records = store.select_table(table, memory.clone(), self)?;
@@ -934,8 +948,10 @@ impl Database {
     pub(crate) fn custody_rows(
         &self,
         rows: &[crate::custody::records::RowRef],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let memory = self.custody_read_memory(read_memory.clone())?;
         self.with_custody_store(|store| {
             let records = store.select_rows(rows, memory.clone(), self)?;
@@ -945,8 +961,10 @@ impl Database {
     }
     pub(crate) fn custody_authority(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.custody_records_in_at(
             CustodyRoot::Operation,
             &["@authority", "@policies"],
@@ -956,8 +974,10 @@ impl Database {
     pub(crate) fn custody_submission(
         &self,
         submission: uuid::Uuid,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.custody_records_in_at(
             CustodyRoot::Operation,
             &[crate::custody::store::Selector::submission(submission)?],
@@ -967,8 +987,10 @@ impl Database {
     pub(crate) fn custody_root(
         &self,
         root: &crate::custody::records::RowRef,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::store::{AdmittedVec, Selector, render_row_group};
         // The root group's name, rendered into an admitted buffer.
         let memory = self.custody_read_memory(read_memory.clone())?;
@@ -1003,8 +1025,10 @@ impl Database {
     }
     pub(crate) fn custody_pending_manifests(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::custody::store::AdmittedRecords> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let memory = self.custody_read_memory(read_memory)?;
         self.with_custody_store(|store| store.pending(memory, self))
     }
@@ -1013,8 +1037,10 @@ impl Database {
         &self,
         receipt: &SyncApplyReceipt,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_sync_apply_receipt_only(receipt, vector_copy_owner, read_memory.clone())?;
         if self.persistence.is_none() {
             let key = Self::applied_push_watermark_node_incarnation_key(
@@ -1045,8 +1071,10 @@ impl Database {
         ddl: Option<&crate::protocol::ReceivedDdlContext>,
         dependency_complete: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let frontier = self
             .persisted_sync_applied_push_watermark_for_node_incarnation_with_read_memory(
                 tenant,
@@ -1079,8 +1107,10 @@ impl Database {
         &self,
         reference: &crate::custody::records::RowRef,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Custody digests cover every committed column, so a file-backed
         // writer's paged-out bodies are read back for the row it hands on.
         let Some(mut row) = self.visible_row_by_natural_key(
@@ -1110,8 +1140,10 @@ impl Database {
         &self,
         ws: &mut WriteSet,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<crate::custody::store::CustodyCharge>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::records::RowRef;
         use crate::custody::store::{AdmittedVec, Selector, render_row_group};
         if ws.relational_deletes.is_empty() {
@@ -1299,8 +1331,10 @@ impl Database {
         &self,
         ws: &mut WriteSet,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::{canonical::hex, records::RowRef};
         if ws.relational_deletes.is_empty() {
             return Ok(());
@@ -1403,8 +1437,10 @@ impl Database {
         &self,
         original: &OwnedMemoryReservation,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::{BorrowedHex, OwnedPreparationValue};
         use crate::custody::records::RowRef;
         use crate::custody::canonical::{finite_bytes_owned, prepare_string_owned};
@@ -1488,9 +1524,11 @@ impl Database {
     pub(super) fn prepare_custody_commit(
         &self,
         ws: &mut WriteSet,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         retired: &mut Vec<crate::custody::store::CustodyCharge>,
     ) -> Result<Option<CustodyDelta>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[cfg(feature = "test-seams")]
         if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) {
             return Ok(None);
@@ -1529,7 +1567,7 @@ impl Database {
         );
         #[cfg(feature = "test-seams")]
         let memory = match CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
-            Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit)),
+            Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit))?,
             None => memory,
         };
         #[cfg(feature = "test-seams")]
@@ -1543,8 +1581,10 @@ impl Database {
         host: &EngineDatabaseTransactions,
         original: &OwnedMemoryReservation,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<CustodyDelta>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         crate::memory_accounting::validate_owned_original(original, &self.finalization.accountant, &host.funder)?;
         #[cfg(feature = "test-seams")]
         if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) { return Ok(None); }
@@ -1557,7 +1597,7 @@ impl Database {
                 crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), projection.read_budget()?)?;
             #[cfg(feature = "test-seams")]
             let memory = match CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
-                Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit)), None => memory,
+                Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit))?, None => memory,
             };
             #[cfg(feature = "test-seams")]
             {
@@ -1572,7 +1612,7 @@ impl Database {
         &self,
         writes: &[(String, Vec<u8>)],
         deletes: &[String],
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Option<CustodyDelta>> {
         let (records, retained, tenant_growth, publication) =
             self.with_custody_store_at(CustodyRoot::Latest, |store| {
@@ -1746,7 +1786,7 @@ fn custody_record_matches_group(db: &Database, record: &Record, group: &str) -> 
 // the decoded/row payload before returning that credit, including unwind.
 struct SelectedCustodyRecord {
     record: Record,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 }
 struct SelectedCustodyRow {
     row: Option<VersionedRow>,

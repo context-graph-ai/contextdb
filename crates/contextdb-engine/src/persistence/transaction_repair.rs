@@ -24,10 +24,7 @@ impl RedbPersistence {
             .try_fold(TxId(0), |previous, tx| (tx >= previous).then_some(tx))
             .is_none()
         {
-            return Err(Error::StoreCorrupted {
-                path: self.path.display().to_string(),
-                reason: "commit index assigns one transaction to disjoint commit ranges".into(),
-            });
+            return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "commit index assigns one transaction to disjoint commit ranges".into()));
         }
         let remap = |tx: &mut TxId| {
             if let Some(value) = mapping.get(tx) {

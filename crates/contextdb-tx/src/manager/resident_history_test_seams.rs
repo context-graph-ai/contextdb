@@ -12,7 +12,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     #[doc(hidden)]
     pub fn visit_captured_read_memory_for_test(
         &self,
-        visit: impl FnOnce(&std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
+        visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner),
     ) {
         if let CommitHistoryCapability::Captured {
             image_read_memory, ..

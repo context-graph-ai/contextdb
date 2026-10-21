@@ -11,7 +11,10 @@ mod custody_remainder;
 mod custody_store;
 #[cfg(feature = "test-seams")]
 pub use custody_store::HeldCustodyRootForTest;
+use contextdb_core::read_memory::ReadMemoryBudget as _;
 mod erasure_frontiers;
+mod schema_history_memory;
+use schema_history_memory::{PreparedSchemaHistory, SchemaHistoryMemory};
 mod graph_cursor_claims;
 mod maintenance_frontier;
 use erasure_frontiers::MemoryErasureFrontiers;
@@ -9388,8 +9391,10 @@ pub(crate) struct AuthoredRowShape {
 }
 impl AuthoredRowShape {
     fn prepare(meta: &TableMeta,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Arc<Self>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let credit = contextdb_core::read_memory::ReadCredit::try_new(
             owner,
             meta.estimated_bytes().saturating_mul(2)
@@ -9412,6 +9417,7 @@ impl std::ops::Deref for AuthoredRowShape {
 /// only memory replacement after that durability succeeds.
 #[allow(dead_code)]
 pub(crate) struct ReceivedSchemaStage {
+    memory_history: Option<PreparedSchemaHistory>,
     custody_memory: Option<custody_store::CustodyDelta>,
     source_order: Vec<ReceivedSchemaOrderEntry>,
     relational: Vec<TableProjection>,
@@ -9825,6 +9831,7 @@ type DdlGenerationValue = (Option<String>, Option<u64>);
 /// carries no sync receipts or lineage adjudication: it is solely the
 /// durable-before-memory hand-off for SQL BEGIN/COMMIT DDL.
 pub(crate) struct LocalSchemaStage {
+    memory_history: Option<PreparedSchemaHistory>,
     relational: Vec<TableProjection>,
     affected_tables: HashSet<String>,
     dag_edge_types: PreparedDagEdgeTypes,
@@ -10231,12 +10238,12 @@ struct DurablePolicyHold {
 /// A selected collection keeps its admission until its last consumer finishes.
 struct ScopedPolicyHolds {
     entries: Vec<(String, DurablePolicyHold)>,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 }
 
 struct ScopedPolicyHoldReleases {
     entries: Vec<(String, DurablePolicyHoldRelease)>,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 }
 
 /// Committed alongside the exact accepted schema correction. A stale hold
@@ -10536,7 +10543,7 @@ impl Drop for TemporaryMemoryReservation {
 /// bill for good. This guard returns it on every such exit; `transfer`
 /// hands it over once the store holding the object will release it instead.
 struct StagedCopyCharge {
-    vector_accountant: std::mem::ManuallyDrop<Arc<dyn contextdb_vector::MemoryBudget>>,
+    vector_accountant: std::mem::ManuallyDrop<contextdb_vector::MemoryBudgetOwner>,
     accountant: std::mem::ManuallyDrop<crate::memory_accounting::AccountantHandle>,
     bytes: usize,
     _writer_use: std::mem::ManuallyDrop<Option<crate::memory_accounting::WriterUse>>,
@@ -10547,7 +10554,7 @@ struct StagedCopyCharge {
 impl StagedCopyCharge {
     fn admit(
         accountant: &crate::memory_accounting::AccountantHandle,
-        vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        vector_accountant: contextdb_vector::MemoryBudgetOwner,
         bytes: usize,
         operation: &'static str,
     ) -> Result<Self> {
@@ -10566,7 +10573,7 @@ impl StagedCopyCharge {
     fn admit_for_host(
         host: &DatabaseTransactionHost,
         accountant: &crate::memory_accounting::AccountantHandle,
-        vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        vector_accountant: contextdb_vector::MemoryBudgetOwner,
         bytes: usize, operation: &'static str,
     ) -> Result<Self> {
         match host {
@@ -10591,7 +10598,7 @@ impl StagedCopyCharge {
     /// The caller removes that exact body before constructing this invoice;
     /// its replacement cannot release/re-admit these still-live bytes.
     fn take_admitted(accountant: &crate::memory_accounting::AccountantHandle,
-        vector_accountant: Arc<dyn contextdb_vector::MemoryBudget>, bytes: usize) -> Self {
+        vector_accountant: contextdb_vector::MemoryBudgetOwner, bytes: usize) -> Self {
         use std::mem::ManuallyDrop;
         Self {
             vector_accountant: ManuallyDrop::new(vector_accountant),
@@ -10623,8 +10630,8 @@ impl StagedCopyCharge {
 }
 
 impl contextdb_vector::PrepaidVectorCopyCharge for StagedCopyCharge {
-    fn accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> {
-        Arc::clone(&self.vector_accountant)
+    fn accountant(&self) -> contextdb_vector::MemoryBudgetOwner {
+        contextdb_vector::MemoryBudgetOwner::clone(&self.vector_accountant).into()
     }
 
     fn retained_bytes(&self) -> usize {
@@ -10706,7 +10713,7 @@ struct ReceivedStagingAccess {
     miss: std::mem::ManuallyDrop<Mutex<Option<ReceivedStagingMiss>>>,
     _charge: std::mem::ManuallyDrop<StagedCopyCharge>,
     _writer_use: std::mem::ManuallyDrop<Option<crate::memory_accounting::WriterUse>>,
-    vector_accountant: std::mem::ManuallyDrop<Arc<dyn contextdb_vector::MemoryBudget>>,
+    vector_accountant: std::mem::ManuallyDrop<contextdb_vector::MemoryBudgetOwner>,
     own_control: Option<crate::memory_accounting::ControlCredit>,
 }
 
@@ -10730,7 +10737,7 @@ impl ReceivedStagingAccess {
             + 256;
         let charge = StagedCopyCharge::admit(
             &source.accountant,
-            Arc::clone(&source.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&source.finalization.vector_accountant),
             bytes,
             "stage_received_table_accesses",
         )?;
@@ -10746,9 +10753,7 @@ impl ReceivedStagingAccess {
             miss: ManuallyDrop::new(Mutex::new(None)),
             _charge: ManuallyDrop::new(charge),
             _writer_use: ManuallyDrop::new(writer_use),
-            vector_accountant: ManuallyDrop::new(Arc::clone(
-                &source.finalization.vector_accountant,
-            )),
+            vector_accountant: ManuallyDrop::new(contextdb_vector::MemoryBudgetOwner::clone(&source.finalization.vector_accountant)),
             own_control: None,
         };
         let layout = crate::memory_accounting::writer_adapter_layout(&value);
@@ -10772,7 +10777,7 @@ impl ReceivedStagingAccess {
         *miss = Some(
             match StagedCopyCharge::admit(
                 &self.accountant,
-                Arc::clone(&self.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.vector_accountant),
                 table.len() + 128,
                 "stage_received_table_miss",
             ) {
@@ -12219,9 +12224,9 @@ fn executed_auto_fallback(
     partition_routes: &[VectorPartitionSearchTrace],
     fallback_reason: Option<&'static str>,
     filtered_exact: bool,
-) -> Option<String> {
+) -> Option<&'static str> {
     if filtered_exact {
-        return Some("filtered_route_exact".to_owned());
+        return Some("filtered_route_exact");
     }
     let mut first = None;
     let mut differs = false;
@@ -12236,9 +12241,9 @@ fn executed_auto_fallback(
         }
     }
     match (first, differs) {
-        (Some(_), true) => Some("mixed_partition_routes".to_owned()),
-        (Some(reason), false) => Some(reason.to_owned()),
-        (None, _) => fallback_reason.map(str::to_owned),
+        (Some(_), true) => Some("mixed_partition_routes"),
+        (Some(reason), false) => Some(reason),
+        (None, _) => fallback_reason,
     }
 }
 
@@ -12260,7 +12265,7 @@ pub struct ExplainOutput {
 pub struct RetainedVectorSearchTrace {
     trace: VectorSearchDebugTrace,
     owner: contextdb_vector::VectorCopyAdmission,
-    executing_owner: Arc<dyn contextdb_vector::MemoryBudget>,
+    executing_owner: contextdb_vector::MemoryBudgetOwner,
 }
 impl std::ops::Deref for RetainedVectorSearchTrace {
     type Target = VectorSearchDebugTrace;
@@ -12279,8 +12284,10 @@ impl RetainedVectorSearchTrace {
     }
     fn from_owned(
         trace: contextdb_vector::mem::OwnedVectorSearchTrace,
-        executing_owner: Arc<dyn contextdb_vector::MemoryBudget>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<Self> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
         let (trace, credit) = trace.into_prepaid(&executing_owner)?;
         let owner =
             contextdb_vector::VectorCopyAdmission::from_prepaid(executing_owner.clone(), credit)?;
@@ -12322,8 +12329,10 @@ impl RetainedVectorSearchTrace {
     }
     fn new(
         trace: VectorSearchDebugTrace,
-        executing_owner: Arc<dyn contextdb_vector::MemoryBudget>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<Self> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
         let owner = contextdb_vector::VectorCopyAdmission::new(executing_owner.clone());
         let mut retained = Self {
             trace,
@@ -12372,8 +12381,10 @@ pub struct VectorSearchTraceObservation {
 impl VectorSearchTraceObservation {
     fn copy_from(
         trace: &contextdb_vector::mem::OwnedVectorSearchTrace,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let bytes =
             std::mem::size_of::<Self>()
                 .saturating_add(trace.index().table.len())
@@ -12448,7 +12459,9 @@ pub struct QueryTrace {
     pub indexes_considered: smallvec::SmallVec<[IndexCandidate; 4]>,
     pub sort_elided: bool,
     pub query_vector_source: Option<contextdb_core::types::VectorIndexRef>,
-    pub vector_search: Option<VectorSearchDisclosure>,
+    /// Executed vector metadata is absent for ordinary queries. Its owning
+    /// allocation is admitted by the executing reader before construction.
+    pub vector_search: Option<Box<VectorSearchDisclosure>>,
     pub rows_examined: u64,
     /// Which route a `COUNT(*)` over an exact index prefix actually took, and
     /// — when the shape was eligible but this table declares no maintained
@@ -12456,7 +12469,8 @@ pub struct QueryTrace {
     /// `None` for every statement that is not such a count.
     /// Boxed because it is `None` for all but an exact index-prefix
     /// `COUNT(*)`, while `QueryTrace` itself is carried BY VALUE inside
-    /// `QueryResult` through every recursive layer of `execute_plan_once`.
+    /// the private execution payload through every recursive layer of
+    /// `execute_plan_once`; the public `QueryResult` shares its frozen payload.
     /// That frame is ~252 KiB per plan layer, so a 2 MiB thread holds only a
     /// handful of layers and each inline byte here is paid many times over by
     /// a deep statement. See the four-CTE stack regression,
@@ -12481,59 +12495,10 @@ pub struct CascadeReport {
     pub dropped_indexes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
-    pub rows_affected: u64,
-    pub trace: QueryTrace,
-    pub cascade: Option<CascadeReport>,
-}
-
-/// Internal answer ownership retained through execution and publication.
-#[derive(Debug)]
-pub(crate) struct OwnedQueryResult {
-    pub(crate) result: QueryResult,
-    pub(crate) answer_charge: crate::read_image_memory::AnswerCharge,
-    pub(crate) vector_copy_charge: crate::read_image_memory::AnswerCharge,
-    pub(crate) retained_read_memory: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
-}
-
-impl OwnedQueryResult {
-    pub(crate) fn new(result: QueryResult) -> Self {
-        Self {
-            result,
-            answer_charge: Default::default(),
-            vector_copy_charge: Default::default(),
-            retained_read_memory: None,
-        }
-    }
-
-    pub(crate) fn empty() -> Self {
-        Self::new(QueryResult::empty())
-    }
-
-    pub(crate) fn empty_with_affected(rows_affected: u64) -> Self {
-        Self::new(QueryResult::empty_with_affected(rows_affected))
-    }
-
-    pub(crate) fn into_public(self) -> QueryResult {
-        self.result
-    }
-}
-
-impl std::ops::Deref for OwnedQueryResult {
-    type Target = QueryResult;
-    fn deref(&self) -> &QueryResult {
-        &self.result
-    }
-}
-
-impl std::ops::DerefMut for OwnedQueryResult {
-    fn deref_mut(&mut self) -> &mut QueryResult {
-        &mut self.result
-    }
-}
+#[path = "database/query_result.rs"]
+mod query_result;
+pub use query_result::QueryResult;
+pub(crate) use query_result::{OwnedQueryResult, QueryResultData};
 
 /// Report returned by [`Database::export_snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -12672,9 +12637,11 @@ impl SnapshotInspector {
 
     pub fn open(
         artifact: impl AsRef<Path>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     ) -> Result<Self> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let artifact = artifact.as_ref();
         if !artifact.is_file() {
             return Err(Error::Other((format!(
@@ -12720,8 +12687,10 @@ impl SnapshotInspector {
         table: &str,
         natural_key: &NaturalKey,
         columns: &[String],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<KeyInspection> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if columns.len() > Self::MAX_INSPECTED_COLUMNS
             || columns
                 .iter()
@@ -12787,10 +12756,7 @@ impl SnapshotInspector {
                     window
                         .position()
                         .try_into()
-                        .map_err(|_| Error::StoreCorrupted {
-                            path: table.to_string(),
-                            reason: "snapshot row has an invalid physical version key".into(),
-                        })?;
+                        .map_err(|_| crate::funded_error::corruption_text(Ok(read_memory.clone()), table, "snapshot row has an invalid physical version key".into()))?;
                 selected.insert((row.lsn, row.created_tx, row.row_id), key);
                 if selected.len() > Self::MAX_RETAINED_VERSIONS {
                     selected.pop_first();
@@ -12807,10 +12773,7 @@ impl SnapshotInspector {
                 table,
                 &key,
             )?;
-            let window = cursor.next_row()?.ok_or_else(|| Error::StoreCorrupted {
-                path: table.to_string(),
-                reason: "snapshot key inspection is missing a selected saved version".into(),
-            })?;
+            let window = cursor.next_row()?.ok_or_else(|| crate::funded_error::corruption_text(Ok(read_memory.clone()), table, "snapshot key inspection is missing a selected saved version".into()))?;
             let row = &window.value;
             let values = columns
                 .iter()
@@ -13279,7 +13242,7 @@ struct AuthoritativePurgePreparedSet {
     durable_sink_entries: Vec<AuthoritativePurgeSinkEntryKey>,
     /// Writer charge for the selected sink entries and their durable
     /// projection, held until the purge is done with them.
-    _sink_projection_charge: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    _sink_projection_charge: Option<crate::read_image_memory::ImageMemoryHandle>,
     graph_arrival_config_keys: Vec<String>,
     publication_replacements: AuthoritativePurgePublicationReplacements,
     survivor_report: OwnedQueryResult,
@@ -13829,8 +13792,8 @@ impl Drop for QueryRowsExaminedScope<'_> {
     }
 }
 
-impl QueryResult {
-    pub fn empty() -> Self {
+impl QueryResultData {
+    pub(crate) fn empty() -> Self {
         Self {
             columns: vec![],
             rows: vec![],
@@ -13840,7 +13803,7 @@ impl QueryResult {
         }
     }
 
-    pub fn empty_with_affected(rows_affected: u64) -> Self {
+    pub(crate) fn empty_with_affected(rows_affected: u64) -> Self {
         Self {
             columns: vec![],
             rows: vec![],
@@ -14802,10 +14765,12 @@ impl DatabaseTransactionHost {
 
     fn with_original_maintenance_publication<R>(
         &self,
+        original: &OwnedMemoryReservation,
         f: impl for<'guard> FnOnce(
             &mut contextdb_tx::manager::MaintenancePublication<'guard, DynStore>,
         ) -> crate::funded_error::OriginalResult<R>,
     ) -> crate::funded_error::OriginalResult<R> {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         self.with_maintenance_publication(|publication| {
             let result = f(publication);
             // The lower Error-only adapter checks success before it destroys
@@ -14814,7 +14779,7 @@ impl DatabaseTransactionHost {
             // No Error/diagnosis is extracted or replaced with a marker.
             if result.is_err() { publication.abandon(); }
             Ok(result)
-        }).map_err(crate::funded_error::OriginalError::unqualified)?
+        }).map_err(|error| diagnostic.error(error))?
     }
 
     fn commit_boundary_held_by_current_thread(&self) -> bool {
@@ -15071,7 +15036,7 @@ impl DatabaseTransactionHost {
     fn commit_with_reserved_lsn_callback_mut<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: F,
         prepare: G,
     ) -> std::result::Result<(Lsn, WriteSet), contextdb_tx::manager::CommitFailure>
@@ -15079,6 +15044,8 @@ impl DatabaseTransactionHost {
         F: FnOnce(Lsn) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match self {
             Self::Legacy(manager) => manager.commit_with_reserved_lsn_callback_mut(
                 tx,
@@ -15096,7 +15063,7 @@ impl DatabaseTransactionHost {
     fn commit_with_lsn_precanonicalized_active_prepare_and_applied_mut<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: F,
         prepare: G,
@@ -15106,6 +15073,8 @@ impl DatabaseTransactionHost {
         F: FnOnce(Lsn, TxId) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match self {
             Self::Legacy(manager) => manager
                 .commit_with_lsn_precanonicalized_active_prepare_and_applied_mut(
@@ -15129,7 +15098,7 @@ impl DatabaseTransactionHost {
         &self,
         tx: TxId,
         positions: u64,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         active_prepare: F,
         prepare_legacy: G,
         prepare_owned: H,
@@ -15140,6 +15109,8 @@ impl DatabaseTransactionHost {
         G: FnOnce(&mut WriteSet) -> Result<()>,
         H: FnOnce(&EngineDatabaseTransactions, &mut contextdb_tx::manager::EngineGuard<'_>) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match self {
             Self::Legacy(manager) => manager
                 .commit_with_private_lsn_interval_active_prepare_and_applied_mut(
@@ -15254,8 +15225,10 @@ impl DatabaseTransactionHost {
         &self,
         store: Arc<VectorStore>,
         hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> MemVectorExecutor<DynStore> {
+        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
+
         match self {
             Self::Legacy(manager) => {
                 MemVectorExecutor::new_with_accountant(store, manager.clone(), hnsw, accountant)
@@ -15345,7 +15318,7 @@ impl DatabaseTransactionHost {
     #[cfg(any(test, feature = "test-seams"))]
     fn visit_captured_read_memory_for_test(
         &self,
-        visit: impl FnOnce(&Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
+        visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner),
     ) {
         match self {
             Self::Legacy(manager) => manager.visit_captured_read_memory_for_test(visit),
@@ -15464,9 +15437,9 @@ pub struct Database {
     image_history: Option<Arc<ImageHistory>>,
     /// Descriptor-backed relational pages for a committed image whose rows
     /// were deliberately left out of memory at open.
-    retained_relational_source: Option<Arc<crate::persistence::RetainedReadSource>>,
+    retained_relational_source: Option<crate::persistence::RetainedReadSource>,
     /// The sealed graph root is retained on both relational loading routes.
-    retained_graph_source: Option<Arc<crate::persistence::RetainedReadSource>>,
+    retained_graph_source: Option<crate::persistence::RetainedReadSource>,
     /// Engine-owned media repository. File-backed databases share their
     /// existing Redb; memory databases own a temporary file-backed Redb so
     /// large media never becomes process-resident merely because rows do.
@@ -15539,7 +15512,7 @@ pub struct Database {
     owner_thread: thread::ThreadId,
     plugin: Arc<dyn DatabasePlugin>,
     owner_read_config: Arc<OwnerReadConfig>,
-    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+    declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     /// The live owner-inspection service this open started, when it started
     /// one. It holds a shared handle onto the same stores rather than this
     /// value, so releasing the database releases the service with it.
@@ -15744,7 +15717,7 @@ pub struct Database {
     handle_role: HandleRole,
     // Payload fields retire before this image admission. Finalization follows
     // it, retaining the source through all payload and image cleanup.
-    read_image_memory: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    read_image_memory: Option<crate::read_image_memory::ImageMemoryHandle>,
     /// Shared by every handle on this store: how many holders are still live,
     /// and what the owner left for the last of them to release.
     finalization: Arc<StoreFinalization>,
@@ -16216,7 +16189,7 @@ impl EngineDatabaseTransactions {
     fn commit_terminal(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl FnOnce(Lsn, TxId) -> Result<()>,
         prepare: impl for<'g, 'h, 'p> FnOnce(
@@ -16225,6 +16198,8 @@ impl EngineDatabaseTransactions {
         ) -> Result<()>,
         after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
     ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.transactions.with_transactions(|lower| {
             lower.commit_owned_active_prepare_and_applied_with_peer(
                 tx,
@@ -16242,13 +16217,15 @@ impl EngineDatabaseTransactions {
     fn commit_reserved_terminal(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: impl FnOnce(Lsn) -> Result<()>,
         prepare: impl for<'g, 'h, 'p> FnOnce(
             &'g mut contextdb_tx::manager::EngineGuard<'h>,
             &'p mut OwnedTerminalMetadata,
         ) -> Result<()>,
     ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let identity = std::cell::Cell::new(None);
         self.with_terminal_apply_scope(|| self.transactions.with_transactions(|lower| {
             lower.commit_owned_with_reserved_lsn_callback_with_peer(
@@ -16323,7 +16300,7 @@ impl EngineDatabaseTransactions {
         &self,
         database: &Database,
         tx: TxId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl FnOnce(
             &DatabaseCommitScope<'_, '_, '_>,
@@ -16337,6 +16314,8 @@ impl EngineDatabaseTransactions {
         ) -> Result<()>,
         after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
     ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Lend the actual immutable original before any commit/state/peer
         // guard. The coordinator orders source pruning and independently
         // funded config stamping before its final validation and hooks.
@@ -16366,7 +16345,7 @@ impl EngineDatabaseTransactions {
         &self,
         tx: TxId,
         positions: u64,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl FnOnce(
             &DatabaseCommitScope<'_, '_, '_>,
@@ -16381,6 +16360,8 @@ impl EngineDatabaseTransactions {
         ) -> Result<()>,
         after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
     ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_interval_terminal_scoped_if(tx,positions,read_memory,||Ok(true),
             requires_commit,active_prepare,prepare,after_apply)
             .map(|result|result.expect("unconditional engine terminal preflight"))
@@ -16391,7 +16372,7 @@ impl EngineDatabaseTransactions {
         &self,
         tx: TxId,
         positions: u64,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         preflight: impl FnOnce() -> Result<bool>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl FnOnce(
@@ -16407,6 +16388,8 @@ impl EngineDatabaseTransactions {
         ) -> Result<()>,
         after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
     ) -> std::result::Result<Option<(Lsn, OwnedDatabaseTerminal)>, OwnedDatabaseTerminalFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let result = self.with_terminal_apply_scope(|| self.transactions.with_transactions(|lower| {
             lower.commit_owned_private_lsn_interval_with_peer_scoped_if(
                 tx,
@@ -16455,13 +16438,15 @@ impl EngineDatabaseTransactions {
     fn commit_reserved_terminal_scoped(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: impl FnOnce(&DatabaseCommitScope<'_, '_, '_>, Lsn) -> PreparationResult<()>,
         prepare: impl for<'g, 'h, 'p> FnOnce(
             &'g mut contextdb_tx::manager::EngineGuard<'h>,
             &'p mut OwnedTerminalMetadata,
         ) -> Result<()>,
     ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let result = self.with_terminal_apply_scope(|| self.transactions.with_transactions(|lower| {
             lower.commit_owned_with_reserved_lsn_callback_with_peer_scoped(
                 tx,
@@ -17442,12 +17427,14 @@ impl DatabaseCommitScope<'_, '_, '_> {
         inputs: ReceivedSchemaAdjudicationInputs<'_>,
         delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedSchemaStage> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_received_schema_stage_in(
             database, events, local_lsn, coordinates, changes, received, validated_lineages,
             inputs, delivery_prepare, vector_copy_owner, read_memory,
-            crate::persistence::received_working::ReceivedWorkingWrite::begin)
+            crate::persistence::received_working::ReceivedWorkingWrite::begin, |error| error)
     }
     fn prepare_received_schema_stage_funded(
         &self,
@@ -17461,14 +17448,17 @@ impl DatabaseCommitScope<'_, '_, '_> {
         inputs: ReceivedSchemaAdjudicationInputs<'_>,
         delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> crate::funded_error::OriginalResult<ReceivedSchemaStage> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(&events.data().original)?;
         self.prepare_received_schema_stage_in(
             database, events, local_lsn, coordinates, changes, received, validated_lineages,
             inputs, delivery_prepare, vector_copy_owner, read_memory,
-            crate::persistence::received_working::ReceivedWorkingWrite::begin_funded)
+            crate::persistence::received_working::ReceivedWorkingWrite::begin_funded, |error| diagnostic.error(error))
     }
-    fn prepare_received_schema_stage_in<E: From<Error>>(
+    fn prepare_received_schema_stage_in<E>(
         &self,
         database: &Database,
         events: &event_bus::OwnedEventBusHandle,
@@ -17480,13 +17470,16 @@ impl DatabaseCommitScope<'_, '_, '_> {
         inputs: ReceivedSchemaAdjudicationInputs<'_>,
         delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         begin: impl FnOnce(&RedbPersistence, &OwnedMemoryReservation)
             -> std::result::Result<crate::persistence::received_working::ReceivedWorkingWrite, E>,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<ReceivedSchemaStage, E> {
-        database.validate_owned_received_event_host(events,self.host)?;
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        database.validate_owned_received_event_host(events,self.host).map_err(&existing)?;
         if !self.host.events.downgrade().matches(events) {
-            return Err(E::from(Error::Other("received preparation requires the host's original event companion".into())));
+            return Err(existing(Error::Other("received preparation requires the host's original event companion".into())));
         }
         // The seed loan remains Error-only. Its success value carries the
         // entire private result, so callback return never extracts custody.
@@ -17497,19 +17490,19 @@ impl DatabaseCommitScope<'_, '_, '_> {
             let mut working = database.persistence.as_ref().map(|persistence|
                 begin(persistence, original))
                 .transpose()?;
-            if let Some(write) = working.as_mut() { write.retain_original_owner(events)?; }
+            if let Some(write) = working.as_mut() { write.retain_original_owner(events).map_err(&existing)?; }
             let loan = working.as_ref().zip(database.persistence.as_ref()).map(|(write, store)|
                 ReceivedWorkingPreparation { write, original, funder: &self.host.funder, store });
             let mut stage = database.prepare_received_schema_stage_with_interval(
                 local_lsn, coordinates, changes, received, validated_lineages, inputs,
-                delivery_prepare, vector_copy_owner, read_memory, Some(original), loan.as_ref())?;
+                delivery_prepare, vector_copy_owner, read_memory, Some(original), loan.as_ref()).map_err(&existing)?;
             if !stage.trigger_audits.is_empty() {
                 stage.native_audit_memory = Some(database.prepare_original_audit_memory_iter(original,
-                    stage.trigger_audits.iter().map(|(_, entry)| entry))?);
+                    stage.trigger_audits.iter().map(|(_, entry)| entry)).map_err(&existing)?);
             }
             *stage.durable_projection.working_write.get_mut() = working;
             Ok(stage)
-        })())).map_err(E::from)?
+        })())).map_err(&existing)?
     }
 
     #[allow(
@@ -18685,7 +18678,7 @@ impl<T: contextdb_tx::WriteSetApplicator> contextdb_tx::WriteSetApplicator for A
     fn apply(
         &self,
         ws: &contextdb_tx::WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         self.payload.apply(ws, read_memory)
     }
@@ -18762,7 +18755,7 @@ impl OwnedPersistentDynStore {
     }
 }
 impl WriteSetApplicator for OwnedPersistentDynStore {
-    fn apply(&self, ws: &WriteSet, memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+    fn apply(&self, ws: &WriteSet, memory: contextdb_core::read_memory::ReadMemoryOwner) -> Result<()> {
         self.payload.apply(ws, memory)
     }
     fn new_row_id(&self) -> RowId { self.payload.new_row_id() }
@@ -18808,7 +18801,7 @@ impl OwnedMemoryDynStore {
 }
 impl WriteSetApplicator for OwnedMemoryDynStore {
     fn apply(&self, ws: &WriteSet,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        memory: contextdb_core::read_memory::ReadMemoryOwner) -> Result<()> {
         crate::persistent_store::apply_owned_memory_store(&self.payload, &self.events, ws, memory)
     }
     fn new_row_id(&self) -> RowId { self.payload.new_row_id() }
@@ -18827,13 +18820,16 @@ impl WriteSetApplicator for OwnedMemoryDynStore {
 /// holder turns out to be the last one pays it out on the way down.
 pub(crate) struct StoreFinalization {
     live_holders: AtomicUsize,
+    loaded_history: Mutex<Option<LoadedHistoryBuffers>>,
+    local_policy_metadata_enabled: AtomicBool,
+    schema_history_memory: std::mem::ManuallyDrop<Mutex<Option<SchemaHistoryMemory>>>,
     pending: std::mem::ManuallyDrop<Mutex<Option<PendingStoreRelease>>>,
     vector: std::mem::ManuallyDrop<Arc<VectorStore>>,
     accountant: std::mem::ManuallyDrop<crate::memory_accounting::AccountantHandle>,
     non_vector_memory: std::mem::ManuallyDrop<Mutex<Option<RetainedNonVectorMemoryOwner>>>,
     staged_posting_admission:
         std::mem::ManuallyDrop<Arc<writer_read::WriterStagedPostingAdmission>>,
-    vector_accountant: std::mem::ManuallyDrop<Arc<dyn contextdb_vector::MemoryBudget>>,
+    vector_accountant: std::mem::ManuallyDrop<contextdb_vector::MemoryBudgetOwner>,
     _writer_use: std::mem::ManuallyDrop<Option<crate::memory_accounting::WriterUse>>,
     control: Option<crate::memory_accounting::ControlCredit>,
 }
@@ -19022,12 +19018,15 @@ impl StoreFinalization {
         budget: DatabaseAssemblyBudget,
     ) -> Result<Arc<Self>> {
         use std::mem::ManuallyDrop;
-        let (accountant, writer_use, vector_accountant) = budget.into_accountant();
+        let (accountant, writer_use, vector_accountant) = budget.into_accountant()?;
         let provider = writer_read::WriterStagedPostingAdmission::prepare(accountant.clone())?;
         let non_vector_memory =
             RetainedNonVectorMemoryOwner::new(relational, graph, accountant.clone());
         let mut value = Self {
             live_holders: AtomicUsize::new(1),
+            loaded_history: Mutex::new(None),
+            local_policy_metadata_enabled: AtomicBool::new(true),
+            schema_history_memory: ManuallyDrop::new(Mutex::new(None)),
             pending: ManuallyDrop::new(Mutex::new(None)),
             vector: ManuallyDrop::new(vector),
             accountant: ManuallyDrop::new(accountant.clone()),
@@ -19070,6 +19069,10 @@ impl StoreFinalization {
                 .vector
                 .teardown_all_without_copy(self.accountant.as_ref());
             self.accountant.release(receipt.legacy_live_raw_bytes);
+            // A receipt observer is Internal and can keep this Arc alive. It
+            // must not extend history residency after the last actual reader.
+            drop(self.schema_history_memory.lock().take());
+            drop(self.loaded_history.lock().take());
             self.non_vector_memory.lock().take();
         }
         last
@@ -19092,7 +19095,7 @@ struct StoreFinalizationCleanup {
 impl StoreFinalizationCleanup {
     fn finish(&mut self) {
         use std::mem::ManuallyDrop;
-        while self.next < 9 {
+        while self.next < 10 {
             let step = self.next;
             self.next += 1;
             // Each initialized field is consumed once, before own refund.
@@ -19102,12 +19105,13 @@ impl StoreFinalizationCleanup {
                     0 => ManuallyDrop::drop(&mut (*self.source).pending),
                     1 => ManuallyDrop::drop(&mut (*self.source).vector),
                     2 => ManuallyDrop::drop(&mut (*self.source).non_vector_memory),
-                    3 => ManuallyDrop::drop(&mut (*self.source).staged_posting_admission),
-                    4 => ManuallyDrop::drop(&mut (*self.source).vector_accountant),
-                    5 => ManuallyDrop::drop(&mut (*self.source).accountant),
-                    6 => ManuallyDrop::drop(&mut (*self.source)._writer_use),
-                    7 => (),
-                    8 => drop(self.refund.take()),
+                    3 => drop((*self.source).loaded_history.get_mut().take()),
+                    4 => ManuallyDrop::drop(&mut (*self.source).schema_history_memory),
+                    5 => ManuallyDrop::drop(&mut (*self.source).staged_posting_admission),
+                    6 => ManuallyDrop::drop(&mut (*self.source).vector_accountant),
+                    7 => ManuallyDrop::drop(&mut (*self.source).accountant),
+                    8 => ManuallyDrop::drop(&mut (*self.source)._writer_use),
+                    9 => drop(self.refund.take()),
                     _ => unreachable!(),
                 }
             }
@@ -20108,8 +20112,10 @@ impl Database {
         tx: TxId,
         registration: crate::custody::preparation::SourceRegistration,
 
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             #[derive(serde::Serialize)]
             struct RegistrationInput<'a> {
@@ -20185,8 +20191,10 @@ impl Database {
         tx: TxId,
         prepare: &mut dyn crate::custody::preparation::CommitPreparation,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.tx_mgr
             .update_flags(tx, |flags| flags.requires_commit_lsn = true)?;
         self.commit_with_source_and_sync_ddl_and_trigger_audit_projection(
@@ -20211,8 +20219,10 @@ impl Database {
         previous: Incarnation,
         next: Incarnation,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::{canonical::*, preparation::*, records::*};
         let runtime = self.custody_runtime().ok_or_else(invalid)?;
         if runtime.tenant != *tenant || runtime.node != hub || self.retention_sync_peer().is_some()
@@ -20286,11 +20296,13 @@ impl Database {
         &self,
         prepare: F,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()>
     where
         F: FnOnce(Lsn) -> Result<Vec<crate::custody::records::Record>>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let tx = self.begin()?;
         let mut prepare = Some(prepare);
         self.commit_delivery_prepared(
@@ -20792,8 +20804,10 @@ struct SnapshotPinPool {
 impl SnapshotPinPool {
     fn acquire(
         self: &Arc<Self>,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<SnapshotPinSlot> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let mut available = self.available.load(Ordering::SeqCst);
         loop {
             if available == 0 {
@@ -20884,7 +20898,7 @@ impl SnapshotFloorRegistry {
 
     fn acquire_pin_slot(
         &self,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<SnapshotPinSlot> {
         self.pin_slots
             .lock()
@@ -20902,8 +20916,6 @@ impl SnapshotFloorRegistry {
 /// once the window has passed -- see [`CursorIdleWindow`].
 struct RegisteredSnapshot {
     snapshot: SnapshotId,
-    /// The caller-held pin owns this root; registration adds no strong hold.
-    pinned_root: Option<crate::persistence::WriterSnapshotWeak>,
     /// SQL statements own the rows they scan before completing the rest of
     /// their read, so retention does not let a continuous stream of those
     /// short-lived registrations pin every expired row. Reader-held
@@ -21005,26 +21017,6 @@ struct ActiveRemovalPass {
 }
 
 impl SnapshotFloorRegistry {
-    /// Borrow the already-held physical root of an exact logical snapshot.
-    /// An upgrade belongs only to the operation that requested it; the pin's
-    /// registration remains the sole discoverability entry for this root.
-    fn pinned_root(&self, snapshot: SnapshotId) -> Option<crate::persistence::WriterSnapshotHandle> {
-        self.state.lock().active.values().find_map(|registered| {
-            if registered.snapshot != snapshot || !registered.holder_still_entitled() {
-                return None;
-            }
-            // A root an authoritative erasure has since invalidated is not
-            // served: the read re-captures the committed post-erasure storage
-            // at its pinned visibility, so it finishes on its own view with
-            // the erased rows absent rather than failing.
-            registered
-                .pinned_root
-                .as_ref()?
-                .upgrade()
-                .filter(|root| root.snapshot == snapshot && !root.erased())
-        })
-    }
-
     /// Whether an in-flight removal pass must hold a registration for
     /// `snapshot` until the pass finishes.
     ///
@@ -21093,7 +21085,6 @@ impl SnapshotFloorRegistry {
                 snapshot,
                 class: SnapshotRegistrationClass::ReaderHeld,
                 idle_window: None,
-                pinned_root: None,
             },
         );
         floors.insert(partition.clone(), token);
@@ -21273,7 +21264,6 @@ impl SnapshotFloorRegistry {
                 snapshot,
                 class,
                 idle_window,
-                pinned_root: None,
             },
         );
         drop(state);
@@ -21584,6 +21574,8 @@ pub struct SnapshotPin<'a> {
     _registration: SnapshotRegistration,
     _slot: SnapshotPinSlot,
     _root: Option<crate::persistence::WriterSnapshotHandle>,
+    // Last: retain the pin's operation child through root and slot destruction.
+    _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
 }
 
 /// Whether a maintenance cycle's currency pass runs unconditionally (an
@@ -21621,7 +21613,7 @@ impl Drop for DurableRawVectorPartitionLoader {
 #[derive(Clone)]
 enum DurableRawVectorSource {
     Writable(Arc<RedbPersistence>),
-    CommittedImage(Arc<crate::persistence::RetainedReadSource>),
+    CommittedImage(crate::persistence::RetainedReadSource),
 }
 
 impl DurableRawVectorSource {
@@ -21632,13 +21624,13 @@ impl DurableRawVectorSource {
     fn vector_budget(
         &self,
         accountant: &crate::memory_accounting::AccountantHandle,
-    ) -> Result<Arc<dyn contextdb_vector::MemoryBudget>> {
+    ) -> Result<contextdb_vector::MemoryBudgetOwner> {
         if let Self::Writable(persistence) = self
             && let Some(original) = persistence.proof_accountant_handle_for(accountant)
         {
-            return original.vector_budget();
+            return original.vector_budget().map(Into::into);
         }
-        accountant.vector_budget_for_original_reader()
+        accountant.vector_budget_for_original_reader().map(Into::into)
     }
 
     fn stream_memberships<T>(
@@ -22022,7 +22014,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             entries,
             resident_bytes,
             workspace_owner,
-            accountant,
+            accountant: accountant.into(),
         })
     }
 
@@ -22210,7 +22202,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             entries,
             resident_bytes,
             workspace_owner,
-            accountant,
+            accountant: accountant.into(),
         })
     }
 
@@ -22284,7 +22276,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
 
     fn body_scan_source(&self) -> usize {
         match &self.source {
-            DurableRawVectorSource::CommittedImage(source) => Arc::as_ptr(source) as usize,
+            DurableRawVectorSource::CommittedImage(source) => source.identity(),
             DurableRawVectorSource::Writable(persistence) => Arc::as_ptr(persistence) as usize,
         }
     }
@@ -22405,8 +22397,22 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         &self,
         session: &mut contextdb_vector::store::OnePassSession,
     ) -> Option<Box<dyn std::any::Any>> {
-        // One cache-growth allowance for the whole statement's scan, however
-        // many resumed steps it takes.
+        use crate::persistence::vector_membership_source::{self, MembershipOwner};
+        let owner = match &self.source {
+            DurableRawVectorSource::Writable(source) => {
+                MembershipOwner::Writable(source.clone())
+            }
+            DurableRawVectorSource::CommittedImage(source) => {
+                MembershipOwner::Retained(source.clone())
+            }
+        };
+        if vector_membership_source::has_scan_scope_for_operation(&owner) {
+            // Preflight entered the actual operation's allowance before root
+            // capture. Its scope spans this call, including every partition.
+            return None;
+        }
+        // Legacy uncaptured callers retain their existing session semantics.
+        // This fallback does not certify their redb control backing as funded.
         let allowance = session
             .0
             .get_or_insert_with(|| Box::new(redb::ScanAllowance::new()))
@@ -22774,7 +22780,7 @@ fn durable_raw_vector_partitions(
 /// placement intervals and reverse identities remain in that pinned store.
 fn register_retained_raw_vector_partitions(
     vector: &VectorStore,
-    source: &Arc<crate::persistence::RetainedReadSource>,
+    source: &crate::persistence::RetainedReadSource,
     accountant: &crate::memory_accounting::AccountantHandle,
     copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<()> {
@@ -23054,13 +23060,10 @@ fn register_dormant_raw_vector_partitions(
     }
     for (partition, summary) in partitions {
         let Some(info) = layouts.iter().find(|info| info.index == partition.index) else {
-            return Err(Error::StoreCorrupted {
-                path: "vector_membership_summary_pages".into(),
-                reason: format!(
+            return Err(crate::funded_error::corruption_display(accountant.read_budget(), "vector_membership_summary_pages", format_args!(
                     "membership summary names undeclared vector column {}.{}",
                     partition.index.table, partition.index.column
-                ),
-            });
+                )));
         };
         let retained = vector.retained_column_copy_owner(&partition.index, copy_owner)?;
         vector.register_durable_raw_partition(
@@ -23793,13 +23796,13 @@ impl DurableVectorGenerationLoader {
         Ok(LoadedVectorGraphGeneration {
             graph,
             resident_bytes,
-            accountant: vector_accountant.clone(),
+            accountant: (vector_accountant.clone()).into(),
             caller_adopted_bytes: 0,
             fresh_tail: fresh_tail.map(|(graph, resident_bytes, replayed_through_lsn)| {
                 LoadedVectorFreshTail {
                     graph,
                     resident_bytes,
-                    accountant: vector_accountant.clone(),
+                    accountant: (vector_accountant.clone()).into(),
                     replayed_through_lsn,
                 }
             }),
@@ -23915,12 +23918,14 @@ fn paged_generation_graph_from(
     dimension: usize,
     quantization: VectorQuantization,
     layout: &VectorIndexLayout,
-    accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+    accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
     meta_bytes: &[u8],
     is_base: bool,
     base_generation_id: u64,
     base_covered: (TxId, Lsn),
 ) -> Result<HnswIndex> {
+        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
+
     use crate::persistence::vector_paged::{NativePagedGraphSource, PagedGenerationMeta};
     let mut backing_owner = contextdb_vector::VectorCopyAdmission::new(accountant.clone());
     backing_owner.reserve_for(
@@ -24436,14 +24441,14 @@ impl DurableVectorGenerationLoader {
                     LoadedVectorFreshTail {
                         graph,
                         resident_bytes,
-                        accountant: retained_accountant.clone(),
+                        accountant: (retained_accountant.clone()).into(),
                         replayed_through_lsn,
                     }
                 });
                 Ok(LoadedVectorGraphGeneration {
                     graph,
                     resident_bytes,
-                    accountant: retained_accountant.clone(),
+                    accountant: (retained_accountant.clone()).into(),
                     caller_adopted_bytes: if caller_charged { retained } else { 0 },
                     fresh_tail,
                 })
@@ -24601,7 +24606,7 @@ fn register_loaded_dormant_vector_generations(
             let step = accountant
                 .vector_budget()
                 .and_then(|budget| {
-                    vector.reserve_workspace(
+                    vector.reserve_workspace_static(
                         budget,
                         0,
                         "truncate_vector_partition_journal",
@@ -24804,23 +24809,20 @@ enum DatabaseAssemblyBudget {
 impl DatabaseAssemblyBudget {
     fn into_accountant(
         self,
-    ) -> (
+    ) -> Result<(
         crate::memory_accounting::AccountantHandle,
         Option<crate::memory_accounting::WriterUse>,
-        Arc<dyn contextdb_vector::MemoryBudget>,
-    ) {
+        contextdb_vector::MemoryBudgetOwner,
+    )> {
         match self {
             Self::Writer(budget) => {
                 let (accountant, writer_use, vector_accountant) = budget.into_parts();
-                (accountant, Some(writer_use), vector_accountant)
+                Ok((accountant, Some(writer_use), vector_accountant))
             }
-            Self::ReadImage(accountant) => (
-                accountant.clone(),
-                None,
-                accountant
-                    .standard_arc()
-                    .expect("read image retains standard Arc"),
-            ),
+            Self::ReadImage(accountant) => {
+                let vector = accountant.vector_budget_for_original_reader()?;
+                Ok((accountant, None, vector))
+            },
         }
     }
 }
@@ -25042,7 +25044,7 @@ struct RetentionDeferredEdges {
 pub(crate) struct MaintenanceContext {
     /// The store declaration, independent of a request choosing a lower limit.
     reader_memory_limit: u64,
-    read_request_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    read_request_provider: crate::vector_read_memory::ReadRequestProvider,
     #[cfg(any(test, feature = "test-seams"))]
     writer_receipt_observer: Option<Arc<Database>>,
     disk_limit: Arc<AtomicU64>,
@@ -25436,8 +25438,10 @@ impl MaintenanceContext {
         catalog: &VectorPartitionGenerationCatalogRecord,
         partition: &VectorPartitionRef,
         partition_state_present: bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         vector_source_page_admission::with_source_page_admission(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || {
@@ -25458,10 +25462,12 @@ impl MaintenanceContext {
         catalog: &VectorPartitionGenerationCatalogRecord,
         partition: &VectorPartitionRef,
         partition_state_present: bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
-        let mut cleanup_workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let mut cleanup_workspace = self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             0,
             "truncate_vector_partition_journal",
             "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before cleaning this maintained route.",
@@ -25483,8 +25489,10 @@ impl MaintenanceContext {
         partition: &VectorPartitionRef,
         partition_state_present: bool,
         cleanup_workspace: &mut contextdb_vector::VectorWorkspaceReservation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match self.truncate_vector_journal_in_published_steps(
             persistence,
             catalog,
@@ -25536,8 +25544,10 @@ impl MaintenanceContext {
 
     fn retry_vector_journal_truncations(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<VectorJournalCleanupRetryOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.build_checkpoint()?;
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(VectorJournalCleanupRetryOutcome::default());
@@ -25694,8 +25704,10 @@ impl MaintenanceContext {
     fn install_published_vector_catalog(
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.tx_mgr.with_maintenance_publication(|publication| {
             // The catalog and pending summary are already durable. New reads
             // must capture that committed storage version before using the
@@ -25711,8 +25723,10 @@ impl MaintenanceContext {
     fn install_published_vector_catalog_at_boundary(
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         // Installing a published catalog is writer work: its layout and
         // route copies are admitted by the writer, never the caller's
         // reader.
@@ -25986,8 +26000,8 @@ impl MaintenanceContext {
         // so an unwind in between leaves this handle behind its own durable
         // image, exactly as it does on the local and received doors.
         let publication_watch = std::cell::RefCell::new(None::<PublicationInterruptionWatch>);
-        let maintenance_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
-            self.finalization.accountant.read_budget()?;
+        let maintenance_read_memory: contextdb_core::read_memory::ReadMemoryOwner =
+            self.finalization.accountant.read_budget()?.into();
         let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
             tx,
             maintenance_read_memory.clone(),
@@ -26183,8 +26197,8 @@ impl MaintenanceContext {
         // so an unwind in between leaves this handle behind its own durable
         // image, exactly as it does on the local and received doors.
         let publication_watch = std::cell::RefCell::new(None::<PublicationInterruptionWatch>);
-        let maintenance_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
-            self.finalization.accountant.read_budget()?;
+        let maintenance_read_memory: contextdb_core::read_memory::ReadMemoryOwner =
+            self.finalization.accountant.read_budget()?.into();
         let result = host.commit_reserved_terminal(
             tx,
             maintenance_read_memory.clone(),
@@ -26487,8 +26501,10 @@ impl MaintenanceContext {
     /// ceiling once before its first admission.
     fn run_pruning(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PruningReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         crate::memory_accounting::observe_inherited_process_ceiling();
         self.run_pruning_within_cycle(read_memory)
     }
@@ -26496,8 +26512,10 @@ impl MaintenanceContext {
     /// Pruning under a boundary that has already observed the process ceiling.
     fn run_pruning_within_cycle(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PruningReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Nothing declares RETAIN, so there is nothing this pass could prune,
         // no fragmentation decision it could take, and no report field it could
         // fill. Bail BEFORE the commit lock and candidate selection.
@@ -26646,8 +26664,10 @@ impl MaintenanceContext {
     fn run_currency(
         &self,
         gate: CurrencyGate,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CurrencyCompactionReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let eligible = self.version_cleanup_eligible_tables();
         let tables = eligible.iter().map(String::as_str).collect::<Vec<_>>();
         if gate == CurrencyGate::Scheduled
@@ -26704,8 +26724,10 @@ impl MaintenanceContext {
     fn run_currency_for_tables(
         &self,
         tables: &[&str],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CurrencyCompactionReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Hold-only timing -- see the comment in `run_currency` above.
         self.tx_mgr.with_maintenance_publication(
             |publication| -> Result<CurrencyCompactionReport> {
@@ -26775,8 +26797,10 @@ impl MaintenanceContext {
 
     fn retire_snapshot_free_vector_partitions(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<MaintenanceMetadataFailures> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
         if !self.vector_partition_retirement_is_possible() {
@@ -26874,8 +26898,10 @@ impl MaintenanceContext {
     fn persist_built_vector_partition(
         &self,
         partition: &VectorPartitionRef,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<VectorPartitionPublicationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
         let Some(persistence) = self.persistence.as_ref() else {
@@ -26896,8 +26922,8 @@ impl MaintenanceContext {
         let mut force_paged = if self.vector.partition_route_quarantine(partition).is_some() {
             false
         } else {
-            let _workspace = self.vector.reserve_workspace(
-                Arc::clone(&self.finalization.vector_accountant),
+            let _workspace = self.vector.reserve_workspace_static(
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 Self::vector_route_inventory_bytes(partition),
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT before inspecting this maintained route.",
@@ -26976,8 +27002,8 @@ impl MaintenanceContext {
             // Admit route keys, decoded count metadata and bounded catalog
             // clones before inspecting the frontier. This owns no vector body.
             let inventory_bytes = Self::vector_route_inventory_bytes(partition);
-            let mut workspace = self.vector.reserve_workspace(
-                Arc::clone(&self.finalization.vector_accountant),
+            let mut workspace = self.vector.reserve_workspace_static(
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 inventory_bytes,
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT before inspecting this maintained route.",
@@ -28324,8 +28350,10 @@ impl MaintenanceContext {
     fn run_cycle(
         &self,
         gate: CurrencyGate,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<MaintenanceReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Every maintenance cycle -- the background worker's and an explicit
         // one -- is a boundary: it observes the process ceiling once, before
         // its first admission.
@@ -28447,7 +28475,7 @@ impl MaintenanceContext {
                 report
             } else {
                 self.vector.run_hnsw_maintenance_cycle_with(
-                    Arc::clone(&self.finalization.vector_accountant),
+                    contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                     &mut || self.build_checkpoint(),
                     &mut maintenance_vector_copy_owner,
                 )?
@@ -29435,12 +29463,12 @@ impl Database {
         disk_limit_startup_ceiling: Option<u64>,
         event_bus: Arc<EventBusState>,
         trigger: Arc<TriggerState>,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     ) -> Result<Self> {
         let accountant =
             crate::memory_accounting::AccountantHandle::clone(&finalization.accountant);
         snapshot_registry.fund_pin_slots(accountant.clone())?;
-        let vector_accountant = Arc::clone(&finalization.vector_accountant);
+        let vector_accountant = contextdb_vector::MemoryBudgetOwner::clone(&finalization.vector_accountant);
         {
             let mut storage = std::mem::MaybeUninit::<Database>::uninit();
             let mut construction = DatabaseConstruction {
@@ -29832,7 +29860,7 @@ impl Database {
 
                 {
                     std::ptr::addr_of_mut!((*construction.source).vector).write(
-                        tx_mgr.vector_executor(vector_store, hnsw, vector_accountant.clone()),
+                        tx_mgr.vector_executor(vector_store, hnsw, contextdb_vector::MemoryBudgetOwner::clone(&vector_accountant)),
                     );
                     construction.initialized[46] = true;
                     #[cfg(test)]
@@ -30794,16 +30822,18 @@ impl Database {
             #[cfg(any(test, feature = "test-seams"))]
             test_kernel_observer,
         } = options;
-        // The caller's own bounds on waiting for readers that are starting as
-        // this open claims the store; absent, the open waits until the store
-        // is handed over.
-        let _reader_wait =
-            crate::persistence::WriterWaitScope::enter(reader_wait_stop, reader_wait_deadline);
-
         let accountant = match memory_limit {
             Some(bytes) => MemoryAccountant::writer_budget(bytes)?,
             None => MemoryAccountant::writer_no_limit()?,
         };
+        // Keep the caller's exact cancellation and absolute deadline together
+        // with this open's original writer payer before any store acquisition.
+        // Absent bounds, the open still waits until the store is handed over.
+        let _reader_wait = crate::persistence::WriterWaitScope::enter(
+            reader_wait_stop,
+            reader_wait_deadline,
+            accountant.writer_wait_payer(),
+        );
         if carried
             .as_mut()
             .is_some_and(|tail| tail.recharge(accountant.vector_accountant()).is_err())
@@ -30812,7 +30842,7 @@ impl Database {
         }
         let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             owner_reads.limits.limits.memory,
-        );
+        )?;
         let mut db = if in_memory {
             let db = Self::open_memory_internal_with_host(
                 Arc::clone(&plugin), accountant, declared_read_memory.clone(),
@@ -32042,7 +32072,7 @@ impl Database {
                         self.tx_mgr.vector_executor(
                             self.vector_store.clone(),
                             Arc::new(OnceLock::new()),
-                            Arc::clone(&self.finalization.vector_accountant),
+                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                         ),
                     );
                     construction.initialized[46] = true;
@@ -32818,10 +32848,12 @@ impl Database {
         startup_disk_limit: Option<u64>,
         open_disposition: OpenDisposition,
         runtime_dir: Option<&Path>,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         host_construction: DatabaseHostConstruction,
     ) -> Result<Self> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
             writer_budget.accountant(),
             read_memory.clone(),
@@ -32871,10 +32903,12 @@ impl Database {
         writer_budget: WriterBudget,
         startup_disk_limit: Option<u64>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
         host_construction: DatabaseHostConstruction,
     ) -> Result<Self> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
             writer_budget.accountant(),
             read_memory.clone(),
@@ -32914,38 +32948,14 @@ impl Database {
         // An open is a boundary: the cache is sized from the process ceiling as
         // it stands now.
         crate::memory_accounting::observe_inherited_process_ceiling();
-        let cache_bytes = persistence.settle_writer_cache_budget(
+        // Preserve the existing startup retained-charge rule for declared
+        // writers and process admission for undeclared cache residue. Genuine
+        // temporary invoices bridge old/new index and allocator-window backing
+        // until this same original fixed reserve owns the settled cache.
+        persistence.settle_and_retain_writer_cache_budget(
+            &accountant,
             crate::persistence::redb_writer_cache_bytes_for_limit(accountant.usage().limit),
         )?;
-        //
-        // Charged, not admitted: the cache exists the moment Redb is open, and
-        // a limit is persisted with the store, so refusing the OPEN on it
-        // would brick a store whose operator once declared a limit smaller
-        // than the floor -- there would be no way back in to raise it. The
-        // limit sees the bytes and the ordinary typed refusal fires on the
-        // next admission, which is the same rule the change log follows.
-        if accountant.usage().limit.is_none() {
-            // A writer that declares no limit is bounded by the process
-            // ceiling, which must see its whole cache. It is held as fixed
-            // open residue of the process, sized from that ceiling, and is
-            // not the writer's own working memory.
-            // A process that cannot fund it refuses this open, typed: an
-            // unowned cache would be memory no budget sees.
-            let residue = crate::memory_accounting::ControlCredit::admit_open_residue(
-                &crate::memory_accounting::StoreAccountantHandle::new(accountant.clone()),
-                cache_bytes,
-                "undeclared_writer_cache",
-            )?;
-            persistence.hold_cache_stripe_residue(cache_bytes, residue);
-            // The writer holds none of it; recorded so a handle recycle
-            // reinstalls exactly this capacity (none + the process residue).
-            persistence.record_cache_charge(0);
-        } else {
-            // The writer owns the complete engine cache, including its native
-            // stripe controls. Keep the same installed capacity and price.
-            accountant.charge_retained(cache_bytes);
-            persistence.record_cache_charge(cache_bytes);
-        }
 
         let persisted_disk_limit = persistence.load_config_value::<u64>("disk_limit")?;
         let startup_disk_ceiling = startup_disk_limit;
@@ -33239,7 +33249,7 @@ impl Database {
         parts: crate::persistence::ReadPersistenceImageParts,
         plugin: Arc<dyn DatabasePlugin>,
         mut accountant: crate::memory_accounting::AccountantHandle,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     ) -> Result<Self> {
         parts.open_context.checkpoint()?;
         let read_memory = parts.open_context.read_memory();
@@ -33249,8 +33259,8 @@ impl Database {
         )?;
         let _decode_scope = decode_memory.enter();
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
-        let vector_accountant: Arc<dyn contextdb_vector::MemoryBudget> =
-            accountant.vector_budget()?;
+        let vector_accountant: contextdb_vector::MemoryBudgetOwner =
+            accountant.vector_budget()?.into();
         let crate::persistence::ReadPersistenceImageParts {
             open_context,
             content_identity: _,
@@ -33300,7 +33310,9 @@ impl Database {
             if let Some(ceiling) = startup.startup_ceiling {
                 accountant.set_budget(Some(persisted.min(ceiling)))?;
             } else if startup.limit.is_none() {
-                accountant = Arc::new(MemoryAccountant::with_runtime_budget(persisted)).into();
+                // Restore the live scalar setting on the original controls;
+                // do not replace their payer, counter or runtime-only ceiling.
+                accountant.set_budget(Some(persisted))?;
             }
         }
         let disk_limit = match config_value("disk_limit") {
@@ -33487,10 +33499,7 @@ impl Database {
         let directory_bounds =
             history_on_request
                 .as_ref()
-                .ok_or_else(|| Error::StoreCorrupted {
-                    path: retained_source.database_path().display().to_string(),
-                    reason: "captured image has no authenticated commit directory bounds".into(),
-                })?;
+                .ok_or_else(|| crate::funded_error::corruption_text(Ok(read_memory.clone()), retained_source.database_path().display(), "captured image has no authenticated commit directory bounds".into()))?;
         let directory = crate::persistence::read_commit_directory::RetainedCommitDirectory::new(
             retained_source.clone(),
             directory_bounds,
@@ -33569,6 +33578,14 @@ impl Database {
             load_history: history_on_request.is_some(),
             loaded: Mutex::new(None),
         }));
+        *db.finalization.loaded_history.lock() = Some(LoadedHistoryBuffers {
+            history: db.image_history.as_ref().expect("constructed image history").clone(),
+            ddl_log: db.ddl_log.clone(),
+            change_log: db.change_log.clone(),
+            table_index: db.change_log_table_index.clone(),
+            lsn_refcounts: db.change_log_lsn_refcounts.clone(),
+            _image_memory: _image_memory.clone(),
+        });
         db.retained_graph_source = Some(retained_source.clone());
         db.retained_relational_source = lazy_relational.then_some(retained_source);
         db.read_image_memory = Some(_image_memory);
@@ -33596,7 +33613,7 @@ impl Database {
     fn open_memory_internal(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     ) -> Result<Self> {
         Self::open_memory_internal_with_transaction_snapshot(
             plugin, writer_budget, declared_read_memory, None,
@@ -33606,7 +33623,7 @@ impl Database {
     fn open_memory_internal_with_transaction_snapshot(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
         transaction_snapshot: Option<(TxId, TxId)>,
     ) -> Result<Self> {
         Self::open_memory_internal_with_working_graph(
@@ -33617,7 +33634,7 @@ impl Database {
     fn open_memory_internal_with_working_graph(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
         transaction_snapshot: Option<(TxId, TxId)>,
         working_graph: Option<FundedWorkingGraphSource>,
         working_vectors: Option<crate::persistence::received_working_vector::WorkingVectorCatalogOwner>,
@@ -33631,7 +33648,7 @@ impl Database {
     fn open_memory_internal_with_host(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
-        declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
         transaction_snapshot: Option<(TxId, TxId)>,
         working_graph: Option<FundedWorkingGraphSource>,
         working_vectors: Option<crate::persistence::received_working_vector::WorkingVectorCatalogOwner>,
@@ -34139,8 +34156,10 @@ impl Database {
         &self,
         tx: TxId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_returning_txid_with_read_memory(tx, vector_copy_owner, read_memory)
             .map(|_| ())
     }
@@ -34149,8 +34168,10 @@ impl Database {
         &self,
         tx: TxId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<TxId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Direct API commits can run trigger callbacks that execute nested
         // reads; give them the same statement-level schema view as SQL
         // `COMMIT` (which enters this gate through `execute`). A transaction
@@ -34282,7 +34303,7 @@ impl Database {
                 .with_writer_original(prepare)
                 .map_err(|refusal| match refusal {
                     contextdb_core::read_memory::NativeRefusal::Other(reason) =>
-                        Error::Other(std::borrow::Cow::Borrowed(reason)),
+                        Error::Other(reason.into()),
                     _ => unreachable!("writer loan only validates source custody"),
                 })?,
         }
@@ -34520,8 +34541,10 @@ impl Database {
         tx: TxId,
         stmt: &Statement,
         sql: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match stmt {
             Statement::CreateTable(_) if self.has_context_or_principal_constraints() => {
                 return Err(Error::Other((
@@ -34703,49 +34726,79 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
-        let read_memory = self.declared_reader_memory()?;
-        self.execute_with_read_memory(sql, params, read_memory)
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::execute");
+        let child = self.ordinary_read_child()?;
+        crate::executor::bounded::with_native_read_memory(child, |read_memory| {
+            self.execute_with_read_memory(sql, params, read_memory)
+        })
+    }
+
+    /// Acquire the built-in ordinary reader before any answer or vector setup.
+    /// Scalar refusal needs no diagnostic allocation before an owner exists.
+    pub(crate) fn ordinary_read_child(&self) -> Result<crate::vector_read_memory::NativeReadChildReceipt> {
+        use contextdb_core::read_memory::NativeRefusal;
+        self.declared_read_memory.native_child().map_err(|refusal| match refusal {
+            NativeRefusal::MemoryBudgetExceeded {
+                subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint,
+            } => Error::MemoryBudgetExceeded {
+                subsystem: subsystem.into(), operation: operation.into(), requested_bytes,
+                available_bytes, budget_limit_bytes, hint: hint.into(),
+            },
+            NativeRefusal::ProcessMemoryBudgetExceeded {
+                operation, requested_bytes, available_bytes, budget_limit_bytes, hint,
+            } => Error::MemoryBudgetExceeded {
+                subsystem: "process_native_ceiling".into(), operation: operation.into(),
+                requested_bytes, available_bytes, budget_limit_bytes, hint: hint.into(),
+            },
+            NativeRefusal::Other(reason) => Error::Other(reason.into()),
+            allocator @ NativeRefusal::AllocatorFailed { .. } => Error::NativeEngineOther(allocator),
+            NativeRefusal::NativeUnsupported { .. } => Error::Other(
+                "native reader admission unsupported: reader/request_owner".into()),
+        })
     }
 
     pub fn execute_with_read_memory(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<QueryResult> {
-        self.execute_owned_with_read_memory(sql, params, read_memory)
-            .map(OwnedQueryResult::into_public)
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        QueryResult::publish_with(read_memory.clone(), || {
+            self.execute_owned_with_read_memory(sql, params, read_memory)
+        })
     }
 
     pub(crate) fn execute_owned_with_read_memory(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
-        let answer_memory = crate::read_image_memory::ImageMemory::charging_reader(
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::execute_owned_with_read_memory");
+        let answer_memory = crate::read_image_memory::ImageMemory::query_reader_for(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
-        );
-        let mut answer_copy = answer_memory.vector_copy(0)?;
-        let vector_copy_owner = &mut answer_copy.owner;
-
-        #[cfg(any(test, feature = "test-seams"))]
-        observe_read_execution_convergence(ReadExecutionConvergenceEvent::PublicExecuteEntered);
-        let scope = QueryRowsExaminedScope::enter(self);
-        let mut result = self.execute_with_rows_examined_scope(
-            sql,
-            params,
-            vector_copy_owner,
-            read_memory.clone(),
-        );
-        scope.finish(&mut result);
-        if let Ok(answer) = &mut result {
-            answer_copy.into_image();
-            answer.vector_copy_charge =
-                crate::read_image_memory::AnswerCharge::holding(answer_memory);
-        }
-        result
+        )?;
+        crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, |image| {
+            let mut answer_copy = image.vector_copy(0)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            observe_read_execution_convergence(ReadExecutionConvergenceEvent::PublicExecuteEntered);
+            let scope = QueryRowsExaminedScope::enter(self);
+            let mut result = self.execute_with_rows_examined_scope(
+                sql, params, &mut answer_copy.owner, read_memory.clone(),
+            );
+            scope.finish(&mut result);
+            if result.is_ok() { answer_copy.into_image(); }
+            result
+        })
     }
 
     fn execute_with_rows_examined_scope(
@@ -34753,8 +34806,10 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Checked BEFORE the snapshot registration below: `snapshot_for_read`
         // resolves through the public `Database::snapshot`, which panics on a
         // closed handle (`assert_open_operation`) by design for a caller that
@@ -35348,8 +35403,10 @@ impl Database {
         params: &HashMap<String, Value>,
         preopened_autocommit_tx: Option<TxId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match plan {
             PhysicalPlan::Insert(_)
             | PhysicalPlan::Delete(_)
@@ -35438,8 +35495,10 @@ impl Database {
         tx: Option<TxId>,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !crate::executor::bounded::kernel_can_answer(plan) {
             return execute_plan(
                 self,
@@ -35539,8 +35598,10 @@ impl Database {
         &self,
         sql: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<String> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let explained =
             self.explain_output_with_read_memory(sql, vector_copy_owner, read_memory.clone())?;
         let mut output = crate::cli_render::render_explain_output(&explained);
@@ -35584,8 +35645,10 @@ impl Database {
         &self,
         sql: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ExplainOutput> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.explain_output_with_params(
             sql,
             &HashMap::new(),
@@ -35601,8 +35664,10 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ExplainOutput> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let stmt = contextdb_parser::parse(sql)?;
         let _schema_publication = self.enter_schema_publication_gate(false);
         let _operation = self.open_operation()?;
@@ -35691,8 +35756,10 @@ impl Database {
         index: &VectorIndexRef,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<MetadataAuthorizedCandidates> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut memory = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         if !self.bounded_read_requires_candidate_filter(&index.table)? {
             return Ok(MetadataAuthorizedCandidates {
@@ -35762,8 +35829,10 @@ impl Database {
         snapshot: SnapshotId,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(VectorPolicyExplainFacts, MetadataAuthorizedCandidates)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let requested_mode = self.resolved_vector_search_mode(
             &shape.index,
             shape
@@ -35896,8 +35965,10 @@ impl Database {
         params: &HashMap<String, Value>,
         actual_trace: Option<&VectorSearchDebugTrace>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(VectorSearchDisclosure, bool)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let actual_used_hnsw = actual_trace.map(|trace| trace.used_hnsw);
         let (facts, authorized) = self.vector_policy_facts_for_explain(
             shape,
@@ -36026,11 +36097,13 @@ impl Database {
         } else if let Some(trace) = actual_trace
             && facts.requested_mode == contextdb_core::VectorSearchMode::Auto
         {
-            executed_auto_fallback(
+            let reason = executed_auto_fallback(
                 &trace.partition_routes,
                 trace.fallback_reason,
                 filtered_exact,
-            )
+            );
+            vector_copy_owner.reserve(reason.map_or(0, str::len))?;
+            reason.map(str::to_owned)
         } else if filtered_exact {
             Some("filtered_route_exact".to_string())
         } else if facts.requested_mode == contextdb_core::VectorSearchMode::Auto
@@ -36076,6 +36149,14 @@ impl Database {
             None,
             vector_copy_owner,
             read_memory.clone(),
+        )?;
+        vector_copy_owner.reserve(
+            facts.policy.auto_index_at_source.len()
+                + layout.flat_below_source().len()
+                + layout.search_radius_source().len()
+                + layout.auto_expansion_ceiling_source().len()
+                + actual_trace.and_then(|trace| trace.budget_receipt)
+                    .map_or(0, |receipt| receipt.budget_terminal.len()),
         )?;
         Ok((
             VectorSearchDisclosure {
@@ -36165,8 +36246,10 @@ impl Database {
         index: &VectorIndexRef,
         prefixes: Option<&[VectorPartitionKey]>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<contextdb_vector::store::VectorPartitionInfo>> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         let Some(prefixes) = prefixes else {
             return self.vector_store.partition_infos(index, vector_copy_owner);
         };
@@ -36222,8 +36305,10 @@ impl Database {
         filtered: bool,
         actual_routes: Option<&[VectorPartitionSearchTrace]>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VectorPartitionHnswDisclosure>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Adaptive graph effort and serving topology can encode the complete
         // partition population. These numeric fields have no redacted value;
         // omit them for constrained callers instead of inventing an effort
@@ -36543,8 +36628,10 @@ impl Database {
         prefixes: Option<&[VectorPartitionKey]>,
         groups: Option<&contextdb_vector::mem::BoundedVectorCandidateGroups>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut local_copy_admission = vector_copy_owner.local_scratch();
         let vector_copy_owner = local_copy_admission.as_mut().unwrap_or(vector_copy_owner);
         for partition in self.vector_partition_infos_for_prefixes(
@@ -36592,8 +36679,13 @@ impl Database {
         params: &HashMap<String, Value>,
         trace: &VectorSearchDebugTrace,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<VectorSearchDisclosure> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Box<VectorSearchDisclosure>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        // The enclosing answer copy owner retains this invoice through every
+        // internal consumer and settles it at the existing public handoff.
+        vector_copy_owner.reserve(std::mem::size_of::<VectorSearchDisclosure>())?;
         self.vector_search_disclosure(
             &VectorExplainShape {
                 index,
@@ -36609,7 +36701,7 @@ impl Database {
             vector_copy_owner,
             read_memory.clone(),
         )
-        .map(|(disclosure, _)| disclosure)
+        .map(|(disclosure, _)| Box::new(disclosure))
     }
 
     /// Describe a vector answer from the same admitted partition groups that
@@ -36632,8 +36724,10 @@ impl Database {
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<VectorSearchDisclosure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let shape = VectorExplainShape {
             index,
             k,
@@ -36711,10 +36805,19 @@ impl Database {
             candidate_residual
         };
         let fallback = if requested_mode == contextdb_core::VectorSearchMode::Auto {
-            executed_auto_fallback(partition_routes, fallback_reason, filtered_exact)
+            let reason = executed_auto_fallback(partition_routes, fallback_reason, filtered_exact);
+            vector_copy_owner.reserve(reason.map_or(0, str::len))?;
+            reason.map(str::to_owned)
         } else {
             None
         };
+        vector_copy_owner.reserve(
+            policy.auto_index_at_source.len()
+                + layout.flat_below_source().len()
+                + layout.search_radius_source().len()
+                + layout.auto_expansion_ceiling_source().len()
+                + budget_receipt.map_or(0, |receipt| receipt.budget_terminal.len()),
+        )?;
         Ok(VectorSearchDisclosure {
             route_evidence: VectorSearchRouteEvidence::Executed,
             requested_mode,
@@ -36772,6 +36875,9 @@ impl Database {
     ) {
         self.last_vector_search_used_hnsw
             .store(trace.used_hnsw(), Ordering::SeqCst);
+        #[cfg(feature = "test-seams")]
+        crate::vector_read_memory::statement_child_proof::trace_published(
+            &trace, self.last_vector_search_trace.read().as_ref());
         let prior = self.last_vector_search_trace.write().replace(trace);
         drop(prior);
     }
@@ -36779,6 +36885,9 @@ impl Database {
     pub(crate) fn clear_last_vector_search_trace(&self) {
         self.last_vector_search_used_hnsw
             .store(false, Ordering::SeqCst);
+        #[cfg(feature = "test-seams")]
+        crate::vector_read_memory::statement_child_proof::trace_cleared(
+            self.last_vector_search_trace.read().as_ref());
         let prior = self.last_vector_search_trace.write().take();
         drop(prior);
     }
@@ -36826,9 +36935,12 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
-        let read_memory = self.declared_reader_memory()?;
-        self.execute_in_tx_with_read_memory(tx, sql, params, read_memory)
-            .map(OwnedQueryResult::into_public)
+        let child = self.ordinary_read_child()?;
+        crate::executor::bounded::with_native_read_memory(child, |read_memory| {
+            QueryResult::publish_with(read_memory.clone(), || {
+                self.execute_in_tx_with_read_memory(tx, sql, params, read_memory)
+            })
+        })
     }
 
     pub(crate) fn execute_in_tx_with_read_memory(
@@ -36836,30 +36948,25 @@ impl Database {
         tx: TxId,
         sql: &str,
         params: &HashMap<String, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
-        let answer_memory = crate::read_image_memory::ImageMemory::charging_reader(
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let answer_memory = crate::read_image_memory::ImageMemory::query_reader_for(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
-        );
-        let mut answer_copy = answer_memory.vector_copy(0)?;
-        let vector_copy_owner = &mut answer_copy.owner;
-
-        let scope = QueryRowsExaminedScope::enter(self);
-        let mut result = self.execute_in_tx_with_rows_examined_scope(
-            tx,
-            sql,
-            params,
-            vector_copy_owner,
-            read_memory.clone(),
-        );
-        scope.finish(&mut result);
-        if let Ok(answer) = &mut result {
-            answer_copy.into_image();
-            answer.vector_copy_charge =
-                crate::read_image_memory::AnswerCharge::holding(answer_memory);
-        }
-        result
+        )?;
+        crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, |image| {
+            let mut answer_copy = image.vector_copy(0)?;
+            let scope = QueryRowsExaminedScope::enter(self);
+            let mut result = self.execute_in_tx_with_rows_examined_scope(
+                tx,
+                sql, params, &mut answer_copy.owner, read_memory.clone(),
+            );
+            scope.finish(&mut result);
+            if result.is_ok() { answer_copy.into_image(); }
+            result
+        })
     }
 
     fn run_callback_dml_plan(
@@ -36868,8 +36975,10 @@ impl Database {
         plan: &PhysicalPlan,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let checkpoint = self.write_set_checkpoint(tx)?;
         let result = execute_plan(
             self,
@@ -36893,8 +37002,10 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Checked BEFORE the snapshot registration below -- see `execute`'s
         // own identical, deliberately LOCK-FREE guard for why (`already_
         // closed`, never `open_operation`, which this function's own later
@@ -37053,8 +37164,10 @@ impl Database {
         key_value: &Value,
         predicates: &[(String, Value)],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation_after_public_tx_control_wait_for_tx(
             "guard_row_conditions_in_tx",
             Some(tx),
@@ -37161,8 +37274,10 @@ impl Database {
         tx: TxId,
         source: CommitSource,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_source_returning_txid(tx, source, vector_copy_owner, read_memory)
             .map(|_| ())
     }
@@ -37172,8 +37287,10 @@ impl Database {
         tx: TxId,
         source: CommitSource,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<TxId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
         if self.pending_local_schema_stages.lock().contains_key(&tx) && !event_bus_ddl.is_empty() {
             self.pending_event_bus_ddl
@@ -37200,8 +37317,10 @@ impl Database {
         tx: TxId,
         visibility_tx: TxId,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<schema_stage_registry::LocalRegistration>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let Some(pending) = self.pending_local_schema_stages.lock().remove(&tx) else {
             return Ok(None);
@@ -37490,7 +37609,7 @@ impl Database {
             let publication = self.vector_store.prepare_partitioned_received_schema_publication(
                 vector_layouts.into_iter().filter(|(index, _)| changed_vector_tables.contains(&index.table)).collect(),
                 vector_entries,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 vector_image_owner,
             )?;
             Some(self.vector_store.prepare_received_schema_tables_publication(
@@ -37602,9 +37721,14 @@ impl Database {
         // Move the early declaration fee only after all fallible local builders
         // have finished. Until here it outlives their declaration-order drops.
         if let Some(early_memory) = early_memory { temporary_memory.absorb(early_memory)?; }
+        let memory_history = if self.persistence.is_none() {
+            Some(self.prepare_memory_history_entries(ddl_log.iter().map(|(lsn, change)| (*lsn, change)),
+                ddl_generations.iter().map(|(key, (table, generation))| (*key, (table, *generation))))?)
+        } else { None };
         self.local_schema_stages.lock().insert(
             lsn,
             LocalSchemaStage {
+                memory_history,
                 relational,
                 affected_tables,
                 dag_edge_types,
@@ -37643,7 +37767,7 @@ impl Database {
         if let Some(vector) = stage.vector {
             self.vector_store.publish_prepared_received_schema_tables(
                 vector,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             );
         }
         if let Some(publication) = stage.native_event_bus.get_mut().take() {
@@ -37661,12 +37785,7 @@ impl Database {
         self.in_memory_table_generations
             .lock()
             .extend(stage.table_generations);
-        self.in_memory_ddl_generations
-            .lock()
-            .extend(stage.ddl_generations);
-        if self.persistence.is_none() {
-            self.ddl_log.write().extend(stage.ddl_log);
-        }
+        self.publish_memory_schema_history(stage.memory_history.take());
         stage.memory_swap.commit_after_swap();
         self.clear_statement_cache();
         self.reconcile_maintenance_thread();
@@ -37678,8 +37797,10 @@ impl Database {
         source: CommitSource,
         event_bus_ddl: &[DdlChange],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_source_and_sync_ddl(
             tx,
             source,
@@ -37697,8 +37818,10 @@ impl Database {
         event_bus_ddl: &[DdlChange],
         trigger_ddl: &[DdlChange],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_source_and_sync_ddl_and_trigger_audit_projection(
             tx,
             source,
@@ -37725,8 +37848,10 @@ impl Database {
         sync_trigger_derived_rows_are_local: bool,
         mut delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Source reads in preparation use this operation's reader. Each actual
         // persistence write admits its own writer decode scope at that boundary.
         let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
@@ -37743,7 +37868,7 @@ impl Database {
             let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
             let detached_capture = std::cell::Cell::new(None::<bool>);
             let detached_rows_funding=std::cell::RefCell::new(None::<(
-                Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,usize)>);
+                contextdb_core::read_memory::ReadMemoryOwner,usize)>);
 
             let discard_selections = self
                 .pending_commit_metadata
@@ -38375,7 +38500,7 @@ impl Database {
                         watch.completed();
                     }
                     if let Some(ws) = failure.write_set.as_deref() {
-                        self.plugin.commit_failed(ws, source, &failure.error);
+                        self.plugin.commit_failed(ws, source, failure.error.engine_diagnostic());
                     }
                     if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
                         // A received-schema stage is registered during
@@ -38580,8 +38705,10 @@ impl Database {
         cached_plan: Option<&PhysicalPlan>,
         mut preopened_autocommit_tx: Option<TxId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Err(error) = self.plugin.on_query(sql) {
             self.rollback_preopened_autocommit_tx(preopened_autocommit_tx.take());
             return Err(error);
@@ -38698,8 +38825,10 @@ impl Database {
         &self,
         stmt: &Statement,
         tx: Option<TxId>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Option<Result<OwnedQueryResult>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !matches!(
             stmt,
             Statement::CreateEventType { .. }
@@ -38731,8 +38860,10 @@ impl Database {
         preopened_autocommit_tx: Option<TxId>,
         skip_static_dml_validation: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(tx) = tx
             && matches!(
                 plan,
@@ -38817,8 +38948,10 @@ impl Database {
         tx: Option<TxId>,
         preopened_autocommit_tx: Option<TxId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::executor::resolve_expr;
 
         let col_index = |name: &str| {
@@ -39214,8 +39347,10 @@ impl Database {
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Statement> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Statement::Select(sel) = stmt
             && !sel.ctes.is_empty()
             && sel.body.where_clause.is_some()
@@ -39265,8 +39400,10 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
         self.complete_insert_access_values(table, &mut values)?;
@@ -39297,8 +39434,10 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.insert_row_with_admission(
             tx,
             table,
@@ -39319,8 +39458,10 @@ impl Database {
         values: HashMap<ColName, Value>,
         admission: OwnedMemoryReservation,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let original = OriginalRowValues { values, admission };
         self.insert_row_with_admission(
             tx,
@@ -39339,8 +39480,10 @@ impl Database {
         values: HashMap<ColName, Value>,
         admission: Option<OwnedMemoryReservation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut original = OriginalOptionalRowValues { values, admission };
         self.ensure_no_mixed_local_schema_dml(tx)?;
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
@@ -39394,8 +39537,10 @@ impl Database {
         values: HashMap<ColName, Value>,
         trigger_callback_bound: bool,
         admission: &mut Option<OwnedMemoryReservation>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
         self.complete_insert_access_values(table, &mut values)?;
@@ -39489,8 +39634,10 @@ impl Database {
     fn stage_original_row_vectors(
         &self, host: &EngineDatabaseTransactions, tx: TxId,
         mut vectors: OriginalDatabaseVectors,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Inputs have all passed validation. Preserve the existing final
         // placement for duplicate index/row inputs, retiring superseded actual
         // bodies before their invoices; array capacity keeps its original owner.
@@ -39549,8 +39696,10 @@ impl Database {
         created_at: Option<Wallclock>,
         assume_no_state_machine: bool,
         admission: &mut Option<OwnedMemoryReservation>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
@@ -39610,8 +39759,10 @@ impl Database {
         mut values: HashMap<ColName, Value>,
         admission: &mut Option<OwnedMemoryReservation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<InsertRowResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr else {
             return self.insert_row_with_unique_noop(
                 tx,
@@ -39676,8 +39827,10 @@ impl Database {
         trigger_callback_bound: bool,
         admission: &mut Option<OwnedMemoryReservation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Statement-scoped bound: `Value::TxId(n)` must satisfy
         // `n <= max(committed_watermark, tx)` so writes inside an active
         // transaction can reference their own allocated TxId. The error,
@@ -39815,8 +39968,10 @@ impl Database {
         old_row_id: RowId,
         place_vectors: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.ensure_trigger_table_ready(table, "insert_row_replacing")?;
         let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
@@ -39876,8 +40031,10 @@ impl Database {
         place_vectors: bool,
         admission: OwnedMemoryReservation,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let original = OriginalRowValues { values, admission };
         let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr else {
             let inserted = self.insert_row_replacing(
@@ -39956,8 +40113,10 @@ impl Database {
         values: HashMap<ColName, Value>,
         snapshot: SnapshotId,
         admission: OwnedMemoryReservation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let original = OriginalRowValues { values, admission };
         let DatabaseTransactionHost::Owned(_) = &self.tx_mgr else {
             let inserted = self.replace_row_after_update_validation(
@@ -40156,8 +40315,10 @@ impl Database {
         values: HashMap<ColName, Value>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
@@ -40189,8 +40350,10 @@ impl Database {
         tx: TxId,
         table: &str,
         row_id: RowId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let checkpoint = self.write_set_checkpoint(tx)?;
         let result = (|| {
             self.retire_row_graph(tx, table, row_id, read_memory.clone())?;
@@ -40210,8 +40373,10 @@ impl Database {
         table: &str,
         row_id: RowId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             return handle.with_host(|host| {
                 self.note_private_pending_row_replacement(tx, table, row_id)?;
@@ -40354,8 +40519,10 @@ impl Database {
         tx: TxId,
         table: &str,
         row_id: RowId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.delete_relational_row_releasing_staged(tx, table, row_id, read_memory.clone())
     }
 
@@ -40369,8 +40536,10 @@ impl Database {
         row_id: RowId,
         mode: StagedDeleteRaceModeForTest,
         hook: impl Fn(StagedDeleteRacePointForTest) + 'static,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         STAGED_DELETE_RACE_HOOK_FOR_TEST.with(|slot| {
             assert!(slot.borrow().is_none());
             *slot.borrow_mut() = Some(StagedDeleteRaceHookForTest {
@@ -40544,8 +40713,10 @@ impl Database {
         values: HashMap<ColName, Value>,
         created_at: Option<Wallclock>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let values = self.coerce_row_for_insert(table, values, None, None)?;
         self.validate_row_constraints(tx, table, &values, None, read_memory.clone())?;
         let row_id = self.relational_store.new_row_id();
@@ -40588,8 +40759,10 @@ impl Database {
         values: HashMap<ColName, Value>,
         created_at: Option<Wallclock>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<UpsertResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let values = self.coerce_row_for_insert(table, values, None, None)?;
         let snapshot = self.snapshot_for_read();
         // Resolve the existing row on the WHOLE natural key — every key column —
@@ -40759,8 +40932,10 @@ impl Database {
         snapshot: SnapshotId,
         created_at: Option<Wallclock>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_primary_key_values_present(table, &values)?;
         let meta = self
             .table_meta(table)
@@ -40822,8 +40997,10 @@ impl Database {
         &self,
         table: &str,
         natural_key: &NaturalKey,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let Some(row) = self.visible_row_by_natural_key(
             table,
@@ -40853,8 +41030,10 @@ impl Database {
         table: &str,
         natural_key: &NaturalKey,
         arrival_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let row_id = self
             .row_id_for_natural_key_full(table, natural_key, self.snapshot_for_read(), read_memory.clone())?
@@ -40889,16 +41068,20 @@ impl Database {
     pub(crate) fn row_change_arrived_by_sync_with_read_memory(
         &self,
         row: &RowChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.checked_row_change_arrived_by_sync(row, read_memory)
     }
 
     pub(crate) fn checked_row_change_arrived_by_sync(
         &self,
         row: &RowChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         if !row.deleted {
             // The sidecar describes the row's CURRENT version, so it can only
@@ -41074,8 +41257,10 @@ impl Database {
     pub(crate) fn graph_change_arrived_by_sync_with_read_memory(
         &self,
         edge: &EdgeChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let deleted = matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)));
         self.with_graph_arrival(
             &(edge.source, edge.target, edge.edge_type.clone()),
@@ -41101,8 +41286,10 @@ impl Database {
     pub(crate) fn vector_change_arrived_by_sync_with_read_memory(
         &self,
         vector: &VectorChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.checked_vector_change_arrived_by_sync(vector, read_memory)
     }
 
@@ -41112,8 +41299,10 @@ impl Database {
         &self,
         vector: &VectorChange,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         if !vector.vector.is_empty() {
             let current = self.committed_row_at(
@@ -41318,6 +41507,9 @@ impl Database {
         &self,
         writes: &[(String, Vec<u8>, DurableLineageRecord)],
     ) -> Result<Vec<(String, Vec<u8>, DurableLineageRecord)>> {
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::encoded_purged_lives_displaced_by");
         self.purged_lives_displaced_by(
             &writes
                 .iter()
@@ -41548,8 +41740,10 @@ impl Database {
         &self,
         identity: &GraphIdentity,
         visit: impl FnOnce(Option<&DurableGraphArrival>) -> Result<T>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<T> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
             let key_record = DurableGraphArrival {
@@ -41568,10 +41762,7 @@ impl Database {
             if let Some(record) = &record
                 && Self::graph_arrival_key(&record.value) != *identity
             {
-                return Err(Error::StoreCorrupted {
-                    path: key,
-                    reason: "graph-arrival key disagrees with its canonical record".into(),
-                });
+                return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), &key, "graph-arrival key disagrees with its canonical record".into()));
             }
             return visit(record.as_ref().map(|record| &record.value));
         }
@@ -41583,6 +41774,9 @@ impl Database {
         natural_key: &NaturalKey,
         generation: u64,
     ) -> String {
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::durable_lineage_config_key");
         format!(
             "{}{}",
             Self::DURABLE_LINEAGE_CONFIG_PREFIX,
@@ -41716,8 +41910,10 @@ impl Database {
     fn visit_received_ddl_arrivals(
         &self,
         mut visit: impl FnMut((Lsn, u32), &DurableReceivedDdlArrival) -> Result<()>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
             let mut cursor = root.config_cursor(
@@ -41733,11 +41929,8 @@ impl Database {
                     record.persisted_ordinal,
                 );
                 if window.position() != key.as_bytes() {
-                    return Err(Error::StoreCorrupted {
-                        path: key,
-                        reason: "received DDL arrival key does not bind one exact local occurrence"
-                            .into(),
-                    });
+                    return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), &key, "received DDL arrival key does not bind one exact local occurrence"
+                            .into()));
                 }
                 visit((record.local_lsn, record.persisted_ordinal), record)?;
             }
@@ -41756,8 +41949,10 @@ impl Database {
         &self,
         occurrence: (Lsn, u32),
         visit: impl FnOnce(Option<&DurableReceivedDdlArrival>) -> Result<T>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<T> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
             return self.with_received_ddl_arrival_at_root(&root, occurrence, read_memory, visit);
@@ -41769,22 +41964,21 @@ impl Database {
         &self,
         root: &crate::persistence::WriterSnapshotHandle,
         occurrence: (Lsn, u32),
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         visit: impl FnOnce(Option<&DurableReceivedDdlArrival>) -> Result<T>,
     ) -> Result<T> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         RedbPersistence::validate_ddl_occurrence_ordinal(occurrence.1)?;
         let key = Self::durable_received_ddl_arrival_key(occurrence.0, occurrence.1);
         let record = root.config_point::<DurableReceivedDdlArrival>(
-            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
             &key,
         )?;
         if let Some(record) = &record
             && (record.value.local_lsn, record.value.persisted_ordinal) != occurrence
         {
-            return Err(Error::StoreCorrupted {
-                path: key,
-                reason: "received DDL arrival key does not bind one exact local occurrence".into(),
-            });
+            return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), &key, "received DDL arrival key does not bind one exact local occurrence".into()));
         }
         visit(record.as_ref().map(|record| &record.value))
     }
@@ -41793,8 +41987,10 @@ impl Database {
         &self,
         occurrence: (Lsn, u32),
         visit: impl FnOnce(Option<&DurableSupersededDdlOccurrence>) -> Result<T>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<T> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
             return self.with_superseded_ddl_occurrence_at_root(
@@ -41811,37 +42007,34 @@ impl Database {
         &self,
         root: &crate::persistence::WriterSnapshotHandle,
         occurrence: (Lsn, u32),
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         visit: impl FnOnce(Option<&DurableSupersededDdlOccurrence>) -> Result<T>,
     ) -> Result<T> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         RedbPersistence::validate_ddl_occurrence_ordinal(occurrence.1)?;
         let key = Self::durable_superseded_ddl_occurrence_key(occurrence.0, occurrence.1);
         let record = root.config_point::<DurableSupersededDdlOccurrence>(
-            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
             &key,
         )?;
         if let Some(record) = &record
             && (record.value.local_lsn, record.value.persisted_ordinal) != occurrence
         {
-            return Err(Error::StoreCorrupted {
-                path: key,
-                reason: "superseded DDL key does not bind one exact local occurrence".into(),
-            });
+            return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), &key, "superseded DDL key does not bind one exact local occurrence".into()));
         }
         visit(record.as_ref().map(|record| &record.value))
     }
 
     pub(crate) fn validate_ddl_occurrence_config(
+        diagnostic_owner: &contextdb_core::read_memory::ReadMemoryOwner,
         key: &str,
         occurrence: (Lsn, u32),
         bytes: &[u8],
     ) -> Result<()> {
         if RedbPersistence::ddl_config_occurrence_coordinate(key)? != occurrence {
-            return Err(Error::StoreCorrupted {
-                path: key.into(),
-                reason: "declaration configuration key does not bind one exact local occurrence"
-                    .into(),
-            });
+            return Err(crate::funded_error::corruption_text(Ok(diagnostic_owner.clone()), key, "declaration configuration key does not bind one exact local occurrence"
+                    .into()));
         }
         let recorded = if key.starts_with(Self::DURABLE_RECEIVED_DDL_ARRIVAL_CONFIG_PREFIX) {
             let record: DurableReceivedDdlArrival =
@@ -41856,10 +42049,7 @@ impl Database {
             None
         };
         if recorded.is_some_and(|recorded| recorded != occurrence) {
-            return Err(Error::StoreCorrupted {
-                path: key.into(),
-                reason: "declaration marker does not bind one exact local occurrence".into(),
-            });
+            return Err(crate::funded_error::corruption_text(Ok(diagnostic_owner.clone()), key, "declaration marker does not bind one exact local occurrence".into()));
         }
         Ok(())
     }
@@ -41888,8 +42078,10 @@ impl Database {
         &self,
         local_ddl_log: &[(Lsn, DdlChange)],
         received_ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<((Lsn, u32), DurableSupersededDdlOccurrence)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut candidates = Vec::<((Lsn, u32), DurableSupersededDdlOccurrence)>::new();
         for change in received_ddl {
             for (position, (lsn, local)) in local_ddl_log.iter().enumerate() {
@@ -42012,8 +42204,10 @@ impl Database {
     fn durable_superseded_local_ddl_occurrences(
         &self,
         received_ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<((Lsn, u32), DurableSupersededDdlOccurrence)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let root = self.writer_read_root()?.ok_or_else(|| {
             Error::Other("durable declaration comparison requires a writer root".into())
         })?;
@@ -42042,10 +42236,7 @@ impl Database {
             )
             .map_err(|error| Error::Other((format!("declaration encoding failed: {error}")).into()))?;
             if written != encoded_len {
-                return Err(Error::StoreCorrupted {
-                    path: "ddl_eligible_occurrences".into(),
-                    reason: "declaration encoding length changed after admission".into(),
-                });
+                return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), "ddl_eligible_occurrences", "declaration encoding length changed after admission".into()));
             }
             let kind = *encoded
                 .first()
@@ -42092,10 +42283,7 @@ impl Database {
             let mut after = if let Some((prior, position)) = selector_positions.get(&selector_hash)
             {
                 if &received_ddl[*prior] != change {
-                    return Err(Error::StoreCorrupted {
-                        path: "ddl_eligible_occurrences".into(),
-                        reason: "exact declaration selector hash collision".into(),
-                    });
+                    return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), "ddl_eligible_occurrences", "exact declaration selector hash collision".into()));
                 }
                 *position
             } else {
@@ -42130,10 +42318,7 @@ impl Database {
                         ),
                         &generation_key,
                     )?
-                    .ok_or_else(|| Error::StoreCorrupted {
-                        path: generation_key.clone(),
-                        reason: "eligible declaration lacks its generation sidecar".into(),
-                    })?;
+                    .ok_or_else(|| crate::funded_error::corruption_text(Ok(read_memory.clone()), generation_key, "eligible declaration lacks its generation sidecar".into()))?;
                 let arrival_key = Self::durable_received_ddl_arrival_key(key.0, key.1);
                 let superseded_key = Self::durable_superseded_ddl_occurrence_key(key.0, key.1);
                 if root
@@ -42153,10 +42338,7 @@ impl Database {
                         )?
                         .is_some()
                 {
-                    return Err(Error::StoreCorrupted {
-                        path: arrival_key,
-                        reason: "eligible declaration carries an exclusion marker".into(),
-                    });
+                    return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), arrival_key, "eligible declaration carries an exclusion marker".into()));
                 }
                 output.try_grow_for(
                     512,
@@ -42224,8 +42406,10 @@ impl Database {
         change: &DdlChange,
         kind: u8,
         candidates: &[((Lsn, u32), DurableSupersededDdlOccurrence)],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<((Lsn, u32), DurableSupersededDdlOccurrence)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         const PREFIX: &str = "sync_ddl_generation.v1.";
         let mut sidecars = root.config_cursor(
             crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
@@ -42526,7 +42710,7 @@ impl Database {
         let incoming_charge = StagedCopyCharge::admit_for_host(
             &self.tx_mgr,
             &self.finalization.accountant,
-            Arc::clone(&self.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             incoming_bytes,
             "stage_received_catalog_dependencies",
         )?;
@@ -42584,7 +42768,7 @@ impl Database {
         let mut charge = StagedCopyCharge::admit_for_host(
             &self.tx_mgr,
             &self.finalization.accountant,
-            Arc::clone(&self.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             bytes,
             "stage_received_catalog",
         )?;
@@ -42751,7 +42935,7 @@ impl Database {
         StagedCopyCharge::admit_for_host(
             &self.tx_mgr,
             &self.finalization.accountant,
-            Arc::clone(&self.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             bytes,
             "stage_received_side_metadata",
         )
@@ -42961,6 +43145,7 @@ impl Database {
                 Arc::new(CorePlugin), WriterBudget::from_original(original)?,
                 self.declared_read_memory.clone(), None, None, None))?
         } else { Database::open_memory() };
+        working.finalization.local_policy_metadata_enabled.store(false, Ordering::SeqCst);
         let metadata = self.relational_store.table_meta.read().clone();
         for (table, meta) in metadata {
             working.relational_store.create_table(&table, meta.clone());
@@ -43070,8 +43255,10 @@ impl Database {
         renamed_vector_sources: &HashSet<contextdb_core::VectorIndexRef>,
         replaced_vector_refs: &HashSet<contextdb_core::VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(MetadataCopyCharges, Database)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The copy this worker makes is the widest point a receiver ever
         // reaches -- for a moment it holds the old image and the arriving one
         // at once -- and an operator's declared MEMORY_LIMIT is entitled to
@@ -43115,7 +43302,7 @@ impl Database {
         metadata_copy_charges.push(StagedCopyCharge::admit_for_host(
             &self.tx_mgr,
             &self.finalization.accountant,
-            Arc::clone(&self.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             generation_bytes,
             "stage_received_generations",
         )?)?;
@@ -43127,30 +43314,20 @@ impl Database {
                 match persistence.load_config_value_raw(&key)? {
                     Some(raw) => {
                         let generation = RedbPersistence::decode_config_value_exact::<u64>(&raw)
-                            .map_err(|error| Error::StoreCorrupted {
-                                path: key.clone(),
-                                reason: format!(
+                            .map_err(|error| crate::funded_error::corruption_display(Ok(read_memory.clone()), &key, format_args!(
                                     "table-generation value is not an exact canonical u64: {error}"
-                                ),
-                            })?;
+                                )))?;
                         if generation == 0
                             || RedbPersistence::encode_config_value(&generation)? != raw
                         {
-                            return Err(Error::StoreCorrupted {
-                                path: key,
-                                reason: "table-generation value is zero or noncanonical"
-                                    .to_string(),
-                            });
+                            return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), &key, "table-generation value is zero or noncanonical".into()));
                         }
                         generation
                     }
                     None if has_schema => {
-                        return Err(Error::StoreCorrupted {
-                            path: key,
-                            reason: format!(
+                        return Err(crate::funded_error::corruption_display(Ok(read_memory.clone()), &key, format_args!(
                                 "table {table} has schema metadata but no authoritative generation"
-                            ),
-                        });
+                            )));
                     }
                     None => 0,
                 }
@@ -43200,7 +43377,7 @@ impl Database {
                             metadata_copy_charges.push(StagedCopyCharge::admit_for_host(
                                 &self.tx_mgr,
                                 &self.finalization.accountant,
-                                Arc::clone(&self.finalization.vector_accountant),
+                                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                                 bytes,
                                 "stage_received_metadata",
                             )?)?;
@@ -43214,14 +43391,13 @@ impl Database {
                         }
                     }};
                 }
-                *working.in_memory_ddl_generations.lock() = copy_selected!(
-                    self.in_memory_ddl_generations.lock(),
-                    |entry: &(&(Lsn, u32), &(Option<String>, Option<u64>))| entry
-                        .1
-                        .0
-                        .as_ref()
-                        .is_some_and(|table| affected_tables.contains(table))
-                );
+                if !admit_only {
+                    let source = self.in_memory_ddl_generations.lock();
+                    let prepared = working.prepare_memory_history_entries(std::iter::empty(),
+                        source.iter().filter(|(_, (table, _))| table.as_ref().is_some_and(|table| affected_tables.contains(table)))
+                            .map(|(key, (table, generation))| (*key, (table, *generation))))?;
+                    working.replace_memory_schema_generations(prepared);
+                }
                 let selected_ddl = self.in_memory_ddl_generations.lock();
                 *working.received_ddl_arrivals.write() = copy_selected!(
                     self.received_ddl_arrivals.read(),
@@ -43249,7 +43425,7 @@ impl Database {
                         metadata_copy_charges.push(StagedCopyCharge::admit_for_host(
                             &self.tx_mgr,
                             &self.finalization.accountant,
-                            Arc::clone(&self.finalization.vector_accountant),
+                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                             bytes,
                             "stage_received_sources",
                         )?)?;
@@ -43412,7 +43588,7 @@ impl Database {
             drop(StagedCopyCharge::admit_for_host(
                 &self.tx_mgr,
                 &self.finalization.accountant,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 image_bytes,
                 "stage_received_unit_vector_image",
             )?);
@@ -43516,7 +43692,7 @@ impl Database {
                         let charge = StagedCopyCharge::admit_for_host(
                             &self.tx_mgr,
                             &self.finalization.accountant,
-                            Arc::clone(&self.finalization.vector_accountant), retained_bytes,
+                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant), retained_bytes,
                             "stage_received_unit_row_image",
                         )?;
                         // Rebuilding the row's index memberships is admitted node
@@ -43572,7 +43748,7 @@ impl Database {
                         let charge = StagedCopyCharge::admit_for_host(
                             &self.tx_mgr,
                             &self.finalization.accountant,
-                            Arc::clone(&self.finalization.vector_accountant), retained_bytes,
+                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant), retained_bytes,
                             "stage_received_unit_row_image",
                         )?;
                         // Owned by the guard until the row reaches the working
@@ -43632,7 +43808,7 @@ impl Database {
             register_vector_layouts(
                 &working.vector_store,
                 &metadata,
-                Arc::clone(&working.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&working.finalization.vector_accountant),
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
@@ -43640,7 +43816,7 @@ impl Database {
         register_vector_layouts(
             &working.vector_store,
             projected_tables,
-            Arc::clone(&working.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&working.finalization.vector_accountant),
             vector_copy_owner,
             read_memory.clone(),
         )?;
@@ -43659,13 +43835,13 @@ impl Database {
             let charge = StagedCopyCharge::admit_for_host(
                 &self.tx_mgr,
                 &self.finalization.accountant,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 self.vector_store
                     .partitioned_copy_bytes_matching(copied_vector_index),
                 "stage_received_unit_vector_image",
             )?;
             let _ = vector_copy_charge.insert(contextdb_vector::VectorCopyAdmission::from_prepaid(
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 charge.prepare_prepaid_box()?,
             )?);
             let owner = vector_copy_charge
@@ -43703,11 +43879,13 @@ impl Database {
         &self,
         matches_index: impl Fn(&VectorIndexRef) -> bool,
         owner: contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         Vec<PartitionedVectorEntry>,
         contextdb_vector::VectorCopyAdmission,
     )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_, source_root) = self.capture_writer_statement()?;
         let result = if let Some(root) = source_root {
             use std::ops::Bound;
@@ -43780,8 +43958,10 @@ impl Database {
         fallback_arrival_tombstones: &HashSet<(String, String)>,
         connected: Option<(&ConnectedCoordinates, &ConnectedOverlay)>,
         accepted_positions: &BTreeMap<(String,RowId),Lsn>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedRestampedVectorImage> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Self::restamp_received_row_graph(working, finalized, local_lsn, receiver_tx, accepted_positions, read_memory.clone())?;
         let local_tx = receiver_tx;
         let detached_lsn = finalized.commit_lsn;
@@ -44018,9 +44198,7 @@ impl Database {
                     Ok(true)
                 })?;
         }
-        let vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(Arc::clone(
-            &working.finalization.vector_accountant,
-        ));
+        let vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(contextdb_vector::MemoryBudgetOwner::clone(&working.finalization.vector_accountant));
         let parts = working.vector_store
             .try_resident_partitioned_entries_with_membership(vector_copy_owner)?.into_parts();
         let mut image = ReceivedRestampedVectorImage { entries: parts.0, owner: parts.1 };
@@ -44156,8 +44334,10 @@ impl Database {
         received: &crate::protocol::ReceivedDdlContext,
         validated_lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedSchemaStage> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let arrivals = HashMap::new();
         self.prepare_received_schema_stage_with_adjudication(
             local_lsn,
@@ -44189,8 +44369,10 @@ impl Database {
         validated_lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         inputs: ReceivedSchemaAdjudicationInputs<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedSchemaStage> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_received_schema_stage_with_delivery(
             local_lsn,
             changes,
@@ -44261,7 +44443,7 @@ impl Database {
                 let _scratch = StagedCopyCharge::admit_for_host(
                     &self.tx_mgr,
                     &self.finalization.accountant,
-                    Arc::clone(&self.finalization.vector_accountant),
+                    contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                     previous
                         .metadata_bytes()
                         .saturating_add(meta.metadata_bytes())
@@ -44497,8 +44679,10 @@ impl Database {
         inputs: ReceivedSchemaAdjudicationInputs<'_>,
         delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedSchemaStage> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.prepare_received_schema_stage_with_interval(local_lsn, None, changes, received,
             validated_lineages, inputs, delivery_prepare, vector_copy_owner, read_memory, None, None)
     }
@@ -44513,10 +44697,12 @@ impl Database {
         inputs: ReceivedSchemaAdjudicationInputs<'_>,
         mut delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         preparation_original: Option<&OwnedMemoryReservation>,
         working_preparation: Option<&ReceivedWorkingPreparation<'_>>,
     ) -> Result<ReceivedSchemaStage> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The private working vector source borrows this executing reader
         // while the same received operation prepares and validates its image.
         let _reader_scope = crate::read_image_memory::ImageMemory::operation_reader(
@@ -44535,7 +44721,7 @@ impl Database {
         let mut publication_vector_copy_owner = Some(contextdb_vector::VectorCopyAdmission::new(
             match preparation_original {
                 Some(original)=>crate::memory_accounting::persistence_original_projection(original)?.vector_budget()?,
-                None=>Arc::clone(&self.finalization.vector_accountant),
+                None=>contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             }));
         let (mut source_order, mut persistence) =
             plan_received_schema_source_order_with_coordinates(local_lsn, &changes.ddl, &changes.ddl_lsn, received, coordinates)?;
@@ -44724,6 +44910,7 @@ impl Database {
                     crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), 0, 0, 0)?,
             };
             return Ok(ReceivedSchemaStage {
+                memory_history: None,
                 _working_row_owner: None,
                 operational_copy_admission: None,
                 _vector_copy_owner: publication_vector_copy_owner.take().expect("one received publication owner"),
@@ -45062,7 +45249,7 @@ impl Database {
             register_vector_layouts(
                 &working.vector_store,
                 &side_semantic.tables,
-                Arc::clone(&working.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&working.finalization.vector_accountant),
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
@@ -45273,7 +45460,7 @@ impl Database {
                     let value=match (working.relational_store.sync_source_lsn(table,row.row_id),
                         working.relational_store.sync_source_kind(table,row.row_id)) {
                         (Some(lsn),Some(kind))=>Some((lsn,kind)),(None,None)=>None,
-                        _=>return Err(Error::StoreCorrupted {path:table.clone(),reason:"private projected provenance is incomplete".into()}),
+                        _=>return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), table, "private projected provenance is incomplete".into())),
                     };
                     loan.write.mark_sync_source(loan.original,table,row.row_id,value)?;
                 }
@@ -45621,11 +45808,8 @@ impl Database {
                 if previous.canonical_deleted_tx != placed.canonical_deleted_tx
                     || previous.entry.vector.len() != placed.entry.vector.len()
                     || previous.entry.vector.iter().zip(placed.entry.vector.iter()).any(|(left,right)| left.to_bits() != right.to_bits()) {
-                    return Err(Error::StoreCorrupted {
-                        path: self.persistence.as_ref().map(|store| store.path().display().to_string())
-                            .unwrap_or_else(|| ":memory:".into()),
-                        reason: "vector partition durability record is corrupt: received placements disagree on their canonical body".into(),
-                    });
+                    return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), self.persistence.as_ref().map(|store| store.path().display().to_string())
+                            .unwrap_or_else(|| ":memory:".into()), "vector partition durability record is corrupt: received placements disagree on their canonical body".into()));
                 }
             }
             let membership = VectorPartitionMembershipRecord {
@@ -45697,7 +45881,7 @@ impl Database {
                     .prepare_partitioned_received_schema_publication(
                         schemas,
                         vectors,
-                        Arc::clone(&self.finalization.vector_accountant),
+                        contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                         vector_image_owner,
                     )
             })
@@ -46230,7 +46414,12 @@ impl Database {
             Some(working.finalization.non_vector_memory.lock().take().ok_or_else(||
                 Error::Other("private received row owner changed before transfer".into()))?)
         } else { None };
+        let memory_history = if self.persistence.is_none() {
+            Some(self.prepare_memory_history_entries(persistence.ddl_log_replacement.iter().map(|(lsn, change)| (*lsn, change)),
+                mirrors.ddl_generations.iter().map(|(key, (table, generation))| (*key, (table, *generation))))?)
+        } else { None };
         Ok(Some(ReceivedSchemaStage {
+            memory_history,
             _working_row_owner: working_row_owner,
             operational_copy_admission: None,
             _vector_copy_owner: publication_vector_copy_owner.take().expect("one received publication owner"),
@@ -46405,7 +46594,7 @@ impl Database {
             self.vector_store.register_index_with_layout(
                 index.clone(),
                 layout,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 &mut stage._vector_copy_owner,
             )?;
             // Record a successful installation immediately in the existing
@@ -46435,8 +46624,10 @@ impl Database {
         stage: &mut ReceivedSchemaStage,
         operational: WriteSet,
 
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if operational.relational_inserts.is_empty() && operational.relational_deletes.is_empty() {
             return Ok(());
         }
@@ -46618,7 +46809,7 @@ impl Database {
         if let Some(vector) = stage.vector.take() {
             self.vector_store.publish_prepared_received_schema_tables(
                 vector,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             );
         }
         let vector_policy_changed = !stage.vector_policy_layouts.is_empty();
@@ -46680,9 +46871,7 @@ impl Database {
         self.in_memory_table_generations
             .lock()
             .extend(std::mem::take(&mut stage.mirrors.table_generations));
-        self.in_memory_ddl_generations
-            .lock()
-            .extend(std::mem::take(&mut stage.mirrors.ddl_generations));
+        self.publish_memory_schema_history(stage.memory_history.take());
         if self.persistence.is_none() {
             self.received_ddl_arrivals
                 .write()
@@ -46720,9 +46909,6 @@ impl Database {
             }
         }
         if self.persistence.is_none() {
-            self.ddl_log
-                .write()
-                .extend(std::mem::take(&mut stage.persistence.ddl_log_replacement));
             publish_prepared_change_log_entries(
                 &self.finalization.accountant,
                 &self.change_log,
@@ -46795,7 +46981,7 @@ impl Database {
         apply_preflight: F,
         after_stage_registration: G,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::protocol::WireApplyResult>
     where
         F: FnOnce(
@@ -46803,6 +46989,8 @@ impl Database {
         ) -> Result<Option<crate::memory_accounting::SchemaUnitReservation>>,
         G: FnOnce() -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[cfg(any(test, feature = "test-seams"))]
         let apply_started = std::time::Instant::now();
         let published = self.tx_mgr.capture_published_read();
@@ -47071,7 +47259,7 @@ impl Database {
                             // the same already captured writer/accountant.
                             let empty_metadata = MetadataCopyCharges::new(&self.finalization.accountant);
                             let empty_vector = contextdb_vector::VectorCopyAdmission::new(
-                                Arc::clone(&self.finalization.vector_accountant));
+                                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant));
                             *moved_preparation_custody.borrow_mut() = Some(ReceivedSchemaPreparationCustody {
                                 _working_row_owner: stage._working_row_owner.take(),
                                 _metadata_copy_charges: std::mem::replace(&mut stage.metadata_copy_charges,empty_metadata),
@@ -47147,7 +47335,7 @@ impl Database {
             .map_err(|failure| {
                 failure.with_write_set(|write_set| {
                     if let Some(write_set) = write_set {
-                        self.plugin.commit_failed(write_set, CommitSource::SyncPull, failure.error());
+                        self.plugin.commit_failed(write_set, CommitSource::SyncPull, failure.error().engine_diagnostic());
                         if let Some(lsn) = write_set.commit_lsn {
                             let _ = self.take_received_schema_stage(lsn);
                         }
@@ -47335,8 +47523,10 @@ impl Database {
         table: &str,
         natural_key: NaturalKey,
         local_row_id: RowId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             return handle.with_host(|host| {
                 self.stage_original_creation_lineage(
@@ -47383,8 +47573,10 @@ impl Database {
         table: &str,
         natural_key: &NaturalKey,
         local_row_id: RowId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[derive(serde::Serialize)]
         struct BorrowedLineage<'a> {
             table: &'a str,
@@ -47889,8 +48081,10 @@ impl Database {
         node: &str,
         incarnation: Incarnation,
         signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedDeliveryLineages> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut result = HashMap::new();
         let state = self.lineage_state_lock.lock();
         for change in &changes.rows {
@@ -48135,11 +48329,13 @@ impl Database {
         author: &str,
         incarnation: Incarnation,
         signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         Vec<(Vec<u8>, Vec<u8>)>,
         contextdb_core::read_memory::ReadCredit,
     )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Only numeric creation positions escape the directory guard.
         let positions = {
             let state = self.lineage_state_lock.lock();
@@ -48237,8 +48433,10 @@ impl Database {
         local_node_id: &str,
         local_incarnation: Incarnation,
         signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<crate::protocol::WireRowLineage>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         // All lineage and coordination locks nest inside the commit boundary.
         // The stores inherit this guard and owe publication after it unlocks.
@@ -48432,8 +48630,10 @@ impl Database {
         &self,
         tx: TxId,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if crate::persistence::received_working_source::WorkingReadSource::current_for(
             self.tx_mgr.identity(),
         )?.is_some() {
@@ -48517,8 +48717,10 @@ impl Database {
     fn transaction_lineage_table_generation_owned(
         &self, tx: TxId, table: &str,
         root: crate::persistence::WriterSnapshotHandle,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.tx_mgr.with_read(tx, |_| ())?;
         let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr else {
             return Err(DatabaseTransactionHost::producer_gap("original lineage memo"));
@@ -48595,8 +48797,10 @@ impl Database {
     pub(crate) fn durable_lineage_table_generation(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(_persistence) = &self.persistence {
             let _operation = self.open_operation()?;
             return self
@@ -48605,12 +48809,9 @@ impl Database {
                     read_memory.clone(),
                 )?
                 .filter(|generation| *generation != 0)
-                .ok_or_else(|| Error::StoreCorrupted {
-                    path: Self::durable_lineage_table_generation_key(table),
-                    reason: format!(
+                .ok_or_else(|| crate::funded_error::corruption_display(Ok(read_memory.clone()), Self::durable_lineage_table_generation_key(table), format_args!(
                         "table {table} has schema metadata but no authoritative generation"
-                    ),
-                });
+                    )));
         }
         self.in_memory_table_generations
             .lock()
@@ -48648,8 +48849,10 @@ impl Database {
     pub(crate) fn next_table_generation_for_create(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(_persistence) = &self.persistence {
             let _operation = self.open_operation()?;
             return self
@@ -48680,16 +48883,15 @@ impl Database {
         lsn: Lsn,
     ) -> Result<()> {
         let change = ddl_change_from_meta(name, meta);
+        let sidecar = DurableDdlGenerationSidecar { table: Some(name.to_string()), table_generation: Some(generation) };
+        let memory_history = self.prepare_memory_schema_history(lsn, 0, std::slice::from_ref(&change), std::slice::from_ref(&sidecar))?;
         if let Some(source)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
             source.project_schema(name,Some(meta),std::slice::from_ref(&change))?;
         }
         let generation_key = Self::durable_lineage_table_generation_key(name);
         let sidecar_key = Self::durable_ddl_generation_sidecar_key(lsn, 0);
         let encoded_generation = RedbPersistence::encode_config_value(&generation)?;
-        let encoded_sidecar = RedbPersistence::encode_config_value(&DurableDdlGenerationSidecar {
-            table: Some(name.to_string()),
-            table_generation: Some(generation),
-        })?;
+        let encoded_sidecar = RedbPersistence::encode_config_value(&sidecar)?;
         if let Some(persistence) = &self.persistence {
             self.publish_direct_metadata(|| {
                 persistence.flush_table_meta_with_config_values_and_append_ddl_log(
@@ -48707,13 +48909,8 @@ impl Database {
             self.in_memory_table_generations
                 .lock()
                 .insert(name.to_string(), generation);
-            self.in_memory_ddl_generations
-                .lock()
-                .insert((lsn, 0), (Some(name.to_string()), Some(generation)));
         }
-        if self.persistence.is_none() {
-            self.ddl_log.write().push((lsn, change));
-        }
+        self.publish_memory_schema_history(memory_history);
         Ok(())
     }
 
@@ -48749,8 +48946,10 @@ impl Database {
         lsn: Lsn,
         ddl: &[DdlChange],
         start: u32,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.ddl_generation_sidecars(ddl, read_memory.clone())?
             .into_iter()
             .enumerate()
@@ -48765,8 +48964,10 @@ impl Database {
     pub(crate) fn ddl_generation_sidecars(
         &self,
         ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DurableDdlGenerationSidecar>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         ddl.iter()
             .map(|change| {
                 let table = Self::ddl_affected_table(change).map(str::to_string);
@@ -48782,32 +48983,14 @@ impl Database {
             .collect()
     }
 
-    pub(crate) fn publish_in_memory_ddl_generation_sidecars(
-        &self,
-        lsn: Lsn,
-        start: u32,
-        sidecars: &[DurableDdlGenerationSidecar],
-    ) {
-        if self.persistence.is_some() || self.capture_detached_sync_write_set.load(Ordering::SeqCst)
-        {
-            return;
-        }
-        self.in_memory_ddl_generations
-            .lock()
-            .extend(sidecars.iter().enumerate().map(|(offset, sidecar)| {
-                (
-                    (lsn, start + offset as u32),
-                    (sidecar.table.clone(), sidecar.table_generation),
-                )
-            }));
-    }
-
     fn record_ddl_generation_sidecars(
         &self,
         lsn: Lsn,
         ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let start = self
             .ddl_log
             .read()
@@ -48825,15 +49008,9 @@ impl Database {
                 )
             })?;
         } else {
-            let mut generations = self.in_memory_ddl_generations.lock();
-            for (offset, change) in ddl.iter().enumerate() {
-                let table = Self::ddl_affected_table(change).map(str::to_string);
-                let table_generation = table
-                    .as_deref()
-                    .map(|table| self.durable_lineage_table_generation(table, read_memory.clone()))
-                    .transpose()?;
-                generations.insert((lsn, start + offset as u32), (table, table_generation));
-            }
+            let sidecars = self.ddl_generation_sidecars(ddl, read_memory)?;
+            let prepared = self.prepare_memory_schema_history(lsn, start, &[], &sidecars)?;
+            self.publish_memory_schema_history(prepared);
         }
         Ok(())
     }
@@ -48842,8 +49019,10 @@ impl Database {
         &self,
         table: &str,
         natural_key: &NaturalKey,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<DurableLineageRecord>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let generation = self.durable_lineage_table_generation(table, read_memory.clone())?;
         self.durable_lineage_record_at_generation(table, natural_key, generation)
     }
@@ -48867,8 +49046,10 @@ impl Database {
     fn exact_outbound_row_occurrence(
         &self,
         row: &RowChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.table_meta(&row.table).is_some() {
             let snapshot = self.history_change_snapshot_at(
                 row.lsn,
@@ -48938,8 +49119,10 @@ impl Database {
     fn outbound_row_generation(
         &self,
         row: &RowChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let generation = if let Some(root) = self.writer_read_root()? {
             let owner =
                 crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone());
@@ -49011,8 +49194,10 @@ impl Database {
         local_incarnation: Incarnation,
         signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OutboundRowLineages> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         // All lineage and coordination locks nest inside the commit boundary.
         // The stores inherit this guard and owe publication after it unlocks.
@@ -49395,8 +49580,10 @@ impl Database {
         &self, tenant_id: &TenantId, changes: &ChangeSet,
         lineages: &[(String,NaturalKey,Lsn,crate::protocol::WireRowLineage)],
         table_generations: &HashMap<String,u64>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for row in &changes.rows {
             let generation = table_generations.get(&row.table).copied()
                 .map(Ok).unwrap_or_else(||self.durable_lineage_table_generation(&row.table,read_memory.clone()))?;
@@ -49440,8 +49627,10 @@ impl Database {
         tenant_id: &TenantId,
         changes: &ChangeSet,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !changes.ddl.is_empty() {
             return Err(Error::SyncError((
                 "received rows beside schema DDL require an authenticated whole-unit schema plan"
@@ -49466,8 +49655,10 @@ impl Database {
         changes: &ChangeSet,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         received_ddl: &crate::protocol::ReceivedDdlContext,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_source_ordered_row_lineages(tenant_id,changes,lineages,received_ddl,&HashMap::new(),read_memory)
     }
 
@@ -49476,8 +49667,10 @@ impl Database {
         lineages: &[(String,NaturalKey,Lsn,crate::protocol::WireRowLineage)],
         received: &crate::protocol::ReceivedDdlContext,
         initial: &HashMap<String,u64>,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         for row in &changes.rows {
             let generation = received.entries.iter().rev().find(|entry|
                 entry.source_ddl_lsn <= row.lsn && entry.table.as_deref() == Some(row.table.as_str())
@@ -49494,8 +49687,10 @@ impl Database {
         lineages: &[(String,NaturalKey,Lsn,crate::protocol::WireRowLineage)],
         received: Option<&crate::protocol::ReceivedDdlContext>,
         initial: &HashMap<String,u64>, dependency: bool,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AcceptedDeleteSuppression> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         if let Some(received) = received {
             self.validate_source_ordered_row_lineages(tenant,&changes,lineages,received,initial,memory.clone())?;
         } else {
@@ -49531,8 +49726,10 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         authenticated_peer: &str,
         sender_incarnation: Incarnation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_received_row_lineages(tenant_id, changes, lineages, read_memory.clone())?;
         self.validate_incoming_push_lineage_authorship(
             changes,
@@ -49609,8 +49806,10 @@ impl Database {
         receipt: Option<&SyncApplyReceipt>,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<AuthenticatedFreshCreatorDelete>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(receipt) = receipt else {
             return Ok(Vec::new());
         };
@@ -49698,8 +49897,10 @@ impl Database {
         authenticated_peer: &str,
         sender_incarnation: Incarnation,
         received_ddl: &crate::protocol::ReceivedDdlContext,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_received_row_lineages_with_received_ddl(
             tenant_id,
             changes,
@@ -49836,8 +50037,10 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         authenticated_peer: &str,
         sender_incarnation: Incarnation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<Conflict>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Verify the immutable, portable creator evidence before consulting a
         // retired generation.  A relay is allowed to carry a creator's signed
         // lineage, but an unauthenticated or malformed row must never learn
@@ -49951,8 +50154,10 @@ impl Database {
         conflicts: Vec<Conflict>,
         outcome_key: &SyncPushOutcomeKey,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let push_lock = self.sync_push_apply_lock_for_key(outcome_key);
         let _push_apply = push_lock.lock();
         if let Some(result) = self.replay_sync_push_outcome(outcome_key)? {
@@ -50006,8 +50211,10 @@ impl Database {
     pub(crate) fn authored_schema_capabilities(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<BTreeSet<crate::sync_types::SchemaSyncCapability>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             return RedbPersistence::authored_capabilities_in_read(
                 &root,
@@ -50075,8 +50282,10 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         table_generations: &HashMap<String, u64>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AcceptedDeleteSuppression> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_received_row_lineages_against_generation_projection(
             tenant_id,
             &changes,
@@ -50112,8 +50321,10 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         table_generations: &HashMap<String, u64>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AcceptedDeleteSuppression> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_received_row_lineages_against_generation_projection(
             tenant_id,
             &changes,
@@ -50139,8 +50350,10 @@ impl Database {
         changes: ChangeSet,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_received_row_lineages(tenant_id, &changes, lineages, read_memory.clone())?;
         Ok(self
             .suppress_accepted_lineage_replays(changes, lineages, true, read_memory.clone())?
@@ -50154,8 +50367,10 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         received_ddl: &crate::protocol::ReceivedDdlContext,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.validate_received_row_lineages_with_received_ddl(
             tenant_id,
             &changes,
@@ -50184,8 +50399,10 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         dependency_complete: bool,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AcceptedDeleteSuppression> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.suppress_accepted_lineage_replays_with_generation_projection(
             changes,
             lineages,
@@ -50202,8 +50419,10 @@ impl Database {
         dependency_complete: bool,
         table_generations: &HashMap<String, u64>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AcceptedDeleteSuppression> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // A preceding unit can publish while the reply retains its admission
         // root. Classify accepted lineage at one current committed frontier,
         // pairing its logical snapshot with the durable source it describes.
@@ -50356,8 +50575,10 @@ impl Database {
         tx: TxId,
         table: &str,
         row: &VersionedRow,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(table) else {
             return Ok(());
         };
@@ -50480,8 +50701,10 @@ impl Database {
         rows: &[RowChange],
         _author_node_id: &str,
         _author_database_incarnation: Incarnation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let lineage_state = self.lineage_state_lock.lock();
         for row in rows.iter().filter(|row| row.deleted) {
             let key = Self::durable_lineage_config_key(
@@ -50509,8 +50732,10 @@ impl Database {
     fn durable_pending_deletes_since(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DurablePendingDelete>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let lineage_state = self.lineage_state_lock.lock();
         let records = self.list_lineage_records(&lineage_state)?;
         let mut changes = Vec::new();
@@ -50539,8 +50764,10 @@ impl Database {
 
     pub(crate) fn has_durable_pending_delete_obligations(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let lineage_state = self.lineage_state_lock.lock();
         Ok(self
             .list_lineage_records(&lineage_state)?
@@ -50637,8 +50864,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         projection: &ChangeProjection<'_>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DurablePendingDelete>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(startup) = self.committed_image_startup.as_ref() else {
             let pending = self.durable_pending_deletes_since(since_lsn, read_memory.clone())?;
             if projection.bounded {
@@ -50676,30 +50905,21 @@ impl Database {
                     bytes
                 };
                 let record = RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)
-                    .map_err(|error| Error::StoreCorrupted {
-                        path: self.committed_image_path(),
-                        reason: format!("durable lineage record {key} cannot be read: {error}"),
-                    })?;
+                    .map_err(|error| crate::funded_error::corruption_display(Ok(read_memory.clone()), self.committed_image_diagnostic_path().display(), format_args!("durable lineage record {key} cannot be read: {error}")))?;
                 let generation_key = Self::durable_lineage_table_generation_key(&record.table);
                 let generation = startup
                     .config_values
                     .get(&generation_key)
                     .map(|bytes| RedbPersistence::decode_config_value::<u64>(bytes))
                     .transpose()
-                    .map_err(|error| Error::StoreCorrupted {
-                        path: self.committed_image_path(),
-                        reason: format!(
+                    .map_err(|error| crate::funded_error::corruption_display(Ok(read_memory.clone()), self.committed_image_diagnostic_path().display(), format_args!(
                             "table generation {generation_key} cannot be read: {error}"
-                        ),
-                    })?
+                        )))?
                     .filter(|generation| *generation != 0)
-                    .ok_or_else(|| Error::StoreCorrupted {
-                        path: self.committed_image_path(),
-                        reason: format!(
+                    .ok_or_else(|| crate::funded_error::corruption_display(Ok(read_memory.clone()), self.committed_image_diagnostic_path().display(), format_args!(
                             "table {} has lineage but no authoritative generation",
                             record.table
-                        ),
-                    })?;
+                        )))?;
                 if record.table_generation != generation
                     || record.delete_obligation != DurableDeleteObligation::Pending
                     || record.delete_lsn <= since_lsn.0
@@ -50730,6 +50950,12 @@ impl Database {
     }
 
     /// The file a committed image was read from, for its damage reports.
+    fn committed_image_diagnostic_path(&self) -> &std::path::Path {
+        self.retained_relational_source.as_ref().map(|source| source.database_path())
+            .or_else(|| self.image_history.as_ref().map(|history| history.source.database_path()))
+            .unwrap_or_else(|| std::path::Path::new(""))
+    }
+
     fn committed_image_path(&self) -> String {
         self.retained_relational_source
             .as_ref()
@@ -50746,8 +50972,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         changes: ChangeSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let pending = self.durable_pending_deletes_since(since_lsn, read_memory)?;
         Ok(Self::reconcile_durable_pending_deletes(changes, pending))
     }
@@ -50775,7 +51003,9 @@ impl Database {
         &self,
         mut changes: ChangeSet,
         held_through_lsn: Lsn,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,) -> Result<ChangeSet> {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let lineage_state = self.lineage_state_lock.lock();
         let records = self.list_lineage_records(&lineage_state)?;
         for (_, record) in records {
@@ -50814,8 +51044,10 @@ impl Database {
         rows: &[RowChange],
         hub_lsn: Lsn,
         hub_node_id: Option<&str>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let operation = || {
             let mut lineage_state = self.lineage_state_lock.lock();
@@ -50856,8 +51088,10 @@ impl Database {
     fn row_id_for_delete_change(
         &self,
         row: &RowChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.find_history_change(
             row.lsn,
             row.lsn,
@@ -50884,8 +51118,10 @@ impl Database {
         last: Lsn,
         mut select: impl FnMut(&ChangeLogEntry) -> Option<T>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<T>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
             let mut cursor = root.change_log_cursor(
@@ -50981,8 +51217,10 @@ impl Database {
         rows: &[RowChange],
         hub_lsn: Lsn,
         hub_node_id: Option<&str>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         self.tx_mgr.with_maintenance_publication(|publication| {
             let snapshot = self.snapshot();
@@ -51107,8 +51345,10 @@ impl Database {
         purge_refused_rows: &[RowChange],
         accepted_rows: &[RowChange],
         hub_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.with_authoritative_hub_reply(hub_node_id, |db| {
             db.record_hub_push_reply_effects_while_authoritative(
                 tenant_id,
@@ -51130,8 +51370,10 @@ impl Database {
         purge_refused_rows: &[RowChange],
         accepted_rows: &[RowChange],
         hub_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_hub_push_reply_while_authoritative(
             tenant_id, hub_node_id, ordinary_refused_rows, purge_refused_rows, accepted_rows,
             hub_lsn, None, None,
@@ -51152,8 +51394,10 @@ impl Database {
         hub_lsn: Lsn,
         confirmed_through: Option<Lsn>,
         pending: Option<(Lsn, &ApplyResult)>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ordinary_refused_rows.is_empty()
             && purge_refused_rows.is_empty()
             && accepted_rows.is_empty()
@@ -51422,8 +51666,10 @@ impl Database {
         &self,
         tenant_id: &TenantId,
         hub_node_id: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.has_terminal_refusal_markers(&TerminalRefusalPullContext {
             tenant_id: tenant_id.clone(),
             hub_node_id: hub_node_id.to_string(),
@@ -51457,8 +51703,10 @@ impl Database {
     pub(crate) fn invalidate_accepted_local_ordering_after_hub_regression_with_read_memory(
         &self,
         hub_applied_source_watermark: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         self.tx_mgr.with_maintenance_publication(|publication| {
             let mut entries = Vec::new();
@@ -51526,8 +51774,10 @@ impl Database {
         &self,
         after_exclusive: Lsn,
         through_inclusive: Option<Lsn>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         self.tx_mgr.with_maintenance_publication(|publication| {
             let mut entries = Vec::new();
@@ -51628,8 +51878,10 @@ impl Database {
         changes: &ChangeSet,
         lineages: &OutboundRowLineages,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         for row in &changes.rows {
             if row.deleted {
@@ -51681,8 +51933,10 @@ impl Database {
         &self,
         after: Lsn,
         through: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if after >= through {
             return Ok(false);
         }
@@ -51803,8 +52057,10 @@ impl Database {
         &self,
         rows: &[RowChange],
         arrivals: &HashMap<Lsn, Option<Lsn>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         self.tx_mgr.with_maintenance_publication(|publication| {
             let mut entries = Vec::new();
@@ -51911,7 +52167,7 @@ impl Database {
     pub(crate) fn commit_index_for_read_image(
         &self,
         context: &contextdb_tx::ReadCommitContext<'_>,
-        charge: &Arc<crate::read_image_memory::ImageMemory>,
+        charge: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Vec<(Lsn, TxId)>> {
         use std::ops::Bound;
         let mut cursor = self.tx_mgr.read_commit_directory_cursor(
@@ -51920,7 +52176,7 @@ impl Database {
             context,
         )?;
         struct OutputCredit {
-            charge: Arc<crate::read_image_memory::ImageMemory>,
+            charge: crate::read_image_memory::ImageMemoryHandle,
             bytes: usize,
         }
         impl Drop for OutputCredit {
@@ -51994,8 +52250,10 @@ impl Database {
     pub(crate) fn ensure_image_history_with_read_memory(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<(), ImageHistoryError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(history) = self.image_history.as_ref() else {
             return Ok(());
         };
@@ -52255,8 +52513,10 @@ impl Database {
         table: &str,
         mut values: HashMap<ColName, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<InsertRowResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.ensure_trigger_table_ready(table, "insert_row")?;
         self.complete_insert_access_values(table, &mut values)?;
         let allow_duplicate_unique_noop =
@@ -52344,8 +52604,10 @@ impl Database {
         conflict_col: &str,
         mut values: HashMap<ColName, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<UpsertResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             let _operation = self.open_operation_after_write_control_wait(tx, "upsert_row")?;
             self.ensure_trigger_table_ready(table, "upsert_row")?;
@@ -52384,8 +52646,10 @@ impl Database {
         admission: &mut Option<OwnedMemoryReservation>,
         staged_row: &mut Option<RowId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<UpsertResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot_for_read();
         let existing_row = values
             .get(conflict_col)
@@ -52603,8 +52867,10 @@ impl Database {
         values: &HashMap<ColName, Value>,
         skip_row_id: Option<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         match self.check_row_constraints(
             tx,
             table,
@@ -52628,8 +52894,10 @@ impl Database {
         skip_row_id: Option<RowId>,
         allow_duplicate_unique_noop: bool,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowConstraintCheck> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Constraint probes MUST see the current committed watermark, not any
         // thread-local override. A PK/UNIQUE violation on a committed row must
         // be detected even if the caller pinned a pre-violation snapshot for
@@ -52663,8 +52931,10 @@ impl Database {
         allow_duplicate_unique_noop: bool,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RowConstraintCheck> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let metas = self.relational_store.table_meta.read();
         let meta = metas
             .get(table)
@@ -52955,8 +53225,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_row_id: Option<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ConstraintProbe> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.persistence.is_some() {
             let columns = [column.to_owned()];
             if let Some(row) = self.writer_constraint_staged_match(
@@ -53101,8 +53373,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_row_id: Option<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if cols.is_empty() || values.is_empty() || cols.len() != values.len() {
             return Ok(None);
         }
@@ -53301,8 +53575,10 @@ impl Database {
         origin_tx: TxId,
         ws: &mut WriteSet,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The guards below are one-shot: each describes work this pass is
         // about to validate and must not be re-applied. The recorded vector
         // schema epochs are NOT one-shot — they describe the whole
@@ -53460,8 +53736,10 @@ impl Database {
         &self,
         ws: &WriteSet,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         // A received unit that declares a table AND carries that table's
         // vectors commits both together atomically. At this
         // point the table exists only in the prepared stage, so reading the
@@ -53589,11 +53867,6 @@ impl Database {
             } else {
                 0
             })
-            .saturating_add(
-                self.persistence
-                    .as_ref()
-                    .map_or(0, |persistence| persistence.cache_charge()),
-            )
     }
 
     /// Writer-owned log, cache and captured source controls, for a proof
@@ -53609,6 +53882,8 @@ impl Database {
     #[doc(hidden)]
     pub fn __durable_writer_charged_bytes_for_test(&self) -> usize {
         self.durable_writer_retained_bytes()
+            .saturating_add(self.schema_history_retained_bytes())
+            .saturating_add(self.persistence.as_ref().map_or(0, |p| p.cache_charge()))
             .saturating_add(self.commit_source_reference_charge)
             .saturating_add(self.persistence.as_ref().map_or(0, |persistence| {
                 let (root_charge, schema_charge) = persistence.writer_snapshot_charge_for_test();
@@ -53627,9 +53902,7 @@ impl Database {
         let persistence = self.persistence.as_ref().ok_or_else(|| {
             Error::Other("durable vector inventory requires a file-backed store".into())
         })?;
-        let mut owner = contextdb_vector::VectorCopyAdmission::new(Arc::clone(
-            &self.finalization.vector_accountant,
-        ));
+        let mut owner = contextdb_vector::VectorCopyAdmission::new(contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant));
         persistence.durable_vector_storage_inventory_for_test(partition, &mut owner)
     }
 
@@ -53655,7 +53928,7 @@ impl Database {
             drop(change_log);
             self.change_log_table_index.write().clear();
             self.change_log_lsn_refcounts.write().clear();
-            self.ddl_log.write().clear();
+            self.clear_memory_schema_log();
         });
     }
 
@@ -53717,8 +53990,10 @@ impl Database {
         snapshot: SnapshotId,
         upsert_intents: &[PendingUpsertIntent],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if upsert_intents.is_empty() {
             return Ok(());
         }
@@ -53782,8 +54057,10 @@ impl Database {
         ws: &mut WriteSet,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ws.relational_deletes.is_empty() {
             return Ok(());
         }
@@ -53843,8 +54120,10 @@ impl Database {
         ws: &WriteSet,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<String, HashMap<RowId, VersionedRow>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if ws.relational_deletes.is_empty() {
             return Ok(HashMap::new());
         }
@@ -54017,8 +54296,10 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut stats = stats;
         if columns.is_empty() || columns.len() != values.len() {
             return Ok(None);
@@ -54071,8 +54352,10 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Option<RowId>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if columns.is_empty() || columns.len() != values.len() {
             return Ok(Some(None));
         }
@@ -54311,8 +54594,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(row_id) = self.indexed_visible_row_id_by_columns(
             table,
             columns,
@@ -54344,8 +54629,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let columns = vec![column.to_string()];
         let values = vec![value.clone()];
         self.required_indexed_visible_row_by_columns(
@@ -54367,8 +54654,10 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(row_id) = self.committed_unique_conflict_row_id(
             table,
             columns,
@@ -54490,8 +54779,10 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.persistence.is_some() || self.retained_relational_source.is_some() {
             if let Some(row) = self.indexed_visible_row_id_by_columns(
                 table,
@@ -54554,8 +54845,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.required_indexed_visible_row_by_columns(
             table,
             &natural_key.key_columns(),
@@ -54575,8 +54868,10 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.persistence.is_some() || self.retained_relational_source.is_some() {
             let row = self.indexed_visible_row_id_by_columns(
                 table,
@@ -54681,8 +54976,10 @@ impl Database {
         intent: &PendingUpsertIntent,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<CommitTimeUpsertRewrite>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if intent.table != ws.relational_inserts[insert_index].0
             || intent.row_id != ws.relational_inserts[insert_index].1.row_id
         {
@@ -54872,8 +55169,10 @@ impl Database {
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.relational_store().is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
@@ -55090,10 +55389,10 @@ impl Database {
                         final_vector.len(),
                         vector_copy_owner,
                     )?;
-                    self.finalization.accountant.try_allocate_for(
+                    self.finalization.accountant.try_allocate_for_label(
                         bytes,
                         "insert",
-                        &format!("vector_insert@{}.{}", index.table, index.column),
+                        self.finalization.accountant.prepare_operation_label(format_args!("vector_insert@{}.{}", index.table, index.column))?,
                         "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
                     )?;
                     VectorEntry {
@@ -55111,10 +55410,10 @@ impl Database {
                         final_vector.len(),
                         vector_copy_owner,
                     )?;
-                    self.finalization.accountant.try_allocate_for(
+                    self.finalization.accountant.try_allocate_for_label(
                         bytes,
                         "insert",
-                        &format!("vector_insert@{}.{}", index.table, index.column),
+                        self.finalization.accountant.prepare_operation_label(format_args!("vector_insert@{}.{}", index.table, index.column))?,
                         "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
                     )?;
                     VectorEntry {
@@ -55173,8 +55472,10 @@ impl Database {
         snapshot: SnapshotId,
         stats: Option<&mut CommitStageStats>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<CommitTimeUpsertRewrite>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut stats = stats;
         let (table, row) = ws.relational_inserts[insert_index].clone();
         let Some(intent_indexes) = upsert_lookup.by_row.get(&(table.clone(), row.row_id)) else {
@@ -55243,8 +55544,10 @@ impl Database {
         deleted_rows_by_table: &mut HashMap<String, HashMap<RowId, VersionedRow>>,
         stats: &mut CommitStageStats,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let upsert_lookup = CommitTimeUpsertLookup {
             intents: upsert_intents,
             by_row: Self::upsert_intent_indexes_by_row(upsert_intents),
@@ -55561,8 +55864,10 @@ impl Database {
     fn reject_purged_lineage_recreation(
         &self,
         ws: &WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for (table, row) in &ws.relational_inserts {
             let Some(meta) = self.table_meta(table) else {
                 continue;
@@ -55671,8 +55976,10 @@ impl Database {
         deleted_rows_by_table: &HashMap<String, HashMap<RowId, VersionedRow>>,
         stats: &mut CommitStageStats,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let staged_lookup = StagedTupleLookup::rebuild(self, ws)?;
         let deleted_by_table = Self::deleted_row_ids_by_table(ws);
         let empty_deleted = HashSet::new();
@@ -55813,8 +56120,10 @@ impl Database {
         deleted_rows_by_table: &HashMap<String, HashMap<RowId, VersionedRow>>,
         stats: &mut CommitStageStats,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let staged_lookup = StagedTupleLookup::rebuild(self, ws)?;
         let deleted_by_table = Self::deleted_row_ids_by_table(ws);
         let empty_deleted = HashSet::new();
@@ -55960,8 +56269,10 @@ impl Database {
         guards: &[PendingConditionalUpdateGuard],
         mut stats: Option<&mut CommitStageStats>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut outcome = CommitValidationOutcome::default();
         for guard in guards.iter().rev() {
             let mut read_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
@@ -56053,8 +56364,10 @@ impl Database {
         snapshot: SnapshotId,
         guards: &[PendingSyncLineageGuard],
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for guard in guards {
             let unchanged = self
                 .committed_row_at(&guard.table, guard.row_id, snapshot, read_memory.clone())?
@@ -56125,8 +56438,10 @@ impl Database {
         row_uuid: Option<uuid::Uuid>,
         new_state: Option<&str>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let (Some(uuid), Some(state)) = (row_uuid, new_state) {
             if !self.propagation_rules_can_react(table, state) {
                 return Ok(());
@@ -56186,8 +56501,10 @@ impl Database {
         row_uuid: uuid::Uuid,
         new_state: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot_for_read();
         let metas = self.relational_store().table_meta.read().clone();
         let mut queue: VecDeque<PropagationQueueEntry> = VecDeque::new();
@@ -56377,8 +56694,10 @@ impl Database {
         new_state: Option<&str>,
         options: &mut PreparedPropagationOptions<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (Some(uuid), Some(state)) = (row_uuid, new_state) else {
             return Ok(());
         };
@@ -56411,8 +56730,10 @@ impl Database {
         new_state: &str,
         options: &mut PreparedPropagationOptions<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let metas = self.relational_store().table_meta.read().clone();
         let mut queue: VecDeque<PropagationQueueEntry> = VecDeque::new();
         let mut visited: HashSet<(String, uuid::Uuid)> = HashSet::new();
@@ -56590,8 +56911,10 @@ impl Database {
         queue: &mut VecDeque<PropagationQueueEntry>,
         source: PropagationSource<'_>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for (owner_table, owner_meta) in ctx.metas {
             for rule in &owner_meta.propagation_rules {
                 let PropagationRule::ForeignKey {
@@ -56646,8 +56969,10 @@ impl Database {
         queue: &mut VecDeque<PropagationQueueEntry>,
         source: PropagationSource<'_>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = ctx.metas.get(source.table) else {
             return Ok(());
         };
@@ -56713,8 +57038,10 @@ impl Database {
         ctx: &PropagationContext<'_>,
         source: PropagationSource<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = ctx.metas.get(source.table) else {
             return Ok(());
         };
@@ -56762,8 +57089,10 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut result = self.committed_rows_at(table, snapshot, read_memory.clone())?;
 
         let committed_row_ids: HashSet<RowId> = result.iter().map(|row| row.row_id).collect();
@@ -56804,8 +57133,10 @@ impl Database {
         snapshot: SnapshotId,
         predicate: &dyn Fn(&VersionedRow) -> bool,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .scan_in_prepared_write_set(ws, table, snapshot, read_memory.clone())?
             .into_iter()
@@ -56821,8 +57152,10 @@ impl Database {
         value: &Value,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .scan_in_prepared_write_set(ws, table, snapshot, read_memory.clone())?
             .into_iter()
@@ -56836,8 +57169,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .scan_in_prepared_write_set(ws, table, snapshot, read_memory.clone())?
             .into_iter()
@@ -56851,8 +57186,10 @@ impl Database {
         uuid: uuid::Uuid,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .scan_in_prepared_write_set(ws, table, snapshot, read_memory.clone())?
             .into_iter()
@@ -56870,8 +57207,10 @@ impl Database {
         next_values: HashMap<ColName, Value>,
         options: &mut PreparedPropagationOptions<'_>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.relational_store().is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
@@ -56973,8 +57312,10 @@ impl Database {
         row_id: RowId,
         mut lookup_delta: Option<&mut StagedTupleLookupDelta>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !self.relational_store.table_meta.read().contains_key(table) {
             return Err(Error::TableNotFound(table.to_string()));
         }
@@ -57032,8 +57373,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.vector_store.with_index_layout(&index, |_| ())?;
         let Some(row) = self.row_by_id_in_prepared_write_set(
             ws,
@@ -57129,8 +57472,10 @@ impl Database {
         queue: &mut VecDeque<PropagationQueueEntry>,
         source: PropagationSource<'_>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for (owner_table, owner_meta) in ctx.metas {
             for rule in &owner_meta.propagation_rules {
                 let PropagationRule::ForeignKey {
@@ -57191,8 +57536,10 @@ impl Database {
         queue: &mut VecDeque<PropagationQueueEntry>,
         source: PropagationSource<'_>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = ctx.metas.get(source.table) else {
             return Ok(());
         };
@@ -57254,8 +57601,10 @@ impl Database {
         ctx: &PropagationContext<'_>,
         source: PropagationSource<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = ctx.metas.get(source.table) else {
             return Ok(());
         };
@@ -57310,8 +57659,10 @@ impl Database {
         table: &str,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.delete_row_inner(
             tx,
             table,
@@ -57330,8 +57681,10 @@ impl Database {
         table: &str,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.delete_row_inner(
             tx,
             table,
@@ -57349,8 +57702,10 @@ impl Database {
         row_id: RowId,
         release_vectors: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.ensure_no_mixed_local_schema_dml(tx)?;
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         let _operation = if trigger_callback_bound || self.sql_write_control_bypass_active(tx) {
@@ -57448,8 +57803,10 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         #[cfg(any(test, feature = "test-seams"))]
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
@@ -57474,8 +57831,10 @@ impl Database {
         snapshot: SnapshotId,
         columns: &[Vec<String>],
         output: &mut contextdb_core::read_memory::ReadCredit,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(root) = self.writer_read_root()? else {
             return self.committed_row_at_admitted(table, row_id, snapshot, output, read_memory);
         };
@@ -57540,8 +57899,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
         read_credit: &mut contextdb_core::read_memory::ReadCredit,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_row_by_identity(
             read_memory.clone(),
             None,
@@ -57566,8 +57927,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             let source = self.statement_relational_source(
                 root,
@@ -57610,8 +57973,10 @@ impl Database {
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(root) = self.writer_read_root()? else {
             return self.committed_row_at(table, row_id, snapshot, read_memory);
         };
@@ -57640,8 +58005,10 @@ impl Database {
         &self,
         table: &str,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             let source = self.statement_relational_source_at_snapshot(
                 root,
@@ -57723,6 +58090,10 @@ impl Database {
             // The durable preparation streams its addressed source directly.
             return Ok(Vec::new());
         }
+        #[cfg(test)]
+        ef_search_metadata_contract_tests::note_projection_rows(
+            self.relational_store.tables.read().get(table).map_or(0, Vec::len) as u64,
+        );
         self.table_versions_for_projection(table)
     }
 
@@ -57822,8 +58193,10 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(tx) = tx {
             return self.scan_in_tx_raw(tx, table, snapshot, vector_copy_owner, read_memory);
         }
@@ -57845,8 +58218,10 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[cfg(any(test, feature = "test-seams"))]
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
         let mut rows = self.committed_rows_at(table, snapshot, read_memory.clone())?;
@@ -57870,8 +58245,10 @@ impl Database {
         table: &str,
         column: &str,
         shape: &crate::executor::IndexPredicateShape,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<IndexScanTxOverlay> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::executor::{IndexPredicateShape, range_includes};
         let mut overlay = IndexScanTxOverlay::default();
         let mut memory = contextdb_core::read_memory::ReadCredit::try_new(
@@ -57946,8 +58323,10 @@ impl Database {
         snapshot: SnapshotId,
         predicate: &dyn Fn(&VersionedRow) -> bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let rows = self.committed_rows_at(table, snapshot, read_memory.clone())?;
         let mut rows = self.filter_rows_for_read(table, rows, snapshot, read_memory.clone())?;
@@ -57989,8 +58368,10 @@ impl Database {
         table: &str,
         col: &str,
         value: &Value,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.point_lookup_with_read_memory(
             table,
@@ -58009,8 +58390,10 @@ impl Database {
         value: &Value,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         self.assert_table_read_allowed(table)?;
         let Some(row) =
@@ -58020,10 +58403,7 @@ impl Database {
         };
         let row = self
             .committed_row_at(table, row.row_id, snapshot, read_memory.clone())?
-            .ok_or_else(|| Error::StoreCorrupted {
-                path: table.to_owned(),
-                reason: "selected committed point has no authenticated visible row".into(),
-            })?;
+            .ok_or_else(|| crate::funded_error::corruption_text(Ok(read_memory.clone()), table, "selected committed point has no authenticated visible row".into()))?;
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
@@ -58057,8 +58437,10 @@ impl Database {
         value: &Value,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let row = self.relational_point_with_tx(
             Some(tx),
             table,
@@ -58121,8 +58503,10 @@ impl Database {
         values: &[Value],
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if columns.is_empty() || columns.len() != values.len() {
             return Err(Error::Other((
                 "ON CONFLICT target must include matching columns and values".to_string()).into()));
@@ -58200,8 +58584,10 @@ impl Database {
         values: &[Value],
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if columns.is_empty() || columns.len() != values.len() {
             return Ok(None);
         }
@@ -58321,8 +58707,10 @@ impl Database {
         edge_type: EdgeType,
         mut properties: HashMap<String, Value>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation_after_write_control_wait(tx, "insert_edge")?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let snapshot = self.snapshot();
@@ -58433,8 +58821,10 @@ impl Database {
         target: NodeId,
         edge_type: &str,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation_after_write_control_wait(tx, "delete_edge")?;
         let snapshot = self.snapshot();
         self.assert_node_write_allowed(source, snapshot, read_memory.clone())?;
@@ -58484,8 +58874,10 @@ impl Database {
         max_depth: u32,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<TraversalResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         if let Some(tx) = self.private_graph_read_tx(snapshot)? {
             return self.graph_bfs_counted(Some(tx), start, edge_types, direction, 1..=max_depth,
@@ -58534,8 +58926,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         if !self.access_is_admin()
             && !self.node_read_allowed(source, snapshot, read_memory.clone())?
@@ -58628,8 +59022,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<HashMap<String, Value>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         if !self.access_is_admin()
             && (!self.node_read_allowed(source, snapshot, read_memory.clone())?
@@ -58666,8 +59062,10 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<HashMap<String, Value>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.graph_snapshot(snapshot, read_memory.clone())? {
             let mut cursor = root.cursor(contextdb_graph::source::GraphQuery {
                 node: source,
@@ -58789,8 +59187,10 @@ impl Database {
         snapshot: SnapshotId,
         rows: &mut [VersionedRow],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(table) else {
             return Ok(());
         };
@@ -58836,8 +59236,10 @@ impl Database {
         selected: Option<&[String]>,
         rows: &mut [VersionedRow],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(table) else {
             return Ok(());
         };
@@ -58886,8 +59288,10 @@ impl Database {
         table: &str,
         row: &VersionedRow,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<ColName, Value>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut values = row.values.clone();
         values.extend(self.shed_committed_values_for_change(
             table,
@@ -58911,8 +59315,10 @@ impl Database {
         row: &VersionedRow,
         values: &mut HashMap<ColName, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.fill_quantized_columns(
             table,
             row,
@@ -58930,8 +59336,10 @@ impl Database {
         snapshot: SnapshotId,
         values: &mut HashMap<ColName, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for column in self.quantized_vector_columns(table) {
             if !matches!(values.get(&column), Some(Value::Null) | None) {
                 continue;
@@ -58966,8 +59374,10 @@ impl Database {
         snapshot: SnapshotId,
         rows: &mut [VersionedRow],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.quantized_vector_columns(table).is_empty() {
             return Ok(());
         }
@@ -59048,8 +59458,10 @@ impl Database {
         >,
         release_retained: &mut dyn FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<f32>, crate::executor::BoundedExecutionError> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.vector_store.bounded_score_live_row(
                 index,
@@ -59105,8 +59517,10 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Vec<f32>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _historical_intent = if snapshot.0 < self.snapshot().0 {
             self.vector_historical_read_intent(snapshot, read_memory.clone())
         } else {
@@ -59237,8 +59651,10 @@ impl Database {
         lsn: Lsn,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Vec<f32>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let row = self.find_row_by_id_in_tx(tx, table, row_id, snapshot, read_memory.clone())?;
         if row.lsn != lsn {
             return Ok(None);
@@ -59310,8 +59726,10 @@ impl Database {
         values: &HashMap<ColName, Value>,
         _staged_before: usize,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let captured = self.row_vector_values(table, values);
         if captured.is_empty() {
             return Ok(());
@@ -59334,8 +59752,10 @@ impl Database {
         row_id: RowId,
         captured: Vec<(VectorIndexRef, Vec<f32>)>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if captured.is_empty() {
             return Ok(());
         }
@@ -59424,13 +59844,14 @@ impl Database {
             let bytes =
                 self.vector_insert_accounted_bytes(index, vector.len(), vector_copy_owner)?;
             reservations.push(
-                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for_label(
                     crate::memory_accounting::AccountantHandle::clone(
                         &self.finalization.accountant,
                     ),
                     bytes,
                     "insert",
-                    &format!("vector_insert@{}.{}", index.table, index.column),
+                    self.finalization.accountant.prepare_operation_label(
+                        format_args!("vector_insert@{}.{}", index.table, index.column))?,
                     "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
                 )?,
             );
@@ -59626,8 +60047,10 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation_after_write_control_wait(tx, "insert_vector")?;
         let _vector_schema = self.vector_schema_read(&index);
         self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
@@ -59675,8 +60098,10 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.write_row_vectors(
             tx,
             row_id,
@@ -59698,8 +60123,10 @@ impl Database {
         index: VectorIndexRef,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation_after_write_control_wait(tx, "delete_vector")?;
         let _vector_schema = self.vector_schema_read(&index);
         self.ensure_trigger_table_ready(&index.table, "delete_vector")?;
@@ -59732,8 +60159,10 @@ impl Database {
         index: VectorIndexRef,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.record_vector_schema_epoch(tx, &index)?;
         let existing_live = self.vector_store.has_live_entry_for_row(
             &index,
@@ -59984,8 +60413,10 @@ impl Database {
         old_row_id: RowId,
         new_row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _vector_schema = self.vector_schema_read(&index);
         self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "move_vector")?;
@@ -60423,8 +60854,10 @@ impl Database {
     fn vector_historical_read_intent(
         &self,
         snapshot: SnapshotId,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Option<crate::persistence::vector_membership_source::HistoricalReadIntentScope> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         self.vector_membership_owner().map(|owner| {
             crate::persistence::vector_membership_source::enter_historical_read_intent(
                 owner, snapshot, memory,
@@ -60454,9 +60887,11 @@ impl Database {
     fn vector_read_scope(
         &self,
         snapshot: SnapshotId,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         copies: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         self.vector_read_preflight(snapshot, memory, copies, None)
     }
 
@@ -60465,10 +60900,12 @@ impl Database {
     pub(crate) fn vector_read_preflight(
         &self,
         snapshot: SnapshotId,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         copies: &mut contextdb_vector::VectorCopyAdmission,
         checkpoint: Option<crate::executor::bounded::ReadOpenContext>,
     ) -> Result<Option<crate::persistence::vector_membership_source::VectorReadScope>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         use crate::persistence::vector_membership_source::{self, MembershipOwner};
         let source = if let Some(persistence) = &self.persistence {
             MembershipOwner::Writable(persistence.clone())
@@ -60480,7 +60917,7 @@ impl Database {
         let scope = vector_membership_source::enter_read_operation(
             source,
             snapshot,
-            memory,
+            memory.clone(),
             copies,
             &mut |partition| {
                 if self
@@ -60488,10 +60925,7 @@ impl Database {
                     .try_partition_state(&partition.index, &partition.partition_key)
                     .is_none()
                 {
-                    return Err(Error::StoreCorrupted {
-                        path: partition.index.table.clone(),
-                        reason: "captured vector route has no installed partition source".into(),
-                    });
+                    return Err(crate::funded_error::corruption_text(Ok(memory.clone()), &partition.index.table, "captured vector route has no installed partition source".into()));
                 }
                 Ok(())
             },
@@ -60530,28 +60964,35 @@ impl Database {
     /// generation a read loads, funded by that read's executing owner.
     fn vector_load_transfer(
         &self,
-        executing_owner: Arc<dyn contextdb_vector::MemoryBudget>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(contextdb_core::read_memory::ReadCredit, crate::memory_accounting::VectorLoadReservationTransfer)> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         fn callback(
-            source: Arc<dyn contextdb_vector::MemoryBudget>,
+            source: impl Into<contextdb_vector::MemoryBudgetOwner>,
+            original: contextdb_core::read_memory::ReadMemoryOwner,
         ) -> impl Fn(&crate::memory_accounting::MemoryAccountant, usize) -> Result<()> + Send + Sync
         {
+        let source: contextdb_vector::MemoryBudgetOwner = source.into();
+
             move |destination: &crate::memory_accounting::MemoryAccountant, bytes: usize| {
-                destination.transfer_vector_load_reservation(bytes, || {
-                    source.release(bytes);
+                destination.transfer_vector_load_reservation(&original, bytes, |prepaid, moved| {
+                    if prepaid { *moved = true; } else { source.release(bytes); }
                     Ok(())
                 })
             }
         }
-        let prototype = callback(executing_owner.clone());
+        let prototype = callback(executing_owner.clone(), read_memory.clone());
         let control_bytes = std::alloc::Layout::new::<[usize; 2]>()
             .extend(std::alloc::Layout::for_value(&prototype))
             .map(|(layout, _)| layout.pad_to_align().size())
             .map_err(|_| Error::Other(("vector load transfer layout overflows".to_string()).into()))?;
         drop(prototype);
         let funding = contextdb_core::read_memory::ReadCredit::try_new(
-            read_memory,
+            read_memory.clone(),
             control_bytes,
             "vector_generation",
             "load_transfer_callback",
@@ -60559,7 +61000,7 @@ impl Database {
         )?;
         // The invoice lives outside the Arc it funds. Capturing the invoice
         // inside its own closure would refund before Arc physically frees it.
-        Ok((funding, Arc::new(callback(executing_owner))))
+        Ok((funding, Arc::new(callback(executing_owner, read_memory))))
     }
 
     /// One owner-door vector search over every admitted partition. Copied
@@ -60573,13 +61014,17 @@ impl Database {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         mode: contextdb_core::VectorSearchMode,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<(
         contextdb_vector::mem::SearchScores,
         RetainedVectorSearchTrace,
     )> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_load_transfer_funding, load_transfer) =
             self.vector_load_transfer(executing_owner.clone(), read_memory)?;
         let (rows, trace) = crate::memory_accounting::with_vector_load_reservation_transfer(
@@ -60653,9 +61098,13 @@ impl Database {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<contextdb_vector::mem::SearchScores> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.clear_last_vector_search_trace();
         let _operation = self.open_operation()?;
         let _source_capture = self.writer_read_scope(read_memory.clone())?;
@@ -60738,9 +61187,13 @@ impl Database {
         &self,
         query: SemanticQuery,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<Vec<SearchResult>> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _source_capture = self.writer_read_scope(read_memory.clone())?;
         self.semantic_search_with_candidates(
@@ -60785,9 +61238,13 @@ impl Database {
         query: SemanticQuery,
         candidates: Option<RoaringTreemap>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<Vec<SearchResult>> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
         let _vector_schema = self.vector_schema_read(&index);
         self.semantic_search_with_candidates_under_schema_read(
@@ -60804,9 +61261,13 @@ impl Database {
         query: SemanticQuery,
         candidates: Option<RoaringTreemap>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<Vec<SearchResult>> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.semantic_search_with_candidates_under_schema_read_with_strategy(
             query,
             candidates,
@@ -60822,9 +61283,13 @@ impl Database {
         query: SemanticQuery,
         candidates: Option<RoaringTreemap>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<(Vec<SearchResult>, bool)> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
             None,
             query,
@@ -60846,9 +61311,13 @@ impl Database {
         query: SemanticQuery,
         candidates: Option<RoaringTreemap>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<(Vec<SearchResult>, RetainedVectorSearchTrace)> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.clear_last_vector_search_trace();
         let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
         let _membership_capture = self.relational_store.begin_membership_capture();
@@ -61194,12 +61663,16 @@ impl Database {
         snapshot: SnapshotId,
         search_mode: contextdb_core::VectorSearchMode,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<(
         contextdb_vector::mem::SearchScores,
         RetainedVectorSearchTrace,
     )> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.vector_store.validate_vector(&index, query.len())?;
         let _scope = self.writer_read_scope(read_memory.clone())?;
         let _vector_capture = if k == 0 {
@@ -61327,12 +61800,16 @@ impl Database {
         ws: &WriteSet,
         request: StrictVectorOverlayRequest<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<(
         contextdb_vector::mem::SearchScores,
         RetainedVectorSearchTrace,
     )> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let StrictVectorOverlayRequest {
             index,
             query,
@@ -61392,10 +61869,10 @@ impl Database {
                 .saturating_add(moved_entries),
             layout.dimension,
         );
-        self.finalization.accountant.try_allocate_for(
-            overlay_bytes,
-            "query",
-            &format!("active_tx_vector_overlay@{}.{}", index.table, index.column),
+        self.finalization.accountant.try_allocate_for_label(
+                        overlay_bytes,
+                        "query",
+                        self.finalization.accountant.prepare_operation_label(format_args!("active_tx_vector_overlay@{}.{}", index.table, index.column))?,
             "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
         )?;
 
@@ -61598,12 +62075,16 @@ impl Database {
         captured: &CapturedVectorWriteSet,
         request: StrictVectorOverlayRequest<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        executing_owner: std::sync::Arc<dyn contextdb_vector::MemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> Result<(
         contextdb_vector::mem::SearchScores,
         RetainedVectorSearchTrace,
     )> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let StrictVectorOverlayRequest {
             index,
             query,
@@ -61889,8 +62370,10 @@ impl Database {
         index: &VectorIndexRef,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<usize> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             let base = self
                 .vector_store
@@ -61921,8 +62404,10 @@ impl Database {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if entry_count == 0 || limit == 0 {
             return Ok(limit);
         }
@@ -61977,8 +62462,10 @@ impl Database {
         require_bounded_route: bool,
         preflight_auto_fallback: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(RoaringTreemap, bool)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let table = index.table.as_str();
         let sql = if where_clause.is_empty() {
             format!("SELECT row_id AS __vector_candidate_identity FROM {table}")
@@ -62078,8 +62565,10 @@ impl Database {
         params: &HashMap<String, Value>,
         scope: Option<&crate::executor::VectorPartitionScope>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<RoaringTreemap> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             let table = index.table.as_str();
             let mut bitmap = RoaringTreemap::new();
@@ -62163,8 +62652,10 @@ impl Database {
         candidates: Option<&RoaringTreemap>,
         mode: contextdb_core::VectorSearchMode,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RoaringTreemap>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             if candidates.is_none() && self.bounded_read_requires_candidate_filter(&index.table)? {
                 return self
@@ -62190,8 +62681,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<VersionedRow> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.committed_row_at(table, row_id, snapshot, read_memory.clone())?
             .ok_or_else(|| Error::NotFound(format!("row {row_id} in table {table}")))
     }
@@ -62203,8 +62696,10 @@ impl Database {
         anchor: &VersionedRow,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if policy.anchor_column.is_empty() {
             return Err(Error::Other((format!(
                 "rank policy on index {}.{} has no resolved anchor join column",
@@ -62329,8 +62824,10 @@ impl Database {
         join_value: &Value,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let rows = self.scan_in_tx_raw(
             tx,
             &policy.joined_table,
@@ -62420,8 +62917,10 @@ impl Database {
         snapshot: SnapshotId,
         mut values: HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<String, Value>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if matches!(values.get(&index.column), Some(Value::Null) | None) {
             let row =
                 self.find_row_by_id_in_tx(tx, &index.table, row_id, snapshot, read_memory.clone())?;
@@ -62484,6 +62983,16 @@ impl Database {
         self.last_vector_search_used_hnsw.load(Ordering::SeqCst)
     }
 
+    /// Borrow the current trace's receipt and original payer without copying its payload.
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn retained_vector_trace_invoice_for_test(&self,
+        visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner))
+        -> Option<contextdb_vector::mem::TraceInvoiceForTest> {
+        self.last_vector_search_trace.read().as_ref()
+            .map(|trace| trace.complete_invoice_for_test(visit))
+    }
+
     /// Observe the existing retained trace credit without copying its payload.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
@@ -62498,8 +63007,10 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __debug_last_query_vector_trace_for_test(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VectorSearchTraceObservation>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         self.last_vector_search_trace
             .read()
@@ -62519,8 +63030,10 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __take_last_query_vector_trace_for_test(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VectorSearchTraceObservation>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let mut slot = self.last_vector_search_trace.write();
         let copied = slot
@@ -62726,8 +63239,10 @@ impl Database {
         &self,
         row_id: RowId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _source_capture = self.writer_read_scope(read_memory.clone())?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -62776,8 +63291,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VectorEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _source_capture = self.writer_read_scope(read_memory.clone())?;
         let _vector_capture =
@@ -62862,8 +63379,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VectorEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _source_capture = self.writer_read_scope(read_memory.clone())?;
         // Mutation bookkeeping uses the existing unbounded live-entry sentinel.
         // It inherits an executing capture but cannot create historical intent.
@@ -62897,8 +63416,10 @@ impl Database {
         key_value: &Value,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(tx) = tx {
             let staged = self.tx_mgr.with_read(tx, |ws| {
                 ws.relational_inserts
@@ -62943,8 +63464,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VectorEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(tx) = tx {
             enum VectorEntryOverlay {
                 Found(VectorEntry),
@@ -63030,8 +63553,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<VersionedRow> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(tx) = tx {
             let staged = self.tx_mgr.with_ordinary_read(tx, |ws| {
                 let staged_insert = ws
@@ -63221,8 +63746,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(row) = captured.rows.as_ref().and_then(|rows| rows.row(row_id)) {
             return self.borrowed_row_read_allowed_for_query(
                 table,
@@ -63275,8 +63802,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(row) = ws
             .relational_inserts
             .iter()
@@ -63328,8 +63857,10 @@ impl Database {
     pub(crate) fn graph_edges_after_table_drop(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<contextdb_graph::GraphAdjEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.graph_store.is_source_backed() {
             return Ok(Vec::new());
         }
@@ -63431,8 +63962,10 @@ impl Database {
     fn authoritative_purge_custody_keys(
         &self,
         selections: &[AuthoritativePurgeSelection],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut current = Vec::new();
         let mut retired = Vec::new();
         for selection in selections {
@@ -63460,8 +63993,13 @@ impl Database {
         &self,
         table: &str,
         natural_key: &NaturalKey,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AuthoritativePurgeSelection> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::resolve_authoritative_purge_selection");
         let _operation = self.open_operation()?;
         let table_generation = self.durable_lineage_table_generation(table, read_memory.clone())?;
         let snapshot = self.snapshot_for_read();
@@ -63548,8 +64086,10 @@ impl Database {
     fn validate_authoritative_purge_selection(
         &self,
         selection: &AuthoritativePurgeSelection,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AuthoritativePurgeLineageWitness> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot_for_read();
         let retired_generation = self.table_meta(&selection.table).is_none()
             || self.durable_lineage_table_generation(&selection.table, read_memory.clone())?
@@ -63788,7 +64328,7 @@ impl Database {
         if surviving_pairs.is_empty() {
             return Ok(OwnedQueryResult::empty());
         }
-        Ok(OwnedQueryResult::new(QueryResult {
+        Ok(OwnedQueryResult::new(QueryResultData {
             columns: vec!["blob_hash".to_string(), "remaining_job_id".to_string()],
             rows: surviving_pairs
                 .into_iter()
@@ -63802,8 +64342,10 @@ impl Database {
 
     fn authoritative_purge_selected_row_versions(
         &self, table: &str, selected: &HashSet<RowId>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut rows = Vec::new();
         let mut keys = HashSet::new();
         let mut control = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
@@ -63849,8 +64391,10 @@ impl Database {
     fn authoritative_purge_selected_blob_hashes(
         &self,
         selections: &[AuthoritativePurgeSelection],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<BTreeSet<[u8; 32]>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !selections.iter().any(|s| s.table == "work_jobs") {
             return Ok(BTreeSet::new());
         }
@@ -63905,8 +64449,10 @@ impl Database {
         &self,
         selections: &[AuthoritativePurgeSelection],
         retain_all_on_malformed_survivor: bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AuthoritativePurgeBlobReferences> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let selected_hashes =
             self.authoritative_purge_selected_blob_hashes(selections, read_memory.clone())?;
         if selected_hashes.is_empty() {
@@ -63959,8 +64505,13 @@ impl Database {
     fn reserve_authoritative_erasure_workspace(
         &self,
         selections: &[AuthoritativePurgeSelection],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::read_image_memory::ImageVectorCopy> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::reserve_authoritative_erasure_workspace");
         let selected_rows = selections
             .iter()
             .map(|selection| (selection.table.clone(), selection.local_row_id))
@@ -63977,8 +64528,9 @@ impl Database {
             .relational_store
             .tables
             .read()
-            .values()
-            .flatten()
+            .iter()
+            .filter(|(table, _)| selections.iter().any(|selection| &selection.table == *table))
+            .flat_map(|(_, rows)| rows)
             .fold(0usize, |bytes, row| {
                 bytes.saturating_add(row.estimated_bytes())
             });
@@ -63986,9 +64538,10 @@ impl Database {
             .relational_store
             .table_meta
             .read()
-            .values()
-            .fold(0usize, |bytes, meta| {
-                bytes.saturating_add(meta.estimated_bytes())
+            .iter()
+            .filter(|(table, _)| selections.iter().any(|selection| &selection.table == *table))
+            .fold(0usize, |bytes, (table, meta)| {
+                bytes.saturating_add(table.len()).saturating_add(meta.estimated_bytes())
             });
         let edges_bound = self
             .graph_store
@@ -64028,8 +64581,13 @@ impl Database {
         report_shape: crate::custody::erasure::PurgeReportShape,
         frontier: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AuthoritativePurgePreparedSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::prepare_authoritative_purge_set_batch");
         use crate::custody::erasure::PurgeReportShape;
         let report_requested = report_shape != PurgeReportShape::None;
         let _operation = self.open_operation()?;
@@ -64399,12 +64957,6 @@ impl Database {
         }
         let mut projections = Vec::new();
         let mut affected_rows = BTreeMap::new();
-        let source_sidecars = self
-            .authoritative_purge_all_memory_source_provenance()
-            .into_iter()
-            .filter(|(table, row_id, _, _)| !selected(table, row_id))
-            .map(|(table, row_id, lsn, kind)| ((table, row_id), (lsn, kind)))
-            .collect::<HashMap<_, _>>();
         for (table, ids) in &selected_by_table {
             durable_sink_entries.extend(self.authoritative_purge_durable_sink_entries(
                 table,
@@ -64454,28 +65006,12 @@ impl Database {
                 // A single-table selection preserves the established single-table report.
                 survivor_report = report;
             }
-            let Some(meta) = self.table_meta(table) else {
+            let Some(_) = self.relational_store.table_meta.read().get(table) else {
                 // Only the archived immutable occurrences remain. Publishing a
                 // table projection here would recreate a dropped declaration.
                 continue;
             };
-            let sources = source_sidecars
-                .iter()
-                .filter(|((name, _), _)| name == table)
-                .map(|((_, row_id), (lsn, kind))| {
-                    let kind = match *kind {
-                        0 => contextdb_relational::store::SyncSourceKind::Pulled,
-                        1 => contextdb_relational::store::SyncSourceKind::AcceptedLocal,
-                        2 => contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
-                        _ => unreachable!("closed source kind"),
-                    };
-                    (*row_id, *lsn, kind)
-                })
-                .collect::<Vec<_>>();
-            projections.push(RelationalStore::with_sync_sources(
-                RelationalStore::table_projection(table.clone(), meta, after.clone()),
-                sources,
-            ));
+            projections.push((table.clone(), after.clone()));
             affected_rows.insert(
                 table.clone(),
                 if self.relational_store.uses_disk_backed_committed_bodies() {
@@ -64487,7 +65023,7 @@ impl Database {
         }
         let relational = self
             .relational_store
-            .prepare_received_schema_publication(projections, std::iter::empty::<String>());
+            .prepare_erasure_publication(projections, selected)?;
         let mut relational = relational.with_history(self.relational_store.prepare_schema_history_erasure(
             row_versions.iter().map(|key| (key.row_id, key.lsn)),
             self.engine_sync_read_memory()?,
@@ -64527,14 +65063,10 @@ impl Database {
             .into_iter()
             .filter(|entry| !selected(&entry.entry.index.table, &entry.entry.row_id))
             .collect::<Vec<_>>();
-        // Layout extraction borrows declarations; scalar declarations need no
-        // copied schema image for a vector publication.
-        let vector_schemas = vector_layouts_from_meta(&self.relational_store.table_meta.read());
-        let materialized_vector_partitions = self
-            .vector_store
-            .materialized_hnsw_partitions(vector_copy_owner)?
-            .into_iter()
-            .collect::<HashSet<_>>();
+        // Borrow the live registry to select declarations before copying;
+        // unrelated columns retain their exact cells and policy owners.
+        let vector_schemas = self.vector_store.copy_erasure_layouts(
+            |table| selected_by_table.contains_key(table), vector_copy_owner)?;
         let mut replacement_generation_plans = Vec::<(VectorPartitionRef, u64)>::new();
         for partition in &affected_vector_partitions {
             let has_live_survivor = vector_registry_entries.iter().any(|entry| {
@@ -64549,7 +65081,7 @@ impl Database {
                 &partition.index,
                 &partition.partition_key,
             )?;
-            if current.is_none() && !materialized_vector_partitions.contains(partition) {
+            if current.is_none() && !self.vector_store.erasure_partition_has_materialized_hnsw(partition) {
                 // A partition that had no maintained route before purge stays
                 // unavailable; maintenance remains responsible for its first
                 // generation. Purge must replace every route that did exist.
@@ -64577,14 +65109,18 @@ impl Database {
             .iter()
             .map(|(partition, _)| partition.clone())
             .collect::<Vec<_>>();
+        admit_erasure_vector_input_copies(
+            &vector_schemas, &vector_registry_entries, &affected_vector_partitions,
+            vector_copy_owner,
+        )?;
         let vector = self
             .vector_store
-            .prepare_partitioned_authoritative_purge_publication(
+            .prepare_selected_authoritative_purge_publication(
                 vector_schemas.clone(),
                 vector_registry_entries.clone(),
                 affected_vector_partitions.clone(),
                 replacement_generation_partitions,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 vector_copy_owner,
             )?;
         let covered_tx = self.tx_mgr.current_tx_max();
@@ -64689,18 +65225,23 @@ impl Database {
                 catalog,
             });
         }
-        let old_rows = self.relational_store.tables.read().clone();
-        let old_edges = if self.graph_store.is_source_backed() {
-            Vec::new()
-        } else {
-            self.collect_graph_versions(|_| true, read_memory.clone())?
-        };
-        let mut replacement_rows = old_rows.clone();
-        replacement_rows.extend(affected_rows);
+        let old_edges = if self.graph_store.is_source_backed() { Vec::new() }
+            else { self.collect_graph_versions(|_| true, read_memory.clone())? };
         let (old_bytes, new_bytes) = {
-            let tables = self.relational_store.table_meta.read();
-            (self.received_schema_replacement_bytes(&tables, &old_rows, &old_edges),
-             self.received_schema_replacement_bytes(&tables, &replacement_rows, &survivor_graph_entries))
+            let rows = self.relational_store.tables.read();
+            let catalog = self.relational_store.table_meta.read();
+            let mut old_bytes = 0usize;
+            let mut new_bytes = 0usize;
+            for (table, after) in &affected_rows {
+                if let Some(meta) = catalog.get(table) {
+                    old_bytes = old_bytes.saturating_add(self.received_schema_table_rows_bytes(
+                        table, meta, rows.get(table).map(Vec::as_slice).unwrap_or(&[])));
+                    new_bytes = new_bytes.saturating_add(self.received_schema_table_rows_bytes(table, meta, after));
+                }
+            }
+            for edge in &old_edges { old_bytes = old_bytes.saturating_add(edge.retained_graph_bytes()); }
+            for edge in &survivor_graph_entries { new_bytes = new_bytes.saturating_add(edge.retained_graph_bytes()); }
+            (old_bytes, new_bytes)
         };
         let memory_swap = PreparedMemorySwap::accounting(old_bytes, new_bytes, 0);
         let accepted_author_memory_keys_removed = lineage_config_owners.iter()
@@ -64749,8 +65290,13 @@ impl Database {
         tables: &[(String, Vec<(NaturalKey, RowId)>)],
         node_local: &[(String, Vec<u8>)],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::commit_authoritative_purge_tables");
         // A no-match PURGE must not falsely certify erasure while unknown
         // native storage may still contain the selected lineage.
         self.maintenance_context()
@@ -64841,8 +65387,10 @@ impl Database {
     pub(crate) fn authoritative_purge_targets_retired_generation(
         &self,
         item: &AuthoritativePurgeDeliveryItem,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Node-local table generations are intentionally independent.
         if item.node_local_predicate.is_some() {
             return Ok(false);
@@ -64854,8 +65402,10 @@ impl Database {
 
     fn retained_unbound_purge_selection(
         &self, item: &AuthoritativePurgeDeliveryItem,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<AuthoritativePurgeSelection>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _scope = self.writer_read_scope(read_memory.clone())?;
         let Some(root) = self.writer_read_root()? else { return Ok(None); };
         let mut controls = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
@@ -64917,8 +65467,10 @@ impl Database {
         &self,
         items: &[AuthoritativePurgeDeliveryItem],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<IncomingAuthoritativePurgePlan> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut plan = IncomingAuthoritativePurgePlan::default();
         for item in items {
             if let Some(bytes) = &item.node_local_predicate {
@@ -65121,8 +65673,10 @@ impl Database {
         &self,
         items: &[AuthoritativePurgeDeliveryItem],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.incoming_authoritative_purge_plan(items, vector_copy_owner, read_memory.clone())
             .map(|_| ())
     }
@@ -65131,8 +65685,10 @@ impl Database {
         &self,
         items: &[AuthoritativePurgeDeliveryItem],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Earlier units in this pull page may already have published writes.
         // Select this mutation from the current publication.
         let _inherited_read = self.enter_writer_read(None, read_memory.clone());
@@ -65273,8 +65829,13 @@ impl Database {
         report_shape: crate::custody::erasure::PurgeReportShape,
         instructions: purge_predicate::Instructions<'_>,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AuthoritativePurgeKernelOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "Database::commit_authoritative_purge_kernel_batch");
         (|| {
             let _operation = self.open_operation()?;
             let Some(persistence) = self.persistence.as_ref() else {
@@ -65631,7 +66192,7 @@ impl Database {
                         .publish_prepared_received_schema(prepared.publication_replacements.graph);
                     self.vector_store.publish_prepared_received_schema(
                         prepared.publication_replacements.vector,
-                        Arc::clone(&self.finalization.vector_accountant),
+                        contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                     );
                     self.event_bus
                         .publish_prepared_authoritative_purge_queue_replacement(
@@ -65836,7 +66397,7 @@ impl Database {
         table: &str,
         selected_row_ids: &HashSet<RowId>,
         sink_names: &BTreeSet<String>,
-        projection: Option<&Arc<crate::read_image_memory::ImageMemory>>,
+        projection: Option<&crate::read_image_memory::ImageMemoryHandle>,
     ) -> Result<Vec<AuthoritativePurgeSinkEntryKey>> {
         let (Some(persistence), Some(projection)) = (&self.persistence, projection) else {
             return Ok(Vec::new());
@@ -66086,9 +66647,12 @@ impl Database {
         params: &HashMap<String, Value>,
         snapshot: SnapshotId,
     ) -> Result<QueryResult> {
-        let read_memory = self.declared_reader_memory()?;
-        self.execute_at_snapshot_with_read_memory(sql, params, snapshot, read_memory)
-            .map(OwnedQueryResult::into_public)
+        let child = self.ordinary_read_child()?;
+        crate::executor::bounded::with_native_read_memory(child, |read_memory| {
+            QueryResult::publish_with(read_memory.clone(), || {
+                self.execute_at_snapshot_with_read_memory(sql, params, snapshot, read_memory)
+            })
+        })
     }
 
     pub(crate) fn execute_at_snapshot_with_read_memory(
@@ -66096,8 +66660,10 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _intent = self.vector_historical_read_intent(snapshot, read_memory.clone());
         self.with_snapshot_override(snapshot, || {
             self.execute_owned_with_read_memory(sql, params, read_memory.clone())
@@ -66131,13 +66697,14 @@ impl Database {
     /// from the store's declared reader memory until unpin; insufficient
     /// memory returns a typed `snapshot_pin` refusal.
     pub fn pin_snapshot(&self, snapshot: SnapshotId) -> contextdb_core::Result<SnapshotPin<'_>> {
+        let read_memory = self.declared_reader_memory()?;
         let slot = self
             .snapshot_registry
-            .acquire_pin_slot(self.declared_read_memory.clone())?;
-        let root = self.snapshot_registry.pinned_root(snapshot).or_else(|| {
-            self.writer_read_root()
-                .expect("an open database has a published read root")
-        });
+            .acquire_pin_slot(read_memory.clone())?;
+        // An explicit pin starts a new reader even inside an older read scope.
+        // Retain the current physical publication and the requested logical
+        // visibility independently, without consulting another reader's pin.
+        let root = writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?;
         let registration = if root.is_some() {
             self.snapshot_registry.admit(
                 self.snapshot_registry.state.lock(),
@@ -66148,21 +66715,12 @@ impl Database {
         } else {
             self.snapshot_registry.register(snapshot)
         };
-        if let Some(root) = &root
-            && let Some(registered) = self
-                .snapshot_registry
-                .state
-                .lock()
-                .active
-                .get_mut(&registration.token)
-        {
-            registered.pinned_root = Some(root.downgrade());
-        }
         Ok(SnapshotPin {
             _database: self,
             _registration: registration,
             _slot: slot,
             _root: root,
+            _read_memory: (read_memory).into(),
         })
     }
 
@@ -66443,8 +67001,10 @@ impl Database {
         &self,
         tx: TxId,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::executor::TransactionTableOverlay> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(captured) = self
             .captured_graph_decisions()
             .filter(|capture| capture.tx == tx)
@@ -66887,8 +67447,10 @@ impl Database {
         idle_window: Option<Arc<CursorIdleWindow>>,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<crate::executor::BoundedReadSnapshotPin>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let remaining = budget.remaining()?;
         let Some(captured) = self.tx_mgr.try_with_commit_lock_cancellable_for(
             remaining,
@@ -66938,8 +67500,10 @@ impl Database {
         needs_vector_graph: bool,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<crate::executor::BoundedReadSnapshotPin>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if withdrawn.is_cancelled() {
             return Ok(None);
         }
@@ -67095,8 +67659,10 @@ impl Database {
         idle_ms: u64,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<crate::executor::BoundedCursorSnapshotPin>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if withdrawn.is_cancelled() {
             return Ok(None);
         }
@@ -67436,8 +68002,10 @@ impl Database {
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &contextdb_core::IndexKey,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<u64>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())?.is_some() {
             return Ok(None);
         }
@@ -67524,10 +68092,12 @@ impl Database {
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &[contextdb_core::DirectedValue],
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         visit: &mut dyn FnMut(contextdb_core::IndexKey, u64) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity()).map_err(E::from)?.is_some() {
             return Ok(false);
         }
@@ -67558,10 +68128,12 @@ impl Database {
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &[contextdb_core::DirectedValue],
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         visit: &mut dyn FnMut(contextdb_core::IndexKey, u64) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(source) = &self.retained_relational_source else {
             return Ok(false);
         };
@@ -67575,7 +68147,9 @@ impl Database {
             "index_name",
             "Raise the declared reader memory limit.",
         );
-        let index = {
+        let mut admitted_name_bytes = 0;
+        let index = loop {
+            let needed = {
             let metas = self.relational_store.table_meta.read();
             let meta = metas
                 .get(table)
@@ -67598,8 +68172,11 @@ impl Database {
             let Some(selected) = selected else {
                 return Ok(false);
             };
-            name_memory.reserve(selected.name.len()).map_err(E::from)?;
-            selected.name.clone()
+            if selected.name.len() <= admitted_name_bytes { break selected.name.clone(); }
+            selected.name.len()
+            };
+            name_memory.reserve(needed - admitted_name_bytes).map_err(E::from)?;
+            admitted_name_bytes = needed;
         };
         // No budget callback or storage seek runs under the metadata lock.
         source.committed_maintained_count_groups(
@@ -67608,19 +68185,27 @@ impl Database {
             columns,
             prefix,
             snapshot,
-            read_memory,
+            read_memory.clone(),
             before_touch,
             &mut |position| {
-                let metas = self.relational_store.table_meta.read();
-                let meta = metas
-                    .get(table)
-                    .ok_or_else(|| "count table metadata absent".to_owned())?;
-                let declaration = meta
-                    .indexes
-                    .iter()
-                    .find(|declaration| declaration.name == index)
-                    .ok_or_else(|| "count index declaration absent".to_owned())?;
-                RedbPersistence::validated_index_position(declaration, meta, position)
+                struct Validation<'a> { db: &'a Database, table: &'a str, index: &'a str, position: &'a crate::persistence::RelationalIndexPosition }
+                impl std::fmt::Display for Validation<'_> {
+                    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        let metas = self.db.relational_store.table_meta.read();
+                        let Some(meta) = metas.get(self.table) else { return f.write_str("count table metadata absent"); };
+                        let Some(declaration) = meta.indexes.iter().find(|d| d.name == self.index) else { return f.write_str("count index declaration absent"); };
+                        match RedbPersistence::validated_index_position(declaration, meta, self.position) {
+                            Ok(()) => Ok(()), Err(reason) => std::fmt::Display::fmt(&reason, f),
+                        }
+                    }
+                }
+                let valid = {
+                    let metas = self.relational_store.table_meta.read();
+                    metas.get(table).and_then(|meta| meta.indexes.iter().find(|d| d.name == index).map(|d| RedbPersistence::validated_index_position(d, meta, position).is_ok())).unwrap_or(false)
+                };
+                if valid { return Ok(()); }
+                // Each Display call drops its guard before try_format admits storage.
+                Err(crate::funded_error::corruption_display(Ok(read_memory.clone()), source.database_path().display(), format_args!("loaded content does not authenticate against the committed image root: {}", Validation { db: self, table, index: &index, position })))
             },
             visit,
         )
@@ -67636,8 +68221,10 @@ impl Database {
         parsed: &Statement,
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Statement, PhysicalPlan)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let resolved = self.pre_resolve_cte_subqueries(
             parsed,
             params,
@@ -67659,7 +68246,7 @@ impl Database {
     /// table and discarding everything it did not ask for.
     pub(crate) fn bounded_row_by_identity<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -67670,6 +68257,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Existing byte callbacks own independently admitted copies. Preserve
         // that contract by making an actual copy while source credit is live.
         let mut source_credit = None;
@@ -67707,12 +68296,14 @@ impl Database {
     }
 
     pub(crate) fn visit_bounded_row_by_identity_admitted<E: From<Error>>(
-        &self, read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        &self, read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         tx: Option<TxId>, table: &str, row_id: RowId, snapshot: SnapshotId,
         before_touch: &mut dyn FnMut() -> std::result::Result<(),E>,
         before_clone: &mut dyn FnMut(crate::read_image_memory::RowReadAdmission<'_>) -> std::result::Result<(),E>,
         visit: &mut dyn FnMut(Option<&VersionedRow>) -> std::result::Result<bool,E>,
     ) -> std::result::Result<bool,E> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // A scalar consumer can borrow the same funded, root-pinned window.
         // Transaction overlays, captured decisions and retained-image routes
         // retain their established resolution and admission behavior.
@@ -67735,7 +68326,7 @@ impl Database {
 
     pub(crate) fn bounded_row_by_identity_admitted<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         tx: Option<TxId>,
         table: &str,
         row_id: RowId,
@@ -67751,6 +68342,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let captured = self
             .captured_graph_decisions()
             .filter(|capture| Some(capture.tx) == tx);
@@ -67943,7 +68536,7 @@ impl Database {
 
     pub(crate) fn bounded_physical_table_row_next<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
@@ -67953,6 +68546,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut source_credit = None;
         let row = self.bounded_physical_table_row_next_admitted(
             read_memory,
@@ -67989,7 +68584,7 @@ impl Database {
 
     pub(crate) fn bounded_physical_table_row_next_admitted<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
@@ -68002,6 +68597,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(source) = &self.retained_relational_source {
             let meta = self
                 .table_meta(table)
@@ -68063,8 +68660,10 @@ impl Database {
     pub(crate) fn ordered_prefix_snapshot_is_current(
         &self,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(source) = &self.retained_relational_source {
             return Ok(source.ordered_prefix_snapshot_is_current(snapshot));
         }
@@ -68081,7 +68680,7 @@ impl Database {
 
     pub(crate) fn bounded_ordered_table_row_next<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         table: &str,
         column: &str,
         direction: SortDirection,
@@ -68096,6 +68695,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_ordered_table_row_next_observed(
             read_memory,
             table,
@@ -68112,7 +68713,7 @@ impl Database {
 
     pub(crate) fn bounded_ordered_table_row_next_observed<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         table: &str,
         column: &str,
         direction: SortDirection,
@@ -68128,6 +68729,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(source) = &self.retained_relational_source {
             let meta = self
                 .table_meta(table)
@@ -68262,11 +68865,13 @@ impl Database {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(source) = &self.retained_relational_source else {
             return Ok(false);
         };
@@ -68294,11 +68899,13 @@ impl Database {
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_probe: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_native_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<bool>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(source) = &self.retained_relational_source else {
             return Ok(None);
         };
@@ -68331,7 +68938,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bounded_exact_index_row_next<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         table: &str,
         index: &str,
         snapshot: SnapshotId,
@@ -68347,6 +68954,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(source) = &self.retained_relational_source {
             let meta = self
                 .table_meta(table)
@@ -68432,11 +69041,13 @@ impl Database {
         snapshot: SnapshotId,
         before_copy: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Option<Vec<f32>>>, E>
     where
         E: From<Error>,
     {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             enum Captured {
                 Vector(Arc<contextdb_tx::ordered_staged::StagedVectorCapability>),
@@ -68516,11 +69127,13 @@ impl Database {
         mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
         use_vector: impl FnOnce(Vec<f32>) -> std::result::Result<T, E>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<T>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(&index.table)
             .ok_or_else(|| E::from(Error::TableNotFound(index.table.clone())))?;
@@ -68594,11 +69207,13 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorCandidateGroups, E>
     where
         E: From<Error>,
     {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.vector.bounded_candidate_groups(
                 index,
@@ -68624,11 +69239,13 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, E>
     where
         E: From<Error>,
     {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.vector.bounded_brute_force_cursor_grouped(
                 index,
@@ -68655,11 +69272,13 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, E>
     where
         E: From<Error>,
     {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.vector.bounded_brute_force_step_with_query(
                 cursor,
@@ -68732,11 +69351,13 @@ impl Database {
         release_retained: impl FnMut(usize),
         visit: impl FnMut(RowId) -> std::result::Result<(), E>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.vector.bounded_visit_visible_ids(
                 index,
@@ -68767,13 +69388,15 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, E>>,
     ) -> std::result::Result<crate::executor::BoundedVectorSearchOutcome, E>
     where
         E: From<Error>,
     {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.clear_last_vector_search_trace();
             let _attribution = contextdb_core::find_attribution::stage("vector_search");
@@ -68895,11 +69518,13 @@ impl Database {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         before_source: impl FnMut() -> std::result::Result<(), E>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<usize, E>
     where
         E: From<Error>,
     {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.assert_bounded_vector_read_is_schema_protected()?;
             let base_candidate_k = if let Some(sort_key) = sort_key {
@@ -68948,7 +69573,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bounded_rank_candidate<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         index: &VectorIndexRef,
         sort_key: &str,
         anchor_row_id: RowId,
@@ -68964,6 +69589,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         before_candidate()?;
         let meta = self
             .table_meta(&index.table)
@@ -69051,7 +69678,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     fn bounded_joined_row_for_rank_policy<E>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         policy: &RankPolicy,
         anchor_values: &HashMap<String, Value>,
         snapshot: SnapshotId,
@@ -69064,6 +69691,8 @@ impl Database {
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.preflight_historical_index(
             &policy.joined_table,
             &policy.protected_index,
@@ -69376,11 +70005,13 @@ impl Database {
         before_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<(VersionedRow, usize)>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The posting and body share one immutable statement source. A
         // durable window retains its own decode admission while access and
         // caller-copy admission borrow the selected row.
@@ -69534,11 +70165,13 @@ impl Database {
         before_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<(VersionedRow, usize)>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(&policy.joined_table)
             .ok_or_else(|| E::from(Error::TableNotFound(policy.joined_table.clone())))?;
@@ -69873,8 +70506,10 @@ impl Database {
         &self,
         since: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<RowChange>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let changes =
             self.changes_since_with_read_memory(since, vector_copy_owner, read_memory.clone());
@@ -70100,13 +70735,14 @@ impl Database {
             QueryTrace::scan()
         };
         let _ = value;
-        Ok(QueryResult {
+        let read_memory = self.declared_reader_memory()?;
+        QueryResult::publish_with(read_memory, || Ok(OwnedQueryResult::new(QueryResultData {
             columns: vec![],
             rows: vec![],
             rows_affected: 0,
             trace,
             cascade: None,
-        })
+        })))
     }
 
     /// Run one pruning cycle and return the pruned row count or typed refusal.
@@ -70118,8 +70754,10 @@ impl Database {
 
     pub(crate) fn run_pruning_cycle_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<u64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.run_pruning_cycle_checked_with_read_memory(read_memory.clone())
             .map(|report| report.pruned_rows)
     }
@@ -70138,8 +70776,10 @@ impl Database {
 
     pub(crate) fn run_pruning_cycle_checked_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PruningReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
         #[cfg(any(test, feature = "test-seams"))]
@@ -70165,8 +70805,10 @@ impl Database {
 
     pub fn run_maintenance_cycle_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<MaintenanceReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut operation = self.assert_open_operation();
         operation.release_schema_publication_for_online_maintenance();
         let _guard = self.pruning_guard.lock();
@@ -70929,8 +71571,10 @@ impl Database {
     pub(crate) fn table_size_estimate_with_read_memory(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<TableSizeEstimate>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let Some(meta) = self.table_meta(table) else {
             return Ok(None);
@@ -70951,8 +71595,10 @@ impl Database {
 
     pub(crate) fn table_size_estimates_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<TableSizeEstimate>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let whole_file_bytes = self.disk_file_size();
         let metas = self.relational_store.table_meta.read().clone();
@@ -70977,8 +71623,10 @@ impl Database {
         meta: &TableMeta,
         whole_file_bytes: Option<u64>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<TableSizeEstimate> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let disk_backed = self.relational_store.uses_disk_backed_committed_bodies();
         if disk_backed {
             let root = self
@@ -71470,8 +72118,10 @@ impl Database {
 
     pub(crate) fn compact_currency_versions_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CurrencyCompactionReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
         self.maintenance_context()
@@ -71490,8 +72140,10 @@ impl Database {
     pub fn __compact_currency_versions_for_tables_for_test(
         &self,
         tables: &[&str],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CurrencyCompactionReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
         self.maintenance_context()
@@ -71591,9 +72243,11 @@ impl Database {
     pub(crate) fn verify_historical_indexes_within(
         &self,
         table: &str,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Vec<crate::HistoricalIndexVerification>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
@@ -72131,7 +72785,7 @@ impl Database {
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
     ) -> Result<Self> {
-        Self::open_memory_internal(plugin, WriterBudget::from_accountant(accountant)?, crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(OwnerReadConfig::default().limits.limits.memory))
+        Self::open_memory_internal(plugin, WriterBudget::from_accountant(accountant)?, crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(OwnerReadConfig::default().limits.limits.memory)?)
     }
     }
 
@@ -72152,8 +72806,10 @@ impl Database {
     pub fn export_snapshot_with_read_memory(
         &self,
         dest: impl AsRef<Path>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ExportReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
         let vector_copy_owner = &mut retained_vector_copy;
 
@@ -72266,8 +72922,10 @@ impl Database {
     fn validate_export_erasure_frontier(
         &self,
         snapshot_lsn: Lsn,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let frontier = match &self.persistence {
             Some(persistence) => persistence.global_erasure_frontier(memory.clone())?,
             None => self.lineage_state_lock.lock().erasure_frontiers.global(),
@@ -72403,8 +73061,10 @@ impl Database {
         dest: &Path,
         temp_path: &Path,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ExportReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // A missing destination directory fails here, before any file exists;
         // the directory is never created on the caller's behalf.
         // The destination maintains a whole committed proof of its own while
@@ -72448,8 +73108,10 @@ impl Database {
         &self,
         artifact: &RedbPersistence,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ExportReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Single commit point: the committed watermark TxId, committed LSN,
         // and commit-index prefix are captured together under the commit
         // mutex. The mutex is released before any copying starts; commits
@@ -73546,7 +74208,7 @@ impl Database {
         }
         let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             OwnerReadConfig::default().limits.limits.memory,
-        );
+        )?;
         let db = Self::open_loaded(
             path,
             plugin,
@@ -73572,7 +74234,7 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     /// In-memory database with budget.
     fn open_memory_with_accountant(accountant: Arc<MemoryAccountant>) -> Self {
-        Self::open_memory_internal(Arc::new(CorePlugin), WriterBudget::from_accountant(accountant).expect("writer budget registration failed"), crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(OwnerReadConfig::default().limits.limits.memory))
+        Self::open_memory_internal(Arc::new(CorePlugin), WriterBudget::from_accountant(accountant).expect("writer budget registration failed"), crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(OwnerReadConfig::default().limits.limits.memory).expect("reader root construction failed"))
             .expect("failed to open in-memory database with accountant")
     }
     }
@@ -73891,6 +74553,7 @@ impl Database {
                 .iter()
                 .map(|(_, ddl)| std::mem::size_of::<(Lsn, DdlChange)>() + ddl.estimated_bytes())
                 .sum();
+            drop(ddl_log);
             let pending_metadata = self.pending_commit_metadata.lock();
             receipt.pending_commit_metadata = pending_metadata.len();
             for metadata in pending_metadata.values() {
@@ -73958,7 +74621,8 @@ impl Database {
                 + receipt.custody_tenant_mirror
                 + receipt.current_membership_charge
                 + receipt.captured_membership_charge
-                + receipt.sink_window_charge;
+                + receipt.sink_window_charge
+                + self.schema_history_retained_bytes();
             receipt.reconciliation_gap =
                 receipt.vector.accountant_total as i64 - receipt.named_owner_total as i64;
             observe(receipt)
@@ -73993,9 +74657,11 @@ impl Database {
         &self,
         partition: &contextdb_vector::VectorPartitionRef,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<contextdb_vector::store::CapturedVectorSuffixInspectionForTest>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _schema = self.vector_schema_read(&partition.index);
         let _source = self.writer_read_scope(read_memory.clone())?;
@@ -74110,8 +74776,10 @@ impl Database {
         table: &str,
         column: &ColumnDef,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.register_vector_index_for_column_with_identity(
             table,
             &column.name,
@@ -74127,13 +74795,15 @@ impl Database {
         index_column: &str,
         column: &ColumnDef,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         if let Some(layout) = vector_index_layout_from_column(column) {
             self.vector_store.register_index_with_layout(
                 VectorIndexRef::new(table, index_column),
                 layout,
-                Arc::clone(&self.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 vector_copy_owner,
             )?;
             self.reconcile_maintenance_thread();
@@ -74146,8 +74816,10 @@ impl Database {
         index: &VectorIndexRef,
         column: &ColumnDef,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         self.vector_store.with_index_layout(index, |_| ())?;
         if let Some(max_partitions) = column.effective_max_partitions()
             && self.vector_store.live_or_retained_partition_count(index)? > max_partitions as usize
@@ -74191,7 +74863,7 @@ impl Database {
             old,
             new,
             replaced,
-            Arc::clone(&self.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             owner,
         )
     }
@@ -74202,8 +74874,10 @@ impl Database {
         from: &str,
         to: &str,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         let old = VectorIndexRef::new(table, from);
         let new = VectorIndexRef::new(table, to);
         if self.vector_store.contains_index(&new) {
@@ -74243,7 +74917,7 @@ impl Database {
         self.vector_store.register_index_with_layout(
             index.clone(),
             layout,
-            Arc::clone(&self.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             vector_copy_owner,
         )?;
         Ok(())
@@ -74279,7 +74953,7 @@ impl Database {
         &self,
         target: Option<&VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<
         Vec<(
             ColumnDef,
@@ -74287,6 +74961,8 @@ impl Database {
             Vec<contextdb_vector::store::VectorPartitionInfo>,
         )>,
     > {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         if !self.access_is_admin() {
             return Err(Error::VectorWholeIndexInspectionDenied);
         }
@@ -74451,7 +75127,7 @@ impl Database {
         // therefore return the original charge once without reconstructing
         // it from a different cache state.
         self.vector_store
-            .account_loaded_state(Arc::clone(&self.finalization.vector_accountant))?;
+            .account_loaded_state(contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant))?;
         charged.1 = 0;
         self.finalization
             .install_loaded_state_owner(RetainedNonVectorMemoryOwner::new(
@@ -74496,12 +75172,14 @@ impl Database {
         )?;
         let mut admitted = non_vector_bytes;
         for (column, projection_bytes) in f32_projection_payload_bytes_by_column(values, meta) {
-            if let Err(err) = self.finalization.accountant.try_allocate_for(
-                projection_bytes,
-                subsystem,
-                &format!("vector_insert@{table}.{column}"),
-                "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
-            ) {
+            if let Err(err) = (|| {
+                let subsystem = self.finalization.accountant.prepare_operation_label(subsystem)?;
+                let operation = self.finalization.accountant.prepare_operation_label(
+                    format_args!("vector_insert@{table}.{column}"))?;
+                self.finalization.accountant.try_allocate_for_labels(
+                    projection_bytes, subsystem, operation,
+                    "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.".into())
+            })() {
                 self.finalization.accountant.release(admitted);
                 return Err(err);
             }
@@ -74533,9 +75211,9 @@ impl Database {
                 subsystem, operation, hint,
             )?;
             for (column, bytes) in f32_projection_payload_bytes_by_column(values, meta) {
-                crate::memory_accounting::grow_preparation_from_original(
+                crate::memory_accounting::grow_preparation_with_operation_label(
                     &mut admission, bytes, subsystem,
-                    &format!("vector_insert@{table}.{column}"),
+                    format_args!("vector_insert@{table}.{column}"),
                     "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
                 )?;
             }
@@ -74711,8 +75389,10 @@ impl Database {
         &self,
         ws: &contextdb_tx::WriteSet,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<DeleteReleaseBytes> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut bytes = DeleteReleaseBytes::default();
         // The whole charge the version took when it was admitted -- its
         // non-vector values and, for an F32 vector column, its relational
@@ -74793,8 +75473,10 @@ impl Database {
         index: &VectorIndexRef,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VectorEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.vector_store_live_entry_for_row(
             index,
             row_id,
@@ -75266,7 +75948,7 @@ impl Database {
     /// share the parent total, while each operation has separate charges.
     pub fn declared_reader_memory(
         &self,
-    ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
         self.declared_read_memory.child()
     }
 
@@ -75304,8 +75986,8 @@ impl Database {
     /// read limit.
     pub(crate) fn engine_sync_read_memory(
         &self,
-    ) -> Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
-        self.finalization.accountant.read_budget()
+    ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        self.finalization.accountant.read_budget().map(Into::into)
     }
 
     /// Measurement only: this store's writer accountant, whose high-water mark
@@ -75347,7 +76029,7 @@ impl Database {
     #[doc(hidden)]
     pub fn declared_read_memory_for_test(
         &self,
-    ) -> Arc<crate::vector_read_memory::DeclaredReadMemory> {
+    ) -> crate::vector_read_memory::DeclaredReadRoot {
         self.declared_read_memory.clone()
     }
 
@@ -75355,14 +76037,14 @@ impl Database {
     /// wrapper Arc before the operation exists would itself be unadmitted.
     pub(crate) fn query_request_provider(
         &self,
-    ) -> &Arc<crate::vector_read_memory::DeclaredReadMemory> {
+    ) -> &crate::vector_read_memory::DeclaredReadRoot {
         &self.declared_read_memory
     }
 
     pub fn declared_read_request_provider(
         &self,
-    ) -> Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider> {
-        Arc::new(self.declared_read_memory.clone())
+    ) -> crate::vector_read_memory::ReadRequestProvider {
+        crate::vector_read_memory::ReadRequestProvider::declared(self.declared_read_memory.clone())
     }
 
     pub fn owner_read_config(&self) -> &OwnerReadConfig {
@@ -75529,8 +76211,10 @@ impl Database {
         name: &str,
         meta: &TableMeta,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let change = alter_table_ddl_change(name, meta, Vec::new());
         self.append_ddl_change(lsn, change, read_memory.clone())
     }
@@ -75552,8 +76236,10 @@ impl Database {
         meta: &TableMeta,
         markers: Vec<String>,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.persist_table_meta_rows_vectors_and_append_alter_table_ddl(
             name,
             meta,
@@ -75700,6 +76386,135 @@ impl Database {
         .and_then(|swap| swap.prepare_schema_generation(self, std::iter::once(name)))
     }
 
+    pub(crate) fn allows_local_ef_search_metadata_publication(&self) -> bool {
+        self.finalization
+            .local_policy_metadata_enabled
+            .load(Ordering::SeqCst)
+            && !self.capture_detached_sync_write_set.load(Ordering::SeqCst)
+            && !self.private_received_rows_hold_delete_invoices()
+    }
+
+    /// Publish an already validated, local-autocommit EF_SEARCH declaration.
+    /// No row, posting or historical body changes ownership on this path.
+    pub(crate) fn publish_local_ef_search_metadata(
+        &self,
+        name: &str,
+        old_meta: &TableMeta,
+        meta: &TableMeta,
+        index: &VectorIndexRef,
+        lsn: Lsn,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        // Admit the replacement live declaration before cloning it. The row
+        // and posting invoices are unchanged, including transaction-local rows.
+        let mut metadata_memory = self.reserve_original_preparation_for(
+            retained_table_metadata_bytes(&self.relational_store, meta),
+            "ddl",
+            "prepare_ef_search_metadata",
+            "Reduce schema metadata or raise MEMORY_LIMIT.",
+        )?;
+        let mut memory_swap = PreparedMemorySwap::from_original_preparation(
+            &mut metadata_memory,
+            retained_table_metadata_bytes(&self.relational_store, old_meta),
+            retained_table_metadata_bytes(&self.relational_store, meta),
+            0,
+        )?;
+        let replacement = meta.clone();
+        // Use the existing schema-staging envelope for DDL rendering and its
+        // transient encodings; the retained occurrence gets its own invoice.
+        let _scratch = self.reserve_original_preparation_for(
+            Self::staged_table_ddl_temporary_bytes("")
+                .saturating_add(meta.metadata_bytes().saturating_mul(32))
+                .saturating_add(name.len().saturating_mul(32)),
+            "ddl",
+            "prepare_ef_search_history",
+            "Reduce schema metadata or raise MEMORY_LIMIT.",
+        )?;
+        vector_copy_owner.reserve(std::mem::size_of::<VectorIndexLayout>().saturating_add(
+            column.partition_key_columns.as_ref().map_or(0, |columns| {
+                columns
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>())
+                    .saturating_add(columns.iter().map(String::len).sum::<usize>())
+            }),
+        ))?;
+        let layout =
+            vector_index_layout_from_column(column).ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        let prepared_policy =
+            self.vector_store
+                .prepare_policy_layout_update(index, layout, vector_copy_owner)?;
+        let ddl = [self.alter_table_ddl_for_meta(name, meta, Vec::new())];
+        let memory_generation = if self.persistence.is_none() {
+            let sidecars = self.ddl_generation_sidecars(&ddl, read_memory.clone())?;
+            let sidecar = &sidecars[0];
+            Some((sidecar.table.clone(), sidecar.table_generation))
+        } else {
+            None
+        };
+        let values = self.ddl_generation_sidecar_values(lsn, &ddl, 0, read_memory)?;
+        let memory_history = if let Some((table, generation)) = &memory_generation {
+            let sidecar = DurableDdlGenerationSidecar { table: table.clone(), table_generation: *generation };
+            self.prepare_memory_schema_history(lsn, 0, &ddl, std::slice::from_ref(&sidecar))?
+        } else { None };
+        // Every fallible preparation, including the captured writer schema,
+        // precedes durability. Move the successor payloads into an infallible
+        // callback that runs before the postcommit observation boundary.
+        let publish = || {
+            let old = {
+                let mut metadata = self.relational_store.table_meta.write();
+                let current = metadata
+                    .get_mut(name)
+                    .expect("validated local policy table");
+                std::mem::replace(current, replacement)
+            };
+            drop(old);
+            self.publish_memory_schema_history(memory_history);
+            memory_swap.commit_after_swap();
+            if let Some(prepared) = prepared_policy {
+                // EF_SEARCH does not change maintenance_need. Do not perform
+                // a fallible storage recheck inside the committed write's
+                // sticky admission scope.
+                self.vector_store.publish_policy_layout_update(prepared);
+            }
+        };
+        let result = if let Some(persistence) = &self.persistence {
+            // The durable occurrence is an admitted temporary encoding input,
+            // not a resident history entry. Persistence keeps the occurrence
+            // and its summary/configuration in the same durable transaction.
+            let durable_ddl = [self.alter_table_ddl_for_meta(name, meta, Vec::new())];
+            self.publish_direct_metadata(|| {
+                persistence.publish_ef_search_metadata_and_ddl(
+                    name,
+                    meta,
+                    values
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.clone()))
+                        .collect(),
+                    lsn,
+                    &durable_ddl,
+                    &metadata_memory,
+                    publish,
+                )
+            })
+        } else {
+            publish();
+            Ok(())
+        };
+        result
+    }
+
     /// Settle what a change to `table`'s INDEX SET costs -- or gives back --
     /// for the rows that are already in it.
     ///
@@ -75779,8 +76594,11 @@ impl Database {
         rows: &[VersionedRow],
         lsn: Lsn,
         ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<()> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Option<PreparedSchemaHistory>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let memory_history = self.prepare_memory_ddl_append(lsn, ddl, read_memory.clone())?;
         if let Some(source)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
             source.project_schema(name,Some(meta),ddl)?;
         }
@@ -75806,10 +76624,8 @@ impl Database {
                         .collect(),
                 )
             })?;
-        } else {
-            self.record_ddl_generation_sidecars(lsn, ddl, read_memory.clone())?;
         }
-        Ok(())
+        Ok(memory_history)
     }
 
     pub(crate) fn prepare_local_index_projection(
@@ -75832,18 +76648,17 @@ impl Database {
         name: &str,
         meta: TableMeta,
         rows: Vec<VersionedRow>,
-        lsn: Lsn,
-        ddl: &[DdlChange],
+        _lsn: Lsn,
+        _ddl: &[DdlChange],
         projected_indexes: HashMap<String, contextdb_relational::IndexStorage>,
         memory_swap: &mut PreparedMemorySwap,
+        memory_history: Option<PreparedSchemaHistory>,
     ) -> Result<()> {
         let store = self.relational_store();
         if !store.publish_table_projection_with_generation(name, meta, rows, projected_indexes, memory_swap.history.take()) {
             return Err(Error::TableNotFound(name.to_string()));
         }
-        self.ddl_log
-            .write()
-            .extend(ddl.iter().cloned().map(|change| (lsn, change)));
+        self.publish_memory_schema_history(memory_history);
         Ok(())
     }
 
@@ -75866,10 +76681,13 @@ impl Database {
         lsn: Lsn,
         extra_constraints: Vec<String>,
         mut prior_ddl: Vec<DdlChange>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let change = alter_table_ddl_change(name, meta, extra_constraints);
         prior_ddl.push(change);
+        let memory_history = self.prepare_memory_ddl_append(lsn, &prior_ddl, read_memory.clone())?;
         if let Some(source)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
             source.project_schema(name,Some(meta),&prior_ddl)?;
         }
@@ -75914,21 +76732,30 @@ impl Database {
                         .collect(),
                 )
             })?;
-        } else {
-            self.record_ddl_generation_sidecars(lsn, &prior_ddl, read_memory.clone())?;
         }
-        self.ddl_log
-            .write()
-            .extend(prior_ddl.into_iter().map(|change| (lsn, change)));
+        self.publish_memory_schema_history(memory_history);
         Ok(())
+    }
+
+    pub(super) fn prepare_memory_ddl_append(&self, lsn: Lsn, ddl: &[DdlChange],
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<PreparedSchemaHistory>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        if self.persistence.is_some() { return Ok(None); }
+        let start = self.ddl_log.read().iter().filter(|(at, _)| *at == lsn).count() as u32;
+        let sidecars = self.ddl_generation_sidecars(ddl, read_memory)?;
+        self.prepare_memory_schema_history(lsn, start, ddl, &sidecars)
     }
 
     fn append_ddl_change(
         &self,
         lsn: Lsn,
         change: DdlChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let memory_history = self.prepare_memory_ddl_append(lsn, std::slice::from_ref(&change), read_memory.clone())?;
         if let Some(source)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
             source.apply_ddl(&change)?;
         }
@@ -75949,16 +76776,8 @@ impl Database {
                     std::slice::from_ref(&change),
                 )
             })?;
-        } else {
-            self.record_ddl_generation_sidecars(
-                lsn,
-                std::slice::from_ref(&change),
-                read_memory.clone(),
-            )?;
         }
-        if self.persistence.is_none() {
-            self.ddl_log.write().push((lsn, change));
-        }
+        self.publish_memory_schema_history(memory_history);
         Ok(())
     }
 
@@ -75968,8 +76787,10 @@ impl Database {
         name: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let change = DdlChange::CreateIndex {
             table: table.to_string(),
             name: name.to_string(),
@@ -75983,8 +76804,10 @@ impl Database {
         table: &str,
         name: &str,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let change = DdlChange::DropIndex {
             table: table.to_string(),
             name: name.to_string(),
@@ -76152,9 +76975,11 @@ impl Database {
 
     pub(crate) fn content_size_totals(
         &self,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_table: &mut dyn FnMut() -> Result<()>,
     ) -> Result<crate::persistence::content_size::ContentSizeTotals> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         if let Some(image) = &self.committed_image_startup {
             return image
                 .config_source
@@ -76170,10 +76995,7 @@ impl Database {
                         .into(),
                 ),
             )),
-            Some(persistence) => Err(Error::StoreCorrupted {
-                path: persistence.path().display().to_string(),
-                reason: "content-size inspection has no captured committed root".into(),
-            }),
+            Some(persistence) => Err(crate::funded_error::corruption_text(Ok(memory.clone()), persistence.path().display(), "content-size inspection has no captured committed root".into())),
         }
     }
 
@@ -76526,8 +77348,10 @@ impl Database {
         &self,
         tenant_id: &TenantId,
         peer_node_id: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<DurableSchemaSyncHoldback>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let key = Self::schema_holdback_config_key(
@@ -76581,8 +77405,10 @@ impl Database {
     pub(crate) fn persisted_inbound_schema_sync_holdbacks(
         &self,
         tenant_id: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DurableSchemaSyncHoldback>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let tenant_suffix = format!(":{}", tenant_id.as_str());
@@ -76651,8 +77477,10 @@ impl Database {
     pub(crate) fn persisted_sync_watermarks_with_read_memory(
         &self,
         tenant_id: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Lsn, Lsn)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let Some(_persistence) = &self.persistence else {
@@ -76760,8 +77588,10 @@ impl Database {
     pub(crate) fn persisted_sync_pending_push_confirmation_with_read_memory(
         &self,
         tenant_id: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Lsn>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let Some(_persistence) = &self.persistence else {
@@ -76928,8 +77758,10 @@ impl Database {
     pub(crate) fn persisted_sync_pull_cursor_with_read_memory(
         &self,
         tenant_id: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(Incarnation, Lsn)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let Some(_persistence) = &self.persistence else {
@@ -76943,13 +77775,10 @@ impl Database {
         let key = tenant_id.config_key("sync_pull_cursor");
         match self.read_config_value::<(String, u64)>(&key, read_memory.clone())? {
             Some((hex, lsn)) => {
-                let source = Incarnation::from_hex(&hex).ok_or_else(|| Error::StoreCorrupted {
-                    path: key.clone(),
-                    reason: format!(
+                let source = Incarnation::from_hex(&hex).ok_or_else(|| crate::funded_error::corruption_display(Ok(read_memory.clone()), &key, format_args!(
                         "persisted sync pull cursor source is not valid hex: {hex} — {}",
                         RedbPersistence::CORRUPT_STORE_NEXT_STEP
-                    ),
-                })?;
+                    )))?;
                 Ok(Some((source, Lsn(lsn))))
             }
             None => Ok(None),
@@ -77011,8 +77840,10 @@ impl Database {
     pub(crate) fn existing_sync_incarnation(
         &self,
         tenant: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Incarnation>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         if let Some(incarnation) = self.sync_incarnations.lock().get(tenant.as_str()).copied() {
@@ -77047,8 +77878,10 @@ impl Database {
     }
 
     pub(crate) fn sync_incarnation_with_read_memory(&self, tenant_id: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Incarnation> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let operation = || {
 
@@ -77060,13 +77893,10 @@ impl Database {
         let key = tenant_id.config_key("sync_incarnation");
         let incarnation = if let Some(persistence) = &self.persistence {
             match self.read_config_value::<String>(&key, read_memory.clone())? {
-                Some(hex) => Incarnation::from_hex(&hex).ok_or_else(|| Error::StoreCorrupted {
-                    path: key.clone(),
-                    reason: format!(
+                Some(hex) => Incarnation::from_hex(&hex).ok_or_else(|| crate::funded_error::corruption_display(Ok(read_memory.clone()), &key, format_args!(
                         "persisted sync incarnation is not valid hex: {hex} — {}",
                         RedbPersistence::CORRUPT_STORE_NEXT_STEP
-                    ),
-                })?,
+                    )))?,
                 None => {
                     let minted = Incarnation::mint();
                     self.publish_direct_metadata(|| persistence.flush_config_value(&key, &minted.to_hex()))?;
@@ -77101,8 +77931,10 @@ impl Database {
     pub(crate) fn production_smoke_sync_incarnation_with_read_memory(
         &self,
         tenant_id: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Incarnation> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.sync_incarnation_with_read_memory(tenant_id, read_memory)
     }
 
@@ -77130,8 +77962,10 @@ impl Database {
     pub(crate) fn persisted_sync_applied_push_watermark_with_read_memory(
         &self,
         tenant_id: &TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Lsn>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         if let Some(_persistence) = &self.persistence {
@@ -77254,8 +78088,10 @@ impl Database {
         tenant_id: &TenantId,
         node_id: &str,
         incarnation: Incarnation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Lsn>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         let _writer_read = self.writer_read_scope(read_memory.clone())?;
         let key =
@@ -77315,8 +78151,10 @@ impl Database {
     pub(crate) fn change_log_since_with_read_memory(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<ChangeLogEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         if !self.access_is_admin() {
             let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -77361,8 +78199,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<ChangeLogEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut selection_credit =
             contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         let (changes, _, _) = self.checked_changes_since_with_arrivals(
@@ -77441,8 +78281,10 @@ impl Database {
     fn change_replay_since_unlocked(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<writer_read::ChangeReplay> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[cfg(any(test, feature = "test-seams"))]
         let since_lsn = Lsn(since_lsn
             .0
@@ -77454,7 +78296,7 @@ impl Database {
             }
             return root
                 .change_log_cursor(
-                    crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+                    crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
                     Lsn(since_lsn.0 + 1),
                     root.lsn,
                 )
@@ -77467,8 +78309,10 @@ impl Database {
     fn change_log_since_unlocked(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<ChangeLogEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The forced gap hides the same committed prefix in resident and
         // native logs; writes after the seam remain available for replay.
         #[cfg(any(test, feature = "test-seams"))]
@@ -77545,8 +78389,10 @@ impl Database {
     pub(crate) fn ddl_log_since_with_read_memory(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DdlChange>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.open_operation()?;
         if !self.access_is_admin() {
             return Ok(Vec::new());
@@ -77563,8 +78409,10 @@ impl Database {
     pub(crate) fn declared_directions_for_tables<'a>(
         &self,
         tables: impl Iterator<Item = &'a str>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<String, SyncDirection>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(root) = self.writer_read_root()? else {
             return self.latest_declared_table_directions(read_memory.clone());
         };
@@ -77589,8 +78437,10 @@ impl Database {
     pub(crate) fn try_sync_direction_history_for_changes(
         &self,
         changes: &ChangeSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<SyncDirectionHistory> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(root) = self.writer_read_root()? else {
             return self.try_sync_direction_history(read_memory.clone());
         };
@@ -77621,8 +78471,10 @@ impl Database {
 
     pub(crate) fn latest_declared_table_directions(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<String, SyncDirection>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         let mut directions = HashMap::new();
         let ddl_log = self.checked_ddl_entries_since(Lsn(0), read_memory.clone())?;
@@ -77665,8 +78517,10 @@ impl Database {
     /// it, while outbound history still needs the dropped generation's policy.
     pub(crate) fn try_sync_direction_history(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<SyncDirectionHistory> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _operation = self.assert_open_operation();
         let mut history = SyncDirectionHistory::default();
         let ddl_log = self.checked_ddl_entries_since(Lsn(0), read_memory.clone())?;
@@ -77713,16 +78567,20 @@ impl Database {
     fn checked_ddl_entries_since(
         &self,
         since: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<writer_read::DdlHistory> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.ddl_log_entries_since_unlocked(since, read_memory.clone())
     }
 
     fn durable_ddl_entries_since(
         &self,
         since: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<writer_read::DdlHistory> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (_, root) = self.capture_writer_statement()?;
         let root = root.ok_or_else(|| {
             Error::Other("durable declaration history requires a captured writer source".into())
@@ -77754,8 +78612,10 @@ impl Database {
     fn ddl_log_since_unlocked(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DdlChange>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .ddl_log_entries_since_unlocked(since_lsn, read_memory.clone())?
             .into_iter()
@@ -77766,8 +78626,10 @@ impl Database {
     fn ddl_log_entries_since_unlocked(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<writer_read::DdlHistory> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.persistence.is_some() {
             return self.durable_ddl_entries_since(since_lsn, read_memory.clone());
         }
@@ -77813,8 +78675,10 @@ impl Database {
         &self,
         lsn: Lsn,
         ordinal: u32,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<DdlChange> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(history) = self.image_history.as_ref() {
             let mut seen = 0u32;
             let mut found = None;
@@ -77960,8 +78824,10 @@ impl Database {
     fn full_state_snapshot(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Freeze the source ceiling before enumerating any body. A commit that
         // lands during enumeration belongs to the next extraction; using a
         // later global clock as this snapshot's DDL position would claim that
@@ -78110,8 +78976,10 @@ impl Database {
         &self,
         mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             use std::ops::Bound;
             for (table, _) in root.captured_table_metadata() {
@@ -78142,8 +79010,10 @@ impl Database {
         &self,
         mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             use std::ops::Bound;
             for (table, _) in root.captured_table_metadata() {
@@ -78200,8 +79070,10 @@ impl Database {
     fn persisted_state_from_snapshot(
         &self,
         changes: ChangeSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.persisted_state_from_snapshot_projected(
             changes,
             &ChangeProjection::unbounded(),
@@ -78219,8 +79091,10 @@ impl Database {
         &self,
         mut changes: ChangeSet,
         projection: &ChangeProjection<'_>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !projection.ddl {
             let source = DdlProvenanceSource::synthetic_snapshot(&changes);
             return Ok((changes, source));
@@ -78292,8 +79166,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.persisted_state_since_through(since_lsn, None, false, vector_copy_owner, read_memory)
     }
 
@@ -78308,8 +79184,10 @@ impl Database {
         through: Option<Lsn>,
         row_vectors: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if since_lsn == Lsn(0) && !row_vectors {
             return self.persisted_state_from_snapshot(
                 self.full_state_snapshot(vector_copy_owner, read_memory.clone())?,
@@ -78571,8 +79449,10 @@ impl Database {
     fn refuse_unattributed_received_history(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.visit_received_ddl_arrivals(
             |key, arrival| {
                 if key.0 <= since_lsn || arrival.author.is_some() {
@@ -78610,8 +79490,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         snapshot_ddl: &[DdlChange],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Vec<DdlChange>, Vec<Lsn>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let history = self.durable_ddl_history_for_provenance(read_memory.clone())?;
         let mut next_ordinal = HashMap::<Lsn, u32>::new();
         let occurrences = history
@@ -78726,9 +79608,11 @@ impl Database {
         changes: &ChangeSet,
         policies: &ConflictPolicies,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<crate::memory_accounting::SchemaUnitReservation>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let usage = self.finalization.accountant.usage();
         let Some(limit) = usage.limit else {
             return Ok(None);
@@ -79329,8 +80213,10 @@ impl Database {
         &self,
         ddl: &[DdlChange],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let changes = ChangeSet {
             ddl: ddl.to_vec(),
             ..ChangeSet::default()
@@ -79518,8 +80404,10 @@ impl Database {
         adoption: SyncAdoption,
         fresh_creator_deletes: &[AuthenticatedFreshCreatorDelete],
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if changes.ddl.is_empty() {
             return Ok(());
         }
@@ -79704,7 +80592,7 @@ impl Database {
 
         new_meta = self.project_table_meta_with_auto_indexes(new_meta);
         let mut graph_copies = contextdb_vector::VectorCopyAdmission::new(
-            Arc::clone(&self.finalization.vector_accountant));
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant));
         let graph_shape_loss = self.prepare_graph_shape_loss(table, old_meta, &new_meta,
             &mut graph_copies, self.declared_reader_memory()?)?;
         // The automatic indexes this refresh adds or removes change what every
@@ -79975,8 +80863,10 @@ impl Database {
         rows: &[RowChange],
         projected_table_meta: &HashMap<String, TableMeta>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for row in rows {
             if row.values.is_empty() {
                 continue;
@@ -80110,8 +81000,10 @@ impl Database {
         adoption: SyncAdoption,
         fresh_creator_deletes: &[AuthenticatedFreshCreatorDelete],
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if rows.is_empty() {
             return Ok(());
         }
@@ -80470,8 +81362,10 @@ impl Database {
         incoming_batch_values: &HashMap<String, Vec<HashMap<String, Value>>>,
         projected_deleted_committed_row_ids: &HashMap<String, HashSet<RowId>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for fk in &child_meta.composite_foreign_keys {
             let mut tuple = Vec::with_capacity(fk.child_columns.len());
             let mut has_null = false;
@@ -80590,8 +81484,10 @@ impl Database {
         values: &HashMap<String, Value>,
         lsn: Lsn,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -80614,8 +81510,10 @@ impl Database {
         incoming_arrival: Option<Lsn>,
         adoption: SyncAdoption,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(match policy {
             ConflictPolicy::InsertIfNotExists | ConflictPolicy::ServerWins => false,
             ConflictPolicy::EdgeWins => true,
@@ -80741,8 +81639,10 @@ impl Database {
         adoption: SyncAdoption,
         fresh_creator_deletes: &[AuthenticatedFreshCreatorDelete],
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ProjectedSyncApply> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot();
         let mut projected_rows = Vec::<ProjectedSyncRow>::new();
         let mut projected_rows_cache = HashMap::new();
@@ -80951,8 +81851,10 @@ impl Database {
         projected_rows_cache: &HashMap<String, Vec<VersionedRow>>,
         deleted_committed_row_ids: &HashSet<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.sync_projected_row_constraint_error_for_values(
             table,
             values,
@@ -80971,8 +81873,10 @@ impl Database {
         skip_row_id: Option<RowId>,
         deleted_committed_row_ids: &HashSet<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
@@ -81069,8 +81973,10 @@ impl Database {
         values: &HashMap<String, Value>,
         deleted_committed_row_ids: &HashSet<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
@@ -81125,8 +82031,10 @@ impl Database {
         projected_rows_cache: &HashMap<String, Vec<VersionedRow>>,
         deleted_committed_row_ids: &HashSet<RowId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let values = match self.coerce_row_for_insert(table, values.clone(), None, None) {
             Ok(values) => values,
             Err(err) if is_fatal_sync_apply_error(&err) => return Err(err),
@@ -81195,8 +82103,10 @@ impl Database {
         projected_rows: &mut Vec<ProjectedSyncRow>,
         deleted_committed_row_ids: &HashMap<String, HashSet<RowId>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         loop {
             let mut remove_indexes = Vec::new();
             for (idx, row) in projected_rows.iter().enumerate() {
@@ -81316,8 +82226,10 @@ impl Database {
         incoming_rows: &[ProjectedSyncRow],
         deleted_committed_row_ids: &HashMap<String, HashSet<RowId>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for fk in &child_meta.composite_foreign_keys {
             let Some(tuple) = tuple_values_from_map(values, &fk.child_columns) else {
                 continue;
@@ -81393,9 +82305,11 @@ impl Database {
     /// durable install retires them.
     fn visit_link_types_of_dropped_link_tables(
         &self, ddl: &[DdlChange], live_tables: &HashMap<String,TableMeta>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         visit: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _keys = contextdb_core::read_memory::ReadCredit::try_new(read_memory.clone(),
             ddl.len().saturating_mul(256),"sync","dropped_graph_table_keys",
             "Raise the declared reader memory limit to inspect dropped graph tables.")?;
@@ -81457,8 +82371,10 @@ impl Database {
         changes: &ChangeSet,
         dag_edge_types: &HashSet<EdgeType>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if dag_edge_types.is_empty() || changes.edges.is_empty() {
             return Ok(());
         }
@@ -81517,8 +82433,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.changes_since_base_projected(
             since_lsn,
             &ChangeProjection::unbounded(),
@@ -81535,8 +82453,10 @@ impl Database {
         since_lsn: Lsn,
         projection: &ChangeProjection<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let since_lsn = self.connected_history_since(since_lsn, read_memory.clone())?;
         (|| {
             // Direct helper calls establish the same admitted statement scope;
@@ -82418,13 +83338,15 @@ impl Database {
         purge_source: &mut PurgeReplay,
         pending_source: &mut PendingReplay,
         pending_deletes: &mut Vec<DurablePendingDelete>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         upto: Option<Lsn>,
         projection: &ChangeProjection<'_>,
         page_lsn: &mut Option<Lsn>,
         ddl_lsn: &mut Vec<Lsn>,
         ddl: &mut Vec<DdlChange>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         loop {
             let next_ddl = ddl_source.peek_lsn()?;
             let next_purge = purge_source.peek_lsn()?;
@@ -82520,8 +83442,10 @@ impl Database {
         since_lsn: Lsn,
         projection: &ChangeProjection<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (projection.checkpoint)()?;
         // This fallback belongs exclusively to unpaged extraction. Paged
         // pulls enumerate surviving ordered sources and admit each copy there.
@@ -82567,8 +83491,10 @@ impl Database {
         source: &crate::persistence::RetainedReadSource,
         projection: &ChangeProjection<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot_ceiling = self.current_lsn();
         let acl_snapshot = self.snapshot();
         let metas = {
@@ -82733,8 +83659,10 @@ impl Database {
         projection: &ChangeProjection<'_>,
         with_arrivals: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             let _operation = self.open_operation()?;
             let (base, _) = self.changes_since_base_projected(
@@ -82775,8 +83703,10 @@ impl Database {
         changes: ChangeSet,
         confirmed_frontier: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<OutboundSyncUnit>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !changes.ddl.is_empty() {
             changes
                 .validate_ddl_lsn_cardinality()
@@ -83138,8 +84068,10 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         history: &SyncDirectionHistory,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(&row.table) else {
             return Ok(false);
         };
@@ -83234,8 +84166,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowChange>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(row) = self.required_indexed_visible_row_by_columns(
             table,
             columns,
@@ -83355,8 +84289,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             let _operation = self.open_operation()?;
             // A change read is funded by the caller's declared reader memory;
@@ -83374,8 +84310,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (base, _) =
             self.changes_since_base(since_lsn, vector_copy_owner, read_memory.clone())?;
         let pending = self.durable_pending_deletes_since(since_lsn, read_memory.clone())?;
@@ -83413,8 +84351,10 @@ impl Database {
     pub fn changes_since_with_arrivals_with_read_memory_for_test(
         &self,
         since_lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.changes_since_with_arrivals_with_read_memory(
             since_lsn,
@@ -83427,8 +84367,10 @@ impl Database {
         &self,
         since_lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             let _operation = self.open_operation()?;
             let output = std::cell::RefCell::new(contextdb_core::read_memory::ReadCredit::new(
@@ -83486,10 +84428,12 @@ impl Database {
         &self,
         since_lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         selection_credit: &mut contextdb_core::read_memory::ReadCredit,
         page: Option<PullPageRequest<'_>>,
     ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>, DdlProvenanceSource)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             if page.is_some() && self.image_history.is_some() {
                 return Err(Error::ReadFailure(
@@ -83575,8 +84519,10 @@ impl Database {
     pub(crate) fn sync_arrivals_for_changes(
         &self,
         changes: &ChangeSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<Lsn, Option<Lsn>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let output = std::cell::RefCell::new(contextdb_core::read_memory::ReadCredit::new(
             read_memory.clone(),
         ));
@@ -83601,8 +84547,10 @@ impl Database {
         checkpoint: &dyn Fn() -> Result<()>,
         admit: &dyn Fn(usize) -> Result<()>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashMap<Lsn, Option<Lsn>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot_for_read();
         let empty_skip_deleted = HashSet::new();
         let mut arrivals = HashMap::new();
@@ -83667,8 +84615,10 @@ impl Database {
         &self,
         source: &DdlProvenanceSource,
         entry: &SourceDdlIdentity,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<DurableDdlGenerationSidecar> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if source.kind == DdlProvenanceKind::SyntheticSnapshot {
             let table = Self::ddl_affected_table(&entry.ddl).map(str::to_string);
             let table_generation = table
@@ -83721,8 +84671,10 @@ impl Database {
     /// old received schema into unprovable synthetic output after a move.
     fn durable_ddl_history_for_provenance(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<writer_read::DdlHistory> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.persistence.is_some() {
             self.durable_ddl_entries_since(Lsn(0), read_memory.clone())
         } else {
@@ -83760,8 +84712,10 @@ impl Database {
     fn received_ddl_arrival_marks(
         &self,
         source: &DdlProvenanceSource,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedDdlArrivalValidation> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if source.kind == DdlProvenanceKind::SyntheticSnapshot {
             if !self.has_received_ddl_arrivals()? {
                 return Ok(ReceivedDdlArrivalValidation::Marked(HashSet::new()));
@@ -83835,8 +84789,10 @@ impl Database {
     fn superseded_ddl_occurrence_marks(
         &self,
         source: &DdlProvenanceSource,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashSet<(Lsn, u32)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if source.kind == DdlProvenanceKind::SyntheticSnapshot {
             return Ok(HashSet::new());
         }
@@ -83905,8 +84861,10 @@ impl Database {
         mut changes: ChangeSet,
         source: &DdlProvenanceSource,
         destination_frontier: Option<Lsn>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let entries = source.surviving_entries(&changes)?;
         let arrivals = self.received_ddl_arrival_marks(source, read_memory.clone())?;
         let superseded = self.superseded_ddl_occurrence_marks(source, read_memory.clone())?;
@@ -83964,8 +84922,10 @@ impl Database {
         local_node_id: &str,
         local_incarnation: Incarnation,
         signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<crate::protocol::WireDdlProvenance>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if changes.ddl.is_empty() {
             return Ok(Vec::new());
         }
@@ -84169,8 +85129,10 @@ impl Database {
         local_node_id: &str,
         local_incarnation: Incarnation,
         signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OutboundPushBatchProvenance> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let lineages = self.outbound_row_lineages(
             changes,
             tenant_id,
@@ -84205,8 +85167,10 @@ impl Database {
         local_node_id: &str,
         local_incarnation: Incarnation,
         signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<crate::protocol::WireDdlProvenance>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !changes.rows.is_empty() || !changes.edges.is_empty() || !changes.vectors.is_empty() {
             return Err(Error::SyncError((
                 "DDL provenance test bridge accepts schema-only units".to_string()).into()));
@@ -84368,8 +85332,10 @@ impl Database {
         marker_lsn: Lsn,
         marker_row_id: RowId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot();
         let no_deleted = HashSet::new();
         if let Some(current) = self.visible_row_by_natural_key(
@@ -84411,8 +85377,10 @@ impl Database {
         row: &RowChange,
         current: Option<&VersionedRow>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let key = Self::terminal_refusal_marker_key(context, &row.table, &row.natural_key);
         let in_memory_marker = self.terminal_refusal_markers.read().get(&key).cloned();
         let marker = match in_memory_marker {
@@ -84457,8 +85425,10 @@ impl Database {
         &self,
         context: &TerminalRefusalPullContext,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut records =
             BTreeMap::<String, (TerminalRefusalMarkerRecord, TerminalRefusalMarkerKey)>::new();
         for (key, record) in self.terminal_refusal_markers.read().iter() {
@@ -85574,8 +86544,10 @@ impl Database {
         changes: ChangeSet,
         policies: &ConflictPolicies,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.apply_changes_impl(
             changes,
             policies,
@@ -85610,8 +86582,10 @@ impl Database {
         source_node_id: &str,
         source_incarnation: Incarnation,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !changes.rows.is_empty() || !changes.edges.is_empty() || !changes.vectors.is_empty() {
             return Err(Error::SyncError((
                 "received-schema test bridge accepts schema-only units".to_string()).into()));
@@ -85692,8 +86666,10 @@ impl Database {
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.apply_changes_impl(
             changes,
             policies,
@@ -85730,8 +86706,10 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         dependency_complete: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.apply_authenticated_received_changes_with_lineages_impl(
             changes,
             arrivals,
@@ -85800,8 +86778,10 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         dependency_complete: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.apply_authenticated_received_changes_with_lineages_impl(
             changes,
             arrivals,
@@ -85834,8 +86814,10 @@ impl Database {
         schema_publication_held: bool,
         push_outcome_key: Option<&SyncPushOutcomeContext>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.apply_changes_impl(
             changes,
             &Self::declared_sync_policies(false),
@@ -85890,8 +86872,10 @@ impl Database {
         adoption: SyncAdoption,
         receipt: SyncApplyReceipt,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let result =
             self.apply_changes_impl(
                 changes,
@@ -85968,8 +86952,10 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         push_outcome_key: Option<&SyncPushOutcomeKey>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let push_lock = push_outcome_key.map(|key| self.sync_push_apply_lock_for_key(key));
         let _push_apply = push_lock.as_ref().map(|lock| lock.lock());
         if let Some(key) = push_outcome_key
@@ -86102,8 +87088,10 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         prepare: &mut dyn crate::custody::preparation::CommitPreparation,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Preserve normal authenticated apply metadata, but
         // hold progress until the custody batch has adjudicated every sibling.
         receipt.source_lsn = self
@@ -86171,8 +87159,10 @@ impl Database {
     fn locally_declared_custody_policy(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             return self.durable_locally_declared_custody_policy(&root, table, read_memory.clone());
         }
@@ -86254,8 +87244,10 @@ impl Database {
         &self,
         root: &crate::persistence::WriterSnapshotHandle,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         const PREFIX: &str = "sync_ddl_generation.v1.";
         let mut sidecars = root.config_cursor(
             crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
@@ -86354,8 +87346,10 @@ impl Database {
     fn arriving_statement_refusal(
         &self,
         change: &DdlChange,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (name, columns, constraints, foreign_keys, composite_foreign_keys, composite_unique) =
             match change {
                 DdlChange::CreateTable {
@@ -86463,8 +87457,10 @@ impl Database {
         received: Option<&crate::protocol::ReceivedDdlContext>,
         source: Option<&str>,
         identity: Option<(&TenantId, Incarnation)>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.received_policy_plan_with_refusals(
             changes,
             received,
@@ -86486,8 +87482,10 @@ impl Database {
         role: SyncApplyRole,
         hub: Option<&str>,
         source: Option<&str>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let planned = if role == SyncApplyRole::HubPushApply
             && let (Some(receipt), Some(hub)) = (receipt, hub)
         {
@@ -86522,8 +87520,10 @@ impl Database {
         received: Option<&crate::protocol::ReceivedDdlContext>,
         receipt: &SyncApplyReceipt,
         hub: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut refusals = HashMap::new();
         if let Some(received) = received {
             if receipt.tenant_id != received.tenant_id
@@ -86591,8 +87591,10 @@ impl Database {
         source: Option<&str>,
         identity: Option<(&TenantId, Incarnation)>,
         refusals: &HashMap<[u8; 32], crate::protocol::RefusedSchemaUnitOutcome>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.received_policy_plan_with_projection(
             changes,
             received,
@@ -86612,8 +87614,10 @@ impl Database {
         identity: Option<(&TenantId, Incarnation)>,
         refusals: &HashMap<[u8; 32], crate::protocol::RefusedSchemaUnitOutcome>,
         projection: Option<&PullPolicyProjection>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let identity = received
             .map(|context| (&context.tenant_id, context.source_incarnation))
             .or(identity);
@@ -87056,12 +88060,14 @@ impl Database {
         identity: Option<(&TenantId, Incarnation)>,
         dependency_complete: bool,
         projection: &mut PullPolicyProjection,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         ChangeSet,
         Option<crate::protocol::ReceivedDdlContext>,
         PullPolicyPreflight,
     )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut plan = self.received_policy_plan_with_projection(
             &changes,
             received,
@@ -87310,11 +88316,13 @@ impl Database {
         hub: &str,
         hub_life: Incarnation,
         digests: &[[u8; 32]],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         Vec<crate::protocol::RefusedSchemaUnitOutcome>,
-        Option<Arc<crate::read_image_memory::ImageMemory>>,
+        Option<crate::read_image_memory::ImageMemoryHandle>,
     )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if digests.len() > 128 {
             return Err(Error::SyncError(
                 "too many local refusal facts in one lookup".into()));
@@ -87506,11 +88514,13 @@ impl Database {
         pushing_incarnation: Incarnation,
         hub: &str,
         digests: &[[u8; 32]],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         Vec<crate::protocol::RefusedSchemaUnitOutcome>,
-        Arc<crate::read_image_memory::ImageMemory>,
+        crate::read_image_memory::ImageMemoryHandle,
     )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if digests.len() > 128 {
             return Err(Error::SyncError(
                 "too many refused schema unit digests in one lookup".into()));
@@ -87568,8 +88578,10 @@ impl Database {
         received: &crate::protocol::ReceivedDdlContext,
         receipt: &SyncApplyReceipt,
         hub: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if receipt.tenant_id != received.tenant_id
             || receipt.node_id != received.source_node_id
             || receipt.incarnation != received.source_incarnation
@@ -87653,8 +88665,10 @@ impl Database {
         hub: &str,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         received: Option<&crate::protocol::ReceivedDdlContext>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut plan = self.received_policy_plan_for_push(
             changes,
             received,
@@ -87781,8 +88795,10 @@ impl Database {
         node: &str,
         incarnation: Incarnation,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let prefix = format!(
             "{}{}.{}.{}.",
             Self::POLICY_HELD_DATA_PREFIX,
@@ -88053,7 +89069,7 @@ impl Database {
 
     fn policy_hold_memory(
         accountant: crate::memory_accounting::AccountantHandle,
-    ) -> Arc<crate::read_image_memory::ImageMemory> {
+    ) -> crate::read_image_memory::ImageMemoryHandle {
         crate::read_image_memory::ImageMemory::charging_for(
             accountant,
             "sync_policy",
@@ -88279,7 +89295,7 @@ impl Database {
         identity: Option<(&TenantId, Incarnation)>,
     ) -> Result<(
         Vec<DurablePolicyHold>,
-        Arc<crate::read_image_memory::ImageMemory>,
+        crate::read_image_memory::ImageMemoryHandle,
     )> {
         let mut tables: BTreeSet<String> = changes
             .rows
@@ -88483,8 +89499,10 @@ impl Database {
         delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         push_outcome_key: Option<&SyncPushOutcomeContext>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The caller may replay several independently committed requests.
         // Keep this invocation's copies until it commits or unwinds, then
         // release them before that caller advances to its next request.
@@ -89053,8 +90071,10 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         stage_verified_lineages: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut total = ApplyResult {
             applied_rows: 0,
             skipped_rows: 0,
@@ -89235,8 +90255,10 @@ impl Database {
     fn preflight_sync_apply_trigger_ready(
         &self,
         changes: &ChangeSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.trigger.ready.load(Ordering::SeqCst) || changes.is_empty() {
             return Ok(());
         }
@@ -89317,8 +90339,10 @@ impl Database {
         table: &str,
         meta: Option<&TableMeta>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut shed_columns = false;
         for (column, incoming) in values {
             match local.values.get(column) {
@@ -89390,8 +90414,10 @@ impl Database {
         table: &str,
         local: &VersionedRow,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (retained_source_lsn, retained_source_kind) =
             self.relational_sync_source_at_read_root(table, local.row_id, read_memory.clone())?;
         let (retained_acceptance_position, retained_source_kind) =
@@ -89506,8 +90532,10 @@ impl Database {
         push_outcome_key: Option<&SyncPushOutcomeContext>,
         unit_reservation: Option<&crate::memory_accounting::SchemaUnitReservation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.apply_changes_with_private_source_order(
             changes, policies, arrivals, adoption, apply_role, receipt, dependency_complete, terminal_refusal_context, hub_local_author, lineages, stage_verified_lineages, delivery_prepare, push_outcome_key, unit_reservation, vector_copy_owner, read_memory, None,
         )
@@ -89530,9 +90558,11 @@ impl Database {
         push_outcome_key: Option<&SyncPushOutcomeContext>,
         unit_reservation: Option<&crate::memory_accounting::SchemaUnitReservation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         private_replay: Option<connected_replay::PrivateReplayContext<'_>>,
     ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         (|| {
             let published = self.tx_mgr.capture_published_read();
             let _writer_read = self.enter_writer_read(
@@ -89545,7 +90575,7 @@ impl Database {
             let private_preparation_owner=if private_replay.is_some() {
                 match crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
                     Some(source)=>source.with_original(|original|
-                        crate::memory_accounting::persistence_original_projection(original)?.read_budget())?,
+                        crate::memory_accounting::persistence_original_projection(original)?.read_budget())?.into(),
                     None=>read_memory.clone(),
                 }
             }else{read_memory.clone()};
@@ -92577,8 +93607,10 @@ impl Database {
         sync_trigger_derived_rows_are_local: bool,
         delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The transaction-manager callback publishes accepted delete
         // provenance while it still holds the commit lock, after relational
         // apply made the tombstone visible and before another commit can run.
@@ -92621,7 +93653,9 @@ impl Database {
     /// the private working write set and is removed before durable staging.
     fn stage_detached_accepted_row(&self, tx: TxId, row: &RowChange,
         local_row_id: Option<RowId>, connected: bool,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         if !connected || !self.capture_detached_sync_write_set.load(Ordering::SeqCst) { return Ok(()); }
         let key = Self::detached_accepted_row_key(row, owner)?;
         let value = RedbPersistence::encode_config_value(&local_row_id)?;
@@ -92630,7 +93664,9 @@ impl Database {
     }
 
     fn detached_accepted_row_key(row: &RowChange,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<String> {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<String> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         // Same-key members at one source position can carry different bodies.
         // Hash the complete received image in deterministic column order;
         // natural key plus LSN alone is not an occurrence identity. This key
@@ -93145,8 +94181,10 @@ impl Database {
         &self,
         tx: TxId,
         receipt: &SyncApplyReceipt,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(contact_ms) = receipt.hub_contact_ms {
             self.stage_hub_node_contact(tx, &receipt.node_id, contact_ms, read_memory.clone())?;
         }
@@ -93200,8 +94238,10 @@ impl Database {
         tx: TxId,
         node_id: &str,
         now_ms: i64,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.execute_in_tx_with_read_memory(
             tx,
             "INSERT INTO work_node_contacts (node_id, last_contact_ms) VALUES ($node_id, $last_contact_ms) \
@@ -93220,8 +94260,10 @@ impl Database {
         key: Option<&SyncPushOutcomeContext>,
         result: &ApplyResult,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let tx = self.begin()?;
         if let Err(err) = self.stage_sync_apply_receipt(tx, receipt, read_memory.clone()) {
             let _ = self.rollback(tx);
@@ -93261,8 +94303,10 @@ impl Database {
         &self,
         receipt: &SyncApplyReceipt,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let tx = self.begin()?;
         if let Err(err) = self.stage_sync_apply_receipt(tx, receipt, read_memory.clone()) {
             let _ = self.rollback(tx);
@@ -93301,8 +94345,10 @@ impl Database {
         policies: &ConflictPolicies,
         hub_local_author: Option<&str>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<Conflict>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.snapshot();
         let no_deleted = HashSet::new();
         let mut remaining = rows.iter().collect::<Vec<_>>();
@@ -93428,8 +94474,10 @@ impl Database {
         rows: &mut Vec<RowChange>,
         vectors: &[VectorChange],
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.restore_vector_owner_rows_projected(
             rows,
             vectors,
@@ -93445,8 +94493,10 @@ impl Database {
         vectors: &[VectorChange],
         projection: &ChangeProjection<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if vectors.is_empty() {
             return Ok(());
         }
@@ -93538,8 +94588,10 @@ impl Database {
         row: &VersionedRow,
         projection: &ChangeProjection<'_>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, Value)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(table) else {
             return Ok(Vec::new());
         };
@@ -93607,10 +94659,12 @@ impl Database {
         table: &str,
         row_id: RowId,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
         admit_copy: Option<&dyn Fn(usize) -> Result<()>>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(source) = &self.retained_relational_source {
             // A change to a table this image no longer declares has no row to
             // answer, exactly as in a live store: the table was dropped after
@@ -93647,7 +94701,7 @@ impl Database {
                 crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()), table, &exact,
             )? {
                 if window.value.lsn != lsn {
-                    return Err(Error::StoreCorrupted { path: table.into(), reason: "retained body does not match the selected change LSN".into() });
+                    return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), table, "retained body does not match the selected change LSN".into()));
                 }
                 if let Some(admit) = admit_copy { admit(std::mem::size_of::<VersionedRow>().saturating_add(held::values(&window.value.values)))?; }
                 return self.clone_writer_row(&window.value, read_memory.clone()).map(Some);
@@ -93669,14 +94723,11 @@ impl Database {
             }
             if let Some(window) = source.indexed_point_row(table, row_id, snapshot)? {
                 if window.value().lsn != lsn {
-                    return Err(Error::StoreCorrupted {
-                        path: table.into(),
-                        reason: format!(
+                    return Err(crate::funded_error::corruption_display(Ok(read_memory.clone()), table, format_args!(
                             "selected change at LSN {} resolves to row LSN {}",
                             lsn.0,
                             window.value().lsn.0
-                        ),
-                    });
+                        )));
                 }
                 if let Some(admit) = admit_copy {
                     admit(
@@ -93699,10 +94750,12 @@ impl Database {
         table: &str,
         row_id: RowId,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
         admit_copy: Option<&dyn Fn(usize) -> Result<()>>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let copy = |row: &VersionedRow| {
             checkpoint()?;
             if let Some(admit) = admit_copy {
@@ -93740,13 +94793,10 @@ impl Database {
             return Ok(None);
         };
         if row.lsn != lsn {
-            return Err(Error::StoreCorrupted {
-                path: table.into(),
-                reason: format!(
+            return Err(crate::funded_error::corruption_display(Ok(read_memory.clone()), table, format_args!(
                     "selected change at LSN {} resolves to row LSN {}",
                     lsn.0, row.lsn.0
-                ),
-            });
+                )));
         }
         copy(row).map(Some)
     }
@@ -93754,9 +94804,11 @@ impl Database {
     fn history_change_snapshot_at(
         &self,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<SnapshotId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         checkpoint()?;
         let lsn = self.connected_history_end(lsn, read_memory.clone())?;
         let snapshot = match self.image_history.as_ref() {
@@ -93783,8 +94835,10 @@ impl Database {
         lsn: Lsn,
         projection: &ChangeProjection<'_>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if projection.bounded
             && self.retained_relational_source.is_none()
             && self.persistence.is_none()
@@ -93820,12 +94874,14 @@ impl Database {
 
     fn with_change_table_meta<T>(
         &self, table: &str, row: &VersionedRow,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         consume: impl FnOnce(Option<&TableMeta>) -> Result<T>,
     ) -> Result<T> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = self.writer_read_root()? {
             let declaration = RedbPersistence::declared_meta_in_read(&root,
-                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory), table, row.lsn)?;
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()), table, row.lsn)?;
             return consume(declaration.as_ref().map(|window| &window.value.0));
         }
         // Retirement keeps the complete declaration beside its original body.
@@ -93845,8 +94901,10 @@ impl Database {
         row: &VersionedRow,
         projection: &ChangeProjection<'_>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.row_change_values_projected_at(
             table,
             row,
@@ -93864,8 +94922,10 @@ impl Database {
         projection: &ChangeProjection<'_>,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !projection.bounded {
             return self.row_change_values_from_row_at(
                 table,
@@ -93914,8 +94974,10 @@ impl Database {
         table: &str,
         row: &VersionedRow,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.row_change_values_from_row_at(
             table,
             row,
@@ -93931,8 +94993,10 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let natural_key = self.with_change_table_meta(table, row, read_memory.clone(), |meta| {
             Ok(meta.and_then(|meta| natural_key_from_row_values(meta, &row.values)))
         })?;
@@ -93967,8 +95031,10 @@ impl Database {
         key_value: &Value,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .required_indexed_visible_row_by_column(
                 table,
@@ -93988,8 +95054,10 @@ impl Database {
         &self,
         table: &str,
         key: &NaturalKey,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -94020,8 +95088,10 @@ impl Database {
         natural_key: &NaturalKey,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .visible_row_by_natural_key(
                 table,
@@ -94038,8 +95108,10 @@ impl Database {
         table: &str,
         row: &VersionedRow,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.with_change_table_meta(table, row, read_memory.clone(), |meta| {
         let Some(meta) = meta else { return Ok(false); };
         let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
@@ -94067,8 +95139,10 @@ impl Database {
         table: &str,
         row_id: RowId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         let Some(row) = self.committed_row_at_admitted(
             table,
@@ -94090,8 +95164,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(
             self.node_read_allowed(source, snapshot, read_memory.clone())?
                 && self.node_read_allowed(target, snapshot, read_memory.clone())?
@@ -94112,8 +95188,10 @@ impl Database {
         edge_type: &str,
         lsn: Lsn,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<HashMap<String, Value>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let root = self
             .graph_read_root()?
             .map(|root| root.snapshot(root.frontier(), read_memory.clone()))
@@ -94502,8 +95580,10 @@ fn sync_visible_point_lookup(
     snapshot: SnapshotId,
     skip_deleted: &HashSet<RowId>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if let Some(projected) = projected_point_lookup(cache, table, natural_key) {
         return Ok(Some(projected));
     }
@@ -95246,8 +96326,9 @@ const ARRIVAL_ENTRY_BYTES: usize = hashed_slot_bytes::<(Lsn, Option<Lsn>)>();
 pub(crate) enum ImageHistoryError {
     Engine(Error),
     Store {
-        path: String,
-        diagnosis: Box<crate::persistence::LoadReadImageError>,
+        path: contextdb_core::error::DiagnosticText,
+        diagnosis: crate::persistence::LoadReadImageError,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
     },
 }
 
@@ -95258,28 +96339,49 @@ impl From<Error> for ImageHistoryError {
 }
 
 impl ImageHistoryError {
-    /// The engine-vocabulary form, for a caller that speaks only `Error`:
-    /// corrupt state stays a corrupt store, an index a writer must rebuild
-    /// stays a typed direct-read refusal.
+    pub(crate) fn store(
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        path: impl std::fmt::Display,
+        diagnosis: crate::persistence::LoadReadImageError,
+    ) -> Self {
+        // Preserve the original refusal before preparing any rendered detail.
+        if let crate::persistence::LoadReadImageError::Memory(error) = diagnosis {
+            return Self::Engine(error);
+        }
+        match crate::funded_error::diagnostic_text(owner.clone(), path) {
+            Ok(path) => Self::Store { path, diagnosis, owner },
+            Err(error) => Self::Engine(error),
+        }
+    }
+
     pub(crate) fn into_engine_error(self) -> Error {
         use crate::persistence::LoadReadImageError as Load;
         match self {
             Self::Engine(error) => error,
-            Self::Store { path, diagnosis } => {
-                let reason = diagnosis.to_string();
-                match *diagnosis {
-                    Load::Memory(error) => error,
-                    Load::Corrupt { .. } | Load::InvalidState { .. } => {
-                        Error::StoreCorrupted { path, reason }
+            Self::Store { path, diagnosis: Load::Memory(error), .. } => { drop(path); error },
+            Self::Store { path, diagnosis, owner } => {
+                let corrupted = matches!(diagnosis, Load::Corrupt { .. } | Load::InvalidState { .. });
+                if matches!(diagnosis, Load::RequiresWriter { .. }) {
+                    struct Count(usize);
+                    impl std::fmt::Write for Count {
+                        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                            self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?; Ok(())
+                        }
                     }
-                    Load::RequiresWriter { .. } => Error::ReadFailure(
-                        contextdb_core::read_contract::ReadFailure::new(
-                            contextdb_core::read_contract::ReadFailureKind::DirectReadRequiresWriter,
-                            contextdb_core::read_contract::ReadFailureDetail::Reason { reason },
-                        )
-                        .expect("a direct-read refusal carries a plain reason"),
-                    ),
-                    _ => Error::Other(reason.into()),
+                    let mut count = Count(0);
+                    use std::fmt::Write;
+                    if write!(&mut count, "{diagnosis}").is_err() {
+                        return Error::Other("history diagnosis length overflow".into());
+                    }
+                    return match contextdb_core::read_contract::ReadFailure::try_funded_reason(
+                        contextdb_core::read_contract::ReadFailureKind::DirectReadRequiresWriter,
+                        owner, count.0, |text| { write!(text, "{diagnosis}").expect("exact diagnosis capacity"); },
+                    ) { Ok(failure) => Error::ReadFailure(failure), Err(error) => error };
+                }
+                match crate::funded_error::diagnostic_text(owner, diagnosis) {
+                    Ok(reason) if corrupted => Error::StoreCorrupted { path, reason },
+                    Ok(reason) => Error::Other(reason),
+                    Err(error) => error,
                 }
             }
         }
@@ -95287,7 +96389,7 @@ impl ImageHistoryError {
 }
 
 pub(crate) struct ImageHistory {
-    source: Arc<crate::persistence::RetainedReadSource>,
+    source: crate::persistence::RetainedReadSource,
     load_history: bool,
     loaded: Mutex<Option<LoadedImageHistoryCharge>>,
 }
@@ -95300,12 +96402,33 @@ pub(crate) struct ImageHistory {
 /// the other, because they are always constructed and stored together).
 struct LoadedImageHistoryCharge {
     _history: crate::persistence::ReadHistoryCharge,
-    _indexes: Arc<crate::read_image_memory::ImageMemory>,
+    _indexes: crate::read_image_memory::ImageMemoryHandle,
+}
+
+/// The existing read-image invoices remain in ImageHistory, pinned by this
+/// owner until its actual shared buffers are destroyed. This inline owner is
+/// part of the admitted finalization control; it creates no new Arc control.
+struct LoadedHistoryBuffers {
+    history: Arc<ImageHistory>,
+    ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
+    change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+    table_index: Arc<RwLock<ChangeLogTableIndex>>,
+    lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
+    _image_memory: crate::read_image_memory::ImageMemoryHandle,
+}
+impl Drop for LoadedHistoryBuffers {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut *self.ddl_log.write()));
+        drop(std::mem::take(&mut *self.change_log.write()));
+        drop(std::mem::take(&mut *self.table_index.write()));
+        drop(std::mem::take(&mut *self.lsn_refcounts.write()));
+        drop(self.history.loaded.lock().take());
+    }
 }
 
 pub(crate) struct CommittedImageStartupState {
     config_values: BTreeMap<String, Vec<u8>>,
-    config_source: Arc<crate::persistence::RetainedReadSource>,
+    config_source: crate::persistence::RetainedReadSource,
     sink_queues: BTreeMap<String, Vec<(u64, Vec<u8>)>>,
     /// Depth and newest id of each queue whose payloads the image left in
     /// the store.
@@ -95351,6 +96474,57 @@ fn same_vector_storage_shape(left: &VectorIndexLayout, right: &VectorIndexLayout
         && left.partition_key_columns == right.partition_key_columns
 }
 
+// The prepared delta and generation encoding simultaneously retain these
+// input images. Keep their copy charge with the enclosing purge workspace.
+fn admit_erasure_vector_input_copies(
+    schemas: &[(VectorIndexRef, VectorIndexLayout)],
+    entries: &[PartitionedVectorEntry],
+    affected: &[VectorPartitionRef],
+    owner: &mut contextdb_vector::VectorCopyAdmission,
+) -> Result<()> {
+    owner.reserve(
+        schemas
+            .len()
+            .saturating_mul(std::mem::size_of::<(VectorIndexRef, VectorIndexLayout)>())
+            .saturating_add(
+                entries
+                    .len()
+                    .saturating_mul(std::mem::size_of::<PartitionedVectorEntry>()),
+            )
+            .saturating_add(
+                affected
+                    .len()
+                    .saturating_mul(std::mem::size_of::<VectorPartitionRef>()),
+            ),
+    )?;
+    for (index, layout) in schemas {
+        owner.reserve(
+            index
+                .table
+                .len()
+                .saturating_add(index.column.len())
+                .saturating_add(layout.estimated_bytes()),
+        )?;
+    }
+    for entry in entries {
+        owner.reserve(
+            crate::memory_accounting::preparation_vector_copy_bytes(&entry.entry)?
+                .saturating_add(entry.partition_key.estimated_bytes()),
+        )?;
+    }
+    for partition in affected {
+        owner.reserve(
+            partition
+                .index
+                .table
+                .len()
+                .saturating_add(partition.index.column.len())
+                .saturating_add(partition.partition_key.estimated_bytes()),
+        )?;
+    }
+    Ok(())
+}
+
 fn vector_layouts_from_meta(
     table_meta: &HashMap<String, TableMeta>,
 ) -> Vec<(VectorIndexRef, VectorIndexLayout)> {
@@ -95378,10 +96552,14 @@ fn vector_layouts_from_meta(
 fn register_vector_layouts(
     vector: &VectorStore,
     table_meta: &HashMap<String, TableMeta>,
-    declared_owner: Arc<dyn contextdb_vector::MemoryBudget>,
+    declared_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let declared_owner: contextdb_vector::MemoryBudgetOwner = declared_owner.into();
+
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
     for (index, layout) in vector_layouts_from_meta(table_meta) {
         vector.register_index_with_layout(
             index,
@@ -96860,8 +98038,10 @@ fn prune_expired_rows(
     mut workspace: crate::memory_accounting::OwnedMemoryReservation,
     prepaid_carry_bytes: usize,
     prepaid_durable_carry_bytes: usize,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<PruningReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let relational_store = &ctx.relational;
     let graph_store = &ctx.graph;
     let vector_store = &ctx.vector;
@@ -97878,7 +99058,7 @@ const LSN_REFCOUNT_ENTRY_UPPER_BYTES: usize = 48;
 #[doc(hidden)]
 pub struct ChangeLogAuxIndexFixtureForTest {
     log: Vec<ChangeLogEntry>,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     built: Option<(ChangeLogTableIndex, ChangeLogLsnRefcounts)>,
 }
 
@@ -97902,7 +99082,8 @@ impl ChangeLogAuxIndexFixtureForTest {
         }
         Self {
             log,
-            memory: crate::read_image_memory::ImageMemory::new(None),
+            memory: crate::read_image_memory::ImageMemory::new(None)
+                .expect("unlimited change-log fixture image owner"),
             built: None,
         }
     }
@@ -97932,8 +99113,10 @@ fn count_pruned_change_log_entries_at_root(
     tx_mgr: &DatabaseTransactionHost,
     resident: &ChangeLogTableIndex,
     pruned: &HashMap<String, HashSet<(RowId, Lsn)>>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(u64, HashMap<Lsn, u64>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? else {
         return Ok(count_pruned_change_log_entries(resident, pruned));
     };
@@ -98061,6 +99244,175 @@ fn apply_removed_lsn_counts(
     }
 }
 
+// Native allocation plan for a fresh TableMeta clone. Inline fields live in
+// the selected vector's already-priced slots; only nested backing is counted.
+// Vec/String clones allocate their initialized length. HashMap::clone keeps
+// its native bucket capacity, including spare buckets in a sparse source.
+fn cleanup_declaration_copy_bytes(meta: &TableMeta) -> Result<usize> {
+    struct Plan(usize);
+    impl Plan {
+        fn add(&mut self, bytes: usize) -> Result<()> {
+            self.0 = self
+                .0
+                .checked_add(bytes)
+                .ok_or_else(EngineMetadataJournal::identity_error)?;
+            Ok(())
+        }
+        fn array<T>(&mut self, values: &[T]) -> Result<()> {
+            self.add(
+                std::alloc::Layout::array::<T>(values.len())
+                    .map_err(|_| EngineMetadataJournal::identity_error())?
+                    .size(),
+            )
+        }
+        fn text(&mut self, value: &str) -> Result<()> {
+            self.add(value.len())
+        }
+        fn optional_text(&mut self, value: &Option<String>) -> Result<()> {
+            if let Some(value) = value {
+                self.text(value)?;
+            }
+            Ok(())
+        }
+        fn names(&mut self, values: &[String]) -> Result<()> {
+            self.array(values)?;
+            for value in values {
+                self.text(value)?;
+            }
+            Ok(())
+        }
+        fn ordered(&mut self, values: &[(String, SortDirection)]) -> Result<()> {
+            self.array(values)?;
+            for (value, _) in values {
+                self.text(value)?;
+            }
+            Ok(())
+        }
+    }
+    let mut plan = Plan(0);
+    plan.array(&meta.columns)?;
+    for column in &meta.columns {
+        plan.text(&column.name)?;
+        plan.optional_text(&column.default)?;
+        if let Some(reference) = &column.references {
+            plan.text(&reference.table)?;
+            plan.text(&reference.column)?;
+        }
+        if let Some(rank) = &column.rank_policy {
+            for name in [
+                &rank.joined_table,
+                &rank.joined_column,
+                &rank.anchor_column,
+                &rank.sort_key,
+                &rank.formula,
+                &rank.protected_index,
+            ] {
+                plan.text(name)?;
+            }
+        }
+        if let Some(scope) = &column.scope_label {
+            match scope {
+                contextdb_core::ScopeLabelKind::Simple { write_labels } => {
+                    plan.names(write_labels)?
+                }
+                contextdb_core::ScopeLabelKind::Split {
+                    read_labels,
+                    write_labels,
+                } => {
+                    plan.names(read_labels)?;
+                    plan.names(write_labels)?;
+                }
+            }
+        }
+        if let Some(reference) = &column.acl_ref {
+            plan.text(&reference.ref_table)?;
+            plan.text(&reference.ref_column)?;
+        }
+        if let Some(names) = &column.partition_key_columns {
+            plan.names(names)?;
+        }
+    }
+    if let Some(machine) = &meta.state_machine {
+        plan.text(&machine.column)?;
+        plan.add(
+            crate::memory_accounting::native_map_plan::<String, Vec<String>>(
+                machine.transitions.capacity(),
+            )?
+            .layout
+            .size(),
+        )?;
+        for (state, next) in &machine.transitions {
+            plan.text(state)?;
+            plan.names(next)?;
+        }
+    }
+    plan.names(&meta.dag_edge_types)?;
+    plan.array(&meta.unique_constraints)?;
+    for names in &meta.unique_constraints {
+        plan.names(names)?;
+    }
+    plan.optional_text(&meta.natural_key_column)?;
+    plan.array(&meta.propagation_rules)?;
+    for rule in &meta.propagation_rules {
+        match rule {
+            contextdb_core::PropagationRule::ForeignKey {
+                fk_column,
+                referenced_table,
+                referenced_column,
+                trigger_state,
+                target_state,
+                ..
+            } => {
+                for name in [
+                    fk_column,
+                    referenced_table,
+                    referenced_column,
+                    trigger_state,
+                    target_state,
+                ] {
+                    plan.text(name)?;
+                }
+            }
+            contextdb_core::PropagationRule::Edge {
+                edge_type,
+                trigger_state,
+                target_state,
+                ..
+            } => {
+                for name in [edge_type, trigger_state, target_state] {
+                    plan.text(name)?;
+                }
+            }
+            contextdb_core::PropagationRule::VectorExclusion { trigger_state } => {
+                plan.text(trigger_state)?
+            }
+        }
+    }
+    plan.optional_text(&meta.expires_column)?;
+    plan.array(&meta.indexes)?;
+    for index in &meta.indexes {
+        plan.text(&index.name)?;
+        plan.ordered(&index.columns)?;
+    }
+    plan.array(&meta.composite_foreign_keys)?;
+    for key in &meta.composite_foreign_keys {
+        plan.names(&key.child_columns)?;
+        plan.text(&key.parent_table)?;
+        plan.names(&key.parent_columns)?;
+    }
+    plan.names(&meta.primary_key_columns)?;
+    if let Some(names) = &meta.delivery_manifest_tables {
+        plan.names(names)?;
+    }
+    if let Some(contextdb_core::MaintainedCounts::Lists(lists)) = &meta.maintained_counts {
+        plan.array(lists)?;
+        for columns in lists {
+            plan.ordered(columns)?;
+        }
+    }
+    Ok(plan.0)
+}
+
 /// Collapse each logical row of the compaction-eligible `tables` down to its
 /// single current (max-LSN) version, dropping every superseded version and — in
 /// lockstep — the change-log entries that referenced those versions.
@@ -98091,8 +99443,10 @@ fn compact_currency_versions_inner(
     publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
     publication_interrupted: &Arc<AtomicBool>,
     tables: &[&str],
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<CurrencyCompactionReport> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     // This pass's own sampled state: the committed watermark right now, and
     // (inside `begin_removal_pass`, atomically with each other) every
     // currently-registered reader's snapshot (an in-flight statement, or a
@@ -98127,17 +99481,53 @@ fn compact_currency_versions_inner(
     // sample above and the removal work below, to prove a concurrent
     // `pin_snapshot` blocks while this pass is genuinely in flight.
     snapshot_registry.removal_pass_test_pause.maybe_pause();
-    // Only declarations selected by this pass belong to its workspace.
-    // Admit their copies while borrowing the catalog, before allocating them.
+    // One finite allocation, with no hash buckets or growth overlap. The
+    // credit is declared first so every copied payload and its backing is
+    // physically freed before the admission returns, including on unwind.
     let mut metadata_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
     let metas = {
         let catalog = relational_store.table_meta.read();
-        let bytes = tables.iter().filter_map(|table| catalog.get(*table)).fold(
-            0usize, |bytes, meta| bytes.saturating_add(meta.metadata_bytes()).saturating_add(256),
-        );
-        metadata_credit.try_grow_for(bytes, "reader", "cleanup_schema", "Raise reader memory to inspect the selected cleanup declarations.")?;
-        tables.iter().filter_map(|table| catalog.get(*table).map(|meta| ((*table).to_owned(), meta.clone())))
-            .collect::<HashMap<_, _>>()
+        let count = tables
+            .iter()
+            .filter(|table| catalog.contains_key(**table))
+            .count();
+        let backing = std::alloc::Layout::array::<(String, TableMeta)>(count)
+            .map_err(|_| EngineMetadataJournal::identity_error())?
+            .size();
+        let bytes = tables
+            .iter()
+            .try_fold(backing, |bytes, table| -> Result<usize> {
+                let Some(meta) = catalog.get(*table) else {
+                    return Ok(bytes);
+                };
+                let nested = cleanup_declaration_copy_bytes(meta)?;
+                bytes
+                    .checked_add(table.len())
+                    .and_then(|bytes| bytes.checked_add(nested))
+                    .ok_or_else(EngineMetadataJournal::identity_error)
+            })?;
+        metadata_credit.try_grow_for(
+            bytes,
+            "reader",
+            "cleanup_schema",
+            "Raise reader memory to inspect the selected cleanup declarations.",
+        )?;
+        let mut copies = Vec::with_capacity(count);
+        if copies.capacity() != count {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        for table in tables {
+            if let Some(meta) = catalog.get(*table) {
+                copies.push(((*table).to_owned(), meta.clone()));
+            }
+        }
+        copies
+    };
+    let selected_meta = |table: &str| {
+        metas
+            .iter()
+            .find(|(name, _)| name == table)
+            .map(|(_, meta)| meta)
     };
     let frontier = MaintenanceFrontier::capture(
         relational_store,
@@ -98147,7 +99537,7 @@ fn compact_currency_versions_inner(
     let durable_source = frontier.is_durable();
     let tables_in_snapshot = tables
         .iter()
-        .filter(|table| metas.contains_key(**table))
+        .filter(|table| selected_meta(table).is_some())
         .count() as u64;
     let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
 
@@ -98266,7 +99656,7 @@ fn compact_currency_versions_inner(
             // version physically removed below (`pruned_versions_by_table`,
             // already recorded above this guard) while its table's meta is
             // missing releases exactly what its load charged.
-            let version_bytes = retained_row_bytes_with_optional_meta(table, row, metas.get(table));
+            let version_bytes = retained_row_bytes_with_optional_meta(table, row, selected_meta(table));
             released_row_bytes = released_row_bytes.saturating_add(version_bytes);
             if !frontier.is_durable()
                 && (row.deleted_tx.is_none()
@@ -98288,7 +99678,7 @@ fn compact_currency_versions_inner(
             } else {
                 tables[ordinal]
             };
-            if !metas.contains_key(table) {
+            if selected_meta(table).is_none() {
                 continue;
             }
             if frontier.is_durable() {
@@ -98303,7 +99693,7 @@ fn compact_currency_versions_inner(
                 )?;
                 let progress = frontier.select_durable_cleanup(
                     table,
-                    &metas[table],
+                    selected_meta(table).expect("selected cleanup declaration"),
                     &mut remaining,
                     &mut removal_allowance,
                     |row, keeper| select(table, row, keeper),
@@ -98375,7 +99765,7 @@ fn compact_currency_versions_inner(
     } else {
         let mut candidates = Vec::new();
         for table in tables {
-            let Some(meta) = metas.get(*table) else {
+            let Some(meta) = selected_meta(table) else {
                 continue;
             };
             for column in &meta.columns {
@@ -98532,7 +99922,7 @@ fn compact_currency_versions_inner(
     relational_store.publish_schema_history_erasure(schema_history);
     for (table, versions) in &pruned_versions_by_table {
         relational_store.remove_row_versions(table, versions);
-        if let Some(meta) = metas.get(table) {
+        if let Some(meta) = selected_meta(table) {
             for index in &meta.indexes {
                 relational_store.rebuild_index_preserving_current(table, &index.name);
             }
@@ -102330,7 +103720,301 @@ mod currency_version_compaction_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn compaction_bounds_versions_and_change_log() {
+        // Complete cleanup copies include selected names and nested payloads.
+        // These rows extend the registered compaction proof: the frozen width
+        // fixture uses short names and cannot expose an omitted selected name.
+        #[cfg(feature = "test-seams")]
+        {
+            use contextdb_core::read_memory::ReadMemoryBudget;
+            use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            #[derive(Debug)]
+            struct RefuseCopy {
+                requested: AtomicUsize,
+                calls: AtomicUsize,
+                ordinary: contextdb_core::read_memory::ReadMemoryOwner,
+            }
+            impl ReadMemoryBudget for RefuseCopy {
+                fn try_reserve(&self, bytes: usize, subsystem: &'static str,
+                    operation: &'static str, hint: &'static str) -> Result<()> {
+                    if operation == "cleanup_schema" {
+                        self.calls.fetch_add(1, Ordering::SeqCst);
+                        self.requested.store(bytes, Ordering::SeqCst);
+                        return Err(Error::MemoryBudgetExceeded {
+                            subsystem: subsystem.into(),
+                            operation: operation.into(),
+                            requested_bytes: bytes,
+                            available_bytes: 0,
+                            budget_limit_bytes: 0,
+                            hint: hint.into(),
+                        });
+                    }
+                    self.ordinary.try_reserve(bytes, subsystem, operation, hint)
+                }
+                fn release(&self, bytes: usize) {
+                    self.ordinary.release(bytes);
+                }
+            }
+
+            // The neighbouring counts cross the usual small map and Vec
+            // growth boundaries without importing a large history fixture.
+            // Collect all rows before asserting the admission lower bound.
+            let mut copies = Vec::new();
+            for (count, name_bytes) in [(1, 16), (1, 4096), (3, 4096),
+                (4, 4096), (7, 4096), (8, 4096)] {
+                let db = Database::open_memory();
+                db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+                let names: Vec<String> = (0..count).map(|i|
+                    format!("selected_{i}_{}", "n".repeat(name_bytes))).collect();
+                for name in &names {
+                    db.execute(&format!("CREATE TABLE {name} (id INT PRIMARY KEY, revision INT) HISTORY CURRENT ONLY SYNC OFF"), &HashMap::new()).unwrap();
+                    db.execute(&format!("INSERT INTO {name} VALUES (1,0)"), &HashMap::new()).unwrap();
+                }
+                let snapshot = db.snapshot();
+                let pin = db.pin_snapshot(snapshot).unwrap();
+                for name in &names {
+                    db.execute(&format!("UPDATE {name} SET revision = 1"), &HashMap::new()).unwrap();
+                }
+                let tables: Vec<&str> = names.iter().map(String::as_str).collect();
+                let before: Vec<_> = names.iter().map(|name|
+                    (physical_versions(&db, name), change_log_row_inserts(&db, name))).collect();
+                assert!(before.iter().all(|state| *state == (2, 2)));
+                let lsn = db.current_lsn();
+                // Stack slots deliberately omit container backing: this is a
+                // conservative physical lower bound, independent of whichever
+                // private container production chooses for the selected copies.
+                let catalog = db.relational_store.table_meta.read();
+                let (payloads, requests, request_count) = oracle::source_requests_for_test(0, || {
+                    let payloads: [Option<(String, TableMeta)>; 8] = std::array::from_fn(|i|
+                        (i < count).then(|| (names[i].clone(), catalog[&names[i]].clone())));
+                    payloads
+                });
+                drop(catalog);
+                assert!(request_count > count && request_count <= requests.len());
+                let native_payload_bytes: usize = requests[..request_count].iter().map(|r| r.1).sum();
+                assert!(native_payload_bytes >= names.iter().map(String::len).sum());
+                drop(payloads);
+                let refusal = Arc::new(RefuseCopy {
+                    requested: AtomicUsize::new(0), calls: AtomicUsize::new(0),
+                    ordinary: db.declared_reader_memory().unwrap(),
+                });
+                let outcome = db.__compact_currency_versions_for_tables_for_test(&tables, refusal.clone());
+                assert!(matches!(&outcome, Err(Error::MemoryBudgetExceeded { operation, .. }) if operation == "cleanup_schema"),
+                    "selected-copy admission must refuse typed: {outcome:?}");
+                assert_eq!(refusal.calls.load(Ordering::SeqCst), 1,
+                    "no later allocation admission after the refused copy");
+                assert_eq!(db.current_lsn(), lsn);
+                assert_eq!(names.iter().map(|name|
+                    (physical_versions(&db, name), change_log_row_inserts(&db, name))).collect::<Vec<_>>(), before,
+                    "refusal publishes neither row erasure nor history pruning");
+                let deferred = db.__compact_currency_versions_for_tables_for_test(
+                    &tables, db.declared_reader_memory().unwrap()).unwrap();
+                assert_eq!(deferred.pruned_versions, 0);
+                assert_eq!(deferred.versions_deferred_for_readers, count as u64);
+                for name in &names {
+                    assert_eq!(db.execute_at_snapshot(&format!("SELECT revision FROM {name}"),
+                        &HashMap::new(), snapshot).unwrap().rows, vec![vec![Value::Int64(0)]],
+                        "admitted cleanup preserves each pinned reader's original answer");
+                }
+                drop(pin);
+                let retried = db.__compact_currency_versions_for_tables_for_test(
+                    &tables, db.declared_reader_memory().unwrap()).unwrap();
+                assert_eq!(retried.pruned_versions, count as u64,
+                    "retry must still find every refused stale version");
+                for name in &names {
+                    assert_eq!(physical_versions(&db, name), 1);
+                    assert_eq!(db.execute(&format!("SELECT revision FROM {name}"), &HashMap::new()).unwrap().rows,
+                        vec![vec![Value::Int64(1)]]);
+                }
+                copies.push((count, name_bytes, refusal.requested.load(Ordering::SeqCst), native_payload_bytes));
+            }
+            assert!(copies.iter().all(|(_, _, admitted, native)| admitted >= native),
+                "cleanup must admit every physically copied selected name and nested payload, even before container backing: {copies:?}");
+        }
+        // The real selected-copy container and nested payload must be paid
+        // before allocation and until System.dealloc returns. Empty tables
+        // isolate this production copy from row/keeper workspace; the earlier
+        // external-clone rows cannot see its backing or refund order.
+        #[cfg(feature = "test-seams")]
+        {
+            use contextdb_core::read_memory::ReadMemoryBudget;
+            use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            #[derive(Debug)]
+            struct ObserveCopy {
+                ordinary: Arc<dyn ReadMemoryBudget>,
+                writer: crate::memory_accounting::AccountantHandle,
+                parent: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+                baseline: usize,
+                requested: AtomicUsize,
+                calls: AtomicUsize,
+                reservations: parking_lot::Mutex<([(&'static str, usize, usize, usize); 64], usize)>,
+                releases: parking_lot::Mutex<([(usize, usize, usize); 64], usize)>,
+                refunds: AtomicUsize,
+                observation: parking_lot::Mutex<Option<oracle::DeclarationObservation>>,
+                receipt: parking_lot::Mutex<Option<(usize, usize, usize)>>,
+            }
+            impl ReadMemoryBudget for ObserveCopy {
+                fn try_reserve(&self, bytes: usize, subsystem: &'static str,
+                    operation: &'static str, hint: &'static str) -> Result<()> {
+                    let before = self.parent.retained_bytes_for_source_unit_test() as usize;
+                    self.ordinary.try_reserve(bytes, subsystem, operation, hint)?;
+                    let after = self.parent.retained_bytes_for_source_unit_test() as usize;
+                    {
+                        let mut reservations = self.reservations.lock();
+                        let index = reservations.1;
+                        if index < reservations.0.len() { reservations.0[index] = (operation, bytes, before, after); }
+                        reservations.1 += 1;
+                    }
+                    if operation == "cleanup_schema"
+                        && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        self.requested.store(bytes, Ordering::SeqCst);
+                        let mut observation = oracle::DeclarationObservation::funded_by_reader(
+                            self.parent.clone(), self.baseline);
+                        observation.observe_writer(self.writer.clone());
+                        *self.observation.lock() = Some(observation);
+                    }
+                    Ok(())
+                }
+                fn release(&self, bytes: usize) {
+                    // Other phase invoices (including ImageMemory controls)
+                    // also use this budget. Match the selected invoice by its
+                    // unique request size, verified outside every destructor.
+                    let before = self.parent.retained_bytes_for_source_unit_test() as usize;
+                    self.ordinary.release(bytes);
+                    let after = self.parent.retained_bytes_for_source_unit_test() as usize;
+                    {
+                        let mut releases = self.releases.lock();
+                        let index = releases.1;
+                        if index < releases.0.len() { releases.0[index] = (bytes, before, after); }
+                        releases.1 += 1;
+                    }
+                    if bytes != 0 && bytes == self.requested.load(Ordering::SeqCst) {
+                        self.refunds.fetch_add(1, Ordering::SeqCst);
+                        if let Some(observation) = self.observation.lock().as_ref() {
+                            *self.receipt.lock() = Some(observation.physical_receipt());
+                        }
+                    }
+                }
+            }
+            // Calibrate the same physical oracle before trusting the copy
+            // rows: a block from before observation is outside its census,
+            // while a genuinely early refund must leave a positive gap until
+            // the observed block has actually passed through System.dealloc.
+            {
+                let db = Database::open_memory();
+                let ordinary = db.declared_reader_memory().unwrap();
+                let baseline = db.declared_read_memory.retained_bytes_for_source_unit_test() as usize;
+                let credit = contextdb_core::read_memory::ReadCredit::try_new(
+                    ordinary.clone(), 31, "reader", "oracle_control", "physical oracle control").unwrap();
+                let ((before, funded, refunded, freed), _, _) = oracle::measured(|| {
+                    let earlier = std::hint::black_box(Vec::<u8>::with_capacity(17));
+                    let observation = oracle::DeclarationObservation::funded_by_reader(
+                        db.declared_read_memory.clone(), baseline);
+                    drop(earlier);
+                    let before = observation.physical_receipt();
+                    let payload = std::hint::black_box(Vec::<u8>::with_capacity(31));
+                    let funded = observation.physical_receipt();
+                    drop(credit);
+                    let refunded = observation.physical_receipt();
+                    drop(payload);
+                    let freed = observation.physical_receipt();
+                    drop(observation);
+                    (before, funded, refunded, freed)
+                });
+                assert_eq!(before, (0, 0, 0), "pre-observation frees do not debit this epoch");
+                assert_eq!(funded, (31, 0, 31), "real parent credit precedes the physical allocation");
+                assert_eq!(refunded, (31, 31, 31), "a genuinely early refund remains a positive gap");
+                assert_eq!(freed, (0, 31, 31), "physical free retires live bytes without hiding the gap");
+                assert_eq!(db.declared_read_memory.retained_bytes_for_source_unit_test() as usize, baseline);
+            }
+            for count in [1, 3, 4, 7, 8] {
+                let db = Database::open_memory();
+                db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+                let names: Vec<_> = (0..count).map(|i| format!("empty_selected_{i}")).collect();
+                for name in &names {
+                    db.execute(&format!("CREATE TABLE {name} (id INT PRIMARY KEY, revision INT) HISTORY CURRENT ONLY SYNC OFF"),
+                        &HashMap::new()).unwrap();
+                }
+                let tables: Vec<_> = names.iter().map(String::as_str).collect();
+                let ordinary = db.declared_reader_memory().unwrap();
+                let baseline = db.declared_read_memory.retained_bytes_for_source_unit_test() as usize;
+                let observer = Arc::new(ObserveCopy {
+                    ordinary, writer: crate::memory_accounting::AccountantHandle::clone(&db.finalization.accountant),
+                    parent: db.declared_read_memory.clone(), baseline,
+                    requested: AtomicUsize::new(0),
+                    reservations: parking_lot::Mutex::new(([ ("", 0, 0, 0); 64], 0)),
+                    releases: parking_lot::Mutex::new(([(0, 0, 0); 64], 0)),
+                    refunds: AtomicUsize::new(0),
+                    calls: AtomicUsize::new(0), observation: parking_lot::Mutex::new(None),
+                    receipt: parking_lot::Mutex::new(None),
+                });
+                let lsn = db.current_lsn();
+                let ((outcome, final_receipt, final_evidence), _, _) = oracle::measured(|| {
+                    let outcome = db.__compact_currency_versions_for_tables_for_test(
+                        &tables, observer.clone());
+                    // Capture at the actual producer return, inside measured:
+                    // its epilogue and current_lsn's new public operation are
+                    // not compaction. Never close over retained producer bytes.
+                    let observation = observer.observation.lock().take().unwrap();
+                    let final_receipt = observation.physical_receipt();
+                    let final_evidence = observation.evidence();
+                    assert_eq!(observer.refunds.load(Ordering::SeqCst), 1,
+                        "operation return must follow the actual selected-copy refund");
+                    assert_eq!(final_receipt.0, 0,
+                        "cannot end observation with actual producer allocations still live: {final_evidence:?}");
+                    assert_eq!(observer.parent.retained_bytes_for_source_unit_test() as usize,
+                        baseline, "operation return must follow all actual copy invoice releases");
+                    drop(observation);
+                    (outcome, final_receipt, final_evidence)
+                });
+                let report = outcome.unwrap();
+                assert_eq!(report.tables_in_memory_snapshot, count as u64);
+                assert_eq!(report.pruned_versions, 0);
+                // A separate native window names the unrelated public DB
+                // inspection. Its requests never enter the compaction receipt.
+                let (inspection_lsn, inspection_requests, inspection_count) =
+                    oracle::native_requests_for_test(|| db.current_lsn());
+                assert_eq!(inspection_lsn, lsn);
+                assert!(inspection_count <= inspection_requests.len(),
+                    "unrelated current_lsn allocation census must be complete");
+                assert_eq!(observer.calls.load(Ordering::SeqCst), 1);
+                let reservations = observer.reservations.lock();
+                assert!(reservations.1 <= reservations.0.len(), "invoice census must be complete");
+                assert_eq!(reservations.0[..reservations.1].iter().filter(|bytes|
+                    bytes.1 == observer.requested.load(Ordering::SeqCst)).count(), 1,
+                    "selected-copy invoice must be distinguishable from every other phase");
+                assert_eq!(observer.refunds.load(Ordering::SeqCst), 1,
+                    "exactly one real selected-copy refund must be observed");
+                let releases = observer.releases.lock();
+                assert!(releases.1 <= releases.0.len(), "release census must be complete");
+                let evidence = final_evidence;
+                assert!(evidence.complete, "declaration allocation census must be complete: {evidence:?}");
+                let (live_at_refund, gap, native_peak) = observer.receipt.lock().take()
+                    .expect("the actual selected-copy invoice was released");
+                assert!(native_peak > names.iter().map(String::len).sum::<usize>(),
+                    "actual copy includes storage beyond selected names");
+                assert_eq!(gap, 0,
+                    "{count} selected declarations: every overlapping native request, including container backing, stays paid through physical free; first-gap/native origin={evidence:?}; baseline={baseline}; reservations={:?}; releases={:?}",
+                    &reservations.0[..reservations.1], &releases.0[..releases.1]);
+                assert_eq!(live_at_refund, 0,
+                    "{count} selected declarations: refund follows every actual copy free");
+
+                assert!(final_evidence.complete,
+                    "final declaration census must be complete: {final_evidence:?}");
+                assert_eq!(final_receipt, (0, 0, native_peak),
+                    "observation includes the real refund and every subsequent physical free before unrelated inspection; first-gap/native origin={final_evidence:?}; baseline={baseline}; unrelated current_lsn requests={inspection_requests:?} count={inspection_count}; reservations={:?}; releases={:?}",
+                    &reservations.0[..reservations.1], &releases.0[..releases.1]);
+                drop(reservations);
+                drop(releases);
+                assert_eq!(observer.parent.retained_bytes_for_source_unit_test() as usize,
+                    baseline, "the actual production budget returns to its initial debit");
+            }
+        }
         // A refused proof pass publishes no cleanup or progress and can be retried
         // with its ordinary owner after resource relief.
         #[cfg(any(test, feature = "test-seams"))]
@@ -102342,51 +104026,33 @@ mod currency_version_compaction_tests {
                     owner: &crate::memory_accounting::AccountantHandle,
                     fired: Arc<AtomicBool>,
                     proof_seen: Arc<AtomicUsize>,
-                    pruning_started: Arc<AtomicBool>,
-                    unique_keys: usize,
-                    grouped_bytes: usize,
+                    target: Arc<std::sync::Mutex<Option<crate::memory_accounting::compaction_admission_capture::GroupingRequest>>>,
                 ) {
                     let captured_owner = owner.clone();
                     owner.set_admission_race_hook(Box::new(move || {
                         let entries = crate::memory_accounting::take_budget_ledger_for_test();
                         crate::memory_accounting::watch_budget_ledger_for_test();
-                        // The descriptor reservation is immediately before
-                        // prune_currency_scoped, after all cleanup selection reads.
-                        // Discard earlier proof traffic before arming this walk.
-                        let reserved = entries
-                            .iter()
-                            .any(|entry| entry.what == "writer_source/published_root");
-                        if reserved {
-                            pruning_started.store(true, Ordering::SeqCst);
-                        }
-                        let count = entries
-                            .iter()
-                            .filter(|entry| {
-                                !reserved
-                                    && pruning_started.load(Ordering::SeqCst)
-                                    && entry.what == "content_identity/maintain_committed_proof"
-                            })
-                            .count();
-                        let seen = proof_seen.fetch_add(count, Ordering::SeqCst) + count;
+                        // Traffic remains diagnostic; it never chooses the cut.
+                        proof_seen.fetch_add(entries.iter().filter(|entry|
+                            entry.what == "content_identity/maintain_committed_proof"
+                        ).count(), Ordering::SeqCst);
                         let owner = captured_owner.clone();
-                        if seen == 2 * unique_keys && !fired.swap(true, Ordering::SeqCst) {
-                            // Each unique key has completed its transient validation
-                            // and one AVL-node admission. The next allocation is the
-                            // exact grouped slice sum, with all nodes still live.
-                            // Keep G-1 bytes here: the grouped slices refuse, while
-                            // the retry can still admit its concrete scratch backend.
-                            owner
-                                .set_budget(Some(owner.usage().used + grouped_bytes - 1))
-                                .unwrap();
+                        let request = crate::memory_accounting::compaction_admission_capture::grouping_request(&owner)
+                            .filter(|request| request.variant == crate::memory_accounting::compaction_admission_capture::GroupingApply::Borrowed
+                                && request.bytes != 0);
+                        if let Some(request) = request {
+                            // Scoped pruning applies posting_outputs first, then
+                            // identity_mutations. Choose its first nonempty borrowed
+                            // group, before any tuple slice allocation. The owned
+                            // preparation path is observed but cannot select this cut.
+                            assert!(!fired.swap(true, Ordering::SeqCst));
+                            assert_eq!(request.payer, owner.as_ptr() as usize);
+                            assert_eq!(owner.usage().used, request.held);
+                            owner.set_budget(Some(request.held + request.bytes - 1)).unwrap();
+                            *target.lock().unwrap() = Some(request);
+                            crate::memory_accounting::compaction_admission_capture::note(&owner, "cut", 0);
                         } else if !fired.load(Ordering::SeqCst) {
-                            Self::arm(
-                                &owner,
-                                fired.clone(),
-                                proof_seen.clone(),
-                                pruning_started.clone(),
-                                unique_keys,
-                                grouped_bytes,
-                            );
+                            Self::arm(&owner, fired.clone(), proof_seen.clone(), target.clone());
                         }
                     }));
                 }
@@ -102490,15 +104156,16 @@ mod currency_version_compaction_tests {
             let original_limit = db.memory_limit();
             let fired = Arc::new(AtomicBool::new(false));
             let proof_seen = Arc::new(AtomicUsize::new(0));
+            let target = Arc::new(std::sync::Mutex::new(None));
+            let capture_storage = crate::memory_accounting::compaction_admission_capture::prepare();
             crate::memory_accounting::watch_budget_ledger_for_test();
             RefuseNextProof::arm(
                 &db.accountant,
                 fired.clone(),
                 proof_seen.clone(),
-                Arc::new(AtomicBool::new(false)),
-                unique_keys,
-                grouped_bytes,
+                target.clone(),
             );
+            crate::memory_accounting::compaction_admission_capture::start(&db.accountant);
             let refused = db.__compact_currency_versions_for_tables_for_test(
                 &["work_capabilities"],
                 db.declared_reader_memory().unwrap(),
@@ -102506,6 +104173,31 @@ mod currency_version_compaction_tests {
             db.accountant.set_admission_race_hook(Box::new(|| {}));
             let _traffic = crate::memory_accounting::take_budget_ledger_for_test();
             db.set_memory_limit(original_limit).unwrap();
+            crate::memory_accounting::compaction_admission_capture::emit();
+            let actual_group = target.lock().unwrap().expect("the actual borrowed grouping admission must fire");
+            assert!(fired.load(Ordering::SeqCst));
+            assert_eq!(actual_group.variant, crate::memory_accounting::compaction_admission_capture::GroupingApply::Borrowed);
+            assert_eq!(actual_group.phase, "proof-grouping");
+            assert_eq!(actual_group.site, "borrowed grouped tuple slices");
+            let selected_family = actual_group.family.expect("ordinary pruning groups one actual family at a time");
+            assert!(actual_group.family_counts[selected_family] > 0);
+            assert!(actual_group.family_counts.iter().enumerate().all(|(family, count)|
+                family == selected_family || *count == 0));
+            assert!(actual_group.apply > 0, "the actual apply must be identified");
+            assert_eq!(actual_group.payer, db.accountant.as_ptr() as usize);
+            let actual_grouped_bytes = actual_group.family_counts.into_iter().map(|count|
+                std::alloc::Layout::array::<(Vec<u8>, Option<[u8; 32]>)>(count).unwrap().size()
+            ).sum::<usize>();
+            assert_eq!(actual_group.bytes, actual_grouped_bytes);
+            assert!(actual_group.bytes > 0);
+            // The old estimate describes identity keys, but posting_outputs can
+            // group first. Preserve that calculation as workload evidence; the
+            // actual production Layout/counts above now set the exact G-1 cut.
+            assert_eq!(unique_keys, family_counts.iter().sum::<usize>());
+            assert_eq!(grouped_bytes, unique_keys * std::mem::size_of::<(Vec<u8>, Option<[u8; 32]>)>());
+            crate::memory_accounting::compaction_admission_capture::assert_exact_group_refusal(actual_group);
+            drop(capture_storage);
+            eprintln!("COMPACTION_ADMISSION_RAW_RESULT {refused:?}");
             assert!(
                 fired.load(Ordering::SeqCst) && proof_seen.load(Ordering::SeqCst) > 0,
                 "the existing seam must reach actual accounted proof maintenance"
@@ -102515,6 +104207,11 @@ mod currency_version_compaction_tests {
                 matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "content_identity" && operation == "maintain_committed_proof"),
                 "the original proof memory refusal must escape without successful unaccounted retry: {error:?}"
             );
+            if let Error::MemoryBudgetExceeded { requested_bytes, available_bytes, budget_limit_bytes, .. } = error {
+                assert_eq!(requested_bytes, actual_group.bytes);
+                assert_eq!(available_bytes, actual_group.bytes - 1);
+                assert_eq!(budget_limit_bytes, actual_group.held + actual_group.bytes - 1);
+            }
             assert_eq!(
                 capture(),
                 before,
@@ -104904,7 +106601,11 @@ mod cdb126_reader_history_tests {
             },
         ));
         db.declared_read_memory =
-            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(128);
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(128)
+                .expect("original 128-byte operation fixture must admit its charged root");
+        let (root, child) = crate::vector_read_memory::native_control_layouts_for_test();
+        assert!(root.size() + child.size() <= 128,
+            "BLOCKED: original 128-byte total must reach the intended history operation after root and child admission");
         typed_memory_refusal(
             db.trigger_audit_history(TriggerAuditFilter::default()),
             "trigger_audit_history",
@@ -104925,7 +106626,11 @@ mod cdb126_reader_history_tests {
         )
         .unwrap();
         db.declared_read_memory =
-            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(128);
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(128)
+                .expect("original 128-byte operation fixture must admit its charged root");
+        let (root, child) = crate::vector_read_memory::native_control_layouts_for_test();
+        assert!(root.size() + child.size() <= 128,
+            "BLOCKED: original 128-byte total must reach the intended history operation after root and child admission");
         typed_memory_refusal(
             db.changes_since_with_arrivals(Lsn(0)),
             "changes_since_with_arrivals",
@@ -105031,8 +106736,10 @@ impl Database {
         guards: impl DoubleEndedIterator<Item = &'conditions PendingConditionalUpdateGuard>,
         mut stats: Option<&mut CommitStageStats>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
         let mut guards = guards.rev().peekable();
         if guards.peek().is_none() {
@@ -105708,8 +107415,10 @@ impl Database {
         intent: &PendingUpsertIntent,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::copy_row_owned;
         let incoming = {
             let read = held.read();
@@ -105819,8 +107528,10 @@ impl Database {
         snapshot: SnapshotId,
         mut stats: Option<&mut CommitStageStats>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::{OwnedPreparationValue, copy_row_owned};
         let read = held.read();
         let (table, row) = &read.relational_inserts[position];
@@ -105909,8 +107620,10 @@ impl Database {
         snapshot: SnapshotId,
         intents: impl DoubleEndedIterator<Item = &'a PendingUpsertIntent>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::OwnedPreparationValue;
         let intents = self.collect_commit_upsert_refs(intents)?;
         if intents.values.is_empty() {
@@ -105971,8 +107684,10 @@ impl Database {
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<NativeCommitUniqueScratch> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let credit = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
         let columns = self.staged_tuple_key_columns_by_table();
         let lookup = held.with_legacy(|ws| StagedTupleLookup::from_write_set(&columns, ws));
@@ -106031,8 +107746,10 @@ impl Database {
         intents: &[&PendingUpsertIntent],
         stats: &mut CommitStageStats,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::{OwnedPreparationValue, copy_row_owned};
         if held.read().relational_inserts.is_empty() {
             return Ok(());
@@ -106281,8 +107998,10 @@ impl Database {
         row: RowId,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
         self.vector_store.with_index_layout(index, |_| ())?;
         let _scratch = self.reserve_owned_preparation(self.commit_preparation_read_bytes(held)?)?;
@@ -106421,8 +108140,10 @@ impl Database {
         target: &str,
         tx: TxId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::{OwnedPreparationValue, copy_row_owned};
         let bytes = crate::memory_accounting::preparation_row_copy_bytes(existing)?
             .checked_add(crate::memory_accounting::preparation_row_map_bytes(
@@ -106547,8 +108268,10 @@ impl Database {
         tx: TxId,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let fk = |held: &mut contextdb_tx::manager::EngineGuard<'_>,
                   queue: &mut MetadataBuffer<_>|
          -> Result<()> {
@@ -106722,8 +108445,10 @@ impl Database {
         tx: TxId,
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::OwnedPreparationValue;
         let (Some(uuid), Some(state)) = (row_uuid, new_state) else {
             return Ok(());
@@ -106809,8 +108534,10 @@ impl Database {
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::{OwnedPreparationValue, preparation_array_bytes};
         let count = held.read().relational_deletes.len();
         if count == 0 {
@@ -106921,8 +108648,10 @@ impl Database {
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
         peer: &mut OwnedTerminalMetadata,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut empty = EnginePendingCommitMetadata::empty();
         let metadata = if let Some(node) = peer.node.as_mut() {
             let record = node.get_mut();
@@ -107019,8 +108748,10 @@ impl Database {
         snapshot: SnapshotId,
         predicate: &dyn Fn(&VersionedRow) -> bool,
         visit: &mut dyn FnMut(&VersionedRow) -> Result<std::ops::ControlFlow<()>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let read = held.read();
         let mut cursor = self.bounded_physical_table_cursor(table)?;
         loop {
@@ -107098,8 +108829,10 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
         predicate: &dyn Fn(&VersionedRow) -> bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<crate::custody::preparation::OwnedPreparationValue<VersionedRow>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut selected = None;
         self.visit_commit_rows_in_restricted_source(
             held,
@@ -107121,8 +108854,10 @@ impl Database {
         table: &str,
         uuid: uuid::Uuid,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<MetadataBuffer<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut rows = MetadataBuffer::empty();
         self.visit_commit_rows_in_restricted_source(
             held,
@@ -107159,8 +108894,10 @@ impl Database {
         deleted_rows_by_table: &HashMap<String, HashMap<RowId, VersionedRow>>,
         stats: &mut CommitStageStats,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let staged_lookup = StagedTupleLookup::rebuild(self, ws)?;
         let deleted_by_table = Self::deleted_row_ids_by_table(ws);
         let empty_deleted = HashSet::new();
@@ -107305,8 +109042,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
         mut stats: Option<&mut CommitStageStats>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RowId>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if columns.is_empty() || columns.len() != values.len() {
             return Ok(None);
         }
@@ -107377,8 +109116,10 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use crate::custody::preparation::OwnedPreparationValue;
         let columns = OwnedPreparationValue::try_produce(
             self,
@@ -107469,8 +109210,10 @@ impl Database {
         report_shape: crate::custody::erasure::PurgeReportShape,
         frontier: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OriginalPurgeNonEventPreparedSet> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         use crate::custody::erasure::PurgeReportShape;
         let report_requested = report_shape != PurgeReportShape::None;
         // Decode selected durable windows from the authentic Original. The
@@ -107681,12 +109424,6 @@ impl Database {
         }
         let mut projections = Vec::new();
         let mut affected_rows = BTreeMap::new();
-        let source_sidecars = self
-            .authoritative_purge_all_memory_source_provenance()
-            .into_iter()
-            .filter(|(table, row_id, _, _)| !selected(table, row_id))
-            .map(|(table, row_id, lsn, kind)| ((table, row_id), (lsn, kind)))
-            .collect::<HashMap<_, _>>();
         for (table, ids) in &selected_by_table {
             durable_sink_entries.extend(self.original_discard_durable_sink_entries(
                 frame,
@@ -107739,26 +109476,10 @@ impl Database {
                 // A single-table selection preserves the established single-table report.
                 survivor_report = report;
             }
-            let meta = self
-                .table_meta(table)
-                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
-            let sources = source_sidecars
-                .iter()
-                .filter(|((name, _), _)| name == table)
-                .map(|((_, row_id), (lsn, kind))| {
-                    let kind = match *kind {
-                        0 => contextdb_relational::store::SyncSourceKind::Pulled,
-                        1 => contextdb_relational::store::SyncSourceKind::AcceptedLocal,
-                        2 => contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
-                        _ => unreachable!("closed source kind"),
-                    };
-                    (*row_id, *lsn, kind)
-                })
-                .collect::<Vec<_>>();
-            projections.push(RelationalStore::with_sync_sources(
-                RelationalStore::table_projection(table.clone(), meta, after.clone()),
-                sources,
-            ));
+            if !self.relational_store.table_meta.read().contains_key(table) {
+                return Err(Error::TableNotFound(table.clone()));
+            }
+            projections.push((table.clone(), after.clone()));
             affected_rows.insert(
                 table.clone(),
                 if self.relational_store.uses_disk_backed_committed_bodies() {
@@ -107770,7 +109491,7 @@ impl Database {
         }
         let relational = self
             .relational_store
-            .prepare_received_schema_publication(projections, std::iter::empty::<String>());
+            .prepare_erasure_publication(projections, selected)?;
         // The fallible spool iterator latches storage/admission failure. It is
         // checked before a partially prepared history replacement can escape.
         let count = discard_history::row_count(history.write())?;
@@ -107813,19 +109534,10 @@ impl Database {
             .into_iter()
             .filter(|entry| !selected(&entry.entry.index.table, &entry.entry.row_id))
             .collect::<Vec<_>>();
-        for meta in self.relational_store.table_meta.read().values() {
-            if meta.columns.iter().any(|column| matches!(column.column_type, ColumnType::Vector(_))) {
-                frame.record(meta)?;
-            }
-        }
-        // Layout extraction borrows declarations; scalar declarations need no
-        // copied schema image for a vector publication.
-        let vector_schemas = vector_layouts_from_meta(&self.relational_store.table_meta.read());
-        let materialized_vector_partitions = self
-            .vector_store
-            .materialized_hnsw_partitions(vector_copy_owner)?
-            .into_iter()
-            .collect::<HashSet<_>>();
+        // Borrow the live registry to select declarations before copying;
+        // unrelated columns retain their exact cells and policy owners.
+        let vector_schemas = self.vector_store.copy_erasure_layouts(
+            |table| selected_by_table.contains_key(table), vector_copy_owner)?;
         let mut replacement_generation_plans = Vec::<(VectorPartitionRef, u64)>::new();
         for partition in &affected_vector_partitions {
             let has_live_survivor = vector_registry_entries.iter().any(|entry| {
@@ -107840,7 +109552,7 @@ impl Database {
                 &partition.index,
                 &partition.partition_key,
             )?;
-            if current.is_none() && !materialized_vector_partitions.contains(partition) {
+            if current.is_none() && !self.vector_store.erasure_partition_has_materialized_hnsw(partition) {
                 // A partition that had no maintained route before purge stays
                 // unavailable; maintenance remains responsible for its first
                 // generation. Purge must replace every route that did exist.
@@ -107868,9 +109580,13 @@ impl Database {
             .iter()
             .map(|(partition, _)| partition.clone())
             .collect::<Vec<_>>();
+        admit_erasure_vector_input_copies(
+            &vector_schemas, &vector_registry_entries, &affected_vector_partitions,
+            vector_copy_owner,
+        )?;
         let vector = self
             .vector_store
-            .prepare_partitioned_authoritative_purge_publication(
+            .prepare_selected_authoritative_purge_publication(
                 vector_schemas.clone(),
                 vector_registry_entries.clone(),
                 affected_vector_partitions.clone(),
@@ -107978,20 +109694,23 @@ impl Database {
                 catalog,
             });
         }
-        for rows in self.relational_store.tables.read().values() {
-            for row in rows {
-                frame.record(row)?;
-            }
-        }
-        let old_rows = self.relational_store.tables.read().clone();
         let old_edges = if self.graph_store.is_source_backed() { Vec::new() }
             else { self.collect_original_graph_versions(frame, |_| true, read_memory.clone())? };
-        let mut replacement_rows = old_rows.clone();
-        replacement_rows.extend(affected_rows);
         let (old_bytes, new_bytes) = {
-            let tables = self.relational_store.table_meta.read();
-            (self.received_schema_replacement_bytes(&tables, &old_rows, &old_edges),
-             self.received_schema_replacement_bytes(&tables, &replacement_rows, &survivor_graph_entries))
+            let rows = self.relational_store.tables.read();
+            let catalog = self.relational_store.table_meta.read();
+            let mut old_bytes = 0usize;
+            let mut new_bytes = 0usize;
+            for (table, after) in &affected_rows {
+                if let Some(meta) = catalog.get(table) {
+                    old_bytes = old_bytes.saturating_add(self.received_schema_table_rows_bytes(
+                        table, meta, rows.get(table).map(Vec::as_slice).unwrap_or(&[])));
+                    new_bytes = new_bytes.saturating_add(self.received_schema_table_rows_bytes(table, meta, after));
+                }
+            }
+            for edge in &old_edges { old_bytes = old_bytes.saturating_add(edge.retained_graph_bytes()); }
+            for edge in &survivor_graph_entries { new_bytes = new_bytes.saturating_add(edge.retained_graph_bytes()); }
+            (old_bytes, new_bytes)
         };
         let memory_swap = PreparedMemorySwap::accounting(old_bytes, new_bytes, 0);
         frame.array::<(String, Vec<u8>)>(lineage_config_owners.len())?;
@@ -108105,7 +109824,7 @@ impl EngineDatabaseTransactions {
     fn commit_discard_terminal_scoped(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl FnOnce(
             &DatabaseCommitScope<'_, '_, '_>,
@@ -108120,6 +109839,8 @@ impl EngineDatabaseTransactions {
             -> Result<Option<discard::OriginalDiscardStageHolder>>,
         after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
     ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut terminal = discard::OriginalDiscardTerminal::new();
         let result = self.with_terminal_apply_scope(|| discard::with_original_discard_terminal(&mut terminal, || {
             self.transactions.with_transactions(|lower| {
@@ -108250,10 +109971,12 @@ impl Database {
         &self,
         read: contextdb_tx::manager::EngineRead<'_>,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<
         crate::custody::preparation::OwnedPreparationValue<Vec<(String, uuid::Uuid, String, TxId)>>,
     > {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let bytes = read.relational_inserts.iter().fold(
             read.relational_inserts
                 .len()
@@ -108392,8 +110115,10 @@ impl Database {
         sync_trigger_derived_rows_are_local: bool,
         mut delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let discard_selections = self.capture_original_discard_selections(host, tx)?;
         let discard_fence_memory = host.events.with_owned_persistence_original(|original| {
             let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
@@ -108729,7 +110454,7 @@ impl Database {
                 let (error, pair) = failure.into_parts();
                 if let Some(pair) = &pair {
                     pair.with_legacy(|ws| {
-                        self.plugin.commit_failed(ws, source, &error);
+                        self.plugin.commit_failed(ws, source, error.engine_diagnostic());
                         if let Some(lsn) = ws.commit_lsn {
                             let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
                             self.discard_staged_event_bus_ddl_commit(lsn);
@@ -108763,8 +110488,10 @@ impl Database {
 impl Database {
     fn prepared_source_could_empty_vector_partition(
         &self, held: &contextdb_tx::manager::EngineGuard<'_>, original: &OwnedMemoryReservation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let read = held.read();
         if !read.vector_moves.is_empty() || read.vector_deletes.iter().any(|(index, row, _)|
             !read.vector_inserts.iter().any(|entry| entry.index == *index && entry.row_id == *row)) { return Ok(true); }
@@ -108986,3 +110713,16 @@ impl Database {
         Ok(PartialRetainedVectorObservation { visited_roots, fenced_roots, gaps: &RETAINED_VECTOR_COVERAGE_GAPS })
     }
 }
+
+#[cfg(all(test, feature = "test-seams"))]
+mod independent_cache_reserve_lifetime_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+pub(crate) mod retained_trace_ownership_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "database/ordinary_native_owner_tests.rs"]
+pub(crate) mod ordinary_native_owner_tests;
+
+#[cfg(test)]
+pub(crate) mod ef_search_metadata_contract_tests;

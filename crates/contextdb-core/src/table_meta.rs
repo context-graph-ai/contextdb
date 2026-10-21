@@ -402,7 +402,29 @@ pub fn render_sql_identifier(name: &str) -> String {
 /// case -- matching the existing intent of
 /// every `.unwrap_or_default()` call on a trailing field here.
 fn is_bincode_tail_truncation<E: std::fmt::Display>(err: &E) -> bool {
-    err.to_string().contains("UnexpectedEnd")
+    // A formatter may split the token across write_str calls. Keep the same
+    // substring classification without creating an owning temporary String.
+    struct Match { matched: usize, found: bool }
+    impl std::fmt::Write for Match {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            const NEEDLE: &[u8] = b"UnexpectedEnd";
+            for byte in text.bytes() {
+                if self.found { break; }
+                if byte == NEEDLE[self.matched] {
+                    self.matched += 1;
+                    if self.matched == NEEDLE.len() { self.found = true; }
+                } else {
+                    // No proper prefix of this token ends in 'U'.
+                    self.matched = usize::from(byte == NEEDLE[0]);
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut matcher = Match { matched: 0, found: false };
+    std::fmt::write(&mut matcher, format_args!("{err}"))
+        .expect("tail error formatter previously had to produce a String");
+    matcher.found
 }
 
 /// Decode ONE trailing, defaultable field of a hand-written positional

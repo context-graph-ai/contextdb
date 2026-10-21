@@ -588,7 +588,7 @@ fn logical_history_key(kind: u8, position: &[u8]) -> Vec<u8> {
 pub fn committed_content_for_test(
     path: &Path,
     operation_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    declared_read_memory: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+    declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
 ) -> Result<CommittedContentForTest> {
     let open_context = crate::executor::bounded::ReadOpenContext::new(
         operation_read_memory.clone(),

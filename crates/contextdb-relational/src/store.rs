@@ -321,6 +321,8 @@ pub struct TableProjection {
 /// provenance sidecars.  It is constructed before durability; publication
 /// only swaps these already-owned maps under the established lock order.
 pub struct PreparedRelationalPublication {
+    // Data-only erasure preserves the live catalog and unrelated table images.
+    selected_only: bool,
     history: Option<crate::schema_generation::PreparedSchemaGeneration>,
     tables: HashMap<TableName, Vec<VersionedRow>>,
     table_meta: HashMap<TableName, TableMeta>,
@@ -336,8 +338,10 @@ impl PreparedRelationalPublication {
     pub fn with_history(mut self, history: crate::schema_generation::PreparedSchemaHistoryErasure) -> Self { self.history = Some(history.into_generation()); self }
     pub fn admit_current_memberships(
         &mut self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         for indexes in self.indexes.values_mut() {
             for storage in indexes.values_mut() {
                 storage.admit_current(budget.clone())?;
@@ -350,8 +354,10 @@ impl PreparedRelationalPublication {
 impl TableProjection {
     pub fn admit_current_memberships(
         &mut self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         for storage in self.indexes.values_mut() {
             storage.admit_current(budget.clone())?;
         }
@@ -582,8 +588,10 @@ impl IndexStorage {
 
     pub fn admit_current(
         &mut self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if self.source_backed {
             return Ok(());
         }
@@ -602,8 +610,10 @@ impl IndexStorage {
 
     fn current_for_preparation(
         &self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<MembershipImage> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if self.current_complete {
             let mut current = self.current.clone();
             current.admit(budget)?;
@@ -615,8 +625,10 @@ impl IndexStorage {
 
     fn reconstruct_current(
         &self,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<MembershipImage> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         let mut current = MembershipImage::with_budget(budget);
         for (key, entries) in &self.tree {
             for entry in entries {
@@ -1089,8 +1101,10 @@ impl RelationalStore {
     pub fn prepare_retention_expiries(
         &self,
         identities: Vec<(TableName, RowId, TxId, Lsn)>,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Vec<PreparedRetentionExpiry>> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if self.uses_disk_backed_committed_bodies() {
             return Ok(Vec::new());
         }
@@ -1142,8 +1156,10 @@ impl RelationalStore {
         &self,
         deletes: &[(TableName, RowId, TxId)],
         inserts: &[(TableName, VersionedRow)],
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<PreparedMembershipBatch> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if self.uses_disk_backed_committed_bodies() {
             let credit = membership_credit(budget, 0)?;
             self.membership_captures.lock().preparations += 1;
@@ -2376,7 +2392,9 @@ impl RelationalStore {
     }
 
     #[doc(hidden)]
-    pub fn prepare_schema_generation(&self, names: impl Iterator<Item=impl AsRef<str>>, owner: Arc<dyn ReadMemoryBudget>) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaGeneration> {
+    pub fn prepare_schema_generation(&self, names: impl Iterator<Item=impl AsRef<str>>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaGeneration> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let tables = self.tables.read();
         let metadata = self.table_meta.read();
         self.schema_history.read().prepare(names.filter_map(|name| {
@@ -2386,7 +2404,9 @@ impl RelationalStore {
     }
 
     #[doc(hidden)]
-    pub fn prepare_schema_history_erasure(&self, keys: impl IntoIterator<Item=(RowId,Lsn)>, owner: Arc<dyn ReadMemoryBudget>) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaHistoryErasure> {
+    pub fn prepare_schema_history_erasure(&self, keys: impl IntoIterator<Item=(RowId,Lsn)>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaHistoryErasure> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         self.schema_history.read().prepare_erasure(keys, owner)
     }
 
@@ -2456,8 +2476,10 @@ impl RelationalStore {
         table: &str,
         name: &str,
         columns: Vec<(String, SortDirection)>,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         let storage = if self.uses_disk_backed_committed_bodies() {
             IndexStorage::new_source_backed(columns, false, false)
         } else {
@@ -2490,8 +2512,10 @@ impl RelationalStore {
         table: &str,
         name: &str,
         columns: Vec<(String, SortDirection)>,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         self.create_auto_index_storage_inner(table, name, columns, Some(budget));
     }
 
@@ -2500,7 +2524,7 @@ impl RelationalStore {
         table: &str,
         name: &str,
         columns: Vec<(String, SortDirection)>,
-        budget: Option<Arc<dyn ReadMemoryBudget>>,
+        budget: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     ) {
         let exact_only = columns.len() == 1;
         let mut indexes = self.indexes.write();
@@ -2612,15 +2636,17 @@ impl RelationalStore {
     pub fn projected_index_storage_with_budget(
         meta: &TableMeta,
         rows: &[VersionedRow],
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<HashMap<String, IndexStorage>> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         Self::projected_index_storage_inner(meta, rows, Some(budget))
     }
 
     fn projected_index_storage_inner(
         meta: &TableMeta,
         rows: &[VersionedRow],
-        budget: Option<Arc<dyn ReadMemoryBudget>>,
+        budget: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<HashMap<String, IndexStorage>> {
         let mut indexes = HashMap::new();
         let mut automatic_columns = Vec::<Vec<(String, SortDirection)>>::new();
@@ -2753,6 +2779,7 @@ impl RelationalStore {
                 .map(|(table, meta)| (table.clone(), Self::projected_source_index_storage(meta)))
                 .collect();
             return PreparedRelationalPublication {
+                selected_only: false,
                 history: None,
                 tables: HashMap::new(),
                 table_meta,
@@ -2807,6 +2834,7 @@ impl RelationalStore {
         }
         let (row_positions, row_version_positions) = Self::position_maps_for_tables(&tables);
         PreparedRelationalPublication {
+            selected_only: false,
             history: None,
             tables,
             table_meta,
@@ -2816,6 +2844,109 @@ impl RelationalStore {
             sync_source_lsns: source_lsns,
             sync_source_kinds: source_kinds,
         }
+    }
+
+    /// Prepare data-only erasure without cloning or replacing declarations.
+    /// The caller holds the commit gate until this delta is published. All
+    /// derived maps and any destination growth are prepared before durability.
+    #[doc(hidden)]
+    pub fn prepare_erasure_publication(
+        &self,
+        replacements: Vec<(String, Vec<VersionedRow>)>,
+        erased: impl Fn(&str, &RowId) -> bool,
+    ) -> contextdb_core::Result<PreparedRelationalPublication> {
+        let source_backed = self.uses_disk_backed_committed_bodies();
+        let mut publication = PreparedRelationalPublication {
+            selected_only: true,
+            history: None,
+            tables: HashMap::new(),
+            table_meta: HashMap::new(),
+            indexes: HashMap::new(),
+            row_positions: HashMap::new(),
+            row_version_positions: HashMap::new(),
+            sync_source_lsns: HashMap::new(),
+            sync_source_kinds: HashMap::new(),
+        };
+        // Match the publication lock order while borrowing the catalog.
+        let live_indexes = self.indexes.read();
+        let live_tables = self.tables.read();
+        let catalog = self.table_meta.read();
+        for (table, rows) in replacements {
+            let Some(meta) = catalog.get(&table) else {
+                continue;
+            };
+            if source_backed {
+                // Source-backed row/index directories were not changed by
+                // erasing durable rows. Keep their exact existing identities.
+                continue;
+            }
+            // Erasure replaces existing slots only; it never creates a table.
+            if !live_tables.contains_key(&table) {
+                return Err(contextdb_core::Error::TableNotFound(table));
+            }
+            let indexes = Self::projected_index_storage(meta, &rows);
+            if !indexes.is_empty() && !live_indexes.contains_key(&table) {
+                return Err(contextdb_core::Error::TableNotFound(table));
+            }
+            Self::rebuild_position_maps_for_table(
+                &table,
+                &rows,
+                &mut publication.row_positions,
+                &mut publication.row_version_positions,
+            );
+            let live_lsns = self.sync_source_lsns.read();
+            let live_kinds = self.sync_source_kinds.read();
+            let mut lsns = HashMap::new();
+            let mut kinds = HashMap::new();
+            if let Some(by_row) = live_lsns.get(&table) {
+                for (row, lsn) in by_row {
+                    if !erased(&table, row)
+                        && let Some(kind) =
+                            live_kinds.get(&table).and_then(|by_row| by_row.get(row))
+                    {
+                        lsns.insert(*row, *lsn);
+                        kinds.insert(*row, *kind);
+                    }
+                }
+            }
+            publication.sync_source_lsns.insert(table.clone(), lsns);
+            publication.sync_source_kinds.insert(table.clone(), kinds);
+            if live_indexes.contains_key(&table) {
+                publication.indexes.insert(table.clone(), indexes);
+            }
+            publication.tables.insert(table, rows);
+        }
+        drop(catalog);
+        drop(live_tables);
+        drop(live_indexes);
+        // Erasure introduces no row identity or sidecar. Validate every
+        // destination before commit; publication only replaces existing slots.
+        let positions = self.row_positions.read();
+        let versions = self.row_version_positions.read();
+        let lsns = self.sync_source_lsns.read();
+        let kinds = self.sync_source_kinds.read();
+        if publication
+            .row_positions
+            .keys()
+            .any(|key| !positions.contains_key(key))
+            || publication
+                .row_version_positions
+                .keys()
+                .any(|key| !versions.contains_key(key))
+            || publication
+                .sync_source_lsns
+                .iter()
+                .any(|(table, sources)| !sources.is_empty() && !lsns.contains_key(table))
+            || publication
+                .sync_source_kinds
+                .iter()
+                .any(|(table, sources)| !sources.is_empty() && !kinds.contains_key(table))
+        {
+            return Err(contextdb_core::Error::Other(
+                "erasure publication lost an existing directory".into(),
+            ));
+        }
+        Ok(publication)
     }
 
     /// Infallibly publish a fully prebuilt received-schema replacement.  Do
@@ -2829,7 +2960,68 @@ impl RelationalStore {
         let mut version_positions = self.row_version_positions.write();
         let mut source_lsns = self.sync_source_lsns.write();
         let mut source_kinds = self.sync_source_kinds.write();
-        if let Some(history) = publication.history { self.schema_history.write().publish(history, &mut tables); }
+        if let Some(history) = publication.history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
+        if publication.selected_only {
+            // A source-backed erasure changes only durable rows and the
+            // prepared history root; no resident directories are replaced.
+            if publication.tables.is_empty() {
+                return;
+            }
+            // Keep every lock through the complete union of affected tables.
+            positions.retain(|key, _| {
+                !publication.tables.contains_key(&key.0)
+                    || publication.row_positions.contains_key(key)
+            });
+            version_positions.retain(|key, _| {
+                !publication.tables.contains_key(&key.0)
+                    || publication.row_version_positions.contains_key(key)
+            });
+            self.retention_expiries
+                .write()
+                .retain(|(table, row, created), _| {
+                    publication.tables.get(table).is_none_or(|rows| {
+                        rows.iter()
+                            .any(|entry| entry.row_id == *row && entry.created_tx == *created)
+                    })
+                });
+            for (table, rows) in publication.tables {
+                *tables.get_mut(&table).expect("prepared erasure table") = rows;
+            }
+            for (table, replacement) in publication.indexes {
+                *indexes.get_mut(&table).expect("prepared erasure indexes") = replacement;
+            }
+            for (key, position) in publication.row_positions {
+                *positions
+                    .get_mut(&key)
+                    .expect("prepared erasure row position") = position;
+            }
+            for (key, replacement) in publication.row_version_positions {
+                *version_positions
+                    .get_mut(&key)
+                    .expect("prepared erasure version positions") = replacement;
+            }
+            for (table, replacement) in publication.sync_source_lsns {
+                if replacement.is_empty() {
+                    source_lsns.remove(&table);
+                } else {
+                    *source_lsns
+                        .get_mut(&table)
+                        .expect("prepared erasure source LSNs") = replacement;
+                }
+            }
+            for (table, replacement) in publication.sync_source_kinds {
+                if replacement.is_empty() {
+                    source_kinds.remove(&table);
+                } else {
+                    *source_kinds
+                        .get_mut(&table)
+                        .expect("prepared erasure source kinds") = replacement;
+                }
+            }
+            return;
+        }
         *indexes = publication.indexes;
         *tables = publication.tables;
         self.retention_expiries
@@ -3464,8 +3656,10 @@ impl RelationalStore {
 fn membership_key_credit(
     columns: &[(String, SortDirection)],
     values: &HashMap<String, Value>,
-    budget: Arc<dyn ReadMemoryBudget>,
+    budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<ReadCredit> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
     let bytes = columns
         .iter()
         .fold(std::mem::size_of::<IndexKey>(), |bytes, (column, _)| {
@@ -3477,9 +3671,11 @@ fn membership_key_credit(
 }
 
 fn membership_credit(
-    budget: Arc<dyn ReadMemoryBudget>,
+    budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     bytes: usize,
 ) -> contextdb_core::Result<ReadCredit> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
     ReadCredit::try_new(
         budget,
         bytes,

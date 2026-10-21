@@ -20,7 +20,7 @@ pub trait GraphReadSource: Send + Sync {
     fn capture(
         &self,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Arc<dyn GraphSnapshot>>;
 }
 

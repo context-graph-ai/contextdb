@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 #[doc(hidden)]
 pub use crate::json_read_builder::{
-    JsonReadAdmissionGuard, deserialize_json_in_read_scope, json_retained_heap_bytes,
+    ClosedJsonReadHooks, JsonReadAdmissionGuard, deserialize_json_in_read_scope, json_retained_heap_bytes,
 };
 
 pub type NodeId = Uuid;
@@ -347,13 +347,81 @@ mod json_as_string {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(value: &serde_json::Value, ser: S) -> Result<S::Ok, S::Error> {
-        let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
-        s.serialize(ser)
+        // Concrete engine callers count/admit their largest JSON field before
+        // entering this serializer, including the outer codec sizing pass.
+        // Count only Value's closed implementation; no custom Display replay.
+        struct Count(Option<usize>);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.and_then(|n| n.checked_add(bytes.len()));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(Some(0));
+        serde_json::to_writer(&mut count, value).map_err(serde::ser::Error::custom)?;
+        let layout = count
+            .0
+            .and_then(|bytes| std::alloc::Layout::array::<u8>(bytes).ok());
+        let Some(layout) = layout else {
+            // Generic/unadmitted callers retain their original native path.
+            // Selected engine preflight refuses this size before codec entry.
+            let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+            return s.serialize(ser);
+        };
+        // JSON text is nonempty. Use the exact admitted Layout rather than a
+        // Vec growth recurrence or an assumption about an allocator's capacity.
+        struct TextBuffer {
+            pointer: std::ptr::NonNull<u8>,
+            layout: std::alloc::Layout,
+        }
+        impl Drop for TextBuffer {
+            fn drop(&mut self) {
+                // SAFETY: this unique buffer owns precisely this allocation.
+                unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+            }
+        }
+        assert!(layout.size() != 0, "JSON Value text is nonempty");
+        // SAFETY: the checked layout is nonzero and valid. Zero initialization
+        // permits constructing a u8 slice before the fixed-slice writer runs.
+        let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let buffer = TextBuffer { pointer, layout };
+        // SAFETY: buffer uniquely owns layout.size() initialized bytes and
+        // remains alive through serialize_str, including errors and unwinding.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(buffer.pointer.as_ptr(), layout.size()) };
+        let mut output = &mut bytes[..];
+        serde_json::to_writer(&mut output, value).map_err(serde::ser::Error::custom)?;
+        assert!(output.is_empty(), "JSON Value matches its measured size");
+        let text = std::str::from_utf8(bytes).expect("serde_json emits UTF-8");
+        // The temporary is physically freed on return, before the enclosing
+        // engine scratch invoice can refund. No String or realloc is created.
+        ser.serialize_str(text)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<serde_json::Value, D::Error> {
         let s = String::deserialize(de)?;
-        if crate::json_read_builder::in_scope() {
+        if crate::json_read_builder::has_closed_hooks() {
+            let result = crate::json_read_builder::deserialize_json_closed(&s);
+            crate::json_read_builder::release_serialized_input(s);
+            match result {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    // Latch the authentic source before crossing the outer
+                    // selected CodecError boundary. Its custom implementation
+                    // sees the ledger cause and returns Captured without text.
+                    match crate::json_read_builder::capture_closed_json(error) {
+                        Ok(()) => Err(serde::de::Error::custom("JSON diagnosis retained by producer")),
+                        // Unknown native/custom recipes keep their original
+                        // conversion and remain outside positive coverage.
+                        Err(error) => Err(serde::de::Error::custom(error)),
+                    }
+                }
+            }
+        } else if crate::json_read_builder::in_scope() {
             let result = super::deserialize_json_in_read_scope(&s);
             // The engine's outer String visitor separately admitted this
             // serialized input. Return its credit only after native drop.

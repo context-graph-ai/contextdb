@@ -21,8 +21,9 @@ fn entry(id: u64) -> SinkQueueEntry {
     }
 }
 
-fn owner() -> Arc<crate::read_image_memory::ImageMemory> {
+fn owner() -> crate::read_image_memory::ImageMemoryHandle {
     crate::read_image_memory::ImageMemory::new(None)
+        .expect("unlimited sink window fixture image owner")
 }
 
 /// A window of these ids, each charged `credit` on a fresh owner.
@@ -177,7 +178,8 @@ fn a_copy_charge_holds_until_its_copies_are_gone() {
     assert_eq!(owner.held(), 500);
     drop(charge);
     assert_eq!(owner.held(), 0);
-    let tight = crate::read_image_memory::ImageMemory::new(Some(10));
+    let tight = crate::read_image_memory::ImageMemory::new(Some(10))
+        .expect("original sink window limit must reach the intended copy operation");
     assert!(matches!(
         SinkWindowCopyCharge::reserve(&tight, 11),
         Err(Error::MemoryBudgetExceeded { .. })
@@ -187,7 +189,7 @@ fn a_copy_charge_holds_until_its_copies_are_gone() {
 
 /// An event bus holding one bounded window of `ids` on `owner`.
 fn bus_with_window(
-    owner: &Arc<crate::read_image_memory::ImageMemory>,
+    owner: &crate::read_image_memory::ImageMemoryHandle,
     ids: &[u64],
     credit: usize,
 ) -> EventBusState {
@@ -265,7 +267,8 @@ fn a_published_purge_returns_the_purged_entrys_credit_once() {
 #[test]
 fn a_purge_replacement_funds_the_copied_window_buffers_before_copying() {
     // Room for the copied entries' decoded bytes but not their buffers.
-    let tight = crate::read_image_memory::ImageMemory::new(Some(2 * 300 + 8));
+    let tight = crate::read_image_memory::ImageMemory::new(Some(2 * 300 + 8))
+        .expect("original sink window limit must reach the intended copy operation");
     let bus = bus_with_window(&tight, &[1, 2, 3], 100);
     let before = tight.held();
     let refused = prepare(&bus, &[2]).map(|_| ()).unwrap_err();

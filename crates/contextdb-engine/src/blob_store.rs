@@ -412,7 +412,7 @@ impl BlobStore {
     /// store's declared reader memory. Directory
     /// registration and store-open errors propagate before handler publication.
     pub fn serve_on(&self, endpoint: &IrohServer) -> Result<()> {
-        self.serve_on_with_read_budget_provider(endpoint, self.db.declared_read_request_provider())
+        self.serve_on_with_provider(endpoint, self.db.declared_read_request_provider())
     }
 
     /// Serve using the host's declared request budget provider.
@@ -420,6 +420,14 @@ impl BlobStore {
         &self,
         endpoint: &IrohServer,
         read_budgets: Arc<dyn ReadRequestBudgetProvider>,
+    ) -> Result<()> {
+        self.serve_on_with_provider(endpoint, read_budgets.into())
+    }
+
+    fn serve_on_with_provider(
+        &self,
+        endpoint: &IrohServer,
+        read_budgets: crate::vector_read_memory::ReadRequestProvider,
     ) -> Result<()> {
         let store = self.store()?;
         // Enroll before publishing the handler: registration failure is a
@@ -524,13 +532,13 @@ impl BlobStore {
     pub async fn bind_and_serve_for_test(
         &self,
         identity_path: &Path,
-        read_budgets: Arc<dyn ReadRequestBudgetProvider>,
+        read_budgets: impl Into<crate::vector_read_memory::ReadRequestProvider>,
     ) -> Result<IrohServer> {
         let spec = format!("iroh:?identity={}", identity_path.display());
         let endpoint = IrohServer::bind(&spec)
             .await
             .map_err(|err| Error::Other((err.to_string()).into()))?;
-        self.serve_on_with_read_budget_provider(&endpoint, read_budgets)?;
+        self.serve_on_with_provider(&endpoint, read_budgets.into())?;
         Ok(endpoint)
     }
 
@@ -603,11 +611,13 @@ impl BlobStore {
     /// Resolve using the executing host operation's READ owner.
     pub async fn resolve_blob_ref_with_read_memory(
         &self,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         hash: &BlobHash,
         holder_ticket: &str,
         sink: &mut (dyn Write + Send),
     ) -> std::result::Result<u64, ResolveError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Client-side pre-check on the consumer's OWN local ledger mirror: a
         // pure optimization to skip a wasted dial when this node has never
         // even mirrored a live claim for this hash. It does NOT check
@@ -790,11 +800,13 @@ impl BlobStore {
     #[cfg(any(test, feature = "test-seams"))]
     pub async fn attempt_authorization_bypass_for_test(
         &self,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         hash: &BlobHash,
         holder_ticket: &str,
         sink: &mut (dyn Write + Send),
     ) -> std::result::Result<u64, ResolveError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let store = self
             .store()
             .map_err(|_| ResolveError::LocalStoreUnavailable)?;
@@ -980,10 +992,12 @@ impl BlobStore {
     /// Reclaim using the executing host operation's READ owner.
     pub fn reclaim_unreferenced_with_read_memory(
         &self,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         now_ms: i64,
         grace_ms: i64,
     ) -> Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let db = self.db.clone();
         let _read = db.writer_temporary_output_scope(read_memory.clone())?;
         self.store()?.reclaim(|hash| {
@@ -1010,13 +1024,21 @@ impl BlobStore {
     /// default uses the store's declared reader parent, with one child per sweep.
     pub fn spawn_reclaim_driver(self: Arc<Self>, grace_ms: i64) -> tokio::task::JoinHandle<()> {
         let read_budgets = self.db.declared_read_request_provider();
-        self.spawn_reclaim_driver_with_read_budget_provider(read_budgets, grace_ms)
+        self.spawn_reclaim_driver_with_provider(read_budgets, grace_ms)
     }
 
     /// Run reclaim using the host's existing provider, with one child per sweep.
     pub fn spawn_reclaim_driver_with_read_budget_provider(
         self: Arc<Self>,
         read_budgets: Arc<dyn ReadRequestBudgetProvider>,
+        grace_ms: i64,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_reclaim_driver_with_provider(read_budgets.into(), grace_ms)
+    }
+
+    fn spawn_reclaim_driver_with_provider(
+        self: Arc<Self>,
+        read_budgets: crate::vector_read_memory::ReadRequestProvider,
         grace_ms: i64,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -1045,11 +1067,13 @@ impl BlobStore {
     #[cfg(any(test, feature = "test-seams"))]
     pub async fn resume_bytes_moved_for_test(
         &self,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         hash: &BlobHash,
         holder_ticket: &str,
         sink: &mut Vec<u8>,
     ) -> std::result::Result<u64, ResolveError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let store = self
             .store()
             .map_err(|e| ResolveError::SinkWrite(std::io::Error::other(e.to_string())))?;

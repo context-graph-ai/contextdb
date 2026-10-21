@@ -357,7 +357,7 @@ fn read_only_open_loads_only_the_working_set() {
     let witness = reader.file_memory_for_test().unwrap().3;
     drop(reader);
     assert!(
-        witness.upgrade().is_none(),
+        !witness.is_alive() && witness.is_physically_freed() && witness.accountant_is_physically_freed(),
         "closing releases the owned cache accountant"
     );
     drop(peer);

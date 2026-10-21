@@ -335,17 +335,17 @@ impl<'a> Encoded<'a, '_> {
 
 /// A stored row body that does not parse: truncated, over-long, or with a
 /// field no writer emits. It is damage to stored bytes, refused as such.
-fn corrupt_body(reason: &str) -> Error {
+fn corrupt_body(reason: &'static str) -> Error {
     Error::StoreCorrupted {
-        path: "relational row version".to_owned(),
-        reason: format!("stored body: {reason}"),
+        path: "relational row version".into(),
+        reason: contextdb_core::error::DiagnosticText::from_static_parts("stored body: ", reason, ""),
     }
 }
 
-fn torn(reason: &str) -> Error {
+fn torn(reason: &'static str) -> Error {
     Error::StoreCorrupted {
-        path: "relational row version".to_owned(),
-        reason: format!("stored vector: {reason}"),
+        path: "relational row version".into(),
+        reason: contextdb_core::error::DiagnosticText::from_static_parts("stored vector: ", reason, ""),
     }
 }
 
@@ -1146,9 +1146,11 @@ impl ContentIdentityReadVerifier {
         family: LogicalFamily,
         key: Vec<u8>,
         expected: Option<[u8; 32]>,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let mutation = ContentIdentityMutation::remove(family, key);
         let mut admission = ProofAdmission::for_reader(memory);
         let result =
@@ -1167,9 +1169,11 @@ impl ContentIdentityReadVerifier {
         table: &str,
         meta: &TableMeta,
         row: &VersionedRow,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         checkpoint()?;
         let count = row.values.len();
         let descriptor_bytes = std::alloc::Layout::array::<(&String, &Value)>(count)

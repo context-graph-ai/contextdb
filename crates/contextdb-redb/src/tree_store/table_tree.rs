@@ -139,6 +139,10 @@ impl TableTree {
         key: &[u8],
         expected: &[u8],
     ) -> std::result::Result<bool, crate::PreparedReadError> {
+        // Prepare requested-name custody before the descriptor producer. Its
+        // independent invoice travels with a retained malformed descriptor.
+        let mut requested = crate::native_storage_admission::NativeStorageBuffer::with_capacity(physical_name.len())?;
+        for byte in physical_name.as_bytes() { requested.push(*byte)?; }
         let Some(directory) = super::btree::prepared_byte_get(
             self.root(), &self.mem, physical_name.as_bytes(), true, self.prepared_root.as_ref(),
         )? else { return Ok(false); };
@@ -147,7 +151,7 @@ impl TableTree {
         let root = match super::table_tree_base::native_byte_table_root(directory.value()) {
             Ok(root) => root,
             Err(cause) => return Err(crate::PreparedReadError::TableDefinition(
-                crate::PreparedTableDefinitionError::new(cause, directory))),
+                crate::PreparedTableDefinitionError::new(cause, directory, requested))),
         };
         let value = super::btree::prepared_byte_get(root, &self.mem, key, false, None)?;
         Ok(value.is_some_and(|value| value.value() == expected))

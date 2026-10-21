@@ -98,8 +98,10 @@ impl PersistentCompositeStore {
         ws: &WriteSet,
         reclaimable_partitions: HashSet<VectorPartitionRef>,
         registered_snapshots: Option<&[SnapshotId]>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(lsn) = ws.commit_lsn {
             let mut local_stages = self.local_schema_stages.lock();
             if let Some(stage) = local_stages.get(&lsn) {
@@ -205,7 +207,7 @@ impl PersistentCompositeStore {
             FlushDataOptions {
                 local_erasure: erasure.map(|stage| LocalErasurePersistence {
                     projection: &stage.durable,
-                    accountant: stage._vector_workspace.accountant().clone(),
+                    accountant: (stage._vector_workspace.accountant().clone()).into(),
                     operation: "discard",
                 }),
                 sink_events: sink_events.as_deref().map(Vec::as_slice).unwrap_or(&[]),
@@ -251,7 +253,7 @@ impl PersistentCompositeStore {
         &self,
         ws: &WriteSet,
         memory: &mut crate::memory_accounting::OwnedMemoryReservation,
-        _statement_read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _statement_read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<
         Option<
             std::collections::HashMap<
@@ -260,6 +262,8 @@ impl PersistentCompositeStore {
             >,
         >,
     > {
+        let _statement_read_memory: contextdb_core::read_memory::ReadMemoryOwner = _statement_read_memory.into();
+
         use crate::sync_types::held;
         use contextdb_relational::source::{RelationalReadSource, visible_row};
         if ws.relational_deletes.is_empty()
@@ -411,7 +415,7 @@ impl WriteSetApplicator for PersistentCompositeStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.replace(false)) {
@@ -612,7 +616,7 @@ impl OwnedPersistentCompositeStore {
         &self,
         ws: &WriteSet,
         memory: &mut crate::memory_accounting::OwnedMemoryReservation,
-        _statement_read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _statement_read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<
         Option<
             std::collections::HashMap<
@@ -621,6 +625,8 @@ impl OwnedPersistentCompositeStore {
             >,
         >,
     > {
+        let _statement_read_memory: contextdb_core::read_memory::ReadMemoryOwner = _statement_read_memory.into();
+
         use contextdb_relational::source::{RelationalReadSource, visible_row};
         if ws.relational_deletes.is_empty()
             && ws.vector_inserts.is_empty()
@@ -912,8 +918,10 @@ impl OwnedPersistentCompositeStore {
         ws: &WriteSet,
         reclaimable_partitions: HashSet<VectorPartitionRef>,
         registered_snapshots: Option<&[SnapshotId]>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let identity = self.owned_terminal_apply_identity(ws)?;
         self.apply_owned_with_vector_reclamation_for_terminal(
             ws,
@@ -929,8 +937,10 @@ impl OwnedPersistentCompositeStore {
         identity: contextdb_tx::manager::EngineTerminalIdentity,
         reclaimable_partitions: HashSet<VectorPartitionRef>,
         registered_snapshots: Option<&[SnapshotId]>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.events.with_owned_persistence_original(|original| {
             // This seed loan is immutable and outside all stage/queue/state
             // guards; its private handle keeps the physical storage alive.
@@ -1082,7 +1092,7 @@ impl OwnedPersistentCompositeStore {
                         FlushDataOptions {
                             local_erasure: erasure.map(|stage| LocalErasurePersistence {
                                 projection: &stage.durable,
-                                accountant: stage._vector_workspace.accountant().clone(),
+                                accountant: (stage._vector_workspace.accountant().clone()).into(),
                                 operation: "discard",
                             }),
                             sink_events: stage.as_ref().map_or(&[], |stage| stage.events),
@@ -1220,7 +1230,7 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.replace(false)) {
@@ -1269,8 +1279,10 @@ pub(crate) fn apply_owned_memory_store(
     store: &CompositeStore,
     events: &crate::database::event_bus::OwnedEventBusHandle,
     ws: &WriteSet,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     events.with_owned_persistence_original(|original| {
         crate::database::discard::validate_original_discard_for_apply(
             ws,
@@ -1393,9 +1405,10 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for RedbPersistence {
         original: &'o crate::memory_accounting::OwnedMemoryReservation,
         sink: &'o str, entry_id: u64, encoded: &[u8], uncertain: bool, unconfirmed_delta: i8,
     ) -> crate::funded_error::OriginalResult<Self::Update<'o>> {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         let decoded = Self::decode_owned_event_funded::<crate::database::event_bus::SinkQueueEntry>(original, encoded)?;
         if decoded.value.id != entry_id {
-            return Err(Error::Other("prepared native sink entry identity mismatch".into()).into());
+            return Err(diagnostic.error(Error::Other("prepared native sink entry identity mismatch".into())));
         }
         Ok(OwnedDurableQueueUpdate { original, sink, entry_id, decoded, uncertain, unconfirmed_delta })
     }

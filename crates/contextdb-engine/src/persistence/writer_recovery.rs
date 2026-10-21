@@ -242,8 +242,8 @@ impl RedbPersistence {
         let SourceWindowOwner::Write(accountant, _) = &owner else {
             unreachable!("internal writer retention owner")
         };
-        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
-            accountant.read_budget()?;
+        let memory: contextdb_core::read_memory::ReadMemoryOwner =
+            accountant.read_budget()?.into();
         graph_read::with_pages(memory, || {
             let _controls = owner.reserve(
                 2 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()
@@ -848,7 +848,7 @@ impl RedbPersistence {
     pub(super) fn read_authenticated_bounds_in_read(
         read: &redb::ReadTransaction,
     ) -> Result<WriterRecoveryBounds> {
-        let damage = |reason: &str| Error::StoreCorrupted {
+        let damage = |reason: &'static str| Error::StoreCorrupted {
             path: "committed read bounds".into(),
             reason: reason.into(),
         };
@@ -1012,15 +1012,9 @@ impl RedbPersistence {
         actual: u64,
     ) -> Result<()> {
         let expected = Self::witnessed_row_count_in_read(read, &Self::rel_table_name(table))?
-            .ok_or_else(|| Error::StoreCorrupted {
-                path: table.to_owned(),
-                reason: "missing saved row cardinality".into(),
-            })?;
+            .ok_or_else(|| crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &table, "missing saved row cardinality".into()))?;
         if expected != actual {
-            return Err(Error::StoreCorrupted {
-                path: table.to_owned(),
-                reason: "row family cardinality differs from its committed record".into(),
-            });
+            return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &table, "row family cardinality differs from its committed record".into()));
         }
         Ok(())
     }
@@ -1192,10 +1186,7 @@ impl RedbPersistence {
             if let Some((key, _)) = relation.last().map_err(Self::storage_error)? {
                 let key = key.value();
                 if key.len() != 24 {
-                    return Err(Error::StoreCorrupted {
-                        path: name,
-                        reason: "relation end key is not a 24-byte version key".into(),
-                    });
+                    return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &name, "relation end key is not a 24-byte version key".into()));
                 }
                 let row_id = u64::from_be_bytes(key[..8].try_into().expect("validated key width"));
                 bounds.max_row_id = bounds.max_row_id.max(RowId(row_id));

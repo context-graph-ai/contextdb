@@ -23,8 +23,8 @@ use std::path::Path;
 pub fn dispatch_if_subcommand<F>(raw_args: &[String], read_memory_factory: F) -> Option<i32>
 where
     F: FnOnce() -> contextdb_core::Result<(
-        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        std::sync::Arc<DeclaredReadMemory>,
+        contextdb_core::read_memory::ReadMemoryOwner,
+        contextdb_engine::vector_read_memory::DeclaredReadRoot,
     )>,
 {
     let name = raw_args.get(1)?;
@@ -39,8 +39,8 @@ where
 pub fn run_operational<F>(name: &str, args: &[String], read_memory_factory: F) -> Option<i32>
 where
     F: FnOnce() -> contextdb_core::Result<(
-        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        std::sync::Arc<DeclaredReadMemory>,
+        contextdb_core::read_memory::ReadMemoryOwner,
+        contextdb_engine::vector_read_memory::DeclaredReadRoot,
     )>,
 {
     match name {
@@ -61,8 +61,8 @@ where
 fn run_inspect<F>(args: &[String], read_memory_factory: F) -> i32
 where
     F: FnOnce() -> contextdb_core::Result<(
-        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        std::sync::Arc<DeclaredReadMemory>,
+        contextdb_core::read_memory::ReadMemoryOwner,
+        contextdb_engine::vector_read_memory::DeclaredReadRoot,
     )>,
 {
     enum Request {
@@ -260,7 +260,7 @@ where
             key,
             columns,
         } => inspector
-            .inspect_key(&table, &key, &columns, std::sync::Arc::clone(&read_memory))
+            .inspect_key(&table, &key, &columns, read_memory.clone())
             .and_then(|report| {
                 serde_json::to_value(report).map_err(|err| {
                     contextdb_core::Error::Other((format!("failed to encode key inspection: {err}")).into())
@@ -320,8 +320,8 @@ where
 fn run_snapshot<F>(args: &[String], read_memory_factory: F) -> i32
 where
     F: FnOnce() -> contextdb_core::Result<(
-        std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-        std::sync::Arc<DeclaredReadMemory>,
+        contextdb_core::read_memory::ReadMemoryOwner,
+        contextdb_engine::vector_read_memory::DeclaredReadRoot,
     )>,
 {
     if args.first().map(String::as_str) != Some("export") {
@@ -625,7 +625,7 @@ fn run_purge(args: &[String]) -> i32 {
     // rendering, and source close, independently of the store's writer funding.
     let read_memory =
         DeclaredReadMemory::from_reader_limit(db.owner_read_config().limits.limits.memory);
-    let result = read_memory.child().and_then(|request_memory| {
+    let result = read_memory.and_then(|root| root.child()).and_then(|request_memory| {
         db.execute_with_read_memory(
             &format!("PURGE FROM {table}"),
             &std::collections::HashMap::new(),
@@ -645,7 +645,7 @@ fn run_purge(args: &[String]) -> i32 {
             println!(
                 "purge '{}': erased {} row(s) from '{table}'.",
                 path.display(),
-                outcome.rows_affected,
+                outcome.rows_affected(),
             );
             EXIT_OK
         }

@@ -108,10 +108,10 @@ pub(crate) struct RawVectorPayload<T> {
 struct RawPayloadCharge {
     body_bytes: usize,
     header_bytes: usize,
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
     /// Promotion can admit a header through a later open's accountant while
     /// the legacy body keeps the funder that already owns its reservation.
-    header_accountant: Option<Arc<dyn MemoryBudget>>,
+    header_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     live_body_bytes: Arc<AtomicUsize>,
     live_header_bytes: Arc<AtomicUsize>,
     _body_control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
@@ -205,7 +205,7 @@ impl<T> SharedVectorPayload<T> {
     }
 
     /// The caller has admitted the shared header before this allocation.
-    fn promote_to_shared(&mut self, header_accountant: Option<Arc<dyn MemoryBudget>>) {
+    fn promote_to_shared(&mut self, header_accountant: Option<crate::memory_budget::MemoryBudgetOwner>) {
         if let Self::Owned(payload) = self {
             let mut charge = payload.charge.get_mut().take();
             if let Some(charge) = charge.as_mut() {
@@ -253,10 +253,12 @@ impl<T> SharedVectorPayload<T> {
     fn adopt_charge(
         &self,
         body_bytes: usize,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_body_bytes: Arc<AtomicUsize>,
         live_header_bytes: Arc<AtomicUsize>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let mut charge = self.payload().charge.lock();
         if charge.is_none() {
             let header_bytes = self.header_bytes();
@@ -267,7 +269,7 @@ impl<T> SharedVectorPayload<T> {
                 header_bytes,
                 _body_control_invoice: accountant.control_invoice(),
                 _header_control_invoice: None,
-                accountant,
+                accountant: accountant.into(),
                 header_accountant: None,
                 live_body_bytes,
                 live_header_bytes,
@@ -457,7 +459,7 @@ impl StoredVector {
 
     pub(crate) fn promote_to_shared_with_header_owner(
         &mut self,
-        accountant: Option<Arc<dyn MemoryBudget>>,
+        accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     ) {
         match self {
             Self::F32(payload) => payload.promote_to_shared(accountant),
@@ -485,10 +487,12 @@ impl StoredVector {
 
     pub(crate) fn adopt_raw_charge(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_bytes: Arc<AtomicUsize>,
         live_header_bytes: Arc<AtomicUsize>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let bytes = self.storage_bytes();
         match self {
             Self::F32(payload) => {

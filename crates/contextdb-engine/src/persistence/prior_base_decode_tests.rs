@@ -445,7 +445,8 @@ fn corrupt_sq4_expansion_is_refused_before_dequantization_allocation() {
     persistence
         .validate_raw_vector_entry_encoded_width(&encoded, &corrupt.index, 1)
         .unwrap();
-    let calibration = crate::read_image_memory::ImageMemory::new(None);
+    let calibration = crate::read_image_memory::ImageMemory::new(None)
+        .expect("unlimited raw decode calibration image owner");
     calibration
         .scope(|| RedbPersistence::decode::<PersistedVectorEntry>(&encoded))
         .unwrap();
@@ -456,7 +457,8 @@ fn corrupt_sq4_expansion_is_refused_before_dequantization_allocation() {
     // The guarded decoder admits its fixed control transient before parsing.
     // That transient is refunded; the body still owns exactly decode_charge.
     let decode_control = std::mem::size_of::<PersistedVectorEntry>() * 4 + 128;
-    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge + decode_control));
+    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge + decode_control))
+        .expect("original raw decode limit must reach the intended corruption check");
     let key = RedbPersistence::vector_identity_key(
         &membership.index,
         membership.row_id,

@@ -14,13 +14,10 @@ fn protected(name: &str) -> bool {
         })
         || name == READ_LINEAGE_CONFIG_TABLE.name()
 }
-fn corruption(name: &str, reason: &str) -> Error {
-    Error::StoreCorrupted {
-        path: name.strip_prefix("rel_").unwrap_or(name).to_owned(),
-        reason: format!(
+fn corruption(name: &str, reason: impl std::fmt::Display) -> Error {
+    crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), name.strip_prefix("rel_").unwrap_or(name), format_args!(
             "historical root witness {reason}; recreate a store without producer witnesses"
-        ),
-    }
+        ))
 }
 fn record(root: Option<[u8; 32]>, incarnation: [u8; 16]) -> [u8; RECORD_BYTES] {
     let mut bytes = [0; RECORD_BYTES];
@@ -76,13 +73,14 @@ impl RedbPersistence {
     pub(super) fn begin_history_write_funded(
         original: &crate::memory_accounting::OwnedMemoryReservation, db: &redb::Database,
     ) -> crate::funded_error::OriginalResult<redb::WriteTransaction> {
-        let write = db.begin_write().map_err(|error| Self::storage_error_funded(original, error))?;
-        if !write.table_exists(WITNESSES).map_err(|error| Self::storage_error_funded(original, error))? {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        let write = db.begin_write().map_err(|error| diagnostic.storage(original, error))?;
+        if !write.table_exists(WITNESSES).map_err(|error| diagnostic.storage(original, error))? {
             // The witness formatter and erasure verifier remain explicit
             // producer gaps; neither is retrospectively charged to Original.
-            return Err(corruption(WITNESSES.name(), "metadata is absent").into());
+            return Err(diagnostic.error(corruption(WITNESSES.name(), "metadata is absent")));
         }
-        super::erasure_frontiers::verify_in_write(&write)?;
+        super::erasure_frontiers::verify_in_write(&write).map_err(|error| diagnostic.error(error))?;
         Ok(write.with_table_root_hook(Self::historical_root_event))
     }
     pub(super) fn historical_root_event(

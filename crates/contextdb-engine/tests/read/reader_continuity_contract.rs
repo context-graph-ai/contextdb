@@ -578,7 +578,7 @@ fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
     });
     let witness = reader.file_memory_for_test().unwrap().3;
     drop(reader);
-    assert!(witness.upgrade().is_none());
+    assert!(!witness.is_alive() && witness.is_physically_freed() && witness.accountant_is_physically_freed());
     let latest = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
     assert_ne!(latest.file_snapshot_for_test(), Some(snapshot));
     assert_eq!(

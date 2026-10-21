@@ -644,7 +644,10 @@ fn vector_declaration_issue_from_code(
 impl From<&contextdb_core::Error> for ReadChannelError {
     fn from(error: &contextdb_core::Error) -> Self {
         use contextdb_core::Error as Engine;
-        match error {
+        match error.engine_diagnostic() {
+            Engine::FundedEngine(_) | Engine::NativeEngineOther(_) => Self::Other {
+                message: error.to_string(),
+            },
             Engine::ReadSessionNotImplemented => Self::ReadSessionNotImplemented,
             Engine::OwnerReadDrainTimeout => Self::OwnerReadDrainTimeout,
             Engine::ReadCancelled => Self::ReadCancelled,
@@ -872,8 +875,8 @@ impl From<&contextdb_core::Error> for ReadChannelError {
                 allowed: label_words(allowed),
             },
             Engine::StoreCorrupted { path, reason } => Self::StoreCorrupted {
-                path: path.clone(),
-                reason: reason.clone(),
+                path: path.to_string(),
+                reason: reason.to_string(),
             },
             Engine::StoreIdentityUnprovable { path } => {
                 Self::StoreIdentityUnprovable { path: path.clone() }
@@ -1149,7 +1152,7 @@ impl From<ReadChannelError> for contextdb_core::Error {
                 }
             }
             ReadChannelError::StoreCorrupted { path, reason } => {
-                Self::StoreCorrupted { path, reason }
+                Self::StoreCorrupted { path: path.into(), reason: reason.into() }
             }
             ReadChannelError::StoreIdentityUnprovable { path } => {
                 Self::StoreIdentityUnprovable { path }
@@ -1218,12 +1221,12 @@ pub(crate) fn query_context_conversion_bytes(
 /// conversion. The special cases avoid collect/format replacement scratch.
 pub(crate) fn convert_query_error(
     document: super::query_funding::Funded<ReadChannelError>,
-    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<super::query_funding::Funded<contextdb_core::Error>> {
     use contextdb_core::types::{ContextId, ScopeLabel};
     use contextdb_core::Error as E;
     let bytes = super::query_funding::error_conversion_bytes(&document.value)?;
-    super::query_funding::Funded::allocate(Some(memory.clone()), bytes, || {
+    super::query_funding::Funded::allocate_owned(Some(memory.owner()), bytes, || {
         match document.into_retained() {
             ReadChannelError::Unknown { class_name, message } => {
                 let mut text = String::with_capacity(class_name.len() + message.len() + 2);
@@ -1274,8 +1277,10 @@ pub(crate) fn encode_read_error_into_slice(
 /// frame ceiling is the only wire cap. No blob cap is imposed on a query.
 pub(crate) fn encode_query_error_funded(
     error: &contextdb_core::Error,
-    owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<super::query_funding::Funded<Vec<u8>>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1287,7 +1292,7 @@ pub(crate) fn encode_query_error_funded(
     let invalid = || contextdb_core::Error::Other("query error encoding failed".into());
     let mut size = Count(0);
     write_read_error(error, &mut size).map_err(|_| invalid())?;
-    let mut output = super::query_funding::Funded::allocate(Some(owner), size.0,
+    let mut output = super::query_funding::Funded::allocate_owned(Some(owner), size.0,
         || Vec::with_capacity(size.0))?;
     write_read_error(error, &mut output.value).map_err(|_| invalid())?;
     if output.value.len() != size.0 { return Err(invalid()); }
@@ -1552,7 +1557,11 @@ pub(super) fn write_read_error<W: std::io::Write>(
                 sink.field(&item.0)?;
             }
         }
-        E::StoreCorrupted { path, reason } => body!(TAG_STORE_CORRUPTED, (path, reason)),
+        E::StoreCorrupted { path, reason } => {
+            sink.field(&TAG_STORE_CORRUPTED)?;
+            sink.display(path)?;
+            sink.display(reason)?;
+        },
         E::StoreIdentityUnprovable { path } => body!(TAG_STORE_IDENTITY_UNPROVABLE, path),
         E::LegacyVectorStoreDetected {
             found_format_marker,
@@ -1593,7 +1602,16 @@ pub(super) fn write_read_error<W: std::io::Write>(
             TAG_DISK_BUDGET_EXCEEDED,
             (operation, current_bytes, budget_limit_bytes, hint)
         ),
-        E::Other(message) => body!(TAG_OTHER, message),
+        E::Other(message) => {
+            sink.field(&TAG_OTHER)?;
+            sink.display(message)?;
+        },
+        // Match the owning read-channel adapter's existing Other class, while
+        // writing borrowed scalar/prepaid diagnostics without an owned String.
+        E::NativeEngineOther(_) | E::FundedEngine(_) => {
+            sink.field(&TAG_OTHER)?;
+            sink.display(error)?;
+        }
         _ => {
             sink.field(&TAG_UNKNOWN)?;
             sink.display(Class(error))?;

@@ -25,8 +25,10 @@ impl ConnectedCoordinates {
         changes: &ChangeSet,
         start: Lsn,
         end: Lsn,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut credit = ReadCredit::new(owner);
         let mut groups = BTreeMap::new();
         for source in changes
@@ -90,8 +92,10 @@ impl Database {
     pub(super) fn connected_membership_at(
         &self,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<(Lsn, Lsn)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _point_credit = ReadCredit::try_new(
             read_memory.clone(),
             256,
@@ -102,7 +106,7 @@ impl Database {
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
             let record = root.config_point::<(u64, u64)>(
-                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
                 &membership_key(lsn),
             )?;
             return record
@@ -110,10 +114,7 @@ impl Database {
                 .map(|record| {
                     let (start, end) = record.value;
                     if start > lsn.0 || end < lsn.0 || end > root.lsn.0 {
-                        return Err(Error::StoreCorrupted {
-                            path: membership_key(lsn),
-                            reason: "connected membership exceeds its committed interval".into(),
-                        });
+                        return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), format_args!("{MEMBERSHIP_PREFIX}{:020}", lsn.0), "connected membership exceeds its committed interval".into()));
                     }
                     Ok((Lsn(start), Lsn(end)))
                 })
@@ -126,10 +127,7 @@ impl Database {
             return record
                 .map(|(start, end)| {
                     if start > lsn.0 || end < lsn.0 || end > self.current_lsn().0 {
-                        return Err(Error::StoreCorrupted {
-                            path: membership_key(lsn),
-                            reason: "invalid retained connected interval".into(),
-                        });
+                        return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), format_args!("{MEMBERSHIP_PREFIX}{:020}", lsn.0), "invalid retained connected interval".into()));
                     }
                     Ok((Lsn(start), Lsn(end)))
                 })
@@ -155,8 +153,10 @@ impl Database {
     pub(crate) fn connected_history_end(
         &self,
         lsn: Lsn,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         Ok(self
             .connected_membership_at(lsn, owner)?
             .map_or(lsn, |(_, end)| end))
@@ -165,8 +165,10 @@ impl Database {
     pub(super) fn connected_history_since(
         &self,
         lsn: Lsn,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         Ok(self
             .connected_membership_at(lsn, owner)?
             .map_or(lsn, |(start, end)| {
@@ -194,16 +196,10 @@ impl Database {
             let Some(position) = key.strip_prefix(MEMBERSHIP_PREFIX) else {
                 continue;
             };
-            let position = position.parse::<u64>().map_err(|_| Error::StoreCorrupted {
-                path: key.clone(),
-                reason: "invalid connected position".into(),
-            })?;
+            let position = position.parse::<u64>().map_err(|_| crate::funded_error::corruption_text(self.finalization.accountant.read_budget(), key, "invalid connected position".into()))?;
             let (start, end): (u64, u64) = RedbPersistence::decode_config_value(value)?;
             if start > position || position > end {
-                return Err(Error::StoreCorrupted {
-                    path: key.clone(),
-                    reason: "invalid connected interval".into(),
-                });
+                return Err(crate::funded_error::corruption_text(self.finalization.accountant.read_budget(), key, "invalid connected interval".into()));
             }
             if image.is_none() {
                 let mut root = self.lineage_state_lock.lock().connected_membership.clone();
@@ -237,8 +233,10 @@ impl Database {
     pub(super) fn connected_source_positions(
         &self,
         changes: &ChangeSet,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ReadCredit, BTreeSet<Lsn>)> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut credit = ReadCredit::new(owner);
         let mut positions = BTreeSet::new();
         for lsn in changes
@@ -265,15 +263,19 @@ impl Database {
     pub(super) fn prepare_connected_overlay(
         &self,
         changes: &ChangeSet,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ConnectedOverlay> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         self.prepare_connected_overlay_with_vectors(changes,owner,false)
     }
 
     pub(super) fn prepare_connected_overlay_with_vectors(
-        &self,changes: &ChangeSet,owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        &self,changes: &ChangeSet,owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         source_vectors: bool,
     ) -> Result<ConnectedOverlay> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let (mut credit, positions) = self.connected_source_positions(changes, owner.clone())?;
         let (_catalog_credit, mut tables) =
             self.selected_received_catalog(changes, std::iter::empty())?;
@@ -526,8 +528,10 @@ impl Database {
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
         deletes: &[AuthenticatedFreshCreatorDelete],
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let overlay = self.prepare_connected_overlay(changes, owner.clone())?;
         let (_catalog_credit, mut tables) =
             self.selected_received_catalog(changes, std::iter::empty())?;
@@ -580,8 +584,10 @@ impl ConnectedOverlay {
         finalized: &WriteSet,
         coordinates: &ConnectedCoordinates,
         source_order: bool,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<BTreeMap<(String, RowId), Lsn>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut positions = BTreeMap::new();
         for (original, _, projected, _) in &self.originals {
             let Some(projected) = projected else { continue; };
@@ -612,8 +618,10 @@ impl ConnectedOverlay {
         finalized: &WriteSet,
         coordinates: &ConnectedCoordinates,
         source_order: bool,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<ChangeLogEntry>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut history = Vec::new();
         for (original, _, projected, _) in &self.originals {
             let pending = if source_order { original } else {
@@ -658,8 +666,10 @@ impl ConnectedOverlay {
         tx: TxId,
         source_order: bool,
         source: &ChangeSet,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, Arc<AuthoredRowShape>, VersionedRow)>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut rows = Vec::new();
         for (original, meta, pending, vector_group) in &self.originals {
             if original.deleted {
@@ -726,8 +736,10 @@ impl Database {
         &self,
         changes: ChangeSet,
         output: &mut contextdb_vector::VectorCopyAdmission,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(ChangeSet, bool)>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let count = changes
             .rows
             .len()
@@ -784,8 +796,10 @@ impl Database {
     pub(crate) fn connected_delivery_ceiling(
         &self,
         lsn: Lsn,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         Ok(self
             .connected_membership_at(lsn, owner)?
             .map_or(lsn, |(start, end)| {
@@ -803,8 +817,10 @@ impl Database {
         &self,
         positions: &mut HashSet<Lsn>,
         output: &mut contextdb_vector::VectorCopyAdmission,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         output.reserve(positions.len().saturating_mul(32).saturating_add(128))?;
         let original = positions.iter().copied().collect::<Vec<_>>();
         for position in original {
@@ -826,7 +842,9 @@ pub(super) enum PrivateApplyPhases {
 }
 impl PrivateApplyPhases {
     pub(super) fn prepare(changes: ChangeSet, coordinates: Option<&ConnectedCoordinates>,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Self> {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let Some(coordinates) = coordinates else { return Ok(Self::One(Some(changes))); };
         let controls = changes.rows.len().saturating_mul(std::mem::size_of::<RowChange>())
             .saturating_add(changes.edges.len().saturating_mul(std::mem::size_of::<EdgeChange>()))
@@ -859,7 +877,9 @@ pub(super) struct PrivateChangedRows {
 }
 struct PrivateRowEffect { kind: u8, before: Option<VersionedRow> }
 impl PrivateChangedRows {
-    fn new(owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
+    fn new(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         Self { rows: HashMap::new(), _credit: ReadCredit::new(owner) }
     }
     fn insert(&mut self, table: &str, row: RowId) -> Result<()> { self.insert_kind(table, row, 1) }
@@ -933,7 +953,9 @@ pub(super) struct PrivatePrefixEffects {
 }
 impl PrivatePrefixEffects {
     pub(super) fn for_refusal_metadata(configs: &[(String, Vec<u8>)], result: &ApplyResult,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Self> {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut effects = Self::new(owner);
         let bytes = configs.iter().map(|(key, value)| key.len().saturating_add(value.len())
             .saturating_mul(8).saturating_add(512)).sum::<usize>()
@@ -990,7 +1012,9 @@ impl PrivatePrefixEffects {
         debug_assert!(self.captured_rows_invoice.is_none(),"one captured row invoice");
         self.captured_rows_invoice=invoice;
     }
-    fn new(owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
+    fn new(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         Self { audits: Vec::new(), synthetic_firings: Vec::new(), sink_events: Vec::new(), sink_cursor: None, source_creation_keys: HashSet::new(), derived_rows: Vec::new(), derived_history: Vec::new(), derived_positions: HashMap::new(), vector_alter_credits: Vec::new(), graph_statement_owner: None, _credit: ReadCredit::new(owner), captured_rows_invoice:None }
     }
 }
@@ -1015,7 +1039,7 @@ struct PrivateUnitState {
     graph_origin: Option<crate::persistence::received_working_graph::WorkingGraphOrigin>,
     callback_config_cursor: usize,
     derived_shapes: HashMap<String, Arc<AuthoredRowShape>>,
-    owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
     effects: PrivatePrefixEffects,
 }
 thread_local! {
@@ -1031,7 +1055,9 @@ pub(super) struct PrivatePhaseScope<'a> {
 }
 impl<'a> PrivatePhaseScope<'a> {
     pub(super) fn enter(db: &'a Database, tx: TxId,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let previous = PRIVATE_PHASE.with(|slot| slot.replace(Some(PrivatePhaseState {
             host: db.tx_mgr.identity(), tx, changed: PrivateChangedRows::new(owner),
         })));
@@ -1058,13 +1084,15 @@ pub(super) struct PrivateUnitScope<'a> {
 }
 impl<'a> PrivateUnitScope<'a> {
     pub(super) fn enter(db: &'a Database, tx: TxId, canonical_tx: TxId, end: Lsn,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Self> {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         if !db.capture_detached_sync_write_set.load(Ordering::SeqCst) {
             return Err(Error::Other("source phases require private captured replay".into()));
         }
         let previous = PRIVATE_UNIT.with(|slot| slot.replace(Some(PrivateUnitState {
             host: db.tx_mgr.identity(), tx, canonical_tx, end, callbacks_prepared: false, graph_origin: None, callback_config_cursor: 0, derived_shapes: HashMap::new(),
-            effects: PrivatePrefixEffects::new(owner.clone()), owner,
+            effects: PrivatePrefixEffects::new(owner.clone()), owner: owner.into(),
         })));
         Ok(Self { db, tx, previous, active: true, _same_thread: std::marker::PhantomData })
     }
@@ -1247,7 +1275,7 @@ impl Database {
         PRIVATE_UNIT.with(|slot| slot.borrow().as_ref().is_some_and(|state|
             state.host == self.tx_mgr.identity() && state.tx == tx && state.callbacks_prepared))
     }
-    pub(super) fn private_replay_owner(&self, tx: TxId) -> Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(super) fn private_replay_owner(&self, tx: TxId) -> Option<contextdb_core::read_memory::ReadMemoryOwner> {
         PRIVATE_UNIT.with(|slot| slot.borrow().as_ref().filter(|state|
             state.host == self.tx_mgr.identity() && state.tx == tx).map(|state| state.owner.clone()))
     }
@@ -1367,7 +1395,9 @@ impl Database {
     /// callback-derived rows. The old admission stays live until its body is
     /// destroyed; the replacement and its postings own independent invoices.
     pub(super) fn alter_private_pending_relational_rows(&self, tx: TxId,
-        ddl: &DdlChange, previous: Option<&TableMeta>, owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<()> {
+        ddl: &DdlChange, previous: Option<&TableMeta>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let DdlChange::AlterTable { name, constraints, .. } = ddl else { return Ok(()); };
         let mut shape_credit = ReadCredit::new(owner.clone());
         let meta = {
@@ -1449,7 +1479,9 @@ impl Database {
     /// replacement kernel; mixed data units remain outside this opening.
     pub(super) fn private_source_order_supported(changes: &ChangeSet,
         live: &HashMap<String, TableMeta>, projected: &HashMap<String, TableMeta>,
-        owner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<bool> {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<bool> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         if !changes.edges.is_empty() { return Ok(false); }
         let graph_bearing = |meta: &TableMeta|
             has_graph_edge_table_shape(meta) || !meta.dag_edge_types.is_empty();
@@ -1760,7 +1792,9 @@ impl PrivatePendingVectorAlter {
 impl Database {
     pub(super) fn detach_private_pending_vectors_for_alter(&self, tx: TxId, ddl: &DdlChange,
         owner: &mut contextdb_vector::VectorCopyAdmission,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Option<PrivatePendingVectorAlter>> {
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<PrivatePendingVectorAlter>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let DdlChange::AlterTable { name,columns,constraints,foreign_keys,composite_foreign_keys,composite_unique } = ddl
             else { return Ok(None); };
         let mut credit = ReadCredit::new(memory);
@@ -1797,7 +1831,7 @@ impl Database {
                 ws.ordered_staged_rows.remove_vector_capability(&entry.index,entry.row_id);
                 let entry = ws.vector_inserts.remove(position);
                 plan.entries.push(PrivatePendingVector { entry: Some(entry), invoice: StagedCopyCharge::take_admitted(
-                    &self.finalization.accountant,Arc::clone(&self.finalization.vector_accountant),bytes) });
+                    &self.finalization.accountant,contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),bytes) });
             }
             let mut position = 0;
             while position < ws.vector_deletes.len() {
@@ -2207,7 +2241,9 @@ impl Database {
         })
     }
     pub(super) fn private_graph_properties(&self, tx: TxId, source: NodeId, kind: &str, target: NodeId,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Option<Option<HashMap<String, Value>>>> {
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<Option<HashMap<String, Value>>>> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let Some(capture) = self.prepare_private_graph_mutation(tx, source, kind, target)? else { return Ok(None); };
         if let Some(before) = &capture.before {
             capture.source.with_original(|original| {

@@ -793,8 +793,10 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
 /// Execute using the caller's existing operation read owner.
 pub fn install_work_ledger_schema_with_read_memory(
     db: &Database,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let existing = db.table_names();
     let ddl: [(&str, &str); 7] = [
         ("work_jobs", LEDGER_TABLE_DECLARATIONS[0]),
@@ -967,8 +969,10 @@ pub fn submit_job_in_tx_with_read_memory(
     db: &Database,
     tx: TxId,
     spec: &JobSpec,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if spec.job_id.is_empty() {
         return Err(Error::Other((
             "work ledger: job_id must not be empty".to_string()).into()));
@@ -1053,8 +1057,10 @@ pub fn add_job_input_in_tx_with_read_memory(
     job_id: &str,
     seq: i64,
     payload: &[u8],
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("input_key".to_string(), text(&input_key(job_id, seq)));
     params.insert("job_id".to_string(), text(job_id));
@@ -1086,8 +1092,10 @@ pub fn submit_job_with_read_memory<I: AsRef<[u8]>>(
     db: &Database,
     spec: &JobSpec,
     inputs: &[I],
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
     let vector_copy_owner = &mut retained_vector_copy;
 
@@ -1122,20 +1130,24 @@ fn select_rows_with_work(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-) -> Result<(Vec<String>, Vec<Vec<Value>>, u64)> {
-    let result = db.execute_with_read_memory(sql, params, read_memory.clone())?;
-    Ok((result.columns, result.rows, result.trace.rows_examined))
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<(crate::QueryResult, u64)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let result = db.execute_with_read_memory(sql, params, read_memory)?;
+    let examined = result.trace().rows_examined;
+    Ok((result, examined))
 }
 
 fn select_rows(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    let (columns, rows, _work) = select_rows_with_work(db, sql, params, read_memory.clone())?;
-    Ok((columns, rows))
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<crate::QueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    select_rows_with_work(db, sql, params, read_memory).map(|(result, _)| result)
 }
 
 /// How many ids one keyed read carries. A batch larger than this is split
@@ -1154,8 +1166,10 @@ fn read_rows_for_jobs(
     job_ids: &[&str],
     work: &mut LedgerWork,
     mut visit: impl FnMut(&[String], &[Vec<Value>]) -> Result<()>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     for chunk in job_ids.chunks(KEYED_LOOKUP_WIDTH) {
         let mut params = HashMap::with_capacity(chunk.len());
         let mut placeholders = String::new();
@@ -1169,8 +1183,9 @@ fn read_rows_for_jobs(
             params.insert(name, text(job_id));
         }
         let sql = format!("SELECT {columns} FROM {table} WHERE job_id IN ({placeholders})");
-        let (columns, rows, examined) =
+        let (answered_rows, examined) =
             select_rows_with_work(db, &sql, &params, read_memory.clone())?;
+        let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
         work.rows_examined = work.rows_examined.saturating_add(examined);
         if !rows.is_empty() {
             visit(&columns, &rows)?;
@@ -1182,16 +1197,19 @@ fn read_rows_for_jobs(
 fn job_row(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<JobSnapshot>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT * FROM work_jobs WHERE job_id = $job_id",
         &params,
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -1245,8 +1263,10 @@ pub fn job_snapshot(db: &Database, job_id: &str) -> Result<Option<JobSnapshot>> 
 pub fn job_snapshot_with_read_memory(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<JobSnapshot>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     job_row(db, job_id, read_memory.clone())
 }
 
@@ -1260,16 +1280,19 @@ struct ClaimRow {
 fn claim_rows(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<ClaimRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT attempt, node_id, lease_deadline FROM work_claims WHERE job_id = $job_id",
         &params,
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let attempt_idx = column_index(&columns, "attempt")?;
     let node_idx = column_index(&columns, "node_id")?;
     let lease_idx = column_index(&columns, "lease_deadline")?;
@@ -1287,16 +1310,19 @@ fn claim_rows(
 fn failure_attempts(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<i64>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT attempt, failed_at FROM work_failures WHERE job_id = $job_id",
         &params,
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let attempt_idx = column_index(&columns, "attempt")?;
     rows.iter()
         .map(|row| int_at(row, attempt_idx, "attempt"))
@@ -1306,32 +1332,38 @@ fn failure_attempts(
 fn cancellation_exists(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
-    let (_, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT job_id FROM work_cancellations WHERE job_id = $job_id",
         &params,
         read_memory.clone(),
     )?;
+    let rows = answered_rows.rows();
     Ok(!rows.is_empty())
 }
 
 fn result_exists(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
-    let (_, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT job_id FROM work_results WHERE job_id = $job_id",
         &params,
         read_memory.clone(),
     )?;
+    let rows = answered_rows.rows();
     Ok(!rows.is_empty())
 }
 
@@ -1358,15 +1390,17 @@ pub fn job_state_with_read_memory(
     db: &Database,
     job_id: &str,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<JobState> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let Some(job) = job_row(db, job_id, read_memory.clone())? else {
         return Err(Error::NotFound(format!("work ledger job {job_id}")));
     };
     let mut rows = LedgerJobRows {
         db,
         job_id,
-        read_memory: read_memory.clone(),
+        read_memory: (read_memory.clone()).into(),
     };
     state_of_job(&job, &mut rows, now_ms)
 }
@@ -1388,7 +1422,7 @@ trait JobStateRows {
 struct LedgerJobRows<'a> {
     db: &'a Database,
     job_id: &'a str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
 }
 
 impl JobStateRows for LedgerJobRows<'_> {
@@ -1425,9 +1459,8 @@ impl ReadSessionJobRows<'_> {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-        let result = self.session.execute(sql, params)?;
-        Ok((result.columns, result.rows))
+    ) -> Result<crate::QueryResult> {
+        self.session.execute(sql, params)
     }
 }
 
@@ -1435,30 +1468,33 @@ impl JobStateRows for ReadSessionJobRows<'_> {
     fn result_recorded(&mut self) -> Result<bool> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(self.job_id));
-        let (_, rows) = self.select_rows(
+        let answered_rows = self.select_rows(
             "SELECT job_id FROM work_results WHERE job_id = $job_id",
             &params,
         )?;
+    let rows = answered_rows.rows();
         Ok(!rows.is_empty())
     }
 
     fn cancellation_recorded(&mut self) -> Result<bool> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(self.job_id));
-        let (_, rows) = self.select_rows(
+        let answered_rows = self.select_rows(
             "SELECT job_id FROM work_cancellations WHERE job_id = $job_id",
             &params,
         )?;
+    let rows = answered_rows.rows();
         Ok(!rows.is_empty())
     }
 
     fn failed_attempts(&mut self) -> Result<Vec<i64>> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(self.job_id));
-        let (columns, rows) = self.select_rows(
+        let answered_rows = self.select_rows(
             "SELECT attempt FROM work_failures WHERE job_id = $job_id",
             &params,
         )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
         let attempt_idx = column_index(&columns, "attempt")?;
         rows.iter()
             .map(|row| int_at(row, attempt_idx, "attempt"))
@@ -1468,10 +1504,11 @@ impl JobStateRows for ReadSessionJobRows<'_> {
     fn claims(&mut self) -> Result<Vec<ClaimRow>> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(self.job_id));
-        let (columns, rows) = self.select_rows(
+        let answered_rows = self.select_rows(
             "SELECT attempt, node_id, lease_deadline FROM work_claims WHERE job_id = $job_id",
             &params,
         )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
         let attempt_idx = column_index(&columns, "attempt")?;
         let node_idx = column_index(&columns, "node_id")?;
         let lease_idx = column_index(&columns, "lease_deadline")?;
@@ -1590,8 +1627,10 @@ pub fn job_state_counts_with_read_memory(
     db: &Database,
     job_ids: &[impl AsRef<str>],
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<JobStateCounts> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let (counts, _work) =
         job_state_counts_with_work_with_read_memory(db, job_ids, now_ms, read_memory.clone())?;
     Ok(counts)
@@ -1616,8 +1655,10 @@ pub fn job_state_counts_with_work_with_read_memory(
     db: &Database,
     job_ids: &[impl AsRef<str>],
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(JobStateCounts, LedgerWork)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut counts = JobStateCounts::default();
     let mut work = LedgerWork::default();
     if job_ids.is_empty() {
@@ -1758,10 +1799,10 @@ pub mod read {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(job_id));
         let result = session.execute("SELECT * FROM work_jobs WHERE job_id = $job_id", &params)?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Ok(None);
         };
-        Ok(Some(job_snapshot_from_row(&result.columns, row)?))
+        Ok(Some(job_snapshot_from_row(result.columns(), row)?))
     }
 
     /// Compute one job's state through the supplied read session.
@@ -1799,26 +1840,26 @@ pub mod read {
         params.insert("job_id".to_string(), text(job_id));
         let result =
             session.execute("SELECT * FROM work_results WHERE job_id = $job_id", &params)?;
-        let Some(row) = result.rows.first() else {
+        let Some(row) = result.rows().first() else {
             return Ok(None);
         };
         Ok(Some(JobResult {
-            job_id: text_at(row, column_index(&result.columns, "job_id")?, "job_id")?,
-            attempt: int_at(row, column_index(&result.columns, "attempt")?, "attempt")?,
+            job_id: text_at(row, column_index(result.columns(), "job_id")?, "job_id")?,
+            attempt: int_at(row, column_index(result.columns(), "attempt")?, "attempt")?,
             executor_node_id: text_at(
                 row,
-                column_index(&result.columns, "executor_node_id")?,
+                column_index(result.columns(), "executor_node_id")?,
                 "executor_node_id",
             )?,
             output: decode_payload(&text_at(
                 row,
-                column_index(&result.columns, "output")?,
+                column_index(result.columns(), "output")?,
                 "output",
             )?)?,
-            receipt: json_at(row, column_index(&result.columns, "receipt")?, "receipt")?,
+            receipt: json_at(row, column_index(result.columns(), "receipt")?, "receipt")?,
             completed_at_ms: int_at(
                 row,
-                column_index(&result.columns, "completed_at")?,
+                column_index(result.columns(), "completed_at")?,
                 "completed_at",
             )?,
         }))
@@ -1846,17 +1887,20 @@ pub fn claimable_jobs_with_read_memory(
     advertised_tags: &[String],
     policy: &MovementPolicy,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<JobSnapshot>> {
-    let (columns, rows) = select_rows(
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let answered_rows = select_rows(
         db,
         "SELECT job_id FROM work_jobs",
         &HashMap::new(),
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let id_idx = column_index(&columns, "job_id")?;
     let mut matching = Vec::new();
-    for row in &rows {
+    for row in rows {
         let job_id = text_at(row, id_idx, "job_id")?;
         if job_state_with_read_memory(db, &job_id, now_ms, read_memory.clone())?
             != JobState::Pending
@@ -1919,10 +1963,12 @@ pub fn node_holds_claim_for_blob_with_read_memory(
     node_id: &str,
     hash: &BlobHash,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let target_hex = hash.to_hex();
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT job_id, attempt, lease_deadline FROM work_claims WHERE node_id = $node_id",
         &{
@@ -1932,10 +1978,11 @@ pub fn node_holds_claim_for_blob_with_read_memory(
         },
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let job_idx = column_index(&columns, "job_id")?;
     let attempt_idx = column_index(&columns, "attempt")?;
     let lease_idx = column_index(&columns, "lease_deadline")?;
-    for row in &rows {
+    for row in rows {
         let lease_deadline_ms = int_at(row, lease_idx, "lease_deadline")?;
         if lease_deadline_ms <= now_ms {
             continue;
@@ -1981,19 +2028,22 @@ pub fn any_node_holds_claim_for_blob_with_read_memory(
     db: &Database,
     hash: &BlobHash,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let target_hex = hash.to_hex();
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT job_id, attempt, lease_deadline FROM work_claims",
         &HashMap::new(),
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let job_idx = column_index(&columns, "job_id")?;
     let attempt_idx = column_index(&columns, "attempt")?;
     let lease_idx = column_index(&columns, "lease_deadline")?;
-    for row in &rows {
+    for row in rows {
         let lease_deadline_ms = int_at(row, lease_idx, "lease_deadline")?;
         if lease_deadline_ms <= now_ms {
             continue;
@@ -2051,10 +2101,12 @@ pub fn node_claim_permits_movement_with_read_memory(
     hash: &BlobHash,
     policy: MovementPolicy,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let target_hex = hash.to_hex();
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT job_id, attempt, lease_deadline FROM work_claims WHERE node_id = $node_id",
         &{
@@ -2064,10 +2116,11 @@ pub fn node_claim_permits_movement_with_read_memory(
         },
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let job_idx = column_index(&columns, "job_id")?;
     let attempt_idx = column_index(&columns, "attempt")?;
     let lease_idx = column_index(&columns, "lease_deadline")?;
-    for row in &rows {
+    for row in rows {
         let lease_deadline_ms = int_at(row, lease_idx, "lease_deadline")?;
         if lease_deadline_ms <= now_ms {
             continue;
@@ -2117,17 +2170,20 @@ pub fn blob_ref_retention_eligible_with_read_memory(
     hash: &BlobHash,
     now_ms: i64,
     grace_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let target_hex = hash.to_hex();
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT job_id FROM work_jobs",
         &HashMap::new(),
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let id_idx = column_index(&columns, "job_id")?;
-    for row in &rows {
+    for row in rows {
         let job_id = text_at(row, id_idx, "job_id")?;
         let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
@@ -2170,8 +2226,10 @@ pub fn next_attempt(db: &Database, job_id: &str) -> Result<i64> {
 pub fn next_attempt_with_read_memory(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<i64> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let highest_claim = claim_rows(db, job_id, read_memory.clone())?
         .iter()
         .map(|c| c.attempt)
@@ -2214,8 +2272,10 @@ pub fn insert_claim_with_read_memory(
     node_id: &str,
     lease_deadline_ms: i64,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ClaimInsert> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if let Some(holder) = claim_holder_with_read_memory(db, job_id, attempt, read_memory.clone())? {
         return Ok(ClaimInsert::AlreadyHeld { holder });
     }
@@ -2237,7 +2297,7 @@ pub fn insert_claim_with_read_memory(
         read_memory.clone(),
     );
     match inserted {
-        Ok(result) if result.rows_affected == 0 => {
+        Ok(result) if result.rows_affected() == 0 => {
             // A concurrent local claimant won the primary key.
             let holder = claim_holder_with_read_memory(db, job_id, attempt, read_memory.clone())?
                 .unwrap_or_default();
@@ -2264,16 +2324,19 @@ pub fn claim_holder_with_read_memory(
     db: &Database,
     job_id: &str,
     attempt: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("claim_key".to_string(), text(&claim_key(job_id, attempt)));
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT node_id FROM work_claims WHERE claim_key = $claim_key",
         &params,
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -2319,8 +2382,10 @@ pub fn record_result_with_read_memory(
     output: &[u8],
     receipt: serde_json::Value,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if job_result_with_read_memory(db, job_id, read_memory.clone())?.is_some() {
         return Ok(());
     }
@@ -2351,16 +2416,19 @@ pub fn job_result(db: &Database, job_id: &str) -> Result<Option<JobResult>> {
 pub fn job_result_with_read_memory(
     db: &Database,
     job_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<JobResult>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT * FROM work_results WHERE job_id = $job_id",
         &params,
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -2401,17 +2469,20 @@ pub fn record_failure_with_read_memory(
     node_id: &str,
     error: &str,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let key = failure_key(job_id, attempt);
     let mut probe = HashMap::new();
     probe.insert("failure_key".to_string(), text(&key));
-    let (_, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT failure_key FROM work_failures WHERE failure_key = $failure_key",
         &probe,
         read_memory.clone(),
     )?;
+    let rows = answered_rows.rows();
     if !rows.is_empty() {
         return Ok(());
     }
@@ -2451,8 +2522,10 @@ pub fn cancel_job_with_read_memory(
     requested_by: &str,
     reason: Option<&str>,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if cancellation_exists(db, job_id, read_memory.clone())? {
         return Ok(());
     }
@@ -2506,8 +2579,10 @@ pub fn advertise_capability_with_read_memory(
     capability_id: &str,
     tags: &[String],
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let key = capability_key(node_id, capability_id);
     let mut params = HashMap::new();
     params.insert("capability_key".to_string(), text(&key));
@@ -2537,19 +2612,22 @@ pub fn advertised_tags(db: &Database, node_id: &str) -> Result<Vec<String>> {
 pub fn advertised_tags_with_read_memory(
     db: &Database,
     node_id: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), text(node_id));
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT tags FROM work_capabilities WHERE node_id = $node_id",
         &params,
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let tags_idx = column_index(&columns, "tags")?;
     let mut union: Vec<String> = Vec::new();
-    for row in &rows {
+    for row in rows {
         for tag in string_list(&json_at(row, tags_idx, "tags")?, "tags")? {
             if !union.contains(&tag) {
                 union.push(tag);
@@ -2586,8 +2664,10 @@ pub fn materialize_inputs_with_read_memory(
     job_id: &str,
     node_id: &str,
     policy: &MovementPolicy,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ExecutionInputs> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let job = job_row(db, job_id, read_memory.clone())?;
     let mut declares_ledger_input = false;
     if let Some(job) = &job {
@@ -2617,12 +2697,13 @@ pub fn materialize_inputs_with_read_memory(
     }
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
-    let (columns, rows) = select_rows(
+    let answered_rows = select_rows(
         db,
         "SELECT seq, payload FROM work_inputs WHERE job_id = $job_id",
         &params,
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let seq_idx = column_index(&columns, "seq")?;
     let payload_idx = column_index(&columns, "payload")?;
     let mut inputs: ExecutionInputs = rows
@@ -2651,8 +2732,10 @@ fn terminal_since(
     db: &Database,
     job: &JobSnapshot,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<i64>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     match job_state_with_read_memory(db, &job.job_id, now_ms, read_memory.clone())? {
         JobState::Done => Ok(
             job_result_with_read_memory(db, &job.job_id, read_memory.clone())?
@@ -2661,12 +2744,13 @@ fn terminal_since(
         JobState::Cancelled => {
             let mut params = HashMap::new();
             params.insert("job_id".to_string(), text(&job.job_id));
-            let (columns, rows) = select_rows(
+            let answered_rows = select_rows(
                 db,
                 "SELECT cancelled_at FROM work_cancellations WHERE job_id = $job_id",
                 &params,
                 read_memory.clone(),
             )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
             let idx = column_index(&columns, "cancelled_at")?;
             rows.first()
                 .map(|row| int_at(row, idx, "cancelled_at"))
@@ -2675,15 +2759,16 @@ fn terminal_since(
         JobState::Failed => {
             let mut params = HashMap::new();
             params.insert("job_id".to_string(), text(&job.job_id));
-            let (columns, rows) = select_rows(
+            let answered_rows = select_rows(
                 db,
                 "SELECT failed_at FROM work_failures WHERE job_id = $job_id",
                 &params,
                 read_memory.clone(),
             )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
             let idx = column_index(&columns, "failed_at")?;
             let mut latest = None;
-            for row in &rows {
+            for row in rows {
                 let at = int_at(row, idx, "failed_at")?;
                 latest = Some(latest.map_or(at, |prev: i64| prev.max(at)));
             }
@@ -2708,17 +2793,20 @@ pub fn run_input_retention_with_read_memory(
     db: &Database,
     now_ms: i64,
     grace_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<usize> {
-    let (columns, rows) = select_rows(
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    let answered_rows = select_rows(
         db,
         "SELECT job_id FROM work_jobs",
         &HashMap::new(),
         read_memory.clone(),
     )?;
+    let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
     let id_idx = column_index(&columns, "job_id")?;
     let mut removed = 0usize;
-    for row in &rows {
+    for row in rows {
         let job_id = text_at(row, id_idx, "job_id")?;
         let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
             continue;
@@ -2736,7 +2824,7 @@ pub fn run_input_retention_with_read_memory(
             &params,
             read_memory.clone(),
         )?;
-        removed += result.rows_affected as usize;
+        removed += result.rows_affected() as usize;
     }
     Ok(removed)
 }
@@ -2764,8 +2852,10 @@ pub fn should_abandon_with_read_memory(
     attempt: i64,
     node_id: &str,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let _ = now_ms;
     if job_result_with_read_memory(db, job_id, read_memory.clone())?.is_some() {
         return Ok(true);

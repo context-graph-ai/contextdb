@@ -997,7 +997,7 @@ struct SealedHnswCharge {
     /// Falls while the generation is resident when its serving cache gives
     /// slots back; what remains is released when the generation goes.
     bytes: AtomicUsize,
-    accountant: Option<Arc<dyn MemoryBudget>>,
+    accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     _control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
@@ -1078,7 +1078,7 @@ impl SealedHnswGeneration {
         identity: VectorGraphGeneration,
         graph: HnswIndex,
         bytes: usize,
-        accountant: Option<Arc<dyn MemoryBudget>>,
+        accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Self {
         Self {
             identity,
@@ -1160,7 +1160,7 @@ impl Drop for StatementPartitions {
 
 /// A sealed generation taken apart: its graph, the bytes it was charged for,
 /// and the accountant that charge belongs to when one is still attached.
-type ReleasedSealedGeneration = (HnswIndex, usize, Option<Arc<dyn MemoryBudget>>);
+type ReleasedSealedGeneration = (HnswIndex, usize, Option<crate::memory_budget::MemoryBudgetOwner>);
 
 impl SealedHnswCharge {
     /// Return `bytes` of this charge to the budget while the generation stays
@@ -1184,7 +1184,7 @@ impl SealedHnswCharge {
         released
     }
 
-    fn disarm(mut self) -> (usize, Option<Arc<dyn MemoryBudget>>) {
+    fn disarm(mut self) -> (usize, Option<crate::memory_budget::MemoryBudgetOwner>) {
         let bytes = self.bytes.swap(0, Ordering::SeqCst);
         let accountant = self.accountant.take();
         (bytes, accountant)
@@ -1208,7 +1208,7 @@ impl Drop for SealedHnswCharge {
 /// for it from vector values after the index identity is gone.
 struct RetainedMemoryCharge {
     bytes: usize,
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
 }
 
 impl Drop for RetainedMemoryCharge {
@@ -1226,9 +1226,11 @@ struct PaidRetainedMemoryCharge {
     _control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 impl PaidRetainedMemoryCharge {
-    fn new(bytes: usize, accountant: Arc<dyn MemoryBudget>) -> Self {
+    fn new(bytes: usize, accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Self {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let invoice = accountant.control_invoice();
-        Self { charge: RetainedMemoryCharge { bytes, accountant }, _control_invoice: invoice }
+        Self { charge: RetainedMemoryCharge { bytes, accountant: accountant.into() }, _control_invoice: invoice }
     }
 }
 impl std::ops::Deref for PaidRetainedMemoryCharge {
@@ -1490,7 +1492,7 @@ pub struct DormantVectorGraphGeneration {
 pub struct LoadedVectorGraphGeneration {
     pub graph: HnswIndex,
     pub resident_bytes: usize,
-    pub accountant: Arc<dyn MemoryBudget>,
+    pub accountant: crate::memory_budget::MemoryBudgetOwner,
     /// Resident bytes transferred from the active caller's temporary
     /// reservation. A retained file reader reserves cache residency directly
     /// against its session accountant, so this is zero for that path.
@@ -1517,7 +1519,7 @@ impl LoadedVectorGraphGeneration {
 pub struct LoadedVectorFreshTail {
     pub graph: HnswIndex,
     pub resident_bytes: usize,
-    pub accountant: Arc<dyn MemoryBudget>,
+    pub accountant: crate::memory_budget::MemoryBudgetOwner,
     /// Highest durable journal LSN represented by this replay image. Hot
     /// commits at or below it were persisted before their in-memory apply and
     /// must not be inserted a second time after this image is published.
@@ -1974,7 +1976,7 @@ impl QuerySourceControl {
         owner.reserve(contextdb_tx::staged_source::source_arc_layout::<VectorCopyAdmission>().size())?;
         Ok(Self(Some(Arc::new(owner))))
     }
-    pub fn funder(&self) -> Arc<dyn MemoryBudget> {
+    pub fn funder(&self) -> crate::memory_budget::MemoryBudgetOwner {
         self.0.as_ref().expect("live query source control").funder()
     }
     pub fn visit_retained_copy_credit(&self, caller: &dyn MemoryBudget,
@@ -2216,7 +2218,7 @@ pub struct LoadedRawVectorPartition {
     pub entries: Vec<LoadedRawVectorEntry>,
     pub resident_bytes: usize,
     pub workspace_owner: VectorCopyAdmission,
-    pub accountant: Arc<dyn MemoryBudget>,
+    pub accountant: crate::memory_budget::MemoryBudgetOwner,
 }
 
 pub(crate) struct HistoricalRawVectorPartition {
@@ -2337,7 +2339,7 @@ fn load_co_created_fixture_carriers(
 pub struct LoadedRawVectorCandidate {
     entry: VectorEntry,
     transient_bytes: usize,
-    loader_accountant: Option<Arc<dyn MemoryBudget>>,
+    loader_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
 }
 
 impl LoadedRawVectorCandidate {
@@ -2345,8 +2347,10 @@ impl LoadedRawVectorCandidate {
     pub fn loader_charged(
         entry: VectorEntry,
         transient_bytes: usize,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Self {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         Self {
             entry,
             transient_bytes,
@@ -3065,7 +3069,7 @@ impl Drop for PagedBuildOperation {
 pub struct WriterVectorTail {
     graph: Option<HnswIndex>,
     bytes: usize,
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
     metadata_bytes: usize,
     sealed_identity: Option<VectorGraphGeneration>,
     replayed_through_lsn: u64,
@@ -3076,14 +3080,14 @@ pub struct WriterVectorTail {
 }
 
 impl WriterVectorTail {
-    pub fn take_metadata_charge(&mut self) -> (Arc<dyn MemoryBudget>, usize) {
+    pub fn take_metadata_charge(&mut self) -> (crate::memory_budget::MemoryBudgetOwner, usize) {
         (
             self.accountant.clone(),
             std::mem::take(&mut self.metadata_bytes),
         )
     }
     pub fn admit_metadata(&mut self, bytes: usize) -> Result<()> {
-        self.accountant.try_allocate_for(
+        self.accountant.try_allocate_for_static(
             bytes,
             "vector_index",
             "detach_writer_tail",
@@ -3093,9 +3097,11 @@ impl WriterVectorTail {
         Ok(())
     }
 
-    pub fn reattach_budget(&mut self, accountant: Arc<dyn MemoryBudget>) -> Result<()> {
+    pub fn reattach_budget(&mut self, accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         if !crate::memory_budget::same_funder(self.accountant.as_ref(), accountant.as_ref()) {
-            accountant.try_allocate_for(
+            accountant.try_allocate_for_static(
                 self.bytes + self.metadata_bytes,
                 "vector_index",
                 "reattach_writer_tail",
@@ -3141,7 +3147,7 @@ pub struct IndexState {
     raw_residency_gate: Arc<RwLock<()>>,
     raw_resident: AtomicBool,
     raw_resident_bytes: AtomicUsize,
-    raw_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
+    raw_accountant: RwLock<Option<crate::memory_budget::MemoryBudgetOwner>>,
     raw_payload_counter: RwLock<Arc<AtomicUsize>>,
     raw_payload_header_counter: RwLock<Arc<AtomicUsize>>,
     /// This state still owns the map key and raw historical directory.  The
@@ -3158,7 +3164,7 @@ pub struct IndexState {
     pending_marks: Mutex<ResidentPendingMarks>,
     hnsw: OnceLock<RwLock<Option<HnswIndex>>>,
     hnsw_bytes: AtomicUsize,
-    hnsw_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
+    hnsw_accountant: RwLock<Option<crate::memory_budget::MemoryBudgetOwner>>,
     serving_policy: RwLock<Option<VectorServingPolicy>>,
     inspection_generation_id: AtomicU64,
     inspection_base_tx: AtomicU64,
@@ -3596,10 +3602,19 @@ impl IndexState {
                 return;
             }
         }
+        Self::attach_limit_with_prepared_key(this, ledger, directory, Arc::new(key.clone()));
+    }
+
+    // Erasure supplies an already admitted key and preallocated ledger buckets.
+    fn attach_limit_with_prepared_key(
+        this: &Arc<Self>,
+        ledger: &Arc<PartitionLimitLedger>,
+        directory: &Arc<DirectoryTally>,
+        key: Arc<VectorPartitionKey>,
+    ) {
         this.detach_limit();
         let mut link = this.limit_link.lock();
         let weak = Arc::downgrade(this);
-        let key = Arc::new(key.clone());
         let class = this.limit_class();
         ledger.apply(&weak, &key, PartitionLimitClass::NotCounted, class);
         let bytes = this.directory_byte_count();
@@ -4104,7 +4119,7 @@ impl IndexState {
             let identity = source
                 .identity_by_row_lsn(row_id, lsn, &mut || true, &mut metadata)?
                 .ok_or_else(|| Error::StoreCorrupted {
-                    path: format!("vector index {}.{}", index.table, index.column),
+                    path: format!("vector index {}.{}", index.table, index.column).into(),
                     reason: "durable membership interval has no body identity".into(),
                 })?;
             let mut scratch = copy_owner.scratch();
@@ -4209,7 +4224,7 @@ impl IndexState {
             let identity = source
                 .identity_by_row_lsn(row_id, lsn, &mut || true, &mut metadata)?
                 .ok_or_else(|| Error::StoreCorrupted {
-                    path: format!("vector index {}.{}", index.table, index.column),
+                    path: format!("vector index {}.{}", index.table, index.column).into(),
                     reason: "durable change suffix names a membership the directory lacks".into(),
                 })?;
             let mut scratch = copy_owner.scratch();
@@ -4873,7 +4888,7 @@ impl IndexState {
         let mut directory_owner = owner.scratch();
         let expected = {
             let directory = self.raw_directory.read();
-            directory_owner.reserve_for(
+            directory_owner.reserve_for_static(
                 directory
                     .len()
                     .checked_mul(std::mem::size_of::<RawVectorDirectoryEntry>())
@@ -4905,7 +4920,7 @@ impl IndexState {
         }
         drop(expected);
         drop(directory_owner);
-        loaded.workspace_owner.reserve_for(
+        loaded.workspace_owner.reserve_for_static(
             loaded
                 .entries
                 .len()
@@ -4979,7 +4994,7 @@ impl IndexState {
                 .len()
                 .checked_mul(std::mem::size_of::<RawVectorDirectoryEntry>())
                 .ok_or_else(|| Error::Other("raw hydration directory capacity overflow".into()))?;
-            directory_owner.reserve_for(
+            directory_owner.reserve_for_static(
                 bytes,
                 "vector_copy",
                 "load_raw_vector_directory",
@@ -5022,7 +5037,7 @@ impl IndexState {
         let header_bytes = entries
             .len()
             .saturating_mul(crate::quantized::shared_payload_header_bytes());
-        if let Err(error) = accountant.try_allocate_for(
+        if let Err(error) = accountant.try_allocate_for_static(
             header_bytes,
             "vector_index",
             "load_raw_vector_headers",
@@ -5100,10 +5115,12 @@ impl IndexState {
 
     fn attach_raw_accounting(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         counter: Arc<AtomicUsize>,
         header_counter: Arc<AtomicUsize>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let mut owner = self.raw_accountant.write();
         if owner.is_some()
             && self.raw_resident.load(Ordering::SeqCst)
@@ -6524,6 +6541,12 @@ impl IndexState {
             .as_deref()
             .or(fallback_accountant)
             .map(|accountant| {
+                if let Some(original) = recorded_accountant.as_ref() {
+                    let operation = crate::memory_budget::prepare_operation_label(original,
+                        format_args!("extend_hnsw@{}.{}", index.table, index.column))?;
+                    return accountant.try_allocate_for_label(additional_bytes, "vector_index", operation,
+                        "Reduce vector volume or raise MEMORY_LIMIT so committed vectors remain on the maintained indexed route.");
+                }
                 accountant.try_allocate_for(
                     additional_bytes,
                     "vector_index",
@@ -7719,7 +7742,7 @@ impl IndexState {
             Self::release_uninstalled_loaded_generation(LoadedVectorGraphGeneration {
                 graph,
                 resident_bytes,
-                accountant,
+                accountant: accountant.into(),
                 caller_adopted_bytes: 0,
                 fresh_tail,
             });
@@ -7732,7 +7755,7 @@ impl IndexState {
             Self::release_uninstalled_loaded_generation(LoadedVectorGraphGeneration {
                 graph,
                 resident_bytes,
-                accountant,
+                accountant: accountant.into(),
                 caller_adopted_bytes: 0,
                 fresh_tail,
             });
@@ -9290,9 +9313,11 @@ impl IndexState {
     /// base/change chain, so reads keep using it while construction runs.
     fn begin_sampled_hnsw_maintenance(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         policy: ResolvedVectorPolicy,
     ) -> Result<Option<(TxId, Lsn)>> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         if let Some(frontier) = self.sampled_maintenance_frontier() {
             return Ok(Some(frontier));
         }
@@ -9330,7 +9355,7 @@ impl IndexState {
             self.quantization,
             policy.hnsw_m,
         );
-        accountant.try_allocate_for(
+        accountant.try_allocate_for_static(
             empty_bytes,
             "vector_index",
             "begin_sampled_hnsw_maintenance",
@@ -9617,11 +9642,13 @@ impl IndexState {
         &self,
         hnsw: HnswIndex,
         bytes: usize,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         policy: ResolvedVectorPolicy,
         sample_tx: TxId,
         sample_lsn: Lsn,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let _publication = self.generation_publication.lock();
         let mut sealed = self.sealed_hnsw.write();
         let mut greatest_generation = self.inspection_generation_id.load(Ordering::SeqCst);
@@ -9745,8 +9772,10 @@ impl IndexState {
     pub(crate) fn set_hnsw_bytes_with_accountant(
         &self,
         bytes: usize,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.hnsw_bytes.store(bytes, Ordering::SeqCst);
         *self.hnsw_accountant.write() = Some(accountant);
     }
@@ -9819,7 +9848,7 @@ impl IndexState {
             self.quantization,
             policy.hnsw_m,
         );
-        accountant.try_allocate_for(
+        accountant.try_allocate_for_static(
             empty_bytes,
             "vector_index",
             "prepare_vector_generation",
@@ -9879,9 +9908,11 @@ impl IndexState {
     #[doc(hidden)]
     pub(crate) fn initialize_empty_fresh_tail(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         policy: ResolvedVectorPolicy,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let _publication = self.generation_publication.lock();
         if self.hnsw.get().is_some_and(|tail| tail.read().is_some()) {
             return Ok(());
@@ -9892,7 +9923,7 @@ impl IndexState {
             self.quantization,
             policy.hnsw_m,
         );
-        accountant.try_allocate_for(
+        accountant.try_allocate_for_static(
             bytes,
             "vector_index",
             "initialize_vector_tail",
@@ -10787,7 +10818,7 @@ struct PreparedDirectoryCharges {
 }
 
 impl PreparedDirectoryCharges {
-    fn owner(&self, index: &VectorIndexRef) -> Option<Arc<dyn MemoryBudget>> {
+    fn owner(&self, index: &VectorIndexRef) -> Option<crate::memory_budget::MemoryBudgetOwner> {
         self.store
             .as_ref()
             .or_else(|| self.indexes.get(index))
@@ -10807,8 +10838,10 @@ impl PreparedDirectoryReservation {
         }
     }
 
-    fn reserve(accountant: Arc<dyn MemoryBudget>, bytes: usize) -> Result<Self> {
-        accountant.try_allocate_for(
+    fn reserve(accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>, bytes: usize) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        accountant.try_allocate_for_static(
             bytes,
             "vector_index",
             "prepare_vector_directory_growth",
@@ -10823,9 +10856,11 @@ impl PreparedDirectoryReservation {
     fn reserve_index(
         &self,
         index: VectorIndexRef,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         bytes: usize,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let reservation = Self::reserve(accountant, bytes)?;
         self.index_charges.lock().insert(
             index,
@@ -11115,11 +11150,15 @@ struct VectorColumnState {
     // Registry removal may leave other Arc holders; their allocation remains
     // charged until this field drops with the final column holder.
     registry_copy_bytes: AtomicUsize,
+    // Native counted-empty capacity prepaid by an erasure publication.
+    erasure_ledger_bytes: AtomicUsize,
     directory_accounting: Mutex<PaidRetainedMemoryCharge>,
 }
 
 impl VectorColumnState {
-    fn new(layout: VectorIndexLayout, declared_owner: Arc<dyn MemoryBudget>) -> Self {
+    fn new(layout: VectorIndexLayout, declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Self {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let mut partitions = BTreeMap::new();
         if !layout.is_partitioned() {
             partitions.insert(
@@ -11139,6 +11178,7 @@ impl VectorColumnState {
             derived: AtomicBool::new(true),
             failed_partitions: Mutex::new(FailedPartitions::default()),
             registry_copy_bytes: AtomicUsize::new(0),
+            erasure_ledger_bytes: AtomicUsize::new(0),
             directory_accounting: Mutex::new(PaidRetainedMemoryCharge::new(0, declared_owner)),
         };
         for (key, state) in column.partitions.read().iter() {
@@ -11150,7 +11190,9 @@ impl VectorColumnState {
     /// A replacement image under preparation. It may hold states that the
     /// live column it replaces still owns, so it keeps no derived figures
     /// until `go_live`.
-    fn new_staged(layout: VectorIndexLayout, declared_owner: Arc<dyn MemoryBudget>) -> Self {
+    fn new_staged(layout: VectorIndexLayout, declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Self {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let column = Self::new(layout, declared_owner);
         for state in column.partitions.read().values() {
             state.detach_limit_from(&column.limit_ledger);
@@ -11353,7 +11395,7 @@ impl VectorColumnState {
         let mut retained = self.directory_accounting.lock();
         if retained
             .accountant
-            .try_allocate_for(
+            .try_allocate_for_static(
                 bytes,
                 "vector_index",
                 "record_partition_failure",
@@ -12124,6 +12166,7 @@ impl VectorColumnState {
     fn directory_fixed_bytes(&self, index: &VectorIndexRef) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.registry_copy_bytes.load(Ordering::SeqCst))
+            .saturating_add(self.erasure_ledger_bytes.load(Ordering::SeqCst))
             .saturating_add(index.table.capacity())
             .saturating_add(index.column.capacity())
             .saturating_add(self.layout.read().estimated_bytes())
@@ -12137,6 +12180,7 @@ impl VectorColumnState {
         let mut ownership = VectorDirectoryOwnership {
             partition_vectors: std::mem::size_of::<Self>()
                 .saturating_add(self.registry_copy_bytes.load(Ordering::SeqCst))
+                .saturating_add(self.erasure_ledger_bytes.load(Ordering::SeqCst))
                 .saturating_add(index.table.capacity())
                 .saturating_add(index.column.capacity())
                 .saturating_add(layout_bytes),
@@ -12600,7 +12644,7 @@ impl VectorRegistry {
                 })
                 .ok_or_else(|| Error::Other("vector registry allocation overflow".into()))?;
             let accountant = column.directory_accounting.lock().accountant.clone();
-            accountant.try_allocate_for(
+            accountant.try_allocate_for_static(
                 bytes,
                 "vector_index",
                 "prepare_vector_registry_growth",
@@ -12743,7 +12787,7 @@ pub struct PreparedVectorIndexRename<'a> {
     reverse: Option<NativeSourceArc<dyn RawVectorReverseMembershipSource>>,
     registry_directories: Vec<PreparedRegistryDirectoryCharge>,
     displaced: Option<Arc<VectorColumnState>>,
-    removal_accountant: Option<Arc<dyn MemoryBudget>>,
+    removal_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     // Drop preparation allocations before returning their statement credit.
     owner: VectorCopyAdmission,
     _rename_guard: RegistryRenameThreadGuard<'a>,
@@ -12837,7 +12881,7 @@ pub struct VectorStore {
     /// Allocation headers remain visible in raw metadata receipts even when
     /// only a holder outside the registry retains the shared body.
     raw_payload_header_bytes: Arc<AtomicUsize>,
-    memory_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
+    memory_accountant: RwLock<Option<crate::memory_budget::MemoryBudgetOwner>>,
     /// Present on a durable-membership store: every column declared after
     /// open is created with its durable sources.
     durable_columns: RwLock<Option<NativeSourceArc<dyn DurableRawColumnFactory>>>,
@@ -12881,7 +12925,7 @@ impl VectorTeardownReceipt {
 pub struct PreparedLoadedVectorReplacement<'a> {
     destination: &'a VectorStore,
     registry: VectorRegistry,
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
 }
 
 impl PreparedLoadedVectorReplacement<'_> {
@@ -12904,9 +12948,14 @@ impl PreparedLoadedVectorReplacement<'_> {
     }
 }
 
-/// A fully constructed vector registry.  Received-schema staging creates this
-/// before durability so publishing it cannot reconfigure an index, quantize a
-/// vector, or allocate registry entries after Redb commits.
+struct PreparedErasurePartitionLink {
+    column: Arc<VectorColumnState>,
+    state: Arc<IndexState>,
+    key: Arc<VectorPartitionKey>,
+}
+
+/// A fully constructed vector registry or existing-cell erasure delta.
+/// Staging funds all allocations before durable publication.
 pub struct PreparedVectorPublication {
     registry: VectorRegistry,
     /// State handles borrowed from the live registry because authoritative
@@ -12917,6 +12966,12 @@ pub struct PreparedVectorPublication {
     // Declaration-only publication retains an entire column by identity. A
     // column-count-sized carrier avoids gathering all of its partition ids.
     preserved_columns: Vec<usize>,
+    // Erasure replaces existing cells only. The registry is a selected delta,
+    // never a full replacement catalog in this mode.
+    existing_cells_only: bool,
+    purge_links: Vec<PreparedErasurePartitionLink>,
+    // Last field: all prepared payloads and native containers die first.
+    purge_workspace: Option<VectorCopyAdmission>,
 }
 
 impl PreparedVectorPublication {
@@ -12925,14 +12980,29 @@ impl PreparedVectorPublication {
             registry,
             preserved_states: HashSet::new(),
             preserved_columns: Vec::new(),
+            existing_cells_only: false,
+            purge_links: Vec::new(),
+            purge_workspace: None,
         }
     }
 
-    fn into_parts(mut self) -> (VectorRegistry, HashSet<usize>, Vec<usize>) {
+    fn into_parts(
+        mut self,
+    ) -> (
+        VectorRegistry,
+        HashSet<usize>,
+        Vec<usize>,
+        bool,
+        Vec<PreparedErasurePartitionLink>,
+        Option<VectorCopyAdmission>,
+    ) {
         (
             std::mem::take(&mut self.registry),
             std::mem::take(&mut self.preserved_states),
             std::mem::take(&mut self.preserved_columns),
+            self.existing_cells_only,
+            std::mem::take(&mut self.purge_links),
+            self.purge_workspace.take(),
         )
     }
 
@@ -13106,12 +13176,34 @@ impl VectorStore {
     #[doc(hidden)]
     pub fn reserve_workspace(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         bytes: usize,
         operation: &str,
         hint: &str,
     ) -> Result<VectorWorkspaceReservation> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         VectorWorkspaceReservation::try_new(
+            accountant,
+            self.workspace_bytes.clone(),
+            bytes,
+            operation,
+            hint,
+        )
+    }
+
+    /// Static labels keep their original lifetime through workspace admission.
+    #[doc(hidden)]
+    pub fn reserve_workspace_static(
+        &self,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+        bytes: usize,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<VectorWorkspaceReservation> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        VectorWorkspaceReservation::try_new_static(
             accountant,
             self.workspace_bytes.clone(),
             bytes,
@@ -13226,6 +13318,21 @@ impl VectorStore {
             .lock()
             .get(partition)
             .is_some_and(|slot| slot.requested_vectors().is_some())
+    }
+
+    /// Observe insertion inside a pending paged batch using the existing
+    /// armed pause, without publishing unfinished maintenance progress.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn maybe_pause_paged_build_insertion_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        done: usize,
+    ) {
+        let slot = self.maintenance_progress_pauses.lock().get(partition).cloned();
+        if let Some(slot) = slot {
+            slot.pause_after(done);
+        }
     }
 
     /// Arm one partition's next maintenance build to pause after the requested
@@ -13362,8 +13469,10 @@ impl VectorStore {
     pub fn prepare_received_schema_publication(
         schemas: Vec<(VectorIndexRef, usize, VectorQuantization)>,
         entries: Vec<VectorEntry>,
-        declared_owner: Arc<dyn MemoryBudget>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<PreparedVectorPublication> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let mut registry = VectorRegistry::new();
         for (index, dimension, quantization) in schemas {
             registry.try_insert(
@@ -13398,7 +13507,7 @@ impl VectorStore {
         }
         for (index, column) in &registry {
             let bytes = column.directory_retained_bytes(index);
-            declared_owner.try_allocate_for(
+            declared_owner.try_allocate_for_static(
                 bytes,
                 "vector_index",
                 "prepare_vector_directory_growth",
@@ -13416,9 +13525,11 @@ impl VectorStore {
         &self,
         schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
         entries: Vec<PartitionedVectorEntry>,
-        declared_owner: Arc<dyn MemoryBudget>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         mut owner: VectorCopyAdmission,
     ) -> Result<PreparedVectorPublication> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let mut bytes = std::mem::size_of::<PreparedVectorPublication>().saturating_add(
             3 * (2 * std::mem::size_of::<usize>() + std::mem::size_of::<AtomicUsize>()),
         );
@@ -13498,7 +13609,7 @@ impl VectorStore {
     // This helper has no public copy door: callers reserve the complete
     // candidate before entering, then adopt its retained charge on success.
     fn prepare_partitioned_received_schema_admitted(
-        schemas: Vec<(VectorIndexRef, VectorIndexLayout, Arc<dyn MemoryBudget>)>,
+        schemas: Vec<(VectorIndexRef, VectorIndexLayout, crate::memory_budget::MemoryBudgetOwner)>,
         mut entries: Vec<PartitionedVectorEntry>,
     ) -> Result<PreparedVectorPublication> {
         // The caller admitted this whole candidate before entering. Sorting
@@ -13638,9 +13749,12 @@ impl VectorStore {
         schemas: Vec<(VectorIndexRef, usize, VectorQuantization)>,
         entries: Vec<VectorEntry>,
         materialized_indexes: Vec<VectorIndexRef>,
-        accountant: Arc<dyn MemoryBudget>,
-        declared_owner: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<PreparedVectorPublication> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let publication =
             Self::prepare_received_schema_publication(schemas, entries, declared_owner)?;
         for index in materialized_indexes {
@@ -13664,15 +13778,241 @@ impl VectorStore {
         Ok(publication)
     }
 
+    /// Internal erasure bridge. Copy only declarations in the selected tables;
+    /// all other registry cells, sources, policies and graph owners stay put.
+    #[doc(hidden)]
+    pub fn copy_erasure_layouts(
+        &self,
+        selected_table: impl Fn(&str) -> bool,
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<Vec<(VectorIndexRef, VectorIndexLayout)>> {
+        self.with_bulk_read(|| {
+            let registry = self.registry.read();
+            let count = registry
+                .keys()
+                .filter(|index| selected_table(&index.table))
+                .count();
+            owner.reserve(
+                count.saturating_mul(std::mem::size_of::<(VectorIndexRef, VectorIndexLayout)>()),
+            )?;
+            let mut layouts = Vec::with_capacity(count);
+            for (index, column) in registry
+                .iter()
+                .filter(|(index, _)| selected_table(&index.table))
+            {
+                let layout = column.layout.read();
+                owner.reserve(
+                    index
+                        .table
+                        .len()
+                        .saturating_add(index.column.len())
+                        .saturating_add(layout.estimated_bytes()),
+                )?;
+                layouts.push((index.clone(), layout.clone()));
+            }
+            Ok(layouts)
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn erasure_partition_has_materialized_hnsw(&self, partition: &VectorPartitionRef) -> bool {
+        self.with_bulk_read(|| {
+            self.registry
+                .read()
+                .get(&partition.index)
+                .and_then(|column| column.partition_state(&partition.partition_key))
+                .is_some_and(|state| state.hnsw_len().is_some())
+        })
+    }
+
+    /// Prepare a complete selected-table delta before durability. No registry
+    /// entry may be added by erasure; publication uses existing-cell swaps.
+    #[doc(hidden)]
+    pub fn prepare_selected_authoritative_purge_publication(
+        &self,
+        schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
+        entries: Vec<PartitionedVectorEntry>,
+        affected_partitions: Vec<VectorPartitionRef>,
+        materialized_partitions: Vec<VectorPartitionRef>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+        owner: &mut VectorCopyAdmission,
+    ) -> Result<PreparedVectorPublication> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        let mut workspace = owner.scratch();
+        // Bound simultaneous native maps/sets, their growth overlap, copied
+        // keys, partition snapshots, column headers and row reverse maps.
+        // Retained output directories and graphs get their standing owners
+        // separately in the common preparation kernel.
+        self.with_bulk_read(|| -> Result<()> {
+            let live = self.registry.read();
+            for (index, layout) in &schemas {
+                let column = live.get(index).ok_or_else(|| Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })?;
+                if *column.layout.read() != *layout {
+                    return Err(Error::Other(
+                        "vector erasure declaration changed during preparation".into(),
+                    ));
+                }
+                let fixed = std::mem::size_of::<VectorColumnState>()
+                    .saturating_add(2 * std::mem::size_of::<usize>())
+                    .saturating_add(layout.estimated_bytes())
+                    .saturating_add(index.table.len())
+                    .saturating_add(index.column.len())
+                    .saturating_add(std::mem::size_of::<(VectorIndexRef, PartitionKeySet)>());
+                workspace.reserve(
+                    fixed
+                        .saturating_add(column.directory_retained_bytes(index))
+                        .saturating_mul(16),
+                )?;
+                for (key, state) in column.partitions.read().iter() {
+                    let identity = std::mem::size_of::<(VectorPartitionRef, usize)>()
+                        .saturating_add(index.table.len())
+                        .saturating_add(index.column.len())
+                        .saturating_add(key.estimated_bytes());
+                    workspace.reserve(
+                        identity.saturating_mul(16).saturating_add(
+                            state.entry_count().saturating_mul(
+                                16 * (std::mem::size_of::<(RowId, Arc<VectorPartitionKey>)>()
+                                    .saturating_add(key.estimated_bytes())),
+                            ),
+                        ),
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        // A new key in an affected partition need not already be resident.
+        for entry in &entries {
+            workspace.reserve(
+                std::mem::size_of::<(VectorPartitionRef, usize)>()
+                    .saturating_add(entry.entry.index.table.len())
+                    .saturating_add(entry.entry.index.column.len())
+                    .saturating_add(entry.partition_key.estimated_bytes())
+                    .saturating_mul(16)
+                    .saturating_add(32 * std::mem::size_of::<StoredVectorEntry>())
+                    .saturating_add(16 * crate::quantized::shared_payload_header_bytes())
+                    .saturating_add(
+                        entry
+                            .entry
+                            .vector
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<f32>())
+                            .saturating_mul(2),
+                    ),
+            )?;
+        }
+        let mut publication = self.prepare_partitioned_authoritative_purge_publication(
+            schemas,
+            entries,
+            affected_partitions,
+            materialized_partitions,
+            accountant,
+            &mut workspace,
+        )?;
+        // The ordinary go_live path clones link keys and may grow the
+        // counted-empty ledger. Prepare those allocations without reparenting
+        // a preserved state away from the live column before durability.
+        let link_count = publication
+            .registry
+            .values()
+            .map(|column| column.partitions.read().len())
+            .sum::<usize>();
+        workspace.reserve(
+            link_count.saturating_mul(std::mem::size_of::<PreparedErasurePartitionLink>()),
+        )?;
+        publication.purge_links = Vec::with_capacity(link_count);
+        for column in publication.registry.values() {
+            let partitions = column.partitions.read();
+            let ledger_bytes = row_placement_map_bytes::<
+                usize,
+                (Weak<IndexState>, Arc<VectorPartitionKey>),
+            >(partitions.len().saturating_mul(2));
+            let accountant = column.directory_accounting.lock().accountant.clone();
+            accountant.try_allocate_for_static(
+                ledger_bytes,
+                "vector_index",
+                "prepare_purge_partition_ledger",
+                "Reduce selected vector partitions or raise MEMORY_LIMIT before purge.",
+            )?;
+            let mut ledger_charge = PaidRetainedMemoryCharge::new(ledger_bytes, accountant);
+            let mut tally = column.limit_ledger.tally.lock();
+            tally.empty_counted.reserve(partitions.len());
+            let actual = row_placement_map_bytes::<
+                usize,
+                (Weak<IndexState>, Arc<VectorPartitionKey>),
+            >(tally.empty_counted.capacity());
+            assert!(
+                actual <= ledger_bytes,
+                "prepaid erasure ledger covers native buckets"
+            );
+            drop(tally);
+            column.erasure_ledger_bytes.store(actual, Ordering::SeqCst);
+            column.directory_accounting.lock().bytes += actual;
+            ledger_charge.bytes -= actual;
+            for (key, state) in partitions.iter() {
+                workspace.reserve(
+                    key.estimated_bytes()
+                        .saturating_add(2 * std::mem::size_of::<usize>()),
+                )?;
+                publication.purge_links.push(PreparedErasurePartitionLink {
+                    column: column.clone(),
+                    state: state.clone(),
+                    key: Arc::new(key.clone()),
+                });
+                if publication
+                    .preserved_states
+                    .contains(&(Arc::as_ptr(state) as usize))
+                    || !state.raw_resident.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
+                // These rebuilt states own fresh inline payloads. Adopt their
+                // exact standing body charge before durability, including abort.
+                let accountant = column.directory_accounting.lock().accountant.clone();
+                let bytes = state
+                    .vectors
+                    .read()
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.vector.payload_is_charged())
+                    .fold(0usize, |bytes, entry| {
+                        bytes
+                            .saturating_add(entry.estimated_bytes())
+                            .saturating_add(entry.vector.payload_header_bytes())
+                    });
+                accountant.try_allocate_for_static(
+                    bytes,
+                    "vector_index",
+                    "prepare_purge_vector_bodies",
+                    "Reduce selected vector bodies or raise MEMORY_LIMIT before purge.",
+                )?;
+                let mut charge = PaidRetainedMemoryCharge::new(bytes, accountant.clone());
+                state.attach_raw_accounting(
+                    accountant,
+                    self.raw_payload_bytes.clone(),
+                    self.raw_payload_header_bytes.clone(),
+                );
+                charge.bytes = 0;
+            }
+        }
+        publication.existing_cells_only = true;
+        publication.purge_workspace = Some(workspace);
+        Ok(publication)
+    }
+
     pub fn prepare_partitioned_authoritative_purge_publication(
         &self,
         schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
         entries: Vec<PartitionedVectorEntry>,
         affected_partitions: Vec<VectorPartitionRef>,
         materialized_partitions: Vec<VectorPartitionRef>,
-        _accountant: Arc<dyn MemoryBudget>,
+        _accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<PreparedVectorPublication> {
+        let _accountant: crate::memory_budget::MemoryBudgetOwner = _accountant.into();
+
         let affected_partitions = affected_partitions.into_iter().collect::<HashSet<_>>();
         let mut registry = VectorRegistry::new();
         let mut requested = HashMap::<VectorIndexRef, PartitionKeySet>::new();
@@ -13725,8 +14065,8 @@ impl VectorStore {
         // for the exact survivor count and cap calculation.
         self.with_bulk_read(|| -> Result<()> {
             let current_registry = self.registry.read();
-            for (index, current_column) in current_registry.iter() {
-                let Some(replacement_column) = registry.get(index) else {
+            for (index, replacement_column) in registry.iter() {
+                let Some(current_column) = current_registry.get(index) else {
                     continue;
                 };
                 if current_column.layout() != replacement_column.layout() {
@@ -13854,6 +14194,9 @@ impl VectorStore {
             registry,
             preserved_states,
             preserved_columns: Vec::new(),
+            existing_cells_only: false,
+            purge_links: Vec::new(),
+            purge_workspace: None,
         };
         for partition in materialized_partitions {
             if !affected_partitions.contains(&partition) {
@@ -13911,7 +14254,7 @@ impl VectorStore {
         for (index, column) in &publication.registry {
             let retained = self.retained_column_copy_owner(index, owner)?;
             let bytes = column.directory_retained_bytes(index);
-            retained.accountant().try_allocate_for(
+            retained.accountant().try_allocate_for_static(
                 bytes,
                 "vector_index",
                 "prepare_purge_vector_directory",
@@ -13926,11 +14269,13 @@ impl VectorStore {
         index: &VectorIndexRef,
         state: &Arc<IndexState>,
         policy: ResolvedVectorPolicy,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         mut workspace: VectorCopyAdmission,
         after_reservation: impl FnOnce(),
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let entry_count = state.vector_count();
         let final_bytes = HnswIndex::estimated_resident_bytes_with_m(
             entry_count,
@@ -13944,16 +14289,17 @@ impl VectorStore {
             state.quantization(),
             policy,
         );
-        workspace.reserve_for(
+        workspace.reserve_for_static(
             reservation_bytes.saturating_sub(final_bytes),
             "vector_index",
             "prepare_authoritative_purge_hnsw_workspace",
             "Reduce vector volume or raise MEMORY_LIMIT before rebuilding its HNSW index.",
         )?;
-        accountant.try_allocate_for(
+        accountant.try_allocate_for_label(
             final_bytes,
             "vector_index",
-            &format!("prepare_authoritative_purge_hnsw@{}.{}", index.table, index.column),
+            crate::memory_budget::prepare_operation_label(&accountant,
+                format_args!("prepare_authoritative_purge_hnsw@{}.{}", index.table, index.column))?,
             "Reduce vector volume or raise MEMORY_LIMIT before authoritative purge can rebuild its materialized HNSW index.",
         )?;
         let mut retained = PaidRetainedMemoryCharge::new(final_bytes, accountant.clone());
@@ -14029,11 +14375,13 @@ impl VectorStore {
     fn run_sampled_hnsw_maintenance(
         &self,
         partition: &VectorPartitionRef,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
         mut after_reservation: impl FnMut(),
         owner: &mut VectorCopyAdmission,
     ) -> Result<bool> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         // Short partition gates freeze and later revalidate one sampled
         // frontier. Construction itself holds only the detached candidate and
         // graph-lifecycle locks, so unrelated structural commits can publish
@@ -14103,13 +14451,13 @@ impl VectorStore {
                     })?;
                     // The fresh tail and detached candidate coexist during
                     // construction, so each owner keeps its complete charge.
-                    accountant.try_allocate_for(
+                    accountant.try_allocate_for_label(
                         reservation_bytes,
                         "vector_index",
-                        &format!(
+                        crate::memory_budget::prepare_operation_label(&accountant, format_args!(
                             "build_hnsw@{}.{}",
                             partition.index.table, partition.index.column
-                        ),
+                        ))?,
                         "Reduce vector volume or raise MEMORY_LIMIT before maintenance rebuilds this materialized HNSW index.",
                     )?;
                     let reservation = PaidRetainedMemoryCharge::new(reservation_bytes, accountant.clone());
@@ -14275,9 +14623,11 @@ impl VectorStore {
         progress: PagedVectorProgress,
         persistence: Arc<dyn PagedGenerationPersistence>,
         plan: PagedVectorBatchPlan,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.register_paged_operation(
             partition,
             progress,
@@ -14298,9 +14648,11 @@ impl VectorStore {
         progress: PagedVectorProgress,
         persistence: Arc<dyn PagedGenerationPersistence>,
         plan: PagedVectorBatchPlan,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         if !matches!(
             progress.phase,
             PagedVectorPhase::Published
@@ -14327,10 +14679,12 @@ impl VectorStore {
         progress: PagedVectorProgress,
         persistence: Arc<dyn PagedGenerationPersistence>,
         plan: PagedVectorBatchPlan,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         cleanup: bool,
         _owner: &mut VectorCopyAdmission,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let state = self.partition_state(&partition.index, &partition.partition_key)?;
         let policy = self.with_index_layout(&partition.index, |layout| {
             layout.resolve_policy(progress.total_points, 1)
@@ -14465,9 +14819,8 @@ impl VectorStore {
         Ok(progress)
     }
 
-    /// Report an engine-driven paged build's durable or in-flight inserted
-    /// point count as this partition's maintenance progress. An armed test
-    /// pause observes the same count the ordinary resident build reports.
+    /// Report only committed paged-build progress. The existing armed pause
+    /// observes insertion inside the pending batch through its own callback.
     #[doc(hidden)]
     pub fn report_partition_paged_build_progress(
         &self,
@@ -14489,7 +14842,6 @@ impl VectorStore {
             vectors_done: vectors_done.min(vectors_total),
             checkpoint_tx,
         });
-        state.set_maintenance_vectors_done(vectors_done);
     }
 
     /// Drop a registered paged build whose durable record was erased. Waits
@@ -14583,8 +14935,10 @@ impl VectorStore {
         &self,
         partition: &VectorPartitionRef,
         tail: PagedVectorTail,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let state = self.partition_state(&partition.index, &partition.partition_key)?;
         let (dimension, quantization, policy) = tail.definition();
         if tail.partition() != partition
@@ -14597,13 +14951,13 @@ impl VectorStore {
         let through_lsn = tail.progress().frontier_lsn;
         let graph = HnswIndex::from_paged_tail(tail);
         let bytes = graph.estimated_resident_bytes();
-        accountant.try_allocate_for(
+        accountant.try_allocate_for_static(
             bytes,
             "vector_index",
             "install_paged_vector_tail",
             "release idle serving pages",
         )?;
-        let mut charge = PaidRetainedMemoryCharge::new(bytes, Arc::clone(&accountant));
+        let mut charge = PaidRetainedMemoryCharge::new(bytes, accountant.clone());
         self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
             let current = self.partition_state(&partition.index, &partition.partition_key)?;
             if !Arc::ptr_eq(&state, &current) {
@@ -14811,19 +15165,23 @@ impl VectorStore {
     /// authority to decide that an old snapshot has released a state.
     pub fn run_hnsw_maintenance_cycle(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<VectorMaintenanceReport> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.run_hnsw_maintenance_cycle_with(accountant, &mut || Ok(()), owner)
     }
 
     #[doc(hidden)]
     pub fn run_hnsw_maintenance_cycle_with(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<VectorMaintenanceReport> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         let mut local_copy_admission = owner.local_scratch();
         let owner = local_copy_admission.as_mut().unwrap_or(owner);
         let indexes = self.scoped_sorted_refs(|_| true, owner)?;
@@ -14952,9 +15310,11 @@ impl VectorStore {
     pub fn run_hnsw_maintenance_for_index_for_test(
         &self,
         index: &VectorIndexRef,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<bool> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.try_column(index)
             .ok_or_else(|| Error::UnknownVectorIndex {
                 index: index.clone(),
@@ -15134,17 +15494,20 @@ impl VectorStore {
     pub fn publish_prepared_received_schema(
         &self,
         publication: PreparedVectorPublication,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.registry.assert_not_renaming();
         let _bulk = self.bulk_gate.write();
-        let (mut registry, preserved_states, preserved_columns) = publication.into_parts();
+        let (mut registry, preserved_states, preserved_columns, existing_cells_only, links, workspace) =
+            publication.into_parts();
         let copied_identity_credit = registry.identity_charges.take();
         for column in registry.values() {
             if preserved_columns.contains(&(Arc::as_ptr(column) as usize)) { continue; }
             let declared_owner = column.directory_accounting.lock().accountant.clone();
             for state in column.partitions.read().values() {
-                if state.raw_resident.load(Ordering::SeqCst)
+                if !existing_cells_only && state.raw_resident.load(Ordering::SeqCst)
                     && !preserved_states.contains(&(Arc::as_ptr(state) as usize))
                 {
                     state.attach_raw_accounting(
@@ -15155,10 +15518,40 @@ impl VectorStore {
                 }
             }
         }
-        for column in registry.values() {
-            if !preserved_columns.contains(&(Arc::as_ptr(column) as usize)) { column.go_live(); }
+        if existing_cells_only {
+            for column in registry.values() {
+                *column.directory_tally.figures.lock() = DirectoryFigures::default();
+                column.derived.store(true, Ordering::SeqCst);
+            }
+            for link in links {
+                IndexState::attach_limit_with_prepared_key(&link.state, &link.column.limit_ledger,
+                    &link.column.directory_tally, link.key);
+            }
+            for column in registry.values() {
+                let rows = VectorColumnState::row_map_terms(&column.row_to_partition.read());
+                let history = VectorColumnState::history_map_terms(&column.row_partition_history.read());
+                column.reset_row_map_terms((0, 0), (0, 0), rows, history);
+            }
+        } else {
+            drop(links);
+            for column in registry.values() {
+                if !preserved_columns.contains(&(Arc::as_ptr(column) as usize)) { column.go_live(); }
+            }
         }
-        let old_registry = std::mem::replace(&mut *self.registry.write(), registry);
+        let old_registry = if existing_cells_only {
+            let mut live = self.registry.write();
+            // Validate the entire unit before replacing any cell. The engine
+            // holds its commit fence from preparation through publication.
+            assert!(registry.keys().all(|index| live.contains_key(index)),
+                "prepared erasure cannot create vector registry entries");
+            for (index, column) in registry.iter_mut() {
+                std::mem::swap(live.get_mut(index).expect("validated erasure cell"), column);
+            }
+            // The selected carrier now owns exactly the retired columns.
+            registry
+        } else {
+            std::mem::replace(&mut *self.registry.write(), registry)
+        };
         for column in old_registry.values() {
             if preserved_columns.contains(&(Arc::as_ptr(column) as usize)) { continue; }
             column.clear_hnsw_except(&*accountant, &preserved_states);
@@ -15168,6 +15561,9 @@ impl VectorStore {
         // replacement keys; the staging duplicate can return its credit.
         drop(old_registry);
         drop(copied_identity_credit);
+        drop(preserved_states);
+        drop(preserved_columns);
+        drop(workspace);
     }
 
     /// Prepare the complete dependency-closure handoff before the durable
@@ -15217,7 +15613,7 @@ impl VectorStore {
                     .len()
                     .saturating_add(index.column.len())
                     .saturating_add(std::mem::size_of::<RegistryIdentityCharge>());
-                accountant.try_allocate_for(
+                accountant.try_allocate_for_static(
                     bytes,
                     "vector_index",
                     "prepare_vector_registry_identity",
@@ -15255,8 +15651,10 @@ impl VectorStore {
         &self, schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
         affected_tables: &std::collections::HashSet<String>,
         recreated: impl Fn(&str) -> bool,
-        declared_owner: Arc<dyn MemoryBudget>, mut owner: VectorCopyAdmission,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>, mut owner: VectorCopyAdmission,
     ) -> Result<PreparedVectorTablePublication> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let new_count = {
             let registry = self.registry.read();
             let mut count = 0usize;
@@ -15335,8 +15733,10 @@ impl VectorStore {
     pub fn publish_prepared_received_schema_tables(
         &self,
         mut prepared: PreparedVectorTablePublication,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         // Keep the complete preparation owner armed across every policy body
         // and the outgoing registry's physical destruction, including unwind.
         for policy in std::mem::take(&mut prepared.policy_updates) {
@@ -15360,8 +15760,10 @@ impl VectorStore {
         index: VectorIndexRef,
         dimension: usize,
         quantization: VectorQuantization,
-        declared_owner: Arc<dyn MemoryBudget>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<()> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         self.with_bulk_read(|| {
             let column = {
                 let mut registry = self.registry.write();
@@ -15369,7 +15771,7 @@ impl VectorStore {
                     let column = Arc::new(VectorColumnState::new(VectorIndexLayout::unpartitioned(
                         dimension, quantization), declared_owner.clone()));
                     let bytes = column.directory_retained_bytes(&index);
-                    declared_owner.try_allocate_for(bytes, "vector_index", "register_vector_directory",
+                    declared_owner.try_allocate_for_static(bytes, "vector_index", "register_vector_directory",
                         "Reduce vector declaration metadata or raise MEMORY_LIMIT before creating the index.")?;
                     column.install_directory_accounting(bytes);
                     registry.try_insert(index.clone(), column.clone())?;
@@ -15392,9 +15794,11 @@ impl VectorStore {
         &self,
         index: VectorIndexRef,
         layout: VectorIndexLayout,
-        declared_owner: Arc<dyn MemoryBudget>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<()> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let mut local_copy_admission = owner.local_scratch();
         let owner = local_copy_admission.as_mut().unwrap_or(owner);
         Self::validate_layout(&index, &layout)?;
@@ -15421,7 +15825,7 @@ impl VectorStore {
                 let retained = VectorCopyAdmission::new(declared_owner.clone());
                 self.make_column_durable(&index, &column, owner, retained)?;
                 let bytes = column.directory_retained_bytes(&index);
-                declared_owner.try_allocate_for(bytes, "vector_index", "register_vector_directory",
+                declared_owner.try_allocate_for_static(bytes, "vector_index", "register_vector_directory",
                     "Reduce vector declaration metadata or raise MEMORY_LIMIT before creating the index.")?;
                 column.install_directory_accounting(bytes);
                 self.registry.write().try_insert(index.clone(), column)?;
@@ -15445,7 +15849,7 @@ impl VectorStore {
                 let mut retained = existing.directory_accounting.lock();
                 let growth = new_layout_bytes.saturating_sub(old_layout_bytes);
                 if growth != 0 {
-                    retained.accountant.try_allocate_for(growth, "vector_index", "register_vector_directory",
+                    retained.accountant.try_allocate_for_static(growth, "vector_index", "register_vector_directory",
                         "Reduce vector declaration metadata or raise MEMORY_LIMIT before updating the index.")?;
                 }
                 *existing.layout.write() = layout.clone();
@@ -15466,7 +15870,7 @@ impl VectorStore {
             let column = Arc::new(VectorColumnState::new(layout.clone(), declared.clone()));
             self.make_column_durable(&index, &column, owner, VectorCopyAdmission::new(declared.clone()))?;
             let bytes = column.directory_retained_bytes(&index);
-            declared.try_allocate_for(bytes, "vector_index", "replace_vector_directory",
+            declared.try_allocate_for_static(bytes, "vector_index", "replace_vector_directory",
                 "Reduce vector declaration metadata or raise MEMORY_LIMIT before replacing the index.")?;
             column.install_directory_accounting(bytes);
             self.registry.write().try_insert(index.clone(), column)?;
@@ -15607,7 +16011,7 @@ impl VectorStore {
             None
         } else {
             let accountant = column.directory_accounting.lock().accountant.clone();
-            accountant.try_allocate_for(
+            accountant.try_allocate_for_static(
                 growth,
                 "vector_index",
                 "register_vector_directory",
@@ -16482,7 +16886,7 @@ impl VectorStore {
         let mut scratch = owner.scratch();
         scratch.reserve(scratch_bytes)?;
         self.reclaim_idle_graphs_for(resident_bytes, &[state.as_ref()]);
-        accountant.try_allocate_for(resident_bytes, "vector_index", "prepare_hnsw_tail",
+        accountant.try_allocate_for_static(resident_bytes, "vector_index", "prepare_hnsw_tail",
             "Reduce vector volume or raise MEMORY_LIMIT before committing another searchable vector.")?;
         let charge = PaidRetainedMemoryCharge::new(resident_bytes, accountant);
         // Conversion, encoding and id-space validation precede durability and
@@ -17436,8 +17840,10 @@ impl VectorStore {
         index: VectorIndexRef,
         dimension: usize,
         quantization: VectorQuantization,
-        declared_owner: Arc<dyn MemoryBudget>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<()> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let lock_index = index.clone();
         self.with_index_maintenance(&lock_index, || {
             let mut registry = self.registry.write();
@@ -17450,7 +17856,7 @@ impl VectorStore {
                     let column = Arc::new(VectorColumnState::new(VectorIndexLayout::unpartitioned(
                         dimension, quantization), declared_owner.clone()));
                     let bytes = column.directory_retained_bytes(&index);
-                    declared_owner.try_allocate_for(bytes, "vector_index", "register_vector_directory",
+                    declared_owner.try_allocate_for_static(bytes, "vector_index", "register_vector_directory",
                         "Reduce vector declaration metadata or raise MEMORY_LIMIT before replacing the index.")?;
                     column.install_directory_accounting(bytes);
                     registry.try_insert(index, column)?;
@@ -17653,9 +18059,11 @@ impl VectorStore {
         old: &VectorIndexRef,
         new: &VectorIndexRef,
         replaced: &VectorIndexRef,
-        removal_accountant: Arc<dyn MemoryBudget>,
+        removal_accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: VectorCopyAdmission,
     ) -> Result<PreparedVectorIndexRename<'a>> {
+        let removal_accountant: crate::memory_budget::MemoryBudgetOwner = removal_accountant.into();
+
         if replaced != new || old == new {
             return Err(Error::Other(
                 "replacement must name the distinct rename destination".into()));
@@ -17668,7 +18076,7 @@ impl VectorStore {
         old: &VectorIndexRef,
         new: &VectorIndexRef,
         replaced: Option<&VectorIndexRef>,
-        removal_accountant: Option<Arc<dyn MemoryBudget>>,
+        removal_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
         mut owner: VectorCopyAdmission,
     ) -> Result<PreparedVectorIndexRename<'a>> {
         self.registry.assert_not_renaming();
@@ -17752,7 +18160,7 @@ impl VectorStore {
                 );
             let bytes = registry_bytes.saturating_add(name_growth);
             let accountant = existing.directory_accounting.lock().accountant.clone();
-            accountant.try_allocate_for(bytes, "vector_index", "prepare_vector_directory_growth",
+            accountant.try_allocate_for_static(bytes, "vector_index", "prepare_vector_directory_growth",
                 "Reduce vector declaration metadata or raise MEMORY_LIMIT before renaming the index.")?;
             registry_directories.push(PreparedRegistryDirectoryCharge {
                 column: existing.clone(),
@@ -19549,7 +19957,7 @@ impl VectorStore {
                 layout.quantization,
             );
             let body_owner = column.directory_accounting.lock().accountant.clone();
-            body_owner.try_allocate_for(
+            body_owner.try_allocate_for_static(
                 body_bytes,
                 "vector_index",
                 "copy_borrowed_vector_body",
@@ -19959,8 +20367,10 @@ impl VectorStore {
     pub fn insert_loaded_vector(
         &self,
         entry: VectorEntry,
-        declared_owner: Arc<dyn MemoryBudget>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<()> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         let index = entry.index.clone();
         self.with_index_maintenance(&index, || {
             let quantization = self
@@ -20505,8 +20915,10 @@ impl VectorStore {
     pub fn replace_loaded_vectors(
         &self,
         entries: Vec<VectorEntry>,
-        declared_owner: Arc<dyn MemoryBudget>,
+        declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<()> {
+        let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
+
         self.with_bulk_maintenance(|| {
             #[cfg(feature = "test-seams")]
             self.pause_registry.maybe_pause(
@@ -20566,7 +20978,7 @@ impl VectorStore {
             // statement allocations, never borrowed source ownership.
             preparation_bytes = preparation_bytes.saturating_add(row_placement_map_bytes::<
                 VectorIndexRef,
-                Arc<dyn MemoryBudget>,
+                crate::memory_budget::MemoryBudgetOwner,
             >(
                 registry.len().saturating_mul(2),
             ));
@@ -20663,7 +21075,7 @@ impl VectorStore {
             Ok(PreparedLoadedVectorReplacement {
                 destination: self,
                 registry,
-                accountant,
+                accountant: accountant.into(),
             })
         });
         if result.is_ok() {
@@ -20796,6 +21208,11 @@ impl VectorStore {
         let mut workspace = 0usize;
         let mut disk = 0usize;
         for (index, column) in self.registry.read().iter() {
+            // Selection must precede every layout/directory copy, including
+            // the admission quote used by both erasure consumers.
+            if !rows.iter().any(|(table, _)| table == &index.table) {
+                continue;
+            }
             let layout = column.scoped_layout(owner)?;
             for (_, state) in column.scoped_partition_snapshots(owner)?.into_iter() {
                 // Unaffected states are carried by handle; only selected
@@ -21837,7 +22254,7 @@ impl VectorStore {
                 // The engine priced this metadata frontier. Refuse an
                 // inconsistent resident image before allocating any body.
                 return Err(Error::StoreCorrupted {
-                    path: format!("vector index {}.{}", index.table, index.column),
+                    path: format!("vector index {}.{}", index.table, index.column).into(),
                     reason: "generation selection differs from its raw directory".into(),
                 });
             }
@@ -21857,7 +22274,7 @@ impl VectorStore {
                                 // or add future tombstones. Never grow a body
                                 // owner beyond the counted selection.
                                 return Err(Error::StoreCorrupted {
-                                    path: format!("vector index {}.{}", index.table, index.column),
+                                    path: format!("vector index {}.{}", index.table, index.column).into(),
                                     reason: "generation selection grew at its pinned frontier"
                                         .into(),
                                 });
@@ -22263,7 +22680,7 @@ impl VectorStore {
                     })
                 },
                 bytes: state.hnsw_bytes.swap(0, Ordering::SeqCst),
-                accountant,
+                accountant: accountant.into(),
                 replayed_through_lsn: state.fresh_tail_replayed_through_lsn.load(Ordering::SeqCst),
                 mutated_through_lsn: state.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst),
                 replay_frontier_active: state
@@ -22450,9 +22867,11 @@ impl VectorStore {
     pub fn initialize_partition_fresh_tail(
         &self,
         partition: &VectorPartitionRef,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         _owner: &mut VectorCopyAdmission,
     ) -> Result<()> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
             let state = self.partition_state(&partition.index, &partition.partition_key)?;
             let live_count = state.vector_count();
@@ -23358,7 +23777,8 @@ impl VectorStore {
         for (index, column) in registry.iter() {
             components[2] = components[2].saturating_add(std::mem::size_of::<VectorColumnState>());
             components[3] =
-                components[3].saturating_add(column.registry_copy_bytes.load(Ordering::SeqCst));
+                components[3].saturating_add(column.registry_copy_bytes.load(Ordering::SeqCst))
+                    .saturating_add(column.erasure_ledger_bytes.load(Ordering::SeqCst));
             components[4] = components[4].saturating_add(index.table.capacity());
             components[5] = components[5].saturating_add(index.column.capacity());
             components[6] = components[6].saturating_add(column.layout.read().estimated_bytes());
@@ -23396,7 +23816,7 @@ impl VectorStore {
     }
 
     /// Passive components used by the ownership snapshot: registry buckets,
-    /// registry identities, column states, registry copies, table strings,
+    /// registry identities, column states, registry copies and prepaid ledgers, table strings,
     /// column strings, layouts, partition handles, partition allocations,
     /// partition map controls, current row directories, historical row
     /// directories, and historical partition-key vectors, in that order.
@@ -23510,7 +23930,9 @@ impl VectorStore {
     /// exact reservations makes later column/table removal release the same
     /// bytes without guessing from the then-current cache contents.
     #[doc(hidden)]
-    pub fn account_loaded_state(&self, accountant: Arc<dyn MemoryBudget>) -> Result<usize> {
+    pub fn account_loaded_state(&self, accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Result<usize> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.account_loaded_state_within(accountant, 0)
     }
 
@@ -23522,9 +23944,11 @@ impl VectorStore {
     #[doc(hidden)]
     pub fn account_loaded_state_within(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         reserved: usize,
     ) -> Result<usize> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.account_loaded_state_with_directory_charges(accountant, reserved, None)
     }
 
@@ -23558,7 +23982,7 @@ impl VectorStore {
                             .sum::<usize>(),
                     )
                 });
-            accountant.try_allocate_for(
+            accountant.try_allocate_for_static(
                 bytes,
                 "vector_index",
                 "prepare_received_vector_bodies",
@@ -23590,10 +24014,12 @@ impl VectorStore {
 
     fn account_loaded_state_with_directory_charges(
         &self,
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         reserved: usize,
         mut directory_charges: Option<PreparedDirectoryCharges>,
     ) -> Result<usize> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         self.with_bulk_maintenance(|| {
             if self.memory_accountant.read().is_some() {
                 return Err(Error::Other((
@@ -23647,7 +24073,7 @@ impl VectorStore {
                     raw.push((state, bytes));
                 }
             }
-            accountant.try_allocate_for(
+            accountant.try_allocate_for_static(
                 total.saturating_sub(reserved),
                 "open",
                 "load_vector_directories",

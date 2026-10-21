@@ -1532,7 +1532,7 @@ fn custody_row_count(db: &Database, table: &str, id: Uuid) -> Result<usize, Stri
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .map_err(|error| format!("cannot inspect custody row: {error}"))?
-        .rows
+        .rows()
         .len())
 }
 

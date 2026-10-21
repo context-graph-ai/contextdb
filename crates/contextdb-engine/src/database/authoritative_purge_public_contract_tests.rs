@@ -169,7 +169,73 @@ fn assert_successful_batch_history(db: &Database, survivor_history_before: &[Row
 }
 
 #[test]
+#[serial_test::serial]
 fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen() {
+    // Extend the registered atomic-erasure proof with long unrelated column
+    // names. The frozen schema-width fixture has only short field names and
+    // does not combine copy observations with a failed durable publication.
+    {
+        use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+        let mut peaks = Vec::new();
+        let mut peak_origins = Vec::new();
+        for columns in [1, 17] {
+            // The production persistence fault is one-shot and thread-local;
+            // an early failure must not leave it armed in the parent proof.
+            let peak = std::thread::spawn(move || {
+                let fixture = file_fixture();
+                fixture.db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+                for table in 0..2 {
+                    let fields = (0..columns).map(|column|
+                        format!("field_{column}_{} TEXT", "x".repeat(1024)))
+                        .collect::<Vec<_>>().join(",");
+                    fixture.db.execute(&format!(
+                        "CREATE TABLE unrelated_{table} (id INT PRIMARY KEY,{fields}) HISTORY ALL SYNC OFF"), &params()).unwrap();
+                    fixture.db.execute(&format!(
+                        "INSERT INTO unrelated_{table} (id) VALUES (77)"), &params()).unwrap();
+                }
+                let before = observable_state(&fixture.db);
+                fixture.db.arm_authoritative_purge_point_remove_persistence_failure_for_test();
+                let (refused, refusal_peak, _, refusal_origin) = oracle::measured_purge(|| fixture.db.execute(
+                    "PURGE FROM purge_contract_rows WHERE cohort = 'selected'", &params()));
+                assert!(matches!(refused, Err(Error::Other(ref message))
+                    if message == "authoritative purge point-remove persistence failure injected"),
+                    "wide unrelated declarations must not mask the actual durable fault: {refused:?}");
+                assert_eq!(observable_state(&fixture.db), before,
+                    "failed erasure preserves both selected rows, survivor, history and deletion frontiers");
+                let history = table_history(&fixture.db);
+                let survivor_history = history_for_id(&history, 3);
+                let (result, success_peak, _, success_origin) = oracle::measured_purge(|| fixture.db.execute(
+                    "PURGE FROM purge_contract_rows WHERE cohort = 'selected'", &params()));
+                assert_eq!(result.unwrap().rows_affected, 2);
+                assert_selected_absent_and_survivor_intact(&fixture.db);
+                assert_successful_batch_history(&fixture.db, &survivor_history);
+                for table in 0..2 {
+                    assert_eq!(fixture.db.execute(&format!(
+                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows,
+                        vec![vec![Value::Int64(77)]]);
+                }
+                fixture.db.close().unwrap();
+                let reopened = Database::open(&fixture.path).unwrap();
+                assert_selected_absent_and_survivor_intact(&reopened);
+                assert_successful_batch_history(&reopened, &survivor_history);
+                for table in 0..2 {
+                    assert_eq!(reopened.execute(&format!(
+                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows,
+                        vec![vec![Value::Int64(77)]]);
+                }
+                reopened.close().unwrap();
+                ((refusal_peak, success_peak), (refusal_origin, success_origin))
+            }).join().expect("selected purge row completes without leaking its fault");
+            let (peak, origins) = peak;
+            assert!(origins.0.complete && origins.1.complete,
+                "purge allocation census must be complete for width {columns}: {origins:?}");
+            assert!(peak.0 > 0 && peak.1 > 0, "both actual publication paths were measured");
+            peaks.push(peak);
+            peak_origins.push((columns, origins));
+        }
+        assert!(peaks[1].0 <= peaks[0].0 && peaks[1].1 <= peaks[0].1,
+            "unrelated nested schema width must not increase physical purge workspace on refusal or success: {peaks:?}; actual native/header/padding origins: {peak_origins:?}");
+    }
     // Authoritative erasure waits for proved orphan cleanup, while maintenance
     // completes outside queries (maintenance intent line 41; root policy 22).
     {

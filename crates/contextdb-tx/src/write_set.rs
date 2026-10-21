@@ -276,7 +276,7 @@ impl WriteSet {
         row_id: RowId,
         lsn: Lsn,
     ) {
-        let table = table.into();
+        let table: TableName = table.into();
         self.relational_insert_source_lsns
             .entry(table.clone())
             .or_default()
@@ -294,7 +294,7 @@ impl WriteSet {
         lsn: Lsn,
         kind: u8,
     ) {
-        let table = table.into();
+        let table: TableName = table.into();
         self.relational_insert_source_lsns
             .entry(table.clone())
             .or_default()
@@ -336,7 +336,7 @@ pub trait WriteSetApplicator: Send + Sync {
     fn apply(
         &self,
         ws: &WriteSet,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()>;
     fn new_row_id(&self) -> RowId;
     /// Return the already prepared root after successful durable apply. All
@@ -391,7 +391,7 @@ impl WriteSetApplicator for Box<dyn WriteSetApplicator> {
     fn apply(
         &self,
         ws: &WriteSet,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         (**self).apply(ws, read_memory)
     }

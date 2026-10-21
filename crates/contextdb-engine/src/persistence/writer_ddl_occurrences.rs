@@ -8,7 +8,7 @@ const GENERATION: &str = "sync_ddl_generation.v1.";
 const ARRIVAL: &str = "sync_ddl_received_arrival.v1.";
 const SUPERSEDED: &str = "sync_ddl_superseded.v1.";
 
-fn damage(reason: &str) -> Error {
+fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "ddl_eligible_occurrences".into(),
         reason: reason.into(),
@@ -296,6 +296,7 @@ impl RedbPersistence {
                     let bytes = value.value().len().saturating_mul(64).saturating_add(256);
                     admission.admit(bytes)?;
                     crate::database::Database::validate_ddl_occurrence_config(
+                            &crate::read_image_memory::active_owner()?.diagnostic_budget()?,
                         &key,
                         at,
                         value.value(),

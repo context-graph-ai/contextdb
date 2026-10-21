@@ -227,7 +227,7 @@ enum CommitHistoryCapability {
     EngineMemory(EngineMemoryCommitDirectory),
     Captured {
         directory: Arc<dyn ReadCommitDirectory>,
-        image_read_memory: Arc<dyn ReadMemoryBudget>,
+        image_read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     },
 }
 
@@ -413,9 +413,11 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         committed_watermark: TxId,
         committed_lsn: Lsn,
         directory: Arc<dyn ReadCommitDirectory>,
-        image_read_memory: Arc<dyn ReadMemoryBudget>,
+        image_read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         handle: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Self {
+        let image_read_memory: contextdb_core::read_memory::ReadMemoryOwner = image_read_memory.into();
+
         Self {
             next_tx: AtomicTxId::new(next_tx),
             committed_watermark: AtomicTxId::new(committed_watermark),
@@ -621,16 +623,20 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_lsn(tx, read_memory).map(|_| ())
     }
 
     pub fn commit_with_lsn(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_lsn_prepared(tx, read_memory, |_| Ok(()))
             .map(|(lsn, _)| lsn)
             .map_err(|failure| failure.error)
@@ -639,7 +645,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_reserved_lsn_callback<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: F,
         prepare: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -647,13 +653,15 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn) -> Result<()>,
         G: FnOnce(&WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_reserved_lsn_callback_mut(tx, read_memory, before_commit, |ws| prepare(ws))
     }
 
     pub fn commit_with_reserved_lsn_callback_mut<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: F,
         prepare: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -661,6 +669,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let directory = self.writable_directory().map_err(|error| CommitFailure {
             error,
             write_set: None,
@@ -716,19 +726,21 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_lsn_prepared<F>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         prepare: F,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
     where
         F: FnOnce(&WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_lsn_prepared_and_applied(tx, read_memory, prepare, |_, _| {})
     }
 
     pub fn commit_with_lsn_prepared_and_applied<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         prepare: F,
         after_apply: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -736,6 +748,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(&WriteSet) -> Result<()>,
         G: FnOnce(Lsn, &WriteSet),
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_lsn_prepared_and_applied_mut(
             tx,
             read_memory,
@@ -747,7 +761,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_lsn_prepared_and_applied_mut<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         prepare: F,
         after_apply: G,
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
@@ -755,6 +769,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(&mut WriteSet) -> Result<()>,
         G: FnOnce(Lsn, &WriteSet),
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let directory = self.writable_directory().map_err(|error| CommitFailure {
             error,
             write_set: None,
@@ -806,7 +822,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_lsn_active_prepare_and_applied_mut<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         active_prepare: F,
         prepare: G,
         after_apply: impl FnOnce(Lsn, &WriteSet),
@@ -815,6 +831,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn, TxId) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_lsn_precanonicalized_active_prepare_and_applied_mut(
             tx,
             read_memory,
@@ -831,7 +849,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn commit_with_lsn_precanonicalized_active_prepare_and_applied_mut<F, G>(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: F,
         prepare: G,
@@ -841,6 +859,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn, TxId) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_with_private_lsn_interval_active_prepare_and_applied_mut(
             tx,
             1,
@@ -865,7 +885,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         &self,
         tx: TxId,
         positions: u64,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: F,
         prepare: G,
@@ -875,6 +895,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn, Lsn, TxId) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let directory = self.writable_directory().map_err(|error| CommitFailure {
             error,
             write_set: None,
@@ -1694,7 +1716,7 @@ impl<S: WriteSetApplicator> contextdb_core::TransactionManager for TransactionMa
     fn commit(
         &self,
         tx: TxId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         TransactionManager::commit(self, tx, read_memory)
     }
@@ -1938,8 +1960,10 @@ impl EngineGuard<'_> {
     #[doc(hidden)]
     pub fn capture_sealed_directory(
         &self,
-        reader: Arc<dyn ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::staged_source::CanonicalStatementDirectory> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         crate::staged_source::CanonicalStatementDirectory::capture(
             &self.host.state.root,
             CapturedIdentity {
@@ -2279,17 +2303,21 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     pub fn commit_owned(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<(Lsn, EngineOwnedWriteSet), EngineCommitFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_owned_prepared_and_applied(tx, read_memory, |_| Ok(()), |_, _| {})
     }
     pub fn commit_owned_prepared_and_applied(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         prepare: impl FnOnce(&mut EngineGuard<'_>) -> Result<()>,
         after_apply: impl FnOnce(Lsn, &WriteSet),
     ) -> std::result::Result<(Lsn, EngineOwnedWriteSet), EngineCommitFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_owned_active_prepare_and_applied(
             tx,
             read_memory,
@@ -2302,12 +2330,14 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     pub fn commit_owned_active_prepare_and_applied(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl FnOnce(Lsn, TxId) -> Result<()>,
         prepare: impl FnOnce(&mut EngineGuard<'_>) -> Result<()>,
         after_apply: impl FnOnce(Lsn, &WriteSet),
     ) -> std::result::Result<(Lsn, EngineOwnedWriteSet), EngineCommitFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.manager
             .ensure_writable()
             .map_err(|error| EngineCommitFailure::new(error, None))?;
@@ -2407,10 +2437,12 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     pub fn commit_owned_with_reserved_lsn_callback(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: impl FnOnce(Lsn) -> Result<()>,
         prepare: impl FnOnce(&mut EngineGuard<'_>) -> Result<()>,
     ) -> std::result::Result<(Lsn, EngineOwnedWriteSet), EngineCommitFailure> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.manager
             .ensure_writable()
             .map_err(|error| EngineCommitFailure::new(error, None))?;
@@ -2972,7 +3004,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     pub fn commit_owned_active_prepare_and_applied_with_peer<V, P: 'static>(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl FnOnce(Lsn, TxId) -> Result<()>,
         prepare: impl for<'g, 'h, 'p> FnOnce(&'g mut EngineGuard<'h>, &'p mut P) -> Result<()>,
@@ -2980,6 +3012,8 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         validate_peer: impl FnOnce(EngineTerminalIdentity) -> V,
         consume_peer: fn(V) -> P,
     ) -> std::result::Result<(Lsn, EngineTerminalWriteSet<P>), EngineTerminalFailure<P>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.manager
             .ensure_writable()
             .map_err(|error| EngineTerminalFailure::new(error, None))?;
@@ -3091,12 +3125,14 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     pub fn commit_owned_with_reserved_lsn_callback_with_peer<V, P: 'static>(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: impl FnOnce(Lsn) -> Result<()>,
         prepare: impl for<'g, 'h, 'p> FnOnce(&'g mut EngineGuard<'h>, &'p mut P) -> Result<()>,
         validate_peer: impl FnOnce(EngineTerminalIdentity) -> V,
         consume_peer: fn(V) -> P,
     ) -> std::result::Result<(Lsn, EngineTerminalWriteSet<P>), EngineTerminalFailure<P>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.manager
             .ensure_writable()
             .map_err(|error| EngineTerminalFailure::new(error, None))?;
@@ -3184,7 +3220,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     pub fn commit_owned_active_prepare_and_applied_with_peer_scoped<V, P: 'static>(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl for<'b, 'm> FnOnce(
             &EngineCommitScope<'b, 'm, S>,
@@ -3197,6 +3233,8 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         validate_peer: impl FnOnce(EngineTerminalIdentity) -> V,
         consume_peer: fn(V) -> P,
     ) -> std::result::Result<(Lsn, EngineTerminalWriteSet<P>), EngineTerminalFailure<P>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_owned_private_lsn_interval_with_peer_scoped(
             tx, 1, read_memory, requires_commit,
             |scope, _start, end, visibility_tx| active_prepare(scope, end, visibility_tx),
@@ -3212,7 +3250,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         &self,
         tx: TxId,
         positions: u64,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl for<'b, 'm> FnOnce(
             &EngineCommitScope<'b, 'm, S>,
@@ -3226,6 +3264,8 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         validate_peer: impl FnOnce(EngineTerminalIdentity) -> V,
         consume_peer: fn(V) -> P,
     ) -> std::result::Result<(Lsn, EngineTerminalWriteSet<P>), EngineTerminalFailure<P>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.commit_owned_private_lsn_interval_with_peer_scoped_if(
             tx,positions,read_memory,||Ok(true),requires_commit,active_prepare,prepare,
             after_apply,validate_peer,consume_peer,
@@ -3240,7 +3280,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         &self,
         tx: TxId,
         positions: u64,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         preflight: impl FnOnce() -> Result<bool>,
         requires_commit: impl FnOnce() -> Result<bool>,
         active_prepare: impl for<'b, 'm> FnOnce(
@@ -3255,6 +3295,8 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         validate_peer: impl FnOnce(EngineTerminalIdentity) -> V,
         consume_peer: fn(V) -> P,
     ) -> std::result::Result<Option<(Lsn, EngineTerminalWriteSet<P>)>, EngineTerminalFailure<P>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.manager
             .ensure_writable()
             .map_err(|error| EngineTerminalFailure::new(error, None))?;
@@ -3411,7 +3453,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     pub fn commit_owned_with_reserved_lsn_callback_with_peer_scoped<V, P: 'static>(
         &self,
         tx: TxId,
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_commit: impl for<'b, 'm> FnOnce(
             &EngineCommitScope<'b, 'm, S>,
             Lsn,
@@ -3421,6 +3463,8 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         validate_peer: impl FnOnce(EngineTerminalIdentity) -> V,
         consume_peer: fn(V) -> P,
     ) -> std::result::Result<(Lsn, EngineTerminalWriteSet<P>), EngineTerminalFailure<P>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.manager
             .ensure_writable()
             .map_err(|error| EngineTerminalFailure::new(error, None))?;
@@ -3709,9 +3753,11 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
         committed_watermark: TxId,
         committed_lsn: Lsn,
         directory: Arc<dyn ReadCommitDirectory>,
-        image_read_memory: Arc<dyn ReadMemoryBudget>,
+        image_read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         handle: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Self {
+        let image_read_memory: contextdb_core::read_memory::ReadMemoryOwner = image_read_memory.into();
+
         Self::install(
             TransactionManager::new_with_captured_directory(
                 store,
@@ -3848,8 +3894,10 @@ impl<S: WriteSetApplicator + 'static> EngineTransactions<S> {
         self: &Arc<Self>,
         tx: TxId,
         table: &str,
-        reader: Arc<dyn ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CanonicalStatementRows> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let active = self.manager.active_txs.lock();
         let host = active.engine().get(&tx).ok_or(Error::TxNotFound(tx))?;
         let root = host.state.root.table(table).cloned();
@@ -3879,8 +3927,10 @@ impl<S: WriteSetApplicator + 'static> EngineTransactions<S> {
         &self,
         tx: TxId,
         table: &str,
-        reader: Arc<dyn ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CanonicalStatementRows> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let active = self.manager.active_txs.lock();
         let host = active.engine().get(&tx).ok_or(Error::TxNotFound(tx))?;
         let root = host.state.root.table(table).cloned();
@@ -3907,8 +3957,10 @@ impl<S: WriteSetApplicator + 'static> EngineTransactions<S> {
         &self,
         tx: TxId,
         index: &contextdb_core::VectorIndexRef,
-        reader: Arc<dyn ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::staged_source::CanonicalStatementVectors> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let active = self.manager.active_txs.lock();
         let host = active.engine().get(&tx).ok_or(Error::TxNotFound(tx))?;
         if host.state.vector_slots.len() != host.state.ws.vector_inserts.len() {
@@ -4259,7 +4311,7 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     #[doc(hidden)]
     pub fn visit_captured_read_memory_for_test(
         &self,
-        visit: impl FnOnce(&Arc<dyn ReadMemoryBudget>),
+        visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner),
     ) {
         self.manager.visit_captured_read_memory_for_test(visit)
     }

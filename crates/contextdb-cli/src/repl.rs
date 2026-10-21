@@ -9,7 +9,7 @@ use contextdb_core::read_contract::{
     OwnerReadCancellation, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
     ReadFailureLimit, ReadLimits,
 };
-use contextdb_engine::vector_read_memory::{DeclaredReadMemory, ReadRequestBudgetProvider};
+use contextdb_engine::vector_read_memory::DeclaredReadMemory;
 use contextdb_engine::{Database, MetadataBody, MetadataRequest, ReadCursor, ReadSession};
 use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_INTERRUPTED_PUSH_UNCONFIRMED, EXIT_OK};
 use contextdb_server::{SyncClient, SyncPlugin};
@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 pub enum Session {
     Reading {
         reader: ReadSession,
-        read_memory: Arc<DeclaredReadMemory>,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
         /// The store this session was pointed at. `.owner status` asks the
         /// path about its owner rather than the session, because it resolves
         /// no route and must answer even when there is no owner to route to.
@@ -41,7 +41,7 @@ pub enum Session {
     Writing {
         database: Arc<Database>,
         reader: ReadSession,
-        read_memory: Arc<DeclaredReadMemory>,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
     },
 }
 
@@ -51,7 +51,7 @@ impl Session {
     pub fn writing(
         database: Arc<Database>,
         limits: ReadLimits,
-        read_memory: Arc<DeclaredReadMemory>,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
     ) -> contextdb_core::Result<Self> {
         let reader = database.read_session(limits)?;
         Ok(Self::Writing {
@@ -65,7 +65,7 @@ impl Session {
     pub fn reading(
         reader: ReadSession,
         path: PathBuf,
-        read_memory: Arc<DeclaredReadMemory>,
+        read_memory: contextdb_engine::vector_read_memory::DeclaredReadRoot,
     ) -> Self {
         Self::Reading {
             reader,
@@ -77,10 +77,10 @@ impl Session {
     /// Each operation shares the working-set parent declared by this session.
     pub fn request_read_memory(
         &self,
-    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    ) -> contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner> {
         match self {
             Self::Reading { read_memory, .. } | Self::Writing { read_memory, .. } => {
-                read_memory.request_budget()
+                read_memory.child()
             }
         }
     }
@@ -1661,8 +1661,7 @@ fn answer_maintenance_status(
         publish_metadata(&answer, input);
         return MetaCommandOutcome::done();
     };
-    let settings: Vec<(String, String, String)> = compaction
-        .rows
+    let settings: Vec<(String, String, String)> = compaction.rows()
         .iter()
         .map(|row| {
             let text = |value: &contextdb_core::Value| match value {
@@ -1962,7 +1961,7 @@ fn publish_cursor_page(
     input: InputContext,
     session: &mut SessionState,
 ) -> MetaCommandOutcome {
-    session.cursor = if page.has_more {
+    session.cursor = if page.has_more() {
         CursorSlot::Open(cursor)
     } else {
         CursorSlot::Drained(cursor)
@@ -1970,11 +1969,11 @@ fn publish_cursor_page(
     if input.output.json {
         json_output::print_document(&json_output::cursor_page_document(page));
     } else {
-        for row in &page.rows {
+        for row in page.rows() {
             let cells: Vec<String> = row.iter().map(crate::formatter::render_value).collect();
             println!("{}", cells.join(" | "));
         }
-        println!("({} rows, has_more: {})", page.rows.len(), page.has_more);
+        println!("({} rows, has_more: {})", page.rows().len(), page.has_more());
     }
     MetaCommandOutcome::done()
 }
@@ -2366,7 +2365,7 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
                 } else {
                     print!(
                         "{}",
-                        contextdb_engine::cli_render::render_explain_trace(&result.trace)
+                        contextdb_engine::cli_render::render_explain_trace(result.trace())
                     );
                 }
                 true
@@ -2531,10 +2530,12 @@ fn interactive_pull_progress_line(pages_read: u64, last_reported: u64) -> Option
 /// watching stdout as text and nothing parses stderr as JSON there, so
 /// there's nothing to usefully stream.
 fn pull_with_progress(
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     client: &SyncClient,
     rt: &tokio::runtime::Runtime,
 ) -> Result<contextdb_engine::sync_types::ApplyResult, contextdb_core::Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let json = json_output_mode();
     let interactive_terminal = std::io::stdin().is_terminal();
     let stream_progress = json || interactive_terminal;
@@ -3123,16 +3124,16 @@ fn execute_sql(
                     _ => session.transaction_open,
                 };
             }
-            if result.columns.is_empty() {
+            if result.columns().is_empty() {
                 if output.json {
                     // A non-query statement: a small JSON status object so the
                     // machine channel stays JSON end to end.
                     println!(
                         "{}",
-                        serde_json::json!({ "rows_affected": result.rows_affected })
+                        serde_json::json!({ "rows_affected": result.rows_affected() })
                     );
                 } else {
-                    println!("ok (rows_affected={})", result.rows_affected);
+                    println!("ok (rows_affected={})", result.rows_affected());
                 }
             } else if output.json {
                 json_output::print_document(&json_output::result_document(&result));
@@ -3148,20 +3149,20 @@ fn execute_sql(
                 // One footer, and it is the last thing a successful ordinary
                 // result prints. There is no other decoration: a result is
                 // complete or it is refused.
-                println!("({} rows)", result.rows.len());
+                println!("({} rows)", result.rows().len());
             }
             if session.trace_enabled {
                 if output.json {
                     // The trace is diagnostics about a result, not the result:
                     // on stdout it would corrupt the JSON Lines stream a
                     // consumer is parsing.
-                    json_output::print_trace(&result.trace, result.trace.rows_examined);
+                    json_output::print_trace(result.trace(), result.trace().rows_examined);
                 } else {
                     println!(
                         "{}",
                         contextdb_engine::cli_render::render_query_trace(
-                            &result.trace,
-                            result.trace.rows_examined
+                            result.trace(),
+                            result.trace().rows_examined
                         )
                     );
                 }

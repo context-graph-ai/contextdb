@@ -518,6 +518,11 @@ impl WriterFileView {
             .ok_or_else(|| io::Error::other("writer file ownership is closed"))
     }
 
+    fn native_owner(&self) -> Result<Arc<LockedWriterFile>, redb::NativeBackendError> {
+        self.owner.upgrade().ok_or(redb::NativeBackendError::Closed(
+            redb::NativeIoCause::WriterOwnerClosed))
+    }
+
     #[cfg(any(test, feature = "test-seams"))]
     fn note_closed(&self) {
         if !self.closed.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -543,15 +548,40 @@ impl redb::StorageBackend for WriterFileView {
     }
 
     fn len(&self) -> io::Result<u64> {
-        self.owner()?.file.metadata().map(|metadata| metadata.len())
+        redb::NativeStorageBackend::native_len(self).map_err(legacy_writer_error)
+    }
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        redb::NativeStorageBackend::native_read(self, offset, out).map_err(legacy_writer_error)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        redb::NativeStorageBackend::native_write(self, offset, data).map_err(legacy_writer_error)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        redb::NativeStorageBackend::native_set_len(self, len).map_err(legacy_writer_error)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        redb::NativeStorageBackend::native_sync_data(self).map_err(legacy_writer_error)
+    }
+    fn close(&self) -> io::Result<()> {
+        // The view owns no descriptor or lock. A closed redb transaction may
+        // retain its cache object; it must not retain physical writer ownership.
+        #[cfg(any(test, feature = "test-seams"))]
+        self.note_closed();
+        Ok(())
+    }
+}
+
+impl redb::NativeStorageBackend for WriterFileView {
+    fn native_len(&self) -> Result<u64, redb::NativeBackendError> {
+        self.native_owner()?.file.metadata().map(|metadata| metadata.len()).map_err(Into::into)
     }
 
     #[cfg(unix)]
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    fn native_read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::NativeBackendError> {
         use std::os::unix::fs::FileExt as _;
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(IoKindForTest::ReadBegin, offset, out.len(), None);
-        let result = self.owner()?.file.read_exact_at(out, offset);
+        let result = self.native_owner()?.file.read_exact_at(out, offset);
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(
             IoKindForTest::ReadEnd,
@@ -559,34 +589,34 @@ impl redb::StorageBackend for WriterFileView {
             out.len(),
             Some(result.is_ok()),
         );
-        result
+        result.map_err(Into::into)
     }
 
     #[cfg(windows)]
-    fn read(&self, mut offset: u64, mut out: &mut [u8]) -> io::Result<()> {
+    fn native_read(&self, mut offset: u64, mut out: &mut [u8]) -> Result<(), redb::NativeBackendError> {
         use std::os::windows::fs::FileExt as _;
-        let owner = self.owner()?;
+        let owner = self.native_owner()?;
         while !out.is_empty() {
             match owner.file.seek_read(out, offset) {
-                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(0) => return Err(redb::NativeBackendError::Io(io::ErrorKind::UnexpectedEof.into())),
                 Ok(count) => {
                     offset += count as u64;
                     out = &mut out[count..];
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(())
     }
 
-    fn set_len(&self, len: u64) -> io::Result<()> {
+    fn native_set_len(&self, len: u64) -> Result<(), redb::NativeBackendError> {
         LAST_DISK_GROWTH_REFUSAL.set(None);
-        let owner = self.owner()?;
+        let owner = self.native_owner()?;
         let mut reserved = owner
             .projected_growth_bytes
             .lock()
-            .map_err(|_| io::Error::other("projected file-growth reservation was poisoned"))?;
+            .map_err(|_| redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned))?;
         let current = owner.file.metadata()?.len();
         *reserved = len.saturating_sub(current);
         let result = if *reserved > 0 {
@@ -598,23 +628,25 @@ impl redb::StorageBackend for WriterFileView {
                     limit_bytes: limit,
                 };
                 LAST_DISK_GROWTH_REFUSAL.set(Some(refusal));
-                Err(io::Error::new(io::ErrorKind::QuotaExceeded, refusal))
+                Err(redb::NativeBackendError::Closed(redb::NativeIoCause::DiskGrowthRefused {
+                    current_bytes: current, projected_bytes: len, limit_bytes: limit,
+                }))
             } else {
-                owner.file.set_len(len)
+                owner.file.set_len(len).map_err(Into::into)
             }
         } else {
-            owner.file.set_len(len)
+            owner.file.set_len(len).map_err(Into::into)
         };
         *reserved = 0;
         result
     }
 
-    fn sync_data(&self) -> io::Result<()> {
+    fn native_sync_data(&self) -> Result<(), redb::NativeBackendError> {
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(IoKindForTest::SyncBegin, 0, 0, None);
         #[cfg(any(test, feature = "test-seams"))]
         super::read_persistence_test_scaffold::note_writer_data_sync_for_test();
-        let result = self.owner()?.file.sync_data();
+        let result = self.native_owner()?.file.sync_data();
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(IoKindForTest::SyncEnd, 0, 0, Some(result.is_ok()));
         #[cfg(feature = "in-process-test-seams")]
@@ -623,11 +655,11 @@ impl redb::StorageBackend for WriterFileView {
                 crate::writer_commit_test_seams::CommitBoundary::DuringRedbSync,
             );
         }
-        result
+        result.map_err(Into::into)
     }
 
     #[cfg(unix)]
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+    fn native_write(&self, offset: u64, data: &[u8]) -> Result<(), redb::NativeBackendError> {
         use std::os::unix::fs::FileExt as _;
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(IoKindForTest::WriteBegin, offset, data.len(), None);
@@ -638,7 +670,7 @@ impl redb::StorageBackend for WriterFileView {
         ) {
             return Ok(());
         }
-        let result = self.owner()?.file.write_all_at(data, offset);
+        let result = self.native_owner()?.file.write_all_at(data, offset);
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(
             IoKindForTest::WriteEnd,
@@ -646,32 +678,24 @@ impl redb::StorageBackend for WriterFileView {
             data.len(),
             Some(result.is_ok()),
         );
-        result
+        result.map_err(Into::into)
     }
 
     #[cfg(windows)]
-    fn write(&self, mut offset: u64, mut data: &[u8]) -> io::Result<()> {
+    fn native_write(&self, mut offset: u64, mut data: &[u8]) -> Result<(), redb::NativeBackendError> {
         use std::os::windows::fs::FileExt as _;
-        let owner = self.owner()?;
+        let owner = self.native_owner()?;
         while !data.is_empty() {
             match owner.file.seek_write(data, offset) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(0) => return Err(redb::NativeBackendError::Io(io::ErrorKind::WriteZero.into())),
                 Ok(count) => {
                     offset += count as u64;
                     data = &data[count..];
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
-        Ok(())
-    }
-
-    fn close(&self) -> io::Result<()> {
-        // The view owns no descriptor or lock. A closed redb transaction may
-        // retain its cache object; it must not retain physical writer ownership.
-        #[cfg(any(test, feature = "test-seams"))]
-        self.note_closed();
         Ok(())
     }
 }
@@ -681,3 +705,23 @@ pub(super) struct OpenedWriterDatabase {
     pub(super) database: redb::Database,
     pub(super) owner: Arc<LockedWriterFile>,
 }
+
+// Preserve the original public StorageBackend payloads as well as kind/text.
+fn legacy_writer_error(error: redb::NativeBackendError) -> io::Error {
+    match error {
+        redb::NativeBackendError::Io(error) => error,
+        redb::NativeBackendError::Closed(redb::NativeIoCause::WriterOwnerClosed) =>
+            io::Error::other("writer file ownership is closed"),
+        redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned) =>
+            io::Error::other("projected file-growth reservation was poisoned"),
+        redb::NativeBackendError::Closed(redb::NativeIoCause::DiskGrowthRefused {
+            current_bytes, projected_bytes, limit_bytes,
+        }) => io::Error::new(io::ErrorKind::QuotaExceeded, DiskGrowthRefusal {
+            current_bytes, projected_bytes, limit_bytes,
+        }),
+    }
+}
+
+#[cfg(test)]
+#[path = "writer_native_io_contract_tests.rs"]
+mod native_io_contract_tests;

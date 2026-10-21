@@ -6,9 +6,11 @@ impl RetainedReadSource {
     pub(super) fn check_history_directory_in_read(
         &self,
         read: &redb::ReadTransaction,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         checkpoint()?;
         let _controls = contextdb_core::read_memory::ReadCredit::try_new(
             memory,
@@ -22,9 +24,11 @@ impl RetainedReadSource {
     }
     pub(super) fn check_history_directory(
         &self,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         graph_read::with_pages(memory.clone(), || {
             self.with_read(|read| self.check_history_directory_in_read(read, memory, checkpoint))
         })
@@ -34,10 +38,12 @@ impl RetainedReadSource {
         &self,
         kind: content_identity::HistoryKind,
         definition: TableDefinition<&'static str, &'static [u8]>,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
         visit: &mut dyn FnMut(&redb::ReadTransaction, &str, &[u8]) -> Result<()>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         graph_read::with_pages(memory.clone(), || {
             self.with_read(|read| {
                 self.check_history_directory_in_read(read, memory.clone(), checkpoint)?;
@@ -177,7 +183,7 @@ impl RetainedReadSource {
     fn graph_window_memory_for_history(
         &self,
         owner: &writer_source::SourceWindowOwner,
-    ) -> Arc<crate::read_image_memory::ImageMemory> {
+    ) -> crate::read_image_memory::ImageMemoryHandle {
         let writer_source::SourceWindowOwner::Read(memory) = owner else {
             unreachable!("image read owner")
         };
@@ -226,10 +232,12 @@ impl RetainedReadSource {
     pub(crate) fn visit_changes_since(
         &self,
         since: Lsn,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
         keep: &mut dyn FnMut(ChangeLogEntry) -> Result<()>,
     ) -> Result<Option<Lsn>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let mut first = None;
         self.visit_history_bytes(
             content_identity::HistoryKind::ChangeLog,
@@ -257,10 +265,12 @@ impl RetainedReadSource {
     pub(crate) fn visit_ddl_since(
         &self,
         since: Lsn,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
         keep: &mut dyn FnMut(Lsn, DdlChange) -> Result<()>,
     ) -> Result<Option<Lsn>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let mut first = None;
         self.visit_history_bytes(
             content_identity::HistoryKind::DdlLog,
@@ -286,9 +296,11 @@ impl RetainedReadSource {
         &self,
         bound: std::ops::Bound<Lsn>,
         reverse: bool,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Option<(Lsn, TxId)>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         checkpoint()?;
         let _controls = contextdb_core::read_memory::ReadCredit::try_new(
             memory.clone(),

@@ -67,8 +67,10 @@ pub fn install_node_contacts_schema(db: &contextdb_engine::Database) -> Result<(
 
 pub fn install_node_contacts_schema_with_read_memory(
     db: &contextdb_engine::Database,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(), Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if !db
         .table_names()
         .iter()
@@ -120,10 +122,12 @@ pub fn record_node_contact(
 
 pub fn record_node_contact_with_read_memory(
     db: &contextdb_engine::Database,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     node_id: &str,
     now_ms: i64,
 ) -> Result<(), Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     install_node_contacts_schema_with_read_memory(db, read_memory.clone())?;
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));
@@ -284,13 +288,15 @@ pub async fn claim_job(
 
 pub async fn claim_job_with_read_memory(
     client: &SyncClient,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     job_id: &str,
     attempt: i64,
     node_id: &str,
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Result<ClaimOutcome, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     match ledger::insert_claim_with_read_memory(
         client.db(),
         job_id,
@@ -375,9 +381,11 @@ pub async fn claim_job_with_read_memory(
 /// attempt", regardless of how many attempts remain.
 fn job_has_failure_rows(
     db: &contextdb_engine::Database,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     job_id: &str,
 ) -> Result<bool, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), Value::Text(job_id.to_string()));
     let result = db.execute_with_read_memory(
@@ -385,7 +393,7 @@ fn job_has_failure_rows(
         &params,
         read_memory.clone(),
     )?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }
 
 /// Must `job`, submitted by `config.node_id` itself, be left unclaimed by
@@ -395,11 +403,13 @@ fn job_has_failure_rows(
 /// failure releases the job for immediate self-reclaim, deadline or not).
 fn defers_own_submission(
     db: &contextdb_engine::Database,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     config: &WorkerConfig,
     job: &JobSnapshot,
     now_ms: i64,
 ) -> Result<bool, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if !config.defer_own_submissions_until_deadline {
         return Ok(false);
     }
@@ -450,9 +460,11 @@ fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
 /// must be read directly.
 fn read_ledger_input_rows(
     db: &contextdb_engine::Database,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     job_id: &str,
 ) -> Result<HashMap<i64, Vec<u8>>, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), Value::Text(job_id.to_string()));
     let result = db.execute_with_read_memory(
@@ -460,18 +472,16 @@ fn read_ledger_input_rows(
         &params,
         read_memory.clone(),
     )?;
-    let seq_idx = result
-        .columns
+    let seq_idx = result.columns()
         .iter()
         .position(|c| c == "seq")
         .ok_or_else(|| Error::Other(("work_inputs: missing column seq".to_string()).into()))?;
-    let payload_idx = result
-        .columns
+    let payload_idx = result.columns()
         .iter()
         .position(|c| c == "payload")
         .ok_or_else(|| Error::Other(("work_inputs: missing column payload".to_string()).into()))?;
     let mut out = HashMap::new();
-    for row in &result.rows {
+    for row in result.rows() {
         let seq = match &row[seq_idx] {
             Value::Int64(n) => *n,
             Value::Timestamp(n) => *n,
@@ -505,10 +515,12 @@ fn read_ledger_input_rows(
 /// the result in the job's own input-sequence order.
 async fn resolve_blob_job_inputs(
     db: &contextdb_engine::Database,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     job: &JobSnapshot,
     blob_store: &crate::blob_resolver::BlobStore,
 ) -> Result<ExecutionInputs, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut assembled: ExecutionInputs = Vec::new();
     let mut ledger_rows: Option<HashMap<i64, Vec<u8>>> = None;
     let mut ledger_seq: i64 = 0;
@@ -584,11 +596,13 @@ pub async fn poll_and_execute_once(
 
 pub async fn poll_and_execute_once_with_read_memory(
     client: &SyncClient,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     config: &WorkerConfig,
     executor: Arc<dyn WorkExecutor>,
     now_ms: i64,
 ) -> Result<PollOutcome, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     tolerate_offline_sync(
         client
             .pull_default_with_read_memory(read_memory.clone())
@@ -908,7 +922,7 @@ pub async fn run_worker_loop(
     poll_interval: Duration,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Error> {
-    run_worker_loop_with_read_budget_provider(
+    run_worker_loop_with_provider(
         client,
         client.db().declared_read_request_provider(),
         config,
@@ -922,6 +936,19 @@ pub async fn run_worker_loop(
 pub async fn run_worker_loop_with_read_budget_provider(
     client: &SyncClient,
     read_budgets: Arc<dyn contextdb_engine::vector_read_memory::ReadRequestBudgetProvider>,
+    config: &WorkerConfig,
+    executor: Arc<dyn WorkExecutor>,
+    poll_interval: Duration,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Error> {
+    run_worker_loop_with_provider(
+        client, read_budgets.into(), config, executor, poll_interval, shutdown,
+    ).await
+}
+
+async fn run_worker_loop_with_provider(
+    client: &SyncClient,
+    read_budgets: contextdb_engine::vector_read_memory::ReadRequestProvider,
     config: &WorkerConfig,
     executor: Arc<dyn WorkExecutor>,
     poll_interval: Duration,

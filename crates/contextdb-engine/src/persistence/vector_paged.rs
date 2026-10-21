@@ -76,10 +76,10 @@ const CANONICAL_BYTES: usize = 32;
 /// Physical source companion suffix width (`vector_membership_pages::source_key`).
 const SOURCE_SUFFIX_BYTES: usize = 24;
 
-pub(crate) fn corruption(reason: impl Into<String>) -> Error {
+pub(crate) fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "vector_paged_generation_pages".into(),
-        reason: reason.into(),
+        reason: reason.into().into(),
     }
 }
 
@@ -1658,7 +1658,7 @@ pub(crate) type PagedRootCapture =
 /// these existing source Arcs never transfers their original invoice.
 pub(crate) enum PagedRootHolder {
     Writer(WriterSnapshotHandle),
-    Image(Arc<RetainedReadSource>),
+    Image(RetainedReadSource),
     Captured(Arc<crate::database::vector_captured_serving::CapturedVectorRootLease>),
 }
 pub(crate) struct CapturedPagedRoot {
@@ -1671,7 +1671,7 @@ impl CapturedPagedRoot {
         Ok(Self { read, holder: PagedRootHolder::Writer(root) })
     }
     pub(super) fn from_image(
-        read: Arc<redb::ReadTransaction>, source: Arc<RetainedReadSource>,
+        read: Arc<redb::ReadTransaction>, source: RetainedReadSource,
     ) -> Result<Self> {
         let captured = Self { read, holder: PagedRootHolder::Image(source) };
         captured.authenticate()?;
@@ -4263,10 +4263,12 @@ impl RedbPersistence {
         &self,
         write: &redb::WriteTransaction,
         prefix: &[u8],
-        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
         operation: &str,
         own_storage: &[u64],
     ) -> Result<()> {
+        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
+
         Self::refuse_unresolved_vector_erasure_in_write(write, own_storage)?;
         let mut pages = write.open_table(PAGES).map_err(Self::storage_error)?;
         let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;

@@ -39,7 +39,7 @@ impl Drop for Scope {
 pub(crate) struct WorkingReadSource {
     token: crate::database::DatabaseId,
     control_identity: u64,
-    budget: Arc<dyn ReadMemoryBudget>,
+    budget: contextdb_core::read_memory::ReadMemoryOwner,
     root: WriterSnapshotHandle,
     snapshot: SnapshotId,
     lsn: Lsn,
@@ -67,7 +67,7 @@ impl ReceivedWorkingWrite {
         // This projection clones precisely the lent writer use, not a current
         // registration discovered from a database accountant.
         let budget = crate::memory_accounting::persistence_original_projection(original)?.read_budget()?;
-        let source=WorkingReadSource {token,control_identity:super::received_working::next_working_control_identity()?,budget,root,snapshot,lsn};
+        let source=WorkingReadSource {token,control_identity:super::received_working::next_working_control_identity()?,budget: budget.into(),root,snapshot,lsn};
         let context=Context {token,host,source:source.clone(),frontier:std::cell::Cell::new((snapshot,lsn)),write:self,original,store,metadata,graph_schema_scope,failure:std::cell::RefCell::new(None),failed:std::cell::Cell::new(false)};
         let previous = ACTIVE.with(|slot|slot.replace((&context as *const Context<'_>).cast()));
         let _scope = Scope { previous,_thread:std::marker::PhantomData };
@@ -146,7 +146,7 @@ impl WorkingReadSource {
     pub(crate) fn same_working_source(&self, other: &Self) -> bool {
         self.token == other.token && self.control_identity == other.control_identity && self.root.ptr_eq(&other.root)
     }
-    pub(crate) fn reader_budget(&self) -> Arc<dyn ReadMemoryBudget> { self.budget.clone() }
+    pub(crate) fn reader_budget(&self) -> contextdb_core::read_memory::ReadMemoryOwner { self.budget.clone() }
     pub(crate) fn rewrite_private_vectors(
         &self,
         body: impl FnMut(&OriginalPersistenceFrame<'_>, &mut super::received_working_vector::WorkingVectorIdentity<'_>) -> Result<bool>,
@@ -166,7 +166,7 @@ impl WorkingReadSource {
         })
     }
     pub(crate) fn root(&self)->WriterSnapshotHandle {self.root.clone()}
-    pub(crate) fn vector_reader_memory(&self) -> Result<Arc<crate::read_image_memory::ImageMemory>> {
+    pub(crate) fn vector_reader_memory(&self) -> Result<crate::read_image_memory::ImageMemoryHandle> {
         self.context(|context| crate::read_image_memory::ImageMemory::operation_reader(
             context.original.accountant().clone(), self.budget.clone()))
     }
@@ -361,7 +361,9 @@ impl WorkingReadSource {
         self.snapshot=snapshot;
         Ok(self)
     }
-    pub(crate) fn for_read(mut self,budget:Arc<dyn ReadMemoryBudget>)->Self {
+    pub(crate) fn for_read(mut self,budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>)->Self {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         self.budget=budget;
         self
     }
@@ -385,8 +387,7 @@ impl WorkingReadSource {
                         let Some((key,body))=entry.transpose().map_err(RedbPersistence::storage_error)? else {return Ok(ReadCopy::End);};
                         let needed=body.value().len();
                         if needed>paid {return Ok(ReadCopy::Need(needed));}
-                        let position:[u8;24]=key.value().try_into().map_err(|_|Error::StoreCorrupted {
-                            path:table.to_owned(),reason:"working read row key has invalid width".into()})?;
+                        let position:[u8;24]=key.value().try_into().map_err(|_|crate::funded_error::corruption_text(Ok(self.budget.clone()), table, "working read row key has invalid width".into()))?;
                         Ok(ReadCopy::Ready((position,body.value().to_vec())))
                     })?;
                     match copied {
@@ -401,7 +402,7 @@ impl WorkingReadSource {
                 if row.row_id.0!=u64::from_be_bytes(position[..8].try_into().unwrap())
                     ||row.created_tx.0!=u64::from_be_bytes(position[8..16].try_into().unwrap())
                     ||row.lsn.0!=u64::from_be_bytes(position[16..].try_into().unwrap()) {
-                    return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"working read row key and body disagree".into()});
+                    return Err(crate::funded_error::corruption_text(Ok(self.budget.clone()), table, "working read row key and body disagree".into()));
                 }
                 let mut window=writer_source::WriterWindow::from_owned(&self.root,memory.clone(),row);
                 window.position=Box::new(position);
@@ -446,18 +447,17 @@ impl WorkingReadSource {
                         ReadCopy::Ready(value)=>break value,
                     }
                 };
-                let corrupt=|reason:String|Error::StoreCorrupted {path:"received_working".into(),reason};
+                let corrupt=|reason:contextdb_core::error::DiagnosticText|crate::funded_error::corruption_text(Ok(self.budget.clone()), "received_working", reason);
                 let mut position=key.decode_canonical().map_err(|error|match error {
-                    Error::Other(reason)=>corrupt(reason.into_owned()),other=>other,
+                    Error::Other(reason)=>corrupt(reason),other=>other,
                 })?;
                 let deleted_tx=if current {
-                    if position.created_tx!=TxId(0) {return Err(Error::StoreCorrupted {
-                        path:table.to_owned(),reason:"working current index has a historical physical tie".into()});}
+                    if position.created_tx!=TxId(0) {return Err(crate::funded_error::corruption_text(Ok(self.budget.clone()), table, "working current index has a historical physical tie".into()));}
                     position.created_tx=RedbPersistence::decode_exact::<TxId>(&value)?;
                     None
                 }else{
                     RedbPersistence::decode_exact::<Option<TxId>>(&value).map_err(|error|match error {
-                        Error::Other(reason)=>corrupt(format!("durable index visibility record is damaged: {reason}")),
+                        Error::Other(reason)=>crate::funded_error::corruption_display(Ok(self.budget.clone()), "received_working", format_args!("durable index visibility record is damaged: {reason}")),
                         other=>other,
                     })?
                 };
@@ -525,10 +525,9 @@ impl WorkingReadSource {
     pub(crate) fn row_head(&self,table:&str,row:RowId)->Result<(Lsn,[u8;24])> {
         let mut cursor=self.row_id_cursor(table,row,self.snapshot)?;
         let Some(window)=cursor.next_window()? else {
-            return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"working row head is missing".into()});
+            return Err(crate::funded_error::corruption_text(Ok(self.budget.clone()), table, "working row head is missing".into()));
         };
-        let key=window.position_key().try_into().map_err(|_|Error::StoreCorrupted {
-            path:table.to_owned(),reason:"working row head has an invalid key".into()})?;
+        let key=window.position_key().try_into().map_err(|_|crate::funded_error::corruption_text(Ok(self.budget.clone()), table, "working row head has an invalid key".into()))?;
         Ok((window.value().lsn,key))
     }
 }
@@ -855,10 +854,10 @@ impl WorkingReadSource {
             |key, encoded| {
                 let member: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
                     VectorPartitionRecordKind::Membership, encoded).map_err(|failure| failure.into_error(|reason|
-                        Error::StoreCorrupted { path: "received working memberships".into(), reason }))?;
+                        crate::funded_error::corruption_display(Ok(self.budget.clone()), "received working memberships", reason)))?;
                 self.root.check_working_scope(&member.index.table)?;
                 if !super::received_working_vector::membership_key_matches(key, &member) {
-                    return Err(Error::StoreCorrupted { path: "received working memberships".into(), reason: "placement key and body disagree".into() });
+                    return Err(crate::funded_error::corruption_text(Ok(self.budget.clone()), "received working memberships", "placement key and body disagree".into()));
                 }
                 Ok(member)
             })
@@ -871,10 +870,10 @@ impl WorkingReadSource {
             |key, encoded| {
                 let member: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
                     VectorPartitionRecordKind::Membership, encoded).map_err(|failure| failure.into_error(|reason|
-                        Error::StoreCorrupted { path: "received working vector reverse".into(), reason }))?;
+                        crate::funded_error::corruption_display(Ok(self.budget.clone()), "received working vector reverse", reason)))?;
                 self.root.check_working_scope(&member.index.table)?;
                 if !super::received_working_vector::reverse_membership_key_matches(key, &member) {
-                    return Err(Error::StoreCorrupted { path: "received working vector reverse".into(), reason: "reverse key and placement disagree".into() });
+                    return Err(crate::funded_error::corruption_text(Ok(self.budget.clone()), "received working vector reverse", "reverse key and placement disagree".into()));
                 }
                 Ok(member)
             })

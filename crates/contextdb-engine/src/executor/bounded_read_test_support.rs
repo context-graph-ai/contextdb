@@ -313,10 +313,10 @@ pub fn execute(db: &Database, request: &BoundedReadRequest) -> Result<TestResult
         request.cancellation.clone(),
         adapted_probe(request),
     )
-    .map(|outcome| TestResult {
-        result: outcome.result.into_public(),
+    .and_then(|outcome| Ok(TestResult {
+        result: outcome.result.into_public().map_err(BoundedExecutionError::from)?,
         telemetry: outcome.telemetry.into(),
-    })
+    }))
     .map_err(test_error)
 }
 
@@ -338,14 +338,14 @@ pub fn open_cursor(
         request.cancellation.clone(),
         adapted_probe(request),
     )
-    .map(|outcome| TestCursorOpen {
+    .and_then(|outcome| Ok(TestCursorOpen {
         cursor: TestCursor {
             handle: outcome.cursor,
             probe: request.probe.as_ref().map(Arc::clone),
         },
-        first_page: outcome.first_page.into_public(),
+        first_page: outcome.first_page.into_public().map_err(BoundedExecutionError::from)?,
         telemetry: outcome.telemetry.into(),
-    })
+    }))
     .map_err(test_error)
 }
 
@@ -360,10 +360,10 @@ impl TestCursor {
             Arc::new(ProbeAdapter(Arc::clone(probe))) as Arc<dyn BoundedExecutionProbe>
         });
         fetch_bounded_cursor(&mut self.handle, rows, cancellation, probe)
-            .map(|outcome| TestCursorFetch {
-                page: outcome.page.into_public(),
+            .and_then(|outcome| Ok(TestCursorFetch {
+                page: outcome.page.into_public().map_err(BoundedExecutionError::from)?,
                 telemetry: outcome.telemetry.into(),
-            })
+            }))
             .map_err(test_error)
     }
 

@@ -206,8 +206,10 @@ impl NodeLocalPredicate {
         db: &Database,
         table: &str,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<AuthoritativePurgeSelection>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = db.table_meta(table) else {
             return Ok(Vec::new());
         };

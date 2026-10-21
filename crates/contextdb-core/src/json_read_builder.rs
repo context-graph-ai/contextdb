@@ -1,6 +1,6 @@
 //! Incremental admission for the pinned serde_json 1.0.149 string reader.
 //! Serde remains the grammar, recursion-limit and number-conversion authority.
-use crate::read_memory::{ReadCredit, ReadMemoryBudget};
+use crate::read_memory::{NativeRefusal, ReadCredit, ReadMemoryBudget, ReadMemoryOwner};
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use std::cell::RefCell;
@@ -18,22 +18,96 @@ const MAP_NODE: usize = 728;
 const NUMBER_WORK_BYTES: usize = 7_200;
 
 thread_local! {
-    static OWNER: RefCell<Option<Arc<dyn ReadMemoryBudget>>> = const { RefCell::new(None) };
+    static CLOSED_HOOKS: RefCell<Option<ClosedJsonReadHooks>> = const { RefCell::new(None) };
+    static CLOSED_FAILURE: RefCell<Option<ClosedState>> = const { RefCell::new(None) };
+    static OWNER: RefCell<Option<ReadMemoryOwner>> = const { RefCell::new(None) };
+    static NATIVE_OWNER: RefCell<Option<ReadMemoryOwner>> = const { RefCell::new(None) };
 }
 
 /// Internal, thread-affine bridge from the engine's row lease into core serde.
 #[doc(hidden)]
 pub struct JsonReadAdmissionGuard {
-    previous: Option<Arc<dyn ReadMemoryBudget>>,
+    previous: Option<crate::read_memory::ReadMemoryOwner>,
+    previous_hooks: Option<ClosedJsonReadHooks>,
+    previous_native: Option<ReadMemoryOwner>,
     _thread: PhantomData<Rc<()>>,
 }
 impl JsonReadAdmissionGuard {
-    pub fn enter(owner: Arc<dyn ReadMemoryBudget>) -> Self {
+    pub fn enter(owner: impl Into<crate::read_memory::ReadMemoryOwner>) -> Self {
+        let owner: crate::read_memory::ReadMemoryOwner = owner.into();
+
         let previous = OWNER.with(|slot| slot.replace(Some(owner)));
         Self {
             previous,
+            previous_native: NATIVE_OWNER.with(|slot| slot.replace(None)),
+            previous_hooks: CLOSED_HOOKS.with(|slot| slot.replace(None)),
             _thread: PhantomData,
         }
+    }
+    /// Native companion; retains the exact original capability inline.
+    #[doc(hidden)]
+    pub fn enter_owned(owner: ReadMemoryOwner) -> Self {
+        let mut guard = Self::enter_owned_empty();
+        guard.previous_native = NATIVE_OWNER.with(|slot| slot.replace(Some(owner)));
+        guard
+    }
+    fn enter_owned_empty() -> Self {
+        Self {
+            previous: OWNER.with(|slot| slot.replace(None)),
+            previous_native: None,
+            previous_hooks: CLOSED_HOOKS.with(|slot| slot.replace(None)),
+            _thread: PhantomData,
+        }
+    }
+    /// Select only a concrete engine root whose outer adapter owns these
+    /// callbacks. This is refusal/diagnostic transport, not calibration proof.
+    #[doc(hidden)]
+    pub fn enter_closed(owner: impl Into<crate::read_memory::ReadMemoryOwner>, hooks: ClosedJsonReadHooks) -> Self {
+        let owner: crate::read_memory::ReadMemoryOwner = owner.into();
+
+        let guard = Self::enter(owner);
+        CLOSED_HOOKS.with(|slot| {
+            slot.replace(Some(hooks));
+        });
+        guard
+    }
+}
+/// Private cross-crate callbacks into the existing operation ledger. Function
+/// pointers cannot retain a caller or create an uncharged closure allocation.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct ClosedJsonReadHooks {
+    pub refused: fn(NativeRefusal),
+    pub diagnostic: fn(serde_json::Error, Option<&'static str>) -> Result<(), serde_json::Error>,
+}
+impl ClosedJsonReadHooks {
+    /// Maximum ONE native Message backing for this closed producer. Each
+    /// explicit finite recipe passes &str to Error::custom: pinned std writes
+    /// it once to an empty String (capacity = max(len, 8)); neither phrase has
+    /// a coordinate suffix, so into_boxed_str cannot shrink/reallocate it.
+    /// fix_position moves that backing; it never clones the Message.
+    #[doc(hidden)]
+    pub const fn native_message_bytes() -> usize {
+        if CAPACITY_ERROR.len() > MISSING_OWNER.len() {
+            CAPACITY_ERROR.len()
+        } else {
+            MISSING_OWNER.len()
+        }
+    }
+}
+pub(crate) fn has_closed_hooks() -> bool {
+    CLOSED_HOOKS.with(|slot| slot.borrow().is_some())
+}
+pub(crate) fn capture_closed_json(error: ClosedJsonFailure) -> Result<(), serde_json::Error> {
+    let hooks = CLOSED_HOOKS
+        .with(|slot| *slot.borrow())
+        .expect("closed JSON field remains within its producer");
+    match error {
+        ClosedJsonFailure::Refused(error) => {
+            (hooks.refused)(error);
+            Ok(())
+        }
+        ClosedJsonFailure::Native(error, finite) => (hooks.diagnostic)(error, finite),
     }
 }
 impl Drop for JsonReadAdmissionGuard {
@@ -41,7 +115,16 @@ impl Drop for JsonReadAdmissionGuard {
         OWNER.with(|slot| {
             slot.replace(self.previous.take());
         });
+        CLOSED_HOOKS.with(|slot| {
+            slot.replace(self.previous_hooks.take());
+        });
+        NATIVE_OWNER.with(|slot| { slot.replace(self.previous_native.take()); });
     }
+}
+
+fn current_owner() -> Option<ReadMemoryOwner> {
+    NATIVE_OWNER.with(|slot| slot.borrow().clone()).or_else(||
+        OWNER.with(|slot| slot.borrow().clone()))
 }
 
 // The outer engine serde adapter has already admitted this exact String.
@@ -49,23 +132,18 @@ impl Drop for JsonReadAdmissionGuard {
 pub(crate) fn release_serialized_input(input: String) {
     let capacity = input.capacity();
     drop(input);
-    OWNER.with(|slot| {
-        if let Some(owner) = slot.borrow().as_ref() {
-            owner.release(capacity);
-        }
-    });
+    if let Some(owner) = current_owner() { owner.release(capacity); }
 }
 
 pub(crate) fn in_scope() -> bool {
-    OWNER.with(|slot| slot.borrow().is_some())
+    NATIVE_OWNER.with(|slot| slot.borrow().is_some()) || OWNER.with(|slot| slot.borrow().is_some())
 }
 
 /// Decode through the engine door; its caller must recover typed admission
 /// failures from the installed budget's existing failure sideband.
 #[doc(hidden)]
 pub fn deserialize_json_in_read_scope(input: &str) -> serde_json::Result<Value> {
-    let owner = OWNER
-        .with(|slot| slot.borrow().clone())
+    let owner = current_owner()
         .ok_or_else(|| serde_json::Error::custom(MISSING_OWNER))?;
     let mut state = BuildState::new(input, owner);
     let mut parser = serde_json::Deserializer::from_str(input);
@@ -104,6 +182,294 @@ pub fn deserialize_json_in_read_scope(input: &str) -> serde_json::Result<Value> 
             Ok(value)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Private engine bridge. The selected engine caller prepays native workspace
+/// before entry and retains it across this result and its outer conversion.
+/// No arbitrary Deserialize visitor enters this path.
+pub(crate) enum ClosedJsonFailure {
+    Native(serde_json::Error, Option<&'static str>),
+    Refused(NativeRefusal),
+}
+#[derive(Clone, Copy)]
+struct ClosedState {
+    refusal: Option<NativeRefusal>,
+    finite: Option<&'static str>,
+}
+struct ClosedScope(Option<ClosedState>);
+impl ClosedScope {
+    fn enter() -> Self {
+        Self(CLOSED_FAILURE.with(|slot| slot.replace(Some(ClosedState { refusal: None, finite: None }))))
+    }
+    fn failure(&self) -> Option<NativeRefusal> {
+        CLOSED_FAILURE.with(|slot| slot.borrow().as_ref().and_then(|state| state.refusal))
+    }
+    fn finite(&self) -> Option<&'static str> {
+        CLOSED_FAILURE.with(|slot| slot.borrow().as_ref().and_then(|state| state.finite))
+    }
+}
+impl Drop for ClosedScope {
+    fn drop(&mut self) {
+        CLOSED_FAILURE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+fn latch_refusal(error: NativeRefusal) {
+    CLOSED_FAILURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let failure = slot
+            .as_mut()
+            .expect("closed JSON refusal has an active scope");
+        if failure.refusal.is_none() {
+            failure.refusal = Some(error);
+        }
+    });
+}
+fn closed() -> bool {
+    CLOSED_FAILURE.with(|slot| slot.borrow().is_some())
+}
+fn refused() -> bool {
+    CLOSED_FAILURE.with(|slot| slot.borrow().as_ref().is_some_and(|state| state.refusal.is_some()))
+}
+
+fn capacity_error<E: serde::de::Error>() -> E {
+    CLOSED_FAILURE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.finite = Some(CAPACITY_ERROR);
+        }
+    });
+    E::custom(CAPACITY_ERROR)
+}
+
+pub(crate) fn deserialize_json_closed(input: &str) -> Result<Value, ClosedJsonFailure> {
+    let owner = current_owner()
+        .ok_or_else(|| ClosedJsonFailure::Native(
+            serde_json::Error::custom(MISSING_OWNER), Some(MISSING_OWNER)))?;
+    let scope = ClosedScope::enter();
+    let mut state = BuildState::new(input, owner);
+    let mut parser = serde_json::Deserializer::from_str(input);
+    let result = ValueSeed { state: &mut state }.deserialize(Closed(&mut parser));
+    // Container cleanup can construct a secondary native error even when a
+    // visitor captured a refusal. The authentic scalar cause always wins.
+    let result = if let Some(error) = scope.failure() {
+        drop(result);
+        Err(ClosedJsonFailure::Refused(error))
+    } else {
+        match result {
+            Ok(value) => match parser.end() {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    drop(value);
+                    Err(ClosedJsonFailure::Native(error, scope.finite()))
+                }
+            },
+            Err(ClosedError::Native(error)) => Err(ClosedJsonFailure::Native(error, scope.finite())),
+            Err(ClosedError::Captured) => unreachable!("captured JSON refusal has a scalar cause"),
+        }
+    };
+    drop(parser);
+    // Neither a successful refund nor an accounting failure allocates text.
+    // In particular, a cleanup failure must not replace the primary refusal.
+    let scratch = state.scratch.bytes();
+    if let Err(error) = state.scratch.try_shrink_native(scratch) {
+        if result.is_ok() {
+            return Err(ClosedJsonFailure::Refused(error));
+        }
+    }
+    match result {
+        Ok(value) => {
+            let retained = decoded_retained_heap_bytes(&value);
+            if retained > state.payload.bytes() {
+                drop(value);
+                // Preserve the genuine Data category and zero coordinates.
+                // Its sole Message backing was prepaid by the selected caller.
+                return Err(ClosedJsonFailure::Native(
+                    capacity_error(), Some(CAPACITY_ERROR)));
+            }
+            if let Err(error) = state
+                .payload
+                .try_shrink_native(state.payload.bytes() - retained)
+            {
+                drop(value);
+                return Err(ClosedJsonFailure::Refused(error));
+            }
+            state.payload.transfer();
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// Selected ValueSeed/KeySeed use only deserialize_any. Captured refusal travels
+// as unit across the native visitor, and as Captured across seed/access edges.
+// Ordinary native errors still cross as Err so fix_position retains its exact
+// legacy message/category/coordinates. No generic visitor is certified here.
+#[derive(Debug)]
+enum ClosedError<E> {
+    Native(E),
+    Captured,
+}
+impl<E: fmt::Display> fmt::Display for ClosedError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Native(error) => fmt::Display::fmt(error, f),
+            Self::Captured => f.write_str(ADMISSION_ERROR),
+        }
+    }
+}
+impl<E: serde::de::Error> std::error::Error for ClosedError<E> {}
+impl<E: serde::de::Error> serde::de::Error for ClosedError<E> {
+    fn custom<T: fmt::Display>(message: T) -> Self {
+        if refused() {
+            Self::Captured
+        } else {
+            Self::Native(E::custom(message))
+        }
+    }
+}
+fn closed_capture<T, E>(
+    result: Result<T, ClosedError<E>>,
+    output: &mut Option<T>,
+) -> Result<(), E> {
+    match result {
+        Ok(value) => {
+            *output = Some(value);
+            Ok(())
+        }
+        Err(ClosedError::Native(error)) => Err(error),
+        Err(ClosedError::Captured) => Ok(()),
+    }
+}
+struct Closed<D>(D);
+struct ClosedSeed<S>(S);
+impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for ClosedSeed<S> {
+    type Value = Option<S::Value>;
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
+        let mut output = None;
+        closed_capture(self.0.deserialize(Closed(de)), &mut output)?;
+        Ok(output)
+    }
+}
+struct CaptureVisitor<'a, V, T> {
+    inner: V,
+    output: &'a mut Option<T>,
+}
+impl<'de, V: Visitor<'de>> Visitor<'de> for CaptureVisitor<'_, V, V::Value> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.expecting(f)
+    }
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<(), E> {
+        closed_capture(self.inner.visit_bool::<ClosedError<E>>(value), self.output)
+    }
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<(), E> {
+        closed_capture(self.inner.visit_i64::<ClosedError<E>>(value), self.output)
+    }
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<(), E> {
+        closed_capture(self.inner.visit_u64::<ClosedError<E>>(value), self.output)
+    }
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<(), E> {
+        closed_capture(self.inner.visit_f64::<ClosedError<E>>(value), self.output)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        closed_capture(self.inner.visit_unit::<ClosedError<E>>(), self.output)
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
+        closed_capture(self.inner.visit_str::<ClosedError<E>>(value), self.output)
+    }
+    fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<(), E> {
+        closed_capture(
+            self.inner.visit_borrowed_str::<ClosedError<E>>(value),
+            self.output,
+        )
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, access: A) -> Result<(), A::Error> {
+        closed_capture(self.inner.visit_seq(ClosedAccess(access)), self.output)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, access: A) -> Result<(), A::Error> {
+        closed_capture(self.inner.visit_map(ClosedAccess(access)), self.output)
+    }
+}
+struct ClosedAccess<A>(A);
+impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for ClosedAccess<A> {
+    type Error = ClosedError<A::Error>;
+    fn next_element_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<S::Value>, Self::Error> {
+        if refused() {
+            return Err(ClosedError::Captured);
+        }
+        match self
+            .0
+            .next_element_seed(ClosedSeed(seed))
+            .map_err(ClosedError::Native)?
+        {
+            Some(Some(value)) => Ok(Some(value)),
+            None => Ok(None),
+            Some(None) => Err(ClosedError::Captured),
+        }
+    }
+    fn size_hint(&self) -> Option<usize> {
+        self.0.size_hint()
+    }
+}
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for ClosedAccess<A> {
+    type Error = ClosedError<A::Error>;
+    fn next_key_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<S::Value>, Self::Error> {
+        if refused() {
+            return Err(ClosedError::Captured);
+        }
+        match self
+            .0
+            .next_key_seed(ClosedSeed(seed))
+            .map_err(ClosedError::Native)?
+        {
+            Some(Some(value)) => Ok(Some(value)),
+            None => Ok(None),
+            Some(None) => Err(ClosedError::Captured),
+        }
+    }
+    fn next_value_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<S::Value, Self::Error> {
+        if refused() {
+            return Err(ClosedError::Captured);
+        }
+        self.0
+            .next_value_seed(ClosedSeed(seed))
+            .map_err(ClosedError::Native)?
+            .ok_or(ClosedError::Captured)
+    }
+    fn size_hint(&self) -> Option<usize> {
+        self.0.size_hint()
+    }
+}
+impl<'de, D: serde::Deserializer<'de>> serde::Deserializer<'de> for Closed<D> {
+    type Error = ClosedError<D::Error>;
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        if refused() {
+            return Err(ClosedError::Captured);
+        }
+        let mut output = None;
+        self.0
+            .deserialize_any(CaptureVisitor {
+                inner: visitor,
+                output: &mut output,
+            })
+            .map_err(ClosedError::Native)?;
+        output.ok_or(ClosedError::Captured)
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+        byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+        map struct enum identifier ignored_any
     }
 }
 
@@ -227,42 +593,65 @@ struct BuildState<'a> {
     number: ReadCredit,
 }
 impl<'a> BuildState<'a> {
-    fn new(input: &'a str, owner: Arc<dyn ReadMemoryBudget>) -> Self {
+    fn new(input: &'a str, owner: impl Into<crate::read_memory::ReadMemoryOwner>) -> Self {
+        let owner: crate::read_memory::ReadMemoryOwner = owner.into();
+
         Self {
             shadow: ShadowCursor::new(input),
-            payload: ReadCredit::new(owner.clone()),
-            scratch: ReadCredit::new(owner.clone()),
-            number: ReadCredit::new(owner),
+            payload: ReadCredit::from_prepaid_owned(owner.clone(), 0),
+            scratch: ReadCredit::from_prepaid_owned(owner.clone(), 0),
+            number: ReadCredit::from_prepaid_owned(owner, 0),
         }
     }
     fn grow<E: serde::de::Error>(credit: &mut ReadCredit, bytes: usize) -> Result<(), E> {
         if bytes == 0 {
             return Ok(());
         }
-        credit
-            .try_grow_for(
-                bytes,
-                "json_decode",
-                "construct_value",
-                "Reduce JSON payload or raise the operation memory limit.",
-            )
-            .map_err(|_| E::custom(ADMISSION_ERROR))
+        if closed() {
+            credit
+                .try_grow_for_native(
+                    bytes,
+                    "json_decode",
+                    "construct_value",
+                    "Reduce JSON payload or raise the operation memory limit.",
+                )
+                .map_err(|error| {
+                    latch_refusal(error);
+                    E::custom(ADMISSION_ERROR)
+                })
+        } else {
+            credit
+                .try_grow_for(
+                    bytes,
+                    "json_decode",
+                    "construct_value",
+                    "Reduce JSON payload or raise the operation memory limit.",
+                )
+                .map_err(|_| E::custom(ADMISSION_ERROR))
+        }
     }
     fn shrink<E: serde::de::Error>(credit: &mut ReadCredit, bytes: usize) -> Result<(), E> {
-        credit
-            .try_shrink(bytes)
-            .map_err(|_| E::custom(ADMISSION_ERROR))
+        if closed() {
+            credit.try_shrink_native(bytes).map_err(|error| {
+                latch_refusal(error);
+                E::custom(ADMISSION_ERROR)
+            })
+        } else {
+            credit
+                .try_shrink(bytes)
+                .map_err(|_| E::custom(ADMISSION_ERROR))
+        }
     }
     fn prepare<E: serde::de::Error>(&mut self) -> Result<(), E> {
         let prediction = self
             .shadow
             .token()
-            .ok_or_else(|| E::custom(CAPACITY_ERROR))?;
+            .ok_or_else(|| capacity_error::<E>())?;
         // Fund only token-local native requests, including realloc overlap.
         let additional = prediction
             .peak
             .checked_sub(self.scratch.bytes())
-            .ok_or_else(|| E::custom(CAPACITY_ERROR))?;
+            .ok_or_else(|| capacity_error::<E>())?;
         Self::grow(&mut self.scratch, additional)?;
         if prediction.number {
             // Token-local upper bound includes lexical limb work, arbitrary
@@ -272,7 +661,7 @@ impl<'a> BuildState<'a> {
                 .encoded_len
                 .checked_mul(8)
                 .and_then(|n| n.checked_add(NUMBER_WORK_BYTES))
-                .ok_or_else(|| E::custom(CAPACITY_ERROR))?;
+                .ok_or_else(|| capacity_error::<E>())?;
             Self::grow(&mut self.number, bound)?;
         }
         Ok(())
@@ -299,7 +688,7 @@ impl<'a> BuildState<'a> {
         let mut owned = String::with_capacity(value.len());
         if owned.capacity() != value.len() {
             drop(owned);
-            return Err(E::custom(CAPACITY_ERROR));
+            return Err(capacity_error::<E>());
         }
         owned.push_str(value);
         Ok(owned)
@@ -360,17 +749,17 @@ impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
                     4
                 } else {
                     old.checked_mul(2)
-                        .ok_or_else(|| A::Error::custom(CAPACITY_ERROR))?
+                        .ok_or_else(|| capacity_error::<A::Error>())?
                 };
                 let bytes = new
                     .checked_mul(std::mem::size_of::<Value>())
-                    .ok_or_else(|| A::Error::custom(CAPACITY_ERROR))?;
+                    .ok_or_else(|| capacity_error::<A::Error>())?;
                 BuildState::grow(&mut self.state.payload, bytes)?;
                 values.reserve_exact(new - values.len());
                 if values.capacity() != new {
                     drop(value);
                     drop(values);
-                    return Err(A::Error::custom(CAPACITY_ERROR));
+                    return Err(capacity_error::<A::Error>());
                 }
                 BuildState::shrink(&mut self.state.payload, old * std::mem::size_of::<Value>())?;
             }
@@ -395,19 +784,19 @@ impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
                 let members = values.len();
                 let next_members = members
                     .checked_add(1)
-                    .ok_or_else(|| A::Error::custom(CAPACITY_ERROR))?;
+                    .ok_or_else(|| capacity_error::<A::Error>())?;
                 let split = map_levels(members)
                     .checked_add(1)
                     .and_then(|levels| levels.checked_mul(MAP_NODE))
-                    .ok_or_else(|| A::Error::custom(CAPACITY_ERROR))?;
+                    .ok_or_else(|| capacity_error::<A::Error>())?;
                 BuildState::grow(&mut self.state.payload, split)?;
                 values.insert(key, value);
                 let retained_delta = map_bytes(next_members)
                     .checked_sub(map_bytes(members))
-                    .ok_or_else(|| A::Error::custom(CAPACITY_ERROR))?;
+                    .ok_or_else(|| capacity_error::<A::Error>())?;
                 let excess = split
                     .checked_sub(retained_delta)
-                    .ok_or_else(|| A::Error::custom(CAPACITY_ERROR))?;
+                    .ok_or_else(|| capacity_error::<A::Error>())?;
                 BuildState::shrink(&mut self.state.payload, excess)?;
             }
         }
@@ -734,4 +1123,52 @@ fn number_requests(
         }
     }
     Some(offset)
+}
+
+#[cfg(test)]
+mod finite_recipe_provenance_rows {
+    use super::*;
+    use serde::de::Error as _;
+
+    // A private constructor/provenance row, explicitly NOT a selected-root
+    // reachability claim. The selected root always installs a memory owner.
+    #[test]
+    fn finite_native_data_recipes_preserve_their_real_constructor_provenance() {
+        let scope = ClosedScope::enter();
+        let produced: ClosedError<serde_json::Error> = capacity_error();
+        let ClosedError::Native(produced) = produced else { panic!("finite capacity is native Data") };
+        let control = serde_json::Error::custom(CAPACITY_ERROR);
+        assert_eq!(scope.finite(), Some(CAPACITY_ERROR));
+        assert_eq!(produced.classify(), control.classify());
+        assert_eq!((produced.line(),produced.column()),(control.line(),control.column()));
+        assert_eq!(produced.to_string(),control.to_string());
+        assert_eq!((produced.line(),produced.column()),(0,0));
+        assert!(produced.is_data()); drop(produced); drop(control); drop(scope);
+
+        struct Restore(Option<ReadMemoryOwner>);
+        impl Drop for Restore { fn drop(&mut self) { OWNER.with(|slot|{slot.replace(self.0.take());}); } }
+        let _restore=Restore(OWNER.with(|slot|slot.replace(None)));
+        let failure=deserialize_json_closed("null").err().expect("no owner must refuse");
+        let ClosedJsonFailure::Native(produced,finite)=failure else {panic!("missing owner retains native Data recipe")};
+        let control=serde_json::Error::custom(MISSING_OWNER);
+        assert_eq!(finite,Some(MISSING_OWNER));assert!(produced.is_data());
+        assert_eq!(produced.to_string(),control.to_string());
+        assert_eq!((produced.line(),produced.column()),(0,0));
+        assert_eq!(produced.classify(),control.classify());
+    }
+
+    #[test]
+    fn captured_scalar_refusal_never_formats_a_custom_message() {
+        struct Forbidden;
+        impl fmt::Display for Forbidden {
+            fn fmt(&self,_:&mut fmt::Formatter<'_>)->fmt::Result {panic!("custom Display entered after actual scalar latch")}
+        }
+        let scope=ClosedScope::enter();
+        let cause=NativeRefusal::MemoryBudgetExceeded {subsystem:"json_decode",operation:"construct_value",
+            requested_bytes:9,available_bytes:8,budget_limit_bytes:8,hint:"test scalar latch"};
+        latch_refusal(cause);
+        let error:ClosedError<serde_json::Error>=ClosedError::custom(Forbidden);
+        assert!(matches!(error,ClosedError::Captured));assert_eq!(scope.failure(),Some(cause));
+        assert_eq!(scope.finite(),None);
+    }
 }

@@ -217,12 +217,14 @@ impl BoundedOrderedRowCursor {
         store: &RelationalStore,
         table: &str,
         snapshot: SnapshotId,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         mut before_touch: impl FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if store.uses_disk_backed_committed_bodies() {
             return Err(E::from(Error::Other(
                 "durable index capture requires a captured source".into())));
@@ -859,12 +861,14 @@ impl BoundedExactIndexCursor {
         table: &str,
         index: &str,
         snapshot: SnapshotId,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         mut before_touch: impl FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if store.uses_disk_backed_committed_bodies() {
             return Err(E::from(Error::Other(
                 "durable index capture requires a captured source".into())));

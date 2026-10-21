@@ -20,8 +20,10 @@ pub(crate) fn lineage_roots(
     key: &crate::sync_types::NaturalKey,
     generation: u64,
     incumbent: &str,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let mut roots = BTreeSet::from([incumbent.to_owned()]);
@@ -49,8 +51,10 @@ pub(crate) fn lineage_roots(
 pub(crate) fn metadata_keys(
     db: &Database,
     selected: &[RowRef],
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     metadata_keys_matching(db, selected, None, read_memory)
 }
 
@@ -59,8 +63,10 @@ pub(crate) fn metadata_keys(
 pub(crate) fn metadata_keys_for_retired_lives(
     db: &Database,
     selected: &[(RowRef, u64, u64, String)],
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let _references_credit = contextdb_core::read_memory::ReadCredit::try_new(
         read_memory.clone(),
         selected.iter().map(|(reference, _, _, _)| {
@@ -78,8 +84,10 @@ fn metadata_keys_matching(
     db: &Database,
     selected: &[RowRef],
     lives: Option<&[(RowRef, u64, u64, String)]>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
     let records = custody_hold.retain(db.custody_rows(selected, read_memory.clone())?)?;
     let matches_anchor = |anchor: &LocalLifeAnchor| lives.is_some_and(|lives|

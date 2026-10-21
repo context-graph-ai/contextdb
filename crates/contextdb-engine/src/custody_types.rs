@@ -42,7 +42,7 @@ impl ApplicationTablePolicyExpectation {
         table: impl Into<String>,
         clauses: &str,
     ) -> contextdb_core::Result<Self> {
-        let table = table.into();
+        let table: String = table.into();
         let policy = parse_expectation_clauses(&table, clauses)?;
         if self.tables.insert(table.clone(), policy).is_some() {
             return Err(contextdb_core::Error::SchemaInvalid {
@@ -85,13 +85,13 @@ fn parse_expectation_clauses(
     })
 }
 
-fn empty_inspection(columns: &[&str]) -> crate::database::QueryResult {
-    let mut result = crate::database::QueryResult::empty();
+fn empty_inspection(columns: &[&str]) -> crate::database::QueryResultData {
+    let mut result = crate::database::QueryResultData::empty();
     result.columns = columns.iter().map(|column| (*column).to_string()).collect();
     result
 }
 
-pub(crate) fn empty_policy_inspection() -> crate::database::QueryResult {
+pub(crate) fn empty_policy_inspection() -> crate::database::QueryResultData {
     empty_inspection(&[
         "table",
         "tenant_id",
@@ -110,7 +110,7 @@ pub(crate) fn empty_policy_inspection() -> crate::database::QueryResult {
     ])
 }
 
-pub(crate) fn empty_binding_inspection() -> crate::database::QueryResult {
+pub(crate) fn empty_binding_inspection() -> crate::database::QueryResultData {
     empty_inspection(&[
         "table",
         "tenant_id",
@@ -132,7 +132,7 @@ pub(crate) fn empty_binding_inspection() -> crate::database::QueryResult {
     ])
 }
 
-pub(crate) fn empty_outcome_inspection() -> crate::database::QueryResult {
+pub(crate) fn empty_outcome_inspection() -> crate::database::QueryResultData {
     empty_inspection(&[
         "root_table",
         "root_key",
@@ -319,8 +319,10 @@ impl crate::Database {
         &self,
         tx: TxId,
         manifest: DeliveryManifest<'_>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let runtime =
             self.custody_runtime()
                 .ok_or_else(|| contextdb_core::Error::SchemaInvalid {
@@ -364,8 +366,10 @@ impl crate::Database {
         &self,
         root_table: &str,
         root_key: &NaturalKey,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Option<DeliveryOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         crate::custody::inspection::outcome(self, root_table, root_key, read_memory)
     }
     /// Count visible eligible units and their accepted, equivalent, refused, and pending states.
@@ -383,8 +387,10 @@ impl crate::Database {
     pub(crate) fn delivery_status_with_read_memory(
         &self,
         root_table: &str,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<DeliveryStatusCounts> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         crate::custody::inspection::status(self, root_table, read_memory)
     }
 }

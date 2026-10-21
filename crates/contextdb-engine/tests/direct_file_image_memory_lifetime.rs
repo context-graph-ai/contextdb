@@ -67,9 +67,11 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         if header.measured {
             LIVE.fetch_sub(header.bytes, Ordering::SeqCst);
         }
+        let free = contextdb_engine::read_work_probe::allocator_events::before_dealloc(pointer, layout);
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
         }
+        contextdb_engine::read_work_probe::allocator_events::after_dealloc(free);
     }
 }
 #[global_allocator]
@@ -199,14 +201,16 @@ fn startup_and_retained_image_allocations_stay_admitted_until_the_last_cursor_re
     );
     drop(reader);
     assert!(
-        lifetime.upgrade().is_some(),
+        lifetime.is_alive(),
         "an active cursor retains the image charge"
     );
     cursor.close().unwrap();
     assert!(
-        lifetime.upgrade().is_none(),
+        !lifetime.is_alive(),
         "the last cursor releases the image and its charge together"
     );
+    assert!(lifetime.is_physically_freed(), "actual allocator free must precede lifetime completion");
+    assert!(lifetime.accountant_is_physically_freed(), "the original accountant also physically freed");
     assert!(
         LIVE.load(Ordering::SeqCst) < 64 * 1024,
         "retained source allocations were released with their owner"

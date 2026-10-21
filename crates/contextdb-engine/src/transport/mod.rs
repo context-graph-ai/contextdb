@@ -271,6 +271,8 @@ impl NativeTerminal {
                     ),
                 ),
             ),
+            Self::Refused(allocator @ NativeRefusal::AllocatorFailed { .. }) =>
+                contextdb_core::Error::NativeEngineOther(allocator),
             Self::Refused(NativeRefusal::Other(_)) => {
                 contextdb_core::Error::SyncError(terminal_class::ALLOCATION.into())
             }
@@ -461,7 +463,7 @@ pub(crate) fn encode_terminal(
             WireRefusalRef::ReadFailure(ReadFailureRef::Borrowed(failure))
         }
         NativeTerminal::Cancelled => WireRefusalRef::ReadCancelled,
-        NativeTerminal::Refused(NativeRefusal::Other(_))
+        NativeTerminal::Refused(NativeRefusal::Other(_) | NativeRefusal::AllocatorFailed { .. })
         | NativeTerminal::Kernel(_)
         | NativeTerminal::Class(_) => return None,
     };
@@ -544,7 +546,7 @@ pub(crate) fn terminal_class_of(terminal: &NativeTerminal) -> &'static str {
     use contextdb_core::read_memory::NativeRefusal;
     match terminal {
         NativeTerminal::Class(class) => class,
-        NativeTerminal::Refused(NativeRefusal::Other(_)) => terminal_class::ALLOCATION,
+        NativeTerminal::Refused(NativeRefusal::Other(_) | NativeRefusal::AllocatorFailed { .. }) => terminal_class::ALLOCATION,
         _ => terminal_class::FAULT,
     }
 }

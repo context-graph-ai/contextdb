@@ -430,7 +430,7 @@ impl ColdCommittedProvider<'_> {
     /// operation child. Never uses child(), the legacy budget, or writer memory.
     pub(crate) fn lend_exact_row_body_reader_unqualified<T>(
         &self,
-        declared: &Arc<crate::vector_read_memory::DeclaredReadMemory>,
+        declared: &crate::vector_read_memory::DeclaredReadRoot,
         logical: &str,
         key: &[u8; 24],
         before: &mut dyn FnMut() -> Result<()>,

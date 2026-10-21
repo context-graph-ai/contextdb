@@ -137,6 +137,15 @@ fn buffer_pool_share_evicts_and_recharges_under_the_writer_budget() {
     // This is a real storage-page AccessGuard, not a synthetic accountant token.
     let held = db.__hold_row_page_for_test("pages", 0).unwrap();
     let held_body = held.value().to_vec();
+    // Ordinary misses preserve pinned residents. Establish actual displacement
+    // of this guard's Cached owner before the unchanged final-release oracle.
+    let (held_offset, held_len, held_identity, exact_identity_absent) =
+        db.__detach_cached_row_page_for_test(&held).unwrap();
+    assert!(exact_identity_absent);
+    assert_ne!(held_identity, 0);
+    assert!(held_len >= held_body.len());
+    assert_eq!(held_offset % 4096, 0);
+    assert_eq!(held.value(), held_body.as_slice());
     for id in 1..256 {
         exec(&db, &format!("SELECT body FROM pages WHERE id = {id}"));
     }
@@ -315,7 +324,10 @@ fn assert_native_cache_index_charge_on_writer_settle_and_read_only_open() {
         )
         .unwrap();
         let ledger = take_budget_ledger_for_test();
-        let (reader_index, source_charge) = reader.file_cache_index_charge_for_test().unwrap();
+        let source = reader.file_cache_index_charge_for_test().unwrap();
+        let reader_index = source.index_bytes;
+        let source_charge = source.remaining_base + source.retained_control.1
+            + source.source_control.1 + source.preparation_invoice;
         assert!(reader_index > 0);
         // Read the unchanged source reserve independently of the actual native index.
         let (read_page_cap, fixed_source_bytes) =
@@ -323,34 +335,27 @@ fn assert_native_cache_index_charge_on_writer_settle_and_read_only_open() {
                 64 * 1024 * 1024,
             ));
         let base_source_charge = read_page_cap + fixed_source_bytes;
-        let base = ledger
-            .iter()
-            .filter(|entry| {
-                entry.what == "direct_read/hydrate_owned_image" && entry.bytes == base_source_charge
-            })
-            .collect::<Vec<_>>();
-        let index = ledger
-            .iter()
-            .filter(|entry| {
-                entry.what == "direct_read/hydrate_owned_image" && entry.bytes == reader_index
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            base.len(),
-            1,
-            "the unchanged source reservation is admitted once"
-        );
-        assert_eq!(
-            index.len(),
-            1,
-            "the actual read-only index is separately admitted once"
-        );
-        assert_eq!(source_charge, base_source_charge + reader_index);
-        assert_eq!(
-            source_charge,
-            base[0].bytes + index[0].bytes,
-            "the retained source and its actual budget admissions have zero gap"
-        );
+        assert_eq!(source.remaining_base + source.retained_control.1, base_source_charge,
+            "detaching the retained control transfers R without refund or readmission");
+        assert_eq!(source.preparation_invoice, source.preparation.1 + reader_index,
+            "the actual preparation owns P and every separate native index invoice I");
+        let allocations = &source.allocations[..source.allocation_count];
+        assert_eq!(allocations.iter().map(|a| a.1).sum::<usize>(), reader_index,
+            "actual producer Layouts reconcile the native index, including both counters");
+        let admissions = ledger.iter().filter(|entry| {
+            entry.what == "direct_read/hydrate_owned_image"
+                && entry.owner_identity == source.payer_identity
+        }).collect::<Vec<_>>();
+        let mut expected = vec![source.source_control.1, base_source_charge, source.preparation.1];
+        expected.extend(allocations.iter().map(|a| a.1));
+        assert!(admissions.len() >= expected.len());
+        let mut actual = admissions[..expected.len()].iter().map(|entry| entry.bytes).collect::<Vec<_>>();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected,
+            "M, unchanged B, P and each actual I are separate once-only admissions by the original payer");
+        assert_eq!(source_charge, expected.iter().sum::<usize>(),
+            "B + M + P + I has zero gap; R was transferred inside B");
         assert_eq!(
             reader.file_retained_charge_bytes_for_test(),
             Some(0),
@@ -368,7 +373,7 @@ fn assert_native_cache_index_charge_on_writer_settle_and_read_only_open() {
         );
         assert_eq!(
             reader.file_cache_index_charge_for_test(),
-            Some((reader_index, source_charge))
+            Some(source)
         );
         drop(reader);
     }

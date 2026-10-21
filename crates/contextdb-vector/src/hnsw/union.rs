@@ -68,7 +68,7 @@ struct NavigationEntry {
     last_used: usize,
 }
 struct NavigationCache {
-    accountant: Option<Arc<dyn crate::memory_budget::MemoryBudget>>,
+    accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     entries: HashMap<NavigationKey, NavigationEntry>,
     tick: usize,
     table_bytes: usize,
@@ -76,7 +76,7 @@ struct NavigationCache {
     _control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 impl NavigationCache {
-    fn new(accountant: Option<Arc<dyn crate::memory_budget::MemoryBudget>>) -> Self {
+    fn new(accountant: Option<crate::memory_budget::MemoryBudgetOwner>) -> Self {
         let control_invoice = accountant.as_ref().and_then(|owner| owner.control_invoice());
         Self {
             accountant,
@@ -173,7 +173,7 @@ impl NavigationCache {
             return false;
         };
         owner
-            .try_allocate_for(
+            .try_allocate_for_static(
                 bytes,
                 "vector_navigation",
                 "retain_authenticated_navigation",
@@ -330,7 +330,7 @@ impl NavigationCache {
             && self.payload_bytes.checked_add(body_bytes).is_some()
             && self.accountant.as_ref().is_some_and(|owner| {
                 owner
-                    .try_allocate_for(
+                    .try_allocate_for_static(
                         body_bytes,
                         "vector_navigation",
                         "retain_authenticated_navigation",
@@ -379,7 +379,7 @@ pub(crate) struct NavigationSession {
     navigation: parking_lot::Mutex<NavigationCache>,
 }
 impl NavigationSession {
-    pub(crate) fn new(owner: Option<Arc<dyn crate::memory_budget::MemoryBudget>>) -> Self {
+    pub(crate) fn new(owner: Option<crate::memory_budget::MemoryBudgetOwner>) -> Self {
         Self {
             navigation: parking_lot::Mutex::new(NavigationCache::new(owner)),
         }
@@ -387,7 +387,7 @@ impl NavigationSession {
     fn lock(&self) -> parking_lot::MutexGuard<'_, NavigationCache> {
         self.navigation.lock()
     }
-    pub(crate) fn owner(&self) -> Option<Arc<dyn crate::memory_budget::MemoryBudget>> {
+    pub(crate) fn owner(&self) -> Option<crate::memory_budget::MemoryBudgetOwner> {
         self.lock().accountant.clone()
     }
     pub(crate) fn release_navigation_before_body(&self) {
@@ -419,12 +419,28 @@ impl NavigationSession {
             }
         }
     }
+    pub(crate) fn reserve_for_static(
+        &self,
+        token: &mut crate::memory_budget::VectorCopyAdmission,
+        bytes: usize,
+        component: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> contextdb_core::Result<()> {
+        loop {
+            match token.reserve_for_static(bytes, component, operation, hint) {
+                Ok(()) => return Ok(()),
+                Err(error) if navigation_memory_refusal(&error) && self.reclaim() => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     pub(crate) fn reserve(
         &self,
         token: &mut crate::memory_budget::VectorCopyAdmission,
         bytes: usize,
     ) -> contextdb_core::Result<()> {
-        self.reserve_for(
+        self.reserve_for_static(
             token,
             bytes,
             "vector_copy",

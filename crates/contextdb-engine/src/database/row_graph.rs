@@ -185,8 +185,10 @@ impl Database {
         table: &str,
         row: RowId,
         values: &HashMap<ColName, Value>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
@@ -276,8 +278,10 @@ impl Database {
         tx: TxId,
         table: &str,
         row_id: RowId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Remove a staged successor through the matching admitted mutation
         // capability. Its inverse stays with every active checkpoint.
         loop {
@@ -417,9 +421,11 @@ impl Database {
         table: &str,
         generation: u64,
         row: &VersionedRow,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         use_witness: impl FnOnce(&AdjEntry, &RowEdgeOwner) -> Result<R>,
     ) -> Result<Option<R>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
@@ -488,8 +494,10 @@ impl Database {
         &self,
         selections: &[AuthoritativePurgeSelection],
         rows: &BTreeMap<String, Vec<VersionedRow>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Vec<OwnedAdjEntry>, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let count: usize = rows.values().map(Vec::len).sum();
         let mut memory = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         memory.try_grow_for(
@@ -531,8 +539,10 @@ impl Database {
     pub(super) fn copy_row_graph_entries(
         &self,
         entries: &[OwnedAdjEntry],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Vec<OwnedAdjEntry>, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut memory = contextdb_core::read_memory::ReadCredit::new(read_memory);
         let bytes = entries.iter().fold(
             entries
@@ -560,8 +570,10 @@ impl Database {
         &self,
         root: Option<crate::persistence::graph_read::EngineGraphReadRoot>,
         mut visit: impl FnMut(&AdjEntry, &RowEdgeOwner) -> Result<()>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(root) = root {
             let mut cursor = root.cursor_lane(
                 false,
@@ -589,8 +601,10 @@ impl Database {
     pub(super) fn row_graph_witnesses_for_table_drop(
         &self,
         table: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<OwnedAdjEntry>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.persistence.is_none() {
             return Ok(Vec::new());
         }
@@ -640,8 +654,10 @@ impl Database {
         source: NodeId,
         target: NodeId,
         kind: &str,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self
             .table_meta(table)
             .is_some_and(|m| {
@@ -701,8 +717,10 @@ impl Database {
         &self,
         table: &str,
         row: &VersionedRow,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<crate::custody::preparation::OwnedPreparationValue<OwnedAdjEntry>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
@@ -752,8 +770,10 @@ impl Database {
         table: &str,
         retired_row: RowId,
         successor: &VersionedRow,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let projection =
             self.prepare_row_graph_projection(table, successor, read_memory.clone())?;
         if projection.is_none() {
@@ -826,8 +846,10 @@ impl Database {
         table: &str,
         retired_row: RowId,
         successor: &VersionedRow,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(projection) =
             self.prepare_row_graph_projection(table, successor, read_memory.clone())?
         else {
@@ -966,8 +988,10 @@ impl Database {
 impl Database {
     pub(crate) fn prepare_graph_shape_loss(&self, table: &str, before: &TableMeta,
         after: &TableMeta, copies: &mut contextdb_vector::VectorCopyAdmission,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>)
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>)
         -> Result<Option<(PreparedGraphPublication, usize)>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         if !has_graph_edge_table_shape(before) || has_graph_edge_table_shape(after)
             || self.graph_store.is_source_backed() { return Ok(None); }
         let bytes = self.resident_row_graph_bytes_for_table_drop(table);

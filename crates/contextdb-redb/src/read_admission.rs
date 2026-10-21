@@ -6,12 +6,89 @@ use std::{marker::PhantomData, rc::Rc};
 type Admission = Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>;
 
 /// A charge a caller's admission hands back for one page. The page the read
-/// cache does not keep carries it and drops it when its last holder drops the
-/// page, so the caller's charge lasts exactly as long as the page does.
+/// cache does not keep carries it outside destruction and physical free of its
+/// complete backing. The private page handle has no independently escaping byte
+/// allocation or Weak control. The opaque receipt is never replaced by Native
+/// credit or a fabricated parent. This legacy opaque Box does not establish
+/// that its own allocation remains paid through physical deallocation.
 pub type ReadPageCharge = Box<dyn Send + Sync>;
 type ChargingAdmission = Arc<dyn Fn(usize) -> io::Result<ReadPageCharge> + Send + Sync>;
 
+/// Private cross-crate single owner for a concrete, movable, prepaid receipt.
+/// Its payload is moved out, its exact allocation freed, and only then dropped.
+/// No shared, weak, raw, or borrowed payload handle can escape this owner.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct OwnedReadPageCharge {
+    pointer: std::ptr::NonNull<()>,
+    finish: unsafe fn(std::ptr::NonNull<()>),
+}
+// SAFETY: construction requires the actual concrete T: Send + Sync + 'static.
+// No accessor exposes T; moving the single owner transfers its sole allocation.
+#[cfg(feature = "contextdb-internal")]
+unsafe impl Send for OwnedReadPageCharge {}
+#[cfg(feature = "contextdb-internal")]
+unsafe impl Sync for OwnedReadPageCharge {}
+#[cfg(feature = "contextdb-internal")]
+impl OwnedReadPageCharge {
+    /// The caller prepays Layout::new::<T>() from the receipt's ORIGINAL budget
+    /// before entry and includes that charge in T. This allocates only that
+    /// concrete layout. A foreign Box payload's contents are not moved/freed by
+    /// this protocol and never acquire a physical-funding certificate here.
+    /// This is an ownership mechanism, not a certificate of caller funding.
+    /// On allocator null, T is dropped with no backing to free; the actual
+    /// failed Layout is returned without constructing diagnostic backing.
+    pub fn try_new_prepaid<T: Send + Sync + 'static>(
+        value: T,
+    ) -> Result<Self, std::alloc::Layout> {
+        let layout = std::alloc::Layout::new::<T>();
+        let pointer = if layout.size() == 0 {
+            std::ptr::NonNull::<T>::dangling()
+        } else {
+            let Some(pointer) = std::ptr::NonNull::new(
+                unsafe { std::alloc::alloc(layout) }.cast::<T>(),
+            ) else {
+                return Err(layout);
+            };
+            pointer
+        };
+        // No fallible/user operation occurs after allocation and before custody.
+        unsafe { pointer.as_ptr().write(value) };
+        Ok(Self { pointer: pointer.cast(), finish: finish_owned_charge::<T> })
+    }
+}
+#[cfg(feature = "contextdb-internal")]
+unsafe fn finish_owned_charge<T: Send + Sync + 'static>(pointer: std::ptr::NonNull<()>) {
+    let pointer = pointer.cast::<T>();
+    // Read MOVES the authentic receipt to this stack. It is not dropped in the
+    // allocation. No user destructor runs until backing is physically freed.
+    let value = unsafe { pointer.as_ptr().read() };
+    let layout = std::alloc::Layout::new::<T>();
+    if layout.size() != 0 {
+        unsafe { std::alloc::dealloc(pointer.as_ptr().cast(), layout) };
+    }
+    // Even if T::drop unwinds, backing is already gone and cannot free twice.
+    drop(value);
+}
+#[cfg(feature = "contextdb-internal")]
+impl Drop for OwnedReadPageCharge {
+    fn drop(&mut self) {
+        unsafe { (self.finish)(self.pointer) };
+    }
+}
+
+// Preserve opaque foreign callers exactly, without silently treating their Box
+// as the concrete free-before-refund protocol used by the closed engine factory.
+#[allow(dead_code)] // Variants own their receipts solely for destruction.
+pub(crate) enum ReadMemoryCharge {
+    Legacy(ReadPageCharge),
+    #[cfg(feature = "contextdb-internal")]
+    Owned(OwnedReadPageCharge),
+}
+
 enum ActiveAdmission {
+    #[cfg(feature = "contextdb-internal")]
+    Owned(Arc<dyn Fn(usize) -> Result<OwnedReadPageCharge, StorageError> + Send + Sync>),
     Scoped(Admission),
     Charging(ChargingAdmission),
     StorageScoped(Arc<dyn Fn(usize) -> Result<(), StorageError> + Send + Sync>),
@@ -39,9 +116,10 @@ pub fn with_read_memory_admission<R>(admit: Admission, operation: impl FnOnce() 
 }
 
 /// Like [`with_read_memory_admission`], but the admission returns a charge
-/// for each page. A page the read cache keeps is released from its charge at
-/// once, because the cache's own budget holds it; a page the cache does not
-/// keep carries the charge until its last holder drops it.
+/// for each page. Backing transfers to the cache's fixed budget only while
+/// that reserve covers it. An uncached page, or source-funded write/flush
+/// overlap beyond that reserve, retains the genuine receipt until transfer
+/// becomes covered or its complete backing is physically freed.
 #[doc(hidden)]
 pub fn with_read_page_charge<R>(admit: ChargingAdmission, operation: impl FnOnce() -> R) -> R {
     ACTIVE.with(|active| active.borrow_mut().push(ActiveAdmission::Charging(admit)));
@@ -79,32 +157,63 @@ pub fn with_read_page_charge_storage<R>(
     operation()
 }
 
-pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadPageCharge>, StorageError> {
+/// Closed engine callback; legacy boxed callbacks keep their original wrappers.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn with_owned_read_page_charge_storage<R>(
+    admit: Arc<dyn Fn(usize) -> Result<OwnedReadPageCharge, StorageError> + Send + Sync>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    ACTIVE.with(|active| active.borrow_mut().push(ActiveAdmission::Owned(admit)));
+    let _reset = ResetAdmission;
+    operation()
+}
+
+pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadMemoryCharge>, StorageError> {
     ACTIVE.with(|active| match active.borrow().last() {
+        #[cfg(feature = "contextdb-internal")]
+        Some(ActiveAdmission::Owned(admit)) => admit(bytes).map(|charge| Some(ReadMemoryCharge::Owned(charge))),
         Some(ActiveAdmission::Scoped(admit)) => {
             admit(bytes).map(|()| None).map_err(StorageError::from)
         }
         Some(ActiveAdmission::Charging(admit)) => {
-            admit(bytes).map(Some).map_err(StorageError::from)
+            admit(bytes).map(|charge| Some(ReadMemoryCharge::Legacy(charge))).map_err(StorageError::from)
         }
         Some(ActiveAdmission::StorageScoped(admit)) => admit(bytes).map(|()| None),
-        Some(ActiveAdmission::StorageCharging(admit)) => admit(bytes).map(Some),
+        Some(ActiveAdmission::StorageCharging(admit)) => admit(bytes).map(|charge| Some(ReadMemoryCharge::Legacy(charge))),
         None => Ok(None),
     })
 }
 
-thread_local! { static SCAN_READS: RefCell<Vec<ScanAllowance>> = const { RefCell::new(Vec::new()) }; }
+// The TLS slot owns no storage or capacity. Every linked node is heap-stable
+// and kept alive by thread-bound guards, including guards returned to callers.
+thread_local! {
+    static SCAN_TAIL: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>> = const { std::cell::Cell::new(None) };
+}
 
 /// Cache growth one outermost scan may take for pages it installs into free
 /// room, such as the root and branch pages every probe of the scan reuses.
 pub(crate) const SCAN_GROWTH_ALLOWANCE: usize = 16 * 1024;
+
+#[derive(Clone)]
+enum ScanRemaining {
+    // Public legacy constructors retain their unqualified allocation behavior.
+    Legacy(Arc<std::sync::atomic::AtomicUsize>),
+    #[cfg(feature = "contextdb-internal")]
+    Native {
+        remaining:
+            crate::native_storage_admission::NativeStorageShared<std::sync::atomic::AtomicUsize>,
+        // Only immutable owned admission crosses threads. Scope links never do.
+        admission: crate::NativeStorageAdmission,
+    },
+}
 
 /// The cache growth one scan may still take for pages it installs into free
 /// room. A statement that scans in several resumed steps keeps one allowance
 /// across them by re-entering with the same value.
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct ScanAllowance(Arc<std::sync::atomic::AtomicUsize>);
+pub struct ScanAllowance(ScanRemaining);
 
 impl Default for ScanAllowance {
     fn default() -> Self {
@@ -113,44 +222,202 @@ impl Default for ScanAllowance {
 }
 
 impl ScanAllowance {
-    /// A fresh allowance of `SCAN_GROWTH_ALLOWANCE` (16 KiB).
+    /// A fresh legacy allowance of `SCAN_GROWTH_ALLOWANCE` (16 KiB).
+    /// Its public infallible allocation remains unqualified for native funding.
     pub fn new() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicUsize::new(
-            SCAN_GROWTH_ALLOWANCE,
+        Self(ScanRemaining::Legacy(Arc::new(
+            std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
         )))
     }
 
-    /// Enter one-pass scan reads on this thread, drawing on this allowance,
-    /// until the guard drops.
+    /// Native engine constructor. The active original reader admission prepays
+    /// the exact shared-block Layout, including its receipt field. The block's
+    /// last owner physically frees it before returning that original invoice.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn try_new_native() -> Result<Self, StorageError> {
+        let admission = crate::NativeStorageAdmission::retain_current()?;
+        let remaining = crate::native_storage_admission::NativeStorageShared::new(
+            std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
+        )
+        .map_err(crate::native_storage_admission::native_storage_error)?;
+        Ok(Self(ScanRemaining::Native {
+            remaining,
+            admission,
+        }))
+    }
+
+    /// Enter one-pass scan reads on this thread until the guard drops.
+    /// This legacy infallible entry does not certify the node's funding.
     pub fn enter(&self) -> ScanReads {
-        SCAN_READS.with(|active| active.borrow_mut().push(self.clone()));
+        let allowance = self.clone();
+        let layout = std::alloc::Layout::new::<ScanScopeNode>();
+        let pointer = unsafe { std::alloc::alloc(layout) }.cast::<ScanScopeNode>();
+        let Some(pointer) = std::ptr::NonNull::new(pointer) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        Self::link_entry(allowance, pointer, ScanNodeInvoice::Legacy)
+    }
+
+    /// Each distinct native entry owns a separate genuinely prepaid node, even
+    /// when this allowance is already active under another allowance or thread.
+    /// Null/refusal returns the actual scalar native cause before linking.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn try_enter_native(&self) -> Result<ScanReads, StorageError> {
+        use crate::native_storage_admission::{admit_native_storage, native_storage_error};
+        let ScanRemaining::Native { admission, .. } = &self.0 else {
+            return Err(native_storage_error(
+                crate::NativeColdReadError::AdmissionRefused,
+            ));
+        };
+        let allowance = self.clone();
+        let layout = std::alloc::Layout::new::<ScanScopeNode>();
+        let invoice = crate::with_native_storage_admission(admission.clone(), || {
+            admit_native_storage(layout)
+        })
+        .map_err(native_storage_error)?;
+        let pointer = unsafe { std::alloc::alloc(layout) }.cast::<ScanScopeNode>();
+        let Some(pointer) = std::ptr::NonNull::new(pointer) else {
+            // No node exists. The genuine invoice settles on this error return.
+            return Err(native_storage_error(
+                crate::NativeColdReadError::AllocatorFailed {
+                    site: "native scan scope",
+                    layout,
+                },
+            ));
+        };
+        Ok(Self::link_entry(
+            allowance,
+            pointer,
+            ScanNodeInvoice::Native(invoice),
+        ))
+    }
+
+    fn link_entry(
+        allowance: Self,
+        pointer: std::ptr::NonNull<ScanScopeNode>,
+        invoice: ScanNodeInvoice,
+    ) -> ScanReads {
+        // All retains happened before allocation. No fallible/user operation
+        // follows allocation before linking and thread-bound guard custody.
+        SCAN_TAIL.with(|tail| {
+            let previous = tail.get();
+            unsafe {
+                pointer.as_ptr().write(ScanScopeNode {
+                    owners: std::cell::Cell::new(1),
+                    previous: std::cell::Cell::new(previous),
+                    next: std::cell::Cell::new(None),
+                    allowance,
+                    _invoice: invoice,
+                })
+            };
+            if let Some(previous) = previous {
+                unsafe { previous.as_ref() }.next.set(Some(pointer));
+            }
+            tail.set(Some(pointer));
+        });
         ScanReads {
+            node: pointer,
+            _thread: PhantomData,
+        }
+    }
+
+    fn remaining(&self) -> &std::sync::atomic::AtomicUsize {
+        match &self.0 {
+            ScanRemaining::Legacy(remaining) => remaining,
+            #[cfg(feature = "contextdb-internal")]
+            ScanRemaining::Native { remaining, .. } => remaining.get(),
+        }
+    }
+}
+
+// The receipt is moved out with the complete node and dropped only after free.
+#[allow(dead_code)] // Native credit is owned solely for destruction.
+enum ScanNodeInvoice {
+    Legacy,
+    #[cfg(feature = "contextdb-internal")]
+    Native(crate::NativeStorageCredit),
+}
+struct ScanScopeNode {
+    owners: std::cell::Cell<usize>,
+    previous: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
+    next: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
+    allowance: ScanAllowance,
+    _invoice: ScanNodeInvoice,
+}
+
+/// While held, this thread's cache misses grow the read cache by at most the
+/// scan's remaining allowance (see [`with_scan_reads`]). A node stays linked
+/// until its last guard drops; dropping an older guard cannot pop a newer entry.
+#[doc(hidden)]
+pub struct ScanReads {
+    node: std::ptr::NonNull<ScanScopeNode>,
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl ScanReads {
+    fn retain_current(node: std::ptr::NonNull<ScanScopeNode>) -> Self {
+        // Only called with the current thread's linked live node. This new
+        // guard is itself !Send + !Sync, so the Cell and links stay thread-local.
+        let owners = &unsafe { node.as_ref() }.owners;
+        let next = owners
+            .get()
+            .checked_add(1)
+            .filter(|n| isize::try_from(*n).is_ok())
+            .expect("scan scope strong count overflow");
+        owners.set(next);
+        Self {
+            node,
             _thread: PhantomData,
         }
     }
 }
 
-/// While held, this thread's cache misses grow the read cache by at most the
-/// scan's remaining allowance (see [`with_scan_reads`]).
-#[doc(hidden)]
-pub struct ScanReads {
-    _thread: PhantomData<Rc<()>>,
-}
-
 impl Drop for ScanReads {
     fn drop(&mut self) {
-        SCAN_READS.with(|active| {
-            active.borrow_mut().pop();
+        let node = unsafe { self.node.as_ref() };
+        let owners = node.owners.get();
+        if owners != 1 {
+            node.owners.set(owners - 1);
+            return;
+        }
+        // Unlink this exact node, including an interior/out-of-order release.
+        // Its neighbors all retain their own live thread-bound guard owners.
+        SCAN_TAIL.with(|tail| {
+            let previous = node.previous.get();
+            let next = node.next.get();
+            if let Some(previous) = previous {
+                unsafe { previous.as_ref() }.next.set(next);
+            }
+            if let Some(next) = next {
+                unsafe { next.as_ref() }.previous.set(previous);
+            } else {
+                tail.set(previous);
+            }
         });
+        // No user destructor runs while any TLS pointer still names this node.
+        let node = unsafe { self.node.as_ptr().read() };
+        unsafe {
+            std::alloc::dealloc(
+                self.node.as_ptr().cast(),
+                std::alloc::Layout::new::<ScanScopeNode>(),
+            )
+        };
+        drop(node); // allowance and real node invoice settle after physical free
     }
 }
 
 /// Enter one-pass scan reads until the guard drops, drawing on the enclosing
 /// scan's allowance when one is active and on a fresh allowance otherwise.
+/// A nested helper retains the SAME current node without allocating or moving
+/// its position in the active list, including inside an ordinary native scan.
 #[doc(hidden)]
 pub fn scan_reads() -> ScanReads {
-    let enclosing = SCAN_READS.with(|active| active.borrow().last().cloned());
-    enclosing.unwrap_or_default().enter()
+    match SCAN_TAIL.with(std::cell::Cell::get) {
+        Some(node) => ScanReads::retain_current(node),
+        None => ScanAllowance::new().enter(),
+    }
 }
 
 /// Execute a one-pass scan with a bounded cache footprint: its misses may
@@ -166,16 +433,17 @@ pub fn with_scan_reads<R>(operation: impl FnOnce() -> R) -> R {
 }
 
 pub(crate) fn scan_reads_active() -> bool {
-    SCAN_READS.with(|active| !active.borrow().is_empty())
+    SCAN_TAIL.with(|tail| tail.get().is_some())
 }
 
 /// Take `bytes` of the innermost scan's growth allowance, if that much remains.
 pub(crate) fn take_scan_growth(bytes: usize) -> bool {
     use std::sync::atomic::Ordering;
-    SCAN_READS.with(|active| {
-        active.borrow().last().is_some_and(|allowance| {
-            allowance
-                .0
+    SCAN_TAIL.with(|tail| {
+        tail.get().is_some_and(|node| {
+            unsafe { node.as_ref() }
+                .allowance
+                .remaining()
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                     left.checked_sub(bytes)
                 })
@@ -214,5 +482,107 @@ pub(crate) fn record_backend_read(bytes: usize) {
     let observer = READ_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {
         observer(bytes);
+    }
+}
+
+// Cache reconstruction is separate from source-page admission: preparing an
+// index must not recurse into the page producer or select its payer.
+#[cfg(feature = "contextdb-internal")]
+thread_local! {
+    static CACHE_PREPARATION: RefCell<Option<(crate::NativeStorageAdmission, bool)>> = const { RefCell::new(None) };
+}
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn with_cache_preparation_admission<R>(
+    admission: crate::NativeStorageAdmission,
+    prepare: impl FnOnce() -> R,
+) -> R {
+    with_cache_preparation_scope(admission, false, prepare)
+}
+
+/// Direct-source preparation retains its genuine aggregate invoice with native
+/// backing. Writer preparation keeps its existing temporary handoff semantics.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn with_retained_cache_preparation_admission<R>(
+    admission: crate::NativeStorageAdmission,
+    prepare: impl FnOnce() -> R,
+) -> R {
+    with_cache_preparation_scope(admission, true, prepare)
+}
+#[cfg(feature = "contextdb-internal")]
+fn with_cache_preparation_scope<R>(
+    admission: crate::NativeStorageAdmission,
+    retain: bool,
+    prepare: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<(crate::NativeStorageAdmission, bool)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = CACHE_PREPARATION.with(|slot| slot.replace(self.0.take()));
+            drop(previous);
+        }
+    }
+    let _restore = Restore(CACHE_PREPARATION.with(|slot| slot.replace(Some((admission, retain)))));
+    prepare()
+}
+
+/// Clone the actual preparation owner without new admission or a receipt cell.
+/// Legacy/unscoped construction returns None, never a fabricated native payer.
+pub(crate) fn cache_preparation_credit() -> Option<crate::native_storage_admission::NativeStorageCredit> {
+    #[cfg(feature = "contextdb-internal")]
+    { CACHE_PREPARATION.with(|slot| slot.borrow().as_ref().and_then(|(owner, retain)| retain.then(|| owner.cache_preparation_credit()))) }
+    #[cfg(not(feature = "contextdb-internal"))]
+    { None }
+}
+
+pub(crate) fn prepare_cache_allocation(layout: std::alloc::Layout) -> Result<(), StorageError> {
+    #[cfg(feature = "contextdb-internal")]
+    if let Some((owner, _)) = CACHE_PREPARATION.with(|slot| slot.borrow().clone()) {
+        // The actual outer preparation owner retains the aggregate original
+        // invoice until fixed custody is installed, including constructor unwind.
+        owner.reserve_cache_preparation(layout)?;
+    }
+    #[cfg(not(feature = "contextdb-internal"))]
+    let _ = layout; // no fabricated receipt in the ordinary upstream backend
+    Ok(())
+}
+
+/// Passive scan identities and the actual production allowance debit, confined
+/// to test-seams. These methods allocate nothing and retain no owner or TLS slot.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+impl ScanAllowance {
+    #[doc(hidden)]
+    pub fn allocation_observation_for_test(&self) -> (usize, std::alloc::Layout, usize) {
+        match &self.0 {
+            ScanRemaining::Native { remaining, .. } => remaining.allocation_observation_for_test(),
+            ScanRemaining::Legacy(_) => panic!("legacy allowance has no native certificate"),
+        }
+    }
+    #[doc(hidden)]
+    pub fn node_layout_for_test() -> std::alloc::Layout {
+        std::alloc::Layout::new::<ScanScopeNode>()
+    }
+    #[doc(hidden)]
+    pub fn current_node_for_test() -> usize {
+        SCAN_TAIL.with(|tail| tail.get().map_or(0, |node| node.as_ptr() as usize))
+    }
+    #[doc(hidden)]
+    pub fn take_current_growth_for_test(bytes: usize) -> bool { take_scan_growth(bytes) }
+    #[doc(hidden)]
+    pub fn remaining_for_test(&self) -> usize {
+        self.remaining().load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+impl ScanReads {
+    #[doc(hidden)]
+    pub fn allocation_observation_for_test(&self) -> (usize, std::alloc::Layout, usize) {
+        let node = unsafe { self.node.as_ref() };
+        let receipt = match &node._invoice {
+            ScanNodeInvoice::Native(invoice) => invoice.receipt_identity_for_test(),
+            ScanNodeInvoice::Legacy => 0,
+        };
+        (self.node.as_ptr() as usize, std::alloc::Layout::new::<ScanScopeNode>(), receipt)
     }
 }

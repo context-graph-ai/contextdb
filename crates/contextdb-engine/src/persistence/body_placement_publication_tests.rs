@@ -55,7 +55,7 @@ fn decode_catalog(persistence: &RedbPersistence) -> std::result::Result<bool, Lo
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let (_, raw) = decode_read_vector_generation_catalog(
                 &read,
-                &crate::read_image_memory::ImageMemory::new(Some(1024 * 1024)),
+                &crate::read_image_memory::ImageMemory::new(Some(1024 * 1024))?,
             )
             .map_err(|error| Error::Other(format!("{error:?}").into()))?;
             Ok(raw.ready)

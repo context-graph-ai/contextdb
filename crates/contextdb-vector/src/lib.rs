@@ -19,7 +19,7 @@ pub use mem::{
 #[doc(hidden)]
 pub use memory_budget::VectorWorkspaceReservation;
 #[doc(hidden)]
-pub use memory_budget::{MemoryBudget, PrepaidVectorCopyCharge, VectorCopyAdmission};
+pub use memory_budget::{MemoryBudget, MemoryBudgetOwner, PrepaidVectorCopyCharge, VectorCopyAdmission};
 #[doc(hidden)]
 pub use memory_budget::{ScopedVectorCopy, scoped_index_layout};
 pub use quantized::{stored_vector_resident_bytes, stored_vector_value};

@@ -28,7 +28,7 @@ struct Node {
     _credit: ReadCredit,
 }
 
-fn credit(owner: &Arc<dyn ReadMemoryBudget>, bytes: usize) -> Result<ReadCredit> {
+fn credit(owner: &contextdb_core::read_memory::ReadMemoryOwner, bytes: usize) -> Result<ReadCredit> {
     ReadCredit::try_new(
         owner.clone(),
         bytes,
@@ -41,7 +41,7 @@ fn height(root: &Root) -> u16 {
     root.as_ref().map_or(0, |node| node.height)
 }
 fn node(
-    owner: &Arc<dyn ReadMemoryBudget>,
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
     key: Key,
     body: Arc<Body>,
     left: Root,
@@ -61,7 +61,7 @@ fn node(
     }))
 }
 fn balanced(
-    owner: &Arc<dyn ReadMemoryBudget>,
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
     key: Key,
     body: Arc<Body>,
     left: Root,
@@ -107,7 +107,7 @@ fn insert(
     root: &Root,
     key: Key,
     body: Arc<Body>,
-    owner: &Arc<dyn ReadMemoryBudget>,
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<Root> {
     let Some(n) = root else {
         return node(owner, key, body, None, None).map(Some);
@@ -145,7 +145,7 @@ fn get(root: &Root, key: Key) -> Option<&Arc<Body>> {
     }
     None
 }
-fn remove(root: &Root, key: Key, owner: &Arc<dyn ReadMemoryBudget>) -> Result<Root> {
+fn remove(root: &Root, key: Key, owner: &contextdb_core::read_memory::ReadMemoryOwner) -> Result<Root> {
     let Some(n) = root else {
         return Ok(None);
     };
@@ -213,8 +213,10 @@ impl History {
     pub(crate) fn prepare<'a>(
         &self,
         tables: impl IntoIterator<Item = (&'a str, &'a TableMeta, &'a [VersionedRow])>,
-        owner: Arc<dyn ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedSchemaGeneration> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut root = self.root.clone();
         let mut moves = Vec::new();
         let mut control = credit(&owner, 0)?;
@@ -265,8 +267,10 @@ impl History {
     pub(crate) fn prepare_erasure(
         &self,
         keys: impl IntoIterator<Item = (RowId, Lsn)>,
-        owner: Arc<dyn ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PreparedSchemaHistoryErasure> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let mut root = self.root.clone();
         for key in keys {
             root = remove(&root, key, &owner)?;
@@ -376,7 +380,9 @@ impl History {
 impl PreparedSchemaGeneration {
     #[doc(hidden)]
     pub fn retain_owned(&mut self, table: &str, meta: &TableMeta, row: &VersionedRow,
-        owner: Arc<dyn ReadMemoryBudget>) -> Result<()> {
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let key = (row.row_id,row.lsn);
         if get(&self.root,key).is_some() { return Ok(()); }
         let declaration_credit = credit(&owner,meta.estimated_bytes()+table.len()+std::mem::size_of::<Declaration>()+16)?;

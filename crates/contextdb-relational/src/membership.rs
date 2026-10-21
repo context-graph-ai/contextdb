@@ -8,7 +8,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 type Link = Option<Arc<Node>>;
-type Budget = Option<Arc<dyn ReadMemoryBudget>>;
+type Budget = Option<contextdb_core::read_memory::ReadMemoryOwner>;
 const HINT: &str = "Release old readers or raise MEMORY_LIMIT before changing indexed rows.";
 
 #[derive(Debug)]
@@ -224,7 +224,9 @@ pub struct MembershipImage {
 }
 
 impl MembershipImage {
-    pub(crate) fn with_budget(budget: Arc<dyn ReadMemoryBudget>) -> Self {
+    pub(crate) fn with_budget(budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         Self {
             budget: Some(budget),
             ..Self::default()
@@ -335,7 +337,9 @@ impl MembershipImage {
     }
 
     /// Admit an image built by a detached loader before it is published.
-    pub fn admit(&mut self, budget: Arc<dyn ReadMemoryBudget>) -> Result<()> {
+    pub fn admit(&mut self, budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if self.budget.is_some() {
             return Ok(());
         }

@@ -35,8 +35,10 @@ impl PreparedPendingRoot {
         key: &str,
         previous: Option<&DurableLineageRecord>,
         replacement: Option<&DurableLineageRecord>,
-        budget: Arc<dyn ReadMemoryBudget>,
+        budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
         if let Some(previous) =
             previous.filter(|record| record.delete_obligation == DurableDeleteObligation::Pending)
         {
@@ -216,8 +218,10 @@ impl Database {
 fn coordinate(
     lsn: u64,
     key: &str,
-    budget: Arc<dyn ReadMemoryBudget>,
+    budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(ReadCredit, IndexKey)> {
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+
     let credit = ReadCredit::try_new(
         budget,
         3 * std::mem::size_of::<contextdb_core::DirectedValue>()
@@ -245,7 +249,7 @@ pub(super) struct ResidentPendingCursor {
     position: Option<IndexKey>,
     position_credit: ReadCredit,
     peeked: Option<Lsn>,
-    memory: Arc<dyn ReadMemoryBudget>,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
     accountant: crate::memory_accounting::AccountantHandle,
     _start_credit: ReadCredit,
 }
@@ -255,9 +259,11 @@ impl ResidentPendingCursor {
         image: MembershipImage,
         since: Lsn,
         through: Lsn,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<Option<Self>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         if since >= through {
             return Ok(None);
         }
@@ -348,7 +354,7 @@ impl ResidentPendingCursor {
     ) -> Result<
         Option<(
             DurableLineageRecord,
-            Arc<crate::read_image_memory::ImageMemory>,
+            crate::read_image_memory::ImageMemoryHandle,
         )>,
     > {
         let Some(lsn) = self.peek_lsn()? else {
@@ -410,7 +416,7 @@ impl ResidentPendingCursor {
     }
 }
 
-fn corrupt(reason: &str) -> Error {
+fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "pending delete history".into(),
         reason: reason.into(),

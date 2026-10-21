@@ -26,6 +26,43 @@ mod grouped_count;
 mod control_memory;
 use control_memory::{ControlArc, ControlWeak, QueryVectorDecode, NativeKernelBudget};
 
+#[cfg(all(test, feature = "test-seams"))]
+pub(crate) fn ordinary_native_control_layouts_for_test() -> [std::alloc::Layout; 3] {
+    [crate::vector_read_memory::native_control_layouts_for_test().1,
+        contextdb_core::read_memory::ReadShared::<ReadCredit>::layout(),
+        ControlArc::<NativeKernelBudget>::arc_layout().expect("declared kernel adapter layout")]
+}
+
+/// Keep the original adapter invoice outside its Arc through ordinary setup,
+/// execution, result conversion and unwind. Escaping owners capture that same
+/// invoice through control_invoice; scoped raw clones finish before this guard.
+/// This only adapts the sealed child: it installs no transport request or limits.
+pub(crate) fn with_native_read_memory<T>(
+    child: crate::vector_read_memory::NativeReadChildReceipt,
+    execute: impl FnOnce(contextdb_core::read_memory::ReadMemoryOwner) -> Result<T>,
+) -> Result<T> {
+    let control = NativeKernelBudget::try_from_child(child)?;
+    execute((*control).clone().into())
+}
+
+/// Preserve the provider's selected owner route for one ordinary query.
+/// Built-in providers supply native children; external legacy providers keep
+/// their existing capability and contracts. The adapter's original invoice
+/// survives execution, and escaping answer credits retain that same invoice.
+pub(crate) fn with_request_read_memory<T, E>(
+    request: crate::vector_read_memory::RequestReadOwner,
+    map_error: impl FnOnce(Error) -> E,
+    execute: impl FnOnce(contextdb_core::read_memory::ReadMemoryOwner) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    match request.into_route() {
+        crate::vector_read_memory::RequestReadRoute::Legacy(owner) => execute(owner.into()),
+        crate::vector_read_memory::RequestReadRoute::Native(child) => {
+            let control = NativeKernelBudget::try_from_child(child).map_err(map_error)?;
+            execute((*control).clone().into())
+        }
+    }
+}
+
 // One public continuation fetch may replay several internal kernel pages.
 // Their work and deadlines belong to the same caller request.
 struct CursorReplayBudget {
@@ -275,19 +312,80 @@ impl Drop for GroupPublicationAttempt<'_> {
 }
 
 #[derive(Debug)]
-pub(super) struct TraceMemoryOwner(
-    pub(super) Arc<dyn ReadMemoryBudget>,
-    Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
-);
+pub(super) struct TraceMemoryOwner {
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    _underlying_invoice: Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
+    invoice: contextdb_core::read_memory::ReadShared<ReadCredit>,
+}
 impl TraceMemoryOwner {
-    pub(super) fn new(owner: Arc<dyn ReadMemoryBudget>) -> Self {
-        let invoice = owner.control_invoice();
-        Self(owner, invoice)
+    pub(super) fn try_new(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<ControlArc<Self>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
+        // The underlying provider's invoice does not price this forwarding Arc.
+        // Admit both this Arc and its native keeper before either allocation.
+        #[cfg(any(test, feature = "test-seams"))]
+        let observer = crate::vector_read_memory::declared_child_observer(&owner);
+        #[cfg(any(test, feature = "test-seams"))]
+        let before = observer.as_ref().map(|original| original.sample().charged_bytes);
+        let invoice = ControlArc::<Self>::admit(owner.clone())?;
+        let underlying = owner.control_invoice();
+        let control = ControlArc::from_prepaid(Self { owner, _underlying_invoice: underlying, invoice: invoice.clone() }, invoice);
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(original) = observer {
+            let layout = ControlArc::<Self>::arc_layout()?;
+            let keeper = contextdb_core::read_memory::ReadShared::<ReadCredit>::layout();
+            let payer = crate::vector_read_memory::observed_reader_identity(&control.owner);
+            let native = crate::vector_read_memory::statement_child_proof::native_controls(payer);
+            crate::vector_read_memory::statement_child_proof::trace_owner_controls(
+                crate::vector_read_memory::statement_child_proof::TraceOwnerControls {
+                    payer,
+                    parent: native.map_or(0, |n| n.parent),
+                    parent_counter: native.map_or(0, |n| n.parent_counter),
+                    native_forwarder: control.owner.accounting_identity(),
+                    native_keeper: control._underlying_invoice.as_ref()
+                        .map_or(0, |invoice| &**invoice as *const ReadCredit as usize),
+                    native_adapter_invoice_bytes: control._underlying_invoice.as_ref()
+                        .map_or(0, |invoice| invoice.bytes()),
+                    counter: original.physical_funding_counter_for_test(),
+                    before_admission: before.unwrap(),
+                    after_admission: original.sample().charged_bytes,
+                    provider_payload: Arc::as_ptr(&*control) as usize,
+                    provider_layout: (layout.size(), layout.align()),
+                    keeper_payload: &*control.invoice as *const ReadCredit as usize,
+                    keeper_layout: (keeper.size(), keeper.align()),
+                },
+            );
+        }
+        Ok(control)
     }
 }
 impl contextdb_vector::MemoryBudget for TraceMemoryOwner {
-    fn try_allocate_for(&self, bytes: usize, _: &str, _: &str, _: &str) -> Result<()> {
-        self.0.try_reserve(
+    fn try_allocate_for_static(
+        &self, bytes: usize, subsystem: &'static str,
+        operation: &'static str, hint: &'static str,
+    ) -> Result<()> {
+        // This adapter deliberately keeps the established trace labels and
+        // observation callbacks, which already pass only borrowed literals.
+        self.try_allocate_for(bytes, subsystem, operation, hint)
+    }
+    fn control_invoice(&self) -> Option<contextdb_core::read_memory::ReadShared<ReadCredit>> {
+        Some(self.invoice.clone())
+    }
+    #[cfg(feature = "test-seams")]
+    fn original_read_payer_for_test(&self) -> (usize, bool, Option<&contextdb_core::read_memory::ReadMemoryOwner>) {
+        (crate::vector_read_memory::observed_reader_identity(&self.owner), self.control_invoice().is_some(),
+            Some(self.owner.original_native_owner_for_test().unwrap_or(&self.owner)))
+    }
+    fn try_allocate_for(&self, bytes: usize, _phase: &str, _reason: &str, _: &str) -> Result<()> {
+        #[cfg(all(test, feature = "test-seams"))]
+// capture969 begin
+        let _ordered_callback = crate::database::retained_trace_ownership_tests::OrderedCallback::new(
+            bytes, _phase, _reason);
+        #[cfg(all(test, feature = "test-seams"))]
+// capture969 end
+        crate::database::retained_trace_ownership_tests::provider_callback_unwind(
+            &self.owner, bytes, _phase, _reason);
+        self.owner.try_reserve(
             bytes,
             "vector_search",
             "trace",
@@ -295,15 +393,35 @@ impl contextdb_vector::MemoryBudget for TraceMemoryOwner {
         )
     }
     fn release(&self, bytes: usize) {
-        self.0.release(bytes);
+        self.owner.release(bytes);
     }
 }
 struct PrepaidTraceCredit {
-    owner: Arc<dyn contextdb_vector::MemoryBudget>,
+    owner: contextdb_vector::MemoryBudgetOwner,
     credit: ReadCredit,
+    // Destroy the provider Arc before releasing its original external keeper.
+    _control_invoice: contextdb_core::read_memory::ReadShared<ReadCredit>,
 }
+// Passive concrete-type access: the independent test computes its own Arc
+// header extension and compares it to BOTH real allocator requests.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn retained_trace_payload_layouts_for_test()
+    -> (std::alloc::Layout, std::alloc::Layout)
+{
+    (std::alloc::Layout::new::<TraceMemoryOwner>(),
+     std::alloc::Layout::new::<PrepaidTraceCredit>())
+}
+
 impl contextdb_vector::PrepaidVectorCopyCharge for PrepaidTraceCredit {
-    fn accountant(&self) -> Arc<dyn contextdb_vector::MemoryBudget> {
+// capture969 begin
+    #[cfg(feature = "test-seams")]
+    fn credit_address_for_test(&self) -> usize { &self.credit as *const ReadCredit as usize }
+// capture969 end
+    #[cfg(feature = "test-seams")]
+    fn original_payer_identity_for_test(&self) -> usize {
+        crate::vector_read_memory::observed_identity(self.credit.original_payer_identity_for_test())
+    }
+    fn accountant(&self) -> contextdb_vector::MemoryBudgetOwner {
         self.owner.clone()
     }
     fn retained_bytes(&self) -> usize {
@@ -322,7 +440,7 @@ struct RequestContext {
     vector_copies: Mutex<contextdb_vector::VectorCopyAdmission>,
     /// The first validated vector capture fixes intent and roots across fetches.
     vector_read_capture:
-        Mutex<Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>>>,
+        Mutex<Option<crate::persistence::vector_membership_source::VectorReadCapture>>,
     /// How this read ends when an operator runs out of budget mid-answer:
     /// refused, or paused for the next fetch.
     resumption: ReadResumption,
@@ -340,7 +458,7 @@ struct RequestContext {
     /// as they exist.
     live_source_pages: ControlArc<std::sync::atomic::AtomicUsize>,
     /// The caller-supplied budget retained by this executing request.
-    reader_budget: Arc<dyn ReadMemoryBudget>,
+    reader_budget: contextdb_core::read_memory::ReadMemoryOwner,
     native_budget_control: Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
     /// Bound-range sizes of tied index candidates, probed once per request so
     /// preflight, ordering and build choose the same index.
@@ -364,6 +482,30 @@ impl Drop for SourcePageCharge {
     fn drop(&mut self) {
         self.live
             .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The public page's one external invoice also keeps its original request's
+/// live-byte counter. Both survive every public alias through physical free.
+#[derive(Debug)]
+pub(crate) struct CursorPageInvoice {
+    credit: ReadCredit,
+    live: Option<ControlArc<std::sync::atomic::AtomicUsize>>,
+}
+impl CursorPageInvoice {
+    pub(crate) fn new(credit: ReadCredit) -> Self { Self { credit, live: None } }
+    pub(crate) fn bytes(&self) -> usize { self.credit.bytes() }
+}
+impl contextdb_core::read_memory::ReadSharedInvoice for CursorPageInvoice {
+    fn credit(&self) -> &ReadCredit { &self.credit }
+}
+impl Drop for CursorPageInvoice {
+    fn drop(&mut self) {
+        if let Some(live) = &self.live {
+            live.fetch_sub(self.credit.bytes(), std::sync::atomic::Ordering::SeqCst);
+        }
+        // ReadShared has already destroyed the payload and physically freed
+        // its cell. Only now may this original credit and counter alias retire.
     }
 }
 
@@ -398,11 +540,13 @@ impl ReadOpenContext {
     }
 
     pub(crate) fn new(
-        read_memory: Arc<dyn ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: OwnerReadCancellation,
     ) -> contextdb_core::Result<Self> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_commit_directory_open_funding(&read_memory);
         RequestContext::new(
@@ -423,7 +567,7 @@ impl ReadOpenContext {
         self.0.checkpoint().map_err(Self::engine_error)
     }
 
-    pub(crate) fn read_memory(&self) -> Arc<dyn ReadMemoryBudget> {
+    pub(crate) fn read_memory(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
         self.0.reader_budget.clone()
     }
 
@@ -447,7 +591,7 @@ impl ReadOpenContext {
 
     pub(crate) fn vector_read_capture(
         &self,
-    ) -> Option<Arc<crate::persistence::vector_membership_source::VectorReadOperation>> {
+    ) -> Option<crate::persistence::vector_membership_source::VectorReadCapture> {
         self.0
             .vector_read_capture
             .lock()
@@ -457,7 +601,7 @@ impl ReadOpenContext {
 
     pub(crate) fn retain_vector_read_capture(
         &self,
-        capture: Arc<crate::persistence::vector_membership_source::VectorReadOperation>,
+        capture: crate::persistence::vector_membership_source::VectorReadCapture,
     ) -> contextdb_core::Result<()> {
         let mut slot = self
             .0
@@ -466,7 +610,7 @@ impl ReadOpenContext {
             .unwrap_or_else(|poison| poison.into_inner());
         if slot
             .as_ref()
-            .is_some_and(|prior| !Arc::ptr_eq(prior, &capture))
+            .is_some_and(|prior| !std::ptr::eq(&**prior, &*capture))
         {
             return Err(Error::StoreCorrupted {
                 path: "vector_partition_memberships".into(),
@@ -491,7 +635,7 @@ impl ReadOpenContext {
 
 impl RequestContext {
     fn new(
-        reader_budget: Arc<dyn ReadMemoryBudget>,
+        reader_budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         limits: ReadLimits,
         resumption: ReadResumption,
         clock: Arc<dyn DeadlineClock>,
@@ -499,19 +643,23 @@ impl RequestContext {
         transaction: Option<TxId>,
         #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     ) -> std::result::Result<ControlArc<Self>, BoundedExecutionError> {
+        let reader_budget: contextdb_core::read_memory::ReadMemoryOwner = reader_budget.into();
+
         Self::new_with_cancellation(reader_budget, limits, resumption, clock,
             RequestCancellation::Legacy(cancellation), transaction, None, None,
             #[cfg(any(test, feature = "test-seams"))] probe)
     }
 
     fn new_with_cancellation(
-        reader_budget: Arc<dyn ReadMemoryBudget>, limits: ReadLimits,
+        reader_budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, limits: ReadLimits,
         resumption: ReadResumption, clock: Arc<dyn DeadlineClock>,
         cancellation: RequestCancellation, transaction: Option<TxId>,
         native_operation: Option<crate::owner_read::NativeReadRequest>,
         original_started_ms: Option<u64>,
         #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     ) -> std::result::Result<ControlArc<Self>, BoundedExecutionError> {
+        let reader_budget: contextdb_core::read_memory::ReadMemoryOwner = reader_budget.into();
+
         Self::check_effective_limits(&limits)?;
         let started_ms = original_started_ms.unwrap_or_else(|| clock.now_ms());
         let counter_bytes = ControlArc::<std::sync::atomic::AtomicUsize>::control_bytes()?;
@@ -529,7 +677,7 @@ impl RequestContext {
             return Err(Self::limit_failure(ReadFailureLimit::Memory, limits.memory));
         }
         let funding_owner = native_operation.as_ref().map(|operation| operation.owner())
-            .unwrap_or_else(|| contextdb_core::read_memory::ReadMemoryOwner::from_legacy(reader_budget.clone()));
+            .unwrap_or_else(|| contextdb_core::read_memory::ReadMemoryOwner::from(reader_budget.clone()));
         let counter_invoice = ControlArc::<std::sync::atomic::AtomicUsize>::admit_owned(funding_owner.clone())?;
         let weak_invoice = ControlArc::<WeakSourceDecodeBudget>::admit_owned(funding_owner.clone())?;
         let vector_invoice = ControlArc::<crate::vector_read_memory::ReaderVectorBudget>::admit_owned(funding_owner.clone())?;
@@ -709,7 +857,33 @@ impl RequestContext {
             vector_search_disclosure_capacity_bytes(vector)?,
             "terminal vector trace",
         )?;
-        self.replace_final_trace(payload, |trace| trace.vector_search = Some(vector.clone()))
+        self.replace_final_trace(payload, |trace| trace.vector_search = Some(Box::new(vector.clone())))
+    }
+
+    /// Replace an answer's diagnostic only when its value changes. Both
+    /// overlapping copies are admitted; retire the old allocation before
+    /// refunding it, then transfer the remaining credit with the answer.
+    fn replace_answer_vector(
+        &self,
+        trace: &mut QueryTrace,
+        vector: Option<&VectorSearchDisclosure>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        if trace.vector_search.as_deref() == vector {
+            return Ok(());
+        }
+        let retired_bytes = trace.vector_search.as_deref()
+            .map(vector_search_disclosure_capacity_bytes).transpose()?.unwrap_or(0);
+        let replacement = vector.map(|vector| {
+            self.reserve(
+                BoundedWorkSource::VectorCandidates,
+                vector_search_disclosure_capacity_bytes(vector)?,
+            )?;
+            Ok::<_, BoundedExecutionError>(Box::new(vector.clone()))
+        }).transpose()?;
+        let retired = std::mem::replace(&mut trace.vector_search, replacement);
+        drop(retired);
+        self.release(retired_bytes)?;
+        Ok(())
     }
 
     /// Move the unique admitted carrier; only inline counters change here.
@@ -1480,7 +1654,8 @@ impl RequestContext {
             destination,
             bytes,
         );
-        destination.transfer_vector_load_reservation(bytes, || {
+        let original = self.state().memory.owner();
+        destination.transfer_vector_load_reservation(&original, bytes, |prepaid, moved| {
             #[cfg(any(test, feature = "test-seams"))]
             self.observe_graph_credit_transfer(
                 GraphCreditTransferPhase::DestinationAdmitted,
@@ -1491,7 +1666,12 @@ impl RequestContext {
                 let mut state = self.state();
                 state.memory.try_split_off(bytes)?
             };
-            drop(split);
+            if prepaid {
+                // transfer sets the credit to zero before invoking its Drop
+                // observer. The destination owns cleanup if that observer unwinds.
+                *moved = true;
+                split.transfer();
+            } else { drop(split); }
             #[cfg(any(test, feature = "test-seams"))]
             self.observe_graph_credit_transfer(
                 GraphCreditTransferPhase::SourceSplit,
@@ -1944,10 +2124,52 @@ impl RequestContext {
         trace: contextdb_vector::mem::BoundedVectorSearchTrace,
     ) -> std::result::Result<contextdb_vector::OwnedVectorSearchTrace, BoundedExecutionError> {
         let bytes = trace.retained_bytes();
+        // The request ledger still owns every incoming buffer while provider
+        // control admission can refuse. A refusal frees trace before that ledger.
+        #[cfg(all(test, feature = "test-seams"))]
+        let owner_window = crate::database::retained_trace_ownership_tests::owner_window(
+            &self.reader_budget, trace.allocation_invoice_for_test());
+        let owner_control = TraceMemoryOwner::try_new(self.reader_budget.clone())?;
+        let owner: contextdb_vector::MemoryBudgetOwner = (*owner_control).clone().into();
+        #[cfg(all(test, feature = "test-seams"))]
+        crate::database::retained_trace_ownership_tests::finish_owner_window(owner_window);
+        #[cfg(feature = "test-seams")]
+        crate::vector_read_memory::statement_child_proof::trace_produced(
+            trace.allocation_invoice_for_test(),
+            crate::vector_read_memory::observed_reader_identity(&self.reader_budget),
+            owner.accounting_identity(),
+            std::alloc::Layout::new::<PrepaidTraceCredit>(),
+        );
+// capture969 begin
+        #[cfg(all(test, feature = "test-seams"))]
+        {
+            let state = self.state();
+            crate::database::retained_trace_ownership_tests::ordered_cut("request-ledger-before-split",
+                [&state.memory as *const ReadCredit as usize, state.memory.bytes(), bytes,
+                 state.memory.original_payer_identity_for_test(), 0, 0, 0, 0]);
+        }
+// capture969 end
         let credit = self.state().memory.try_split_off(bytes)?;
-        let owner: Arc<dyn contextdb_vector::MemoryBudget> =
-            Arc::new(TraceMemoryOwner::new(Arc::clone(&self.reader_budget)));
-        Ok(trace.into_owned(owner.clone(), PrepaidTraceCredit { owner, credit })?)
+// capture969 begin
+        #[cfg(all(test, feature = "test-seams"))]
+        {
+            let state = self.state();
+            crate::database::retained_trace_ownership_tests::ordered_cut("request-ledger-after-split",
+                [&state.memory as *const ReadCredit as usize, state.memory.bytes(), bytes,
+                 state.memory.original_payer_identity_for_test(), 0, 0, 0, 0]);
+        }
+        #[cfg(all(test, feature = "test-seams"))]
+        crate::database::retained_trace_ownership_tests::ordered_cut("detached-credit",
+            [&credit as *const ReadCredit as usize, credit.bytes(),
+             credit.original_payer_identity_for_test(), 0, 0, 0, 0, 0]);
+// capture969 end
+        #[cfg(all(test, feature = "test-seams"))]
+        let _handoff_window = crate::database::retained_trace_ownership_tests::handoff_window(&self.reader_budget);
+        #[cfg(feature = "test-seams")]
+        crate::vector_read_memory::statement_child_proof::funding_next(&self.reader_budget);
+        Ok(trace.into_owned(owner.clone(), PrepaidTraceCredit {
+            owner: owner.into(), credit, _control_invoice: owner_control.original_invoice(),
+        })?)
     }
 
     fn transfer_answer(
@@ -1973,7 +2195,8 @@ impl RequestContext {
             "answer trace",
         )?;
         let credit = self.state().memory.try_split_off(bytes)?;
-        result.answer_charge = crate::read_image_memory::AnswerCharge::holding_reader(credit)?;
+        result.answer_charge = crate::read_image_memory::QueryAnswerCharge::holding_reader(credit)?;
+        result.retained_read_memory = Some(contextdb_core::read_memory::ReadMemoryOwner::from(self.reader_budget.clone()));
         Ok(())
     }
 
@@ -2019,7 +2242,7 @@ impl RequestContext {
             return Err(self.memory_limit_failure(held, bytes, operation));
         }
         let credit = ReadCredit::try_new(
-            Arc::clone(&self.reader_budget),
+            self.reader_budget.clone(),
             bytes,
             "bounded_read",
             operation,
@@ -2496,6 +2719,16 @@ struct SourceDecodeBudget {
     source: BoundedWorkSource,
 }
 
+// The request remains alive through final control free and only then settles
+// the original reservation. This adapter never becomes request-owned state.
+struct SourceDecodeInvoice {
+    context: ControlArc<RequestContext>,
+    bytes: usize,
+}
+impl Drop for SourceDecodeInvoice {
+    fn drop(&mut self) { self.context.release_parked(self.bytes); }
+}
+
 impl std::fmt::Debug for SourceDecodeBudget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SourceDecodeBudget")
@@ -2505,7 +2738,7 @@ impl std::fmt::Debug for SourceDecodeBudget {
 impl contextdb_core::read_memory::ReadMemoryBudget for SourceDecodeBudget {
     #[cfg(any(test, feature = "test-seams"))]
     fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
-        Some(&self.context.reader_budget)
+        self.context.reader_budget.funding_owner_for_test()
     }
 
     fn try_reserve(
@@ -3165,7 +3398,9 @@ struct VectorState {
     /// The statement's filter as a check one row at a time: the predicate of
     /// a plain scan of this table, with the table's declaration for its
     /// authorization. `None` where the candidates are anything else.
-    row_filter: Option<Box<(Expr, Option<TableMeta>)>>,
+    // Tuple fields drop in order: the box and all nested copies are freed
+    // before their independent live charge. Cursor settlement cannot refund it.
+    row_filter: Option<(Box<(Expr, Option<TableMeta>)>, SourcePageCharge)>,
     prepaid_construction: usize,
     /// The row checks this statement may spend (see `row_check_allowance`),
     /// once known, and those spent so far: index entries a bounded probe
@@ -3549,9 +3784,9 @@ impl PullNode {
     fn published_vector_search(&self) -> Option<&VectorSearchDisclosure> {
         match &self.kind {
             PullKind::Scan(_) | PullKind::Graph(_) | PullKind::Static(_) => {
-                self.trace.vector_search.as_ref()
+                self.trace.vector_search.as_deref()
             }
-            PullKind::Vector(_) => self.trace.vector_search.as_ref(),
+            PullKind::Vector(_) => self.trace.vector_search.as_deref(),
             PullKind::Project(state) => state.input.published_vector_search(),
             PullKind::Sort(state) => state.input.published_vector_search(),
             PullKind::Window(state) => state.input.published_vector_search(),
@@ -4789,10 +5024,23 @@ fn index_predicate_shape_capacity_bytes(
     }
 }
 
-fn vector_search_disclosure_capacity_bytes(
+pub(crate) fn vector_search_disclosure_capacity_bytes(
     disclosure: &VectorSearchDisclosure,
 ) -> std::result::Result<usize, BoundedExecutionError> {
-    let mut bytes = disclosure.auto_index_at_source.capacity();
+    // The disclosure now lives in an owning box. Every admitted deep copy
+    // must cover both that allocation and all nested container allocations.
+    let mut bytes = checked_size_add(
+        std::mem::size_of::<VectorSearchDisclosure>(),
+        disclosure.auto_index_at_source.capacity(),
+        "trace vector disclosure box",
+    )?;
+    for source in [
+        &disclosure.flat_below_source,
+        &disclosure.search_radius_source,
+        &disclosure.auto_expansion_ceiling_source,
+    ] {
+        bytes = checked_size_add(bytes, source.capacity(), "trace vector policy source")?;
+    }
     bytes = checked_size_add(
         bytes,
         strings_capacity_bytes(
@@ -4805,6 +5053,7 @@ fn vector_search_disclosure_capacity_bytes(
         disclosure.fallback.as_ref(),
         disclosure.refusal.as_ref(),
         disclosure.recovery.as_ref(),
+        disclosure.budget_terminal.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -5326,6 +5575,10 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
             checked_size_add(state_bytes, size_of::<GraphState>(), "graph control")?
         }
         PullKind::Vector(state) => {
+            // row_filter carries its own SourcePageCharge. Its box and nested
+            // buffers are already in live_source_pages, outside the standing
+            // continuation credit settled here; counting them again would
+            // charge the same allocation twice.
             let mut state_bytes = checked_size_add(
                 checked_size_add(
                     size_of::<VectorState>(),
@@ -6561,7 +6814,7 @@ impl ScanState {
                     candidate_ids.push(row_id.0);
                     Ok(())
                 },
-                context.source_read_memory(BoundedWorkSource::IndexRange),
+                context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
             );
             let visited = match visited {
                 Err(BoundedExecutionError::Cancelled) if capped.get() => {
@@ -6691,7 +6944,7 @@ impl ScanState {
                     let existing =
                         context.with_source_page_admission(BoundedWorkSource::TableScan, || {
                             db.bounded_row_by_identity(
-                                context.source_read_memory(BoundedWorkSource::TableScan),
+                                context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
                                 None,
                                 &self.table,
                                 row.row_id,
@@ -6872,7 +7125,7 @@ impl ScanState {
                             BoundedWorkSource::TableScan,
                             || {
                                 db.bounded_physical_table_row_next(
-                                    context.source_read_memory(BoundedWorkSource::TableScan),
+                                    context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
                                     self.table.as_str(),
                                     self.snapshot,
                                     cursor,
@@ -6938,7 +7191,7 @@ impl ScanState {
                             BoundedWorkSource::IndexRange,
                             || {
                                 db.bounded_ordered_table_row_next_observed(
-                                    context.source_read_memory(BoundedWorkSource::IndexRange),
+                                    context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
                                     &self.table,
                                     column,
                                     *direction,
@@ -7022,7 +7275,7 @@ impl ScanState {
                             BoundedWorkSource::IndexRange,
                             || {
                                 db.bounded_ordered_table_row_next_observed(
-                                    context.source_read_memory(BoundedWorkSource::IndexRange),
+                                    context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
                                     &self.table,
                                     column,
                                     *direction,
@@ -7089,7 +7342,7 @@ impl ScanState {
                             BoundedWorkSource::IndexRange,
                             || {
                                 db.bounded_exact_index_row_next(
-                                    context.source_read_memory(BoundedWorkSource::IndexRange),
+                                    context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
                                     &self.table,
                                     index,
                                     self.snapshot,
@@ -7143,7 +7396,7 @@ impl ScanState {
                         let selected_bytes = Cell::new(0);
                         let selected = context.with_source_page_admission(source, || {
                             db.bounded_row_by_identity(
-                                context.source_read_memory(source),
+                                context.source_read_memory(source)?,
                                 None,
                                 &self.table,
                                 identity.row_id,
@@ -7160,9 +7413,8 @@ impl ScanState {
                         reserved.set(selected_bytes.get());
                         if selected.is_none() {
                             return Err(Error::StoreCorrupted {
-                                path: db.bounded_store_path(),
-                                reason: "authenticated current posting has no visible row"
-                                    .to_string(),
+                                path: db.bounded_store_path().into(),
+                                reason: "authenticated current posting has no visible row".into(),
                             }
                             .into());
                         }
@@ -7240,10 +7492,7 @@ impl ScanState {
             if !self.supplement_columns.is_empty() {
                 if self.pending_vector_copy.is_none() {
                     self.pending_vector_copy = Some(Box::new(
-                        crate::vector_read_memory::admission(Arc::new(SourceDecodeBudget {
-                            context: context.clone(),
-                            source: BoundedWorkSource::TableScan,
-                        })),
+                        crate::vector_read_memory::admission(context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?),
                     ));
                 }
                 let (row_identity, row_lsn) = self
@@ -7268,7 +7517,7 @@ impl ScanState {
                         self.pending_vector_copy
                             .as_deref_mut()
                             .expect("pending vector owner"),
-                        Arc::clone(&context.reader_budget),
+                        context.reader_budget.clone(),
                     )? {
                         filled.push((column.clone(), Value::Vector(vector)));
                     }
@@ -7425,7 +7674,7 @@ impl ScanState {
                     row,
                     self.snapshot,
                     &mut charge_access,
-                    context.source_read_memory(BoundedWorkSource::AccessControl),
+                    context.source_read_memory(BoundedWorkSource::AccessControl).map_err(BoundedExecutionError::into_engine_error)?,
                 )?;
             } else {
                 hidden = !db.bounded_read_allowed_for_row(
@@ -7439,7 +7688,7 @@ impl ScanState {
                     row,
                     self.snapshot,
                     &mut charge_access,
-                    context.source_read_memory(BoundedWorkSource::AccessControl),
+                    context.source_read_memory(BoundedWorkSource::AccessControl).map_err(BoundedExecutionError::into_engine_error)?,
                 )?;
             }
             if hidden || refused.is_some() {
@@ -7619,7 +7868,7 @@ impl GraphState {
                     &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
                     &mut |bytes| context.release(bytes),
                     &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
-                    context.source_read_memory(BoundedWorkSource::GraphTraversal),
+                    context.source_read_memory(BoundedWorkSource::GraphTraversal).map_err(BoundedExecutionError::into_engine_error)?,
                 )
             }?;
             let Some(edge) = edge else {
@@ -7836,10 +8085,7 @@ impl GraphState {
                             }
                             Ok(())
                         },
-                        Arc::new(SourceDecodeBudget {
-                            context: context.clone(),
-                            source: BoundedWorkSource::GraphTraversal,
-                        }),
+                        context.source_read_memory(BoundedWorkSource::GraphTraversal).map_err(BoundedExecutionError::into_engine_error)?,
                     )
                 })
                 .transpose();
@@ -7988,7 +8234,7 @@ impl GraphState {
                 &mut |bytes| access_memory.charge_access_row(bytes),
                 &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
                 &mut |bytes| context.release_parked(bytes),
-                context.source_read_memory(BoundedWorkSource::GraphTraversal),
+                context.source_read_memory(BoundedWorkSource::GraphTraversal).map_err(BoundedExecutionError::into_engine_error)?,
             )
         }?;
         let Some(mut cursor) = cursor else {
@@ -8042,7 +8288,7 @@ impl GraphState {
             &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
             visited_cap,
             context.transaction(),
-            context.source_read_memory(BoundedWorkSource::GraphTraversal),
+            context.source_read_memory(BoundedWorkSource::GraphTraversal).map_err(BoundedExecutionError::into_engine_error)?,
         )
     }
 
@@ -8606,10 +8852,7 @@ impl GraphState {
                             }
                             Ok(())
                         },
-                        Arc::new(SourceDecodeBudget {
-                            context: context.clone(),
-                            source: BoundedWorkSource::GraphTraversal,
-                        }),
+                        context.source_read_memory(BoundedWorkSource::GraphTraversal).map_err(BoundedExecutionError::into_engine_error)?,
                     )
                 })
                 .transpose();
@@ -8945,10 +9188,14 @@ impl VectorState {
             )
         })?;
         context.bind_final_vector(&disclosure)?;
-        // The node's existing trace already owns this inline result slot.
-        // Publish into that slot directly instead of retaining another full
-        // disclosure in the vector state and cloning it on every pulled row.
-        published_trace.vector_search = Some(disclosure);
+        // Nested disclosure storage belongs to the vector copy admission.
+        // Admit the new owning box separately before allocating it; context
+        // custody outlives this node and its internal execution consumers.
+        context.reserve(
+            BoundedWorkSource::VectorCandidates,
+            std::mem::size_of::<VectorSearchDisclosure>(),
+        )?;
+        published_trace.vector_search = Some(Box::new(disclosure));
         Ok(())
     }
 
@@ -8998,15 +9245,12 @@ impl VectorState {
         row_id: RowId,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         let mut vector_copy_owner =
-            crate::vector_read_memory::admission(Arc::new(SourceDecodeBudget {
-                context: context.clone(),
-                source: BoundedWorkSource::TableScan,
-            }));
+            crate::vector_read_memory::admission(context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?);
         let mut retained = 0usize;
         context.charge_operator(BoundedWorkSource::TableScan)?;
         let row = context.with_source_page_admission(BoundedWorkSource::TableScan, || {
             db.bounded_row_by_identity(
-                context.source_read_memory(BoundedWorkSource::TableScan),
+                context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
                 context.transaction(),
                 &self.table,
                 row_id,
@@ -9052,7 +9296,7 @@ impl VectorState {
                 context.attribute_live_memory(BoundedWorkSource::AccessControl);
                 Ok(())
             },
-            context.source_read_memory(BoundedWorkSource::AccessControl),
+            context.source_read_memory(BoundedWorkSource::AccessControl).map_err(BoundedExecutionError::into_engine_error)?,
         )?;
         // The gate decides what this reader MAY see; it does not decide what
         // the statement ASKED for. On the identity route nothing has read this
@@ -9082,7 +9326,7 @@ impl VectorState {
                 drop(row);
                 context.release(retained)?;
                 return Err(Error::StoreCorrupted {
-                    path: db.bounded_store_path(),
+                    path: db.bounded_store_path().into(),
                     reason: format!(
                         "relational index {index} on table {} names row {} as {}, and the row \
                          version stored at this snapshot disagrees",
@@ -9093,7 +9337,7 @@ impl VectorState {
                         } else {
                             "one this reader may see"
                         },
-                    ),
+                    ).into(),
                 }
                 .into());
             }
@@ -9113,7 +9357,7 @@ impl VectorState {
                 row.lsn,
                 self.snapshot,
                 &mut vector_copy_owner,
-                Arc::clone(&context.reader_budget),
+                context.reader_budget.clone(),
             )? {
                 row.values.insert(column.clone(), Value::Vector(vector));
             }
@@ -9298,7 +9542,7 @@ impl VectorState {
         let row =
             context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
                 db.bounded_row_by_identity(
-                    context.source_read_memory(BoundedWorkSource::VectorCandidates),
+                    context.source_read_memory(BoundedWorkSource::VectorCandidates).map_err(BoundedExecutionError::into_engine_error)?,
                     context.transaction(),
                     &self.table,
                     row_id,
@@ -9328,7 +9572,7 @@ impl VectorState {
                 row,
                 self.snapshot,
                 &mut |_| context.charge_operator(BoundedWorkSource::AccessControl),
-                context.source_read_memory(BoundedWorkSource::AccessControl),
+                context.source_read_memory(BoundedWorkSource::AccessControl).map_err(BoundedExecutionError::into_engine_error)?,
             )
         })();
         drop(row);
@@ -9473,7 +9717,7 @@ impl VectorState {
             );
             self.receipt.finish_step(
                 vector_search_receipt::exact_candidates(context).saturating_sub(before),
-                published_trace.vector_search.as_ref(),
+                published_trace.vector_search.as_deref(),
                 completed || terminal,
             );
             result
@@ -9760,7 +10004,7 @@ impl VectorState {
                         // never reduced by what the bounded probe before it
                         // read under its separate half allowance.
                         let row_check_allowance = self.row_check_allowance;
-                        let mut row_check = |row_id: RowId| match self.row_filter.as_deref() {
+                        let mut row_check = |row_id: RowId| match self.row_filter.as_ref().map(|(filter, _charge)| filter.as_ref()) {
                             Some((filter, meta)) => {
                                 self.row_checks.set(self.row_checks.get() + 1);
                                 vector_row_passes(
@@ -10014,7 +10258,7 @@ impl VectorState {
                 VectorPreparation::Materialize if self.source.is_some() => {
                     // A filter checked row by row is asked about each row the
                     // exhaustive comparison scores, before it competes.
-                    let mut brute_row_check = |row_id: RowId| match self.row_filter.as_deref() {
+                    let mut brute_row_check = |row_id: RowId| match self.row_filter.as_ref().map(|(filter, _charge)| filter.as_ref()) {
                         Some((filter, meta)) => {
                             self.row_checks.set(self.row_checks.get() + 1);
                             vector_row_passes(
@@ -10221,7 +10465,7 @@ impl VectorState {
                             return Err(error);
                         }
                         let ranked = db.bounded_rank_candidate(
-                            context.source_read_memory(BoundedWorkSource::RankCandidates),
+                            context.source_read_memory(BoundedWorkSource::RankCandidates).map_err(BoundedExecutionError::into_engine_error)?,
                             &self.index,
                             sort_key,
                             row_id,
@@ -11593,10 +11837,7 @@ fn bounded_resolve_graph_start_nodes(
         snapshot,
         start_alias,
         &mut read,
-        Arc::new(SourceDecodeBudget {
-            context: context.clone(),
-            source: BoundedWorkSource::GraphTraversal,
-        }),
+        context.source_read_memory(BoundedWorkSource::GraphTraversal).map_err(BoundedExecutionError::into_engine_error)?,
     )
     .map(Some)
 }
@@ -11776,7 +12017,7 @@ fn in_transaction_prefix_count(
     let overlay = db.transaction_table_overlay(
         tx,
         table,
-        context.source_read_memory(BoundedWorkSource::IndexRange),
+        context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
     )?;
     if overlay.is_empty() {
         return Ok(Some(committed));
@@ -11818,7 +12059,7 @@ fn in_transaction_prefix_count(
         let probe = Cell::new(0_usize);
         let original = context.with_source_page_admission(BoundedWorkSource::IndexRange, || {
             db.bounded_row_by_identity(
-                context.source_read_memory(BoundedWorkSource::IndexRange),
+                context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
                 None,
                 table,
                 row_id,
@@ -12000,7 +12241,7 @@ fn build_authenticated_index_count(
         &pick.columns[..prefix.len()],
         &prefix,
         snapshot,
-        context.source_read_memory(BoundedWorkSource::IndexRange),
+        context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
     )?;
     let served = match (committed, context.transaction()) {
         (Some(committed), Some(tx)) => in_transaction_prefix_count(
@@ -12658,7 +12899,7 @@ fn build_ranked_prefix(
     };
     if !db.ordered_prefix_snapshot_is_current(
         snapshot,
-        context.source_read_memory(BoundedWorkSource::IndexRange),
+        context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
     )? {
         return Ok(None);
     }
@@ -13683,7 +13924,7 @@ fn build_kernel_with_ctes<'plan>(
         } => {
             let row_edge_guard = db.graph_cursor_read_guard(
                 context.transaction(),
-                context.source_read_memory(BoundedWorkSource::GraphTraversal),
+                context.source_read_memory(BoundedWorkSource::GraphTraversal).map_err(BoundedExecutionError::into_engine_error)?,
             )?;
             let _decisions = row_edge_guard.as_ref().map(|capture| capture.enter());
             let Some(step) = steps.first() else {
@@ -13750,7 +13991,7 @@ fn build_kernel_with_ctes<'plan>(
                                         snapshot,
                                         |bytes| access_memory.charge_access_row(bytes),
                                         context
-                                            .source_read_memory(BoundedWorkSource::GraphTraversal),
+                                            .source_read_memory(BoundedWorkSource::GraphTraversal)?,
                                     )?;
                                 }
                                 predicates_pushed
@@ -14976,7 +15217,7 @@ fn candidate_runs_admit_whole_partitions(
                 )
             },
             &mut || context.native_source_touch(),
-            context.source_read_memory(BoundedWorkSource::IndexRange),
+            context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
         )?;
         if empty != Some(true) {
             return Ok(None);
@@ -15063,7 +15304,7 @@ fn funded_graph_credit_transfer(
     let prototype = graph_credit_transfer(
         context.clone(),
         SourcePageCharge {
-            _credit: ReadCredit::new(Arc::clone(&context.reader_budget)),
+            _credit: ReadCredit::new(context.reader_budget.clone()),
             live: context.live_source_pages.clone(),
             bytes: 0,
         },
@@ -15175,11 +15416,12 @@ fn build_vector_kernel<'plan>(
         .then(|| candidate_plan.and_then(|plan| vector_row_filter(plan, table))).flatten();
     let stream_plain_filter = streamed_filter.is_some();
     let row_filter = if let Some(filter) = streamed_filter {
-        Some(Box::new((filter, None)))
+        Some(copy_vector_row_filter(filter, None, context)?)
     } else {
         (context.transaction().is_none() && !directory_candidates)
             .then(|| candidate_plan.and_then(|plan| vector_row_filter(plan, table))).flatten()
-            .map(|filter| Box::new((filter, Some(meta.clone()))))
+            .map(|filter| copy_vector_row_filter(filter, Some(&meta), context))
+            .transpose()?
     };
     let mut candidate_root = candidate_plan.filter(|_| !stream_plain_filter)
         .map(|candidate| {
@@ -15283,7 +15525,7 @@ fn build_vector_kernel<'plan>(
             let row =
                 context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
                     db.bounded_row_by_identity(
-                        context.source_read_memory(BoundedWorkSource::VectorCandidates),
+                        context.source_read_memory(BoundedWorkSource::VectorCandidates).map_err(BoundedExecutionError::into_engine_error)?,
                         context.transaction(),
                         table,
                         row_id,
@@ -15321,7 +15563,7 @@ fn build_vector_kernel<'plan>(
                         context.attribute_live_memory(BoundedWorkSource::AccessControl);
                         Ok(())
                     },
-                    context.source_read_memory(BoundedWorkSource::AccessControl),
+                    context.source_read_memory(BoundedWorkSource::AccessControl).map_err(BoundedExecutionError::into_engine_error)?,
                 )? {
                     candidate_bytes += reserve_vector_slot(
                         context,
@@ -15490,7 +15732,7 @@ fn build_vector_kernel<'plan>(
 /// The predicate of a candidate plan that is a plain scan of `table`, under
 /// any projections: the one shape whose rows a search can check one at a
 /// time with exactly the statement's own filter.
-fn vector_row_filter(plan: &PhysicalPlan, table: &str) -> Option<Expr> {
+fn vector_row_filter<'a>(plan: &'a PhysicalPlan, table: &str) -> Option<&'a Expr> {
     let mut plan = plan;
     while let PhysicalPlan::Project { input, .. } = plan {
         plan = input;
@@ -15501,10 +15743,161 @@ fn vector_row_filter(plan: &PhysicalPlan, table: &str) -> Option<Expr> {
             filter: Some(filter),
             ..
         } if scanned == table && predicate_is_answerable_from_one_row(filter) => {
-            Some(filter.clone())
+            Some(filter)
         },
         _ => None,
     }
+}
+
+/// Quote the complete owned copy, including the tuple's actual Box layout.
+/// The ordinary metadata walker covers every column's ACL, scope and rank
+/// strings. Include the native transition map and declarations omitted by
+/// that walk, without changing other metadata producers' accounting.
+fn vector_row_filter_copy_bytes(
+    filter: &Expr,
+    meta: Option<&TableMeta>,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let mut bytes = checked_size_add(
+        std::alloc::Layout::new::<(Expr, Option<TableMeta>)>().size(),
+        expr_capacity_bytes(filter)?,
+        "vector row filter",
+    )?;
+    if let Some(meta) = meta {
+        bytes = checked_size_add(
+            bytes,
+            table_meta_capacity_bytes(meta)?,
+            "vector row metadata",
+        )?;
+        if let Some(machine) = &meta.state_machine {
+            // Replace the generic entry estimate with the concrete destination
+            // map layout. Rebuild by length below: cloning a source raw table
+            // could preserve spare buckets and deleted-entry control bytes.
+            let entries = checked_size_mul(
+                machine.transitions.capacity(),
+                size_of::<(String, Vec<String>)>(),
+                "state-machine entries",
+            )?;
+            let native = crate::memory_accounting::native_map_plan::<String, Vec<String>>(
+                machine.transitions.len(),
+            )?;
+            bytes = checked_size_add(
+                bytes - entries,
+                native.layout.size(),
+                "vector row transition map",
+            )?;
+        }
+        if let Some(tables) = &meta.delivery_manifest_tables {
+            bytes = checked_size_add(
+                bytes,
+                strings_capacity_bytes(tables, "delivery manifest tables")?,
+                "vector row metadata",
+            )?;
+        }
+        if let Some(contextdb_core::MaintainedCounts::Lists(lists)) = &meta.maintained_counts {
+            bytes = checked_size_add(
+                bytes,
+                checked_size_mul(
+                    lists.capacity(),
+                    size_of::<Vec<(String, contextdb_core::SortDirection)>>(),
+                    "maintained count lists",
+                )?,
+                "vector row metadata",
+            )?;
+            for columns in lists {
+                bytes = checked_size_add(
+                    bytes,
+                    checked_size_mul(
+                        columns.capacity(),
+                        size_of::<(String, contextdb_core::SortDirection)>(),
+                        "maintained count columns",
+                    )?,
+                    "vector row metadata",
+                )?;
+                for (column, _) in columns {
+                    bytes = checked_size_add(bytes, column.capacity(), "maintained count column")?;
+                }
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// Copy this one metadata owner with a transition map of known native shape.
+/// Every other field follows TableMeta's derived Clone without sharing payloads.
+fn copy_vector_row_filter_meta(meta: &TableMeta) -> TableMeta {
+    TableMeta {
+        columns: meta.columns.clone(),
+        immutable: meta.immutable,
+        state_machine: meta.state_machine.as_ref().map(|machine| {
+            let mut transitions = HashMap::with_capacity(machine.transitions.len());
+            for (state, targets) in &machine.transitions {
+                transitions.insert(state.clone(), targets.clone());
+            }
+            contextdb_core::StateMachineConstraint {
+                column: machine.column.clone(),
+                transitions,
+            }
+        }),
+        dag_edge_types: meta.dag_edge_types.clone(),
+        unique_constraints: meta.unique_constraints.clone(),
+        natural_key_column: meta.natural_key_column.clone(),
+        propagation_rules: meta.propagation_rules.clone(),
+        default_ttl_seconds: meta.default_ttl_seconds,
+        sync_safe: meta.sync_safe,
+        expires_column: meta.expires_column.clone(),
+        indexes: meta.indexes.clone(),
+        composite_foreign_keys: meta.composite_foreign_keys.clone(),
+        sync_direction: meta.sync_direction.clone(),
+        retain_declared_unit: meta.retain_declared_unit,
+        primary_key_columns: meta.primary_key_columns.clone(),
+        conflict_policy: meta.conflict_policy.clone(),
+        history_policy: meta.history_policy.clone(),
+        delivery_manifest_tables: meta.delivery_manifest_tables.clone(),
+        edge_discard: meta.edge_discard,
+        maintained_counts: meta.maintained_counts.clone(),
+    }
+}
+
+/// Discovery only borrows the plan. Admit before cloning either owned shape
+/// or allocating the box, then keep that invoice beside its actual holder.
+fn copy_vector_row_filter(
+    filter: &Expr,
+    meta: Option<&TableMeta>,
+    context: &ControlArc<RequestContext>,
+) -> std::result::Result<(Box<(Expr, Option<TableMeta>)>, SourcePageCharge), BoundedExecutionError>
+{
+    // String/Vec clones have at most their source capacities. The transition
+    // map is rebuilt with its quoted native capacity; all other fields use
+    // derived Clone. Inline headers are included in the tuple layout.
+    let planned = vector_row_filter_copy_bytes(filter, meta)?;
+    let mut charge = context.admit_live_charge(
+        BoundedWorkSource::VectorCandidates,
+        planned,
+        "vector_row_filter_copy",
+    )?;
+    // Declare the payload after its charge: every fallible exit or unwind
+    // destroys the entire box before refunding the still-local invoice.
+    let value = Box::new((filter.clone(), meta.map(copy_vector_row_filter_meta)));
+    if let Some(machine) = value
+        .1
+        .as_ref()
+        .and_then(|meta| meta.state_machine.as_ref())
+    {
+        let native = crate::memory_accounting::native_map_plan::<String, Vec<String>>(
+            machine.transitions.len(),
+        )?;
+        crate::memory_accounting::validate_native_map_capacity(&machine.transitions, &native)?;
+    }
+    let actual = vector_row_filter_copy_bytes(&value.0, value.1.as_ref())?;
+    let unused = planned
+        .checked_sub(actual)
+        .ok_or_else(|| Error::Other("vector row filter clone exceeded its quote".into()))?;
+    charge._credit.try_shrink(unused)?;
+    charge
+        .live
+        .fetch_sub(unused, std::sync::atomic::Ordering::SeqCst);
+    charge.bytes = actual;
+    Ok((value, charge))
 }
 
 /// Whether one row passes the statement's filter and authorization, read by
@@ -15528,7 +15921,7 @@ fn vector_row_passes(
     let mut retained = 0;
     let passes = context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
         db.visit_bounded_row_by_identity(
-            context.source_read_memory(BoundedWorkSource::VectorCandidates),
+            context.source_read_memory(BoundedWorkSource::VectorCandidates).map_err(BoundedExecutionError::into_engine_error)?,
             context.transaction(), table, row_id, snapshot,
             &mut || context.native_source_touch(),
             &mut |bytes| {
@@ -15557,7 +15950,7 @@ fn vector_row_passes(
                 context.attribute_live_memory(BoundedWorkSource::AccessControl);
                 Ok(())
             },
-            context.source_read_memory(BoundedWorkSource::AccessControl),
+            context.source_read_memory(BoundedWorkSource::AccessControl).map_err(BoundedExecutionError::into_engine_error)?,
         )
             },
         )
@@ -15765,17 +16158,14 @@ fn bounded_query_vector(
                     &key_column,
                     &key,
                     snapshot,
-                    context.source_read_memory(BoundedWorkSource::VectorCandidates),
+                    context.source_read_memory(BoundedWorkSource::VectorCandidates).map_err(BoundedExecutionError::into_engine_error)?,
                 )?
                 .ok_or_else(|| Error::PersistedRowVectorRowMissing {
                     index: source_index.clone(),
                     key: key_label.clone(),
                 })?;
             let mut vector_copy_owner =
-                crate::vector_read_memory::admission(Arc::new(SourceDecodeBudget {
-                    context: context.clone(),
-                    source: BoundedWorkSource::VectorCandidates,
-                }));
+                crate::vector_read_memory::admission(context.source_read_memory(BoundedWorkSource::VectorCandidates).map_err(BoundedExecutionError::into_engine_error)?);
             let resolved = db.with_bounded_row_vector(
                 &source_index,
                 row_id,
@@ -15794,10 +16184,7 @@ fn bounded_query_vector(
                     reserve_query_vector_clone(vector, context)
                 },
                 &mut vector_copy_owner,
-                Arc::new(SourceDecodeBudget {
-                    context: context.clone(),
-                    source: BoundedWorkSource::VectorCandidates,
-                }),
+                context.source_read_memory(BoundedWorkSource::VectorCandidates).map_err(BoundedExecutionError::into_engine_error)?,
             )?;
             // The helper's temporary source body is gone; the returned clone
             // has its separate, existing query-vector reservation.
@@ -15871,7 +16258,7 @@ fn scan_transaction_overlay(
     let overlay = db.transaction_table_overlay(
         tx,
         table,
-        context.source_read_memory(BoundedWorkSource::TableScan),
+        context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
     )?;
     if overlay.is_empty() {
         return Ok(None);
@@ -16165,7 +16552,7 @@ fn build_scan(
             table,
             index,
             snapshot,
-            context.source_read_memory(BoundedWorkSource::IndexRange),
+            context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
             &mut || context.charge_operator(BoundedWorkSource::IndexRange),
         )?;
     }
@@ -16430,10 +16817,7 @@ fn build_store_state(
         PhysicalPlan::ShowMemoryLimit | PhysicalPlan::ShowDiskLimit
     );
     let answered = if matches!(plan, PhysicalPlan::ShowContentSize) {
-        let read_memory: Arc<dyn ReadMemoryBudget> = Arc::new(SourceDecodeBudget {
-            context: context.clone(),
-            source: BoundedWorkSource::TableScan,
-        });
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?;
         let mut before_table = || {
             context
                 .charge(BoundedWorkSource::TableScan, BoundedSourceTouch::IndexEntry)
@@ -16452,10 +16836,7 @@ fn build_store_state(
             db.store_state_answer(
                 plan,
                 vector_copy_owner,
-                Arc::new(SourceDecodeBudget {
-                    context: context.clone(),
-                    source: BoundedWorkSource::TableScan,
-                }),
+                context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
             )
         })?
     };
@@ -16578,7 +16959,7 @@ fn build_direct_index_scan(
         table,
         index,
         snapshot,
-        context.source_read_memory(BoundedWorkSource::IndexRange),
+        context.source_read_memory(BoundedWorkSource::IndexRange).map_err(BoundedExecutionError::into_engine_error)?,
         &mut || context.charge_operator(BoundedWorkSource::IndexRange),
     )?;
     capture_scan_membership(db, table, snapshot, &mut mode, context)?;
@@ -16968,7 +17349,7 @@ fn planned_values_clone_bytes(
 
 #[allow(dead_code)]
 fn planned_query_clone_bytes(
-    result: &QueryResult,
+    result: &QueryResultData,
 ) -> std::result::Result<usize, BoundedExecutionError> {
     let mut bytes = std::mem::size_of::<CanonicalQueryResult>();
     bytes = checked_size_add(
@@ -17061,6 +17442,19 @@ fn planned_query_clone_bytes(
     Ok(bytes)
 }
 
+/// Native page buffers, excluding its separately admitted immutable root.
+pub(crate) fn cursor_page_capacity_bytes(
+    page: &crate::owned_cursor_page::OwnedCursorPage,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let mut bytes = strings_capacity_bytes(&page.columns, "cursor columns")?;
+    bytes = checked_size_add(bytes, checked_size_mul(page.rows.capacity(),
+        std::mem::size_of::<Vec<Value>>(), "cursor row slots")?, "cursor page")?;
+    for row in page.rows.iter() {
+        bytes = checked_size_add(bytes, values_capacity_allocation_bytes(row)?, "cursor values")?;
+    }
+    Ok(bytes)
+}
+
 #[allow(dead_code)]
 pub(crate) fn canonical_query_capacity_bytes(
     result: &CanonicalQueryResult,
@@ -17149,7 +17543,7 @@ pub(crate) fn canonical_query_capacity_bytes(
 
 fn encoded_query_size(
     context: &ControlArc<RequestContext>,
-    result: &QueryResult,
+    result: &QueryResultData,
 ) -> std::result::Result<u64, BoundedExecutionError> {
     for row in &result.rows {
         if row.len() != result.columns.len() {
@@ -17355,8 +17749,10 @@ pub(crate) fn drain_chosen_plan(
     snapshot: SnapshotId,
     clock: Arc<dyn DeadlineClock>,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<crate::database::OwnedQueryResult, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     // These fixed control answers remain available when the operator has
     // exhausted the store budget, including the kernel's scaffolding. They
     // share the same recovery exemption as their uncharged static row.
@@ -17374,7 +17770,7 @@ pub(crate) fn drain_chosen_plan(
     }
     let _release_proofs = StatementProofReuse { db };
     let context = RequestContext::new(
-        Arc::clone(&read_memory),
+        read_memory.clone(),
         uncapped_ceilings(),
         ReadResumption::OneShot,
         clock,
@@ -17421,7 +17817,7 @@ pub(crate) fn drain_chosen_plan(
             context.release(admitted_bytes - retained_bytes)?;
         }
     }
-    let mut result = crate::database::OwnedQueryResult::new(QueryResult {
+    let mut result = crate::database::OwnedQueryResult::new(QueryResultData {
         columns: result_columns,
         rows: Vec::new(),
         rows_affected: 0,
@@ -17467,7 +17863,7 @@ pub(crate) fn drain_chosen_plan(
     #[cfg(any(test, feature = "test-seams"))]
     crate::database::Database::observe_pull_kernel_drained_for_test();
     result.trace.physical_plan = root.published_plan();
-    result.trace.vector_search = root.published_vector_search().cloned();
+    context.replace_answer_vector(&mut result.trace, root.published_vector_search())?;
     result.trace.rows_examined = context.rows_examined()?;
     context.refresh_group_trace(&mut result.trace)?;
     context.check_final_boundary()?;
@@ -17677,12 +18073,14 @@ pub(super) fn execute(
     db: &dyn ReadExecutionTarget,
     sql: &str,
     params: &HashMap<String, Value>,
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let _release_proofs = StatementProofReuse { db };
     let statement = contextdb_parser::parse(sql)?;
     db.plugin().on_query(sql)?;
@@ -17691,7 +18089,7 @@ pub(super) fn execute(
     let withdrawn = cancellation.clone();
     let execution = (|| {
         let context = RequestContext::new(
-            Arc::clone(&read_memory),
+            read_memory.clone(),
             limits,
             ReadResumption::OneShot,
             clock,
@@ -17708,14 +18106,14 @@ pub(super) fn execute(
                 statement_needs_vector_graph(&statement),
                 &context.registration_budget(),
                 &withdrawn,
-                context.source_read_memory(BoundedWorkSource::TableScan),
+                context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
             )?
         else {
             return Err(context.withdrawn_failure());
         };
         let _writer_read = db.enter_writer_read(
             writer_root,
-            context.source_read_memory(BoundedWorkSource::TableScan),
+            context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
         );
         let _vector_read = enter_vector_read(
             db,
@@ -17751,9 +18149,7 @@ pub(super) fn execute(
             context.with_vector_copies(|vector_copy_owner| {
                 db.prepare_bounded_read_plan(
                     &statement, params, vector_copy_owner,
-                    Arc::new(SourceDecodeBudget {
-                        context: context.clone(), source: BoundedWorkSource::TableScan,
-                    }),
+                    context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
                 )
             })
         }?;
@@ -17857,7 +18253,7 @@ pub(super) fn execute(
                 context.release(admitted_bytes - retained_bytes)?;
             }
         }
-        let mut result = crate::database::OwnedQueryResult::new(QueryResult {
+        let mut result = crate::database::OwnedQueryResult::new(QueryResultData {
             columns: result_columns,
             rows: Vec::new(),
             rows_affected: 0,
@@ -17935,7 +18331,7 @@ pub(super) fn execute(
             retained_rows.push(row.retained_bytes);
             result.rows.push(row.values);
             result.trace.physical_plan = root.published_plan();
-            result.trace.vector_search = root.published_vector_search().cloned();
+            context.replace_answer_vector(&mut result.trace, root.published_vector_search())?;
             result.trace.rows_examined = context.rows_examined()?;
             context.refresh_group_trace(&mut result.trace)?;
             let encoded = encoded_query_size(&context, &result)?;
@@ -17949,7 +18345,7 @@ pub(super) fn execute(
         }
 
         result.trace.physical_plan = root.published_plan();
-        result.trace.vector_search = root.published_vector_search().cloned();
+        context.replace_answer_vector(&mut result.trace, root.published_vector_search())?;
         result.trace.rows_examined = context.rows_examined()?;
         context.refresh_group_trace(&mut result.trace)?;
         let encoded = encoded_query_size(&context, &result)?;
@@ -18415,7 +18811,7 @@ impl CursorState {
         };
         let changed = groups_changed
             || self.observation.as_ref().is_none_or(|prior| {
-                prior.trace.physical_plan != plan || prior.trace.vector_search.as_ref() != vector
+                prior.trace.physical_plan != plan || prior.trace.vector_search.as_deref() != vector
             });
         if changed && !check_boundary {
             let mut observation = self.context.final_observation_snapshot()?;
@@ -18462,7 +18858,7 @@ impl CursorState {
             });
             let mut trace = self.root.trace.clone();
             trace.physical_plan = plan;
-            trace.vector_search = vector.cloned();
+            trace.vector_search = vector.map(|vector| Box::new(vector.clone()));
             trace.groups = self.context.group_snapshot(check_boundary)?;
             self.observation = Some(CursorObservation {
                 trace: Arc::new(trace),
@@ -18479,6 +18875,7 @@ impl CursorState {
     fn fetch_page(
         &mut self,
         rows: NonZeroUsize,
+        public_page: bool,
     ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
         self.context.prepare_final_observation_work()?;
         let publication_context = self.context.clone();
@@ -18486,7 +18883,7 @@ impl CursorState {
         let _writer_read = self.database.enter_writer_read(
             self.writer_root.clone(),
             self.context
-                .source_read_memory(BoundedWorkSource::TableScan),
+                .source_read_memory(BoundedWorkSource::TableScan)?,
         );
         let _vector_read = enter_vector_read(
             self.database.as_ref(),
@@ -18507,12 +18904,25 @@ impl CursorState {
             ));
         }
         let row_capacity = rows.get();
-        // What this cursor holds before it touches anything. A fetch that is
-        // INTERRUPTED publishes nothing, so nothing about the cursor may have
-        // changed when it returns -- every row it had assembled goes back into
-        // the replay and every byte it took for the attempt goes back here.
-        // The figure is taken before the page's own scaffolding is exchanged,
-        // so "as it was" means exactly that.
+        // Admit only an actual public handoff, through this request's ceiling
+        // and observer, before any scaffolding exchange or source advancement.
+        let public_carrier = if public_page {
+            let bytes = CursorPage::public_carrier_bytes();
+            self.context.reserve(BoundedWorkSource::TableScan, bytes)?;
+            let credit = self.context.state().memory.try_split_off(bytes)?;
+            self.context.live_source_pages.fetch_add(
+                bytes, std::sync::atomic::Ordering::SeqCst,
+            );
+            let invoice = CursorPageInvoice {
+                credit,
+                live: Some(self.context.live_source_pages.clone()),
+            };
+            Some(CursorPage::prepare_publication(invoice)?)
+        } else {
+            None
+        };
+        // Anchor the cursor before its page scaffolding is exchanged. A
+        // cancelled assembly restores all unpublished rows to the replay.
         let mut anchor = self.page_anchor()?;
         // This page's scaffolding replaces the last page's rather than adding
         // to it: a cursor that is handing back equally-shaped pages costs the
@@ -18658,6 +19068,9 @@ impl CursorState {
             "cursor-page state",
         )?;
         let mut page = CursorPage::from_parts(page_columns, page_rows, true);
+        if let Some(prepared) = public_carrier {
+            page.attach_publication(prepared);
+        }
         page_column_charge.bytes = 0;
         row_state_charge.bytes = 0;
         let assembled = (|| {
@@ -18808,7 +19221,6 @@ impl CursorState {
             Err(error) => return Err(error),
         };
         let published = page.rows.len();
-        self.context.publish_group_returns()?;
         // Transfer the existing request credit with the published allocation.
         // The row membership scratch drops here; it never travels with the DTO.
         let row_bytes = retained.iter().try_fold(0usize, |bytes, (held, _)| {
@@ -18835,7 +19247,8 @@ impl CursorState {
             owner_bytes,
             "published cursor credit owner",
         )?)?;
-        page = page.with_credit(credit);
+        page = page.with_credit(credit)?;
+        self.context.publish_group_returns()?;
         drop(retained);
         self.held_page_base = 0;
         self.settle_retained_charge(anchor, 0)?;
@@ -18897,19 +19310,24 @@ pub(super) fn open_cursor(
     db: Arc<dyn ReadExecutionTarget>,
     sql: &str,
     params: &HashMap<String, Value>,
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    // Consume the public door's marker before plugin/source callbacks can
+    // open unrelated private cursors on this thread.
+    let public_page = crate::owned_cursor_page::take_public_page_request();
     let statement = contextdb_parser::parse(sql)?;
     db.plugin().on_query(sql)?;
     let plugin_started_ms = clock.now_ms();
     let withdrawn = cancellation.clone();
     let prepared = (|| {
         let context = RequestContext::new(
-            Arc::clone(&read_memory),
+            read_memory.clone(),
             limits,
             ReadResumption::AcrossFetches,
             Arc::clone(&clock),
@@ -18937,14 +19355,14 @@ pub(super) fn open_cursor(
             limits.cursor_idle_ms,
             &context.registration_budget(),
             &withdrawn,
-            context.source_read_memory(BoundedWorkSource::TableScan),
+            context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
         )?
         else {
             return Err(context.withdrawn_failure());
         };
         let _writer_read = db.enter_writer_read(
             writer_root.clone(),
-            context.source_read_memory(BoundedWorkSource::TableScan),
+            context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
         );
         let vector_read = statement_needs_vector_read(&statement);
         let _vector_read = enter_vector_read(db.as_ref(), snapshot, &context, vector_read)?;
@@ -18976,9 +19394,7 @@ pub(super) fn open_cursor(
             context.with_vector_copies(|vector_copy_owner| {
                 db.prepare_bounded_read_plan(
                     &statement, params, vector_copy_owner,
-                    Arc::new(SourceDecodeBudget {
-                        context: context.clone(), source: BoundedWorkSource::TableScan,
-                    }),
+                    context.source_read_memory(BoundedWorkSource::TableScan).map_err(BoundedExecutionError::into_engine_error)?,
                 )
             })
         }?;
@@ -19161,7 +19577,7 @@ pub(super) fn open_cursor(
             return Err(error);
         }
     };
-    let first = match state.fetch_page(first_page_rows) {
+    let first = match state.fetch_page(first_page_rows, public_page) {
         Ok(first) => first,
         Err(error) => {
             let error = work_refusal_naming_the_statement(sql, error);
@@ -19194,7 +19610,7 @@ pub(super) fn open_cursor(
         BoundedCursorLifecycle::Exhausted(columns, first.observation.clone())
     };
     let execution = Arc::new(BoundedCursorExecutionState {
-        read_memory: read_memory.clone(),
+        read_memory: (read_memory.clone()).into(),
         lifecycle: Mutex::new(lifecycle),
         publication: publication.clone(),
         erased: std::sync::atomic::AtomicBool::new(false),
@@ -19202,7 +19618,7 @@ pub(super) fn open_cursor(
         expiry_watch: Mutex::new(None),
     });
     db.register_writer_cursor(&execution)?;
-    start_cursor_expiry_watch(&execution, Arc::clone(&read_memory))?;
+    start_cursor_expiry_watch(&execution, read_memory.clone())?;
     Ok(BoundedCursorOpen {
         cursor: BoundedCursorHandle { _state: execution },
         first_page: first.page,
@@ -19219,7 +19635,7 @@ pub(super) struct CursorExpiryWatch {
     execution: std::sync::Weak<BoundedCursorExecutionState>,
     clock: Arc<dyn DeadlineClock>,
     wait: Mutex<Option<(u64, contextdb_core::read_contract::DeadlineWait<'static>)>>,
-    _read_memory: Arc<dyn ReadMemoryBudget>,
+    _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
 }
 
 impl CursorExpiryWatch {
@@ -19335,8 +19751,10 @@ impl std::task::Wake for CursorExpiryWatch {
 
 fn start_cursor_expiry_watch(
     execution: &Arc<BoundedCursorExecutionState>,
-    read_memory: Arc<dyn ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<(), BoundedExecutionError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let clock = {
         let lifecycle = execution
             .lifecycle
@@ -19351,7 +19769,7 @@ fn start_cursor_expiry_watch(
         execution: Arc::downgrade(execution),
         clock,
         wait: Mutex::new(None),
-        _read_memory: read_memory,
+        _read_memory: (read_memory).into(),
     });
     *execution
         .expiry_watch
@@ -19649,6 +20067,7 @@ pub(super) fn fetch_cursor(
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+    let public_page = crate::owned_cursor_page::take_public_page_request();
     // A request cancelled before it starts consumes no continuation state.
     // Do not attach its already-fired listener to the parked cursor: that
     // listener terminally withdraws a read, rather than cancelling this page.
@@ -19776,7 +20195,7 @@ pub(super) fn fetch_cursor(
         *lifecycle = BoundedCursorLifecycle::Open(state);
         return Err(error);
     }
-    let outcome = state.fetch_page(rows);
+    let outcome = state.fetch_page(rows, public_page);
     match outcome {
         Ok(fetch) => {
             if fetch.page.has_more {
@@ -20368,9 +20787,11 @@ impl<T> NativeControlStrong<T> {
     /// layouts are admitted with native forms before either allocation, and a
     /// refusal carries no owned diagnostic.
     fn try_new_with_native(
-        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         make: impl FnOnce() -> T,
     ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         use contextdb_core::read_memory::{NativeProduce, OwnedReadBox, ReadShared};
         let control_invoice = ReadCredit::try_new_owned_native(
             owner.clone(),
@@ -20527,7 +20948,7 @@ impl NativeReadExecutionEntry {
         let started_ms = clock.now_ms();
         let bridge = NativeKernelBudget::try_from_operation(operation)
             .map_err(crate::transport::NativeTerminal::from_kernel)?;
-        let reader: Arc<dyn ReadMemoryBudget> = (*bridge).clone();
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = (*bridge).clone().into();
         let context = RequestContext::new_with_cancellation(reader, limits,
             ReadResumption::OneShot, clock,
             RequestCancellation::Native(operation.cancellation().clone()), None,
@@ -20594,11 +21015,14 @@ impl ControlArc<RequestContext> {
     fn source_read_memory(
         &self,
         source: BoundedWorkSource,
-    ) -> Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> {
-        Arc::new(SourceDecodeBudget {
-            context: self.clone(),
-            source,
-        })
+    ) -> std::result::Result<contextdb_core::read_memory::ReadMemoryOwner, BoundedExecutionError> {
+        let bytes = contextdb_core::read_memory::ReadMemoryOwner::native_layout::<
+            SourceDecodeBudget, SourceDecodeInvoice>().size();
+        self.reserve(source, bytes)?;
+        let invoice = SourceDecodeInvoice { context: self.clone(), bytes };
+        contextdb_core::read_memory::ReadMemoryOwner::try_native_result(
+            SourceDecodeBudget { context: self.clone(), source }, invoice)
+            .map_err(|error| BoundedExecutionError::Engine(Error::NativeEngineOther(error)))
     }
 
     fn with_source_page_admission<T>(
@@ -20800,8 +21224,12 @@ impl ControlArc<RequestContext> {
             cancellation.clone(),
             state.started_ms,
         );
+        drop(state);
         scope.inspection = inspection;
-        scope.read_memory = Some(self.source_read_memory(BoundedWorkSource::AccessControl));
+        scope.read_memory = Some(self.source_read_memory(BoundedWorkSource::AccessControl)?);
         Ok(scope)
     }
 }
+
+#[cfg(all(test, feature = "test-seams"))]
+mod filter_metadata_independent_tests;

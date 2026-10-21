@@ -22,6 +22,10 @@ pub struct NativeStorageCredit {
 unsafe impl Send for NativeStorageCredit {}
 unsafe impl Sync for NativeStorageCredit {}
 impl NativeStorageCredit {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn identity_for_test(&self) -> usize { self.receipt.as_ptr() as usize }
+
     /// Transfer one real funded strong receipt to storage.
     ///
     /// # Safety
@@ -61,6 +65,13 @@ impl Drop for NativeStorageCredit {
 pub struct NativeStorageAdmission {
     owner: NativeStorageCredit,
     admit: unsafe fn(NonNull<()>, Layout) -> Result<NativeStorageCredit, NativeStorageRefused>,
+    inspect_failure: Option<NativeFailureInspector>,
+}
+type NativeFailureInspector = unsafe fn(NonNull<()>, &mut dyn FnMut(Option<&(dyn std::error::Error + Send + Sync + 'static)>));
+impl std::fmt::Debug for NativeStorageAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeStorageAdmission").finish_non_exhaustive()
+    }
 }
 impl NativeStorageAdmission {
     /// # Safety
@@ -76,7 +87,42 @@ impl NativeStorageAdmission {
         Self {
             owner: unsafe { NativeStorageCredit::from_owned_receipt(receipt, retain, finish) },
             admit,
+            inspect_failure: None,
         }
+    }
+
+    /// # Safety
+    /// The callback borrows only this SAME concrete owned scope's failure and
+    /// invokes its visitor exactly once, while the diagnosis is protected. It
+    /// may neither retain the visitor/reference nor allocate or move a primary
+    /// into a scope retained by that primary. The receipt contract still holds.
+    pub unsafe fn with_failure_inspector(mut self, inspect: NativeFailureInspector) -> Self {
+        self.inspect_failure = Some(inspect);
+        self
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn reserve_cache_preparation(&self, layout: Layout) -> Result<(), crate::StorageError> {
+        unsafe { (self.admit)(self.owner.receipt, layout) }
+            .map(drop)
+            .map_err(|_| crate::StorageError::Native(NativeColdReadError::AdmissionRefusedAt(self.clone())))
+    }
+
+    pub(crate) fn cache_preparation_credit(&self) -> NativeStorageCredit {
+        self.owner.clone()
+    }
+
+    /// Read-only identity comparison; no raw owner address escapes.
+    pub fn same_source(&self, other: &Self) -> bool { self.owner.receipt == other.owner.receipt }
+    /// Lend the producing scope's actual typed cause without copying its text,
+    /// transferring its ownership, or recovering an unrelated current scope.
+    pub fn inspect_failure<R>(&self, inspect: impl FnOnce(Option<&(dyn std::error::Error + Send + Sync + 'static)>) -> R) -> R {
+        let Some(callback) = self.inspect_failure else { return inspect(None); };
+        let mut inspect = Some(inspect);
+        let mut result = None;
+        unsafe { callback(self.owner.receipt, &mut |cause| {
+            result = Some(inspect.take().expect("one native failure inspection")(cause));
+        }) };
+        result.expect("native failure inspector invokes its visitor")
     }
 }
 impl Clone for NativeStorageAdmission {
@@ -84,6 +130,7 @@ impl Clone for NativeStorageAdmission {
         Self {
             owner: self.owner.clone(),
             admit: self.admit,
+            inspect_failure: self.inspect_failure,
         }
     }
 }
@@ -114,11 +161,12 @@ pub fn with_native_storage_admission<R>(
 }
 pub(crate) fn admit_native_storage(
     layout: Layout,
-) -> Result<NativeStorageCredit, NativeStorageRefused> {
+) -> Result<NativeStorageCredit, NativeColdReadError> {
     let owner = NATIVE
         .with(|slot| slot.borrow().clone())
-        .ok_or(NativeStorageRefused)?;
+        .ok_or(NativeColdReadError::AdmissionRefused)?;
     unsafe { (owner.admit)(owner.owner.receipt, layout) }
+        .map_err(|_| NativeColdReadError::AdmissionRefusedAt(owner))
 }
 #[doc(hidden)]
 pub fn native_storage_active() -> bool {
@@ -145,14 +193,65 @@ impl NativeColdFault {
         }
     }
 }
+/// Finite causes emitted by the original writer backend before I/O error allocation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum NativeIoCause {
+    WriterOwnerClosed,
+    ProjectedGrowthPoisoned,
+    DiskGrowthRefused { current_bytes: u64, projected_bytes: u64, limit_bytes: u64 },
+}
+impl NativeIoCause {
+    pub fn kind(self) -> std::io::ErrorKind {
+        match self {
+            Self::DiskGrowthRefused { .. } => std::io::ErrorKind::QuotaExceeded,
+            Self::WriterOwnerClosed | Self::ProjectedGrowthPoisoned => std::io::ErrorKind::Other,
+        }
+    }
+}
+impl std::fmt::Display for NativeIoCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterOwnerClosed => f.write_str("writer file ownership is closed"),
+            Self::ProjectedGrowthPoisoned => f.write_str("projected file-growth reservation was poisoned"),
+            Self::DiskGrowthRefused { current_bytes, projected_bytes, limit_bytes } => write!(f,
+                "projected storage growth from {current_bytes} to {projected_bytes} bytes exceeds the {limit_bytes} byte limit"),
+        }
+    }
+}
+impl std::error::Error for NativeIoCause {}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum NativeBackendError {
+    Closed(NativeIoCause),
+    Io(std::io::Error),
+}
+impl From<std::io::Error> for NativeBackendError {
+    fn from(error: std::io::Error) -> Self { Self::Io(error) }
+}
+impl NativeBackendError {
+    pub(crate) fn into_native(self) -> NativeColdReadError {
+        match self {
+            Self::Io(error) => NativeColdReadError::Io(error),
+            Self::Closed(cause) => NativeColdReadError::BackendIo(cause),
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum NativeColdReadError {
     AdmissionRefused,
+    /// This retained producer can differ from the scope executing the read.
+    AdmissionRefusedAt(NativeStorageAdmission),
+    /// The allocator actually returned null after this exact layout was admitted.
+    AllocatorFailed { site: &'static str, layout: Layout },
     TableAbsent,
     TypeMismatch,
     Corrupt(NativeColdFault),
     Io(std::io::Error),
+    BackendIo(NativeIoCause),
 }
 impl From<NativeStorageRefused> for NativeColdReadError {
     fn from(_: NativeStorageRefused) -> Self {
@@ -182,11 +281,9 @@ impl<T> NativeStorageBuffer<T> {
         let invoice = admit_native_storage(layout)?;
         let pointer = unsafe { alloc(layout) }.cast::<T>();
         let Some(pointer) = NonNull::new(pointer) else {
-            // Inline ErrorKind keeps the lower allocator failure unqualified,
-            // with no diagnostic allocation or fabricated budget refusal.
-            return Err(NativeColdReadError::Io(
-                std::io::ErrorKind::OutOfMemory.into(),
-            ));
+            return Err(NativeColdReadError::AllocatorFailed {
+                site: "native storage buffer", layout,
+            });
         };
         Ok(Self {
             data: ManuallyDrop::new(unsafe { Vec::from_raw_parts(pointer.as_ptr(), 0, capacity) }),
@@ -282,9 +379,9 @@ impl<T> NativeStorageShared<T> {
             // BEFORE returning this control invoice, including panic unwind.
             drop(payload);
             drop(invoice);
-            return Err(NativeColdReadError::Io(
-                std::io::ErrorKind::OutOfMemory.into(),
-            ));
+            return Err(NativeColdReadError::AllocatorFailed {
+                site: "native shared control", layout,
+            });
         };
         unsafe {
             block.as_ptr().write(NativeStorageSharedBlock {
@@ -369,24 +466,26 @@ pub(crate) struct NativePagePayload {
 struct ReaderRegistryHeader {
     invoice: Option<NativeStorageCredit>,
 }
-#[derive(Clone)]
 pub(crate) struct ReaderRegistryAllocator {
     pub(crate) qualified: bool,
-    refused: std::cell::Cell<bool>,
+    failure: RefCell<Option<NativeColdReadError>>,
+}
+impl Clone for ReaderRegistryAllocator {
+    fn clone(&self) -> Self { Self::new(self.qualified) }
 }
 impl ReaderRegistryAllocator {
     pub(crate) fn new(qualified: bool) -> Self {
         Self {
             qualified,
-            refused: std::cell::Cell::new(false),
+            failure: RefCell::new(None),
         }
     }
     pub(crate) fn error(&self) -> crate::StorageError {
-        if self.refused.replace(false) {
-            native_storage_error(NativeColdReadError::AdmissionRefused)
-        } else {
-            crate::StorageError::Io(std::io::ErrorKind::OutOfMemory.into())
-        }
+        self.failure.borrow_mut().take().map_or_else(
+            // No observed allocator call: capacity/layout failure is unqualified.
+            || crate::StorageError::Io(std::io::ErrorKind::OutOfMemory.into()),
+            native_storage_error,
+        )
     }
     fn combined(layout: Layout) -> (Layout, usize) {
         let (whole, offset) = Layout::new::<ReaderRegistryHeader>()
@@ -398,16 +497,22 @@ impl ReaderRegistryAllocator {
 unsafe impl allocator_api2::alloc::Allocator for ReaderRegistryAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         use allocator_api2::alloc::AllocError;
+        self.failure.borrow_mut().take();
         let (whole, offset) = Self::combined(layout);
         let invoice = if self.qualified {
-            Some(admit_native_storage(whole).map_err(|_| {
-                self.refused.set(true);
+            Some(admit_native_storage(whole).map_err(|error| {
+                *self.failure.borrow_mut() = Some(error);
                 AllocError
             })?)
         } else {
             None
         };
-        let pointer = NonNull::new(unsafe { alloc(whole) }).ok_or(AllocError)?;
+        let pointer = NonNull::new(unsafe { alloc(whole) }).ok_or_else(|| {
+            *self.failure.borrow_mut() = Some(NativeColdReadError::AllocatorFailed {
+                site: "reader registry", layout: whole,
+            });
+            AllocError
+        })?;
         unsafe {
             pointer
                 .cast::<ReaderRegistryHeader>()
@@ -431,17 +536,24 @@ unsafe impl allocator_api2::alloc::Allocator for ReaderRegistryAllocator {
 }
 
 pub(crate) fn native_storage_error(error: NativeColdReadError) -> crate::StorageError {
+    // Internal native provenance survives intermediate legacy Storage wrappers.
+    // Genuine backend I/O remains the same io::Error, including custom payloads.
+    #[cfg(feature = "contextdb-internal")]
+    return match error {
+        NativeColdReadError::Io(error) => crate::StorageError::Io(error),
+        error => crate::StorageError::Native(error),
+    };
+    #[cfg(not(feature = "contextdb-internal"))]
     match error {
         NativeColdReadError::Io(error) => crate::StorageError::Io(error),
-        NativeColdReadError::AdmissionRefused => {
-            crate::StorageError::Io(std::io::ErrorKind::OutOfMemory.into())
-        }
-        NativeColdReadError::TableAbsent => {
-            crate::StorageError::Corrupted("required native table is absent".into())
-        }
-        NativeColdReadError::TypeMismatch => {
-            crate::StorageError::Corrupted("native table type mismatch".into())
-        }
+        NativeColdReadError::BackendIo(cause) => crate::StorageError::Io(std::io::Error::new(cause.kind(), cause)),
+        NativeColdReadError::AdmissionRefused | NativeColdReadError::AdmissionRefusedAt(_)
+        | NativeColdReadError::AllocatorFailed { .. } =>
+            crate::StorageError::Io(std::io::ErrorKind::OutOfMemory.into()),
+        NativeColdReadError::TableAbsent =>
+            crate::StorageError::Corrupted("required native table is absent".into()),
+        NativeColdReadError::TypeMismatch =>
+            crate::StorageError::Corrupted("native table type mismatch".into()),
         NativeColdReadError::Corrupt(fault) => crate::StorageError::Corrupted(fault.reason.into()),
     }
 }
@@ -456,7 +568,7 @@ impl NativeStorageAdmission {
 
 // Pending directory backing uses the existing owned native receipt protocol.
 // The receipt is stored in the same allocation: no unfunded side registry.
-thread_local! { static PENDING_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static PENDING_FAILURE: RefCell<Option<NativeColdReadError>> = const { RefCell::new(None) }; }
 #[derive(Clone, Default)]
 pub(crate) struct PendingAlloc(Option<NativeStorageAdmission>);
 impl PendingAlloc {
@@ -472,18 +584,23 @@ impl PendingAlloc {
 }
 unsafe impl allocator_api2::alloc::Allocator for PendingAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
-        PENDING_REFUSED.with(|flag| flag.set(false));
+        PENDING_FAILURE.with(|flag| flag.borrow_mut().take());
         let (full, offset) = Self::layout(layout);
         let invoice = match &self.0 {
             Some(owner) => Some(unsafe { (owner.admit)(owner.owner.receipt, full) }.map_err(
                 |_| {
-                    PENDING_REFUSED.with(|flag| flag.set(true));
+                    PENDING_FAILURE.with(|flag| *flag.borrow_mut() = Some(
+                        NativeColdReadError::AdmissionRefusedAt(owner.clone())));
                     allocator_api2::alloc::AllocError
                 },
             )?),
             None => None, // Ordinary standalone redb has no embedding memory budget.
         };
-        let raw = NonNull::new(unsafe { alloc(full) }).ok_or(allocator_api2::alloc::AllocError)?;
+        let raw = NonNull::new(unsafe { alloc(full) }).ok_or_else(|| {
+            PENDING_FAILURE.with(|flag| *flag.borrow_mut() = Some(
+                NativeColdReadError::AllocatorFailed { site: "pending directory", layout: full }));
+            allocator_api2::alloc::AllocError
+        })?;
         unsafe {
             raw.cast::<Option<NativeStorageCredit>>()
                 .as_ptr()
@@ -542,19 +659,12 @@ impl PartialEq for PendingName {
 }
 impl Eq for PendingName {}
 pub(crate) fn pending_allocation_error() -> crate::StorageError {
-    if PENDING_REFUSED.with(|flag| flag.replace(false)) {
-        #[derive(Debug)]
-        struct Refused;
-        impl std::fmt::Display for Refused {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("pending directory admission refused")
-            }
-        }
-        impl std::error::Error for Refused {}
-        crate::StorageError::AdmissionRefused(Box::new(Refused))
-    } else {
-        crate::StorageError::Io(std::io::ErrorKind::OutOfMemory.into())
-    }
+    let failure = PENDING_FAILURE.with(|flag| flag.borrow_mut().take());
+    failure.map_or_else(
+        // No producer tag: a capacity/layout error is not an observed null allocation.
+        || crate::StorageError::Io(std::io::ErrorKind::OutOfMemory.into()),
+        native_storage_error,
+    )
 }
 
 /// Preparation retains the actual lower producer error. An admission marker
@@ -577,10 +687,14 @@ pub enum PreparedReadError {
 pub struct PreparedTableDefinitionError {
     pub cause: NativeColdReadError,
     descriptor: crate::AccessGuard<'static, &'static [u8]>,
+    requested: NativeStorageBuffer<u8>,
 }
 impl PreparedTableDefinitionError {
-    pub(crate) fn new(cause: NativeColdReadError, descriptor: crate::AccessGuard<'static, &'static [u8]>) -> Self {
-        Self { cause, descriptor }
+    pub(crate) fn new(cause: NativeColdReadError, descriptor: crate::AccessGuard<'static, &'static [u8]>, requested: NativeStorageBuffer<u8>) -> Self {
+        Self { cause, descriptor, requested }
+    }
+    pub fn requested_table(&self) -> &str {
+        std::str::from_utf8(self.requested.as_slice()).expect("copied table name UTF-8")
     }
     pub fn descriptor(&self) -> &[u8] { self.descriptor.value() }
 }
@@ -592,8 +706,117 @@ impl std::fmt::Debug for PreparedTableDefinitionError {
     }
 }
 impl From<crate::StorageError> for PreparedReadError {
-    fn from(error: crate::StorageError) -> Self { Self::Storage(error) }
+    fn from(error: crate::StorageError) -> Self {
+        match error {
+            #[cfg(feature = "contextdb-internal")]
+            crate::StorageError::Native(error) => Self::Native(error),
+            error => Self::Storage(error),
+        }
+    }
 }
 impl From<NativeColdReadError> for PreparedReadError {
     fn from(error: NativeColdReadError) -> Self { Self::Native(error) }
+}
+
+impl std::fmt::Display for NativeColdReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AdmissionRefused => f.write_str("native storage admission refused"),
+            Self::AdmissionRefusedAt(owner) => owner.inspect_failure(|cause| match cause {
+                Some(cause) => std::fmt::Display::fmt(cause, f),
+                None => f.write_str("native storage admission refused (producer cause unavailable)"),
+            }),
+            Self::AllocatorFailed { site, layout } => write!(f,
+                "native allocator failed at {site} (size={}, alignment={})", layout.size(), layout.align()),
+            Self::TableAbsent => f.write_str("required native table is absent"),
+            Self::TypeMismatch => f.write_str("native table type mismatch"),
+            Self::Corrupt(fault) => write!(f, "DB corrupted: {} (page={:?}, offset={}, expected={}, actual={})",
+                fault.reason, fault.page, fault.offset, fault.expected, fault.actual),
+            Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::BackendIo(cause) => write!(f, "I/O error: {cause}"),
+        }
+    }
+}
+impl std::error::Error for NativeColdReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::Io(error) => Some(error), _ => None }
+    }
+}
+impl std::fmt::Display for PreparedReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaticCorrupted(reason) => write!(f, "DB corrupted: {reason}"),
+            Self::Storage(error) => std::fmt::Display::fmt(error, f),
+            Self::Native(error) => std::fmt::Display::fmt(error, f),
+            Self::TableDefinition(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl std::error::Error for PreparedReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error), Self::Native(error) => Some(error),
+            Self::TableDefinition(error) => Some(error), Self::StaticCorrupted(_) => None,
+        }
+    }
+}
+impl std::fmt::Display for PreparedTableDefinitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self.descriptor();
+        // Same serialized descriptor offsets as the native validator. Invalid
+        // descriptors keep their concrete corruption facts; never decode ownership.
+        if !matches!(self.cause, NativeColdReadError::TypeMismatch) {
+            return std::fmt::Display::fmt(&self.cause, f);
+        }
+        let table = self.requested_table();
+        if data.first() == Some(&4) { return write!(f, "{table} is a multimap table"); }
+        let width = 10 + crate::tree_store::BtreeHeader::serialized_size();
+        let align = width + 10;
+        let names = align + 12;
+        let Some(fixed) = data.get(..names) else { return std::fmt::Display::fmt(&self.cause, f); };
+        let key_len = u32::from_le_bytes(fixed[align+8..names].try_into().unwrap()) as usize;
+        let Some(end) = names.checked_add(key_len) else { return std::fmt::Display::fmt(&self.cause, f); };
+        fn name(bytes: &[u8]) -> Option<&str> { bytes.get(1..).and_then(|s| std::str::from_utf8(s).ok()) }
+        let Some(key) = data.get(names..end).and_then(name) else { return std::fmt::Display::fmt(&self.cause, f); };
+        let Some(value) = data.get(end..).and_then(name) else { return std::fmt::Display::fmt(&self.cause, f); };
+        let alignment = |start| u32::from_le_bytes(fixed[start..start+4].try_into().unwrap()) as usize;
+        let stored_width = |start| if fixed[start] == 1 {
+            Some(u32::from_le_bytes(fixed[start+1..start+5].try_into().unwrap()) as usize)
+        } else { None };
+        // Preserve the ordinary table validator's diagnosis precedence.
+        for (name, start, offset) in [(key, align, width), (value, align+4, width+5)] {
+            if alignment(start) != crate::tree_store::ALIGNMENT {
+                return write!(f, "Current definition of {name} does not match stored definition (width={:?}, alignment={})",
+                    stored_width(offset), alignment(start));
+            }
+        }
+        if data.get(names..end) != Some(b"\x01&[u8]".as_slice()) || data.get(end..) != Some(b"\x01&[u8]".as_slice()) {
+            return write!(f, "{table} is of type Table<{key}, {value}>");
+        }
+        for (start, offset) in [(align, width), (align+4, width+5)] {
+            if stored_width(offset).is_some() {
+                return write!(f, "Current definition of &[u8] does not match stored definition (width={:?}, alignment={})",
+                    stored_width(offset), alignment(start));
+            }
+        }
+        std::fmt::Display::fmt(&self.cause, f)
+    }
+}
+impl std::error::Error for PreparedTableDefinitionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.cause) }
+}
+
+// Passive identities for the existing engine allocator oracle. No owner escapes.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+impl<T> NativeStorageShared<T> {
+    pub(crate) fn allocation_observation_for_test(&self) -> (usize, Layout, usize) {
+        let block = unsafe { self.block.as_ref() };
+        let invoice = block.ownership.lock().unwrap_or_else(|e| e.into_inner());
+        (self.block.as_ptr() as usize, Self::layout(),
+            invoice.as_ref().expect("live shared invoice").receipt.as_ptr() as usize)
+    }
+}
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+impl NativeStorageCredit {
+    pub(crate) fn receipt_identity_for_test(&self) -> usize { self.receipt.as_ptr() as usize }
 }

@@ -175,14 +175,13 @@ fn edit_note(db: &Database, id: Uuid, body: &str) -> Result<(), String> {
 }
 
 fn note_body(db: &Database, id: Uuid) -> Result<Option<String>, String> {
-    let rows = db
+    let result = db
         .execute(
             "SELECT body FROM notes WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
-        .map_err(|_| "cannot read purge verifier note".to_string())?
-        .rows;
-    match rows.as_slice() {
+        .map_err(|_| "cannot read purge verifier note".to_string())?;
+    match result.rows() {
         [] => Ok(None),
         [row] => match row.as_slice() {
             [Value::Text(body)] => Ok(Some(body.clone())),
@@ -211,8 +210,8 @@ fn work_job_ids(db: &Database) -> Result<Vec<String>, String> {
         &HashMap::new(),
     )
     .map_err(|_| "cannot read purge verifier work jobs".to_string())?
-    .rows
-    .into_iter()
+    .rows()
+    .iter()
     .map(|row| match row.as_slice() {
         [Value::Text(job_id)] => Ok(job_id.clone()),
         _ => Err("purge verifier work job has the wrong key type".to_string()),
@@ -560,7 +559,7 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
             ]),
         )
         .map_err(|_| "cannot execute authoritative multi-row purge".to_string())?;
-    if purged_rows.rows_affected != 2 {
+    if purged_rows.rows_affected() != 2 {
         return Err("multi-row purge did not commit both selected rows".to_string());
     }
     let stale_commit = hub
@@ -581,7 +580,7 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
             &HashMap::new(),
         )
         .map_err(|_| "cannot purge selected detection job".to_string())?;
-    if purged_job.rows_affected != 1 {
+    if purged_job.rows_affected() != 1 {
         return Err("detection-job purge did not select exactly one job".to_string());
     }
     within(edge_a.client.pull_default())
@@ -1107,14 +1106,13 @@ async fn run_stale_and_fresh(root: &Path) -> Result<(), String> {
 }
 
 fn push_only_body(db: &Database, id: Uuid) -> Result<Option<String>, String> {
-    let rows = db
+    let result = db
         .execute(
             "SELECT body FROM push_only_notes WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
-        .map_err(|_| "cannot read push-only purge row".to_string())?
-        .rows;
-    match rows.as_slice() {
+        .map_err(|_| "cannot read push-only purge row".to_string())?;
+    match result.rows() {
         [] => Ok(None),
         [row] => match row.as_slice() {
             [Value::Text(body)] => Ok(Some(body.clone())),
@@ -1273,9 +1271,9 @@ async fn run_shared_blob(root: &Path) -> Result<(), String> {
             &HashMap::new(),
         )
         .map_err(|_| "cannot purge one shared-media referent".to_string())?;
-    let report = serde_json::to_string(&first.rows)
+    let report = serde_json::to_string(first.rows())
         .map_err(|_| "cannot serialize shared-media purge report".to_string())?;
-    if first.rows_affected != 1 || !report.contains("remaining-job") {
+    if first.rows_affected() != 1 || !report.contains("remaining-job") {
         return Err("shared-media purge did not name the surviving referent".to_string());
     }
     if work_job_ids(&hub.db)? != vec!["remaining-job".to_string()] {
@@ -1297,7 +1295,7 @@ async fn run_shared_blob(root: &Path) -> Result<(), String> {
             &HashMap::new(),
         )
         .map_err(|_| "cannot purge final shared-media referent".to_string())?;
-    if final_purge.rows_affected != 1 || !work_job_ids(&hub.db)?.is_empty() {
+    if final_purge.rows_affected() != 1 || !work_job_ids(&hub.db)?.is_empty() {
         return Err("final shared-media purge did not remove the remaining job".to_string());
     }
     let destroyed = export_blob(&hub.db, &case.join("shared-destroyed.snapshot"), &hash)?;

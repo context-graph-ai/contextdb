@@ -13,7 +13,7 @@ use std::sync::{
 /// Keep the lease through use; consuming the answer transfers it explicitly.
 pub(crate) struct AdmittedRecords {
     records: Vec<Record>,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl std::ops::Deref for AdmittedRecords {
     type Target = [Record];
@@ -22,20 +22,20 @@ impl std::ops::Deref for AdmittedRecords {
     }
 }
 impl AdmittedRecords {
-    pub(crate) fn memory(&self) -> Arc<crate::read_image_memory::ImageMemory> {
+    pub(crate) fn memory(&self) -> crate::read_image_memory::ImageMemoryHandle {
         self.memory.clone()
     }
-    pub(crate) fn into_parts(self) -> (Vec<Record>, Arc<crate::read_image_memory::ImageMemory>) {
+    pub(crate) fn into_parts(self) -> (Vec<Record>, crate::read_image_memory::ImageMemoryHandle) {
         (self.records, self.memory)
     }
 }
 /// One executing custody operation retains every admitted selection until use ends.
 pub(crate) struct SelectionHold {
-    images: Vec<Arc<crate::read_image_memory::ImageMemory>>,
+    images: Vec<crate::read_image_memory::ImageMemoryHandle>,
     credit: contextdb_core::read_memory::ReadCredit,
 }
 impl SelectionHold {
-    pub(crate) fn new(read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
+    pub(crate) fn new(read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
         Self {
             images: Vec::new(),
             credit: contextdb_core::read_memory::ReadCredit::new(read_memory),
@@ -44,7 +44,7 @@ impl SelectionHold {
     pub(crate) fn retain(&mut self, selected: AdmittedRecords) -> Result<Vec<Record>> {
         if self.images.len() == self.images.capacity() {
             self.credit.try_grow_for(
-                std::mem::size_of::<Arc<crate::read_image_memory::ImageMemory>>()
+                std::mem::size_of::<crate::read_image_memory::ImageMemoryHandle>()
                     + if self.images.is_empty() {
                         crate::sync_types::held::ALLOCATION_BYTES
                     } else {
@@ -64,11 +64,11 @@ impl SelectionHold {
 }
 
 struct KeyScratch {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     bytes: usize,
 }
 impl KeyScratch {
-    fn new(memory: Arc<crate::read_image_memory::ImageMemory>, count: usize) -> Result<Self> {
+    fn new(memory: crate::read_image_memory::ImageMemoryHandle, count: usize) -> Result<Self> {
         let bytes = if count == 0 {
             0
         } else {
@@ -105,7 +105,7 @@ impl std::io::Write for EncodedLen {
 /// is: its wire form is admitted, then decoded into the answer's image.
 fn copy_record(
     record: &Record,
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<Record> {
     let mut count = EncodedLen(0);
     serde::Serialize::serialize(
@@ -133,7 +133,7 @@ fn copy_record(
 }
 fn copy_records<'a>(
     source: impl Iterator<Item = &'a Record> + Clone,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<AdmittedRecords> {
     let count = source.clone().count();
     if count != 0 {
@@ -567,7 +567,7 @@ pub(crate) fn admission_probe(_held: usize) {
 /// under `memory`. Answers the outcome; the probe is dropped before return.
 #[cfg(feature = "test-seams")]
 pub(crate) fn probe_for_test(
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     key: &str,
     bytes: &[u8],
 ) -> Result<()> {
@@ -579,7 +579,8 @@ pub(crate) fn decode_refusals_for_test(
     bytes: &[u8],
     durable_limit: Option<usize>,
 ) -> (Option<contextdb_core::Error>, Option<contextdb_core::Error>) {
-    let memory = crate::read_image_memory::ImageMemory::new(durable_limit);
+    let memory = crate::read_image_memory::ImageMemory::new(durable_limit)
+        .expect("custody decode fixture must reach decode under its original limit");
     let mut owner = durable::Scratch::new(memory.clone());
     let durable = durable::decode_stored(&memory, &mut owner, key, bytes).err();
     drop(owner);
@@ -919,7 +920,7 @@ impl Store {
     }
     pub fn pending(
         &mut self,
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
         if self.durable.is_some() {
@@ -942,7 +943,7 @@ impl Store {
     pub fn select<S: AsRef<str>>(
         &mut self,
         selectors: &[S],
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
         if self.durable.is_some() {
@@ -1012,7 +1013,7 @@ impl Store {
     pub fn select_table(
         &mut self,
         table: &str,
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
         if self.durable.is_some() {
@@ -1074,7 +1075,7 @@ impl Store {
     pub fn select_rows(
         &mut self,
         rows: &[RowRef],
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
         if self.durable.is_some() {
@@ -1211,7 +1212,7 @@ impl Store {
         &mut self,
         writes: &[(String, Vec<u8>)],
         deletes: &[String],
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<(DeltaRecords, CustodyCharge, Option<TenantGrowth>)> {
         if let Some(source) = &self.durable {
@@ -1349,7 +1350,7 @@ mod verified {
 /// keeps the operation's own typed error for the caller.
 #[derive(Debug)]
 struct VerificationFunds {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     refusal: parking_lot::Mutex<Option<contextdb_core::Error>>,
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for VerificationFunds {
@@ -1405,7 +1406,7 @@ impl contextdb_core::read_memory::ReadMemoryBudget for VerificationFunds {
 /// verified before. The key and signature inputs are rendered into native
 /// buffers `memory` admits first through the admitted `VerificationFunds`.
 fn native_check(
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     key: &str,
     bytes: &[u8],
 ) -> Result<()> {
@@ -1444,7 +1445,7 @@ fn native_check(
         refusal: parking_lot::Mutex::new(None),
     });
     bracket("custody_native_funder", PROBE_POST, 0, memory.held());
-    let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(funds.clone());
+    let owner = contextdb_core::read_memory::ReadMemoryOwner::from(funds.clone());
     let checked = (|| -> std::result::Result<(), Failure> {
         bracket("custody_native_key", PROBE_PRE, 0, memory.held());
         if refusal_injected("custody_native_key") {
@@ -1510,13 +1511,13 @@ mod durable {
 
     /// Bytes admitted to one owner on an operation's memory, released on drop.
     pub(crate) struct Scratch {
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         bytes: usize,
     }
     /// A debit detached from one owner, owed to the next: the memory still
     /// holds it. Dropping it un-adopted releases it (the abort path).
     pub(crate) struct Debit {
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         bytes: usize,
     }
     impl Drop for Debit {
@@ -1535,14 +1536,14 @@ mod durable {
         }
     }
     impl Scratch {
-        pub(crate) fn new(memory: Arc<ImageMemory>) -> Self {
+        pub(crate) fn new(memory: crate::read_image_memory::ImageMemoryHandle) -> Self {
             Self { memory, bytes: 0 }
         }
         /// Bytes this owner holds admitted now.
         pub(crate) fn bytes(&self) -> usize {
             self.bytes
         }
-        pub(crate) fn memory(&self) -> &Arc<ImageMemory> {
+        pub(crate) fn memory(&self) -> &crate::read_image_memory::ImageMemoryHandle {
             &self.memory
         }
         /// Admit `bytes` under `label` before the allocation they fund. The
@@ -1592,7 +1593,7 @@ mod durable {
         }
         /// Adopt a detached debit on the same memory, without a reservation.
         pub(crate) fn adopt_debit(&mut self, debit: Debit) -> Result<()> {
-            if !Arc::ptr_eq(&self.memory, &debit.memory) {
+            if !std::ptr::eq(self.memory.as_ref(), debit.memory.as_ref()) {
                 return Err(invalid());
             }
             self.bytes = self.bytes.checked_add(debit.bytes).ok_or_else(invalid)?;
@@ -1642,7 +1643,7 @@ mod durable {
         label: &'static str,
     }
     impl<T> AdmittedVec<T> {
-        pub(crate) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+        pub(crate) fn new(memory: crate::read_image_memory::ImageMemoryHandle, label: &'static str) -> Self {
             Self {
                 items: Vec::new(),
                 owner: Scratch::new(memory),
@@ -1650,7 +1651,7 @@ mod durable {
             }
         }
         pub(crate) fn with_exact(
-            memory: Arc<ImageMemory>,
+            memory: crate::read_image_memory::ImageMemoryHandle,
             label: &'static str,
             n: usize,
         ) -> Result<Self> {
@@ -1744,14 +1745,14 @@ mod durable {
         keys: Scratch,
     }
     impl KeyList {
-        pub(crate) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+        pub(crate) fn new(memory: crate::read_image_memory::ImageMemoryHandle, label: &'static str) -> Self {
             Self {
                 items: AdmittedVec::new(memory.clone(), label),
                 keys: Scratch::new(memory),
             }
         }
         pub(crate) fn with_exact(
-            memory: Arc<ImageMemory>,
+            memory: crate::read_image_memory::ImageMemoryHandle,
             label: &'static str,
             n: usize,
         ) -> Result<Self> {
@@ -1834,7 +1835,7 @@ mod durable {
         keys: Scratch,
     }
     impl<K: KeyBytes, V> AdmittedKeys<K, V> {
-        pub(crate) fn new(memory: Arc<ImageMemory>, label: &'static str) -> Self {
+        pub(crate) fn new(memory: crate::read_image_memory::ImageMemoryHandle, label: &'static str) -> Self {
             Self {
                 entries: AdmittedVec::new(memory.clone(), label),
                 order: AdmittedVec::new(memory.clone(), label),
@@ -1995,7 +1996,7 @@ mod durable {
     /// The operation's error reserve, admitted at entry by its outermost
     /// owner and released at the public return, where a returned error's
     /// ownership passes to the caller.
-    pub(crate) fn error_reserve(memory: &Arc<ImageMemory>) -> Result<Scratch> {
+    pub(crate) fn error_reserve(memory: &crate::read_image_memory::ImageMemoryHandle) -> Result<Scratch> {
         let mut reserve = Scratch::new(memory.clone());
         reserve.admit_at("custody_error_reserve", ERROR_RESERVE)?;
         reserve.post("custody_error_reserve");
@@ -2006,7 +2007,7 @@ mod durable {
     /// the charged decode first (malformed input keeps the established codec
     /// diagnostic), then the native canonical, key and signature checks.
     pub(crate) fn decode_stored(
-        memory: &Arc<ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
         owner: &mut Scratch,
         key: &str,
         bytes: &[u8],
@@ -2024,7 +2025,7 @@ mod durable {
     /// malformed record refuses with the custody codec's established
     /// diagnostic; an admission refusal passes through unchanged.
     pub(crate) fn decode_charged(
-        memory: &Arc<ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
         bytes: &[u8],
     ) -> Result<(Record, usize)> {
         let before = memory.held();
@@ -2072,7 +2073,7 @@ mod durable {
 
     /// A transient check of one stored record (canonical, keyed, signed):
     /// charged as it decodes and released when the caller drops it.
-    fn probe_stored(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<Probed> {
+    fn probe_stored(memory: &crate::read_image_memory::ImageMemoryHandle, key: &str, bytes: &[u8]) -> Result<Probed> {
         let mut probed = Probed {
             owner: Scratch::new(memory.clone()),
             record: None,
@@ -2098,13 +2099,13 @@ mod durable {
     }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn probe_for_test(memory: &Arc<ImageMemory>, key: &str, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn probe_for_test(memory: &crate::read_image_memory::ImageMemoryHandle, key: &str, bytes: &[u8]) -> Result<()> {
         let _errors = error_reserve(memory)?;
         probe_stored(memory, key, bytes).map(drop)
     }
 
     /// The committed record at `key`, transiently.
-    fn load(r: &CustodyReader, memory: &Arc<ImageMemory>, key: &str) -> Result<Option<Probed>> {
+    fn load(r: &CustodyReader, memory: &crate::read_image_memory::ImageMemoryHandle, key: &str) -> Result<Option<Probed>> {
         r.get(key, |value| {
             value
                 .map(|bytes| probe_stored(memory, key, bytes))
@@ -2275,7 +2276,7 @@ mod durable {
     fn selected_keys<S: AsRef<str>>(
         r: &CustodyReader,
         selectors: &[S],
-        memory: &Arc<ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<KeyList> {
         let mut count = 0usize;
         for selector in selectors {
@@ -2310,7 +2311,7 @@ mod durable {
     fn answer(
         r: &CustodyReader,
         keys: &[String],
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
         let mut build = AnswerBuild {
@@ -2362,7 +2363,7 @@ mod durable {
         r: &CustodyReader,
         keys: &[String],
         records: &[Record],
-        memory: &Arc<ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<()> {
         // Positions of the answer by key, for companions the answer holds.
@@ -2570,7 +2571,7 @@ mod durable {
         LAST_MEMO_KEY_BYTES.with(std::cell::Cell::get)
     }
     impl MemoRing {
-        fn new(memory: &Arc<ImageMemory>) -> Result<Self> {
+        fn new(memory: &crate::read_image_memory::ImageMemoryHandle) -> Result<Self> {
             let mut slots = Scratch::new(memory.clone());
             slots.admit_at(
                 "custody_closure_memo",
@@ -2616,7 +2617,7 @@ mod durable {
     pub(crate) fn select<S: AsRef<str>>(
         r: &CustodyReader,
         selectors: &[S],
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
         let _errors = error_reserve(&memory)?;
@@ -2633,7 +2634,7 @@ mod durable {
     pub(crate) fn select_table(
         r: &CustodyReader,
         table: &str,
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<(AdmittedRecords, u64)> {
         let _errors = error_reserve(&memory)?;
@@ -2746,7 +2747,7 @@ mod durable {
     pub(crate) fn select_rows(
         r: &CustodyReader,
         rows: &[RowRef],
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<(AdmittedRecords, u64)> {
         let _errors = error_reserve(&memory)?;
@@ -2831,7 +2832,7 @@ mod durable {
     /// set is refused by the reader limit rather than held unadmitted.
     pub(crate) fn pending(
         r: &CustodyReader,
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
     ) -> Result<AdmittedRecords> {
         let _errors = error_reserve(&memory)?;
@@ -2875,7 +2876,7 @@ mod durable {
     /// Decode, check and verify one stored body under `memory`, its decoded
     /// allocations taken over by `owner`.
     fn decode_checked(
-        memory: &Arc<ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
         owner: &mut Scratch,
         key: &str,
         bytes: &[u8],
@@ -2984,7 +2985,7 @@ mod durable {
         r: &CustodyReader,
         writes: &[(String, Vec<u8>)],
         deletes: &[String],
-        memory: Arc<ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
         db: &crate::Database,
         growth: &mut super::TenantGrowth,
     ) -> Result<(DeltaRecords, u64, Scratch)> {
@@ -3164,7 +3165,7 @@ mod durable {
         _key: &str,
         record: &Record,
         delta: Option<&DeltaRecords>,
-        memory: &Arc<ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<AdmittedKeys<String, ()>> {
         let (selectors, count) = companion_selectors(record)?;
         let mut keys: AdmittedKeys<String, ()> =

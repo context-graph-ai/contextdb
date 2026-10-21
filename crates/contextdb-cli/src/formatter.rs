@@ -9,7 +9,7 @@ pub fn format_query_result_with_empty_headers(
     result: &QueryResult,
     show_empty_headers: bool,
 ) -> String {
-    render_table(&result.columns, &result.rows, show_empty_headers)
+    render_table(result.columns(), result.rows(), show_empty_headers)
 }
 
 /// Rows as objects keyed by column name, one object per row.
@@ -72,7 +72,7 @@ impl serde::Serialize for JsonCell<'_> {
 
 /// Serialize the existing admitted rows directly to their public JSON shape.
 pub fn format_query_result_json(result: &QueryResult) -> String {
-    serde_json::to_string(&rows_as_objects(&result.columns, &result.rows))
+    serde_json::to_string(&rows_as_objects(result.columns(), result.rows()))
         .unwrap_or_else(|_| "[]".to_string())
 }
 

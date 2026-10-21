@@ -8,6 +8,7 @@
 //! set rather than insertion order, compaction, or Redb page layout. Point
 //! mutations rewrite one page and its bounded proof path.
 
+use contextdb_core::read_memory::ReadMemoryBudget as _;
 use super::{
     CONTENT_IDENTITY_METADATA_TABLE, CONTENT_IDENTITY_NODES_TABLE, CONTENT_IDENTITY_ROOTS_TABLE,
     RedbPersistence,
@@ -809,7 +810,7 @@ fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 
 fn canonical_json_admitted<T: Serialize + ?Sized>(
     value: &T,
-    owner: &Arc<crate::read_image_memory::ImageMemory>,
+    owner: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<Vec<u8>> {
     let failure = |error: serde_json::Error| {
         Error::Other(format!("cannot encode logical identity leaf: {error}").into())
@@ -881,7 +882,7 @@ fn row_mutation_with_owner(
     table: &str,
     row: &VersionedRow,
     meta: Option<&TableMeta>,
-    owner: Option<&Arc<crate::read_image_memory::ImageMemory>>,
+    owner: Option<&crate::read_image_memory::ImageMemoryHandle>,
 ) -> Result<ContentIdentityMutation> {
     if let Some(owner) = owner {
         owner.reserve(table.len().saturating_add(24))?;
@@ -942,7 +943,7 @@ pub(crate) fn admitted_edge_mutation(edge: &AdjEntry) -> Result<ContentIdentityM
 }
 fn edge_mutation_with_owner(
     edge: &AdjEntry,
-    owner: Option<&Arc<crate::read_image_memory::ImageMemory>>,
+    owner: Option<&crate::read_image_memory::ImageMemoryHandle>,
 ) -> Result<ContentIdentityMutation> {
     if let Some(owner) = owner {
         owner.reserve(edge.edge_type.len().saturating_add(56))?;
@@ -3448,7 +3449,7 @@ fn node_live_bytes(node: &Node) -> usize {
 /// With no accountant attached the charge is still measured, so the same code
 /// runs in engine-internal contracts; production always attaches one.
 pub(crate) struct ProofAdmission {
-    reader_budget: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    reader_budget: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     reader_refusal: Option<Arc<Mutex<Option<Error>>>>,
     accountant: Option<crate::memory_accounting::AccountantHandle>,
     /// A cache this admission may reclaim from before it refuses. A proved
@@ -3493,6 +3494,12 @@ impl std::ops::DerefMut for OwnedProofAdmission {
 }
 
 impl ProofAdmission {
+    pub(super) fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        if let Some(reader) = &self.reader_budget { return Ok(reader.clone()); }
+        self.accountant.as_ref().ok_or_else(|| Error::Other(
+            "diagnostic requires its original proof payer".into()))?.read_budget()
+    }
+
     pub(super) fn take_reader_refusal(&self) -> Option<Error> {
         self.reader_refusal
             .as_ref()
@@ -3500,8 +3507,10 @@ impl ProofAdmission {
     }
 
     pub(super) fn for_reader(
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Self {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let mut owner = Self::new(None);
         owner.reader_budget = Some(memory);
         owner
@@ -3621,6 +3630,8 @@ impl ProofAdmission {
         operation: &'static str,
         hint: &'static str,
     ) -> Result<()> {
+        #[cfg(test)]
+        let _capture_phase = crate::memory_accounting::compaction_admission_capture::Phase::proof_default();
         if let Some(reader) = &self.reader_budget {
             if let Err(error) = reader.try_reserve(
                 bytes,
@@ -3697,13 +3708,13 @@ impl ProofAdmission {
     ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
         let budget = match (&self.reader_budget, &self.accountant) {
             (Some(reader), _) => reader.clone(),
-            (None, Some(accountant)) => accountant.read_budget()?,
+            (None, Some(accountant)) => accountant.read_budget()?.into(),
             (None, None) => crate::memory_accounting::AccountantHandle::from(Arc::new(
                 crate::memory_accounting::MemoryAccountant::no_limit(),
             ))
-            .read_budget()?,
+            .read_budget()?.into(),
         };
-        Ok(contextdb_core::read_memory::ReadMemoryOwner::from_legacy(
+        Ok(contextdb_core::read_memory::ReadMemoryOwner::from(
             budget,
         ))
     }
@@ -3723,7 +3734,7 @@ impl ProofAdmission {
 /// Admitted bytes owned by one allocation, returned when that allocation is
 /// dropped — including when it is dropped by an unwind.
 struct AdmittedBytes {
-    reader_budget: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    reader_budget: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     accountant: Option<crate::memory_accounting::StoreAccountantHandle>,
     bytes: usize,
 }
@@ -3916,6 +3927,9 @@ impl MutationKeyNode {
             let total = node_bytes
                 .checked_add(bytes)
                 .ok_or_else(|| proof_allocation_overflow(admission))?;
+            #[cfg(test)]
+            let _capture_node = crate::memory_accounting::compaction_admission_capture::Phase::enter(
+                "proof-node", "MutationKeyNode::insert", "", Some(mutations[ordinal].family as usize));
             admission.admit(bytes)?;
             *link = Some(Box::new(Self {
                 first: ordinal,
@@ -4248,6 +4262,50 @@ fn persist_changed_family_roots(
             .map_err(RedbPersistence::storage_error)?;
     }
     Ok(())
+}
+
+/// Compare the producer's fixed-size placement commitment with the family
+/// roots in this captured read. Hash the borrowed encoding directly: no decoded
+/// lane box or encoded copy is needed to authenticate a fresh historical read.
+pub(super) fn vector_directory_projection_matches_in_read(
+    read: &redb::ReadTransaction,
+    bodies: u64,
+    members: u64,
+) -> Result<bool> {
+    let set = CompactIndexSet::VectorDirectory;
+    let table = match read.open_table(super::COMPACT_INDEX_SET_TABLE) {
+        Ok(table) => Some(table),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(error) => return Err(RedbPersistence::storage_error(error)),
+    };
+    let stored = table.as_ref()
+        .map(|table| table.get(set.state_key()).map_err(RedbPersistence::storage_error))
+        .transpose()?.flatten();
+    let mut set_hash = blake3::Hasher::new();
+    set_hash.update(set.root_domain());
+    if let Some(stored) = stored {
+        if stored.value().len() != SET_COMMITMENT_STATE_BYTES {
+            return Err(Error::Other("compact index set commitment has invalid size".into()));
+        }
+        if stored.value()[..8] != members.to_be_bytes() {
+            return Ok(false);
+        }
+        set_hash.update(stored.value());
+    } else {
+        if members != 0 {
+            return Ok(false);
+        }
+        // An absent running commitment represents the empty set.
+        set_hash.update(&0u64.to_be_bytes());
+        for _ in 0..SET_COMMITMENT_LANES {
+            set_hash.update(&0u16.to_le_bytes());
+        }
+    }
+    let mut coverage = blake3::Hasher::new();
+    coverage.update(b"contextdb-vector-directory-body-coverage");
+    coverage.update(set_hash.finalize().as_bytes());
+    coverage.update(&bodies.to_be_bytes());
+    Ok(*coverage.finalize().as_bytes() == vector_directory_projection_in_read(read)?)
 }
 
 pub(super) fn vector_directory_projection_in_read(
@@ -5499,12 +5557,9 @@ impl ContentIdentityReadVerifier {
     /// Report a proof failure as the existing typed corruption error. An error
     /// that already carries that type passes through unchanged.
     pub(super) fn corrupt(&self, reason: impl std::fmt::Display) -> Error {
-        Error::StoreCorrupted {
-            path: self.source.clone(),
-            reason: format!(
+        crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &self.source, format_args!(
                 "loaded content does not authenticate against the committed image root: {reason}"
-            ),
-        }
+            ))
     }
 
     fn typed(&self, error: Error) -> Error {
@@ -5685,8 +5740,10 @@ impl ContentIdentityReadVerifier {
     pub(crate) fn verify_with_read_memory(
         &self,
         mutation: &ContentIdentityMutation,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let _controls = contextdb_core::read_memory::ReadCredit::try_new(
             memory.clone(),
             std::mem::size_of::<Mutex<Option<Error>>>() + 2 * std::mem::size_of::<usize>(),
@@ -5721,9 +5778,11 @@ impl ContentIdentityReadVerifier {
     pub(crate) fn verify_with_read_memory_before(
         &self,
         mutation: &ContentIdentityMutation,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         before()?;
         let _controls = contextdb_core::read_memory::ReadCredit::try_new(
             memory.clone(),
@@ -7479,9 +7538,10 @@ impl RedbPersistence {
     ) -> Result<()> {
         let _decode = if let Some(reader) = admission.reader_budget.as_ref() {
             crate::read_image_memory::ImageMemory::operation_reader(
-                admission.accountant.clone().unwrap_or_else(
-                    crate::read_image_memory::ImageMemory::default_decode_accountant,
-                ),
+                match admission.accountant.clone() {
+                    Some(accountant) => accountant,
+                    None => crate::read_image_memory::active_owner()?.accountant.clone(),
+                },
                 reader.clone(),
             )?
             .enter()
@@ -7557,6 +7617,8 @@ impl RedbPersistence {
         admission: &mut ProofAdmission,
         groups: Option<&super::custody_groups::GroupPlan>,
     ) -> Result<DirectTypedImageDigest> {
+        #[cfg(test)]
+        let _capture_apply = crate::memory_accounting::compaction_admission_capture::Phase::apply();
         Self::reconcile_ddl_selectors_in_write(write_txn, mutations, admission)?;
         super::content_size::reconcile_row_heads(write_txn, mutations, admission)?;
         Self::apply_writer_row_heads_in_write(write_txn, mutations, admission)?;
@@ -7763,6 +7825,10 @@ impl RedbPersistence {
             std::array::from_fn(|i| if observing { None } else { Some(LogicalFamily::ALL[i]) });
         let mut observed_directory = None;
         for selected_family in selections.into_iter().take(if observing { 1 } else { LogicalFamily::ALL.len() }) {
+        #[cfg(test)]
+        let _capture_family = crate::memory_accounting::compaction_admission_capture::Phase::enter(
+            "proof-non-group", "apply_content_identity_mutations_in_write", "",
+            selected_family.map(|family| family as usize));
         let coalescing_admission_start = admission.held();
         let coalescing_result = (|| -> Result<Option<Box<MutationKeyNode>>> {
             // Retain only unique-key boxes. Every input still receives the
@@ -7773,6 +7839,9 @@ impl RedbPersistence {
                 if selected_family.is_some_and(|family| mutation.family != family) {
                     continue;
                 }
+                #[cfg(test)]
+                let _capture_validation = crate::memory_accounting::compaction_admission_capture::Phase::enter(
+                    "proof-validation", "mutation_tree_key", "", Some(mutation.family as usize));
                 let key_bytes = mutation_key_capacity(mutation, admission)?;
                 admission.admit(key_bytes)?;
                 let key = mutation_tree_key(mutation)?;
@@ -7825,6 +7894,10 @@ impl RedbPersistence {
                     .checked_add(layout.size())
                     .ok_or_else(|| proof_allocation_overflow(admission))?;
             }
+            #[cfg(test)]
+            let _capture_grouping = crate::memory_accounting::compaction_admission_capture::Phase::grouping(
+                crate::memory_accounting::compaction_admission_capture::GroupingApply::Borrowed,
+                family_counts, grouped_bytes);
             admission.admit(grouped_bytes)?;
             let mut grouped: [EntryEdits; LogicalFamily::ALL.len()] =
                 std::array::from_fn(|family| {
@@ -7841,12 +7914,17 @@ impl RedbPersistence {
                     debug_assert_eq!(entries.capacity(), count);
                     entries
                 });
+            #[cfg(test)]
+            drop(_capture_grouping);
             let mut family_positions = [0usize; LogicalFamily::ALL.len()];
             unique.visit(&mut |node| {
                 // First-key ownership and final-value replacement match the map.
                 let mutation = &mutations[node.first];
                 let final_mutation = &mutations[node.last];
                 let key_bytes = mutation_key_capacity(mutation, admission)?;
+                #[cfg(test)]
+                let _capture_payload = crate::memory_accounting::compaction_admission_capture::Phase::enter(
+                    "proof-group-key", "grouped key payload", "", Some(mutation.family as usize));
                 let next_bytes = coalesced_bytes
                     .checked_add(key_bytes)
                     .ok_or_else(|| proof_allocation_overflow(admission))?;
@@ -9164,7 +9242,7 @@ pub(crate) mod original_writer {
         pub(crate) fn verification_owner(
             &self,
         ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
-            Ok(contextdb_core::read_memory::ReadMemoryOwner::from_legacy(
+            Ok(contextdb_core::read_memory::ReadMemoryOwner::from(
                 self.original.accountant().read_budget()?,
             ))
         }
@@ -9636,6 +9714,8 @@ pub(crate) mod original_writer {
             admission: &mut ProofAdmission,
             groups: Option<&super::super::custody_groups::GroupPlan>,
         ) -> Result<DirectTypedImageDigest> {
+            #[cfg(test)]
+            let _capture_apply = crate::memory_accounting::compaction_admission_capture::Phase::apply();
             Self::reconcile_owned_ddl_selectors_in_write(write_txn, mutations, admission)?;
             super::super::content_size::reconcile_row_heads(write_txn, mutations, admission)?;
             Self::apply_writer_row_heads_in_write(write_txn, mutations, admission)?;
@@ -9903,6 +9983,10 @@ pub(crate) mod original_writer {
                         .checked_add(layout.size())
                         .ok_or_else(|| proof_allocation_overflow(admission))?;
                 }
+                #[cfg(test)]
+                let _capture_grouping = crate::memory_accounting::compaction_admission_capture::Phase::grouping(
+                    crate::memory_accounting::compaction_admission_capture::GroupingApply::Owned,
+                    family_counts, grouped_bytes);
                 admission.admit(grouped_bytes)?;
                 let mut grouped: [EntryEdits; LogicalFamily::ALL.len()] =
                     std::array::from_fn(|family| {
@@ -9919,6 +10003,8 @@ pub(crate) mod original_writer {
                         debug_assert_eq!(entries.capacity(), count);
                         entries
                     });
+                #[cfg(test)]
+                drop(_capture_grouping);
                 let mut family_positions = [0usize; LogicalFamily::ALL.len()];
                 unique.visit(&mut |node| {
                     // First-key ownership and final-value replacement match the map.
@@ -12436,7 +12522,7 @@ mod original_ddl_occurrences {
     const ARRIVAL: &str = "sync_ddl_received_arrival.v1.";
     const SUPERSEDED: &str = "sync_ddl_superseded.v1.";
 
-    fn damage(reason: &str) -> Error {
+    fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
         Error::StoreCorrupted {
             path: "ddl_eligible_occurrences".into(),
             reason: reason.into(),
@@ -12744,6 +12830,7 @@ mod original_ddl_occurrences {
                         let bytes = value.value().len().saturating_mul(64).saturating_add(256);
                         admission.admit(bytes)?;
                         crate::database::Database::validate_ddl_occurrence_config(
+                            &crate::funded_error::original_budget(frame.original)?,
                             &key,
                             at,
                             value.value(),

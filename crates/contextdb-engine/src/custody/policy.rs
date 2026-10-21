@@ -1,6 +1,6 @@
 //! Declared authority, authenticated binding, and metadata inspection.
 use super::{canonical::*, preparation::*, records::*};
-use crate::{Database, custody_types::*, database::QueryResult};
+use crate::{Database, custody_types::*, database::QueryResultData};
 use contextdb_core::{Error, Result, TableMeta, TenantId, Value};
 use std::collections::BTreeMap;
 
@@ -13,8 +13,10 @@ pub(crate) struct Runtime {
 
 pub(crate) fn require_admin(
     db: &Database,
-    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
     if db.contexts().is_some() || db.scope_labels().is_some() || db.principal().is_some() {
         use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind};
         return Err(Error::ReadFailure(
@@ -101,8 +103,10 @@ pub(crate) fn declare(
     db: &Database,
     p: &contextdb_parser::DeclareTenantTablePolicy,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-) -> Result<QueryResult> {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<QueryResultData> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     require_admin(db, read_memory.clone())?;
@@ -141,15 +145,17 @@ pub(crate) fn declare(
         vector_copy_owner,
         read_memory.clone(),
     )?;
-    Ok(QueryResult::empty())
+    Ok(QueryResultData::empty())
 }
 
 pub(crate) fn check_binding(
     db: &Database,
     table: &str,
     candidate: &TableMeta,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let candidate = normalized(table, from_meta(candidate))?;
@@ -181,8 +187,10 @@ pub(crate) fn check_declared(
     db: &Database,
     table: &str,
     candidate: &TableMeta,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let candidate = normalized(table, from_meta(candidate))?;
@@ -348,8 +356,10 @@ fn policy_cells(p: &ApplicationTablePolicy) -> Vec<Value> {
 pub(crate) fn show_policy(
     db: &Database,
     table: Option<&str>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-) -> Result<QueryResult> {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<QueryResultData> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     require_admin(db, read_memory.clone())?;
@@ -382,8 +392,10 @@ pub(crate) fn show_policy(
 
 pub(crate) fn show_bindings(
     db: &Database,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-) -> Result<QueryResult> {
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<QueryResultData> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     require_admin(db, read_memory.clone())?;

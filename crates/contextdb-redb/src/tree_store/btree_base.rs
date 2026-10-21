@@ -248,6 +248,16 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         }
     }
 
+    // Borrow the actual backing; never clone it while testing final ownership.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn cached_memory_for_test(&self) -> Option<&PageMemory> {
+        match &self.page {
+            EitherPage::Immutable(page) => Some(page.memory_for_test()),
+            EitherPage::ArcMemory(page) => Some(page),
+            _ => None,
+        }
+    }
+
     /// Access the stored value
     pub fn value(&self) -> V::SelfType<'_> {
         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])

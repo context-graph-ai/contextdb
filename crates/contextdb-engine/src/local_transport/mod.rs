@@ -104,6 +104,7 @@ pub use framing::{
 };
 pub(crate) use framing::{
     FundedOrdinaryResult, FundedResultReceiveOutcome, split_canonical_result_funded,
+    split_payload_answer_funded,
     decode_read_error_under_memory_ceiling, observed_cursor_page_allocation_bytes,
     preflight_canonical_query_result, preflight_cursor_page_payload,
     preflight_metadata_page_payload, preflight_observed_cursor_page_payload, response_is_encodable,

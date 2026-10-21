@@ -1182,6 +1182,7 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
 #[test]
 fn public_execute_releases_answer_and_copy_credit_before_return() {
     use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+    use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
@@ -1189,7 +1190,7 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         source: Arc<dyn ReadMemoryBudget>,
         used: AtomicUsize,
         peak: AtomicUsize,
-        eager_image_bytes: AtomicUsize,
+        materialize_answer_bytes: AtomicUsize,
     }
     impl ReadMemoryBudget for ObservedReadBudget {
         fn try_reserve(
@@ -1200,18 +1201,46 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
             hint: &'static str,
         ) -> Result<()> {
             self.source.try_reserve(bytes, subsystem, operation, hint)?;
-            if subsystem == "reader" && operation == "materialize_answer" {
-                self.eager_image_bytes.fetch_add(bytes, Ordering::SeqCst);
-            }
             let used = self.used.fetch_add(bytes, Ordering::SeqCst) + bytes;
             self.peak.fetch_max(used, Ordering::SeqCst);
+            if subsystem == "reader" && operation == "materialize_answer" {
+                self.materialize_answer_bytes.fetch_add(bytes, Ordering::SeqCst);
+                oracle::answer_copy_reservation(bytes);
+            }
             Ok(())
         }
         fn release(&self, bytes: usize) {
             let before = self.used.fetch_sub(bytes, Ordering::SeqCst);
             assert!(before >= bytes, "reader credit returned at most once");
+            oracle::answer_copy_refund(bytes);
             self.source.release(bytes);
         }
+    }
+    fn assert_control_freed(
+        observation: &oracle::AnswerCopyControlObservation<'_>,
+        layout: (usize, usize),
+    ) -> usize {
+        let control = observation.receipt();
+        assert_ne!(control.pointer, 0, "actual producer control address was observed");
+        assert_eq!(control.reservations, 1,
+            "only the producer's prepaid control is admitted; no eager image reservation");
+        assert_eq!((control.bytes, control.align), layout,
+            "actual execution allocates the calibrated producer's control layout");
+        assert_eq!(control.admitted, control.bytes,
+            "the control reservation pays its exact native Box request");
+        assert!(control.funded_at_allocation >= control.bytes,
+            "the original operation owner pays before control allocation");
+        assert_eq!(control.frees, 1, "the actual control Box physically frees once");
+        assert!(control.funded_at_free >= control.bytes,
+            "control funding survives until System.dealloc");
+        assert_eq!(control.funded_after_free, control.funded_at_free,
+            "physical free precedes the original owner's refund");
+        assert_eq!(control.refund_after_free, Some(control.bytes),
+            "the first refund after the actual control free returns its exact invoice");
+        assert_eq!(control.funded_after_refund,
+            Some(control.funded_after_free.checked_sub(control.bytes).unwrap()),
+            "the exact originating owner returns only this control invoice after free");
+        control.bytes
     }
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();
@@ -1255,7 +1284,7 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
             source: db.declared_reader_memory().unwrap(),
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
-            eager_image_bytes: AtomicUsize::new(0),
+            materialize_answer_bytes: AtomicUsize::new(0),
         })
     };
     // Open retains standing reader credit; operation release returns to that baseline.
@@ -1296,7 +1325,35 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         );
     };
     assert_parent_baseline();
+    // Calibrate against the actual production bridge with zero prepaid payload.
+    // from_prepaid allocates its charge Box even when no vector image exists.
+    // Its observed native Layout, not a literal byte allowance, classifies the
+    // same first reservation in real execution below.
+    let calibration_owner = observe();
+    let calibration = oracle::AnswerCopyControlObservation::begin(&calibration_owner.used);
+    let image = crate::read_image_memory::ImageMemory::charging_reader(
+        crate::memory_accounting::AccountantHandle::clone(&db.finalization.accountant),
+        calibration_owner.clone(),
+    );
+    let bridge = image.vector_copy(0).unwrap();
+    assert_eq!(bridge.owner.retained_bytes(), 0, "control owns no vector payload");
+    assert_eq!(image.held(), 0, "control invoice is separate from image bytes");
+    let native_control = calibration.receipt();
+    assert_ne!(native_control.pointer, 0, "real producer control address was observed");
+    assert_eq!(native_control.frees, 0, "bridge still owns its control Box");
+    assert_eq!(native_control.funded_at_allocation, native_control.bytes,
+        "isolated producer debits exactly the physical control request");
+    let control_layout = (native_control.bytes, native_control.align);
+    bridge.into_image();
+    assert_control_freed(&calibration, control_layout);
+    assert_eq!(image.held(), 0, "zero payload transfer creates no eager image");
+    assert_eq!(calibration_owner.used.load(Ordering::SeqCst), 0);
+    drop(image);
+    drop(calibration);
+    drop(calibration_owner);
+    assert_parent_baseline();
     let owner = observe();
+    let control = oracle::AnswerCopyControlObservation::begin(&owner.used);
     let owned = db
         .execute_owned_with_read_memory(sql, &HashMap::new(), owner.clone())
         .unwrap();
@@ -1324,7 +1381,10 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
     });
     let answer_credit = owned.answer_charge.held();
     let copy_credit = owned.vector_copy_charge.held();
-    let eager_image_bytes = owner.eager_image_bytes.load(Ordering::SeqCst);
+    let physical_control_bytes = assert_control_freed(&control, control_layout);
+    let eager_image_bytes = owner.materialize_answer_bytes.load(Ordering::SeqCst)
+        .checked_sub(physical_control_bytes)
+        .expect("actual materialization pays its physically observed control");
     assert!(
         answer_credit.checked_add(copy_credit).unwrap() > 0,
         "internal result retains actual answer/copy credit"
@@ -1343,7 +1403,7 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
     );
     assert_eq!(
         copy_credit, eager_image_bytes,
-        "separate vector copy credit equals the observed eager image admission"
+        "separate vector copy credit equals image admission after the actual freed control"
     );
     assert_eq!(
         eager_image_bytes, 0,
@@ -1366,13 +1426,18 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         "consuming conversion releases all observed credit while public rows remain alive"
     );
     assert!(owner.peak.load(Ordering::SeqCst) > 0);
+    drop(control);
     drop(owner);
     assert_parent_baseline();
     let owner = observe();
+    let control = oracle::AnswerCopyControlObservation::begin(&owner.used);
     let explicit = db
         .execute_with_read_memory(sql, &HashMap::new(), owner.clone())
         .unwrap();
     assert_eq!(explicit.rows, expected);
+    assert_control_freed(&control, control_layout);
+    assert_eq!(owner.materialize_answer_bytes.load(Ordering::SeqCst), control_layout.0,
+        "public explicit-owner route also creates no eager image beyond its actual control");
     assert!(
         owner.peak.load(Ordering::SeqCst) > 0,
         "public execution actually admitted memory"
@@ -1382,6 +1447,7 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         0,
         "public explicit-owner boundary releases every observed answer/copy credit before return"
     );
+    drop(control);
     drop(owner);
     assert_parent_baseline();
     let ordinary = db.execute(sql, &HashMap::new()).unwrap();

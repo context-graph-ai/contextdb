@@ -207,7 +207,17 @@ impl MaintenanceContext {
             kept_vector_bytes,
         )?;
         #[cfg(feature = "test-seams")]
-        let observed = std::sync::Arc::downgrade(&owner);
+        enum Observation {
+            Legacy(std::sync::Weak<crate::read_image_memory::ImageMemory>),
+            Native(crate::read_image_memory::ImageMemoryObservation),
+        }
+        #[cfg(feature = "test-seams")]
+        let observed = match &owner {
+            crate::read_image_memory::ImageMemoryHandle::Arc(image) => Observation::Legacy(std::sync::Arc::downgrade(image)),
+            crate::read_image_memory::ImageMemoryHandle::Native(_) => Observation::Native(crate::read_image_memory::ImageMemoryObservation::new(&owner)),
+        };
+        #[cfg(feature = "test-seams")]
+        let owner_properties = (owner.labels(), owner.funded_by_writer(&self.finalization.accountant), owner.is_per_call());
         let loaded = {
             let _decode = owner.enter();
             #[cfg(feature = "test-seams")]
@@ -217,12 +227,14 @@ impl MaintenanceContext {
                 cohort_vectors,
                 cohort_through,
                 workspace_bytes,
-                Some(&owner),
+                Some((owner_properties, owner.held_with_call())),
             )?;
             load()
         };
         #[cfg(feature = "test-seams")]
         let adopted_output = owner.adopted_output();
+        #[cfg(feature = "test-seams")]
+        let held_after_load = owner.held_with_call();
         drop(owner);
         #[cfg(feature = "test-seams")]
         {
@@ -237,14 +249,26 @@ impl MaintenanceContext {
                     error: error.to_string(),
                 },
             };
-            let survivor = observed.upgrade();
+            // Preserve the genuine legacy upgrade through the callback, as before.
+            let legacy_survivor = match &observed {
+                Observation::Legacy(observed) => observed.upgrade(),
+                Observation::Native(_) => None,
+            };
+            let survivor = match observed {
+                Observation::Legacy(_) => legacy_survivor.as_ref().map(|owner|
+                    ((owner.labels(), owner.funded_by_writer(&self.finalization.accountant), owner.is_per_call()), owner.held_with_call())),
+                // Dropping a non-final native handle changes no payload fields.
+                // The producer token observes whether that exact block survived;
+                // the immediately preceding sample adds no strong alias.
+                Observation::Native(observed) => observed.is_alive().then_some((owner_properties, held_after_load)),
+            };
             self.observe_import_cohort_load(
                 site,
                 boundary,
                 cohort_vectors,
                 cohort_through,
                 workspace_bytes,
-                survivor.as_ref(),
+                survivor,
             )?;
         }
         #[cfg(not(feature = "test-seams"))]
@@ -260,7 +284,7 @@ impl MaintenanceContext {
         cohort_vectors: usize,
         cohort_through: Option<Lsn>,
         workspace_bytes: usize,
-        owner: Option<&Arc<crate::read_image_memory::ImageMemory>>,
+        owner: Option<(((&'static str, &'static str), bool, bool), usize)>,
     ) -> Result<()> {
         if !crate::vector_observations::import_tail_load_observed() {
             return Ok(());
@@ -274,11 +298,11 @@ impl MaintenanceContext {
             cohort_vectors,
             cohort_through,
             workspace_bytes,
-            decode_owner: owner.map_or(("", ""), |owner| owner.labels()),
+            decode_owner: owner.map_or(("", ""), |owner| owner.0.0),
             decode_owner_funded_by_writer: owner
-                .is_some_and(|owner| owner.funded_by_writer(&self.finalization.accountant)),
-            decode_owner_per_call: owner.is_some_and(|owner| owner.is_per_call()),
-            decode_held: owner.map_or(0, |owner| owner.held_with_call()),
+                .is_some_and(|owner| owner.0.1),
+            decode_owner_per_call: owner.is_some_and(|owner| owner.0.2),
+            decode_held: owner.map_or(0, |owner| owner.1),
         };
         if let Some(limit) = crate::vector_observations::emit_import_tail_load_for_test(&event) {
             self.finalization.accountant.set_budget(limit)?;
@@ -347,7 +371,7 @@ impl MaintenanceContext {
         &self,
         persistence: &Arc<RedbPersistence>,
         partition: &VectorPartitionRef,
-        read_memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: &contextdb_core::read_memory::ReadMemoryOwner,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         target: (TxId, Lsn),
     ) -> Result<bool> {
@@ -372,7 +396,7 @@ impl MaintenanceContext {
                 let outcome = self.advance_paged_vector_build_toward(
                     partition,
                     copy_owner,
-                    Arc::clone(read_memory),
+                    read_memory.clone(),
                     target,
                 )?;
                 let Some(outcome) = outcome else {
@@ -403,8 +427,10 @@ impl MaintenanceContext {
 
     fn persist_import_vector_tails(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(persistence) = &self.persistence else {
             return Ok(true);
         };
@@ -462,7 +488,7 @@ impl MaintenanceContext {
         &self,
         persistence: &Arc<RedbPersistence>,
         partition: &VectorPartitionRef,
-        read_memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: &contextdb_core::read_memory::ReadMemoryOwner,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         target: (TxId, Lsn),
     ) -> Result<ImportCohort> {
@@ -508,15 +534,15 @@ impl MaintenanceContext {
             CohortPlan::Covered | CohortPlan::Retain { .. } => {}
         }
         if catalog.change.is_none() {
-            let mut base_workspace = self.vector.reserve_workspace(
-                Arc::clone(&self.finalization.vector_accountant),
+            let mut base_workspace = self.vector.reserve_workspace_static(
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 128 * 1024,
                 "prepare_native_import_base",
                 "Release idle writer state before preparing native graph pages.",
             )?;
             let prepared = self.publish_direct_metadata(|| {
                 persistence.prepare_native_import_base(&catalog, |bytes, disk_bytes| {
-                    base_workspace.resize(
+                    base_workspace.resize_static(
                         bytes,
                         "prepare_native_import_base",
                         "Release idle writer state before copying native graph pages.",
@@ -529,7 +555,7 @@ impl MaintenanceContext {
             };
             if prepared != catalog {
                 catalog = prepared;
-                base_workspace.resize(
+                base_workspace.resize_static(
                     64 * 1024,
                     "prepare_native_import_base",
                     "Release idle writer state.",
@@ -540,15 +566,15 @@ impl MaintenanceContext {
         if catalog.change.is_some_and(|change| {
             change.generation_id & crate::persistence::vector_paged::MUTABLE_STORAGE == 0
         }) {
-            let mut workspace = self.vector.reserve_workspace(
-                Arc::clone(&self.finalization.vector_accountant),
+            let mut workspace = self.vector.reserve_workspace_static(
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                 128 * 1024,
                 "prepare_native_import_change",
                 "Release idle writer state before adopting saved change pages.",
             )?;
             let prepared = self.publish_direct_metadata(|| {
                 persistence.prepare_native_import_change(&catalog, |bytes, disk_bytes| {
-                    workspace.resize(
+                    workspace.resize_static(
                         bytes,
                         "prepare_native_import_change",
                         "Release idle writer state before copying saved change pages.",
@@ -560,7 +586,7 @@ impl MaintenanceContext {
                 return Ok(ImportCohort::Incomplete);
             };
             catalog = prepared;
-            workspace.resize(
+            workspace.resize_static(
                 64 * 1024,
                 "prepare_native_import_change",
                 "Release idle writer state.",
@@ -629,8 +655,8 @@ impl MaintenanceContext {
             .checked_mul(entry_bytes)
             .ok_or_else(|| Error::Other("import vector suffix size overflow".into()))?;
         let workspace_bytes = body_bytes.saturating_add(128 * 1024);
-        let mut workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        let mut workspace = self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             workspace_bytes,
             "persist_import_vector_tail",
             "Release idle writer state before persisting this import's vector suffix.",
@@ -750,7 +776,7 @@ impl MaintenanceContext {
         drop(tail);
         drop(backend);
         drop(entries);
-        workspace.resize(
+        workspace.resize_static(
             64 * 1024,
             "persist_import_vector_tail",
             "Release idle writer state.",
@@ -812,8 +838,8 @@ impl MaintenanceContext {
             return Ok(false);
         }
         let workspace_bytes = bytes.saturating_add(128 * 1024);
-        let _workspace = self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        let _workspace = self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             workspace_bytes,
             "catch_up_native_import_candidate",
             "Release idle writer state before advancing this finite cohort.",

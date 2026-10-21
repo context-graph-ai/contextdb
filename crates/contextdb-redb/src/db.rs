@@ -83,6 +83,107 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
     }
 }
 
+
+/// Original construction capability. Legacy or wrapped backends never acquire it implicitly.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub trait NativeStorageBackend: StorageBackend {
+    fn native_len(&self) -> Result<u64, crate::NativeBackendError>;
+    fn native_read(&self, offset: u64, out: &mut [u8]) -> Result<(), crate::NativeBackendError>;
+    fn native_write(&self, offset: u64, data: &[u8]) -> Result<(), crate::NativeBackendError>;
+    fn native_set_len(&self, len: u64) -> Result<(), crate::NativeBackendError>;
+    fn native_sync_data(&self) -> Result<(), crate::NativeBackendError>;
+}
+
+pub(crate) enum Backend {
+    Legacy(Box<dyn StorageBackend>),
+    #[cfg(feature = "contextdb-internal")]
+    Native(Box<dyn NativeStorageBackend>),
+}
+impl Debug for Backend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(file) => Debug::fmt(file, f),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => Debug::fmt(file, f),
+        }
+    }
+}
+impl<T: StorageBackend> From<Box<T>> for Backend {
+    fn from(file: Box<T>) -> Self { Self::Legacy(file) }
+}
+impl From<Box<dyn StorageBackend>> for Backend {
+    fn from(file: Box<dyn StorageBackend>) -> Self { Self::Legacy(file) }
+}
+impl Backend {
+    pub(crate) fn scratch_backend(&self) -> std::io::Result<Option<Box<dyn ScratchBackend>>> {
+        match self {
+            Self::Legacy(file) => file.scratch_backend(),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.scratch_backend(),
+        }
+    }
+    pub(crate) fn close(&self) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.close().map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.close().map_err(StorageError::from),
+        }
+    }
+    pub(crate) fn len(&self) -> Result<u64, StorageError> {
+        match self {
+            Self::Legacy(file) => file.len().map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_len().map_err(|error|
+                crate::native_storage_admission::native_storage_error(error.into_native())),
+        }
+    }
+    pub(crate) fn read_cause(&self, offset: u64, out: &mut [u8]) -> Result<(), crate::NativeBackendError> {
+        match self {
+            Self::Legacy(file) => file.read(offset, out).map_err(Into::into),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_read(offset, out),
+        }
+    }
+    pub(crate) fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), StorageError> {
+        self.read_cause(offset, out).map_err(|error|
+            crate::native_storage_admission::native_storage_error(error.into_native()))
+    }
+    pub(crate) fn write(&self, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.write(offset, data).map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_write(offset, data).map_err(|error|
+                crate::native_storage_admission::native_storage_error(error.into_native())),
+        }
+    }
+    pub(crate) fn set_len(&self, len: u64) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.set_len(len).map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_set_len(len).map_err(|error|
+                crate::native_storage_admission::native_storage_error(error.into_native())),
+        }
+    }
+    pub(crate) fn sync_data(&self) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.sync_data().map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_sync_data().map_err(|error|
+                crate::native_storage_admission::native_storage_error(error.into_native())),
+        }
+    }
+}
+
+pub(crate) fn backend_quota_refused(error: &StorageError) -> bool {
+    match error {
+        StorageError::Io(error) => error.kind() == std::io::ErrorKind::QuotaExceeded,
+        #[cfg(feature = "contextdb-internal")]
+        StorageError::Native(crate::NativeColdReadError::BackendIo(crate::NativeIoCause::DiskGrowthRefused { .. })) => true,
+        _ => false,
+    }
+}
+
 /// Seekable, non-durable backing for allocator working state. Its contents are
 /// discarded when the database closes or reopens; committed system tables stay
 /// the durable authority.
@@ -560,6 +661,18 @@ impl ReadableDatabase for ReadOnlyDatabase {
 }
 
 impl ReadOnlyDatabase {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {
+        self.mem.write_control_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cached_header_for_test(&self) -> Result<crate::CachePageForTest> {
+        self.mem.cached_header_for_test()
+    }
+
     /// Capture one internally funded retained root without ordinary table controls.
     #[cfg(feature = "contextdb-internal")]
     #[doc(hidden)]
@@ -582,11 +695,29 @@ impl ReadOnlyDatabase {
         ))
     }
 
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cache_allocations_for_test(&self, visit: &mut dyn FnMut((usize, usize, usize))) -> usize {
+        self.mem.cache_allocations_for_test(visit)
+    }
+
     /// Exact fixed cache-index allocation, separate from the configured page cap.
     #[doc(hidden)]
     pub fn cache_index_bytes(&self) -> usize {
         self.mem.cache_index_bytes()
     }
+
+    /// Retain the reader's original fixed source reserve through every native
+    /// cache alias. No new admission or writer registration occurs here.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn retain_cache_reserve(
+        &self,
+        reserve: crate::native_storage_admission::NativeStorageCredit,
+    ) -> crate::CacheReserveOwner {
+        self.mem.retain_cache_reserve(reserve)
+    }
+
 
     /// Opens an existing redb database.
     pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
@@ -1186,6 +1317,22 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cache_controls_for_test(&self) -> [(usize, usize); 2] { self.mem.controls_for_test() }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn lifetime_aliases_for_test(&self) -> Result<(crate::CachePageForTest, crate::CachePageForTest, crate::CacheWriteForTest)> {
+        self.mem.lifetime_aliases_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn detach_cached_guard_for_test<V: Value + 'static>(&self, guard: &crate::AccessGuard<'_, V>) -> (u64, usize, usize, bool) {
+        self.mem.detach_cached_memory_for_test(guard.cached_memory_for_test().expect("fixture must retain a page"))
+    }
+
     /// Capture a native retained read that authenticates every consumed page.
     /// The ordinary native transaction guard remains responsible for retention.
     #[cfg(feature = "contextdb-internal")]
@@ -1233,6 +1380,12 @@ impl Database {
         ))
     }
 
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cache_allocations_for_test(&self, visit: &mut dyn FnMut((usize, usize, usize))) -> usize {
+        self.mem.cache_allocations_for_test(visit)
+    }
+
     /// Exact fixed cache-index allocation, separate from the configured page cap.
     #[doc(hidden)]
     pub fn cache_index_bytes(&self) -> usize {
@@ -1252,6 +1405,17 @@ impl Database {
     #[doc(hidden)]
     pub fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize, StorageError> {
         self.mem.settle_startup_cache_budget(bytes)
+    }
+
+    /// Retain the engine's original fixed cache invoice through physical free.
+    /// Call once at quiescent startup; the owner also seeds handle recycling.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn retain_cache_reserve(
+        &self,
+        reserve: crate::native_storage_admission::NativeStorageCredit,
+    ) -> crate::CacheReserveOwner {
+        self.mem.retain_cache_reserve(reserve)
     }
 
     /// Upper bound on the allocator's resident heap owner. Paged file
@@ -1957,7 +2121,7 @@ impl Database {
 
     #[allow(clippy::too_many_arguments)]
     fn new(
-        file: Box<dyn StorageBackend>,
+        file: impl Into<Backend>,
         allow_initialize: bool,
         page_size: usize,
         region_size: Option<u64>,
@@ -1967,6 +2131,7 @@ impl Database {
         deferred_free_budget: (usize, usize),
         keep_pace_reclaim: bool,
     ) -> Result<Self, DatabaseError> {
+        let file: Backend = file.into();
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
         #[cfg(feature = "logging")]
@@ -2650,6 +2815,25 @@ impl Builder {
             self.deferred_free_budget,
             self.keep_pace_reclaim,
         )
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn create_with_native_backend_and_external_snapshots(
+        &self, backend: impl NativeStorageBackend, provider: ExternalSnapshotProvider,
+    ) -> Result<Database, DatabaseError> {
+        Database::new(Backend::Native(Box::new(backend)), true, self.page_size,
+            self.region_size, self.cache_size, &self.repair_callback, Some(provider),
+            self.deferred_free_budget, self.keep_pace_reclaim)
+    }
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_with_native_backend_and_external_snapshots(
+        &self, backend: impl NativeStorageBackend, provider: ExternalSnapshotProvider,
+    ) -> Result<Database, DatabaseError> {
+        Database::new(Backend::Native(Box::new(backend)), false, self.page_size,
+            None, self.cache_size, &self.repair_callback, Some(provider),
+            self.deferred_free_budget, self.keep_pace_reclaim)
     }
 
     /// Open an existing or create a new database with the given backend.

@@ -8,7 +8,7 @@ use contextdb_core::read_memory::{NativeRefusal, ReadMemoryBudget, ReadShared};
 /// releasing it, including panic and failure while constructing an error.
 pub(super) struct QueryIngress {
     _decoded: Mutex<Option<ReadCredit>>,
-    _memory: Mutex<Option<Funded<Arc<crate::read_image_memory::ImageMemory>>>>,
+    _memory: Mutex<Option<Funded<crate::read_image_memory::ImageMemoryHandle>>>,
     operation: QueryBudget,
     _owner: AcquiredQueryOwner,
 }
@@ -77,7 +77,9 @@ impl RequestControls {
         arc_bytes::<RequestSlot>() + arc_bytes::<ProgressRelay>() + RequestPublication::bytes()
             + CancellationRegistration::bytes()
     }
-    pub(super) fn from_prepaid(mut invoice: ReadCredit, owner: contextdb_core::read_memory::ReadMemoryOwner) -> Self {
+    pub(super) fn from_prepaid(mut invoice: ReadCredit, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let registration = invoice.try_split_off(CancellationRegistration::bytes())
             .expect("original supplier prepaid cancellation and registration");
         let registration = CancellationRegistration::from_prepaid(owner, registration);
@@ -86,7 +88,9 @@ impl RequestControls {
     }
 }
 
-fn node_credit(owner: Arc<dyn ReadMemoryBudget>) -> contextdb_core::Result<ReadCredit> {
+fn node_credit(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> contextdb_core::Result<ReadCredit> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     ReadCredit::try_new(owner, queued_event_bytes(), "reader", "request_inbox",
         "Reduce simultaneous requests or raise the declared reader memory limit.")
 }
@@ -107,7 +111,7 @@ pub(super) fn receive(
             .decode_payload(LocalInboundKind::Request, &payload)? else {
                 return Err(crate::local_transport::invalid_channel_data());
             };
-        let node = node_credit(reading.query_request_provider().clone())
+        let node = node_credit(reading.query_request_provider().original_owner())
             .map_err(|error| query_funding::transport_error(error, prefix.limits.memory))?;
         return Ok(ConnectionEvent::Request(ReceivedRequest {
             envelope, query: None, node: Some(node), controls: None,
@@ -178,7 +182,7 @@ pub(super) fn receive(
     let prepared = (|| -> contextdb_core::Result<_> {
         let memory = crate::read_image_memory::ImageMemory::query_reader_for(
             reading.writer_accountant_handle(), ingress.budget.clone())?;
-        let payload = Funded::allocate(Some(ingress.budget.clone()), prefix.length,
+        let payload = Funded::allocate_owned(Some(ingress.budget.clone()), prefix.length,
             || vec![0; prefix.length])?;
         *ingress._memory.lock().unwrap_or_else(|p| p.into_inner()) = Some(memory);
         Ok(payload)
@@ -242,6 +246,8 @@ fn native_error(error: NativeRefusal) -> contextdb_core::Error {
             available_bytes, budget_limit_bytes, hint: hint.into(),
         },
         NativeRefusal::Other(reason) => contextdb_core::Error::Other(reason.into()),
+        allocator @ NativeRefusal::AllocatorFailed { .. } =>
+            contextdb_core::Error::NativeEngineOther(allocator),
         // The connection uses the native declared-reader supplier; these
         // variants are not produced by that supplier.
         NativeRefusal::NativeUnsupported { .. } =>

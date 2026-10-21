@@ -341,7 +341,7 @@ impl RedbPersistence {
         let memory = owner.image(root, "authored_declaration");
         let meta = memory.scope(|| {
             let state: DirectionState = Self::decode(value.value())?;
-            let damage = |reason: &str| Error::StoreCorrupted { path: table.into(), reason: reason.into() };
+            let damage = |reason: &str| crate::funded_error::corruption_display(owner.diagnostic_budget(), table, reason);
             let (position, ordinal) = state.ddl_key.split_once(':').unwrap_or((&state.ddl_key, "0"));
             let position = position.parse::<u64>().map_err(|_| damage("authored declaration has an invalid DDL position"))?;
             let ordinal = ordinal.parse::<u32>().map_err(|_| damage("authored declaration has an invalid DDL ordinal"))?;

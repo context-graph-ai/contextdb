@@ -19,10 +19,10 @@ pub(crate) struct CurrencyCleanupGroup {
     pub(crate) prune_after: Option<[u8; 24]>,
 }
 
-fn damage(reason: impl Into<String>) -> Error {
+fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "currency_cleanup_progress".into(),
-        reason: reason.into(),
+        reason: reason.into().into(),
     }
 }
 

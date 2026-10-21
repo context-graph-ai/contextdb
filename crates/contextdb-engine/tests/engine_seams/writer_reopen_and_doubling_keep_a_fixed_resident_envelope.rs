@@ -17,20 +17,30 @@ use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 static LIVE_ALLOCATIONS: AtomicIsize = AtomicIsize::new(0);
 static ALLOCATION_PEAK: AtomicUsize = AtomicUsize::new(0);
 struct ResidentAllocator;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::read_work_probe::allocator_events;
 fn allocated_growth(bytes: isize) {
     let live = LIVE_ALLOCATIONS.fetch_add(bytes, Ordering::Relaxed) + bytes;
     ALLOCATION_PEAK.fetch_max(live.max(0) as usize, Ordering::Relaxed);
 }
 unsafe impl GlobalAlloc for ResidentAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "test-seams")]
+        allocator_events::before_alloc(layout);
         let pointer = unsafe { System.alloc(layout) };
+        #[cfg(feature = "test-seams")]
+        allocator_events::allocated(pointer, layout);
         if !pointer.is_null() {
             allocated_growth(layout.size() as isize);
         }
         pointer
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "test-seams")]
+        allocator_events::before_alloc(layout);
         let pointer = unsafe { System.alloc_zeroed(layout) };
+        #[cfg(feature = "test-seams")]
+        allocator_events::allocated(pointer, layout);
         if !pointer.is_null() {
             allocated_growth(layout.size() as isize);
         }
@@ -38,17 +48,29 @@ unsafe impl GlobalAlloc for ResidentAllocator {
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE_ALLOCATIONS.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+        #[cfg(feature = "test-seams")]
+        let free = allocator_events::before_dealloc(pointer, layout);
         unsafe { System.dealloc(pointer, layout) }
+        #[cfg(feature = "test-seams")]
+        allocator_events::after_dealloc(free);
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         // Keep the old/new overlap visible instead of hiding System::realloc's
         // internal copy from the peak oracle. Failure preserves the old owner.
         let new_layout = unsafe { Layout::from_size_align_unchecked(size, layout.align()) };
+        #[cfg(feature = "test-seams")]
+        allocator_events::before_alloc(new_layout);
         let updated = unsafe { System.alloc(new_layout) };
+        #[cfg(feature = "test-seams")]
+        allocator_events::reallocated(pointer, layout, updated, new_layout);
         if !updated.is_null() {
             allocated_growth(size as isize);
             unsafe { std::ptr::copy_nonoverlapping(pointer, updated, layout.size().min(size)) };
+            #[cfg(feature = "test-seams")]
+            let free = allocator_events::before_dealloc(pointer, layout);
             unsafe { System.dealloc(pointer, layout) };
+            #[cfg(feature = "test-seams")]
+            allocator_events::after_dealloc(free);
             LIVE_ALLOCATIONS.fetch_sub(layout.size() as isize, Ordering::Relaxed);
         }
         updated
@@ -64,6 +86,13 @@ pub fn reset_allocation_peak_for_test() {
 }
 pub fn allocation_peak_for_test() -> usize {
     ALLOCATION_PEAK.load(Ordering::Relaxed)
+}
+
+// Static borrowed diagnostics bypass libtest capture and never format or allocate.
+// Warm stderr and its thread-local lock identity before the first peak reset.
+fn stage(marker: &'static [u8]) {
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(marker);
 }
 
 const ARM: &str = "CONTEXTDB_RESIDENT_ENVELOPE_ROWS";
@@ -129,9 +158,22 @@ fn sample(db: &Database, path: &Path, startup_peak: usize, append_peak: usize) -
         file_bytes: std::fs::metadata(path).unwrap().len(),
     }
 }
+// Four fixed completed-seed milestones for the original full fixture sizes.
+fn seed_milestone(n: usize, completed: usize) {
+    match (n, completed) {
+        (128, 32) | (256, 64) => stage(b"reopen prepare seed-quarter-complete\n"),
+        (128, 64) | (256, 128) => stage(b"reopen prepare seed-half-complete\n"),
+        (128, 96) | (256, 192) => stage(b"reopen prepare seed-three-quarters-complete\n"),
+        (128, 128) | (256, 256) => stage(b"reopen prepare seed-all-complete\n"),
+        _ => {}
+    }
+}
+
 fn prepare(path: &Path, n: usize) {
+    stage(b"reopen prepare before-clock-and-source-open\n");
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let source = Database::open_memory();
+    stage(b"reopen prepare source-open-before-schema\n");
     source.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     exec(
         &source,
@@ -146,7 +188,9 @@ fn prepare(path: &Path, n: usize) {
         &source,
         "CREATE TABLE payloads (id INT PRIMARY KEY, body TEXT) HISTORY ALL SYNC TWO WAY",
     );
+    stage(b"reopen prepare schema-complete-before-writer-open\n");
     let db = open(path, Some(CEILING));
+    stage(b"reopen prepare writer-open-before-seed\n");
     let mut applied = Lsn(0);
     for id in 0..n {
         source
@@ -201,18 +245,22 @@ fn prepare(path: &Path, n: usize) {
         )
         .unwrap();
         applied = source.current_lsn();
+        seed_milestone(n, id + 1);
     }
+    stage(b"reopen prepare seed-complete-before-revisions\n");
     for id in 0..n {
         exec(
             &db,
             &format!("UPDATE items SET revision = 1 WHERE id = {id}"),
         );
     }
+    stage(b"reopen prepare revisions-complete-before-tombstones\n");
     let received_source_lsn = source.current_lsn();
     // Authored tombstone and graph-arrival sidecars must participate in growth.
     for id in 0..n / 4 {
         exec(&source, &format!("DELETE FROM payloads WHERE id = {id}"));
     }
+    stage(b"reopen prepare tombstones-authored-before-sync\n");
     db.apply_changes(
         source
             .changes_since(received_source_lsn)
@@ -221,6 +269,7 @@ fn prepare(path: &Path, n: usize) {
     )
     .unwrap();
     let ddl_since = source.current_lsn();
+    stage(b"reopen prepare tombstones-synced-before-ddl\n");
     for ordinal in 0..n / 4 {
         let ddl = format!(
             "ALTER TABLE items ALTER COLUMN v SET HNSW (EF_SEARCH = {})",
@@ -229,6 +278,7 @@ fn prepare(path: &Path, n: usize) {
         exec(&db, &ddl);
         exec(&source, &ddl);
     }
+    stage(b"reopen prepare ddl-authored-before-sync\n");
     db.apply_changes(
         source
             .changes_since(ddl_since)
@@ -237,6 +287,7 @@ fn prepare(path: &Path, n: usize) {
     )
     .unwrap();
 
+    stage(b"reopen prepare ddl-synced-before-refusal-fixture\n");
     // Real authenticated-reply semantics populate terminal refusal evidence;
     // the helper is the existing test-only door to the actual reply commit.
     exec(
@@ -246,6 +297,7 @@ fn prepare(path: &Path, n: usize) {
     for id in 0..n / 4 {
         exec(&db, &format!("INSERT INTO refused_items VALUES ({id})"));
     }
+    stage(b"reopen prepare refusal-rows-written-before-change-read\n");
     let refused = db
         .changes_since(Lsn(0))
         .expect("read the declared changes")
@@ -255,6 +307,7 @@ fn prepare(path: &Path, n: usize) {
         .collect::<Vec<_>>();
     assert_eq!(refused.len(), n / 4);
     let tenant = TenantId::from("resident-fixture");
+    stage(b"reopen prepare refusal-change-read-before-reply\n");
     db.register_retention_sync_peer("fixture-hub").unwrap();
     db.record_hub_push_reply_effects_for_hub(
         &tenant,
@@ -265,6 +318,7 @@ fn prepare(path: &Path, n: usize) {
         Lsn(900_000),
     )
     .unwrap();
+    stage(b"reopen prepare refusal-reply-complete-before-check\n");
     let received_schema_read_memory_1 = db
         .declared_reader_memory()
         .expect("admit the sync observation reader");
@@ -278,6 +332,7 @@ fn prepare(path: &Path, n: usize) {
         .unwrap()
     );
 
+    stage(b"reopen prepare refusal-check-complete-before-expiry-fixture\n");
     // A retained old frontier keeps real, durable expiry identities after
     // current answers expire; no observer-created mirror is inserted.
     exec(
@@ -294,9 +349,12 @@ fn prepare(path: &Path, n: usize) {
         )
         .unwrap();
     }
+    stage(b"reopen prepare expiry-rows-written-before-snapshot-and-pin\n");
     let expiry_frontier = db.snapshot();
     let pin = db.pin_snapshot(expiry_frontier).unwrap();
+    stage(b"reopen prepare expiry-pinned-before-prune\n");
     db.run_pruning_cycle_checked().unwrap();
+    stage(b"reopen prepare expiry-prune-complete-before-counts\n");
     assert_eq!(
         exec(&db, "SELECT COUNT(*) FROM expired_items"),
         vec![vec![Value::Int64(0)]]
@@ -312,6 +370,7 @@ fn prepare(path: &Path, n: usize) {
         vec![vec![Value::Int64((n / 4) as i64)]]
     );
     drop(pin);
+    stage(b"reopen prepare expiry-counts-complete-before-cache-fixture\n");
     exec(
         &db,
         "CREATE TABLE cache_pressure (id INT PRIMARY KEY, body TEXT) HISTORY ALL SYNC OFF",
@@ -333,7 +392,9 @@ fn prepare(path: &Path, n: usize) {
         )
         .unwrap();
     }
+    stage(b"reopen prepare cache-fixture-complete-before-close\n");
     db.close().unwrap();
+    stage(b"reopen prepare close-complete\n");
 }
 fn saturate_cache(db: &Database) {
     // Uniform small leaves fill the declared share without wide-page eviction
@@ -352,15 +413,23 @@ fn saturate_cache(db: &Database) {
 }
 fn arm(path: &Path, n: usize) -> Vec<Sample> {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    stage(match n {
+        128 => b"reopen child n128 before-open\n",
+        256 => b"reopen child n256 before-open\n",
+        _ => b"reopen child other-n before-open\n",
+    });
     // The measured process never constructs a source, fixture, or full oracle.
     reset_allocation_peak_for_test();
     let db = open(path, Some(CEILING));
     let startup_peak = allocation_peak_for_test();
+    stage(b"reopen child after-open\n");
     reset_allocation_peak_for_test();
     saturate_cache(&db);
     // Fund all three measurement records before measuring the first checkpoint.
     let mut samples = Vec::with_capacity(3);
+    stage(b"reopen child initial-cache-saturated\n");
     samples.push(sample(&db, path, startup_peak, 0));
+    stage(b"reopen child sample0-complete\n");
     for checkpoint in 0..2 {
         reset_allocation_peak_for_test();
         for id in n + checkpoint * n / 2..n + (checkpoint + 1) * n / 2 {
@@ -383,6 +452,7 @@ fn arm(path: &Path, n: usize) -> Vec<Sample> {
             .unwrap();
             db.commit(tx).unwrap();
         }
+        stage(b"reopen child append-loop-complete\n");
         let membership_before_moves = db
             .vector_store_for_test()
             .resident_membership_directory_bytes_for_test();
@@ -423,6 +493,7 @@ fn arm(path: &Path, n: usize) -> Vec<Sample> {
             membership_before_moves
         );
         let append_peak = allocation_peak_for_test();
+        stage(b"reopen child append-membership-checks-complete\n");
         reset_allocation_peak_for_test();
         let received_schema_read_memory_2 = db
             .declared_reader_memory()
@@ -459,14 +530,20 @@ fn arm(path: &Path, n: usize) -> Vec<Sample> {
                 .unwrap(),
             1
         );
+        stage(b"reopen child read-checks-complete\n");
         saturate_cache(&db);
+        stage(b"reopen child cache-saturated\n");
         samples.push(sample(&db, path, startup_peak, append_peak));
+        stage(b"reopen child sample-complete\n");
     }
+    stage(b"reopen child before-final-count\n");
     assert_eq!(
         exec(&db, "SELECT COUNT(*) FROM items"),
         vec![vec![Value::Int64((2 * n) as i64)]]
     );
+    stage(b"reopen child before-close\n");
     db.close().unwrap();
+    stage(b"reopen child after-close-before-json-return\n");
     samples
 }
 #[test]
@@ -484,12 +561,29 @@ fn writer_reopen_and_doubling_keep_a_fixed_resident_envelope() {
     let mut durable_populations = Vec::new();
     for n in [128, 256] {
         let path = dir.path().join(format!("history-{n}.db"));
+        stage(match n {
+            128 => b"reopen parent n128 prepare-start\n",
+            256 => b"reopen parent n256 prepare-start\n",
+            _ => b"reopen parent other-n prepare-start\n",
+        });
+        stage(b"reopen parent before-region-fixture\n");
         Database::__create_region_fixture_for_test(&path, 1024 * 1024).unwrap();
+        stage(b"reopen parent region-fixture-complete-before-prepare\n");
         prepare(&path, n);
+        stage(match n {
+            128 => b"reopen parent n128 prepare-complete\n",
+            256 => b"reopen parent n256 prepare-complete\n",
+            _ => b"reopen parent other-n prepare-complete\n",
+        });
         let prepared = open(&path, None);
         durable_populations.push(prepared.__durable_page_population_for_test().unwrap());
         prepared.close().unwrap();
         drop(prepared);
+        stage(match n {
+            128 => b"reopen parent n128 metadata-closed-child-launch\n",
+            256 => b"reopen parent n256 metadata-closed-child-launch\n",
+            _ => b"reopen parent other-n metadata-closed-child-launch\n",
+        });
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -501,6 +595,7 @@ fn writer_reopen_and_doubling_keep_a_fixed_resident_envelope() {
             ])
             .env(ARM, n.to_string())
             .env(FIXTURE, &path)
+            .stderr(std::process::Stdio::inherit())
             .output()
             .unwrap();
         assert!(

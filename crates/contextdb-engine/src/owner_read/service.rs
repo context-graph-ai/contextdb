@@ -24,7 +24,7 @@ use crate::local_transport::{
 };
 use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::read_contract::{
-    encode_metadata_page, encode_observed_cursor_page, encode_query_result,
+    encode_observed_cursor_page,
 };
 use crate::{Database, OwnerReadConfig};
 use contextdb_core::read_contract::{
@@ -539,7 +539,7 @@ pub struct CursorEntry {
     effective_limits: ReadLimits,
     retained_memory_bytes: u64,
     cursor: Option<BoundedCursorHandle>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     publication: crate::executor::ReadPublicationScope,
     /// A page the bounded kernel completed but the owner carrier has not yet
     /// published. Cancellation at the carrier boundary leaves it here so the
@@ -558,11 +558,13 @@ impl CursorEntry {
         opened: BoundedCursorOpen,
         effective_limits: ReadLimits,
         retained_memory_bytes: u64,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         lease: RequestLease,
         store_hold: crate::database::OwnerReadStoreHold,
         clock: &dyn DeadlineClock,
     ) -> Self {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let now_ms = clock.now_ms();
         Self {
             cursor_id,
@@ -664,7 +666,7 @@ enum CursorRegistration {
 
 enum PreparedOwnerMetadata {
     CanonicalPage(MetadataPage),
-    CanonicalComplete(Vec<u8>),
+    CanonicalComplete(crate::local_transport::query_funding::Funded<Vec<u8>>),
 }
 
 fn owner_metadata_publication_tables(request: &LocalMetadataRequest) -> BTreeSet<String> {
@@ -689,7 +691,7 @@ struct CompletedOwnerRequest {
     responses: Vec<LocalResponse>,
     // Original query invoices outlive the physical response allocations.
     response_credit: Option<contextdb_core::read_memory::ReadCredit>,
-    query_memory: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+    query_memory: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     cursor_page: Option<CursorPagePublication>,
     cursor_open: Option<[u8; 16]>,
     publication: Option<crate::executor::ReadPublicationScope>,
@@ -743,6 +745,17 @@ impl CompletedOwnerRequest {
         }
     }
 
+    fn authoritative_funded(
+        responses: crate::local_transport::query_funding::Funded<Vec<LocalResponse>>,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        publication: crate::executor::ReadPublicationScope,
+    ) -> Self {
+        let mut completed = Self::authoritative(responses.value, publication);
+        completed.response_credit = responses.credit;
+        completed.query_memory = Some(owner);
+        completed
+    }
+
     fn authoritative_query(
         responses: crate::local_transport::query_funding::Funded<Vec<LocalResponse>>,
         owner: ReadShared<QueryIngress>,
@@ -772,14 +785,15 @@ impl CompletedOwnerRequest {
     }
 
     fn authoritative_cursor_open(
-        responses: Vec<LocalResponse>,
+        responses: crate::local_transport::query_funding::Funded<Vec<LocalResponse>>,
         cursor_id: [u8; 16],
         publication: crate::executor::ReadPublicationScope,
     ) -> Self {
+        let owner = responses.credit.as_ref().map(|credit| credit.owner());
         Self {
-            responses,
-            response_credit: None,
-            query_memory: None,
+            responses: responses.value,
+            response_credit: responses.credit,
+            query_memory: owner,
             cursor_page: None,
             cursor_open: Some(cursor_id),
             publication: Some(publication),
@@ -791,15 +805,16 @@ impl CompletedOwnerRequest {
     }
 
     fn cursor_page(
-        responses: Vec<LocalResponse>,
+        responses: crate::local_transport::query_funding::Funded<Vec<LocalResponse>>,
         cursor_id: [u8; 16],
         published_rows: usize,
         publication: crate::executor::ReadPublicationScope,
     ) -> Self {
+        let owner = responses.credit.as_ref().map(|credit| credit.owner());
         Self {
-            responses,
-            response_credit: None,
-            query_memory: None,
+            responses: responses.value,
+            response_credit: responses.credit,
+            query_memory: owner,
             cursor_page: Some(CursorPagePublication {
                 cursor_id,
                 published_rows,
@@ -1472,8 +1487,8 @@ impl OwnerReadService {
         };
 
         let reading = self.reading_handle(connection_id);
-        let connection_parent: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
-            reading.query_request_provider().clone();
+        let connection_parent: contextdb_core::read_memory::ReadMemoryOwner =
+            reading.query_request_provider().original_owner();
         // The final-free native cell keeps the original parent invoice
         // through reader and concurrent shutdown-notifier aliases.
         let _reader_control = ReadCredit::try_new(connection_parent.clone(),
@@ -1486,7 +1501,7 @@ impl OwnerReadService {
             "Reduce simultaneous connections or raise the declared reader limit.")
             .map_err(OwnerReadScaffoldError::Database)?;
         let refusal_controls = RequestControls::from_prepaid(refusal_controls,
-            contextdb_core::read_memory::ReadMemoryOwner::from_legacy(connection_parent.clone()));
+            contextdb_core::read_memory::ReadMemoryOwner::from(connection_parent.clone()));
         let connection_control = ReadCredit::try_new(connection_parent,
             ReadShared::<ConnectionInbox>::layout().size(),
             "reader", "connection_inbox",
@@ -1728,9 +1743,9 @@ impl OwnerReadService {
             let controls = standing.as_ref().expect("authenticated connection controls");
             (controls.slot.clone(), controls.progress.clone(), controls.registration.clone())
         } else {
-            let parent: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> =
-                self.reading_handle(connection_id).query_request_provider().clone();
-            let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(parent.clone());
+            let parent: contextdb_core::read_memory::ReadMemoryOwner =
+                self.reading_handle(connection_id).query_request_provider().original_owner();
+            let owner = contextdb_core::read_memory::ReadMemoryOwner::from(parent.clone());
             let invoice = ReadCredit::try_new(parent, CancellationRegistration::bytes(),
                 "reader", "connection_cancellation", "Reduce simultaneous connections or raise the declared reader limit.")
                 .map_err(OwnerReadScaffoldError::Database)?;
@@ -2244,13 +2259,10 @@ impl OwnerReadService {
         if matches!(&request, LocalRequest::Query { .. }) && query_control.is_none() {
             return Err(OwnerReadScaffoldError::unimplemented("query ingress custody"));
         }
-        let read_memory = match &query_control {
-            Some(owner) => owner.budget.clone(),
-            None => reading.declared_read_request_provider().request_budget()
-                .map_err(OwnerReadScaffoldError::Database)?,
-        };
-        match request {
+        let request = match request {
             LocalRequest::Query { statement, params } => {
+                let read_memory = query_control.as_ref()
+                    .expect("query keeps its original control").budget.clone();
                 // The keeper is outside the handler closure, including its
                 // error conversion. Success and failure both carry it to the
                 // same worker slot and selected-carrier publication.
@@ -2297,7 +2309,7 @@ impl OwnerReadService {
                             query_control.take().expect("unwound query retains its original control")));
                     }
                 };
-                match answered {
+                return match answered {
                     Ok((responses, publication)) =>
                         Ok(CompletedOwnerRequest::authoritative_query(responses,
                             query_control.take().expect("query keeps its original control"), publication)),
@@ -2311,8 +2323,14 @@ impl OwnerReadService {
                         Ok(CompletedOwnerRequest::failed_query(responses,
                             query_control.take().expect("failed query keeps its original control")))
                     }
-                }
+                };
             }
+            request => request,
+        };
+        let read_memory = reading.declared_read_request_provider().request_budget()
+            .map_err(OwnerReadScaffoldError::Database)?;
+        match request {
+            LocalRequest::Query { .. } => unreachable!("query returned above"),
             LocalRequest::CursorOpen { statement, params } => {
                 require_read_statement(&statement)?;
                 let cursor_id = self
@@ -2345,7 +2363,10 @@ impl OwnerReadService {
                 )
                 .unwrap_or(u64::MAX);
                 let payload =
-                    match encode_observed_cursor_page(&opened.first_page, &opened.observation) {
+                    match crate::read_contract::cursor_observation::encode_observed_cursor_page_funded(
+                        &opened.first_page, &opened.observation, read_memory.clone(),
+                        connection.effective_limits().memory,
+                    ) {
                         Ok(payload) => payload,
                         Err(_) => {
                             close_unpublished_open(&mut opened)?;
@@ -2365,7 +2386,7 @@ impl OwnerReadService {
                         self.map_request_bounded_error(connection.connection_id(), error.into())
                     })?;
                 let responses =
-                    match split_payload_answer(payload, |payload| LocalResponse::CursorOpened {
+                    match crate::local_transport::split_payload_answer_funded(payload, |payload| LocalResponse::CursorOpened {
                         opened: CursorOpenedResponse {
                             effective_limits: Some(connection.effective_limits()),
                             cursor_id,
@@ -2380,14 +2401,14 @@ impl OwnerReadService {
                                 )
                             }),
                         },
-                    }) {
+                    }, connection.effective_limits().memory) {
                         Ok(responses) => responses,
                         Err(error) => {
                             close_unpublished_open(&mut opened)?;
                             return Err(OwnerReadScaffoldError::from_local(error));
                         }
                     };
-                for response in &responses {
+                for response in &responses.value {
                     if let Err(error) = response_is_encodable(response) {
                         close_unpublished_open(&mut opened)?;
                         return Err(OwnerReadScaffoldError::from_local(error));
@@ -2444,8 +2465,9 @@ impl OwnerReadService {
                     started_ms,
                 );
                 publication.read_memory = Some(read_memory.clone());
-                self.metadata_response(&reading, read_memory, request, lease)
-                    .map(|responses| CompletedOwnerRequest::authoritative(responses, publication))
+                self.metadata_response(&reading, read_memory.clone(), request, lease)
+                    .map(|responses| CompletedOwnerRequest::authoritative_funded(
+                        responses, read_memory, publication))
             }
             LocalRequest::Explain { statement, params } => {
                 let started_ms = self.spec.clock.now_ms();
@@ -2508,24 +2530,26 @@ impl OwnerReadService {
                             None,
                         )
                     };
-                let payload = crate::read_contract::encode_metadata_body(
+                let payload = crate::read_contract::encode_metadata_body_funded(
                     &crate::direct_file_reader::DirectMetadataBody::Explain {
                         sql: statement,
                         physical_plan,
                         index,
                         vector_search,
-                    },
+                    }, read_memory.clone(), connection.effective_limits().memory,
                 )
                 .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical explain encoding"))?;
-                self.admit_metadata_payload(&payload, lease.effective_limits())?;
+                self.admit_metadata_payload(&payload.value, lease.effective_limits())?;
                 let responses =
-                    split_payload_answer(payload, |payload| LocalResponse::Explain { payload })
+                    crate::local_transport::split_payload_answer_funded(
+                        payload, |payload| LocalResponse::Explain { payload },
+                        connection.effective_limits().memory)
                         .map_err(OwnerReadScaffoldError::from_local)?;
-                for response in &responses {
+                for response in &responses.value {
                     response_is_encodable(response).map_err(OwnerReadScaffoldError::from_local)?;
                 }
                 drop(lease);
-                Ok(CompletedOwnerRequest::authoritative(responses, publication))
+                Ok(CompletedOwnerRequest::authoritative_funded(responses, read_memory, publication))
             }
             LocalRequest::Custom { namespace, payload } => {
                 let handler = self.spec.config.handler.as_ref().ok_or_else(|| {
@@ -2856,7 +2880,9 @@ impl OwnerReadService {
                 .observation
                 .groups_published_through(pending.published_rows + published_rows)
                 .map_err(map_bounded_error)?;
-            let responses = match self.cursor_page_response(&page, &published_observation) {
+            let responses = match self.cursor_page_response_with_size(
+                &page, &published_observation, entry.read_memory.clone(), entry.effective_limits.memory,
+            ).map(|(responses, _)| responses) {
                 Ok(responses) => responses,
                 Err(error) => {
                     let has_more = entry
@@ -2939,7 +2965,9 @@ impl OwnerReadService {
         };
 
         let (responses, payload_bytes) =
-            match self.cursor_page_response_with_size(&page, &observation) {
+            match self.cursor_page_response_with_size(
+                &page, &observation, entry.read_memory.clone(), entry.effective_limits.memory,
+            ) {
                 Ok(responses) => responses,
                 Err(error) => {
                     let release = entry.discard_unpublished_page(page.has_more);
@@ -3046,9 +3074,9 @@ impl OwnerReadService {
             remaining_page
                 .rows
                 .discard_prefix(publication.published_rows);
-            let resized = encode_observed_cursor_page(&remaining_page, &pending.observation)
-                .ok()
-                .map(|encoded| encoded.len())
+            let resized = crate::read_contract::cursor_observation::observed_cursor_page_encoded_size(
+                &remaining_page, &pending.observation,
+            ).ok()
                 .and_then(|remaining_pending_bytes| {
                     previous_pending_bytes.checked_sub(remaining_pending_bytes)
                 })
@@ -3167,22 +3195,35 @@ impl OwnerReadService {
         page: &CursorPage,
         observation: &crate::executor::CursorObservation,
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
-        self.cursor_page_response_with_size(page, observation)
-            .map(|(responses, _)| responses)
+        // Exhausted cursor identities no longer retain a read owner. Keep
+        // this existing standalone boundary separate from live cursor output.
+        let payload = encode_observed_cursor_page(page, observation)
+            .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical cursor-page encoding"))?;
+        let responses = split_payload_answer(payload, |payload| LocalResponse::CursorPage {
+            page: CursorPageResponse { payload },
+        })?;
+        for response in &responses { response_is_encodable(response)?; }
+        Ok(responses)
     }
 
     fn cursor_page_response_with_size(
         &self,
         page: &CursorPage,
         observation: &crate::executor::CursorObservation,
-    ) -> OwnerReadScaffoldResult<(Vec<LocalResponse>, usize)> {
-        let payload = encode_observed_cursor_page(page, observation)
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        memory_ceiling: u64,
+    ) -> OwnerReadScaffoldResult<(crate::local_transport::query_funding::Funded<Vec<LocalResponse>>, usize)> {
+        let payload = crate::read_contract::cursor_observation::encode_observed_cursor_page_funded(
+            page, observation, owner, memory_ceiling,
+        )
             .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical cursor-page encoding"))?;
-        let payload_bytes = payload.len();
-        let responses = split_payload_answer(payload, |payload| LocalResponse::CursorPage {
-            page: CursorPageResponse { payload },
-        })?;
-        for response in &responses {
+        let payload_bytes = payload.value.len();
+        let responses = crate::local_transport::split_payload_answer_funded(
+            payload, |payload| LocalResponse::CursorPage {
+                page: CursorPageResponse { payload },
+            }, memory_ceiling,
+        )?;
+        for response in &responses.value {
             response_is_encodable(response)?;
         }
         Ok((responses, payload_bytes))
@@ -3226,10 +3267,12 @@ impl OwnerReadService {
     fn metadata_response(
         &self,
         reading: &Database,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         request: LocalMetadataRequest,
         lease: RequestLease,
-    ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
+    ) -> OwnerReadScaffoldResult<crate::local_transport::query_funding::Funded<Vec<LocalResponse>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let prepare = || {
             self.prepare_metadata(
                 reading,
@@ -3249,17 +3292,21 @@ impl OwnerReadService {
         let prepared = prepare()?;
         let payload = match prepared {
             PreparedOwnerMetadata::CanonicalPage(page) => {
-                encode_metadata_page(&page).map_err(|_| {
+                crate::read_contract::encode_metadata_page_funded(
+                    &page, read_memory.clone(), lease.effective_limits().memory,
+                ).map_err(|_| {
                     OwnerReadScaffoldError::unimplemented("canonical metadata-page encoding")
                 })?
             }
             PreparedOwnerMetadata::CanonicalComplete(payload) => payload,
         };
-        self.admit_metadata_payload(&payload, lease.effective_limits())?;
-        let responses = split_payload_answer(payload, |payload| LocalResponse::Metadata {
-            metadata: MetadataResponse { payload },
-        })?;
-        for response in &responses {
+        self.admit_metadata_payload(&payload.value, lease.effective_limits())?;
+        let responses = crate::local_transport::split_payload_answer_funded(
+            payload, |payload| LocalResponse::Metadata {
+                metadata: MetadataResponse { payload },
+            }, lease.effective_limits().memory,
+        )?;
+        for response in &responses.value {
             response_is_encodable(response)?;
         }
         drop(lease);
@@ -3273,11 +3320,13 @@ impl OwnerReadService {
     fn prepare_metadata(
         &self,
         reading: &Database,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         request: LocalMetadataRequest,
         effective_limits: ReadLimits,
         cancellation: &OwnerReadCancellation,
     ) -> OwnerReadScaffoldResult<PreparedOwnerMetadata> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _read_scope = reading.enter_writer_read(None, read_memory.clone());
         match request {
             LocalMetadataRequest::DeliveryStatus { root_table, .. } => {
@@ -3287,7 +3336,8 @@ impl OwnerReadService {
                     read_memory.clone(),
                 )
                 .map_err(OwnerReadScaffoldError::Database)?;
-                let payload = crate::read_contract::encode_metadata_body(&body).map_err(|_| {
+                let payload = crate::read_contract::encode_metadata_body_funded(
+                    &body, read_memory.clone(), effective_limits.memory).map_err(|_| {
                     OwnerReadScaffoldError::unimplemented("custody metadata encoding")
                 })?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
@@ -3306,7 +3356,8 @@ impl OwnerReadService {
                     read_memory.clone(),
                 )
                 .map_err(OwnerReadScaffoldError::Database)?;
-                let payload = crate::read_contract::encode_metadata_body(&body).map_err(|_| {
+                let payload = crate::read_contract::encode_metadata_body_funded(
+                    &body, read_memory.clone(), effective_limits.memory).map_err(|_| {
                     OwnerReadScaffoldError::unimplemented("custody metadata encoding")
                 })?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
@@ -3330,10 +3381,10 @@ impl OwnerReadService {
                         table.clone(),
                     ))
                 })?;
-                let payload = crate::read_contract::encode_metadata_body(
+                let payload = crate::read_contract::encode_metadata_body_funded(
                     &crate::direct_file_reader::DirectMetadataBody::Schema {
                         schema: crate::read_image::project_schema(&table, &meta),
-                    },
+                    }, read_memory.clone(), effective_limits.memory,
                 )
                 .map_err(|_| OwnerReadScaffoldError::unimplemented("canonical schema encoding"))?;
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
@@ -3367,11 +3418,11 @@ impl OwnerReadService {
                         )
                     })
                     .map_err(OwnerReadScaffoldError::Database)?;
-                let payload = crate::read_contract::encode_metadata_body(
+                let payload = crate::read_contract::encode_metadata_body_funded(
                     &crate::direct_file_reader::DirectMetadataBody::VerifyHistory {
                         table,
                         indexes,
-                    },
+                    }, read_memory.clone(), effective_limits.memory,
                 )
                 .map_err(|_| {
                     OwnerReadScaffoldError::unimplemented("canonical history-verification encoding")
@@ -3380,7 +3431,7 @@ impl OwnerReadService {
             }
             LocalMetadataRequest::MaintenanceStatus => {
                 let status = reading.maintenance_status();
-                let payload = crate::read_contract::encode_metadata_body(
+                let payload = crate::read_contract::encode_metadata_body_funded(
                     &crate::direct_file_reader::DirectMetadataBody::MaintenanceStatus {
                         status: crate::direct_file_reader::DirectMaintenanceStatus {
                             policy: match status.policy {
@@ -3394,7 +3445,7 @@ impl OwnerReadService {
                             currency_compaction_enabled: status.currency_compaction_enabled,
                             active_maintenance_loops: status.active_maintenance_loops,
                         },
-                    },
+                    }, read_memory.clone(), effective_limits.memory,
                 )
                 .map_err(|_| {
                     OwnerReadScaffoldError::unimplemented("canonical maintenance-status encoding")

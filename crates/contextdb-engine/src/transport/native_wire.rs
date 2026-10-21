@@ -407,7 +407,7 @@ impl NativeWireRoutes {
 }
 struct NativeRoute<H, L> {
     subject: NativeWireString,
-    provider: std::sync::Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    provider: crate::vector_read_memory::ReadRequestProvider,
     native: H,
     legacy: L,
 }
@@ -546,7 +546,7 @@ impl NativeRouteBuilder {
     pub(crate) fn try_push<H, L>(
         &mut self,
         subject: &str,
-        provider: std::sync::Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+        provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
         make_native: impl FnOnce(ReadMemoryOwner) -> WireResult<H>,
         make_legacy: impl FnOnce(ReadMemoryOwner) -> WireResult<L>,
     ) -> WireResult<()>
@@ -587,7 +587,7 @@ impl NativeRouteBuilder {
         unsafe {
             storage.as_ptr().write(NativeRoute {
                 subject,
-                provider,
+                provider: provider.into(),
                 native,
                 legacy,
             });
@@ -676,7 +676,7 @@ impl Drop for NativeRouteBuilder {
 #[allow(clippy::too_many_arguments)] // Standing roots and policy stay explicit.
 pub(crate) fn install_native_delivery_route<L>(
     installation: NativeReadChildReceipt,
-    provider: std::sync::Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
     subject: &str,
     tenant: &str,
     hub: &str,

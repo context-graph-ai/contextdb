@@ -145,8 +145,10 @@ impl PerEdgeAppliedPushWatermarks {
         tenant_id: &TenantId,
         node_id: &str,
         incarnation: Incarnation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut cache = self.cache.lock().unwrap_or_else(|err| err.into_inner());
         Self::load_locked(&mut cache, db, tenant_id, node_id, incarnation, read_memory)
     }
@@ -168,8 +170,10 @@ impl PerEdgeAppliedPushWatermarks {
         tenant_id: &TenantId,
         node_id: &str,
         incarnation: Incarnation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(known) = cache.get(&(node_id.to_string(), incarnation)) {
             return Ok(*known);
         }
@@ -187,7 +191,7 @@ impl PerEdgeAppliedPushWatermarks {
 }
 
 struct PushApplyWork {
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
 
     db: Arc<Database>,
     local_node_id: Option<String>,
@@ -317,7 +321,7 @@ async fn maybe_wait_for_test_push_barrier(row_count: usize) {
 }
 
 pub struct SyncServer {
-    read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
     db: Arc<Database>,
     transport: Arc<dyn ServerTransport>,
     lineage_signer: Option<LineageSigner>,
@@ -356,7 +360,7 @@ impl SyncServer {
         tenant_id: TenantId,
     ) -> Result<Self, Error> {
         let read_budget_provider = db.declared_read_request_provider();
-        Self::new_with_read_budget_provider(db, endpoint, tenant_id, read_budget_provider)
+        Self::new_with_read_budget_provider_handle(db, endpoint, tenant_id, read_budget_provider)
     }
 
     }
@@ -367,6 +371,17 @@ impl SyncServer {
         endpoint: &crate::transport::PeerEndpoint,
         tenant_id: TenantId,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    ) -> Result<Self, Error> {
+        Self::new_with_read_budget_provider_handle(db, endpoint, tenant_id, read_budget_provider.into())
+    }
+    }
+
+    crate::transport::peer_endpoint_available! {
+    fn new_with_read_budget_provider_handle(
+        db: Arc<Database>,
+        endpoint: &crate::transport::PeerEndpoint,
+        tenant_id: TenantId,
+        read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
     ) -> Result<Self, Error> {
         // Receiving a pushed unit is the hub's write working memory: its
         // writer budget funds reassembling an oversized request.
@@ -392,8 +407,9 @@ impl SyncServer {
         lineage_identity: Option<Arc<crate::identity::FabricIdentity>>,
         tenant_id: TenantId,
         local_node_id: Option<String>,
-        read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+        read_budget_provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
     ) -> Result<Self, Error> {
+        let read_budget_provider: crate::vector_read_memory::ReadRequestProvider = read_budget_provider.into();
         assert!(
             !tenant_id.as_str().is_empty()
                 && tenant_id
@@ -468,7 +484,7 @@ impl SyncServer {
         tenant_id: TenantId,
     ) -> Result<Self, Error> {
         let read_budget_provider = db.declared_read_request_provider();
-        Self::with_authenticated_transport_for_test_with_read_budget_provider(
+        Self::with_authenticated_transport_for_test_with_read_budget_provider_handle(
             db,
             transport,
             tenant_id,
@@ -483,6 +499,16 @@ impl SyncServer {
         transport: Arc<dyn crate::transport::ServerTransport>,
         tenant_id: TenantId,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    ) -> Result<Self, Error> {
+        Self::with_authenticated_transport_for_test_with_read_budget_provider_handle(db, transport, tenant_id, read_budget_provider.into())
+    }
+
+    #[cfg(feature = "test-seams")]
+    fn with_authenticated_transport_for_test_with_read_budget_provider_handle(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        tenant_id: TenantId,
+        read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
     ) -> Result<Self, Error> {
         Self::build(
             db,
@@ -507,7 +533,7 @@ impl SyncServer {
         identity: Arc<crate::identity::FabricIdentity>,
     ) -> Result<Self, Error> {
         let read_budget_provider = db.declared_read_request_provider();
-        Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider(
+        Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(
             db,
             transport,
             tenant_id,
@@ -526,6 +552,18 @@ impl SyncServer {
         local_node_id: String,
         identity: Arc<crate::identity::FabricIdentity>,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    ) -> Result<Self, Error> {
+        Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(db, transport, tenant_id, local_node_id, identity, read_budget_provider.into())
+    }
+
+    #[cfg(feature = "test-seams")]
+    fn with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        tenant_id: TenantId,
+        local_node_id: String,
+        identity: Arc<crate::identity::FabricIdentity>,
+        read_budget_provider: crate::vector_read_memory::ReadRequestProvider,
     ) -> Result<Self, Error> {
         let lineage_identity = identity.clone();
         let signer: LineageSigner = Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)));
@@ -1165,8 +1203,10 @@ async fn handle_status(
     applied_push_watermark: Arc<AtomicLsn>,
     per_edge_watermarks: Arc<PerEdgeAppliedPushWatermarks>,
     req: IncomingRequest,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
@@ -1256,11 +1296,13 @@ fn refused_outcomes_for_request(
     incarnation: Incarnation,
     hub: &str,
     context: Option<&crate::protocol::ReceivedDdlContext>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<(
     Vec<crate::protocol::RefusedSchemaUnitOutcome>,
-    Vec<Arc<crate::read_image_memory::ImageMemory>>,
+    Vec<crate::read_image_memory::ImageMemoryHandle>,
 )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let Some(context) = context else {
         return Ok((Vec::new(), Vec::new()));
     };
@@ -1335,8 +1377,10 @@ async fn refuse_push_for_memory(
     responder: crate::transport::Responder,
     protocol_version: u8,
     error: contextdb_core::Error,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let contextdb_core::Error::MemoryBudgetExceeded {
         subsystem,
         operation,
@@ -1523,7 +1567,7 @@ async fn handle_push(
         let changeset = ChangeSet::try_from(wire)
             .map_err(|e| contextdb_core::Error::SyncError((e.to_string()).into()))?;
         return spawn_apply_and_reply(PushApplyWork {
-            read_memory: read_memory.clone(),
+            read_memory: (read_memory.clone()).into(),
 
             db: state.db.clone(),
             local_node_id: state.local_node_id.clone(),
@@ -1782,7 +1826,7 @@ async fn handle_push(
                 tracing::warn!(%authenticated_peer, error = %err, "failed to record non-schema node last-contact");
             }
             spawn_apply_and_reply(PushApplyWork {
-                read_memory: read_memory.clone(),
+                read_memory: (read_memory.clone()).into(),
 
                 db: state.db.clone(),
                 local_node_id: state.local_node_id.clone(),
@@ -1871,8 +1915,10 @@ async fn handle_pull(
     schema_sync_holdbacks: SchemaSyncHoldbackStates,
     peer_schema_capabilities: PeerSchemaCapabilities,
     req: IncomingRequest,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
@@ -2684,8 +2730,10 @@ pub(crate) fn unsupported_schema_capabilities_for_table(
     db: &Database,
     table: &str,
     capabilities: SchemaCapabilities,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<BTreeSet<SchemaSyncCapability>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut declared = db.authored_schema_capabilities(table, read_memory.clone())?;
     if let Some(meta) = db.table_meta(table) {
         declared.extend(schema_capabilities_in_meta(&meta));
@@ -2703,8 +2751,10 @@ pub(crate) fn unsupported_schema_capabilities_in_changes(
     db: &Database,
     changes: &ChangeSet,
     capabilities: SchemaCapabilities,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<BTreeMap<String, BTreeSet<SchemaSyncCapability>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut tables = HashSet::new();
     tables.extend(changes.rows.iter().map(|row| row.table.clone()));
     tables.extend(
@@ -2748,8 +2798,10 @@ fn holdback_for_capabilities(
     db: &Database,
     state: &PeerSchemaSyncHoldbackState,
     capabilities: SchemaCapabilities,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<CapabilityHoldbackSplit> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut recoverable = HashSet::new();
     let mut remaining = BTreeMap::new();
     for table in state.capabilities.keys() {
@@ -3190,8 +3242,10 @@ async fn admit_push_request(
     request_key: PushRequestKey,
     responder: Responder,
     protocol_version: u8,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<PushAdmission> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut in_flight = in_flight_push_applies.lock().await;
     if let Some(responders) = in_flight.get_mut(&request_key) {
         if responders.len() >= MAX_REPLIES_PER_IN_FLIGHT_PUSH {
@@ -3234,8 +3288,10 @@ async fn publish_in_flight_push_response(
     request_key: PushRequestKey,
     response: PushResponse,
     protocol_version: u8,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     loop {
         let responders = {
             let mut in_flight = in_flight_push_applies.lock().await;
@@ -3268,8 +3324,10 @@ async fn publish_push_response(
     responder: Responder,
     response: PushResponse,
     protocol_version: u8,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let (payload, _encoded_credit) = crate::protocol::encode_for_version_with_read_owner(
         protocol_version,
         MessageType::PushResponse,
@@ -3401,10 +3459,12 @@ fn legacy_delivery_reply(
     db: &Database,
     tenant: &TenantId,
     hub: Option<String>,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     bytes: &[u8],
     node_id: Option<String>,
 ) -> Result<Vec<u8>, TransportError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
@@ -3483,7 +3543,7 @@ fn legacy_delivery_arm(
             }
         };
         counts.legacy.fetch_add(1, Ordering::SeqCst);
-        let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(read_memory.clone());
+        let owner = contextdb_core::read_memory::ReadMemoryOwner::from(read_memory.clone());
         let db = db.clone();
         let tenant = tenant.clone();
         let hub = hub.clone();

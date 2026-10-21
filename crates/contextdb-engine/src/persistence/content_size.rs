@@ -54,7 +54,7 @@ impl ContentSizeTotals {
         bytes
     }
 }
-fn corrupt(reason: &str) -> Error {
+fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "content_size_totals".into(),
         reason: reason.into(),
@@ -786,13 +786,12 @@ pub(super) fn repair_vector_value(
 pub(crate) fn read_totals(
     read: &redb::ReadTransaction,
     path: &str,
-    memory: Arc<dyn ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     before_table: &mut dyn FnMut() -> Result<()>,
 ) -> Result<ContentSizeTotals> {
-    let fail = |reason: &str| Error::StoreCorrupted {
-        path: path.into(),
-        reason: reason.into(),
-    };
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
+    let fail = |reason: &str| crate::funded_error::corruption_display(Ok(memory.clone()), path, reason);
     let mut control = ReadCredit::new(memory.clone());
     // ReadOnlyTable owns its native name String. These are the exact name
     // buffers opened below and by the fixed-root decoder, not a control floor.
@@ -804,7 +803,7 @@ pub(crate) fn read_totals(
     )?;
     let fingerprint = super::erasure_frontiers::binding_in_read(read)?;
     let expected = content_identity::content_size_root_in_read(read)
-        .map_err(|error| fail(&error.to_string()))?;
+        .map_err(|error| crate::funded_error::corruption_display(Ok(memory.clone()), path, error))?;
     control.try_shrink(CONTENT_IDENTITY_ROOTS_TABLE.name().len())?;
     if fingerprint != expected {
         return Err(fail(
@@ -846,7 +845,7 @@ pub(crate) fn read_totals(
             .map_err(RedbPersistence::storage_error)?
             .ok_or_else(|| fail("a committed table has no content-size totals"))?;
         let mut value =
-            ContentSizeTotals::decode(value.value()).map_err(|error| fail(&error.to_string()))?;
+            ContentSizeTotals::decode(value.value()).map_err(|error| crate::funded_error::corruption_display(Ok(memory.clone()), path, error))?;
         // The durable row counter stores all physical values; subtract the
         // authenticated current-head sum only when forming the public report.
         value.retained_row_bytes = value

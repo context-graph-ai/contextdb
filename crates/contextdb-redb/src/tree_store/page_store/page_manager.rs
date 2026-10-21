@@ -18,7 +18,7 @@ use crate::tree_store::page_store::region::{
 };
 use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
 use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
-use crate::{CacheStats, StorageBackend};
+use crate::CacheStats;
 use crate::{DatabaseError, Result, StorageError};
 use std::cmp::{max, min};
 #[cfg(debug_assertions)]
@@ -324,7 +324,6 @@ pub(crate) struct TransactionalMemory {
     // upstream's growth.
     #[cfg(feature = "contextdb-internal")]
     growth_step_ratio: std::sync::atomic::AtomicU64,
-    storage: PagedCachedFile,
     state: Mutex<InMemoryState>,
     // The number of PageMut which are outstanding
     #[cfg(debug_assertions)]
@@ -347,6 +346,9 @@ pub(crate) struct TransactionalMemory {
     /// is refused without reading or allocating anything.
     #[cfg(feature = "contextdb-internal")]
     read_budget: Mutex<Option<ReadBudget>>,
+    // The fixed cache invoice also covers allocator windows in state. Free
+    // that state before storage releases its final genuine reserve owner.
+    storage: PagedCachedFile,
 }
 
 /// One commit slot of a crashed store's header.
@@ -405,6 +407,34 @@ pub(crate) fn rewrite_header_for_test(
 }
 
 impl TransactionalMemory {
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {
+        self.storage.write_control_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn cached_header_for_test(&self) -> Result<super::cached_file::CachePageForTest> {
+        self.storage.cached_header_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn cache_allocations_for_test(&self, visit: &mut dyn FnMut((usize, usize, usize))) -> usize {
+        self.storage.allocations_for_test(visit)
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn controls_for_test(&self) -> [(usize, usize); 2] { self.storage.controls_for_test() }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn lifetime_aliases_for_test(&self) -> Result<(crate::CachePageForTest, crate::CachePageForTest, crate::CacheWriteForTest)> {
+        self.storage.lifetime_aliases_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn detach_cached_memory_for_test(&self, memory: &super::cached_file::PageMemory) -> (u64, usize, usize, bool) {
+        self.storage.detach_cached_memory_for_test(memory)
+    }
+
     /// The file byte range a page number occupies, for proofs that damage a
     /// closed store in place.
     #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
@@ -524,7 +554,7 @@ impl TransactionalMemory {
 
     #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     pub(crate) fn new(
-        file: Box<dyn StorageBackend>,
+        file: impl Into<crate::db::Backend>,
         // Allow initializing a new database in an empty file
         allow_initialize: bool,
         page_size: usize,
@@ -534,6 +564,7 @@ impl TransactionalMemory {
         external_read: bool,
         allocator_free: bool,
     ) -> Result<Self, DatabaseError> {
+        let file: crate::db::Backend = file.into();
         assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
         assert!(!external_read || read_only);
         let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
@@ -733,6 +764,14 @@ impl TransactionalMemory {
             .storage
             .settle_startup_cache_budget(bytes - allocator_window_bytes)?;
         Ok(reserve + allocator_window_bytes)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn retain_cache_reserve(
+        &self,
+        reserve: crate::native_storage_admission::NativeStorageCredit,
+    ) -> super::page_allocation::CacheReserveOwner {
+        self.storage.retain_cache_reserve(reserve)
     }
 
     pub(crate) fn cache_index_bytes(&self) -> usize {
@@ -2202,21 +2241,13 @@ impl TransactionalMemory {
         // smallest growth that still guarantees this allocation's block.
         let minimal_layout = calculate(layout.usable_bytes() + required_growth * 2);
         if minimal_layout.len() < new_layout.len()
-            && matches!(
-                &result,
-                Err(StorageError::Io(error))
-                    if error.kind() == std::io::ErrorKind::QuotaExceeded
-            )
+            && result.as_ref().is_err_and(crate::db::backend_quota_refused)
         {
             new_layout = minimal_layout;
             result = self.storage.resize(new_layout.len());
         }
         if result.is_err() {
-            if matches!(
-                &result,
-                Err(StorageError::Io(error))
-                    if error.kind() == std::io::ErrorKind::QuotaExceeded
-            ) {
+            if result.as_ref().is_err_and(crate::db::backend_quota_refused) {
                 return result;
             }
             // TODO: it would be nice to have a more cohesive approach to setting this.

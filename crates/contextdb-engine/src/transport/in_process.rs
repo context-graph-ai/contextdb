@@ -917,7 +917,7 @@ mod native_serving {
                 else {
                     return Err(TransportError::NoResponder.into());
                 };
-                (ReadMemoryOwner::from_legacy(reader), None)
+                (ReadMemoryOwner::from(reader), None)
             }
         };
         let timeout_ms =

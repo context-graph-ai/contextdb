@@ -36,7 +36,8 @@ impl ReceivedWorkingWrite {
     pub(crate) fn begin_funded(store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation,
     ) -> crate::funded_error::OriginalResult<Self> {
-        let scope = super::native_storage_admission::StorageAdmissionScope::writer_original(original)?;
+        let scope = super::native_storage_admission::StorageAdmissionScope::writer_original_native(original)
+            .map_err(crate::funded_error::OriginalError::native)?;
         scope.run_original(crate::funded_error::OriginalStoragePhase::ReceivedOuter, || store.with_db_original_funded(original, |db|
             Self::begin_in_funded(store, db, original)))
     }
@@ -45,24 +46,27 @@ impl ReceivedWorkingWrite {
         Self::begin_in_route(store, original, || {
             let scope = super::native_storage_admission::StorageAdmissionScope::writer_original(original)?;
             scope.run_original_unqualified(|| RedbPersistence::begin_history_write(db))
-        })
+        }, |error| error)
     }
     pub(super) fn begin_in_funded(store: &RedbPersistence, db: &redb::Database,
         original: &crate::memory_accounting::OwnedMemoryReservation,
     ) -> crate::funded_error::OriginalResult<Self> {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         Self::begin_in_route(store, original, || {
-            let scope = super::native_storage_admission::StorageAdmissionScope::writer_original(original)?;
+            let scope = super::native_storage_admission::StorageAdmissionScope::writer_original_native(original)
+                .map_err(crate::funded_error::OriginalError::native)?;
             scope.run_original(crate::funded_error::OriginalStoragePhase::ReceivedBegin, || RedbPersistence::begin_history_write_funded(original, db))
-        })
+        }, |error| diagnostic.error(error))
     }
-    fn begin_in_route<E: From<Error>>(store:&RedbPersistence,
+    fn begin_in_route<E>(store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         write: impl FnOnce() -> std::result::Result<redb::WriteTransaction, E>,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<Self, E> {
         let owner=crate::memory_accounting::reserve_preparation_from_original(original,
             std::mem::size_of::<Self>(),"persistence","received_working_write",
-            "Raise MEMORY_LIMIT to prepare this received unit.")?;
-        let control_identity = next_working_control_identity()?;
+            "Raise MEMORY_LIMIT to prepare this received unit.").map_err(&existing)?;
+        let control_identity = next_working_control_identity().map_err(&existing)?;
         let write = write()?;
         Ok(Self {write:Some(write),control_identity,original_address:original as *const _ as usize,
             store_address:store as *const _ as usize,scratch:parking_lot::Mutex::new(Vec::new()),
@@ -188,15 +192,12 @@ impl ReceivedWorkingWrite {
         let Some((physical_key,body)) = next.transpose().map_err(RedbPersistence::storage_error)? else {
             return Ok(None);
         };
-        let key: [u8;24] = physical_key.value().try_into().map_err(|_| Error::StoreCorrupted {
-            path: table.to_owned(), reason: "private working row has an invalid physical key".into(),
-        })?;
+        let key: [u8;24] = physical_key.value().try_into().map_err(|_| crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "private working row has an invalid physical key".into()))?;
         let row = RedbPersistence::decode_versioned_row_original(&frame,body.value(),None)?;
         if u64::from_be_bytes(key[..8].try_into().unwrap()) != row.row_id.0
             || u64::from_be_bytes(key[8..16].try_into().unwrap()) != row.created_tx.0
             || u64::from_be_bytes(key[16..].try_into().unwrap()) != row.lsn.0 {
-            return Err(Error::StoreCorrupted { path: table.to_owned(),
-                reason: "private working row key and body disagree".into() });
+            return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "private working row key and body disagree".into()));
         }
         drop(body);
         drop(physical_key);
@@ -249,7 +250,7 @@ impl ReceivedWorkingWrite {
                 let encoded:EncodedRelationalIndexPosition=frame.decode(&key.0)?;
                 let _json_scratch=frame.json_scratch(encoded.key.iter().map(|(_,value)|value))?;
                 if frame.encode(&encoded)?!=key.0 || encoded.created_tx!=TxId(0) {
-                    return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"noncanonical working current index key".into()});
+                    return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "noncanonical working current index key".into()));
                 }
                 frame.array::<DirectedValue>(encoded.key.len())?;
                 let mut position:RelationalIndexPosition=encoded.into();
@@ -284,10 +285,10 @@ impl ReceivedWorkingWrite {
                         let lsn=Lsn(u64::from_be_bytes(rest[..8].try_into().unwrap()));
                         let kind=match rest[8] {0=>SyncSourceKind::Pulled,1=>SyncSourceKind::AcceptedLocal,
                             2=>SyncSourceKind::AcceptedLocalPending,
-                            _=>return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"invalid private provenance kind".into()})};
+                            _=>return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "invalid private provenance kind".into()))};
                         Ok(Some((lsn,kind)))
                     },
-                    _=>Err(Error::StoreCorrupted {path:table.to_owned(),reason:"invalid private provenance record".into()}),
+                    _=>Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "invalid private provenance record".into())),
                 };
             }
             if source.get(&[] as &[u8]).map_err(RedbPersistence::storage_error)?.is_some() {
@@ -307,8 +308,8 @@ impl ReceivedWorkingWrite {
             (None,None)=>Ok(None),
             (Some(lsn),Some(kind))=>Ok(Some((lsn,match kind {0=>SyncSourceKind::Pulled,
                 1=>SyncSourceKind::AcceptedLocal,2=>SyncSourceKind::AcceptedLocalPending,
-                _=>return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"invalid working source provenance kind".into()}) }))),
-            _=>Err(Error::StoreCorrupted {path:table.to_owned(),reason:"incomplete working source provenance".into()}),
+                _=>return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "invalid working source provenance kind".into())) }))),
+            _=>Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "incomplete working source provenance".into())),
         }
     }
 }
@@ -371,7 +372,7 @@ impl ReceivedWorkingWrite {
             let mut admission=ProofAdmission::new(original,store.proof_scratch_owner())?;
             let next=manifest::writer_manifest_next(self.transaction(),&prefix,false,&mut admission)?;
             if next.as_ref().is_some_and(|key|key.starts_with(&prefix)) {
-                return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"working source has rooted rows but no physical table".into()});
+                return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "working source has rooted rows but no physical table".into()));
             }
             self.transaction().open_table(destination_def).map_err(RedbPersistence::storage_error)?;
             return self.keep_scratch_name(name,frame.into_reservation());
@@ -388,16 +389,16 @@ impl ReceivedWorkingWrite {
                     after.is_some(),&mut admission)?;
                 let Some(coordinate)=next.filter(|key|key.starts_with(&prefix)) else {
                     if rows.next().transpose().map_err(RedbPersistence::storage_error)?.is_some() {
-                        return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"working source has an unrooted physical suffix".into()});
+                        return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "working source has an unrooted physical suffix".into()));
                     }
                     break;
                 };
                 let Some((key,body))=rows.next().transpose().map_err(RedbPersistence::storage_error)? else {
-                    return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"working source lost a rooted physical row".into()});
+                    return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "working source lost a rooted physical row".into()));
                 };
                 let expected=manifest::manifest_for_body(table,key.value(),body.value(),&mut admission)?;
                 if coordinate!=expected {
-                    return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"working source physical order/body disagrees with its rooted row".into()});
+                    return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "working source physical order/body disagrees with its rooted row".into()));
                 }
                 destination.insert(key.value(),body.value()).map_err(RedbPersistence::storage_error)?;
                 drop(expected);drop(body);drop(key);
@@ -536,22 +537,24 @@ impl ReceivedWorkingWrite {
     pub(super) fn take_or_begin(store:&RedbPersistence,db:&redb::Database,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         stage:&ReceivedSchemaPersistenceProjection)->Result<Self> {
-        Self::take_or_begin_in(store, db, original, stage, Self::begin_in)
+        Self::take_or_begin_in(store, db, original, stage, Self::begin_in, |error| error)
     }
     pub(super) fn take_or_begin_funded(store:&RedbPersistence,db:&redb::Database,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         stage:&ReceivedSchemaPersistenceProjection)->crate::funded_error::OriginalResult<Self> {
-        Self::take_or_begin_in(store, db, original, stage, Self::begin_in_funded)
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        Self::take_or_begin_in(store, db, original, stage, Self::begin_in_funded, |error| diagnostic.error(error))
     }
-    pub(super) fn take_or_begin_in<E: From<Error>>(store:&RedbPersistence,db:&redb::Database,
+    pub(super) fn take_or_begin_in<E>(store:&RedbPersistence,db:&redb::Database,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         stage:&ReceivedSchemaPersistenceProjection,
         begin: impl FnOnce(&RedbPersistence, &redb::Database,
             &crate::memory_accounting::OwnedMemoryReservation) -> std::result::Result<Self, E>,
+        existing: impl Fn(Error) -> E,
     )->std::result::Result<Self,E> {
         let prepared={
             let mut slot=stage.working_write.lock();
-            if let Some(write)=slot.as_ref() {write.require_original(original)?;}
+            if let Some(write)=slot.as_ref() {write.require_original(original).map_err(&existing)?;}
             slot.take()
         };
         if let Some(write)=prepared {
@@ -770,8 +773,7 @@ impl ReceivedWorkingWrite {
             key[8..16].copy_from_slice(&row.created_tx.0.to_be_bytes());
             key[16..].copy_from_slice(&row.lsn.0.to_be_bytes());
             if previous.is_some_and(|old|old>=key) {
-                return Err(Error::StoreCorrupted {path:table.to_owned(),
-                    reason:"private projection contains repeated or unordered row identities".into()});
+                return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "private projection contains repeated or unordered row identities".into()));
             }
             let window=OriginalPersistenceFrame::new(original)?;
             let encoded=RedbPersistence::encode_versioned_row_original(&window,row,Some(meta))?;
@@ -889,7 +891,7 @@ impl ReceivedWorkingWrite {
                 use contextdb_relational::store::SyncSourceKind;
                 let kind=match kind {0=>SyncSourceKind::Pulled,1=>SyncSourceKind::AcceptedLocal,
                     2=>SyncSourceKind::AcceptedLocalPending,
-                    _=>return Err(Error::StoreCorrupted {path:table.to_owned(),reason:"invalid adjudicated provenance kind".into()})};
+                    _=>return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), table, "invalid adjudicated provenance kind".into()))};
                 self.mark_sync_source(original,table,row,Some((lsn,kind)))
             })
     }

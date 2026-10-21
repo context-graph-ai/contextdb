@@ -552,8 +552,10 @@ impl LocalEngineFailure {
 
     pub(crate) fn from_query_error(
         error: &contextdb_core::Error,
-        owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Funded<Self>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         let document = super::engine_answer::encode_query_error_funded(error, owner)?;
         Ok(Funded { value: Self { document: document.value }, credit: document.credit })
     }
@@ -562,7 +564,7 @@ impl LocalEngineFailure {
     /// and never charges already-funded document bytes as a new input copy.
     pub(crate) fn decode_query_error(
         &self,
-        memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>, ceiling: u64,
+        memory: &crate::read_image_memory::ImageMemoryHandle, ceiling: u64,
     ) -> contextdb_core::Result<Funded<contextdb_core::Error>> {
         preflight_read_channel_error(&self.document, ceiling)
             .map_err(|error| match error {
@@ -739,7 +741,7 @@ const fn ends_the_exchange(response: &LocalResponse) -> bool {
 pub struct LocalProtocolBoundary {
     effective_limits: ReadLimits,
     cursor_receive_memory: Option<u64>,
-    query_funding: std::sync::Mutex<Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>>,
+    query_funding: std::sync::Mutex<Option<contextdb_core::read_memory::ReadMemoryOwner>>,
     ordinary_bytes: std::sync::Mutex<OrdinaryBoundaryBytes>,
     payload_assembly: std::sync::Mutex<PayloadAssemblyBytes>,
 }
@@ -775,11 +777,11 @@ impl LocalProtocolBoundary {
         Ok(Some(memory.saturating_sub(held)))
     }
 
-    pub(crate) fn query_funding(&self) -> Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+    pub(crate) fn query_funding(&self) -> Option<contextdb_core::read_memory::ReadMemoryOwner> {
         self.query_funding.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    pub(crate) fn set_query_funding(&self, owner: Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>) {
+    pub(crate) fn set_query_funding(&self, owner: Option<contextdb_core::read_memory::ReadMemoryOwner>) {
         *self.query_funding.lock().unwrap_or_else(|p| p.into_inner()) = owner;
     }
 
@@ -833,7 +835,7 @@ impl LocalProtocolBoundary {
                     OrdinaryBoundaryDirection::Outbound,
                 )?;
             }
-            Funded::allocate(self.query_funding(), payload.value.len() + 4, || {
+            Funded::allocate_owned(self.query_funding(), payload.value.len() + 4, || {
                 let mut frame = Vec::with_capacity(payload.value.len() + 4);
                 frame.extend_from_slice(&prefix);
                 frame.extend_from_slice(&payload.value);
@@ -1023,7 +1025,7 @@ impl LocalProtocolBoundary {
 
     pub(crate) fn decode_query_request(
         &self, payload: &[u8],
-        memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Funded<LocalRequestEnvelope>, LocalTransportError> {
         preflight_request(payload, self.effective_limits.memory)?;
         let request = super::query_funding::decode::<LocalRequestEnvelope>(payload, memory)
@@ -1035,7 +1037,7 @@ impl LocalProtocolBoundary {
 
     pub(crate) fn decode_query_response(
         &self, payload: &[u8],
-        memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Funded<LocalResponse>, LocalTransportError> {
         let expectation = LocalResponseExpectation::OrdinaryResult;
         preflight_response(payload, &expectation, self.effective_limits.memory, false)?;
@@ -1825,7 +1827,7 @@ pub struct OrdinaryResultReceiver {
     byte_limit: u64,
     memory_ceiling: u64,
     state: Option<ResultReceiveState>,
-    receiving_memory: Option<std::sync::Arc<crate::read_image_memory::ImageMemory>>,
+    receiving_memory: Option<crate::read_image_memory::ImageMemoryHandle>,
 }
 
 pub(crate) struct FundedOrdinaryResult {
@@ -1843,14 +1845,16 @@ pub(crate) enum FundedResultReceiveOutcome {
 
 pub(crate) fn split_canonical_result_funded(
     bytes: &[u8],
-    owner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     memory_ceiling: u64,
 ) -> Result<Funded<Vec<LocalResponse>>, LocalTransportError> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
     let capacity = MAX_FRAME_BYTES - 6;
     let count = bytes.len().saturating_sub(1) / capacity + 1;
     let invoice = count.checked_mul(std::mem::size_of::<LocalResponse>())
         .and_then(|n| n.checked_add(bytes.len())).ok_or_else(invalid_channel_data)?;
-    Funded::allocate(Some(owner), invoice, || {
+    Funded::allocate_owned(Some(owner), invoice, || {
         let mut responses = Vec::with_capacity(count);
         let mut remainder = bytes;
         while remainder.len() > capacity {
@@ -1897,6 +1901,48 @@ pub fn split_canonical_result(
     Ok(responses)
 }
 
+/// Split engine-created metadata using its original payload invoice. The
+/// small answer moves without copying; larger answers admit both the response
+/// slots and every copied byte while the source buffer is still alive.
+pub(crate) fn split_payload_answer_funded(
+    mut payload: Funded<Vec<u8>>,
+    terminal: impl Fn(Vec<u8>) -> LocalResponse,
+    memory_ceiling: u64,
+) -> Result<Funded<Vec<LocalResponse>>, LocalTransportError> {
+    let empty = crate::read_contract::encoded_size(&terminal(Vec::new()))
+        .map_err(transport_decode_error)?;
+    let terminal_capacity = MAX_FRAME_BYTES.saturating_sub(empty + 4);
+    let owner = payload.credit.as_ref().ok_or_else(invalid_channel_data)?.owner();
+    if payload.value.len() <= terminal_capacity {
+        payload.credit.as_mut().expect("funded payload keeps credit").try_grow_for(
+            std::mem::size_of::<LocalResponse>(), "reader", "query_buffer",
+            "Reduce simultaneous query working memory or raise the declared reader limit.",
+        ).map_err(|error| transport_decode_error(
+            crate::read_contract::encoding_error_from_core(error, memory_ceiling)))?;
+        let mut responses = Vec::with_capacity(1);
+        responses.push(terminal(payload.value));
+        return Ok(Funded { value: responses, credit: payload.credit });
+    }
+    let capacity = MAX_FRAME_BYTES - 6;
+    let chunks = (payload.value.len() - terminal_capacity).div_ceil(capacity);
+    let count = chunks.checked_add(1).ok_or_else(invalid_channel_data)?;
+    let invoice = count.checked_mul(std::mem::size_of::<LocalResponse>())
+        .and_then(|n| n.checked_add(payload.value.len())).ok_or_else(invalid_channel_data)?;
+    Funded::allocate_owned(Some(owner), invoice, || {
+        let mut responses = Vec::with_capacity(count);
+        let mut remainder = payload.value.as_slice();
+        while remainder.len() > terminal_capacity {
+            let take = capacity.min(remainder.len());
+            let (chunk, rest) = remainder.split_at(take);
+            responses.push(LocalResponse::ResultChunk { chunk: ResultChunk { bytes: chunk.to_vec() } });
+            remainder = rest;
+        }
+        responses.push(terminal(remainder.to_vec()));
+        responses
+    }).map_err(|error| transport_decode_error(
+        crate::read_contract::encoding_error_from_core(error, memory_ceiling)))
+}
+
 /// Split one payload-carrying answer into the frames this channel can move,
 /// with the response that ends the exchange carrying the last of them.
 ///
@@ -1918,7 +1964,8 @@ pub fn split_payload_answer(
     // real encoder rather than assumed, plus the four bytes a payload length
     // grows by once it needs the widest variable-length form.
     const LENGTH_GROWTH: usize = 4;
-    let empty = encode_message(&terminal(Vec::new()))?.len();
+    let empty = crate::read_contract::encoded_size(&terminal(Vec::new()))
+        .map_err(transport_decode_error)?;
     let terminal_capacity = MAX_FRAME_BYTES.saturating_sub(empty + LENGTH_GROWTH);
     if payload.len() <= terminal_capacity {
         return Ok(vec![terminal(payload)]);
@@ -1962,7 +2009,7 @@ impl OrdinaryResultReceiver {
     pub(crate) fn with_receiving_memory(
         byte_limit: u64,
         memory_ceiling: u64,
-        receiving_memory: std::sync::Arc<crate::read_image_memory::ImageMemory>,
+        receiving_memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Self, LocalTransportError> {
         let mut receiver = Self::with_effective_ceilings(byte_limit, memory_ceiling)?;
         receiver.receiving_memory = Some(receiving_memory);
@@ -2240,10 +2287,10 @@ impl OrdinaryResultReceiver {
 
     pub(crate) fn with_query_memory(
         byte_limit: u64, memory_ceiling: u64,
-        memory: std::sync::Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Self, LocalTransportError> {
         let mut receiver = Self::with_receiving_memory(byte_limit, memory_ceiling, memory.clone())?;
-        receiver.chunks = FundedVec::new(Some(memory));
+        receiver.chunks = FundedVec::new_owned(Some(memory.owner()));
         Ok(receiver)
     }
 
@@ -2271,7 +2318,6 @@ impl OrdinaryResultReceiver {
             return Err(invalid_channel_data());
         }
         if let Some(owner) = self.chunks.owner() {
-            let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(owner);
             if !response.credit.as_ref().is_some_and(|credit| credit.is_funded_by(&owner)) {
                 self.discard_buffered();
                 return Err(invalid_channel_data());
@@ -2313,7 +2359,7 @@ impl OrdinaryResultReceiver {
                     }
                 };
                 let owner = self.chunks.owner();
-                let mut bytes = match Funded::allocate(owner.clone(), final_length,
+                let mut bytes = match Funded::allocate_owned(owner.clone(), final_length,
                     || Vec::with_capacity(final_length)) {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -2431,8 +2477,8 @@ pub fn encode_message<T: Serialize>(message: &T) -> Result<Vec<u8>, LocalTranspo
 /// (`LocalProtocolBoundary::encode_frame`) still runs moments later, at the
 /// real send.
 pub(crate) fn response_is_encodable(response: &LocalResponse) -> Result<(), LocalTransportError> {
-    let encoded = encode_message(response)?;
-    encode_payload_frame(&encoded)?;
+    let len = crate::read_contract::encoded_size(response).map_err(transport_decode_error)?;
+    frame_length_prefix(len)?;
     Ok(())
 }
 

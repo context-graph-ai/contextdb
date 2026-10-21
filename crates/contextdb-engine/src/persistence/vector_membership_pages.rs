@@ -438,21 +438,16 @@ pub(super) fn publish_pending_frontier(
 }
 
 pub(super) fn metadata_error(error: impl Into<redb::Error>) -> Error {
-    let error = error.into();
-    let corrupted = match &error {
-        redb::Error::Corrupted(reason) => Some(reason.clone()),
-        _ => None,
-    };
+    let error: redb::Error = error.into();
+    let corrupted = matches!(&error, redb::Error::Corrupted(_));
     // Consume the error so an admission payload survives the projection's
     // metadata adapter instead of being flattened through Display.
     let refusal = RedbPersistence::storage_error(error);
     match refusal {
-        Error::Other(reason) => match corrupted {
-            Some(reason) => corruption(&reason),
-            None => Error::VectorMetadataIo {
+        Error::Other(reason) => if corrupted { corruption(reason) } else { Error::VectorMetadataIo {
                 operation: "vector membership metadata".into(),
-                reason: reason.into_owned(),
-            },
+                reason,
+            }
         },
         error => error,
     }
@@ -462,7 +457,7 @@ pub(super) fn typed_metadata_error(error: Error) -> Error {
     match error {
         Error::Other(reason) => Error::VectorMetadataIo {
             operation: "vector membership metadata".into(),
-            reason: reason.into_owned(),
+            reason: reason,
         },
         error => error,
     }
@@ -544,7 +539,7 @@ pub(super) fn read_partition_summary(
     Ok(MembershipSummary::default())
 }
 
-fn corruption(reason: &str) -> Error {
+fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "vector_membership_summary_pages".into(),
         reason: reason.into(),
@@ -582,7 +577,9 @@ pub(super) fn decode_summary(key: &[u8], bytes: &[u8]) -> Result<MembershipSumma
     let payload = &bytes[MAGIC.len()..end];
     let (summary, consumed): (MembershipSummary, usize) =
         bincode::serde::decode_from_slice(payload, bincode::config::standard())
-            .map_err(|error| corruption(&format!("membership summary payload is invalid: {error}")))?;
+            .map_err(|error| crate::funded_error::corruption_display(
+                crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+                "vector_membership_summary_pages", format_args!("membership summary payload is invalid: {error}")))?;
     if consumed != payload.len() {
         return Err(corruption("membership summary payload has trailing bytes"));
     }
@@ -669,14 +666,14 @@ fn reverse_key_from_membership_key(mut key: &[u8]) -> Result<Vec<u8>> {
 
 fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembershipRecord> {
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-        .map_err(|reason| corruption(&reason))?;
+        .map_err(|reason| corruption(reason))?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-        .map_err(|reason| corruption(&reason))?;
+        .map_err(|reason| corruption(reason))?;
     let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
         VectorPartitionRecordKind::Membership,
         encoded,
     )
-    .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+    .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
     if source_key(&record) != key {
         return Err(corruption(
             "membership source key does not match its authenticated identity",
@@ -690,14 +687,14 @@ fn decode_primary_member(
     encoded: &[u8],
 ) -> Result<VectorPartitionMembershipRecord> {
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-        .map_err(|reason| corruption(&reason))?;
+        .map_err(|reason| corruption(reason))?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-        .map_err(|reason| corruption(&reason))?;
+        .map_err(|reason| corruption(reason))?;
     let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
         VectorPartitionRecordKind::Membership,
         encoded,
     )
-    .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+    .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
     if RedbPersistence::vector_partition_membership_key(&record) != membership_key {
         return Err(corruption(
             "one owning row version has conflicting vector placements",
@@ -852,7 +849,7 @@ fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
                 VectorPartitionRecordKind::Membership,
                 value.value(),
             )
-            .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+            .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
         if reverse_key(&other).as_slice() != key.value() {
             return Err(corruption(
                 "reverse membership key disagrees with its body identity",
@@ -1042,7 +1039,7 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
                     VectorPartitionRecordKind::GenerationCatalog,
                     value.value(),
                 )
-                .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+                .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
             partition.pending.covered_tx = catalog.change.unwrap_or(catalog.base).covered_tx;
             partition.base_pending = catalog.change.map(|_| PendingCounts {
                 covered_tx: catalog.base.covered_tx,
@@ -1831,14 +1828,14 @@ pub(super) fn decode_reverse_member(
     encoded: &[u8],
 ) -> Result<VectorPartitionMembershipRecord> {
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-        .map_err(|reason| corruption(&reason))?;
+        .map_err(|reason| corruption(reason))?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-        .map_err(|reason| corruption(&reason))?;
+        .map_err(|reason| corruption(reason))?;
     let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
         VectorPartitionRecordKind::Membership,
         encoded,
     )
-    .map_err(|failure| failure.into_error(|reason| corruption(&reason)))?;
+    .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
     if reverse_key(&record) != key {
         return Err(corruption(
             "reverse membership key disagrees with its authenticated identity",
@@ -1913,59 +1910,47 @@ pub(super) fn partition_live_entries(
     usize::try_from(summary.live_entries).map_err(|_| corruption("membership live count overflow"))
 }
 
-/// Check one maintained summary against its complete captured source prefix.
-/// The high-water max_tx may exceed the remaining members after retirement.
-pub(super) fn verify_summary_projection(
-    read: &redb::ReadTransaction,
-    prefix: &[u8],
-    encoded: &[u8],
-    owner: &mut contextdb_vector::VectorCopyAdmission,
-    before: &mut dyn FnMut() -> Result<()>,
-) -> Result<()> {
-    before()?;
-    let expected = decode_summary(prefix, encoded)?;
-    let mut actual = MembershipSummary::default();
-    let source = open_optional_read_table(read, SOURCE)?;
-    let mut cursor = source
+/// Authenticate the fixed-size global summary at an already fingerprint-checked
+/// captured root. Its digest covers SOURCE keys, whereas the open-directory
+/// digest covers forward keys; those two digests are deliberately not equal.
+pub(super) fn verify_summary_projection(read: &redb::ReadTransaction, entries: u64) -> Result<()> {
+    let summaries = open_optional_read_table(read, SUMMARY)?;
+    let encoded = summaries
         .as_ref()
-        .map(|table| table.prefix_bounded(prefix).map_err(metadata_error))
-        .transpose()?;
-    loop {
-        before()?;
-        let Some(item) = cursor.as_mut().and_then(Iterator::next) else {
-            break;
-        };
-        let (key, value) = item.map_err(metadata_error)?;
-        let mut window = owner.scratch();
-        window.reserve(
-            key.value()
-                .len()
-                .checked_add(value.value().len())
-                .and_then(|n| n.checked_mul(6))
-                .and_then(|n| n.checked_add(std::mem::size_of::<VectorPartitionMembershipRecord>()))
-                .ok_or_else(|| corruption("summary projection window overflow"))?,
-        )?;
-        let payload =
-            vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-                .map_err(|reason| corruption(&reason))?;
-        window.reserve(
-            vector_partition_route_native_capacity(payload)
-                .map_err(|reason| corruption(&reason))?
-                .checked_mul(3)
-                .ok_or_else(|| corruption("summary route native capacity overflow"))?,
-        )?;
-        let record = decode_source_member(key.value(), value.value())?;
-        adjust(&mut actual, key.value(), value.value(), &record, true)?;
+        .map(|table| table.get(GLOBAL).map_err(metadata_error))
+        .transpose()?
+        .flatten();
+    match encoded {
+        Some(encoded) => {
+            let summary = decode_summary(GLOBAL, encoded.value())?;
+            // Publication of a global row proves these schemas have existed,
+            // including after their last entries retire. A zero count cannot
+            // authorize silently losing an empty companion table.
+            for definition in [SOURCE, REVERSE, VECTOR_PARTITION_MEMBERSHIP_TABLE] {
+                if open_optional_read_table(read, definition)?.is_none() {
+                    return Err(corruption(
+                        "global membership summary has a missing companion schema",
+                    ));
+                }
+            }
+            if summary.entries != entries || (entries == 0 && summary.digest != [0; 32]) {
+                return Err(corruption(
+                    "global membership summary disagrees with captured directory",
+                ));
+            }
+        }
+        None if entries == 0 => {
+            // Declared empty routes can precede the first membership and its
+            // global summary. A no-op removal can create both empty companions.
+            // The captured fingerprints authenticate their contents; require
+            // the companion schemas to agree independently of their counts.
+            if open_optional_read_table(read, SOURCE)?.is_some()
+                != open_optional_read_table(read, REVERSE)?.is_some()
+            {
+                return Err(corruption("empty membership companion schemas disagree"));
+            }
+        }
+        None => return Err(corruption("global membership summary is absent")),
     }
-    if expected.entries != actual.entries
-        || expected.live_entries != actual.live_entries
-        || expected.digest != actual.digest
-        || expected.max_tx < actual.max_tx
-    {
-        return Err(corruption(
-            "summary disagrees with its complete captured source projection",
-        ));
-    }
-    before()?;
     Ok(())
 }

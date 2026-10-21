@@ -29,7 +29,7 @@ use contextdb_engine::persistence::read_persistence_test_scaffold::{
     observe_read_image_source_events_for_test, prepare_durable_store_damage_for_test,
 };
 use contextdb_engine::read_content_test_adapter::committed_content_for_test;
-use contextdb_engine::read_contract::{encode_cursor_page, encode_query_result};
+use contextdb_engine::read_contract::encode_query_result;
 use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_vector::stored_vector_value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1487,14 +1487,7 @@ fn assert_complete_public_image_state(
 }
 
 fn exact_empty_page(columns: &[String], snapshot: DirectSnapshot) -> DirectCursorPage {
-    let page = contextdb_core::read_contract::CursorPage {
-        columns: columns.to_vec(),
-        rows: Vec::new(),
-        has_more: false,
-    };
-    let canonical_bytes =
-        encode_cursor_page(&page).expect("shared encoder supplies empty terminal-page bytes");
-    DirectCursorPage::new_for_test(page, canonical_bytes, snapshot)
+    DirectCursorPage::new_for_test(columns.to_vec(), snapshot)
 }
 
 fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCursorPage> {
@@ -1518,17 +1511,7 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
         assert_eq!(page.page.has_more, ordinal + 1 < fixture.cursor_rows.len());
         assert_eq!(
             page.canonical_bytes,
-            encode_cursor_page(
-                &page
-                    .page
-                    .try_clone(
-                        reader
-                            .request_read_memory_for_test()
-                            .expect("admit the fixture page copy reader")
-                    )
-                    .expect("share the admitted private page")
-                    .into_public()
-            )
+            page.encode_page_for_test()
             .expect("shared encoder supplies cursor bytes")
         );
     }

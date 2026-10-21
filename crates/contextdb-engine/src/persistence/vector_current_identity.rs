@@ -10,7 +10,7 @@ pub(super) const CURRENT: TableDefinition<&[u8], &[u8]> =
 pub(super) const ROOT: &str = "vector_current_counted_identity_root";
 const MAGIC: &[u8; 8] = b"CDBVCI01";
 
-fn damage(reason: &str) -> Error {
+fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "vector_current_counted_identity".into(),
         reason: reason.into(),
@@ -188,8 +188,10 @@ pub(crate) fn accepted_identity(
     partition: &VectorPartitionKey,
     accepted: &VersionedRow,
     copies: &mut VectorCopyAdmission,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<(TxId, Lsn)>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     vector_membership_source::operation_checkpoint()?;
     let mut scratch = copies.scratch();
     scratch.reserve(
@@ -276,14 +278,14 @@ pub(crate) fn accepted_identity(
         scratch.reserve(source.value().len().saturating_mul(8))?;
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Membership, source.value())
-                .map_err(|reason| damage(&reason))?;
+                .map_err(|reason| damage(reason))?;
         prevalidate_vector_partition_metadata_routes(
             VectorPartitionRecordKind::Membership,
             payload,
         )
-        .map_err(|reason| damage(&reason))?;
+        .map_err(|reason| damage(reason))?;
         let native =
-            vector_partition_route_native_capacity(payload).map_err(|reason| damage(&reason))?;
+            vector_partition_route_native_capacity(payload).map_err(|reason| damage(reason))?;
         scratch.reserve(native.saturating_mul(8))?;
         // All decoded fields are transient; only two scalar identities leave
         // this lookup. Release their codec charges after the record and keys

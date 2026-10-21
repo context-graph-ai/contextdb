@@ -819,7 +819,7 @@ fn a_settled_cursor_fetch_clears_its_connections_in_flight_registration_before_i
     assert!(
         decode_cursor_page(&opened.payload)
             .expect("decode the first page")
-            .has_more,
+            .has_more(),
         "the fixture must leave a second page for the fetch this proof exercises"
     );
     // CursorOpen's own admission and its own page publication are not the
@@ -1962,7 +1962,7 @@ fn six_typed_request_limits_and_active_timeout_use_their_frozen_boundaries() {
         .database
         .execute(sql, &HashMap::new())
         .expect("calibrate canonical result from the same committed rows");
-    let exact_rows = u64::try_from(calibration.rows.len()).expect("row count fits u64");
+    let exact_rows = u64::try_from(calibration.rows().len()).expect("row count fits u64");
     let exact_bytes =
         u64::try_from(query_result_encoded_size(&calibration).expect("canonical result size"))
             .expect("canonical bytes fit u64");
@@ -2310,11 +2310,11 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     let first = decode_cursor_page(&opened.payload).expect("decode first cursor page");
     assert_eq!(
-        first.rows.len(),
+        first.rows().len(),
         2,
         "the owner's lower cursor_page_rows clamps the default page"
     );
-    assert!(first.has_more);
+    assert!(first.has_more());
     let full_two_row_bytes =
         u64::try_from(opened.payload.len()).expect("cursor page size fits u64");
     let live = harness.service.resources();
@@ -2351,8 +2351,8 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     let caller_shaped_page =
         decode_cursor_page(&caller_shaped.payload).expect("decode caller-shaped cursor page");
-    assert_eq!(caller_shaped_page.rows.len(), 1);
-    assert!(caller_shaped_page.has_more);
+    assert_eq!(caller_shaped_page.rows().len(), 1);
+    assert!(caller_shaped_page.has_more());
     harness
         .request(
             41,
@@ -2380,7 +2380,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     let exact_page =
         decode_cursor_page(&exact_page_shape.payload).expect("decode exact-byte cursor page");
-    assert_eq!(exact_page.rows.len(), 2);
+    assert_eq!(exact_page.rows().len(), 2);
     harness
         .request(
             39,
@@ -2408,8 +2408,8 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     let byte_stopped_page =
         decode_cursor_page(&byte_stopped.payload).expect("decode byte-stopped cursor page");
-    assert_eq!(byte_stopped_page.rows.len(), 1);
-    assert!(byte_stopped_page.has_more);
+    assert_eq!(byte_stopped_page.rows().len(), 1);
+    assert!(byte_stopped_page.has_more());
     harness
         .request(
             38,
@@ -2461,7 +2461,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     assert!(
         !decode_cursor_page(&exact_explicit_page.payload)
             .expect("decode exact explicit-fetch page")
-            .has_more,
+            .has_more(),
     );
     assert_eq!(harness.service.resources(), live);
 
@@ -2500,14 +2500,14 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
     );
     let resumed = decode_cursor_page(&resumed.payload).expect("decode the page after the refusal");
     assert_eq!(
-        resumed.rows,
+        resumed.rows(),
         vec![vec![
             Value::Int64(3),
             Value::Text("cursor-row-3".to_owned())
         ]],
         "the page after the refusal is the next row, with nothing skipped and nothing repeated"
     );
-    assert!(!resumed.has_more);
+    assert!(!resumed.has_more());
     assert_resources(&harness.service, baseline);
 
     let exhaustion = cursor_opened(
@@ -2536,8 +2536,8 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
             .expect("owner cursor fetch resumes the retained bounded cursor"),
     );
     let final_page = decode_cursor_page(&final_page.payload).expect("decode final cursor page");
-    assert_eq!(final_page.rows.len(), 1);
-    assert!(!final_page.has_more);
+    assert_eq!(final_page.rows().len(), 1);
+    assert!(!final_page.has_more());
     assert_resources(&harness.service, baseline);
 
     let past_end = cursor_page(
@@ -2553,8 +2553,8 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
             .expect("fetch after exhaustion is one empty success page"),
     );
     let past_end = decode_cursor_page(&past_end.payload).expect("decode exhausted cursor page");
-    assert!(past_end.rows.is_empty());
-    assert!(!past_end.has_more);
+    assert!(past_end.rows().is_empty());
+    assert!(!past_end.has_more());
     let close_after_end = harness
         .request(
             43,
@@ -2633,7 +2633,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
         decode_cursor_page(&calibration.payload).expect("decode calibration cursor page");
     let required_page_bytes =
         u64::try_from(calibration.payload.len()).expect("cursor page size fits u64");
-    assert!(!calibration_page.has_more);
+    assert!(!calibration_page.has_more());
     assert_resources(&harness.service, baseline);
 
     let mut exact_page_bytes = owner_limits;
@@ -3123,8 +3123,8 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             .expect("a statement-cancelled fetch resumes the same cursor"),
     );
     let resumed = decode_cursor_page(&resumed.payload).expect("decode resumed cursor page");
-    assert_eq!(resumed.rows, vec![vec![Value::Int64(2)]]);
-    assert!(resumed.has_more);
+    assert_eq!(resumed.rows(), vec![vec![Value::Int64(2)]]);
+    assert!(resumed.has_more());
     let records = observer.records();
     let [record] = records.as_slice() else {
         panic!("resumed fetch reaches one production bounded operation");
@@ -3146,8 +3146,8 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             .expect("the resumed snapshot advances to its third original row"),
     );
     let third = decode_cursor_page(&third.payload).expect("decode third snapshot page");
-    assert_eq!(third.rows, vec![vec![Value::Int64(3)]]);
-    assert!(third.has_more);
+    assert_eq!(third.rows(), vec![vec![Value::Int64(3)]]);
+    assert!(third.has_more());
     assert_resources_draining(&harness.service, after_resume);
 
     let final_page = cursor_page(
@@ -3163,8 +3163,8 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             .expect("the resumed snapshot exhausts at its fourth original row"),
     );
     let final_page = decode_cursor_page(&final_page.payload).expect("decode final snapshot page");
-    assert_eq!(final_page.rows, vec![vec![Value::Int64(4)]]);
-    assert!(!final_page.has_more);
+    assert_eq!(final_page.rows(), vec![vec![Value::Int64(4)]]);
+    assert!(!final_page.has_more());
     assert!(
         observer
             .records()
@@ -3200,7 +3200,7 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             &HashMap::new(),
         )
         .expect("ordinary database reads include the commit made after cursor open");
-    assert_eq!(current.rows.len(), 5);
+    assert_eq!(current.rows().len(), 5);
 }
 
 struct ReusedCursorIdentifier([u8; 16]);
@@ -3275,7 +3275,7 @@ fn actual_identifier_reuse_after_every_release_path_has_no_tombstone_or_resource
     assert!(
         !decode_cursor_page(&exhausted.payload)
             .expect("decode exhausted page")
-            .has_more
+            .has_more()
     );
     assert_resources(&harness.service, baseline);
 
@@ -3293,7 +3293,7 @@ fn actual_identifier_reuse_after_every_release_path_has_no_tombstone_or_resource
     );
     assert_eq!(after_exhaustion.cursor_id, cursor_id);
     let first = decode_cursor_page(&after_exhaustion.payload).expect("decode reused first page");
-    assert_eq!(first.rows, vec![vec![Value::Int64(1)]]);
+    assert_eq!(first.rows(), vec![vec![Value::Int64(1)]]);
     let live = harness.service.resources();
     assert_eq!(live.active_slots, 1);
     assert_eq!(live.cursor_count, 1);
@@ -3349,7 +3349,7 @@ fn actual_identifier_reuse_after_every_release_path_has_no_tombstone_or_resource
     assert_eq!(
         decode_cursor_page(&after_refusal.payload)
             .expect("decode cursor reused after refusal")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]],
     );
     let live_after_refusal_reuse = harness.service.resources();
@@ -3387,7 +3387,7 @@ fn actual_identifier_reuse_after_every_release_path_has_no_tombstone_or_resource
     assert_eq!(
         decode_cursor_page(&after_close.payload)
             .expect("decode cursor reused after explicit close")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]],
     );
     let live_after_close_reuse = harness.service.resources();
@@ -3456,7 +3456,7 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
             .expect("open one-row snapshot cursor"),
     );
     let first = decode_cursor_page(&opened.payload).expect("decode snapshot first page");
-    assert_eq!(first.rows.len(), 1);
+    assert_eq!(first.rows().len(), 1);
     let live = harness.service.resources();
     assert_eq!(live.active_slots, baseline.active_slots + 1);
     assert!(live.cursor_retained_bytes > 0);
@@ -3517,9 +3517,9 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
             .expect("fetch retained snapshot without a file/store lock"),
     );
     let second = decode_cursor_page(&second.payload).expect("decode snapshot second page");
-    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows().len(), 1);
     assert!(
-        !second.has_more,
+        !second.has_more(),
         "later committed row is outside the cursor snapshot"
     );
     assert_resources(
@@ -3562,7 +3562,7 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
         .database
         .execute("SELECT id FROM snapshot_rows ORDER BY id", &HashMap::new())
         .expect("ordinary writer handle remains fully usable");
-    assert_eq!(current.rows.len(), 3);
+    assert_eq!(current.rows().len(), 3);
 }
 
 #[test]
@@ -3829,10 +3829,10 @@ fn remote_explain_of_a_bound_partition_key_reports_the_bound_scopes_count_and_ro
                 Vec::new()
             };
             assert_eq!(
-                page.rows, expected,
+                page.rows(), expected,
                 "nonempty and empty Contexts keep their exact session answers"
             );
-            assert!(!page.has_more, "the one-row and empty answers are complete");
+            assert!(!page.has_more(), "the one-row and empty answers are complete");
             let responses = harness
                 .request(connection, limits(), query("SELECT 1"))
                 .expect("the same owner connection remains usable after the ranked answer");
@@ -3892,12 +3892,12 @@ fn remote_explain_of_a_bound_partition_key_reports_the_bound_scopes_count_and_ro
             )
             .expect("SHOW VECTOR_PARTITIONS is an admin inspection surface");
         let state_col = partitions
-            .columns
+            .columns()
             .iter()
             .position(|name| name == "query_state")
             .expect("partition inspection names query_state");
-        if (0..partitions.rows.len()).all(|row| {
-            matches!(&partitions.rows[row][state_col], Value::Text(state) if state == "ready")
+        if (0..partitions.rows().len()).all(|row| {
+            matches!(&partitions.rows()[row][state_col], Value::Text(state) if state == "ready")
         }) {
             break;
         }
@@ -4028,8 +4028,8 @@ fn actual_inbound_decoder_refusal_preserves_the_authenticated_stream_and_ordinal
         let pressure = if refusal_source != "request limit" {
             let available = ReadLimits::SHIPPED_MEMORY - parent.retained_bytes_for_test()
                 - 64 * 1024;
-            let budget: Arc<dyn ReadMemoryBudget> = parent.clone();
-            Some(ReadCredit::try_new(budget, available as usize,
+            let budget = parent.original_owner_for_test();
+            Some(ReadCredit::try_new_owned(budget, available as usize,
                 "reader", "test_pressure", "test pressure").unwrap())
         } else { None };
         let request = LocalRequestEnvelope {

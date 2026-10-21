@@ -63,7 +63,8 @@ fn retained_corrupt_sq4_refuses_before_conversion_owner() {
     };
     let encoded = RedbPersistence::encode(&corrupt).unwrap();
     validate_raw_vector_entry_encoded_width(&encoded, &membership.index, 1, corruption).unwrap();
-    let calibration = crate::read_image_memory::ImageMemory::new(None);
+    let calibration = crate::read_image_memory::ImageMemory::new(None)
+        .expect("unlimited raw decode calibration image owner");
     calibration
         .scope(|| RedbPersistence::decode::<PersistedVectorEntry>(&encoded))
         .unwrap();
@@ -71,7 +72,8 @@ fn retained_corrupt_sq4_refuses_before_conversion_owner() {
     // The guarded decoder admits its fixed control transient before parsing.
     // That transient is refunded; the body still owns exactly decode_charge.
     let decode_control = std::mem::size_of::<PersistedVectorEntry>() * 4 + 128;
-    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge + decode_control));
+    let memory = crate::read_image_memory::ImageMemory::new(Some(decode_charge + decode_control))
+        .expect("original raw decode limit must reach the intended corruption check");
     let error = memory
         .scope(|| decode_retained_raw_vector_entry(&encoded, &membership, 1, corruption))
         .unwrap_err();
@@ -94,7 +96,8 @@ fn retained_oversized_body_is_refused_before_persisted_decode() {
         lsn: Lsn(1),
     };
     let encoded = RedbPersistence::encode(&oversized).unwrap();
-    let memory = crate::read_image_memory::ImageMemory::new(Some(0));
+    let memory = crate::read_image_memory::ImageMemory::new(Some(0))
+        .expect("BLOCKED: zero image total must reach the encoded-width corruption check");
     let error = memory
         .scope(|| decode_retained_raw_vector_entry(&encoded, &membership, 1, corruption))
         .unwrap_err();

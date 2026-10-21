@@ -1105,8 +1105,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         &self,
         tx: TxId,
         owned: &OwnedAdjEntry,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let entry = &owned.entry;
         if self.dag_edge_types.read().contains(&entry.edge_type)
             && (entry.source == entry.target
@@ -1132,8 +1134,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         source: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.try_edge_count(source, edge_type, snapshot, read_memory)
     }
 
@@ -1142,8 +1146,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         source: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let root = self.store.capture_source(snapshot, read_memory)?;
         let mut count = 0;
         self.store.visit_edges(
@@ -1171,9 +1177,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         mut visit: impl FnMut(NodeId, &AdjEntry) -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use std::cell::RefCell;
         let credit = RefCell::new(contextdb_core::read_memory::ReadCredit::new(read_memory));
         let mut logical: Option<LogicalEdge> = None;
@@ -1252,8 +1260,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         start: NodeId,
         goal: NodeId,
         edge_type: &str,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use std::cell::RefCell;
         let credit = RefCell::new(contextdb_core::read_memory::ReadCredit::new(
             read_memory.clone(),
@@ -1373,13 +1383,15 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
     ) -> std::result::Result<BoundedBfsCursor, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let root = self
             .store
             .capture_source(snapshot, read_memory)
@@ -2468,8 +2480,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         max_depth: u32,
         snapshot: SnapshotId,
         root: Option<Arc<dyn GraphSnapshot>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(TraversalResult, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use std::cell::RefCell;
         let credit = RefCell::new(contextdb_core::read_memory::ReadCredit::new(read_memory));
         let mut admit = |bytes| {
@@ -2591,8 +2605,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         source: NodeId,
         target: NodeId,
         edge_type: &str,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<std::collections::HashMap<String, Value>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = self.tx_mgr.snapshot();
         let root = self.store.capture_source(snapshot, read_memory)?;
         let mut existing = None;
@@ -2615,8 +2631,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
 
     fn current_owned_edge_properties(
         &self, source: NodeId, target: NodeId, edge_type: &str,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<OwnedEdgePropertyCopy>> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let snapshot = self.tx_mgr.snapshot();
         let root = self.store.capture_source(snapshot, reader.clone())?;
         let mut existing = None;
@@ -2641,8 +2659,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     fn owned_dag_reaches(
         &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
         start: NodeId, goal: NodeId, edge_type: &str,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let mut memory = contextdb_core::read_memory::ReadCredit::new(reader.clone());
         let snapshot = self.tx_mgr.snapshot();
         let root = self.store.capture_source(snapshot, reader)?;
@@ -2690,8 +2710,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     fn stage_owned_graph_entry(
         &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
         entry: &AdjEntry, replacement: bool,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let _input = contextdb_core::read_memory::ReadCredit::try_new(reader, entry.edge_type.len(),
             "graph", "edge_delete_input", "Raise MEMORY_LIMIT to stage this edge.")?;
         let deletes = [(entry.source, entry.edge_type.clone(), entry.target, tx)];
@@ -2727,8 +2749,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
         source: NodeId, target: NodeId, edge_type: String,
         properties: std::collections::HashMap<String, Value>,
-        reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let deleted = handle.with_transactions(|transactions| transactions.with_read(tx, |read|
             read.adj_deletes.iter().any(|(s, kind, t, _)| *s == source && *t == target && kind == &edge_type)))?;
         if !deleted && let Some(mut existing) = self.current_owned_edge_properties(source, target, &edge_type, reader.clone())? {
@@ -2802,7 +2826,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<TraversalResult> {
         let root = self.store.capture_source(snapshot, read_memory.clone())?;
         self.bfs_at_source(
@@ -2824,7 +2848,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         edge_types: Option<&[EdgeType]>,
         direction: Direction,
         snapshot: SnapshotId,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Vec<(NodeId, EdgeType, std::collections::HashMap<String, Value>)>> {
         let root = self.store.capture_source(snapshot, read_memory.clone())?;
         let mut results = Vec::new();
@@ -2851,7 +2875,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         target: NodeId,
         edge_type: EdgeType,
         properties: std::collections::HashMap<String, Value>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool> {
         if let ExecutorTransactions::Owned(handle) = &self.tx_mgr {
             return self.insert_owned_edge(handle, tx, source, target, edge_type, properties, read_memory);
@@ -2939,7 +2963,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         source: NodeId,
         target: NodeId,
         edge_type: &str,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         let snapshot = self.tx_mgr.snapshot();
         let root = self.store.capture_source(snapshot, read_memory.clone())?;

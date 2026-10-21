@@ -5,7 +5,7 @@ use contextdb_tx::{ReadCommitContext, ReadCommitCursor, ReadCommitDirectory};
 use std::ops::Bound;
 
 pub(crate) struct RetainedCommitDirectory {
-    source: Arc<RetainedReadSource>,
+    source: RetainedReadSource,
     count: usize,
     first: Option<(Lsn, TxId)>,
     last: Option<(Lsn, TxId)>,
@@ -14,7 +14,7 @@ pub(crate) struct RetainedCommitDirectory {
 
 impl RetainedCommitDirectory {
     pub(crate) fn new(
-        source: Arc<RetainedReadSource>,
+        source: RetainedReadSource,
         bounds: &ReadHistoryOnRequest,
         context: &ReadCommitContext<'_>,
     ) -> Result<Arc<Self>> {
@@ -128,7 +128,7 @@ impl RetainedCommitDirectory {
                 context.checkpoint()?;
                 match open {
                     Some(capability) => {
-                        if !std::ptr::eq(capability.source, self.source.as_ref())
+                        if !RetainedReadSource::ptr_eq(capability.source, &self.source)
                             || !std::ptr::eq(capability.context, context)
                         {
                             return Err(self.source.history_damage(
@@ -266,7 +266,7 @@ impl ReadCommitDirectory for RetainedCommitDirectory {
 }
 
 struct RetainedCommitCursor {
-    source: Arc<RetainedReadSource>,
+    source: RetainedReadSource,
     lower: Bound<Lsn>,
     upper: Bound<Lsn>,
     after: Option<Lsn>,

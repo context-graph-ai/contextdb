@@ -22,8 +22,8 @@ impl Database {
         // No caller holds the commit boundary here. Serialize samples before
         // capturing their roots so concurrent commits cannot reorder the lines.
         let _emission = EMISSION.lock();
-        let (receipt, lsn) = self.with_writer_memory_ownership_receipt_for_test(|receipt| {
-            (receipt, self.tx_mgr.capture_published_read().lsn)
+        let (receipt, lsn, schema_history_charge) = self.with_writer_memory_ownership_receipt_for_test(|receipt| {
+            (receipt, self.tx_mgr.capture_published_read().lsn, self.schema_history_retained_bytes())
         });
         let rss_bytes = current_process_rss_bytes();
         let current_rows_by_table = receipt
@@ -189,6 +189,7 @@ impl Database {
             "ddl_log_entries".into(),
             serde_json::json!(receipt.ddl_log_entries),
         );
+        owners.insert("schema_history_charge".into(), serde_json::json!(schema_history_charge));
         owners.insert(
             "ddl_log_estimated_bytes".into(),
             serde_json::json!(receipt.ddl_log_estimated_bytes),

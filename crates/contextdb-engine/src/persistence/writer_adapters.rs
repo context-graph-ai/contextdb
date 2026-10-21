@@ -18,6 +18,10 @@ pub(crate) struct WriterRelationalSource {
     _control: SourceWindowCredit,
 }
 impl WriterRelationalSource {
+    pub(crate) fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        self.owner.diagnostic_budget()
+    }
+
     pub(crate) fn for_working(mut self,working:super::received_working_source::WorkingReadSource)->Self {
         self.requested_snapshot=working.snapshot();
         self.working=Some(working);
@@ -47,15 +51,19 @@ impl WriterRelationalSource {
     }
     pub(crate) fn new_for_read(
         root: WriterSnapshotHandle,
-        read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let read: contextdb_core::read_memory::ReadMemoryOwner = read.into();
+
         Self::new_owned(root, SourceWindowOwner::Read(read))
     }
     pub(crate) fn new_for_read_at_snapshot(
         root: WriterSnapshotHandle,
-        read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         snapshot: SnapshotId,
     ) -> Result<Self> {
+        let read: contextdb_core::read_memory::ReadMemoryOwner = read.into();
+
         let mut source = Self::new_for_read(root, read)?;
         if snapshot.0 > source.root.snapshot.0 {
             return Err(Error::Other(
@@ -409,10 +417,7 @@ impl WriterRelationalSource {
             })?;
         before()?;
         let read = self.root.owner_read()?;
-        let damage = |reason: &str| Error::StoreCorrupted {
-            path: RedbPersistence::relational_index_table_name(table, index),
-            reason: reason.into(),
-        };
+        let damage = |reason: &str| crate::funded_error::corruption_display(self.owner.diagnostic_budget(), super::DiagnosticIndexName { table, index }, reason);
         match historical_index_commitment::published_in_read(&read, table, &declaration)? {
             Some((entry, equal)) => {
                 before()?;
@@ -468,12 +473,9 @@ impl WriterRelationalSource {
                 table: table.into(),
                 index: index.into(),
             })?;
-        let damage = |reason: &str| Error::StoreCorrupted {
-            path: table.into(),
-            reason: reason.into(),
-        };
+        let damage = |reason: &str| crate::funded_error::corruption_display(self.owner.diagnostic_budget(), table, reason);
         RedbPersistence::validated_index_key(declaration, meta, key)
-            .map_err(|reason| damage(&reason))?;
+            .map_err(|reason| crate::funded_error::corruption_display(self.owner.diagnostic_budget(), table, reason))?;
         before()?;
         let raw = self.historical_position_key(key, entry.row_id, entry.created_tx, before)?;
         if !content_identity::version_manifest::equal_with_checkpoint(
@@ -519,10 +521,7 @@ impl WriterRelationalSource {
                 table: table.into(),
                 index: index.into(),
             })?;
-        let damage = |reason: &str| Error::StoreCorrupted {
-            path: table.into(),
-            reason: reason.into(),
-        };
+        let damage = |reason: &str| crate::funded_error::corruption_display(self.owner.diagnostic_budget(), table, reason);
         let inside = entry.created_tx <= row.created_tx
             && match (entry.deleted_tx, row.deleted_tx) {
                 (None, _) => true,
@@ -584,10 +583,7 @@ impl WriterRelationalSource {
                 table: table.into(),
                 index: index.into(),
             })?;
-        let damage = |reason: &str| Error::StoreCorrupted {
-            path: table.into(),
-            reason: reason.into(),
-        };
+        let damage = |reason: &str| crate::funded_error::corruption_display(self.owner.diagnostic_budget(), table, reason);
         let _state = self.owner.reserve(
             std::mem::size_of::<(
                 u64,
@@ -638,7 +634,7 @@ impl WriterRelationalSource {
                     postings.next_window_before(&mut || (touch.borrow_mut())())?
                 {
                     RedbPersistence::validated_index_key(declaration, meta, &posting.value().key)
-                        .map_err(|reason| damage(&reason))?;
+                        .map_err(|reason| crate::funded_error::corruption_display(self.owner.diagnostic_budget(), table, reason))?;
                     (touch.borrow_mut())()?;
                     let raw = self.historical_position_key(
                         &posting.value().key,
@@ -709,7 +705,7 @@ impl WriterRelationalSource {
         let mut actual = 0u64;
         while let Some(posting) = postings.next_window_before(&mut || (touch.borrow_mut())())? {
             RedbPersistence::validated_index_key(declaration, meta, &posting.value().key)
-                .map_err(|reason| damage(&reason))?;
+                .map_err(|reason| crate::funded_error::corruption_display(self.owner.diagnostic_budget(), table, reason))?;
             (touch.borrow_mut())()?;
             let raw = self.historical_position_key(
                 &posting.value().key,
@@ -1029,8 +1025,10 @@ impl WriterGraphSnapshot {
     }
     pub(crate) fn new_for_read(
         root: WriterSnapshotHandle,
-        read: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
+        let read: contextdb_core::read_memory::ReadMemoryOwner = read.into();
+
         Self::new_owned(root, SourceWindowOwner::Read(read))
     }
     pub(crate) fn new_for_write(
@@ -1040,10 +1038,10 @@ impl WriterGraphSnapshot {
         Self::new_owned(root, SourceWindowOwner::writer(writer))
     }
     fn new_owned(root: WriterSnapshotHandle, owner: SourceWindowOwner) -> Result<Self> {
-        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = match &owner {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = match &owner {
             SourceWindowOwner::Read(memory) => memory.clone(),
             SourceWindowOwner::Write(memory, original_use) => {
-                memory.read_budget_for_original(original_use.clone())?
+                memory.read_budget_for_original(original_use.clone())?.into()
             }
         };
         super::graph_read::with_pages(memory, || {

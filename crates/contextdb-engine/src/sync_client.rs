@@ -168,7 +168,7 @@ struct DeliveryNames {
     subject: String,
     hub: Option<String>,
     edge: Option<String>,
-    provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+    provider: crate::vector_read_memory::ReadRequestProvider,
 }
 
 /// The request a delivery fetch sends, borrowed, with the same named
@@ -205,7 +205,9 @@ const DELIVERY_RESULT_HINT: &str =
     "Reduce the delivery continuation or raise the declared reader memory limit.";
 
 impl ChargedOutcomes {
-    fn new(owner: contextdb_core::read_memory::ReadMemoryOwner) -> Self {
+    fn new(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
         Self {
             outcomes: Vec::new(),
             credit: None,
@@ -346,7 +348,7 @@ impl Drop for PostPushReplyEffectsPause {
 
 /// Decode an envelope under the actual requesting read's admitted image.
 pub(crate) fn decode_sync_envelope(
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     data: &[u8],
     expected: Option<u8>,
 ) -> contextdb_core::Result<crate::protocol::Envelope> {
@@ -376,8 +378,8 @@ pub(crate) fn decode_sync_envelope(
 struct PullPage {
     ordinary: PullResponse,
     dependency_units: Vec<WireChangeSet>,
-    _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    _image_memory: Arc<crate::read_image_memory::ImageMemory>,
+    _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    _image_memory: crate::read_image_memory::ImageMemoryHandle,
 }
 
 struct AppliedPullPage {
@@ -695,8 +697,10 @@ impl SyncClient {
     pub async fn bind_application_table_policy_with_read_memory(
         &self,
         expectation: ApplicationTablePolicyExpectation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<AuthenticatedTenantPolicyBinding> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -819,7 +823,7 @@ impl SyncClient {
                     receipt.into_owner()
                 }
                 crate::vector_read_memory::RequestReadRoute::Legacy(reader) => {
-                    contextdb_core::read_memory::ReadMemoryOwner::from_legacy(reader)
+                    contextdb_core::read_memory::ReadMemoryOwner::from(reader)
                 }
             },
             Err(crate::vector_read_memory::RequestOwnerFailure::Native(refusal)) => {
@@ -836,10 +840,12 @@ impl SyncClient {
     pub async fn fetch_delivery_outcomes_with_read_memory(
         &self,
         since: Option<DeliveryOutcomeCursor>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Vec<DeliveryOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // A caller-supplied reader keeps every charge on that reader.
-        let owner = contextdb_core::read_memory::ReadMemoryOwner::from_legacy(read_memory.clone());
+        let owner = contextdb_core::read_memory::ReadMemoryOwner::from(read_memory.clone());
         self.fetch_delivery_outcomes_on(since, owner, read_memory)
             .await
     }
@@ -852,9 +858,12 @@ impl SyncClient {
     async fn fetch_delivery_outcomes_on(
         &self,
         since: Option<DeliveryOutcomeCursor>,
-        owner: contextdb_core::read_memory::ReadMemoryOwner,
-        custody_reader: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        custody_reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Vec<DeliveryOutcome>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+        let custody_reader: contextdb_core::read_memory::ReadMemoryOwner = custody_reader.into();
+
         let mut result = ChargedOutcomes::new(owner.clone());
         let mut since = since;
         // The continuation cursor's own strings, charged while it is held.
@@ -881,9 +890,11 @@ impl SyncClient {
         &self,
         since: Option<DeliveryOutcomeCursor>,
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         result: &mut ChargedOutcomes,
     ) -> contextdb_core::Result<(usize, bool)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -1049,8 +1060,10 @@ impl SyncClient {
     pub async fn __seed_application_table_policy_binding_for_test(
         &self,
         expectation: ApplicationTablePolicyExpectation,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -1104,8 +1117,10 @@ impl SyncClient {
         &self,
         tx: contextdb_core::TxId,
         manifest: crate::custody_types::DeliveryManifest<'_>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let edge_node_id = self.transport.local_node_id().ok_or_else(|| {
             Error::SyncError(("fixture manifest requires an authenticated edge".to_string()).into())
         })?;
@@ -1140,8 +1155,10 @@ impl SyncClient {
     #[doc(hidden)]
     pub fn __ordinary_push_request_for_test(
         &self,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<crate::protocol::PushRequest> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let mut selection_credit = contextdb_core::read_memory::ReadCredit::try_new(
             read_memory.clone(),
@@ -1195,8 +1212,10 @@ impl SyncClient {
         &self,
         table: &str,
         key: &crate::sync_types::NaturalKey,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<crate::protocol::PushRequest> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let signer = self
             .lineage_signer
             .as_ref()
@@ -1219,8 +1238,10 @@ impl SyncClient {
         root_key: &crate::sync_types::NaturalKey,
         kind: crate::custody_types::DeliveryOutcomeKind,
         cause: Option<&str>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.seed_delivery_outcome_for_test(
             root_table,
             root_key,
@@ -1240,8 +1261,10 @@ impl SyncClient {
         root_key: &crate::sync_types::NaturalKey,
         kind: crate::custody_types::DeliveryOutcomeKind,
         cause: Option<&str>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.seed_delivery_outcome_for_test(
             root_table,
             root_key,
@@ -1264,8 +1287,10 @@ impl SyncClient {
         &self,
         root_table: &str,
         root_key: &crate::sync_types::NaturalKey,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let hub = self.transport.peer_node_id().ok_or_else(|| {
             Error::SyncError("progress reconciliation requires an authenticated hub".into())
         })?;
@@ -1321,8 +1346,10 @@ impl SyncClient {
         kind: crate::custody_types::DeliveryOutcomeKind,
         cause: Option<&str>,
         install_on_edge: bool,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -1393,8 +1420,10 @@ impl SyncClient {
     pub async fn __seed_hub_delivery_batch_for_test(
         &self,
         table: &str,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.__seed_hub_delivery_roots_for_test(table, None, read_memory.clone())
             .await
     }
@@ -1406,8 +1435,10 @@ impl SyncClient {
         &self,
         table: &str,
         roots: Option<&[crate::sync_types::NaturalKey]>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<usize> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
@@ -1464,8 +1495,10 @@ impl SyncClient {
         db: Arc<Database>,
         endpoint: &str,
         tenant_id: TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _calling_session_read_memory = read_memory.clone();
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_sync_client_start();
@@ -1490,8 +1523,10 @@ impl SyncClient {
         lineage_signer: Option<LineageSigner>,
         endpoint: String,
         tenant_id: TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _calling_session_read_memory = read_memory.clone();
         assert!(
             !tenant_id.as_str().is_empty()
@@ -1590,8 +1625,10 @@ impl SyncClient {
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
         tenant_id: TenantId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _calling_session_read_memory = read_memory.clone();
         Self::build(
             db,
@@ -1631,8 +1668,10 @@ impl SyncClient {
         transport: Arc<dyn ClientTransport>,
         tenant_id: TenantId,
         identity: Arc<crate::identity::FabricIdentity>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _calling_session_read_memory = read_memory.clone();
         let signer: LineageSigner = Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)));
         Self::build(
@@ -1873,9 +1912,11 @@ impl SyncClient {
     fn pending_push_changes(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         selection_credit: &mut contextdb_core::read_memory::ReadCredit,
     ) -> Result<ChangeSet, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _schema_read = self.db.enter_outbound_sync_schema_read();
         let since = self.push_watermark.load(Ordering::SeqCst);
         let (changes, _, ddl_provenance_source) = self.db.checked_changes_since_with_arrivals(
@@ -1941,8 +1982,10 @@ impl SyncClient {
         &self,
         encoded: Vec<u8>,
         require_reply: bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Vec<u8>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut attempt = 0u32;
         loop {
             if attempt > 0 {
@@ -1985,8 +2028,10 @@ impl SyncClient {
         &self,
         incarnation: Incarnation,
         require_reply: bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<SyncStatusResponse>, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
@@ -2156,8 +2201,10 @@ impl SyncClient {
         incarnation: Incarnation,
         prepared_batches: &[PreparedPushBatch],
         initial_status: Option<&SyncStatusResponse>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Incarnation, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -2439,8 +2486,10 @@ impl SyncClient {
         &self,
         outcomes: &[RefusedSchemaUnitOutcome],
         hub_incarnation: Option<Incarnation>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(), Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let incarnation = self
             .db
             .sync_incarnation_with_read_memory(&self.tenant_id, read_memory.clone())?;
@@ -2500,8 +2549,10 @@ impl SyncClient {
         &self,
         provenance: &[crate::protocol::WireDdlProvenance],
         hub_incarnation: Option<Incarnation>,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<HashSet<usize>, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut units = Self::authored_ddl_units(provenance)?;
         let mut refused = HashSet::new();
         if units.is_empty() {
@@ -2558,8 +2609,10 @@ impl SyncClient {
         &self,
         reply: &[u8],
         protocol_version: u8,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, PushReplyError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -2664,8 +2717,10 @@ impl SyncClient {
         &self,
         encoded: Vec<u8>,
         protocol_version: u8,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, PushRequestError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _calling_session_read_memory = read_memory.clone();
         let reply = self
             .transport
@@ -2692,8 +2747,10 @@ impl SyncClient {
         encoded: Vec<u8>,
         protocol_version: u8,
         retry_safety: Result<(), TransportError>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, PushRequestError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _calling_session_read_memory = read_memory.clone();
         match retry_safety {
             Ok(()) => {}
@@ -2786,8 +2843,10 @@ impl SyncClient {
     async fn request_pull(
         &self,
         request: PullRequest,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<PullPage, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -2852,7 +2911,7 @@ impl SyncClient {
                 .map(|ordinary| PullPage {
                     ordinary,
                     dependency_units: Vec::new(),
-                    _read_memory: read_memory.clone(),
+                    _read_memory: (read_memory.clone()).into(),
                     _image_memory: decoded_memory.clone(),
                 })
                 .map_err(|e| Error::SyncError((e.to_string()).into())),
@@ -2862,7 +2921,7 @@ impl SyncClient {
                 Ok(PullPage {
                     ordinary: response.ordinary,
                     dependency_units: response.units,
-                    _read_memory: read_memory.clone(),
+                    _read_memory: (read_memory.clone()).into(),
                     _image_memory: decoded_memory.clone(),
                 })
             }
@@ -2895,8 +2954,10 @@ impl SyncClient {
     /// typed memory error before sending anything.
     pub async fn push_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let unit_memory = self.db.engine_sync_read_memory()?;
         let _calling_session_read_memory = read_memory.clone();
         let mut selection_credit =
@@ -3921,8 +3982,10 @@ impl SyncClient {
         incarnation: Incarnation,
         encoded: Vec<u8>,
         protocol_version: u8,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let status = self
             .fetch_sync_status(incarnation, true, read_memory.clone())
             .await
@@ -3971,8 +4034,10 @@ impl SyncClient {
         batch: &ChangeSet,
         lineages: &HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>,
         keep_public_watermark: bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(), Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // The hub answers this edge with the per-edge record it holds for THIS
         // life of the edge — keyed by (node_id, incarnation), stamped on the
         // status probe below. A lost acknowledgement is confirmed only when that
@@ -4150,8 +4215,10 @@ impl SyncClient {
     /// restored-hub Pending marker. It is private to the lost-ack path.
     async fn pull_default_confirmed_pending(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // `finish_interrupted_push` just authenticated and bounded the hub's
         // per-edge watermark. Re-probing status here would add a second
         // independent status exchange after the lost reply without improving
@@ -4168,8 +4235,10 @@ impl SyncClient {
     async fn pull_with_initial_adoption(
         &self,
         initial_adoption: SyncAdoption,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let _calling_session_read_memory = read_memory.clone();
         self.pull_with_initial_adoption_and_status_probe(
             initial_adoption,
@@ -4183,8 +4252,10 @@ impl SyncClient {
         &self,
         initial_adoption: SyncAdoption,
         probe_status: bool,
-        _caller_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _caller_read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
+        let _caller_read_memory: contextdb_core::read_memory::ReadMemoryOwner = _caller_read_memory.into();
+
         // Receiving and applying a pulled page is this edge's own sync work:
         // the rows it carries are funded by the writer budget (MEMORY_LIMIT),
         // never by a caller's per-request read limit.
@@ -4799,8 +4870,10 @@ impl SyncClient {
 
     pub async fn pull_default_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // An offline local delete is owed to the hub.  Offer that durable
         // obligation before accepting a contradictory ordinary pull; otherwise
         // a close/open between delete and reconnect could resurrect the very
@@ -5123,8 +5196,10 @@ fn checked_drop_rows_that_arrived_by_sync_after(
     changes: ChangeSet,
     reupload_through: Option<Lsn>,
 
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ChangeSet, Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut changes = changes;
     // A changeset can include the older local insert that preceded a pulled
     // tombstone. Suppressing only the tombstone would re-offer that stale

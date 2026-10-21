@@ -37,7 +37,7 @@ pub(crate) fn with_pending_summary_failure_for_test<R>(
     action()
 }
 
-pub(super) fn damage(reason: &str) -> Error {
+pub(super) fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "vector_partition_memberships".into(),
         reason: reason.into(),
@@ -47,7 +47,7 @@ pub(super) fn damage(reason: &str) -> Error {
 #[derive(Clone)]
 pub(crate) enum MembershipOwner {
     Writable(Arc<RedbPersistence>),
-    Retained(Arc<RetainedReadSource>),
+    Retained(RetainedReadSource),
 }
 
 thread_local! {
@@ -81,6 +81,12 @@ impl MembershipOwner {
         if let Some(context) = operation_for(self) {
             return Ok(context.root.clone());
         }
+        self.capture_fresh()
+    }
+    /// A new operation has already declined same-child continuation. Capture
+    /// its scoped writer publication rather than inheriting the outer vector
+    /// operation's descriptor merely because both use the same store.
+    fn capture_fresh(&self) -> Result<MembershipRoot> {
         match self {
             Self::Writable(persistence) => MembershipRoot::capture(persistence),
             Self::Retained(source) => {
@@ -130,7 +136,7 @@ struct MembershipRoot {
     read: Arc<redb::ReadTransaction>,
     writer: Option<WriterSnapshotHandle>,
     // Hold the registered committed source throughout each cursor operation.
-    retained: Option<Arc<RetainedReadSource>>,
+    retained: Option<RetainedReadSource>,
 }
 
 impl MembershipRoot {
@@ -203,7 +209,7 @@ impl MembershipRoot {
 // This slot belongs to the executing operation, never to the store. It
 // carries the already selected physical root and the existing Read(child).
 thread_local! {
-    static OPERATION: std::cell::RefCell<Option<Arc<VectorReadOperation>>> = const { std::cell::RefCell::new(None) };
+    static OPERATION: std::cell::RefCell<Option<VectorReadCapture>> = const { std::cell::RefCell::new(None) };
     static EXPLICIT_INTENT: std::cell::RefCell<Option<HistoricalReadIntent>> = const { std::cell::RefCell::new(None) };
 }
 // Explicit history is selected at the public request door, independently
@@ -211,7 +217,7 @@ thread_local! {
 struct HistoricalReadIntent {
     owner: MembershipOwner,
     snapshot: SnapshotId,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
 }
 pub(crate) struct HistoricalReadIntentScope {
     prior: Option<HistoricalReadIntent>,
@@ -225,13 +231,15 @@ impl Drop for HistoricalReadIntentScope {
 pub(crate) fn enter_historical_read_intent(
     owner: MembershipOwner,
     snapshot: SnapshotId,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> HistoricalReadIntentScope {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     let prior = EXPLICIT_INTENT.with(|slot| {
         slot.borrow_mut().replace(HistoricalReadIntent {
             owner,
             snapshot,
-            memory,
+            memory: memory.into(),
         })
     });
     HistoricalReadIntentScope {
@@ -242,16 +250,18 @@ pub(crate) fn enter_historical_read_intent(
 fn explicit_historical_intent(
     owner: &MembershipOwner,
     snapshot: SnapshotId,
-    memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: &contextdb_core::read_memory::ReadMemoryOwner,
 ) -> bool {
     EXPLICIT_INTENT.with(|slot| {
         slot.borrow().as_ref().is_some_and(|intent| {
             same_owner(&intent.owner, owner)
                 && intent.snapshot == snapshot
-                && Arc::ptr_eq(&intent.memory, memory)
+                && intent.memory.same_owner(memory)
         })
     })
 }
+
+pub(crate) type VectorReadCapture = contextdb_core::read_memory::ReadShared<VectorReadOperation>;
 
 pub(crate) struct VectorReadOperation {
     owner: MembershipOwner,
@@ -259,11 +269,13 @@ pub(crate) struct VectorReadOperation {
     snapshot: SnapshotId,
     historical: bool,
     checkpoint: Option<crate::executor::bounded::VectorReadCheckpoint>,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    _credit: contextdb_core::read_memory::ReadCredit,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
+    // Preflight and resumed loaders draw on the same existing scan allowance.
+    scan_allowance: redb::ScanAllowance,
 }
 pub(crate) struct VectorReadScope {
-    prior: Option<Arc<VectorReadOperation>>,
+    _scan_reads: Option<redb::ScanReads>,
+    prior: Option<VectorReadCapture>,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl Drop for VectorReadScope {
@@ -274,11 +286,11 @@ impl Drop for VectorReadScope {
 fn same_owner(a: &MembershipOwner, b: &MembershipOwner) -> bool {
     match (a, b) {
         (MembershipOwner::Writable(a), MembershipOwner::Writable(b)) => Arc::ptr_eq(a, b),
-        (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => Arc::ptr_eq(a, b),
+        (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => RetainedReadSource::ptr_eq(a, b),
         _ => false,
     }
 }
-fn operation_for(owner: &MembershipOwner) -> Option<Arc<VectorReadOperation>> {
+fn operation_for(owner: &MembershipOwner) -> Option<VectorReadCapture> {
     OPERATION.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -287,16 +299,49 @@ fn operation_for(owner: &MembershipOwner) -> Option<Arc<VectorReadOperation>> {
     })
 }
 
+// Scan producer refusals keep the original scalar diagnosis. In particular,
+// do not manufacture an allocating error Box after this admission has failed.
+fn scan_storage_error(error: redb::StorageError) -> Error {
+    use native_storage_admission::NativeStorageFailure;
+    if let redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefusedAt(owner)) = &error
+    {
+        let original = owner.inspect_failure(|cause| {
+            cause
+                .and_then(|cause| cause.downcast_ref::<NativeStorageFailure>())
+                .and_then(|cause| match cause {
+                    NativeStorageFailure::Refused(refusal) => {
+                        Some(NativeStorageFailure::Refused(*refusal))
+                    }
+                    NativeStorageFailure::AllocatorFailed { site, layout } => {
+                        Some(NativeStorageFailure::AllocatorFailed {
+                            site: *site,
+                            layout: *layout,
+                        })
+                    }
+                    NativeStorageFailure::Unqualified(_) => None,
+                })
+        });
+        if let Some(original) = original {
+            return native_storage_admission::original_storage_error(original);
+        }
+    }
+    // Exact allocator null is already scalar in the existing storage adapter.
+    // Non-native reader implementations retain their inherited error route.
+    RedbPersistence::storage_error(error)
+}
+
 pub(crate) fn enter_read_operation(
     owner: MembershipOwner,
     snapshot: SnapshotId,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     copies: &mut contextdb_vector::VectorCopyAdmission,
     route: &mut dyn FnMut(&VectorPartitionRef) -> Result<()>,
     checkpoint: Option<crate::executor::bounded::ReadOpenContext>,
 ) -> Result<VectorReadScope> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     if let Some(checkpoint) = &checkpoint {
-        if !Arc::ptr_eq(&checkpoint.read_memory(), &memory) {
+        if !checkpoint.read_memory().same_owner(&memory) {
             return Err(damage(
                 "vector preflight checkpoint belongs to another reader child",
             ));
@@ -309,7 +354,7 @@ pub(crate) fn enter_read_operation(
     {
         if !same_owner(&context.owner, &owner)
             || context.snapshot != snapshot
-            || !Arc::ptr_eq(&context.memory, &memory)
+            || !context.memory.same_owner(&memory)
             || context
                 .checkpoint
                 .as_ref()
@@ -320,6 +365,17 @@ pub(crate) fn enter_read_operation(
                 "resumed vector read changed its captured owner, snapshot, intent or reader child",
             ));
         }
+        // A nested call on the already executing capture needs no additional
+        // scan node. A continuation on another thread enters it afresh.
+        let scan_reads = if operation_for(&owner)
+            .is_some_and(|active| std::ptr::eq(&*active, &*context))
+        {
+            None
+        } else {
+            Some(
+                context.scan_allowance.try_enter_native().map_err(scan_storage_error)?,
+            )
+        };
         if let Some(writer) = &context.root.writer {
             if context.root.read.storage_snapshot_identity() != writer.storage_identity() {
                 return Err(damage(
@@ -356,16 +412,17 @@ pub(crate) fn enter_read_operation(
             .checkpoint()?;
         let prior = OPERATION.with(|slot| slot.borrow_mut().replace(context));
         return Ok(VectorReadScope {
+            _scan_reads: scan_reads,
             prior,
             _same_thread: std::marker::PhantomData,
         });
     }
 
     if let Some(context) = operation_for(&owner) {
-        if context.snapshot != snapshot {
+        if context.memory.same_owner(&memory) && context.snapshot != snapshot {
             return Err(damage("nested vector read changed its requested snapshot"));
         }
-        if Arc::ptr_eq(&context.memory, &memory)
+        if context.memory.same_owner(&memory)
             && (!explicit_history || context.historical)
             && (checkpoint.as_ref().is_none_or(|request| {
                 context
@@ -381,6 +438,7 @@ pub(crate) fn enter_read_operation(
                 checkpoint.retain_vector_read_capture(context.clone())?;
             }
             return Ok(VectorReadScope {
+                _scan_reads: None,
                 prior: Some(context),
                 _same_thread: std::marker::PhantomData,
             });
@@ -391,16 +449,26 @@ pub(crate) fn enter_read_operation(
     }
     let credit = contextdb_core::read_memory::ReadCredit::try_new(
         memory.clone(),
-        std::mem::size_of::<VectorReadOperation>()
-            + 2 * std::mem::size_of::<usize>()
-            + checkpoint.as_ref().map_or(0, |_| {
-                std::mem::size_of::<std::sync::Mutex<Option<Arc<VectorReadOperation>>>>()
-            }),
+        VectorReadCapture::layout().size(),
         "reader",
         "vector_capture",
         HINT,
     )?;
-    let root = graph_read::with_pages(memory.clone(), || owner.capture())?;
+    // Root capture and historical authentication run before any vector cursor
+    // exists, but consume the same allowance as its later resumed body reads.
+    let storage = native_storage_admission::StorageAdmissionScope::reader_operation(memory.clone())
+        .map_err(native_storage_admission::original_storage_error)?;
+    let scan_allowance = storage
+        .run_native(|| redb::ScanAllowance::try_new_native().map_err(scan_storage_error))
+        .map_err(native_storage_admission::original_storage_error)?;
+    let scan_reads = Some(
+        scan_allowance
+            .try_enter_native()
+            .map_err(scan_storage_error)?,
+    );
+    drop(storage); // the allowance retains this genuine original reader owner
+
+    let root = graph_read::with_pages(memory.clone(), || owner.capture_fresh())?;
     let frontier = root.writer.as_ref().map_or_else(
         || match &owner {
             MembershipOwner::Retained(source) => source.logical_frontier,
@@ -412,30 +480,33 @@ pub(crate) fn enter_read_operation(
         return Err(damage("vector snapshot exceeds its captured frontier"));
     }
 
-    let context = Arc::new(VectorReadOperation {
-        owner,
-        root,
-        snapshot,
-        historical: snapshot != frontier || explicit_history,
-        checkpoint: checkpoint
-            .as_ref()
-            .map(|context| context.vector_checkpoint()),
-        memory,
-        _credit: credit,
-    });
+    // The existing reader child prepays the native shared cell. Its invoice
+    // is moved outside the cell on final release and settled after physical
+    // free, including unwind. The request already owns its inline capture slot.
+    let context = VectorReadCapture::try_from_prepaid(
+        VectorReadOperation {
+            owner,
+            root,
+            snapshot,
+            historical: snapshot != frontier || explicit_history,
+            checkpoint: checkpoint
+                .as_ref()
+                .map(|context| context.vector_checkpoint()),
+            memory: memory.into(),
+            scan_allowance,
+        },
+        credit,
+    )?;
     let prior = OPERATION.with(|slot| slot.borrow_mut().replace(context.clone()));
     let scope = VectorReadScope {
+        _scan_reads: scan_reads,
         prior,
         _same_thread: std::marker::PhantomData,
     };
     if context.historical {
         graph_read::with_pages(context.memory.clone(), || {
-            validate_universe(
-                &context.root.read,
-                copies,
-                &mut || operation_checkpoint(),
-                route,
-            )
+            validate_captured_roots(&context.root.read, copies, &mut || operation_checkpoint())?;
+            validate_captured_routes(&context.root.read, copies, route)
         })?;
     }
     operation_checkpoint()?;
@@ -449,6 +520,16 @@ pub(crate) fn enter_read_operation(
 /// library reads have no cancellation/deadline context to replace.
 pub(crate) fn operation_checkpoint() -> Result<()> {
     let context = OPERATION.with(|slot| slot.borrow().clone());
+    #[cfg(any(test, feature = "test-seams"))]
+    if context.is_some() {
+        // Observe only a live, genuinely admitted native cell. This reader
+        // workspace is not a charge against the store's writer accountant.
+        crate::database::resident_history_test_seams::note(|work| {
+            work.workspace_peak = work.workspace_peak.max(VectorReadCapture::layout().size());
+        });
+        crate::vector_read_memory::statement_child_proof::live_workspace(
+            &context.as_ref().unwrap().memory, VectorReadCapture::layout().size());
+    }
     if let Some(checkpoint) = context
         .as_ref()
         .and_then(|context| context.checkpoint.as_ref())
@@ -458,49 +539,42 @@ pub(crate) fn operation_checkpoint() -> Result<()> {
     Ok(())
 }
 
+/// The captured operation's live scope already entered its single allowance.
+/// Loader re-entry needs neither a separately boxed alias nor another TLS push.
+/// Each resumed call re-enters that same retained allowance in enter_read_operation.
+pub(crate) fn has_scan_scope_for_operation(owner: &MembershipOwner) -> bool {
+    operation_for(owner).is_some()
+}
+
 pub(crate) fn read_memory_for_operation()
--> Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+-> Option<contextdb_core::read_memory::ReadMemoryOwner> {
     OPERATION.with(|slot| slot.borrow().as_ref().map(|context| context.memory.clone()))
 }
 
-/// Reconcile the independent committed directory with every physical member,
-/// both companion indexes and every summary. One decoded window is live; no
-/// population directory, body set or route map is constructed.
-pub(super) fn validate_universe(
+/// Authenticate the captured producer commitments without walking retained
+/// membership history. Each consumed membership still checks its key, route,
+/// owning row and companions at this same physical root.
+fn validate_captured_roots(
     read: &redb::ReadTransaction,
     copies: &mut contextdb_vector::VectorCopyAdmission,
     before: &mut dyn FnMut() -> Result<()>,
-    route: &mut dyn FnMut(&VectorPartitionRef) -> Result<()>,
 ) -> Result<()> {
     before()?;
-    vector_membership_pages::validate_in_read(read)?;
     let mut controls = copies.scratch();
     controls.reserve(
-        std::mem::size_of::<content_identity::SetCommitment>()
-            + std::mem::size_of::<blake3::Hasher>()
-            + 3 * std::mem::size_of::<vector_membership_pages::MembershipSummary>()
+        2 * std::mem::size_of::<blake3::Hasher>()
             + 8 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()
-            + 3 * std::mem::size_of::<redb::Range<'static, &'static [u8], &'static [u8]>>()
             + 40,
     )?;
-    // Table presence is independent of the fingerprint's absent-table value.
-    let members = open_optional_read_table(read, VECTOR_PARTITION_MEMBERSHIP_TABLE)?;
-    let source = open_optional_read_table(read, vector_membership_pages::SOURCE)?;
-    let reverse = open_optional_read_table(read, vector_membership_pages::REVERSE)?;
-    let summaries = open_optional_read_table(read, vector_membership_pages::SUMMARY)?;
-    let directory = read
-        .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
-        .map_err(|_| damage("captured vector directory table is absent"))?;
-    let vectors = open_optional_read_table(read, VECTORS_TABLE)?;
-    before()?;
+    vector_membership_pages::validate_in_read(read)?;
+    let directory = open_optional_read_table(read, VECTOR_OPEN_DIRECTORY_TABLE)?
+        .ok_or_else(|| damage("captured vector directory table is absent"))?;
     let aggregate = directory
         .get(VECTOR_OPEN_DIRECTORY_ROOT_KEY)
         .map_err(vector_membership_pages::metadata_error)?
         .ok_or_else(|| damage("captured vector directory aggregate is absent"))?;
     if aggregate.value().len() != 40 {
-        return Err(damage(
-            "captured vector directory aggregate has invalid size",
-        ));
+        return Err(damage("captured vector directory aggregate has invalid size"));
     }
     let metadata = read
         .open_table(CONTENT_IDENTITY_METADATA_TABLE)
@@ -510,260 +584,182 @@ pub(super) fn validate_universe(
         .map_err(vector_membership_pages::metadata_error)?
         .ok_or_else(|| damage("captured vector directory commitment is absent"))?;
     if commitment.value() != blake3::hash(aggregate.value()).as_bytes() {
-        return Err(damage(
-            "captured vector directory aggregate is not committed",
-        ));
+        return Err(damage("captured vector directory aggregate is not committed"));
     }
-    let mut projection =
-        content_identity::SetCommitment::empty(content_identity::CompactIndexSet::VectorDirectory);
-    let mut directory_cursor = directory
-        .iter()
-        .map_err(vector_membership_pages::metadata_error)?;
-    let first = directory_cursor
-        .next()
-        .transpose()
+    let count = u64::from_be_bytes(aggregate.value()[..8].try_into().expect("checked length"));
+    if directory
+        .len()
         .map_err(vector_membership_pages::metadata_error)?
-        .ok_or_else(|| damage("captured vector directory has no aggregate"))?;
-    if first.0.value() != VECTOR_OPEN_DIRECTORY_ROOT_KEY {
-        return Err(damage(
-            "vector directory aggregate is not its lower boundary",
-        ));
-    }
-    drop(first);
-    let mut count = 0u64;
-    let mut digest = [0u8; 32];
-    let mut member_cursor = members
-        .as_ref()
-        .map(|table| {
-            table
-                .iter()
-                .map_err(vector_membership_pages::metadata_error)
-        })
-        .transpose()?;
-    loop {
-        before()?;
-        let Some(item) = member_cursor.as_mut().and_then(Iterator::next) else {
-            break;
-        };
-        let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
-        let mut window = copies.scratch();
-        let bytes = key
-            .value()
-            .len()
-            .checked_add(value.value().len())
-            .and_then(|n| n.checked_mul(8))
-            .and_then(|n| n.checked_add(std::mem::size_of::<VectorPartitionMembershipRecord>()))
-            .ok_or_else(|| damage("vector membership decode capacity overflow"))?;
-        window.reserve(bytes)?;
-        let payload =
-            vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-                .map_err(|reason| damage(&reason))?;
-        prevalidate_vector_partition_metadata_routes(
-            VectorPartitionRecordKind::Membership,
-            payload,
-        )
-        .map_err(|reason| damage(&reason))?;
-        window.reserve(
-            vector_partition_route_native_capacity(payload)
-                .map_err(|reason| damage(&reason))?
-                .checked_mul(6)
-                .ok_or_else(|| damage("vector route clone capacity overflow"))?,
-        )?;
-        let member: VectorPartitionMembershipRecord =
-            decode_vector_partition_record_payload_checked(
-                VectorPartitionRecordKind::Membership,
-                value.value(),
-            )
-            .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
-        let partition = VectorPartitionRef::new(member.index.clone(), member.partition_key.clone());
-        decode_forward(&partition, key.value(), value.value())?;
-        let context = OPERATION
-            .with(|slot| slot.borrow().clone())
-            .ok_or_else(|| damage("historical vector universe has no operation capture"))?;
-        authenticate_owning_row(
-            &context.owner,
-            read,
-            &member.index,
-            &body_identity(&member),
-            None,
-            before,
-        )?;
-        route(&partition)?;
-        before()?;
-        let source_key = vector_membership_pages::source_key(&member);
-        let reverse_key = vector_membership_pages::reverse_key(&member);
-        let source = source
-            .as_ref()
-            .ok_or_else(|| damage("nonempty universe has no source table"))?;
-        let reverse = reverse
-            .as_ref()
-            .ok_or_else(|| damage("nonempty universe has no reverse table"))?;
-        let vectors = vectors
-            .as_ref()
-            .ok_or_else(|| damage("nonempty universe has no body table"))?;
-        let summaries = summaries
-            .as_ref()
-            .ok_or_else(|| damage("nonempty universe has no summary table"))?;
-        if source
-            .get_bounded(source_key.as_slice())
-            .map_err(vector_membership_pages::metadata_error)?
-            .is_none_or(|copy| copy.value() != value.value())
-            || reverse
-                .get_bounded(reverse_key.as_slice())
-                .map_err(vector_membership_pages::metadata_error)?
-                .is_none_or(|copy| copy.value() != value.value())
-        {
-            return Err(damage(
-                "membership source or reverse companion differs from its captured member",
-            ));
-        }
-        let body_key = RedbPersistence::vector_identity_key(
-            &member.index,
-            member.row_id,
-            member.vector_created_tx,
-            member.vector_lsn,
-        );
-        if vectors
-            .get_bounded(body_key.as_slice())
-            .map_err(vector_membership_pages::metadata_error)?
-            .is_none()
-        {
-            return Err(damage("captured membership references a missing body"));
-        }
-        before()?;
-        let mut hash = blake3::Hasher::new();
-        hash.update(key.value());
-        hash.update(value.value());
-        let hash = hash.finalize();
-        projection.insert(key.value(), hash.as_bytes())?;
-        let (expected_key, expected_hash) = directory_cursor
-            .next()
-            .transpose()
-            .map_err(vector_membership_pages::metadata_error)?
-            .ok_or_else(|| damage("captured vector directory omits a membership"))?;
-        if expected_key.value() != key.value() || expected_hash.value() != hash.as_bytes() {
-            return Err(damage(
-                "captured directory membership order or body differs",
-            ));
-        }
-        count = count
+        != count
             .checked_add(1)
-            .ok_or_else(|| damage("vector membership count overflow"))?;
-        for (dst, src) in digest.iter_mut().zip(hash.as_bytes()) {
-            *dst ^= src;
-        }
-        let prefix =
-            RedbPersistence::vector_partition_prefix(&partition.index, &partition.partition_key);
-        if summaries
-            .get_bounded(prefix.as_slice())
-            .map_err(vector_membership_pages::metadata_error)?
-            .is_none()
-        {
-            return Err(damage("captured route has no summary"));
-        }
-    }
-    before()?;
-    if directory_cursor
-        .next()
-        .transpose()
-        .map_err(vector_membership_pages::metadata_error)?
-        .is_some()
-        || source
-            .as_ref()
-            .map(|table| table.len().map_err(vector_membership_pages::metadata_error))
-            .transpose()?
-            .unwrap_or(0)
-            != count
-        || reverse
-            .as_ref()
-            .map(|table| table.len().map_err(vector_membership_pages::metadata_error))
-            .transpose()?
-            .unwrap_or(0)
-            != count
-        || aggregate.value()[..8] != count.to_be_bytes()
-        || aggregate.value()[8..] != digest
+            .ok_or_else(|| damage("captured directory count overflow"))?
     {
-        return Err(damage(
-            "captured directory or companion universe has missing or extra members",
-        ));
+        return Err(damage("captured directory has missing or extra witnesses"));
+    }
+    if count == 0 && aggregate.value()[8..] != [0; 32] {
+        return Err(damage("empty captured directory has a nonempty digest"));
+    }
+    vector_membership_pages::verify_summary_projection(read, count)?;
+    for definition in [
+        VECTOR_PARTITION_MEMBERSHIP_TABLE,
+        vector_membership_pages::SOURCE,
+        vector_membership_pages::REVERSE,
+    ] {
+        before()?;
+        let actual = open_optional_read_table(read, definition)?
+            .map(|table| table.len().map_err(vector_membership_pages::metadata_error))
+            .transpose()?
+            .unwrap_or(0);
+        if actual != count {
+            return Err(damage("captured directory or companion universe has missing or extra members"));
+        }
     }
     let body_count = vector_membership_pages::referenced_body_count_in_read(read)?;
-    if vectors
-        .as_ref()
+    let actual_bodies = open_optional_read_table(read, VECTORS_TABLE)?
         .map(|table| table.len().map_err(vector_membership_pages::metadata_error))
         .transpose()?
-        .unwrap_or(0)
-        != body_count
-        || projection.root_with_vector_body_count(body_count)
-            != content_identity::vector_directory_projection_in_read(read).map_err(|error| {
+        .unwrap_or(0);
+    if actual_bodies != body_count
+        || !content_identity::vector_directory_projection_matches_in_read(read, body_count, count)
+            .map_err(|error| {
                 if crate::read_image_memory::is_memory_refusal(&error)
                     || matches!(error, Error::ReadCancelled)
                 {
                     return error;
                 }
-                damage(&format!(
-                    "captured vector root projection is invalid: {error}"
-                ))
+                crate::funded_error::corruption_display(
+                    crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+                    "vector_partition_memberships", format_args!("captured vector root projection is invalid: {error}"))
             })?
         || !vector_scan_body_root_matches(read)?
     {
-        return Err(damage(
-            "captured vector body universe differs from its committed directory",
-        ));
+        return Err(damage("captured vector body universe differs from its committed directory"));
     }
-    // Summaries are scanned reciprocally, including the independent global
-    // summary and lawful empty declared routes. Each source prefix is bounded.
-    let mut summary_cursor = summaries
-        .as_ref()
-        .map(|table| {
-            table
-                .iter()
-                .map_err(vector_membership_pages::metadata_error)
-        })
-        .transpose()?;
-    let mut global_seen = false;
-    loop {
-        before()?;
-        let Some(item) = summary_cursor.as_mut().and_then(Iterator::next) else {
-            break;
-        };
-        let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
-        let mut window = copies.scratch();
-        window.reserve(
-            key.value()
-                .len()
-                .checked_mul(8)
-                .and_then(|n| n.checked_add(value.value().len()))
-                .and_then(|n| {
-                    n.checked_add(
-                        2 * std::mem::size_of::<vector_membership_pages::MembershipSummary>(),
-                    )
-                })
-                .ok_or_else(|| damage("vector summary window overflow"))?,
-        )?;
+    before()
+}
+
+/// Visit only maintained route metadata, never historical membership records.
+/// The installed-source callback is scoped to preflight and cannot escape it.
+fn validate_captured_routes(
+    read: &redb::ReadTransaction,
+    copies: &mut contextdb_vector::VectorCopyAdmission,
+    route: &mut dyn FnMut(&VectorPartitionRef) -> Result<()>,
+) -> Result<()> {
+    let Some(summaries) = open_optional_read_table(read, vector_membership_pages::SUMMARY)? else {
+        return Ok(());
+    };
+    for entry in summaries
+        .iter()
+        .map_err(vector_membership_pages::metadata_error)?
+    {
+        operation_checkpoint()?;
+        let (key, value) = entry.map_err(vector_membership_pages::metadata_error)?;
         if key.value().is_empty() {
-            global_seen = true;
+            continue;
         }
-        if !key.value().is_empty() {
-            let partition =
-                vector_membership_pages::partition_from_prefix_admitted(key.value(), &mut window)?;
-            route(&partition)?;
-        }
-        vector_membership_pages::verify_summary_projection(
-            read,
-            key.value(),
-            value.value(),
-            copies,
-            before,
-        )?;
+        vector_membership_pages::decode_summary(key.value(), value.value())?;
+        let mut window = copies.scratch();
+        let partition =
+            vector_membership_pages::partition_from_prefix_admitted(key.value(), &mut window)?;
+        route(&partition)?;
     }
-    if count != 0 && !global_seen {
-        return Err(damage(
-            "nonempty universe has no independent global summary",
-        ));
-    }
-    before()?;
     Ok(())
+}
+
+/// Prove the consumed forward record's exact companions using borrowed values
+/// at the operation's immutable root. Only lookup keys are materialized;
+/// companion values and directory witnesses remain borrowed.
+fn authenticate_membership_companions(
+    owner: &MembershipOwner,
+    read: &redb::ReadTransaction,
+    key: &[u8],
+    encoded: &[u8],
+    record: &VectorPartitionMembershipRecord,
+) -> Result<()> {
+    let Some(memory) = historical_operation_memory(owner, read)? else {
+        return Ok(());
+    };
+    operation_checkpoint()?;
+    let bytes = key
+        .len()
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(4 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()))
+        .and_then(|n| n.checked_add(std::mem::size_of::<blake3::Hasher>() + 256))
+        .ok_or_else(|| damage("membership companion window overflow"))?;
+    let _credit = contextdb_core::read_memory::ReadCredit::try_new(
+        memory.clone(),
+        bytes,
+        "reader",
+        "vector_membership_companions",
+        HINT,
+    )?;
+    graph_read::with_pages(memory, || {
+        for (definition, companion_key) in [
+            (
+                vector_membership_pages::SOURCE,
+                vector_membership_pages::source_key(record),
+            ),
+            (
+                vector_membership_pages::REVERSE,
+                vector_membership_pages::reverse_key(record),
+            ),
+        ] {
+            operation_checkpoint()?;
+            let table = match read.open_byte_table_bounded(definition) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(damage("consumed membership companion schema is absent"));
+                }
+                Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+            };
+            let companion = table
+                .get_bounded(companion_key.as_slice())
+                .map_err(vector_membership_pages::metadata_error)?
+                .ok_or_else(|| damage("consumed membership companion is absent"))?;
+            if companion.value() != encoded {
+                return Err(damage(
+                    "consumed membership companion differs from its authority",
+                ));
+            }
+        }
+        let directory = match read.open_byte_table_bounded(VECTOR_OPEN_DIRECTORY_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(damage("consumed membership directory schema is absent"));
+            }
+            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+        };
+        let witness = directory
+            .get_bounded(key)
+            .map_err(vector_membership_pages::metadata_error)?
+            .ok_or_else(|| damage("consumed membership directory witness is absent"))?;
+        let mut hash = blake3::Hasher::new();
+        hash.update(key);
+        hash.update(encoded);
+        if witness.value() != hash.finalize().as_bytes() {
+            return Err(damage(
+                "consumed membership directory witness differs from its authority",
+            ));
+        }
+        // A route absent from the authenticated summary inventory was not checked
+        // against the installed source at preflight and must never be consumed.
+        let prefix = RedbPersistence::vector_partition_prefix(&record.index, &record.partition_key);
+        let summaries = match read.open_byte_table_bounded(vector_membership_pages::SUMMARY) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(damage("consumed membership summary schema is absent"));
+            }
+            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
+        };
+        let summary = summaries
+            .get_bounded(prefix.as_slice())
+            .map_err(vector_membership_pages::metadata_error)?
+            .ok_or_else(|| damage("consumed membership route summary is absent"))?;
+        if vector_membership_pages::decode_summary(&prefix, summary.value())?.entries == 0 {
+            return Err(damage("consumed membership route summary is empty"));
+        }
+        operation_checkpoint()
+    })
 }
 
 pub(crate) fn check_declared_routes(
@@ -861,7 +857,7 @@ pub(super) fn operation_read_for_retained(
         slot.borrow()
             .as_ref()
             .and_then(|context| match &context.owner {
-                MembershipOwner::Retained(owner) if std::ptr::eq(owner.as_ref(), source) => {
+                MembershipOwner::Retained(owner) if RetainedReadSource::ptr_eq(owner, source) => {
                     Some(context.root.read.clone())
                 }
                 _ => None,
@@ -875,8 +871,10 @@ pub(crate) fn retained_partition_row_at_lsn(
     meta: &TableMeta,
     row: RowId,
     lsn: Lsn,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<VersionedRow>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
     operation_checkpoint()?;
     let read = match operation_read_for_retained(source) {
         Some(read) => read,
@@ -916,7 +914,7 @@ pub(super) fn authenticate_retained_historical_body(
             .as_ref()
             .filter(|context| context.historical)
             .and_then(|context| match &context.owner {
-                MembershipOwner::Retained(owner) if std::ptr::eq(owner.as_ref(), source) => {
+                MembershipOwner::Retained(owner) if RetainedReadSource::ptr_eq(owner, source) => {
                     Some(context.clone())
                 }
                 _ => None,
@@ -978,7 +976,7 @@ pub(super) fn authenticate_retained_historical_body(
 pub(super) fn historical_memory_for_persistence(
     source: &RedbPersistence,
     read: &redb::ReadTransaction,
-) -> Result<Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>> {
+) -> Result<Option<contextdb_core::read_memory::ReadMemoryOwner>> {
     let owner = OPERATION.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -1034,7 +1032,7 @@ pub(super) fn operation_read(owner: &MembershipOwner) -> Option<Arc<redb::ReadTr
 pub(super) fn historical_operation_memory(
     owner: &MembershipOwner,
     read: &redb::ReadTransaction,
-) -> Result<Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>> {
+) -> Result<Option<contextdb_core::read_memory::ReadMemoryOwner>> {
     let Some(context) = operation_for(owner) else {
         return Ok(None);
     };
@@ -1265,15 +1263,15 @@ pub(crate) fn select_live_fallback(
         )?;
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-                .map_err(|reason| damage(&reason))?;
+                .map_err(|reason| damage(reason))?;
         prevalidate_vector_partition_metadata_routes(
             VectorPartitionRecordKind::Membership,
             payload,
         )
-        .map_err(|reason| damage(&reason))?;
+        .map_err(|reason| damage(reason))?;
         window.reserve(
             vector_partition_route_native_capacity(payload)
-                .map_err(|reason| damage(&reason))?
+                .map_err(|reason| damage(reason))?
                 .checked_mul(6)
                 .ok_or_else(|| damage("vector route clone capacity overflow"))?,
         )?;
@@ -1282,9 +1280,10 @@ pub(crate) fn select_live_fallback(
                 VectorPartitionRecordKind::Membership,
                 value.value(),
             )
-            .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
+            .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
         let partition = VectorPartitionRef::new(record.index.clone(), record.partition_key.clone());
         decode_forward(&partition, key.value(), value.value())?;
+        authenticate_membership_companions(&owner, &root.read, key.value(), value.value(), &record)?;
         authenticate_owning_row(
             &owner,
             &root.read,
@@ -1353,7 +1352,7 @@ impl SelectedVectorMembership {
     ) -> Result<VectorEntry> {
         let same_source = match (&self.owner, owner) {
             (MembershipOwner::Writable(a), MembershipOwner::Writable(b)) => Arc::ptr_eq(a, b),
-            (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => Arc::ptr_eq(a, b),
+            (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => RetainedReadSource::ptr_eq(a, b),
             _ => false,
         };
         if !same_source
@@ -1493,9 +1492,9 @@ pub(super) fn decode_forward_for_route(
     // scalar; only the two owned index strings below are new engine buffers.
     let _decode = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, value)
-        .map_err(|reason| damage(&reason))?;
+        .map_err(|reason| damage(reason))?;
     let route_end = vector_partition_expected_route_prefix(payload, index, partition_key)
-        .map_err(|reason| damage(&reason))?;
+        .map_err(|reason| damage(reason))?;
     let suffix = &payload[route_end..];
     let ((row_id, row_created_tx, row_lsn, vector_created_tx, vector_lsn, visible_from, deleted_tx), consumed):
         ((RowId, TxId, Lsn, TxId, Lsn, TxId, Option<TxId>), usize) =
@@ -1964,7 +1963,7 @@ impl DurableMembershipSource {
                     VectorPartitionRecordKind::Journal,
                     value.value(),
                 )
-                .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
+                .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
             if record.index != self.partition.index
                 || record.partition_key != self.partition.partition_key
             {
@@ -2225,7 +2224,7 @@ impl MembershipCursor {
     ) -> Result<RawVectorDirectoryEntry> {
         let same_source = match (&self.owner, owner) {
             (MembershipOwner::Writable(a), MembershipOwner::Writable(b)) => Arc::ptr_eq(a, b),
-            (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => Arc::ptr_eq(a, b),
+            (MembershipOwner::Retained(a), MembershipOwner::Retained(b)) => RetainedReadSource::ptr_eq(a, b),
             _ => false,
         };
         if !same_source
@@ -2324,9 +2323,9 @@ impl MembershipCursor {
             return Ok(None);
         };
         let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-            .map_err(|reason| damage(&reason))?;
+            .map_err(|reason| damage(reason))?;
         prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-            .map_err(|reason| damage(&reason))?;
+            .map_err(|reason| damage(reason))?;
         let required = membership_cursor_owned_bytes(&self.partition, self.prefix.capacity(), key.value().len());
         if required > self.max_bytes {
             if !request(DormantVectorLoadRequest::Reserve(required - self.max_bytes)) {
@@ -2335,6 +2334,13 @@ impl MembershipCursor {
             self.max_bytes = required;
         }
         let record = decode_forward(&self.partition, key.value(), value.value())?;
+        authenticate_membership_companions(
+            &self.owner,
+            &self.root.read,
+            key.value(),
+            value.value(),
+            &record,
+        )?;
         authenticate_owning_row(
             &self.owner,
             &self.root.read,
@@ -3049,14 +3055,14 @@ impl ReverseCursor {
         });
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-                .map_err(|reason| damage(&reason))?;
+                .map_err(|reason| damage(reason))?;
         prevalidate_vector_partition_metadata_routes(
             VectorPartitionRecordKind::Membership,
             payload,
         )
-        .map_err(|reason| damage(&reason))?;
+        .map_err(|reason| damage(reason))?;
         let native =
-            vector_partition_route_native_capacity(payload).map_err(|reason| damage(&reason))?;
+            vector_partition_route_native_capacity(payload).map_err(|reason| damage(reason))?;
         let needed = needed
             .checked_add(
                 native
@@ -3073,7 +3079,7 @@ impl ReverseCursor {
                 VectorPartitionRecordKind::Membership,
                 value.value(),
             )
-            .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
+            .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
         if vector_membership_pages::reverse_key(&record).as_slice() != key.value()
             || record.index != self.index
             || record.row_id != self.row
@@ -3826,13 +3832,13 @@ pub(crate) fn stream_partition_journal_tail(
         // Ground actual codec & control pricing before record deserialization
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Journal, val_buf.as_slice())
-                .map_err(|reason| damage(&reason))?;
+                .map_err(|reason| damage(reason))?;
 
         prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Journal, payload)
-            .map_err(|reason| damage(&reason))?;
+            .map_err(|reason| damage(reason))?;
 
         let route_native_cap =
-            vector_partition_route_native_capacity(payload).map_err(|reason| damage(&reason))?;
+            vector_partition_route_native_capacity(payload).map_err(|reason| damage(reason))?;
         let decoded_route_bytes = route_native_cap
             .checked_mul(2)
             .ok_or_else(|| damage("journal record route capacity overflow"))?;
@@ -3851,7 +3857,7 @@ pub(crate) fn stream_partition_journal_tail(
             VectorPartitionRecordKind::Journal,
             val_buf.as_slice(),
         )
-        .map_err(|failure| failure.into_error(|reason| damage(&reason)))?;
+        .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
 
         if record.index != partition.index || record.partition_key != partition.partition_key {
             return Err(damage("journal route disagrees with membership source"));

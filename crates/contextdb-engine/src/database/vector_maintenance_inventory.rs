@@ -161,10 +161,10 @@ impl MaintenanceContext {
     fn maintenance_workspace(
         &self,
         bytes: usize,
-        operation: &str,
+        operation: &'static str,
     ) -> Result<VectorWorkspaceReservation> {
-        self.vector.reserve_workspace(
-            Arc::clone(&self.finalization.vector_accountant),
+        self.vector.reserve_workspace_static(
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             bytes,
             operation,
             HINT,
@@ -392,7 +392,7 @@ impl MaintenanceContext {
                     } else {
                         0
                     };
-                    if let Err(error) = workspace.resize(
+                    if let Err(error) = workspace.resize_static(
                         key_bound.saturating_add(
                             RedbPersistence::maintenance_vector_catalog_decode_bound(
                                 value.value().len(),
@@ -448,7 +448,7 @@ impl MaintenanceContext {
                         &catalog.partition_key,
                     )?;
                     drop(frames);
-                    workspace.resize(
+                    workspace.resize_static(
                         key_bound.saturating_add(
                             RedbPersistence::maintenance_vector_catalog_heap_bytes(&catalog),
                         ),
@@ -778,7 +778,7 @@ impl MaintenanceContext {
                     let retained = self
                         .vector
                         .snapshot_retained_partition_chain_ids(&partition, registered_snapshots);
-                    entry.workspace.resize(
+                    entry.workspace.resize_static(
                         heap.saturating_add(
                             RedbPersistence::vector_journal_cleanup_key_reservation(
                                 &catalog.index,
@@ -827,7 +827,7 @@ impl MaintenanceContext {
 
     pub(super) fn maintenance_build_candidates(&self) -> Result<MaintenanceBuildCandidates> {
         let mut maintenance_vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(
-            Arc::clone(&self.finalization.vector_accountant),
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
         );
         self.tx_mgr.with_commit_lock(|| {
             let mut phase = self.maintenance_inventory_phase_locked()?;
@@ -972,7 +972,7 @@ impl MaintenanceContext {
                                         &route.partition_key,
                                         covered_lsn,
                                         |decode| {
-                                            workspace.resize(
+                                            workspace.resize_static(
                                                 fixed.saturating_add(decode),
                                                 PREPARE,
                                                 HINT,
@@ -1035,7 +1035,7 @@ impl MaintenanceContext {
                             && info.serving_policy.is_none()
                             && info.quarantine_reason.is_none();
                         drop(info);
-                        workspace.resize(route_heap, PREPARE, HINT)?;
+                        workspace.resize_static(route_heap, PREPARE, HINT)?;
                         self.admit_inventory_slot("candidates", &mut memory, &mut candidates)?;
                         candidates.push(MaintenanceBuildCandidate {
                             partition: route,
@@ -1066,7 +1066,7 @@ impl MaintenanceContext {
                         &catalog.index,
                         &catalog.partition_key,
                     ));
-                let probe = entry.workspace.resize(fixed, PREPARE, HINT).and_then(|()| {
+                let probe = entry.workspace.resize_static(fixed, PREPARE, HINT).and_then(|()| {
                     vector_source_page_admission::with_preparation_source_page_admission(
                         crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         || {
@@ -1076,7 +1076,7 @@ impl MaintenanceContext {
                                     &catalog.partition_key,
                                     catalog.change.unwrap_or(catalog.base).covered_lsn,
                                     |decode| {
-                                        entry.workspace.resize(
+                                        entry.workspace.resize_static(
                                             fixed.saturating_add(decode),
                                             PREPARE,
                                             HINT,
@@ -1103,7 +1103,7 @@ impl MaintenanceContext {
                             catalog.index.clone(),
                             catalog.partition_key.clone(),
                         );
-                        workspace.resize(heap, PREPARE, HINT)?;
+                        workspace.resize_static(heap, PREPARE, HINT)?;
                         self.admit_inventory_slot("candidates", &mut memory, &mut candidates)?;
                         candidates.push(MaintenanceBuildCandidate {
                             partition,

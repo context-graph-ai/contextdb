@@ -165,14 +165,13 @@ fn delete(db: &Database, id: Uuid) -> Result<(), String> {
 }
 
 fn body(db: &Database, id: Uuid) -> Result<Option<String>, String> {
-    let rows = db
+    let result = db
         .execute(
             "SELECT body FROM notes WHERE id = $id",
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
-        .map_err(|_| "policy verifier row read failed".to_string())?
-        .rows;
-    match rows.as_slice() {
+        .map_err(|_| "policy verifier row read failed".to_string())?;
+    match result.rows() {
         [] => Ok(None),
         [row] => match row.as_slice() {
             [Value::Text(body)] => Ok(Some(body.clone())),

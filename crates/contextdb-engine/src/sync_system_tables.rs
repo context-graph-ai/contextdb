@@ -17,8 +17,10 @@ const CREATE_WORK_NODE_CONTACTS: &str = "CREATE TABLE work_node_contacts (\
 /// never comes from an application policy map.
 pub(crate) fn ensure_node_contacts_schema(
     db: &Database,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(), Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if !db
         .table_names()
         .iter()
@@ -58,8 +60,10 @@ pub(crate) fn record_node_contact(
     db: &Database,
     node_id: &str,
     now_ms: i64,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(), Error> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     ensure_node_contacts_schema(db, read_memory.clone())?;
     db.execute_with_read_memory(
         "INSERT INTO work_node_contacts (node_id, last_contact_ms) VALUES ($node_id, $last_contact_ms) \

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 // Forward compatibility feature in case alignment can be supported in the future
 // See https://github.com/cberner/redb/issues/360
-const ALIGNMENT: usize = 1;
+pub(crate) const ALIGNMENT: usize = 1;
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
 pub(crate) enum TableType {

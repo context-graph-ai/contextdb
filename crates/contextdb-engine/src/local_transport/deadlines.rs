@@ -788,7 +788,12 @@ fn native_source_with<S: contextdb_core::read_contract::NativeDeadlineSource + '
         std::ptr::NonNull::<S>::dangling()
     } else {
         std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }.cast::<S>())
-            .ok_or(contextdb_core::Error::ReadSessionNotImplemented)?
+            .ok_or(contextdb_core::Error::NativeEngineOther(
+                contextdb_core::read_memory::NativeRefusal::AllocatorFailed {
+                    site: "native deadline source",
+                    layout,
+                },
+            ))?
     };
     struct Guard<S> {
         block: std::ptr::NonNull<S>,

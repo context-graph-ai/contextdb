@@ -27,7 +27,7 @@ pub(in super::super) const DIRECTORY_CHECK_SCRATCH_BYTES: usize =
         + std::mem::size_of::<redb::ReadOnlyUntypedTable>()
         + std::mem::size_of::<redb::ReadOnlyTable<u64, u64>>();
 
-pub(super) fn history_control_damage(reason: &str) -> Error {
+pub(super) fn history_control_damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "committed history controls".into(),
         reason: reason.into(),

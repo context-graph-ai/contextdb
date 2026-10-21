@@ -30,7 +30,7 @@ pub(crate) use page_store::{
 };
 pub use page_store::{InMemoryBackend, Savepoint, file_backend};
 pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut};
-pub(crate) use table_tree_base::{InternalTableDefinition, TableType};
+pub(crate) use table_tree_base::{ALIGNMENT, InternalTableDefinition, TableType};
 
 #[cfg(feature = "test-seams")]
 mod random_state_override;
@@ -38,3 +38,14 @@ mod random_state_override;
 pub(crate) use random_state_override::fixture_random_state;
 #[cfg(feature = "test-seams")]
 pub use random_state_override::with_random_state_for_test;
+
+#[cfg(feature = "contextdb-internal")]
+pub use page_store::CacheReserveOwner;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use page_store::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub use page_store::CheckedWriterBackendForTest;

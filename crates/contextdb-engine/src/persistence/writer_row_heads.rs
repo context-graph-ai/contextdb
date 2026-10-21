@@ -7,7 +7,7 @@ use super::*;
 mod held_relations_tests;
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("writer_row_heads");
 const ROOT_KEY: &str = "row_heads_root";
-fn damage(reason: &str) -> Error {
+fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "writer_row_heads".into(),
         reason: reason.into(),

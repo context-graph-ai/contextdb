@@ -284,8 +284,10 @@ impl ReceivedWorkingWrite {
         &self, store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         root: WriterSnapshotHandle,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.require_original(original)?;
         self.require_store(store)?;
         root.require_working_store(store)?;
@@ -429,10 +431,10 @@ fn next_membership_in_write(
         let mut range = table.range::<&[u8]>((lower, upper)).map_err(RedbPersistence::storage_error)?;
         let Some((key, body)) = range.next().transpose().map_err(RedbPersistence::storage_error)? else { return Ok(None); };
         let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, body.value())
-            .map_err(|reason| Error::StoreCorrupted { path: "received working memberships".into(), reason })?;
+            .map_err(|reason| crate::funded_error::corruption_display(crate::funded_error::original_budget(original), "received working memberships", reason))?;
         let record = frame.decode::<VectorPartitionMembershipRecord>(payload)?;
         if !membership_key_matches(key.value(), &record) {
-            return Err(Error::StoreCorrupted { path: "received working memberships".into(), reason: "placement key and body disagree".into() });
+            return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), "received working memberships", "placement key and body disagree".into()));
         }
         (record, frame.copy_bytes(key.value())?, frame.copy_bytes(body.value())?)
     };
@@ -628,7 +630,7 @@ impl ReceivedWorkingWrite {
             };
             // Native guards are gone before decode/admission and the next seek.
             let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, &copied.1)
-                .map_err(|reason| Error::StoreCorrupted { path: "received working reverse".into(), reason })?;
+                .map_err(|reason| crate::funded_error::corruption_display(crate::funded_error::original_budget(original), "received working reverse", reason))?;
             let member: VectorPartitionMembershipRecord = frame.decode(payload)?;
             if !copied.0.starts_with(&prefix) || !reverse_membership_key_matches(&copied.0, &member)
                 || member.index != *index || member.row_id != row {
@@ -1094,7 +1096,7 @@ struct WorkingVectorStreamedTail {
     covered_tx: TxId,
     covered_lsn: Lsn,
     // Decoded route metadata stays paid through saved source/loader teardown.
-    _metadata_memory: Arc<crate::read_image_memory::ImageMemory>,
+    _metadata_memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl WorkingVectorStreamedTail {
     fn delta(&self, interval: &RawVectorDirectoryEntry, body: &RawVectorDirectoryEntry,
@@ -1702,11 +1704,11 @@ impl WorkingVectorPartitionSource {
             .and_then(|n| n.checked_add(body.index.table.len())).and_then(|n| n.checked_add(body.index.column.len()))
             .ok_or_else(|| Error::Other("working vector copy size overflow".into()))
     }
-    fn resident_budget(&self) -> Result<Arc<dyn MemoryBudget>> {
+    fn resident_budget(&self) -> Result<contextdb_vector::MemoryBudgetOwner> {
         match &self.owner {
             WorkingPartitionOwner::Query { control, .. } => Ok(control.funder()),
             WorkingPartitionOwner::Original { .. } =>
-                crate::memory_accounting::persistence_original_projection(&self.catalog.catalog.storage.lock())?.vector_budget(),
+                crate::memory_accounting::persistence_original_projection(&self.catalog.catalog.storage.lock())?.vector_budget().map(Into::into),
         }
     }
     fn candidate_from_member(&self, source: &super::received_working_source::WorkingReadSource,
@@ -1782,7 +1784,7 @@ impl DormantRawVectorLoader for WorkingVectorPartitionSource {
                     member.value.visible_from, member.value.deleted_tx), canonical_deleted));
         }
         resident.transfer();
-        Ok(contextdb_vector::store::LoadedRawVectorPartition { entries, resident_bytes, workspace_owner: workspace, accountant: budget })
+        Ok(contextdb_vector::store::LoadedRawVectorPartition { entries, resident_bytes, workspace_owner: workspace, accountant: (budget).into() })
     }
     fn load_candidate(&self, identity: &RawVectorDirectoryEntry, caller_charged: bool,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<contextdb_vector::store::LoadedRawVectorCandidate> {
@@ -1934,7 +1936,7 @@ impl ReceivedWorkingWrite {
                 })?;
                 if destination.name() == WORKING_VECTOR_MEMBERSHIPS.name() {
                     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, &encoded)
-                        .map_err(|reason| Error::StoreCorrupted { path: "received working vector rewrite".into(), reason })?;
+                        .map_err(|reason| crate::funded_error::corruption_display(crate::funded_error::original_budget(original), "received working vector rewrite", reason))?;
                     let member: VectorPartitionMembershipRecord = frame.decode(payload)?;
                     let reverse = reverse_membership_key_original(&frame, &member)?;
                     let (mut summary_lower, summary_upper) = summary_bounds(&frame, &key)?;

@@ -263,6 +263,8 @@ pub struct CommitDirectoryFunding {
     pub image_held_bytes: Option<usize>,
     pub image_accountant_alive: Option<bool>,
     pub image_accountant_used_bytes: Option<usize>,
+    pub image_physical_free_returned: Option<bool>,
+    pub image_accountant_physical_free_returned: Option<bool>,
 }
 
 /// Immutable native source-registration window on the directory funding seam.
@@ -281,31 +283,21 @@ pub struct CommitDirectorySourceRegistrationFunding {
 struct CommitDirectoryFundingReceipt {
     open_child: crate::vector_read_memory::DeclaredReadChildObserver,
     request_child: Option<crate::vector_read_memory::DeclaredReadChildObserver>,
-    image: Option<std::sync::Weak<crate::read_image_memory::ImageMemory>>,
-    image_accountant: Option<std::sync::Weak<crate::memory_accounting::MemoryAccountant>>,
+    image: Option<crate::read_image_memory::ImageMemoryObservation>,
     source_registration: Option<CommitDirectorySourceRegistrationFunding>,
 }
 impl CommitDirectoryFundingReceipt {
     fn sample(&self) -> CommitDirectoryFunding {
-        let image = self.image.as_ref().and_then(std::sync::Weak::upgrade);
-        let accountant = self
-            .image_accountant
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade);
+        let image = self.image.map(|image| image.sample());
         CommitDirectoryFunding {
             open_child: self.open_child.sample(),
             request_child: self.request_child.as_ref().map(|child| child.sample()),
-            image_alive: self.image.as_ref().map(|_| image.is_some()),
-            image_held_bytes: self
-                .image
-                .as_ref()
-                .map(|_| image.as_ref().map_or(0, |image| image.held())),
-            image_accountant_alive: self.image_accountant.as_ref().map(|_| accountant.is_some()),
-            image_accountant_used_bytes: self.image_accountant.as_ref().map(|_| {
-                accountant
-                    .as_ref()
-                    .map_or(0, |accountant| accountant.usage().used)
-            }),
+            image_alive: image.map(|sample| sample.0),
+            image_held_bytes: image.map(|sample| sample.1),
+            image_accountant_alive: image.map(|sample| sample.2),
+            image_accountant_used_bytes: image.map(|sample| sample.3),
+            image_physical_free_returned: self.image.map(|image| image.is_physically_freed()),
+            image_accountant_physical_free_returned: self.image.map(|image| image.accountant_is_physically_freed()),
         }
     }
 }
@@ -586,11 +578,12 @@ thread_local! {
     static GRAPH_ROOT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 /// Capability identity is process-local and remains stable while the owner lives.
-pub(crate) fn funding_owner_name<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
+fn legacy_funding_owner_name<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
     owner: &std::sync::Arc<T>,
 ) -> String {
+    if let Some(funder) = owner.funding_owner_handle_for_test() { return funding_owner_name(funder); }
     if let Some(funder) = owner.funding_owner_for_test() {
-        return funding_owner_name(funder);
+        return legacy_funding_owner_name(funder);
     }
     format!(
         "{}@{:p}",
@@ -598,13 +591,35 @@ pub(crate) fn funding_owner_name<T: ?Sized + contextdb_core::read_memory::ReadMe
         std::sync::Arc::as_ptr(owner) as *const ()
     )
 }
-pub(crate) fn funding_owner_id<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
+fn legacy_funding_owner_id<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
     owner: &std::sync::Arc<T>,
 ) -> usize {
+    if let Some(funder) = owner.funding_owner_handle_for_test() { return funding_owner_id(funder); }
     if let Some(funder) = owner.funding_owner_for_test() {
-        return funding_owner_id(funder);
+        return legacy_funding_owner_id(funder);
     }
     std::sync::Arc::as_ptr(owner) as *const () as usize
+}
+pub(crate) fn funding_owner_name(
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> String {
+    use contextdb_core::read_memory::ReadMemoryBudget;
+    let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+    if let Some(funder) = owner.funding_owner_for_test() {
+        return legacy_funding_owner_name(funder);
+    }
+    format!("{}@{:p}", std::any::type_name::<contextdb_core::read_memory::ReadMemoryOwner>(),
+        owner.accounting_identity() as *const ())
+}
+pub(crate) fn funding_owner_id(
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> usize {
+    use contextdb_core::read_memory::ReadMemoryBudget;
+    let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+    if let Some(funder) = owner.funding_owner_for_test() {
+        return legacy_funding_owner_id(funder);
+    }
+    owner.accounting_identity()
 }
 pub(crate) fn observed_funding_identity() -> Option<usize> {
     FUNDING.with(|f| f.borrow().as_ref().map(|v| v.1))
@@ -703,7 +718,7 @@ impl ReadWorkObservationScope {
             .map(|sample| (sample.resident_entries, sample.durable_entries))
     }
     /// None means the actual open funder was never observed. Samples retain
-    /// only Weak handles; a known dropped owner is reported as dead with zero.
+    /// only generation tokens; values are copied at real producer boundaries and free events.
     pub fn commit_directory_funding(&self) -> Option<CommitDirectoryFunding> {
         self.commit_directory_funding
             .lock()
@@ -920,20 +935,50 @@ pub(crate) fn note_graph(
                 control_reservation_bytes: observed_funding().map(|v| v.1),
             });
     });
+    #[cfg(test)]
+    graph_publication_root_tests::after_graph_event(family, operation, key);
+}
+
+// None means binding has not replaced the root; Some(None) restores an
+// originally unobserved context. The original allocation moves here at binding.
+struct GraphPublicationRoot {
+    previous_root: Option<Option<String>>,
+}
+impl Drop for GraphPublicationRoot {
+    fn drop(&mut self) {
+        if let Some(previous_root) = self.previous_root.take() {
+            GRAPH_ROOT.with(|r| {
+                r.replace(previous_root);
+            });
+        }
+    }
 }
 
 pub(crate) struct GraphPublicationAttempt {
     committed: bool,
-    previous_root: Option<String>,
+    root: GraphPublicationRoot,
 }
 impl GraphPublicationAttempt {
     pub(crate) fn begin_in_write(write: &redb::WriteTransaction) -> Self {
-        let previous_root = GRAPH_ROOT.with(|r| r.borrow().clone());
-        bind_graph_write_root(write);
+        // Only restoration is armed during binding/begin. If either unwinds,
+        // recording an abort from a partially constructed attempt could panic
+        // again; there was no completed begin to pair with that abort.
+        let mut root = GraphPublicationRoot {
+            previous_root: None,
+        };
+        bind_graph_write_root_with(write, |replacement| {
+            GRAPH_ROOT.with(|r| {
+                // Attribute the ownership handoff, without copying the String.
+                #[cfg(test)]
+                let _purge_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::new::<Option<String>>(
+                    "GraphPublicationAttempt::begin_in_write::previous_root");
+                root.previous_root = Some(r.replace(replacement));
+            });
+        });
         note_graph("publication", "begin", &[], None, None);
         Self {
             committed: false,
-            previous_root,
+            root,
         }
     }
     pub(crate) fn committed(&mut self) {
@@ -943,12 +988,14 @@ impl GraphPublicationAttempt {
 }
 impl Drop for GraphPublicationAttempt {
     fn drop(&mut self) {
+        // A local restorer runs even if abort recording unwinds. Disarm the
+        // field first so field cleanup cannot restore a second time.
+        let _root = GraphPublicationRoot {
+            previous_root: self.root.previous_root.take(),
+        };
         if !self.committed {
             note_graph("publication", "aborted", &[], None, None);
         }
-        GRAPH_ROOT.with(|r| {
-            r.replace(self.previous_root.take());
-        });
     }
 }
 
@@ -969,6 +1016,16 @@ pub(crate) fn graph_storage_key<K: AsRef<[u8]>>(family: &str, operation: &str, k
 
 /// Initial roots of this executing transaction, captured before any open handles.
 pub(crate) fn bind_graph_write_root(write: &redb::WriteTransaction) {
+    bind_graph_write_root_with(write, |root| {
+        GRAPH_ROOT.with(|r| {
+            r.replace(root);
+        });
+    });
+}
+
+// Keep all prebinding observations on the existing root. Only its replacement
+// is delegated, so publication can retain ownership for scoped restoration.
+fn bind_graph_write_root_with(write: &redb::WriteTransaction, bind: impl FnOnce(Option<String>)) {
     let mut roots = [
         "graph_fwd",
         "graph_rev",
@@ -998,9 +1055,7 @@ pub(crate) fn bind_graph_write_root(write: &redb::WriteTransaction) {
         note_graph_root("root_binding", name.as_bytes(), root);
     }
     if roots.iter().any(|(_, root)| root.is_err()) {
-        GRAPH_ROOT.with(|r| {
-            r.replace(None);
-        });
+        bind(None);
         note_graph(
             "root_binding",
             "UNOBSERVED",
@@ -1009,7 +1064,7 @@ pub(crate) fn bind_graph_write_root(write: &redb::WriteTransaction) {
             Some("transaction roots unavailable"),
         );
     } else {
-        bind_graph_root(&roots);
+        bind(Some(format!("{root:?}", root = &roots)));
     }
 }
 pub(crate) fn note_graph_root(family: &str, key: &[u8], root: impl std::fmt::Debug) {
@@ -1129,7 +1184,7 @@ pub(crate) fn note_commit_directory_residency(resident: u64, durable: u64) {
 
 /// Bind the exact child selected for native open, never an inferred byte sum.
 pub(crate) fn note_commit_directory_open_funding(
-    memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: &contextdb_core::read_memory::ReadMemoryOwner,
 ) {
     let child = crate::vector_read_memory::declared_child_observer(memory);
     ACTIVE.with(|active| {
@@ -1150,7 +1205,6 @@ pub(crate) fn note_commit_directory_open_funding(
                         open_child,
                         request_child: None,
                         image: None,
-                        image_accountant: None,
                         source_registration: None,
                     });
                 }
@@ -1160,28 +1214,23 @@ pub(crate) fn note_commit_directory_open_funding(
     });
 }
 pub(crate) fn note_commit_directory_image_memory(
-    image: &Arc<crate::read_image_memory::ImageMemory>,
+    image: &crate::read_image_memory::ImageMemoryHandle,
+) {
+    note_commit_directory_image_observation(crate::read_image_memory::ImageMemoryObservation::new(image));
+}
+pub(crate) fn note_commit_directory_image_observation(
+    image: crate::read_image_memory::ImageMemoryObservation,
 ) {
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref()
-            && let Some(receipt) = active
-                .commit_directory_funding
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_mut()
-        {
-            receipt.image = Some(Arc::downgrade(image));
-            receipt.image_accountant = Some(Arc::downgrade(
-                &image
-                    .accountant
-                    .standard_arc()
-                    .expect("reader image preserves standard Arc observation"),
-            ));
+            && let Some(receipt) = active.commit_directory_funding.lock()
+                .unwrap_or_else(|error| error.into_inner()).as_mut() {
+            receipt.image = Some(image);
         }
     });
 }
 pub(crate) fn note_commit_directory_request_funding(
-    memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: &contextdb_core::read_memory::ReadMemoryOwner,
 ) {
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref()
@@ -1198,11 +1247,11 @@ pub(crate) fn note_commit_directory_request_funding(
 
 /// Record only a successfully reserved wrapper on its actual native owner.
 pub(crate) fn note_commit_directory_source_registration_funding(
-    image: &Arc<crate::read_image_memory::ImageMemory>,
+    image: &crate::read_image_memory::ImageMemoryHandle,
     before: (usize, usize),
 ) {
     let window = CommitDirectorySourceRegistrationFunding {
-        image_owner_identity: Arc::as_ptr(image) as usize,
+        image_owner_identity: image.as_ref() as *const crate::read_image_memory::ImageMemory as usize,
         image_accountant_identity: image.accountant.as_ptr() as usize,
         image_held_before_reservation: before.0,
         image_held_after_reservation: image.held(),
@@ -1220,4 +1269,27 @@ pub(crate) fn note_commit_directory_source_registration_funding(
             receipt.source_registration = Some(window);
         }
     });
+}
+
+#[cfg(test)]
+#[path = "read_work_probe/graph_publication_root_tests.rs"]
+mod graph_publication_root_tests;
+
+// Extend the existing cfg observation surface; the integration target keeps its
+// original global allocator and calls these passive hooks around System.
+#[path = "read_work_probe/allocator_events.rs"]
+pub mod allocator_events;
+
+/// Current retained trace, read in place without copying or clearing its owners.
+#[cfg(feature = "test-seams")]
+pub fn retained_trace_invoice(database: &crate::Database,
+    visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner))
+    -> Option<contextdb_vector::mem::TraceInvoiceForTest> {
+    database.retained_vector_trace_invoice_for_test(visit)
+}
+
+/// Concrete payload layouts are expectations for independent allocator matching.
+#[cfg(any(test, feature = "test-seams"))]
+pub fn retained_trace_payload_layouts() -> (std::alloc::Layout, std::alloc::Layout) {
+    crate::executor::bounded::retained_trace_payload_layouts_for_test()
 }

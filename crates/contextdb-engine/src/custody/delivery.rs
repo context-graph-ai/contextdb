@@ -13,8 +13,10 @@ pub(crate) fn manifested_request(
     table: &str,
     key: &NaturalKey,
     signer: &LineageSigner,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<crate::protocol::PushRequest> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     use crate::protocol::*;
     let m = current_manifest(db, table, key, read_memory.clone())?.ok_or_else(|| {
         Error::ManifestRequired {
@@ -119,7 +121,7 @@ pub(crate) fn wire_packet(packet: &SignedOutcomePacket) -> Result<WireDeliveryOu
 
 pub(crate) fn read_packet(
     wire: &WireDeliveryOutcome,
-    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<SignedOutcomePacket> {
     let packet: SignedOutcomePacket = memory.decode_msgpack(&wire.lookup_source)?;
     if wire_packet(&packet)? != *wire {
@@ -132,8 +134,10 @@ pub(crate) fn packet_for(
     db: &Database,
     t: &TerminalRecord,
     signer: &LineageSigner,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<SignedOutcomePacket> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let block = custody_hold
@@ -167,8 +171,10 @@ pub(crate) fn attach(
     tenant: &TenantId,
     changes: &ChangeSet,
     signer: &LineageSigner,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<WireDeliveryManifest>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut out = Vec::new();
     for row in &changes.rows {
         if !row.deleted
@@ -209,8 +215,10 @@ pub(crate) fn apply(
     arrivals: &std::collections::HashMap<contextdb_core::Lsn, Option<contextdb_core::Lsn>>,
     lineages: &[(String, NaturalKey, contextdb_core::Lsn, WireRowLineage)],
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(ApplyResult, Vec<WireDeliveryOutcome>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
@@ -482,8 +490,10 @@ fn missing_manifest(
     edge: &str,
     incarnation: contextdb_core::Incarnation,
     changes: &ChangeSet,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(ApplyResult, Vec<WireDeliveryOutcome>)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
@@ -633,8 +643,10 @@ pub(crate) fn fetch(
     edge: &str,
     incarnation: contextdb_core::Incarnation,
     since: Option<&[u8]>,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<WireDeliveryOutcome>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
@@ -706,8 +718,10 @@ pub(crate) fn fetch(
 pub(crate) fn pending_changes(
     db: &Database,
     mut changes: ChangeSet,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ChangeSet> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
     // Examine the changed identities and the pending index,
@@ -803,8 +817,10 @@ pub(crate) fn pending_changes(
 fn missing_rows(
     db: &Database,
     changes: &ChangeSet,
-    _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::collections::BTreeSet<(String, Vec<u8>)> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
     let identity = |r: &RowChange| {
         RowRef {
             table: r.table.clone(),
@@ -869,8 +885,10 @@ fn missing_rows(
 fn remove_missing_units(
     db: &Database,
     changes: &mut ChangeSet,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let missing = missing_rows(db, changes, read_memory.clone());
     changes.rows.retain(|r| {
         !missing.contains(
@@ -891,8 +909,10 @@ fn apply_remainder(
     request_lineages: &[(String, NaturalKey, contextdb_core::Lsn, WireRowLineage)],
     mut changes: ChangeSet,
     dependency_complete: bool,
-    read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ApplyResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
     let vector_copy_owner = &mut retained_vector_copy;
 

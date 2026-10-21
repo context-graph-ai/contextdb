@@ -2,7 +2,7 @@
 use super::*;
 use contextdb_tx::OwnedAdjEntry;
 
-fn corruption(reason: &str) -> Error {
+fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "row-derived adjacency".into(),
         reason: reason.into(),

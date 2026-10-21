@@ -254,3 +254,311 @@ fn durable_admission_rechecks_cancellation_and_deadline_before_registering() {
         }
     }
 }
+
+// Acceptance: new readers capture the current physical publication while
+// historical visibility remains at the requested logical snapshot. An older
+// reader with that same logical snapshot must not supply the new reader's root.
+#[test]
+fn fresh_snapshot_pin_does_not_borrow_an_older_readers_root() {
+    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let dir = tempfile::tempdir().expect("temporary durable store");
+    let db = Database::open_with_options(
+        dir.path().join("fresh-capture.db"),
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .expect("open store");
+    db.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT) HISTORY ALL SYNC OFF",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'original')", &HashMap::new())
+        .unwrap();
+    let snapshot = db.snapshot();
+    let older_pin = db.pin_snapshot(snapshot).expect("first reader captures root");
+    let older_root = older_pin._root.as_ref().expect("durable first reader");
+    let older_identity = older_root.storage_identity();
+
+    db.execute(
+        "UPDATE items SET body = 'replacement' WHERE id = 1",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let current_identity = db
+        .writer_read_root()
+        .unwrap()
+        .expect("current publication")
+        .storage_identity();
+    assert_ne!(
+        older_identity, current_identity,
+        "fixture publishes a new root"
+    );
+
+    let fresh_pin = db.pin_snapshot(snapshot).expect("fresh pin");
+    let selected_root = fresh_pin
+        ._root
+        .clone()
+        .expect("fresh reader has a durable root");
+    assert_eq!(
+        selected_root.storage_identity(),
+        current_identity,
+        "a fresh reader must not borrow the older reader's physical root"
+    );
+    let scope = db.enter_writer_read(
+        Some(selected_root),
+        db.declared_reader_memory().expect("admit fixture reader"),
+    );
+    assert_eq!(
+        db.execute_at_snapshot(
+            "SELECT id, body FROM items ORDER BY id",
+            &HashMap::new(),
+            snapshot,
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Int64(1), Value::Text("original".to_owned())]],
+        "current physical storage still filters out the later logical version"
+    );
+    drop(scope);
+    assert_eq!(
+        db.execute("SELECT body FROM items", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("replacement".to_owned())]]
+    );
+    drop(fresh_pin);
+    drop(older_pin);
+    assert!(db.snapshot_registry.state.lock().active.is_empty());
+}
+
+
+// Historical vector authenticity is a different criterion from relational pin
+// registration: an internally consistent physical fingerprint cannot substitute
+// for authenticating selected placement companions and their global controls.
+#[test]
+fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
+    use redb::{ReadableDatabase as _, ReadableTable as _};
+
+    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let companions = [
+        (
+            "vector_partition_membership",
+            "vector_membership_authority_pages_root_v1",
+        ),
+        (
+            "vector_membership_source_pages",
+            "vector_membership_source_pages_root_v1",
+        ),
+        (
+            "vector_membership_reverse_pages",
+            "vector_membership_reverse_pages_root_v1",
+        ),
+        (
+            "vector_open_directory",
+            "vector_open_directory_pages_root_v1",
+        ),
+        (
+            "vector_membership_summary_pages",
+            "vector_membership_summary_pages_root_v1",
+        ),
+    ];
+    let mut cases = Vec::new();
+    for (table, fingerprint) in companions {
+        for damage in ["missing", "extra", "contradictory"] {
+            for rebind in [false, true] {
+                cases.push((table, Some(fingerprint), damage, rebind));
+            }
+        }
+    }
+    for damage in ["count", "digest"] {
+        cases.push((
+            "vector_open_directory",
+            Some("vector_open_directory_pages_root_v1"),
+            damage,
+            true,
+        ));
+    }
+
+    for damage in ["missing", "digest"] {
+        cases.push(("__content_identity_metadata", None, damage, false));
+    }
+
+    assert_eq!(cases.len(), 34, "every original companion-damage row remains covered");
+    for (table_name, fingerprint_key, damage, rebind) in cases {
+        let case = format!("{table_name}/{damage}/rebind={rebind}");
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_options(
+            dir.path().join("historical-vectors.db"),
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE EXACT) HISTORY ALL SYNC OFF",
+            &HashMap::new(),
+        ).unwrap();
+        db.execute("INSERT INTO vectors VALUES (1, '[1,0]')", &HashMap::new())
+            .unwrap();
+        let historical = db.snapshot();
+        let retained = db.writer_read_root().unwrap().unwrap();
+        db.execute(
+            "UPDATE vectors SET embedding = '[0,1]' WHERE id = 1",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let successor = db.writer_read_root().unwrap().unwrap();
+        assert_ne!(
+            retained.storage_identity(),
+            successor.storage_identity(),
+            "{case}"
+        );
+        // A raw projection uses __pk_id and never consumes vector membership.
+        // Exact vector search enters the real historical vector preflight on
+        // the selected physical root before candidate discovery and scoring.
+        let sql = "SELECT id, embedding FROM vectors ORDER BY embedding <=> [1,0] USE VECTOR EXACT LIMIT 1";
+        let expected = vec![vec![Value::Int64(1), Value::Vector(vec![1.0, 0.0])]];
+        // A newer physical root with an old logical snapshot is valid. Neither
+        // a different physical identity nor an old logical time is corruption.
+        {
+            let _scope = db.enter_writer_read(
+                Some(successor.clone()),
+                db.declared_reader_memory().unwrap(),
+            );
+            let answer = db.execute_at_snapshot(sql, &HashMap::new(), historical).unwrap();
+            assert_eq!(answer.rows, expected, "healthy successor: {case}");
+            let route = answer.trace.vector_search.as_ref()
+                .expect("the healthy control must execute the vector consumer");
+            assert_eq!(route.route_evidence, VectorSearchRouteEvidence::Executed, "{case}");
+            assert_eq!(route.route, Some(VectorSearchRoute::Exact), "{case}");
+        }
+        let persistence = db.persistence.as_ref().unwrap();
+        persistence
+            .with_db(|native| {
+                let write = native.begin_write().unwrap();
+                if table_name == "__content_identity_metadata" {
+                    let mut table = write
+                        .open_table(redb::TableDefinition::<&str, &[u8]>::new(table_name))
+                        .unwrap();
+                    let key = "vector_open_directory_root_v1";
+                    let mut bytes = table
+                        .get(key)
+                        .unwrap()
+                        .expect("producer directory commitment")
+                        .value()
+                        .to_vec();
+                    assert_eq!(bytes.len(), 32);
+                    if damage == "missing" {
+                        table.remove(key).unwrap();
+                    } else {
+                        bytes[31] ^= 1;
+                        table.insert(key, bytes.as_slice()).unwrap();
+                    }
+                } else {
+                    let definition = redb::TableDefinition::<&[u8], &[u8]>::new(table_name);
+                    {
+                        let mut table = write.open_table(definition).unwrap();
+                        let records: Vec<_> = table
+                            .iter()
+                            .unwrap()
+                            .map(|row| {
+                                let (key, value) = row.unwrap();
+                                (key.value().to_vec(), value.value().to_vec())
+                            })
+                            .collect();
+                        let (key, value) = records
+                            .iter()
+                            .find(|(key, _)| !key.is_empty())
+                            .expect("real producer companion");
+                        match damage {
+                            "missing" => {
+                                table.remove(key.as_slice()).unwrap();
+                            }
+                            "extra" => {
+                                let mut extra = key.clone();
+                                extra.push(0);
+                                assert!(table.get(extra.as_slice()).unwrap().is_none());
+                                table.insert(extra.as_slice(), value.as_slice()).unwrap();
+                            }
+                            "contradictory" => {
+                                // Reuse a real successor's valid envelope when one
+                                // exists: this is a key/identity contradiction,
+                                // rather than an invented serialized membership.
+                                let replacement = records
+                                    .iter()
+                                    .find(|(other, _)| other != key && !other.is_empty());
+                                let mut bytes = replacement
+                                    .map_or_else(|| value.clone(), |(_, bytes)| bytes.clone());
+                                if replacement.is_none() {
+                                    bytes[0] ^= 1;
+                                }
+                                table.insert(key.as_slice(), bytes.as_slice()).unwrap();
+                            }
+                            "count" | "digest" => {
+                                let mut root = table
+                                    .get(&[][..])
+                                    .unwrap()
+                                    .expect("producer global directory root")
+                                    .value()
+                                    .to_vec();
+                                assert_eq!(root.len(), 40);
+                                root[if damage == "count" { 7 } else { 39 }] ^= 1;
+                                table.insert(&[][..], root.as_slice()).unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    if rebind {
+                        // Use the storage engine's actual fingerprint. Only this
+                        // physical binding is updated; semantic companions and
+                        // the producer's global commitments remain untouched.
+                        let fingerprint =
+                            write.table_root_fingerprint(definition).unwrap().unwrap();
+                        write
+                            .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                                "__content_identity_metadata",
+                            ))
+                            .unwrap()
+                            .insert(fingerprint_key.unwrap(), fingerprint.as_slice())
+                            .unwrap();
+                    }
+                }
+                write.commit().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let damaged = persistence
+            .initialize_writer_snapshot(db.snapshot(), db.current_lsn())
+            .unwrap();
+        assert_ne!(
+            successor.storage_identity(),
+            damaged.storage_identity(),
+            "damage committed: {case}"
+        );
+        {
+            let _scope =
+                db.enter_writer_read(Some(damaged.into()), db.declared_reader_memory().unwrap());
+            let answer = db.execute_at_snapshot(sql, &HashMap::new(), historical);
+            assert!(
+                matches!(&answer, Err(Error::StoreCorrupted { .. })),
+                "selected damaged root must refuse typed corruption: {case}: {answer:?}"
+            );
+        }
+        // A reader already holding the earlier physical root must still return
+        // the exact vector after companion damage in a later transaction.
+        {
+            let _scope = db.enter_writer_read(Some(retained), db.declared_reader_memory().unwrap());
+            assert_eq!(
+                db.execute_at_snapshot(sql, &HashMap::new(), historical)
+                    .unwrap()
+                    .rows,
+                expected,
+                "retained root: {case}"
+            );
+        }
+    }
+}

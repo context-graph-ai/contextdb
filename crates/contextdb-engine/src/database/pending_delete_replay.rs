@@ -24,9 +24,11 @@ impl PendingReplay {
     pub(super) fn new(
         root: crate::persistence::WriterSnapshotHandle,
         owner: SourceWindowOwner,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         since: Lsn,
     ) -> Result<Self> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         use std::fmt::Write;
         if since >= root.lsn {
             return Ok(Self::empty());
@@ -55,9 +57,11 @@ impl PendingReplay {
         image: Option<contextdb_relational::membership::MembershipImage>,
         since: Lsn,
         through: Lsn,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<Self> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let mut source = Self::empty();
         if let Some(image) = image {
             source.resident = super::resident_pending::ResidentPendingCursor::new(
@@ -164,7 +168,7 @@ impl PendingReplay {
         }))
     }
 
-    fn corrupt(reason: &str) -> Error {
+    fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
         Error::StoreCorrupted {
             path: "pending delete history".into(),
             reason: reason.into(),
@@ -186,6 +190,6 @@ pub(super) enum PendingRecordOwner {
         _window: WriterWindow<()>,
     },
     Resident {
-        _memory: Arc<crate::read_image_memory::ImageMemory>,
+        _memory: crate::read_image_memory::ImageMemoryHandle,
     },
 }

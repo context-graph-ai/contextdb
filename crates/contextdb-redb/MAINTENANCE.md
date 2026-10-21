@@ -13,6 +13,27 @@ Header begin/end observations in `tree_store/page_store/page_manager.rs` disting
 both logical header preparations from backend writes that buffering may coalesce, so
 process-crash fixtures can cover each boundary without changing write or sync ordering.
 
+Direct read-only opens can install retained cache-preparation admission under
+`contextdb-internal`. The actual counter, arena, stripe, head-array and write-map
+control layouts are admitted before allocation. Weakless arena/write-map owners
+use concrete Rust layouts instead of estimating an `Arc` header; fallible boxed
+array construction cleans partially initialized arrays. The preparation receipt
+travels with native backings until physical free, including detached cache aliases.
+Read-only handles can retain the caller's original fixed page reserve in the
+existing occupancy owners. Ordinary writer preparation retains its temporary
+handoff semantics. These hooks choose no memory limit or funding policy; the
+engine supplies the original source invoice. Compilation and runtime verification
+of this ownership extension remain outstanding.
+
+The `test-seams` cache receipt now borrows the actual counter, write-control,
+shared arena, entry/free-slot arrays, stripe array and head-array pointers and
+Layouts. Its preparation identity is the live native receipt already retained
+by the counter. A cached-header alias exposes the actual original counter for
+physical-free tests. These observations admit no bytes and choose no policy.
+The flushed-header test prices the live file's native write-control instead of
+constructing an unrelated `Arc`; the existing allocator/free watches observe
+that constructor and its final native control release. Runtime proof is owed.
+
 This existing storage fork is based on the **redb 4.1.0 crates.io package**, checksum
 `8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839`, upstream revision
 `6ed1f981ba4deab0b2adbdd7bccb46ec409b2191`. The `MIT OR Apache-2.0` license files are unchanged.
@@ -47,8 +68,73 @@ complete-node checksum kernel. It validates byte keys without requiring UTF-8;
 the text-key sibling retains UTF-8 validation and the same exclusive bounds.
 The engine owns the table names, membership encoding and admission policy.
 
+The private cache reserve owner retains the engine's original fixed invoice in
+both real occupancy controls, including across close and recycled handle
+construction. Every cache page or dirty alias retains those controls. Last-release
+guards free page and counter allocations before releasing that same parent;
+allocator state and cache index/map backing are destroyed before the final cache
+control owner. The internal `CacheReserveOwner` and its synchronous recycle scope
+share actual old/new generation occupancy, so retired pages cannot disappear from
+the replacement handle's capacity accounting. No second fixed reserve is invoiced. A numeric cache capacity without that
+actual installed parent cannot discharge a genuine source-page receipt; such
+pages keep their real source charge through physical free or a later funded
+handoff, including on standalone/custom backends.
+
+A distinct internal cache-preparation scope receives the actual index/arena,
+stripe/head array, write-buffer Arc control, stripe-lock scratch, allocator-window,
+slot-vector and allocator-index Layouts before replacement allocation. The engine
+keeps that real aggregate invoice across rollback/unwind or until the original
+fixed reserve takes custody. Preparation has its own TLS slot and never calls the
+source-page admission callback. Declared startup retains its existing retained-charge rule; runtime handle
+recycling uses ordinary native writer admission. Undeclared cache residue
+retains process-ceiling admission. The scope
+uses no allocation per quote and no global allocation/accounting registry.
+
+The feature-internal engine source-credit callback now supplies a concrete
+`OwnedReadPageCharge`, prepaid with the actual `Layout<SourcePageCharge>` from
+its original accountant before allocation. Its single-owner drop function moves
+the genuine receipt to the stack, deallocates that exact control, then drops the
+receipt and refunds. Page/counter free guards retain that owner outside their
+physical free too. Allocator null returns its actual Layout through the existing
+prepaid native refusal marker; it allocates no error Box. The original opaque
+`ReadPageCharge` alias and all legacy callback APIs remain compatible and
+explicitly unqualified for their own Box-control funding. No legacy Box is
+promoted to the concrete owner. These changes are source-only and require
+independent allocator/unwind proof before physical-funding qualification.
+
+The internal scan producer uses a genuinely admitted weakless native shared
+remaining counter and a separate exact-layout node for each distinct active
+thread entry. Both are prepaid from the operation's original reader child using
+the existing native credit protocol; their complete allocations are physically
+freed before their invoices settle. The thread-local scan slot is only a scalar
+tail pointer, with no retained vector capacity. A node's links and guard count
+are thread-bound; the cross-thread allowance holds only an atomic counter and
+immutable owned admission. Nested `scan_reads`/`with_scan_reads` helpers retain
+the same active node without allocation. Last-guard release unlinks the exact
+node, including an interior node, before physical free. Fallible native creation
+and entry preserve actual admission and allocator-null causes. Public legacy
+`new`/`default`/`enter` signatures remain infallible and explicitly unqualified;
+native engine operations use the internal fallible methods. The 16 KiB allowance
+and cache admission/eviction behavior are unchanged. These source mechanisms
+still require independent allocation, concurrent continuation, out-of-order guard,
+null and unwind verification; no compiler or runtime clearance is implied.
+
+These are source mechanisms, UNCOMPILED / RUNTIME_UNRUN. Initial bootstrap before
+the engine installs this preparation/fixed owner, direct-read Vecs, growing dirty
+map storage and legacy non-retaining/unscoped backing remain unqualified. The
+fork does not invent a payer for those producers or arbitrary backend errors.
+Allocator observation and independent tests must still prove every exact quote,
+physical-free/refund order, alias/recycle overlap and refusal/unwind path. Existing
+private cache tests still require the independently owned real-handle adoption.
+
 | Changed source | Reason |
 |---|---|
+| `src/read_admission.rs` | Feature-internal prepaid native scan counter and thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the original 16 KiB scan-growth contract. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
+| `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/tree_store/bounded_bytes.rs` | Feature-internal concrete movable source-credit owner and a distinct internal legacy/owned carrier. Preserve authentic credit through actual control deallocation, source-page/counter teardown and cache handoff. Keep legacy Box wrappers and the public backend trait unchanged; exact actual Layout prepayment remains with the engine factory. Upstream proposal remains unsubmitted. |
+| `src/tree_store/page_store/cache_owner_contract_rows.rs` (added), `src/tree_store/page_store/lru_cache.rs`, `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/base.rs`, `src/tree_store/btree_base.rs`, `src/tree_store/page_store/page_manager.rs`, `src/db.rs` | Independent rows extend the existing immutable-page lifetime test with exact cached-identity displacement, a no-invalidation pinned negative, multiple clones, source-paid windows/unwind, retained dirty and COW aliases, flush/cancellation, refusal and real backend error/unwind. The existing test allocator observes one actual backing pointer and its real counter immediately before and after System deallocation. A test-seams-only borrowed guard adapter finds its actual Cached identity and file coordinate, calls existing exact invalidation and requires that identity absent. Ordinary holds, eviction policy and all byte caps stay unchanged. Private Arc-specific tests adopt actual PageAllocation handles and Layout-derived prices/full capacity; there is no Arc compatibility shim. These source tests remain uncompiled and unrun; fixed writer-reserve close/recycle custody is not certified. |
+| `src/lib.rs`, `src/db.rs`, `src/read_admission.rs`, `src/native_storage_admission.rs`, `src/tree_store/mod.rs`, `src/tree_store/page_store/{mod,page_allocation,page_manager,cached_file,lru_cache,allocator_pager,region}.rs` | Feature-internal original cache-reserve custody and shared real occupancy across handle recycling; exact preallocation quotes for index/window/control reconstruction, separate from source-page admission. Physical cache/allocator destruction precedes final parent refund. Private allocator-window settlement propagates existing typed storage errors rather than boxing an admission refusal as I/O. No cache capacity, pinned-victim rule, public backend API, default or storage format changes. Upstream proposal remains unsubmitted. |
+| `src/tree_store/page_store/page_allocation.rs` (added), `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/mod.rs`, `src/read_admission.rs` | Concrete weakless page allocation coallocates reference control, checksum, original payer and bytes. Every read/write alias retains that one allocation. External final-release guards physically free backing before releasing the genuine opaque source receipt or cache occupancy; separately admitted weakless occupancy controls use the same ordering. Write COW prepays complete old/new overlap, dirty sources stay in their map across fallible preparation, and flush transfers occupancy in place. Pinned read victims remain ineligible. Actual Layout replaces the old independent Arc estimates; private tests use the real page handle and Layout-derived capacity while preserving numeric caps, full-capacity pressure and strict assertions. The original fixed reserve now has physical-owner custody; initial bootstrap, non-retaining/unscoped map storage and over-cap allocations remain unqualified pending the documented integration proof. |
+| `src/native_storage_admission.rs`, `src/error.rs`, `src/tree_store/table_tree.rs`, `src/tree_store/table_tree_base.rs`, `src/tree_store/mod.rs` | Internal native errors retain separate admission-source ownership, actual allocator-null site/Layout and original I/O. The existing owned admission can lend its producing synchronized failure through a nonallocating callback; earlier pending-directory payers are not confused with current TLS. Feature-internal Native/PreparedRead transport crosses legacy storage wrappers without a post-denial refusal Box. Prepared descriptor errors retain independently admitted requested-name bytes beside their original paid descriptor page, render stored names/width/alignment, and share the validator alignment constant. Default backend methods and storage format are unchanged. |
 | `src/transactions.rs`, `src/tree_store/table_tree.rs`, `src/tree_store/btree.rs`, `src/tree_store/table_tree_base.rs` | Hidden internal borrowed directory and numeric-key/byte-value successor reads retain the captured user root, authenticate table types, and use complete-node checksums and native admitted navigation. The engine owns source coverage and all table names; unknown coverage cannot certify erasure. |
 | `src/transactions.rs`, `src/tree_store/mod.rs`, `src/tree_store/btree.rs`, `src/tree_store/table_tree.rs`, `src/tree_store/table_tree_base.rs`, `src/tree_store/bounded_bytes.rs`, `src/tree_store/page_store/cached_file.rs`, `src/native_storage_admission.rs` | Mechanical strict-lint cleanup: name the existing native key/value guard tuple and root-hook function types, mark the builder return as must-use, place the unchanged test module last, use checked integer conversions for page sizes and stripe indices, and normalize documentation, inclusive ranges and statement punctuation. Storage layout and operation ordering are unchanged. |
 | `src/lib.rs`, `src/tree_store/mod.rs`, `src/tree_store/table_tree.rs`, `src/tree_store/random_state_override.rs` | Under `test-seams`, let an explicitly scoped, thread-local cloned `RandomState` control pending table-update map construction; the scope restores a nested predecessor on normal return or unwind. Without `test-seams`, `TableTreeMut` still constructs `RandomState::new()` directly. This is fixture-only hash control, with no production hash policy or ownership change. |
@@ -76,7 +162,7 @@ The engine owns the table names, membership encoding and admission policy.
 | `src/tree_store/table_tree.rs` | Advance a finite compaction cursor past a protected allocator source without reading its payload. Enumerate and relocate the selected page batch, expose consistent statistics, the read transaction's user-tree root and its read hint; authenticate just the root page for bounded external admission; pop a deferred-free list tail in place without a scratch collection; report actual user-directory inserts/removals, and each copy-on-write page the table tree makes unreachable, under `test-seams`. |
 | `src/tree_store/btree_base.rs` | Let an access guard hold a read page as `PageMemory`, keeping any charge the page carries alive while the guard is; allow crate-private mutation of an existing copy-on-write value so partial free-list cleanup needs no temporary page vector. |
 | `src/tree_store/table_tree_base.rs` | Forward bounded page traversal for the table root. |
-| `src/tree_store/page_store/cached_file.rs` | The private native clean read prepays fresh byte/header owners before cache locks, copies exact-length original warm read-cache bytes under the stripe read lock, and otherwise uses the backend without consulting dirty write cells. Its paid native page never borrows or adopts a legacy cell and never probes the write buffer. Use one shared fixed read-entry arena across all cache stripes; an exhausted read index returns an uncached page without allocation. The write buffer retains its original growable map and releases its capacity at each flush. Rebuild indexes under startup exclusion, preserving held entries, and expose exact index allocation bytes separately from the page cap.  Memoize only successful variable-width byte-node checksum computations in one object-local mutex on each immutable CachedPage/ChargedPage, leaving Plain bytes uncached; explicitly count immutable wrapper, slot, alignment and Arc controls in the unchanged native cache share, preadmit those controls independently of the existing directory/window allowance, and preserve charges through eviction until the last holder drops. Admit page/cache-entry bytes before allocation and observe successful backend reads; hand readers a `PageMemory` that, for a page the read cache does not keep, carries the charge its admission returned until the last holder drops the page; count a cached page against the cache budget until the page itself is dropped (`CachedPage`), so a page evicted while a reader still holds it stays counted, eviction frees only pages no reader holds, and a miss is cached only when its count fits the budget; keep caller quota refusals recoverable while real backend I/O failures still poison the handle; read private allocator and contextdb-internal bounded windows with admission before allocation and backend I/O, copying cached or buffered sources without installing a partial cache page; on resize invalidate only cached pages that reach past the new end, so a truncating compaction step keeps the valid working set instead of dropping the whole read cache; under one-pass scan reads a miss may use free cache room only within the scan's 16 KiB growth allowance; past it a miss first evicts as many bytes as it needs and enters the cache at lowest priority only if that eviction made room, otherwise it is returned uncached (hits are still served), so an exhaustive scan grows the cache by at most the allowance and replaces its own pages before the warm working set. Size the fixed read arena with one extra slot for the sole sub-page entry, the 320-byte database header at offset zero. Construction and startup settlement share overflow-safe sizing and retain the held-entry floor. Debug assertions at every native cache admission enforce the header exception; the fixed arena's actual bytes remain charged by the existing index observation. Rust formatting is normalized without changing expressions or assertions. The byte-node checksum memo is compiled only for its `contextdb-internal` and test callers (its slot stays in every build so page layout and admitted charge do not vary), and page-size conversions are checked. |
+| `src/tree_store/page_store/cached_file.rs` | The private native clean read prepays fresh byte/header owners before cache locks, copies exact-length original warm read-cache bytes under the stripe read lock, and otherwise uses the backend without consulting dirty write cells. Its paid native page never borrows or adopts a legacy cell and never probes the write buffer. Use one shared fixed read-entry arena across all cache stripes; an exhausted read index returns an uncached page without allocation. The write buffer retains its original growable map and releases its capacity at each flush. Rebuild indexes under startup exclusion, preserving held entries, and expose exact index allocation bytes separately from the page cap.  Memoize only successful variable-width byte-node checksum computations in one object-local mutex on each immutable CachedPage/ChargedPage, leaving Plain bytes uncached; count the complete concrete page Layout, including checksum and alignment, in the unchanged native cache share, preadmit those controls independently of the existing directory/window allowance, and preserve charges through eviction until the last holder drops. Admit page/cache-entry bytes before allocation and observe successful backend reads; hand readers a `PageMemory` that, for a page the read cache does not keep, carries the charge its admission returned until the last holder drops the page; count a cached page against the cache budget until the page itself is dropped (`CachedPage`), so a page evicted while a reader still holds it stays counted, eviction frees only pages no reader holds, and a miss is cached only when its count fits the budget; keep caller quota refusals recoverable while real backend I/O failures still poison the handle; read private allocator and contextdb-internal bounded windows with admission before allocation and backend I/O, copying cached or buffered sources without installing a partial cache page; on resize invalidate only cached pages that reach past the new end, so a truncating compaction step keeps the valid working set instead of dropping the whole read cache; under one-pass scan reads a miss may use free cache room only within the scan's 16 KiB growth allowance; past it a miss first evicts as many bytes as it needs and enters the cache at lowest priority only if that eviction made room, otherwise it is returned uncached (hits are still served), so an exhaustive scan grows the cache by at most the allowance and replaces its own pages before the warm working set. Size the fixed read arena with one extra slot for the sole sub-page entry, the 320-byte database header at offset zero. Construction and startup settlement share overflow-safe sizing and retain the held-entry floor. Debug assertions at every native cache admission enforce the header exception; the fixed arena's actual bytes remain charged by the existing index observation. Rust formatting is normalized without changing expressions or assertions. The byte-node checksum memo is compiled only for its `contextdb-internal` and test callers (its slot stays in every build so page layout and admitted charge do not vary), and page-size conversions are checked. |
 | `src/tree_store/page_store/lru_cache.rs` | Insert a page at the front of the eviction order without a second chance (`insert_lowest_priority`), so a page a one-pass scan installs is the next one evicted unless it is read again, and a scan replaces its own pages rather than the warm working set. Keep pinned read entries linked during a bounded two-pass CLOCK victim search, so only reclaimable entries leave the map. Maintain per-stripe eviction order and collision chains with fixed u32 links in one shared entry arena; allocate arena slots, a free stack and stripe heads once, return slots on eviction and clear, and count their exact allocations outside the page cap. Retain held entries and their second chances when rebuilding indexes for a settled startup cap. The arena resize helpers (`arena_capacity`, `transfer_to`) are compiled only for their `contextdb-internal` caller. |
 | `src/tree_store/page_store/mod.rs` | Re-export `PageMemory` to the tree code that holds read pages and register the allocator pager. |
 | `src/tree_store/page_store/page_manager.rs` | Forward the exact fixed cache-index allocation to the database owner. Give a paged allocator its window allotment of the cache share at open and at startup cache settlement, settling the page cache on the remainder and returning one reserve that covers both.  Leave the allocator layout and recovery state unchanged when a caller refuses projected file growth before resize; allow caller-retained external readers to use file geometry while a live writer has marked the current header dirty, without recovery or allocator writes, and without asserting that a concurrently growing file still matches the captured header length; publish the clean committed header before a graceful read-only handoff without closing the writer backend; validate byte-window ranges against their allocation extent before storage access. Choose paged allocators when the backend supplies scratch, locate saved fixed-key allocator values through header/key windows and read only requested bitmap header/word windows (including the region tracker), preserving full retained-root checksum authentication; lazily read saved allocator words, preserve repair and growth ordering, and refuse publication or clean Drop after a sticky scratch fault. Before explicit integrity repair, align an aborted writer's free tail to the committed header geometry. |
@@ -703,3 +789,189 @@ cleanup owner using numeric order, fixed-width node validation and byte values.
 Both keep native page/control admission and cancellation boundaries. The complete
 source patch was regenerated from the locally checksum-verified redb 4.1.0 archive.
 These additions have no compilation or runtime qualification in this source packet.
+
+
+## Internal native producer provenance and exact prepared publication
+
+The existing `NativeColdReadError` distinguishes an actual allocator-null with
+its producer site and complete admitted `Layout` from a budget marker and from
+an unchanged genuine `io::Error`. Buffer, shared-control, reader-registry and
+pending-directory allocators tag their actual null returns. Capacity failures
+without an observed allocator call keep an explicitly unqualified I/O fallback;
+I/O `OutOfMemory` is never used to infer budget or null provenance.
+
+Admission markers retain the original `NativeStorageAdmission`, including when
+pending-directory backing was admitted by an earlier scope than the one running
+commit. Its optional failure inspector borrows that same synchronized typed
+source during one callback; no raw owner address escapes, new registry is
+introduced, or error Box is constructed after denial. Foreign owners without
+that inspector retain the marker and remain unqualified. The internal feature
+adds hidden `StorageError::Native` and `Error::{Native, PreparedRead}` transport;
+ordinary default-feature error variants and backend methods are unchanged.
+
+Prepared descriptor failure now owns a requested-name copy admitted before the
+lookup/validation plus the original complete descriptor page. Both allocations
+keep independent original receipts through physical free. Formatting reads those
+bytes without owned `TypeName` decoding or String conversion and preserves the
+normal table validator's diagnostic precedence. The shared alignment constant
+still has the existing value and is an invariant, not a consumer policy.
+
+The engine's real exact queue-publication consumer now uses
+`prepare_commit_with_read`. It owns abort custody before diagnostic bootstrap,
+keeps its prepaid primary outside retained native scopes, and installs the same
+prepared scope across consuming commit and retirement. Exact identity, complete
+marker, schema, source-link settlement and durable-root settlement still come
+from the sealed consuming write. The five real engine phases remain at their
+existing call boundaries; retaining the prepared scope adds no phase marker.
+
+This is source work only: no compilation, native execution or test ran in this
+packet. The engine's legacy prepared Storage wrapper remains unqualified, as do
+opaque I/O/custom error backing, legacy Error-only conversions and foreign
+cleanup/unwind payloads. No whole-route qualification or ordinary-host activation
+is established. File/coordination/witness/saved-abandonment origins remain separate
+work. Required independent proofs include actual budget/null/real-I/O producers,
+zero post-refusal allocation, exact durable outcomes and last-holder/unwind frees.
+
+The source-only patch was regenerated from the locally checksum-verified redb
+4.1.0 archive, and offline reconstruction compared every resulting source byte.
+The unchanged `redb_fork_patch_matches_its_sources` audit remains the source-hunk
+binding; no expected checksum was changed to excuse unrelated drift. Upstream
+proposal (not submitted): retain original native admission ownership on scalar
+failure transport and defer descriptor diagnostic ownership to its producing page.
+
+
+## Concrete weakless legacy page allocation (source work, run 898)
+
+The page control, checksum mutex, original payer and initialized bytes occupy one
+allocation quoted by `Layout::new::<PageBlock>().extend(Layout::array::<u8>(len)?)`
+followed by `pad_to_align`. Reads preserve the separate 128-byte directory/window
+allowance. Cached, Charged, Plain, write-buffer and writable handles share the
+same backing owner; no byte Arc or Weak escape exists. Mutability requires the
+actual strong count to be one. A write with other readers allocates a complete
+new owner before releasing the old one; checksum invalidation precedes mutation.
+Exact invalidation, resize and replacement unlink only the selected map owner.
+The pinned-victim guard and the scan allowance are preserved.
+
+Final Release/Acquire release extracts the real source receipt or occupancy
+payment into an external free guard, destroys the emptied header and checksum,
+frees the complete allocation, then drops that payer. Null/backend errors and
+unwind release only an actually created allocation; write preparation keeps its
+old dirty map entry until all fallible preparation completes. Occupancy controls
+are themselves concrete weakless allocations, admitted with their actual Layout,
+counted separately in index observation, and refunded after their own free.
+The native owner/error provenance remains the separate run-887 protocol; native
+cache copies only change their borrow of the new legacy backing representation.
+
+This closes the page/occupancy-control release ordering in source, not the entire
+engine cache funding route. The engine still owns/refunds the fixed outer writer
+reserve at database close; it is not moved into these counters by this patch.
+The existing write policy can retain more physical backing than the fixed share
+when old aliases cannot be reclaimed or one incoming extent exceeds the share.
+In charging mode that new backing keeps its genuine source receipt beside its
+occupancy tally, through write and flush, until it fits the fixed reserve or is
+physically freed. The tally is not a second source invoice. The close edge and
+overflow under non-retaining/unscoped admissions, as well as standard write-map,
+control/index/bootstrap allocations and native copies, still require their own
+source funding proof. They are
+implementation blockers to whole-cache qualification, not claims of paid memory.
+
+All existing test text is unchanged in this production patch. An independent
+author must adopt private Arc constructor/count/pointer/type spellings and derive
+representation-specific prices/full-page counts from the actual Layout while
+preserving resource caps, full-capacity workloads, pinned policies and assertions.
+The separately authorized engine exact-identity invalidation setup is not changed
+here. There is no compilation or runtime result in this source packet.
+The complete upstream patch is regenerated and reconstructed offline from the
+checksum-verified 4.1.0 archive, including every inherited run-887 source change.
+
+
+Compiler integration: the two cached mutable-page copy paths borrow the
+`ValueRef<PageAllocation>` when passing its byte slice to `copy_from_slice`.
+This preserves page ownership, admission, copy contents and cache behavior.
+The complete source patch is regenerated against the pinned upstream archive.
+
+## Independent reserve/source precondition tests (source work, run 915)
+
+The preserved header/full-page test now independently constructs the concrete
+write-buffer Arc Layout and observes its actual allocation and free. Its exact
+index equality includes that real control; all original assertions, the 4 MiB
+and 64 MiB capacities, populations and stripe pressure remain. The test-seams-only
+`CachePageForTest`/`CacheWriteForTest` wrappers lend genuine production page and
+write-map/control aliases from the installed engine cache. They expose backing
+identity and immutable bytes, create no parent or receipt, and return the checked
+out write before close/flush. `cache_controls_for_test` observes the actual two
+occupancy controls so engine tests can prove old/new handle identity and summed
+occupancy through the real recycler. These seams are absent from ordinary builds.
+The engine tests inspect genuine fixed-writer/process-residue invoices at actual
+System deallocation, close, final alias release and same-cap re-admission.
+Everything remains UNCOMPILED / RUNTIME_UNRUN. The inherited source-charge Box
+control refund before its own physical free remains a known production defect;
+the new independent assertion exposes it and no production repair is included.
+
+
+## Integrated concrete source-credit observation (source work)
+
+The independent source-control test retains its historical selector and every
+original assertion. With the concrete prepaid owner integrated, its test-only
+observer arms the existing allocator immediately before construction using the
+actual monomorphized SourcePageCharge Layout and original accountant counter.
+The allocator binds its real returned pointer and samples that same counter
+before and after System.dealloc. The test arms before the read and additionally
+requires the selected control to remain physically live until value release.
+No Box is promoted to the concrete owner, and no erased-pointer ABI is assumed.
+The historical early-refund defect described above is repaired in the integrated
+source by the concrete free-before-refund owner; its physical proof is UNRUN.
+The recorded-refusal replacement of a successful callback remains unresolved;
+its original successful-return assertions are deliberately retained.
+Compiler integration still borrows both mutable-page cells at copy_from_slice.
+The generated complete fork delta includes those fixes and all independent
+seams. Parsing and offline reconstruction are not compilation or runtime proof.
+
+The standalone `cached_file` cache-byte-budget test module imports the standard-library
+`Mutex` and `AtomicUsize` types used by its existing native write-cache control
+layout observations. This is a compile-only test import repair; its fixtures,
+assertions, expected bytes, production cache behavior and budgets are unchanged.
+
+## Current page-payment observation for independent recycle proofs
+
+The existing test-seams-only page alias now reports its CURRENT PagePayer
+category, original CounterBlock identity and complete payment bytes under the
+actual payer transition mutex. It neither constructs nor retains a payer and
+changes no admission, transfer or refund. The independent engine fixture checks
+each distinct C/D/F/G backing against the original controls and exact native
+Layout, retaining the valid read lower bound plus per-counter and aggregate
+coverage. A SourceCounted observation is explicitly unqualified until its actual
+source invoice/lifetime is independently proved; capacity is never a receipt.
+Runtime handoff observations remain owed. The complete source patch and metadata
+overlay reconstruct all maintained bytes/modes from the pinned cached archive.
+
+The `contextdb-internal` + `test-seams` scan observations report the actual
+shared block, linked node, concrete Layout and original receipt identity. The
+remaining-byte and current-tail methods inspect the real scan state; the debit
+adapter calls the same production `take_scan_growth` used by the page cache.
+These methods allocate nothing and retain no owner. They are absent without the
+test feature and do not change ordinary scan behavior. Independent engine tests
+extend the existing System-backed allocator oracle with a scalar injected-null
+sample; no second allocator or heap ledger is added. Source parsing and patch
+reconstruction do not certify compilation, physical funding or runtime behavior:
+these tests remain UNCOMPILED / RUNTIME_UNRUN. The upstream proposal for the
+existing thread-scoped admission remains unsubmitted.
+
+| `src/db.rs`, `src/lib.rs`, `src/native_storage_admission.rs`, `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/page_manager.rs` | Feature-internal native backend capability is explicitly selected at original engine WriterFileView construction before trait erasure. Inline Legacy/Native dispatch retains one original concrete backend Box and uses the same database/memory/cache funnel; foreign, wrapped, read-only and scratch sources keep their legacy provenance. Finite owner-closed, projected-growth-poison and disk-growth-refusal causes bypass custom I/O payload construction; opaque OS errors move unchanged. Quota retry and non-sticky refusal accept both original opaque quota errors and native scalar disk refusals without changing sizes, retry count, recovery or publication. The engine funds its actual diagnostic block before the producer and retains the original source through physical free; this does not certify bootstrap, region/pager round trips, scratch or general OS Display funding. Source-only: compilation and independent runtime proofs remain owed. Upstream proposal (not submitted): an optional typed backend-failure construction capability preserving the existing StorageBackend contract. |
+
+
+## Independent WriterFileView error producer observation
+
+`src/tree_store/page_store/cached_file.rs` exposes
+`CheckedWriterBackendForTest` only with both `test-seams` and
+`contextdb-internal`. It holds the actual `CheckedBackend`, dispatches its real
+len/read/write/resize/sync operations, and accepts the existing native or legacy
+backend constructor. It produces no errors itself and allocates no observer.
+The original backend Box construction remains outside the diagnostic funding
+claim. Re-exports in the two tree-store module files and `src/lib.rs` have the
+same feature guards. Ordinary compiled source and every existing test body are
+unchanged. The independent engine test module
+`persistence/writer_native_io_contract_tests.rs` uses real WriterFileView owners,
+OS calls, poisoned growth mutexes and quota refusals. Source is uncompiled;
+runtime, strict linting, and mutation validation remain unrun. The complete
+source delta is regenerated in `upstream-4.1.0.patch`.

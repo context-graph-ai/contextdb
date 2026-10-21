@@ -79,8 +79,10 @@ impl Database {
         &self,
         working: &Database,
         affected_tables: &HashSet<String>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let tables = working.relational_store.tables.read();
         for table in affected_tables {
             let Some(rows) = tables.get(table) else {
@@ -106,7 +108,7 @@ impl Database {
                         );
                         let charge = StagedCopyCharge::admit(
                             &self.finalization.accountant,
-                            Arc::clone(&self.finalization.vector_accountant),
+                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
                             bytes,
                             "stage_received_unit_row_edge_image",
                         )?;
@@ -188,8 +190,10 @@ impl Database {
         local_lsn: Lsn,
         receiver_tx: TxId,
         accepted_positions: &BTreeMap<(String, RowId), Lsn>,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+
         let position = |owner: &contextdb_tx::RowEdgeOwner| {
             accepted_positions.iter().find(|((table, row), _)| table == &owner.table && *row == owner.row_id)
                 .map_or(local_lsn, |(_, lsn)| *lsn)

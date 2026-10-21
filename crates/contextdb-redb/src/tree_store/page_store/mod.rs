@@ -9,6 +9,7 @@ pub mod file_backend;
 mod header;
 mod layout;
 mod lru_cache;
+mod page_allocation;
 mod page_manager;
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 pub(crate) use page_manager::rewrite_header_for_test;
@@ -35,3 +36,14 @@ pub(super) use xxh3::hash128_with_seed;
 
 #[cfg(feature = "contextdb-internal")]
 pub(super) use xxh3::hash128_from_windows;
+
+#[cfg(feature = "contextdb-internal")]
+pub use page_allocation::CacheReserveOwner;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use cached_file::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub use cached_file::CheckedWriterBackendForTest;

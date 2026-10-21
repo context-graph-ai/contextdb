@@ -7,7 +7,7 @@ pub(super) const TABLE: TableDefinition<&[u8], &[u8]> =
 // No UTF-8 table name can alias this key; named probes borrow the admitted name.
 const GLOBAL: &[u8] = &[0xff];
 
-fn corrupt(reason: &str) -> Error {
+fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "read_erasure_frontiers".into(),
         reason: reason.into(),
@@ -145,6 +145,8 @@ fn native_failure(failure: native_storage_admission::NativeStorageFailure) -> Er
     use contextdb_core::read_memory::NativeRefusal;
     match failure {
         native_storage_admission::NativeStorageFailure::Unqualified(error) => error,
+        native_storage_admission::NativeStorageFailure::AllocatorFailed { site, layout } =>
+            Error::NativeEngineOther(NativeRefusal::AllocatorFailed { site, layout }),
         native_storage_admission::NativeStorageFailure::Refused(refusal) => match refusal {
             NativeRefusal::MemoryBudgetExceeded {
                 subsystem,
@@ -186,12 +188,15 @@ fn native_failure(failure: native_storage_admission::NativeStorageFailure) -> Er
                 ),
             ),
             NativeRefusal::Other(reason) => Error::Other(reason.into()),
+            allocator @ NativeRefusal::AllocatorFailed { .. } => Error::NativeEngineOther(allocator),
         },
     }
 }
 
 impl RedbPersistence {
-    pub(crate) fn global_erasure_frontier(&self, memory: Arc<dyn ReadMemoryBudget>) -> Result<Lsn> {
+    pub(crate) fn global_erasure_frontier(&self, memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Lsn> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let admission = native_storage_admission::StorageAdmissionScope::reader_operation(memory)
             .map_err(native_failure)?;
         admission
@@ -213,8 +218,10 @@ impl RedbPersistence {
     pub(crate) fn validate_erasure_frontiers(
         &self,
         scope: &crate::executor::ReadPublicationScope,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let admission = native_storage_admission::StorageAdmissionScope::reader_operation(memory)
             .map_err(native_failure)?;
         admission
@@ -274,8 +281,10 @@ impl WriterSnapshot {
     pub(crate) fn copy_erasure_frontiers_into(
         &self,
         destination: &RedbPersistence,
-        memory: Arc<dyn ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         graph_read::with_pages(memory.clone(), || {
             let _control = ReadCredit::try_new(
                 memory.clone(),

@@ -64,12 +64,15 @@ mod erasure_frontiers;
 mod graph_history_read;
 mod historical_index_commitment;
 pub use historical_index_commitment::HistoricalIndexVerification;
+use contextdb_core::read_memory::ReadMemoryBudget as _;
 mod graph_history_record;
 mod graph_history_writer;
 pub(crate) mod graph_read;
 pub mod holder_presence;
 #[cfg(unix)]
 pub(crate) mod physical_admission;
+#[cfg(unix)]
+mod wait_diagnostic;
 pub(crate) mod purge_publication;
 pub(crate) mod read_commit_directory;
 #[cfg(target_os = "linux")]
@@ -96,6 +99,9 @@ mod writer_wait_helper;
 pub(crate) use schema_binding::VectorSchemaBinding;
 mod custody_groups;
 pub(crate) mod history_root_witness;
+mod cache_reserve;
+mod source_shared;
+use source_shared::SourceShared;
 #[allow(dead_code)]
 // Staged native storage admission is inactive until its integration prerequisites land.
 pub(crate) mod native_storage_admission;
@@ -2174,7 +2180,7 @@ pub(crate) struct SinkQueueWindowRead<T> {
     pub(crate) newest_id: u64,
     pub(crate) entries: Vec<T>,
     pub(crate) credits: Vec<usize>,
-    pub(crate) owner: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    pub(crate) owner: Option<crate::read_image_memory::ImageMemoryHandle>,
     pub(crate) exhausted: bool,
     pub(crate) refusal: Option<Error>,
 }
@@ -2218,7 +2224,7 @@ pub(crate) struct LoadedReadHistory {
 /// admitted as each was made. Both are given back when this is dropped.
 pub(crate) struct ReadHistoryCharge {
     _slots: contextdb_core::read_memory::ReadCredit,
-    _decoded: Arc<crate::read_image_memory::ImageMemory>,
+    _decoded: crate::read_image_memory::ImageMemoryHandle,
 }
 
 /// An operation-funded proof pool grows only as the authenticated walk needs
@@ -2229,7 +2235,9 @@ struct ReadHistoryProofOwner {
 }
 
 impl ReadHistoryProofOwner {
-    fn new(memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Arc<Self>> {
+    fn new(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Arc<Self>> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let control = contextdb_core::read_memory::ReadCredit::try_new(
             memory,
             std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>(),
@@ -2312,7 +2320,7 @@ pub(crate) struct ReadPersistenceImage {
     /// length could not be read at all.
     store_file_bytes: Option<u64>,
     // Admission outlives every allocation carried by this image.
-    pub(crate) memory: Arc<crate::read_image_memory::ImageMemory>,
+    pub(crate) memory: crate::read_image_memory::ImageMemoryHandle,
 }
 
 /// Hydrated state consumed by the direct backend after the hydration
@@ -2343,11 +2351,11 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) sink_queues: BTreeMap<String, Vec<(u64, Vec<u8>)>>,
     pub(crate) sink_queue_extents: BTreeMap<String, SinkQueueExtent>,
     pub(crate) vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
-    pub(crate) retained_source: Arc<RetainedReadSource>,
+    pub(crate) retained_source: RetainedReadSource,
     pub(crate) source_path: PathBuf,
     pub(crate) store_file_bytes: Option<u64>,
     // Admission outlives every allocation carried by this image.
-    pub(crate) memory: Arc<crate::read_image_memory::ImageMemory>,
+    pub(crate) memory: crate::read_image_memory::ImageMemoryHandle,
 }
 
 impl ReadPersistenceImage {
@@ -2431,7 +2439,7 @@ impl ReadPersistenceImage {
 
     pub(crate) fn into_runtime_parts(
         self,
-        retained_source: Arc<RetainedReadSource>,
+        retained_source: RetainedReadSource,
     ) -> ReadPersistenceImageParts {
         ReadPersistenceImageParts {
             open_context: self.open_context,
@@ -2510,7 +2518,7 @@ impl ReadPersistenceReleaseReceipt {
 pub(crate) struct ReadPersistenceLoad {
     image: ReadPersistenceImage,
     release_receipt: ReadPersistenceReleaseReceipt,
-    source: Arc<RetainedReadSource>,
+    source: RetainedReadSource,
 }
 
 impl ReadPersistenceLoad {
@@ -2519,7 +2527,7 @@ impl ReadPersistenceLoad {
     ) -> (
         ReadPersistenceImage,
         ReadPersistenceReleaseReceipt,
-        Arc<RetainedReadSource>,
+        RetainedReadSource,
     ) {
         (self.image, self.release_receipt, self.source)
     }
@@ -2564,6 +2572,8 @@ pub(crate) enum LoadReadImageErrorKind {
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub(crate) enum LoadReadImageError {
+    #[error("{}", std::ops::Deref::deref(.0))]
+    Funded(contextdb_core::read_memory::ReadShared<LoadReadImageError>),
     #[error("{0}")]
     Memory(Error),
     #[error("load_read_image production path is not implemented")]
@@ -2590,6 +2600,15 @@ pub(crate) enum LoadReadImageError {
     },
     #[error("read-image durable state is invalid: {reason}")]
     InvalidState { reason: String },
+    #[cfg(unix)]
+    #[error("read-image I/O failed during {operation}: {reason}")]
+    WaitIo {
+        operation: &'static str,
+        reason: physical_admission::WaitIo,
+    },
+    #[cfg(unix)]
+    #[error("read-image I/O failed during acquire reader publication hold: reader publication wait failed: {0:?}")]
+    WaitRefused(physical_admission::PublicationWaitRefusal),
     #[error("read-image I/O failed during {operation}: {reason}")]
     Io {
         operation: &'static str,
@@ -2607,6 +2626,7 @@ pub(crate) enum LoadReadImageError {
 impl LoadReadImageError {
     pub(crate) fn kind(&self) -> LoadReadImageErrorKind {
         match self {
+            Self::Funded(diagnostic) => diagnostic.kind(),
             Self::Memory(_) => LoadReadImageErrorKind::Memory,
             Self::NotImplemented => LoadReadImageErrorKind::NotImplemented,
             Self::Source(_) => LoadReadImageErrorKind::Io,
@@ -2619,6 +2639,8 @@ impl LoadReadImageError {
             Self::Corrupt { cause, .. } => LoadReadImageErrorKind::Corrupt(*cause),
             Self::InvalidState { .. } => LoadReadImageErrorKind::InvalidState,
             Self::Io { .. } | Self::IoAtPath { .. } => LoadReadImageErrorKind::Io,
+            #[cfg(unix)]
+            Self::WaitIo { .. } | Self::WaitRefused(_) => LoadReadImageErrorKind::Io,
         }
     }
 
@@ -2652,8 +2674,11 @@ impl LoadReadImageError {
             DirectStoreDiagnostic,
         };
 
-        let reason = self.to_string();
+        // Memory refusals must not format (or copy static labels) on their way
+        // out. Wait diagnostics already own a cell prepaid by the actual source.
         match self {
+            Self::Funded(diagnostic) => DirectFileReaderError::Engine(
+                contextdb_core::error::DiagnosticText::from_shared(diagnostic)),
             Self::Memory(Error::MemoryBudgetExceeded {
                 subsystem,
                 operation,
@@ -2662,29 +2687,30 @@ impl LoadReadImageError {
                 budget_limit_bytes,
                 hint,
             }) => DirectFileReaderError::MemoryBudget {
-                subsystem: subsystem.into_owned(),
-                operation: operation.into_owned(),
+                subsystem,
+                operation,
                 requested_bytes,
                 available_bytes,
                 budget_limit_bytes,
-                hint: hint.into_owned(),
+                hint,
             },
             Self::Memory(Error::ReadCancelled) => DirectFileReaderError::Cancelled,
             Self::Memory(Error::ReadFailure(failure)) => {
                 DirectFileReaderError::ReadFailure(failure)
             }
             Self::Memory(error) => crate::read_image::history_answer_error(error),
-            Self::Corrupt {
+            error @ Self::Corrupt {
                 cause: ReadImageCorruptionCause::MalformedRecord,
                 ..
             } => {
-                DirectFileReaderError::CorruptStore(DirectStoreDiagnostic::MalformedRecord, reason)
+                DirectFileReaderError::CorruptStore(DirectStoreDiagnostic::MalformedRecord, error.to_string().into())
             }
-            Self::Corrupt {
+            error @ Self::Corrupt {
                 cause: ReadImageCorruptionCause::LegacyLayout,
                 ..
-            } => DirectFileReaderError::LegacyLayout(DirectStoreDiagnostic::LegacyLayout, reason),
-            Self::RequiresWriter { cause, .. } => {
+            } => DirectFileReaderError::LegacyLayout(DirectStoreDiagnostic::LegacyLayout, error.to_string().into()),
+            error @ Self::RequiresWriter { cause, .. } => {
+                let reason = error.to_string();
                 let cause = match cause {
                     ReadImageRequiresWriterCause::NonMonotonicCommitIndex => {
                         DirectRepairRequiredCause::NonMonotonicCommitIndex
@@ -2709,15 +2735,15 @@ impl LoadReadImageError {
                 .expect("direct-read refusal carries a plain reason");
                 DirectFileReaderError::DirectReadRequiresWriter { failure, cause }
             }
-            Self::StoreMissing { .. } => DirectFileReaderError::StoreNotFound {
+            error @ Self::StoreMissing { .. } => DirectFileReaderError::StoreNotFound {
                 failure: ReadFailure::new(
                     ReadFailureKind::StoreNotFound,
-                    ReadFailureDetail::Reason { reason },
+                    ReadFailureDetail::Reason { reason: error.to_string() },
                 )
                 .expect("a missing-store refusal carries a plain reason"),
             },
-            Self::Contention { .. } | Self::RegistryContention { .. } => {
-                DirectFileReaderError::Contended { reason }
+            error @ (Self::Contention { .. } | Self::RegistryContention { .. }) => {
+                DirectFileReaderError::Contended { reason: error.to_string() }
             }
             // Only an absent production load path is a missing prerequisite.
             // A source that failed, a release proof that failed, durable state
@@ -2728,11 +2754,13 @@ impl LoadReadImageError {
             Self::NotImplemented => DirectFileReaderError::MissingPrerequisite(
                 DirectReaderPrerequisite::PersistenceLoadReadImage,
             ),
-            Self::Source(_)
+            error @ (Self::Source(_)
             | Self::Release(_)
             | Self::InvalidState { .. }
             | Self::Io { .. }
-            | Self::IoAtPath { .. } => DirectFileReaderError::Engine(reason),
+            | Self::IoAtPath { .. }) => DirectFileReaderError::Engine(error.to_string().into()),
+            #[cfg(unix)]
+            error @ (Self::WaitIo { .. } | Self::WaitRefused(_)) => DirectFileReaderError::Engine(error.to_string().into()),
         }
     }
 }
@@ -2753,7 +2781,7 @@ pub(crate) fn load_read_image_with_memory(
     limit: Option<usize>,
 ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
     let limits = crate::read_session::ReadSessionOptions::default().limits;
-    let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+    let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory).map_err(LoadReadImageError::Memory)?;
     let open_context = crate::executor::bounded::ReadOpenContext::new(
         declared.child().map_err(LoadReadImageError::Memory)?,
         limits,
@@ -2777,7 +2805,9 @@ pub(crate) fn load_read_image_at_registration_with_context(
         .checkpoint()
         .map_err(LoadReadImageError::Memory)?;
     let read_memory = open_context.read_memory();
-    let memory = crate::read_image_memory::ImageMemory::new(limit);
+    let memory = crate::read_image_memory::ImageMemory::new_direct_reader(limit,
+        read_memory.clone())
+        .map_err(LoadReadImageError::Memory)?;
     // The persistence cache coexists with decoded records and later lazy page
     // reads. Admit its fixed ceiling before Redb opens and retain that charge
     // for the source handle's lifetime.
@@ -2789,8 +2819,12 @@ pub(crate) fn load_read_image_at_registration_with_context(
         .saturating_add(std::mem::size_of::<
             content_identity::ValidatedHistoryOpenControl,
         >());
+    #[cfg(test)]
+    let source_observation = direct_source_contract_rows::begin(0, &memory);
     let source_memory = SourceMemoryReservation::new(memory.clone(), source_bytes)
         .map_err(LoadReadImageError::Memory)?;
+    #[cfg(test)]
+    drop(source_observation);
     let result = memory.scope(|| {
         let mut source = ReadImageSource::start(
             path,
@@ -4605,7 +4639,7 @@ impl ReadSnapshotRegistrationGuard {
         cancellation: &OwnerReadCancellation,
         deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
         active_ms: u64,
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<File, LoadReadImageError> {
         use physical_admission::{ByteLock, Granted, READER_HOLD_OFFSET, WriterAcquireRefusal};
         let cancelled_or_expired = || {
@@ -4629,12 +4663,19 @@ impl ReadSnapshotRegistrationGuard {
         if let Some(error) = cancelled_or_expired() {
             return Err(LoadReadImageError::Memory(error));
         }
-        let io_error = |error: std::io::Error| LoadReadImageError::Io {
+        let original = memory.diagnostic_budget().map_err(LoadReadImageError::Memory)?;
+        let diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared(original,
+            "reader", "publication_wait_diagnostic",
+            "Release retained reader diagnostics or raise the declared memory limit.")
+            .map_err(LoadReadImageError::Memory)?;
+        let result = (|| {
+        let wait_io = |reason| LoadReadImageError::WaitIo {
             operation: "acquire reader publication hold",
-            reason: error.to_string(),
+            reason,
         };
-        let file =
-            physical_admission::reopen_independent(&self.descriptor, false).map_err(io_error)?;
+        let io_error = |error| wait_io(physical_admission::WaitIo::Io(error));
+        let file = physical_admission::reopen_independent_native(&self.descriptor, false)
+            .map_err(wait_io)?;
         if physical_admission::try_byte(&file, READER_HOLD_OFFSET, ByteLock::Shared)
             .map_err(io_error)?
             == Granted::HeldByAnother
@@ -4656,9 +4697,10 @@ impl ReadSnapshotRegistrationGuard {
                     return Err(cancelled_or_expired()
                         .map(LoadReadImageError::Memory)
                         .unwrap_or_else(|| {
-                            io_error(std::io::Error::other(
-                                "reader publication helper termination is unconfirmed",
-                            ))
+                            wait_io(physical_admission::WaitIo::Static {
+                                kind: std::io::ErrorKind::Other,
+                                reason: "reader publication helper termination is unconfirmed",
+                            })
                         }));
                 }
                 writer_wait_helper::WaitEnded::Refused(refusal) => {
@@ -4669,26 +4711,32 @@ impl ReadSnapshotRegistrationGuard {
                         WriterAcquireRefusal::DeadlineExpired => cancelled_or_expired()
                             .map(LoadReadImageError::Memory)
                             .unwrap_or_else(|| {
-                                io_error(std::io::Error::other(
-                                    "reader publication deadline expired",
-                                ))
+                                wait_io(physical_admission::WaitIo::Static {
+                                    kind: std::io::ErrorKind::Other,
+                                    reason: "reader publication deadline expired",
+                                })
                             }),
-                        WriterAcquireRefusal::Io(error) => {
-                            let reason = error.to_string();
-                            match error
-                                .into_inner()
-                                .and_then(|inner| inner.downcast::<Error>().ok())
-                            {
-                                Some(error) => LoadReadImageError::Memory(*error),
-                                None => LoadReadImageError::Io {
-                                    operation: "acquire reader publication hold",
-                                    reason,
-                                },
-                            }
-                        }
-                        other => io_error(std::io::Error::other(format!(
-                            "reader publication wait failed: {other:?}"
-                        ))),
+                        WriterAcquireRefusal::Memory(error) => LoadReadImageError::Memory(error),
+                        WriterAcquireRefusal::Io(error) => io_error(error),
+                        WriterAcquireRefusal::NativeIo(error) => wait_io(error),
+                        WriterAcquireRefusal::HeldByWriter => LoadReadImageError::WaitRefused(
+                            physical_admission::PublicationWaitRefusal::HeldByWriter,
+                        ),
+                        WriterAcquireRefusal::CancellableWaitUnsupported => LoadReadImageError::WaitRefused(
+                            physical_admission::PublicationWaitRefusal::CancellableWaitUnsupported,
+                        ),
+                        WriterAcquireRefusal::HelperFailed(reason) => LoadReadImageError::WaitRefused(
+                            physical_admission::PublicationWaitRefusal::HelperFailed(reason),
+                        ),
+                        #[cfg(all(
+                            target_os = "linux",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        ))]
+                        WriterAcquireRefusal::Quarantined(helper) => LoadReadImageError::WaitRefused(
+                            physical_admission::PublicationWaitRefusal::Quarantined(
+                                physical_admission::QuarantinedHelperDiagnostic(helper.pid()),
+                            ),
+                        ),
                     });
                 }
             }
@@ -4697,6 +4745,11 @@ impl ReadSnapshotRegistrationGuard {
             return Err(LoadReadImageError::Memory(error));
         }
         Ok(file)
+        })();
+        result.map_err(|error| match error {
+            error @ LoadReadImageError::Memory(_) => error,
+            error => LoadReadImageError::Funded(diagnostic.publish(error)),
+        })
     }
 
     /// Publish a conservative transaction floor before asking the owner for
@@ -4737,7 +4790,7 @@ impl ReadSnapshotRegistrationGuard {
         cancellation: &OwnerReadCancellation,
         deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
         active_ms: u64,
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<Self, LoadReadImageError> {
         #[cfg(unix)]
         let mut guard = Self::open_descriptor(path, false)?;
@@ -4778,7 +4831,7 @@ impl ReadSnapshotRegistrationGuard {
         cancellation: &OwnerReadCancellation,
         deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
         active_ms: u64,
-        memory: Arc<crate::read_image_memory::ImageMemory>,
+        memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<Self, LoadReadImageError> {
         if provisional.snapshot.physical_identity != physical_identity
             || provisional.snapshot.database_identity != Some(identity)
@@ -6226,6 +6279,9 @@ fn capture_reader_snapshot_registry_one(
     identity: (u64, u64),
     runtime: &RuntimeDirectory,
 ) -> ReaderSnapshotRegistry {
+    #[cfg(test)]
+    let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+        "capture_reader_snapshot_registry_one");
     let directory = reader_snapshot_directory(runtime.path(), identity);
     // The lock is cooperative exclusion only. Atomically acquire and validate
     // the actual registry directory before the pause/lock window so a
@@ -6477,27 +6533,37 @@ pub(crate) fn locked_reader_breadcrumbs(
     Ok(locked)
 }
 
-thread_local! {
-    static WRITER_WAIT: std::cell::RefCell<
-        Option<(Option<OwnerReadCancellation>, Option<crate::ReaderWaitDeadline>)>,
-    > = const { std::cell::RefCell::new(None) };
+#[derive(Clone, Default)]
+struct WriterWaitContext {
+    stop: Option<OwnerReadCancellation>,
+    deadline: Option<crate::ReaderWaitDeadline>,
+    payer: Option<crate::memory_accounting::StoreAccountantHandle>,
 }
 
-/// The caller's bounds on a writable open's wait for starting readers, in
-/// force on this thread for the length of one open.
+thread_local! {
+    static WRITER_WAIT: std::cell::RefCell<Option<WriterWaitContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The caller's bounds and original writer payer for one writable open.
+/// Scope and TLS custody only clone strong capabilities, without allocating.
 pub(crate) struct WriterWaitScope {
-    previous: Option<(
-        Option<OwnerReadCancellation>,
-        Option<crate::ReaderWaitDeadline>,
-    )>,
+    previous: Option<WriterWaitContext>,
 }
 
 impl WriterWaitScope {
     pub(crate) fn enter(
         stop: Option<OwnerReadCancellation>,
         deadline: Option<crate::ReaderWaitDeadline>,
+        payer: crate::memory_accounting::StoreAccountantHandle,
     ) -> Self {
-        let previous = WRITER_WAIT.with(|slot| slot.replace(Some((stop, deadline))));
+        let previous = WRITER_WAIT.with(|slot| {
+            slot.replace(Some(WriterWaitContext {
+                stop,
+                deadline,
+                payer: Some(payer),
+            }))
+        });
         Self { previous }
     }
 }
@@ -6509,11 +6575,15 @@ impl Drop for WriterWaitScope {
     }
 }
 
-fn current_writer_wait() -> (
-    Option<OwnerReadCancellation>,
-    Option<crate::ReaderWaitDeadline>,
-) {
-    WRITER_WAIT.with(|slot| slot.borrow().clone().unwrap_or((None, None)))
+fn current_writer_wait() -> WriterWaitContext {
+    WRITER_WAIT.with(|slot| slot.borrow().clone().unwrap_or_default())
+}
+
+fn writer_open_diagnostic_budget() -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+    match current_writer_wait().payer {
+        Some(original) => original.wait_memory_owner().map_err(Error::NativeEngineOther),
+        None => crate::read_image_memory::active_owner()?.diagnostic_budget(),
+    }
 }
 
 /// A provisional registration: published before admission, retaining every
@@ -6778,7 +6848,7 @@ struct ReadImageSource {
     store_file_bytes: Option<u64>,
     // This final field keeps the one admitted charge alive until every
     // hydration handle, hold and breadcrumb descriptor above has closed.
-    source_memory: Option<Arc<SourceMemoryReservation>>,
+    source_memory: Option<SourceShared<SourceMemoryReservation>>,
     #[cfg(any(test, feature = "test-seams"))]
     source_handles_dropped_for_test: bool,
     #[cfg(any(test, feature = "test-seams"))]
@@ -6786,19 +6856,25 @@ struct ReadImageSource {
 }
 
 struct SourceMemoryReservation {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl SourceMemoryReservation {
-    fn new(memory: Arc<crate::read_image_memory::ImageMemory>, bytes: usize) -> Result<Self> {
+    fn new(memory: crate::read_image_memory::ImageMemoryHandle, bytes: usize) -> Result<SourceShared<Self>> {
+        let layout = SourceShared::<Self>::layout();
+        let control = memory.direct_source_native_credit(layout.size())
+            .map_err(|refusal| native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(refusal)))?;
         memory.reserve(bytes)?;
-        Ok(Self {
+        SourceShared::try_new_prepaid(Self {
             memory,
             bytes: std::sync::atomic::AtomicUsize::new(bytes),
-        })
+        }, control)
     }
     fn detach_control(&self, bytes: usize) -> Result<crate::memory_accounting::ControlCredit> {
+        #[cfg(test)]
+        let _transfer_observation = direct_source_contract_rows::TransferObservation::begin(self, bytes);
         self.bytes
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 held.checked_sub(bytes)
@@ -6837,7 +6913,9 @@ enum IndexRootCheck {
     Canonical,
 }
 
-pub(crate) struct RetainedReadSource {
+pub(crate) type RetainedReadSource = SourceShared<RetainedReadSourceData>;
+
+pub(crate) struct RetainedReadSourceData {
     database_path: PathBuf,
     database: redb::ReadOnlyDatabase,
     snapshot: redb::StorageSnapshotIdentity,
@@ -6850,15 +6928,14 @@ pub(crate) struct RetainedReadSource {
     content_identity: content_identity::ContentIdentityReadVerifier,
     history_open_control: content_identity::ValidatedHistoryOpenControl,
     /// The existing reader child that admitted this exact source capture.
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     /// Pages proved under this source's pinned root, shared by row and exact
     /// vector-body reads; retained bytes remain charged to the read session.
     content_proof: Mutex<content_identity::ReadAuthenticationNodes>,
     physical_rows: Mutex<Option<RetainedPhysicalRowScan>>,
     image_config_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
     verified_ordered_runs: VerifiedOrderedRunCache,
-    _source_memory: Arc<SourceMemoryReservation>,
-    _own_control: crate::memory_accounting::ControlCredit,
+    _source_memory: SourceShared<SourceMemoryReservation>,
 }
 
 /// The most proof pages one statement's open body read keeps between the
@@ -6879,7 +6956,7 @@ const RETAINED_CONTENT_PROOF_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) struct RetainedRawVectorBodyScan {
     producer_body_root: bool,
     selected_stream_identity: Option<RawVectorDirectoryEntry>,
-    source: Arc<RetainedReadSource>,
+    source: RetainedReadSource,
     vectors: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     // Declared last so the tables above close before the transaction that
     // pins them does.
@@ -7409,7 +7486,7 @@ const VERIFIED_ORDERED_RUN_BUILD_MAX_BYTES: usize = 8 * 1024 * 1024;
 const VERIFIED_ORDERED_WINDOW_MAX_BYTES: usize = 256 * 1024;
 
 struct VerifiedOrderedRunCache {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     max_bytes: usize,
     state: Arc<Mutex<VerifiedOrderedRunCacheState>>,
     /// Bumped when a cached window is dropped so a cursor still holding
@@ -7522,7 +7599,7 @@ struct VerifiedOrderedRunCacheState {
 /// retains the original typed budget refusal instead of treating a partial
 /// authenticated descent as an empty group range.
 struct CommittedCountProofMemory {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     refusal: Mutex<Option<Error>>,
 }
 impl content_identity::ProofPoolGrowth for CommittedCountProofMemory {
@@ -7544,7 +7621,7 @@ impl content_identity::ProofPoolGrowth for CommittedCountProofMemory {
 /// Borrowed components avoid copying the caller's strings just to seek.
 fn charged_count_group_boundary(
     prefix: &[DirectedValue],
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<Vec<u8>> {
     let slots = prefix
         .len()
@@ -7616,7 +7693,7 @@ struct VerifiedOrderedPosting {
 /// with nothing reserved and grows by the walk's actual demand -- up to,
 /// never straight to, this cache's ceiling.
 struct VerifiedOrderedRunMemory {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     /// The cache this reservation evicts from before it admits more. Weak, so
     /// a cached window's own reservation never keeps its cache alive.
     cache: std::sync::Weak<Mutex<VerifiedOrderedRunCacheState>>,
@@ -7695,7 +7772,7 @@ fn evict_oldest_verified_run(state: &Mutex<VerifiedOrderedRunCacheState>) -> boo
 }
 
 impl VerifiedOrderedRunCache {
-    fn new(memory: Arc<crate::read_image_memory::ImageMemory>) -> Self {
+    fn new(memory: crate::read_image_memory::ImageMemoryHandle) -> Self {
         let max_bytes = memory
             .accountant
             .usage()
@@ -7734,8 +7811,10 @@ impl VerifiedOrderedRunCache {
 
     fn begin_build(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Option<Arc<VerifiedOrderedRunMemory>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         #[cfg(any(test, feature = "test-seams"))]
         if verified_ordered_run_test_seams::verified_run_memory_exhausted_for_test() {
             return None;
@@ -7829,20 +7908,20 @@ pub(crate) struct CheckpointReadSource {
     /// bodies the directory no longer carries is bounded by the same budget
     /// the rest of the database answers to.
     accountant: Option<crate::memory_accounting::AccountantHandle>,
-    decode_memory: Arc<crate::read_image_memory::ImageMemory>,
+    decode_memory: crate::read_image_memory::ImageMemoryHandle,
 
     _writer_use: Option<crate::memory_accounting::WriterUse>,
 }
 
 /// A run holds exactly its decoder/copy owner through caller serialization.
 pub(crate) struct ExportBodyAdmission {
-    memory: Arc<crate::read_image_memory::ImageMemory>,
-    decoded: Option<Arc<crate::read_image_memory::ImageMemory>>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
+    decoded: Option<crate::read_image_memory::ImageMemoryHandle>,
     decoded_controls: Option<contextdb_core::read_memory::ReadCredit>,
 }
 
 impl ExportBodyAdmission {
-    fn empty(memory: Arc<crate::read_image_memory::ImageMemory>) -> Self {
+    fn empty(memory: crate::read_image_memory::ImageMemoryHandle) -> Self {
         Self {
             memory,
             decoded: None,
@@ -7870,12 +7949,9 @@ impl CheckpointReadSource {
     }
 
     fn content_identity_corruption(&self, reason: impl std::fmt::Display) -> Error {
-        Error::StoreCorrupted {
-            path: self.database_path.display().to_string(),
-            reason: format!(
+        crate::funded_error::corruption_display(self.decode_memory.diagnostic_budget(), self.database_path.display(), format_args!(
                 "checkpoint source does not authenticate against its captured root: {reason}"
-            ),
-        }
+            ))
     }
 
     /// Restore each exported row's stored values from the pinned source.
@@ -7907,20 +7983,21 @@ impl CheckpointReadSource {
         name: &str,
         meta: &TableMeta,
         rows: &mut [VersionedRow],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(usize, ExportBodyAdmission)> {
-        let controls = contextdb_core::read_memory::ReadCredit::try_new(
-            read_memory.clone(),
-            std::mem::size_of::<crate::read_image_memory::ImageMemory>()
-                + 2 * std::mem::size_of::<usize>(),
-            "reader",
-            "export_decode_owner",
-            "Raise the declared reader memory limit.",
-        )?;
-        let bridge = self.accountant.clone().unwrap_or_else(|| {
-            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()
-        });
-        let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        // The native image retains its exact control invoice itself. Keep
+        // the existing return slot empty rather than charging that block twice.
+        let controls = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let bridge = match &self.accountant {
+            Some(accountant) => accountant.clone(),
+            None => crate::memory_accounting::AccountantHandle::reader(
+                None, read_memory.clone(), false)?,
+        };
+        let decoded = crate::read_image_memory::ImageMemory::admitted_reader_for(
+            bridge, read_memory, "reader", "materialize_answer",
+            "Reduce the statement's output or raise the declared reader memory limit.")?;
         let (filled, mut admission) =
             decoded.scope(|| self.load_export_row_values(name, meta, rows))?;
         admission.decoded = Some(decoded);
@@ -7948,10 +8025,7 @@ impl CheckpointReadSource {
             .read
             .open_table(definition)
             .map_err(|error| match error {
-                redb::TableError::TableDoesNotExist(_) => Error::StoreCorrupted {
-                    path: self.database_path.display().to_string(),
-                    reason: format!("checkpoint source relational table {name} is absent"),
-                },
+                redb::TableError::TableDoesNotExist(_) => crate::funded_error::corruption_display(self.decode_memory.diagnostic_budget(), self.database_path.display(), format_args!("checkpoint source relational table {name} is absent")),
                 other => RedbPersistence::storage_error(other),
             })?;
         let mut filled = 0usize;
@@ -7961,13 +8035,10 @@ impl CheckpointReadSource {
                 let stored = relation
                     .get(key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::StoreCorrupted {
-                        path: self.database_path.display().to_string(),
-                        reason: format!(
+                    .ok_or_else(|| crate::funded_error::corruption_display(self.decode_memory.diagnostic_budget(), self.database_path.display(), format_args!(
                             "checkpoint source lost relational table {name} row {} at tx {} lsn {}",
                             row.row_id.0, row.created_tx.0, row.lsn.0
-                        ),
-                    })?;
+                        )))?;
                 let durable = match admission.memory.scope(|| {
                     RedbPersistence::decode_relational_source_row(name, meta, stored.value())
                 }) {
@@ -8125,23 +8196,24 @@ impl CheckpointReadSource {
         name: &str,
         meta: &TableMeta,
         rows: &mut [VersionedRow],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
-        Arc<crate::read_image_memory::ImageMemory>,
+        crate::read_image_memory::ImageMemoryHandle,
         contextdb_core::read_memory::ReadCredit,
     )> {
-        let controls = contextdb_core::read_memory::ReadCredit::try_new(
-            read_memory.clone(),
-            std::mem::size_of::<crate::read_image_memory::ImageMemory>()
-                + 2 * std::mem::size_of::<usize>(),
-            "reader",
-            "export_decode_owner",
-            "Raise the declared reader memory limit.",
-        )?;
-        let bridge = self.accountant.clone().unwrap_or_else(|| {
-            Arc::new(crate::memory_accounting::MemoryAccountant::no_limit()).into()
-        });
-        let decoded = crate::read_image_memory::ImageMemory::charging_reader(bridge, read_memory);
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        // The native image retains its exact control invoice itself. Keep
+        // the existing return slot empty rather than charging that block twice.
+        let controls = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let bridge = match &self.accountant {
+            Some(accountant) => accountant.clone(),
+            None => crate::memory_accounting::AccountantHandle::reader(
+                None, read_memory.clone(), false)?,
+        };
+        let decoded = crate::read_image_memory::ImageMemory::admitted_reader_for(
+            bridge, read_memory, "reader", "materialize_answer",
+            "Reduce the statement's output or raise the declared reader memory limit.")?;
         decoded.scope(|| self.overlay_export_row_f32_projections(name, meta, rows))?;
         Ok((decoded, controls))
     }
@@ -8187,8 +8259,8 @@ impl CheckpointReadSource {
                     && matches!(column.quantization, VectorQuantization::F32)
             })
             .count();
-        let _columns_credit = contextdb_core::read_memory::ReadCredit::try_new(
-            admission.memory.clone(),
+        let _columns_credit = contextdb_core::read_memory::ReadCredit::try_new_owned(
+            admission.memory.owner(),
             f32_count
                 .checked_mul(std::mem::size_of::<(&str, usize, bool)>())
                 .ok_or_else(|| Error::Other("export vector columns size overflow".into()))?,
@@ -8213,10 +8285,7 @@ impl CheckpointReadSource {
             .read
             .open_table(definition)
             .map_err(|error| match error {
-                redb::TableError::TableDoesNotExist(_) => Error::StoreCorrupted {
-                    path: self.database_path.display().to_string(),
-                    reason: format!("checkpoint source relational table {name} is absent"),
-                },
+                redb::TableError::TableDoesNotExist(_) => crate::funded_error::corruption_display(self.decode_memory.diagnostic_budget(), self.database_path.display(), format_args!("checkpoint source relational table {name} is absent")),
                 other => RedbPersistence::storage_error(other),
             })?;
         for row in rows {
@@ -8224,13 +8293,10 @@ impl CheckpointReadSource {
             let stored = relation
                 .get(key.as_slice())
                 .map_err(RedbPersistence::storage_error)?
-                .ok_or_else(|| Error::StoreCorrupted {
-                    path: self.database_path.display().to_string(),
-                    reason: format!(
+                .ok_or_else(|| crate::funded_error::corruption_display(self.decode_memory.diagnostic_budget(), self.database_path.display(), format_args!(
                         "checkpoint source lost relational table {name} row {} at tx {} lsn {}",
                         row.row_id.0, row.created_tx.0, row.lsn.0
-                    ),
-                })?;
+                    )))?;
             let row_memory = self.decode_memory.row_owner()?;
             let durable = row_memory.scope(|| {
                 RedbPersistence::decode_relational_source_row(name, meta, stored.value())
@@ -8270,8 +8336,8 @@ impl CheckpointReadSource {
                                 Error::Other("export vector copy size overflow".into())
                             })?;
                         admission.memory.reserve(copied_bytes)?;
-                        let incoming_key = contextdb_core::read_memory::ReadCredit::try_new(
-                            admission.memory.clone(),
+                        let incoming_key = contextdb_core::read_memory::ReadCredit::try_new_owned(
+                            admission.memory.owner(),
                             column.len(),
                             "checkpoint_export",
                             "vector_overlay_key",
@@ -8318,13 +8384,50 @@ impl CheckpointReadSource {
     }
 }
 
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct SourceCacheChargeForTest {
+    pub index_bytes: usize,
+    pub remaining_base: usize,
+    pub source_control: (usize, usize, usize),
+    pub retained_control: (usize, usize, usize),
+    pub preparation: (usize, usize, usize),
+    pub preparation_invoice: usize,
+    pub payer_identity: usize,
+    pub allocations: [(usize, usize, usize); 140],
+    pub allocation_count: usize,
+}
+
 impl RetainedReadSource {
+    #[cfg(test)]
+    pub(crate) fn write_control_for_test(&self) -> redb::CacheWriteControlForTest {
+        self.database.write_control_for_test()
+    }
+    #[cfg(test)]
+    pub(crate) fn cached_header_for_test(&self) -> redb::CachePageForTest {
+        self.database.cached_header_for_test().unwrap()
+    }
+
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn cache_index_charge_for_test(&self) -> (usize, usize) {
-        (
-            self.database.cache_index_bytes(),
-            self._source_memory.bytes.load(Ordering::SeqCst),
-        )
+    pub(crate) fn cache_index_charge_for_test(&self) -> SourceCacheChargeForTest {
+        let mut allocations = [(0, 0, 0); 140];
+        let mut allocation_count = 0;
+        let preparation = self.database.cache_allocations_for_test(&mut |request| {
+            allocations[allocation_count] = request;
+            allocation_count += 1;
+        });
+        let (preparation, preparation_invoice, payer_identity) =
+            cache_reserve::direct_observation_for_test(preparation);
+        let m = SourceShared::<SourceMemoryReservation>::layout();
+        let r = Self::layout();
+        SourceCacheChargeForTest {
+            index_bytes: self.database.cache_index_bytes(),
+            remaining_base: self._source_memory.bytes.load(Ordering::SeqCst),
+            source_control: (self._source_memory.identity(), m.size(), m.align()),
+            retained_control: (self.identity(), r.size(), r.align()),
+            preparation, preparation_invoice, payer_identity, allocations, allocation_count,
+        }
     }
 
     pub(crate) fn durable_membership_summary(
@@ -8379,11 +8482,7 @@ impl RetainedReadSource {
 
     fn begin_read(&self) -> Result<redb::ReadTransaction> {
         if self.registration.snapshot.storage_snapshot != self.snapshot {
-            return Err(Error::StoreCorrupted {
-                path: self.database_path.display().to_string(),
-                reason: "retained source root differs from its authenticated registration"
-                    .to_owned(),
-            });
+            return Err(crate::funded_error::corruption_text(Ok(self.read_memory.clone()), self.database_path.display(), "retained source root differs from its authenticated registration".into()));
         }
         if self.registration.registration.is_none() {
             return Err(Error::Other((
@@ -8394,26 +8493,22 @@ impl RetainedReadSource {
             .database
             .begin_external_read(self.snapshot)
             .map_err(|error| {
-                crate::database::ImageHistoryError::Store {
-                    path: self.database_path.display().to_string(),
-                    diagnosis: Box::new(read_transaction_error(error)),
-                }
+                crate::database::ImageHistoryError::store(self.read_memory.clone(), self.database_path.display(), read_transaction_error(error))
                 .into_engine_error()
             })?;
         if transaction.storage_snapshot_identity() != self.snapshot {
-            return Err(Error::StoreCorrupted {
-                path: self.database_path.display().to_string(),
-                reason: "retained source transaction escaped its registered snapshot".to_owned(),
-            });
+            return Err(crate::funded_error::corruption_text(Ok(self.read_memory.clone()), self.database_path.display(), "retained source transaction escaped its registered snapshot".into()));
         }
         Ok(transaction)
     }
 
     pub(crate) fn content_size_totals(
         &self,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_table: &mut dyn FnMut() -> Result<()>,
     ) -> Result<content_size::ContentSizeTotals> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         self.with_read(|read| {
             content_size::read_totals(
                 read,
@@ -8681,14 +8776,10 @@ impl RetainedReadSource {
         })
     }
 
-    fn raw_vector_corruption(&self, reason: impl Into<String>) -> Error {
-        Error::StoreCorrupted {
-            path: self.database_path.display().to_string(),
-            reason: format!(
-                "vector partition durability record is corrupt: {}",
-                reason.into()
-            ),
-        }
+    fn raw_vector_corruption(&self, reason: impl std::fmt::Display) -> Error {
+        crate::funded_error::corruption_display(Ok(self.read_memory.clone()), self.database_path.display(), format_args!(
+                "vector partition durability record is corrupt: {reason}"
+            ))
     }
 
     /// Keep an identity failure that already carries the typed corruption
@@ -8717,12 +8808,9 @@ impl RetainedReadSource {
     }
 
     fn content_identity_corruption(&self, reason: impl std::fmt::Display) -> Error {
-        Error::StoreCorrupted {
-            path: self.database_path.display().to_string(),
-            reason: format!(
+        crate::funded_error::corruption_display(Ok(self.read_memory.clone()), self.database_path.display(), format_args!(
                 "loaded content does not authenticate against the committed image root: {reason}"
-            ),
-        }
+            ))
     }
 
     /// The identity route could not hold the authenticated run that proves its
@@ -8758,8 +8846,10 @@ impl RetainedReadSource {
         &self,
         accountant: &crate::memory_accounting::AccountantHandle,
         checkpoint: &dyn Fn() -> Result<()>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<LoadedReadHistory, crate::database::ImageHistoryError> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         checkpoint()?;
         let mut reservation = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         reservation.try_grow_for(
@@ -8849,10 +8939,7 @@ impl RetainedReadSource {
             })
         });
         result.map_err(|error| match diagnosis.into_inner() {
-            Some(diagnosis) => crate::database::ImageHistoryError::Store {
-                path: self.database_path.display().to_string(),
-                diagnosis: Box::new(diagnosis),
-            },
+            Some(diagnosis) => crate::database::ImageHistoryError::store(self.read_memory.clone(), self.database_path.display(), diagnosis),
             None => crate::database::ImageHistoryError::Engine(error),
         })
     }
@@ -8895,9 +8982,9 @@ impl RetainedReadSource {
         read: &redb::ReadTransaction,
         definition: TableDefinition<&'static str, &'static [u8]>,
         class: OpenHistoryClass,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         reservation: &mut contextdb_core::read_memory::ReadCredit,
-        decoded: &Arc<crate::read_image_memory::ImageMemory>,
+        decoded: &crate::read_image_memory::ImageMemoryHandle,
         checkpoint: &dyn Fn() -> Result<()>,
         decode_record: &dyn Fn(&str, &[u8]) -> Result<T>,
         value_hash: &dyn Fn(&T, &[u8]) -> Result<[u8; 32]>,
@@ -8906,6 +8993,8 @@ impl RetainedReadSource {
     where
         T: content_identity::HistoryRecord,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         const HINT: &str = "Raise MEMORY_LIMIT so this reader can hold the store's change history.";
         let kind = <T as content_identity::HistoryRecord>::KIND;
         let table = open_optional_read_table(read, definition)?;
@@ -9201,13 +9290,15 @@ impl RetainedReadSource {
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &[DirectedValue],
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         validate_position: &mut dyn FnMut(
             &RelationalIndexPosition,
-        ) -> std::result::Result<(), String>,
+        ) -> std::result::Result<(), Error>,
         visit: &mut dyn FnMut(IndexKey, u64) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !self.ordered_prefix_snapshot_is_current(snapshot) {
             return Ok(false);
         }
@@ -9317,7 +9408,7 @@ impl RetainedReadSource {
                 return Ok(true);
             };
             validate_position(&position)
-                .map_err(|e| E::from(self.content_identity_corruption(e)))?;
+                .map_err(E::from)?;
             if position.created_tx != TxId(0) {
                 return Err(E::from(self.content_identity_corruption(
                     "logical count posting has transaction",
@@ -9358,8 +9449,10 @@ impl RetainedReadSource {
         index: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &IndexKey,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<u64>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.verify_relational_source_roots(
             table,
             index,
@@ -9465,10 +9558,7 @@ impl RetainedReadSource {
                 self.graph_lsn_frontier,
             )
             .map_err(|error| {
-                crate::database::ImageHistoryError::Store {
-                    path: self.database_path.display().to_string(),
-                    diagnosis: Box::new(error),
-                }
+                crate::database::ImageHistoryError::store(self.read_memory.clone(), self.database_path.display(), error)
                 .into_engine_error()
             })
         })
@@ -9787,7 +9877,7 @@ impl RetainedReadSource {
     /// body it compares: one transaction pinned at this source's snapshot and
     /// the body table opened once. Authentication pages belong to that pinned
     /// source, so this scan reuses proofs from the preceding row walk.
-    pub(crate) fn open_raw_vector_body_scan(self: &Arc<Self>) -> Result<RetainedRawVectorBodyScan> {
+    pub(crate) fn open_raw_vector_body_scan(&self) -> Result<RetainedRawVectorBodyScan> {
         let owner = vector_membership_source::MembershipOwner::Retained(self.clone());
         let read = match vector_membership_source::operation_read(&owner) {
             Some(read) => read,
@@ -9797,7 +9887,7 @@ impl RetainedReadSource {
     }
 
     pub(crate) fn open_raw_vector_body_scan_at(
-        self: &Arc<Self>,
+        &self,
         transaction: Arc<redb::ReadTransaction>,
     ) -> Result<RetainedRawVectorBodyScan> {
         let owner = vector_membership_source::MembershipOwner::Retained(self.clone());
@@ -9820,7 +9910,7 @@ impl RetainedReadSource {
             Ok(RetainedRawVectorBodyScan {
                 producer_body_root,
                 selected_stream_identity: None,
-                source: Arc::clone(self),
+                source: self.clone(),
 
                 vectors,
                 _transaction: transaction,
@@ -10067,7 +10157,7 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         snapshot: SnapshotId,
-    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+    ) -> Result<Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         self.reconciled_row_with_owner(
             read,
@@ -10087,9 +10177,11 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         addressed: bool,
-    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+    ) -> Result<Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let memory = crate::read_image_memory::ImageMemory::operation_reader(
             self._source_memory.memory.accountant.clone(),
             read_memory.clone(),
@@ -10147,8 +10239,10 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.reconciled_row_with_owner(read, table, meta, row_id, snapshot, read_memory, false)
     }
 
@@ -10160,7 +10254,7 @@ impl RetainedReadSource {
         row_id: RowId,
         snapshot: SnapshotId,
         _authentication: Option<&mut content_identity::ReadAuthenticationBatch<'_>>,
-    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+    ) -> Result<Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         self.reconciled_row_with_owner(
             read,
@@ -10181,8 +10275,10 @@ impl RetainedReadSource {
         row_id: RowId,
         snapshot: SnapshotId,
         _authentication: Option<&mut content_identity::ReadAuthenticationBatch<'_>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Option<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.reconciled_row_with_owner(read, table, meta, row_id, snapshot, read_memory, false)
     }
 
@@ -10205,8 +10301,10 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.relational_row_by_id_lsn_with_checkpoint(
             table,
             meta,
@@ -10223,9 +10321,11 @@ impl RetainedReadSource {
         meta: &TableMeta,
         row_id: RowId,
         lsn: Lsn,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         graph_read::with_pages(read_memory.clone(), || {
             self.with_read(|read| {
                 let mut last = None;
@@ -10259,11 +10359,13 @@ impl RetainedReadSource {
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let operation = crate::read_image_memory::ImageMemory::operation_reader(
             self.verified_ordered_runs.memory.accountant.clone(),
             read_memory.clone(),
@@ -10294,11 +10396,13 @@ impl RetainedReadSource {
         meta: &TableMeta,
         snapshot: SnapshotId,
         mut visit: impl FnMut(&VersionedRow) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut cursor = contextdb_relational::mem::BoundedPhysicalCursor::default();
         loop {
             let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
@@ -10449,11 +10553,13 @@ impl RetainedReadSource {
         cache_key: [u8; 32],
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Arc<VerifiedOrderedRun>>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if cursor.source_prefix_quota() == Some(0) {
             cursor.source_stop_prefix();
             return Ok(None);
@@ -11038,8 +11144,10 @@ impl RetainedReadSource {
         table: &str,
         index: &str,
         mode: IndexRootCheck,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
             self._source_memory.memory.accountant.clone(),
             read_memory,
@@ -11091,11 +11199,13 @@ impl RetainedReadSource {
         check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_probe: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_native_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<bool>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         check_boundary()?;
         before_native_touch()?;
         self.verify_relational_source_roots(
@@ -11166,11 +11276,13 @@ impl RetainedReadSource {
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         visit: &mut dyn FnMut(RowId) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if snapshot != self.logical_frontier {
             let meta = self
                 .with_read(|read| RedbPersistence::load_table_meta_in_read_txn(read, table))
@@ -11293,11 +11405,13 @@ impl RetainedReadSource {
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let witness_memory = crate::read_image_memory::ImageMemory::charging_reader(
             self._source_memory.memory.accountant.clone(),
             read_memory.clone(),
@@ -11557,11 +11671,13 @@ impl RetainedReadSource {
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_relational_ordered_next_observed(
             table,
             meta,
@@ -11589,11 +11705,13 @@ impl RetainedReadSource {
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         check_boundary()?;
         self.verify_relational_source_roots(
             table,
@@ -11731,13 +11849,10 @@ impl RetainedReadSource {
                     let index = match read.open_table(definition) {
                         Ok(index) => index,
                         Err(redb::TableError::TableDoesNotExist(_)) => {
-                            return Err(Error::StoreCorrupted {
-                                path: self.database_path.display().to_string(),
-                                reason: format!(
+                            return Err(crate::funded_error::corruption_display(Ok(read_memory.clone()), self.database_path.display(), format_args!(
                                     "relational index {} is absent from the retained root",
                                     declaration.name
-                                ),
-                            });
+                                )));
                         }
                         Err(error) => return Err(RedbPersistence::storage_error(error)),
                     };
@@ -11881,13 +11996,10 @@ impl RetainedReadSource {
             };
             let actual = contextdb_relational::index_key_for_row(&declaration.columns, &row.values);
             if actual != position.key {
-                return Err(E::from(Error::StoreCorrupted {
-                    path: self.database_path.display().to_string(),
-                    reason: format!(
+                return Err(E::from(crate::funded_error::corruption_display(Ok(read_memory.clone()), self.database_path.display(), format_args!(
                         "durable relational index {} points row {} at a different key",
                         declaration.name, position.row_id.0
-                    ),
-                }));
+                    ))));
             }
             before_clone(crate::read_image_memory::RowReadAdmission::Move(&memory))?;
             return Ok(Some(row));
@@ -11907,11 +12019,13 @@ impl RetainedReadSource {
         before_clone: &mut dyn FnMut(
             crate::read_image_memory::RowReadAdmission<'_>,
         ) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<VersionedRow>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.historical_index_preflight(
             table,
             meta,
@@ -11940,13 +12054,10 @@ impl RetainedReadSource {
                     let index = match read.open_table(definition) {
                         Ok(index) => index,
                         Err(redb::TableError::TableDoesNotExist(_)) => {
-                            return Err(Error::StoreCorrupted {
-                                path: self.database_path.display().to_string(),
-                                reason: format!(
+                            return Err(crate::funded_error::corruption_display(Ok(read_memory.clone()), self.database_path.display(), format_args!(
                                     "relational index {} is absent from the retained root",
                                     declaration.name
-                                ),
-                            });
+                                )));
                         }
                         Err(error) => return Err(RedbPersistence::storage_error(error)),
                     };
@@ -12021,13 +12132,10 @@ impl RetainedReadSource {
                 ))));
             };
             if contextdb_relational::index_key_for_row(&declaration.columns, &row.values) != probe {
-                return Err(E::from(Error::StoreCorrupted {
-                    path: self.database_path.display().to_string(),
-                    reason: format!(
+                return Err(E::from(crate::funded_error::corruption_display(Ok(read_memory.clone()), self.database_path.display(), format_args!(
                         "durable relational index {} points row {} at a different key",
                         declaration.name, position.row_id.0
-                    ),
-                }));
+                    ))));
             }
             before_clone(crate::read_image_memory::RowReadAdmission::Move(&memory))?;
             return Ok(Some(row));
@@ -12050,20 +12158,17 @@ fn decode_relational_index_entry(
     let Some((key, value)) = entry else {
         return Ok(None);
     };
-    let corrupt = |reason: String| Error::StoreCorrupted {
-        path: database_path.display().to_string(),
-        reason,
-    };
+    let corrupt = |reason: contextdb_core::error::DiagnosticText| crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), database_path.display(), reason.into());
     let key = key.value();
     let position = key.decode_canonical().map_err(|error| match error {
-        Error::Other(reason) => corrupt(reason.into_owned()),
+        Error::Other(reason) => corrupt(reason),
         other => other,
     })?;
     let deleted_tx = RedbPersistence::decode_exact::<Option<TxId>>(value.value()).map_err(
         |error| match error {
-            Error::Other(reason) => corrupt(format!(
-                "durable index visibility record is damaged: {reason}"
-            )),
+            Error::Other(reason) => crate::funded_error::corruption_display(
+                crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+                database_path.display(), format_args!("durable index visibility record is damaged: {reason}")),
             other => other,
         },
     )?;
@@ -12075,14 +12180,12 @@ fn decode_relational_index_entry_original(
     entry: Option<(redb::AccessGuard<'_, DurableRelationalIndexKey>, redb::AccessGuard<'_, &[u8]>)>,
 ) -> Result<Option<(Vec<u8>, RelationalIndexPosition, Option<TxId>)>> {
     let Some((key, value)) = entry else { return Ok(None); };
-    let corrupt = |reason: String| Error::StoreCorrupted {
-        path: database_path.display().to_string(), reason,
-    };
+    let corrupt = |reason: contextdb_core::error::DiagnosticText| crate::funded_error::corruption_text(crate::funded_error::original_budget(frame.original), database_path.display(), reason.into());
     // Admit the native owned from_bytes representation before requesting it.
     frame.reserve(key.retained_page_bytes())?;
     let key = key.value();
     let encoded: EncodedRelationalIndexPosition = frame.decode(&key.0).map_err(|error| match error {
-        Error::Other(reason) => corrupt(format!("durable index position is not an exactly decodable key: {reason}")),
+        Error::Other(reason) => crate::funded_error::corruption_display(crate::funded_error::original_budget(frame.original), database_path.display(), format_args!("durable index position is not an exactly decodable key: {reason}")),
         other => other,
     })?;
     let _json_scratch = frame.json_scratch(encoded.key.iter().map(|(_,value)|value))?;
@@ -12093,7 +12196,7 @@ fn decode_relational_index_entry_original(
     frame.array::<DirectedValue>(encoded.key.len())?;
     let position = encoded.into();
     let deleted_tx = frame.decode::<Option<TxId>>(value.value()).map_err(|error| match error {
-        Error::Other(reason) => corrupt(format!("durable index visibility record is damaged: {reason}")),
+        Error::Other(reason) => crate::funded_error::corruption_display(crate::funded_error::original_budget(frame.original), database_path.display(), format_args!("durable index visibility record is damaged: {reason}")),
         other => other,
     })?;
     Ok(Some((key.0, position, deleted_tx)))
@@ -12152,7 +12255,7 @@ impl ReadImageSource {
     fn start(
         database_path: &Path,
         cache_bytes: usize,
-        source_memory: SourceMemoryReservation,
+        source_memory: SourceShared<SourceMemoryReservation>,
         runtime_dir: Option<&Path>,
         registration: Option<ReadSnapshotRegistrationGuard>,
         open_context: Option<&crate::executor::bounded::ReadOpenContext>,
@@ -12179,20 +12282,28 @@ impl ReadImageSource {
             ReaderBreadcrumbGuard::create_in(database_path, &runtime, breadcrumb.as_ref()).ok()
         });
         let snapshot_view = snapshot_registration.view()?;
-        let opened = RedbPersistence::open_hook_suppressed(|| {
-            let mut builder = redb_builder();
-            builder.set_cache_size(cache_bytes);
-            // A reader always reads at a registered root, so its handle never
-            // builds or loads allocator state. Where registration exists, the
-            // native open's clean-state verdict is asked for separately below.
-            if cfg!(unix) || snapshot_registration.registration.is_some() {
-                builder.open_read_only_external_with_backend(snapshot_view)
-            } else {
-                // A reader never allocates; a store whose writer died is
-                // refused here and left to the next writer.
-                builder.open_read_only_allocator_free_with_backend(snapshot_view)
-            }
+        #[cfg(test)]
+        let native_observation = direct_source_contract_rows::begin(1, &source_memory.memory);
+        let preparation = cache_reserve::direct_preparation(&source_memory.memory)
+            .map_err(LoadReadImageError::Memory)?;
+        let opened = redb::with_retained_cache_preparation_admission(preparation, || {
+            RedbPersistence::open_hook_suppressed(|| {
+                let mut builder = redb_builder();
+                builder.set_cache_size(cache_bytes);
+                // A reader always reads at a registered root, so its handle never
+                // builds or loads allocator state. Where registration exists, the
+                // native open's clean-state verdict is asked for separately below.
+                if cfg!(unix) || snapshot_registration.registration.is_some() {
+                    builder.open_read_only_external_with_backend(snapshot_view)
+                } else {
+                    // A reader never allocates; a store whose writer died is
+                    // refused here and left to the next writer.
+                    builder.open_read_only_allocator_free_with_backend(snapshot_view)
+                }
+            })
         });
+        #[cfg(test)]
+        drop(native_observation);
         let database = match opened {
             Ok(Ok(database)) => database,
             Ok(Err(error)) => return Err(read_database_open_error(error)),
@@ -12203,6 +12314,10 @@ impl ReadImageSource {
                 ));
             }
         };
+        // Carry the SAME source reservation into native cache occupancy owners.
+        // Detached pages/transactions may outlive this Rust database wrapper;
+        // their last physical free must precede the original reserve's refund.
+        drop(database.retain_cache_reserve(source_memory.clone().into_native_credit()));
         // A store whose writer died is read at the commit the next writer's
         // repair keeps, chosen at the same fixed cost as a healthy capture
         // below -- but only when that writer died on this boot, on this exact
@@ -12214,24 +12329,9 @@ impl ReadImageSource {
         if crashed_commit {
             snapshot_registration.crashed_store_is_readable(database_path)?;
         }
-        // The native index is separate from the retained page-cache reserve.
-        // Charge the actual opened handle and release it with the source.
-        let index_bytes = database.cache_index_bytes();
-        let total_source_bytes = source_memory
-            .bytes
-            .load(Ordering::SeqCst)
-            .checked_add(index_bytes)
-            .ok_or_else(|| {
-                LoadReadImageError::Memory(Error::Other(
-                    "read source memory charge overflow".into()))
-            })?;
-        source_memory
-            .memory
-            .reserve(index_bytes)
-            .map_err(LoadReadImageError::Memory)?;
-        source_memory
-            .bytes
-            .store(total_source_bytes, Ordering::SeqCst);
+        // Native preparation admitted each actual index/control Layout before
+        // allocation. Its genuine receipt now follows the native backings;
+        // the page-cache/source reserve above remains independent. No late debit.
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_persistence_read_only_open();
         #[cfg(any(test, feature = "test-seams"))]
@@ -12308,7 +12408,7 @@ impl ReadImageSource {
             // nothing, and creates nothing, which is what a direct read is
             // allowed to do.
             store_file_bytes,
-            source_memory: Some(Arc::new(source_memory)),
+            source_memory: Some(source_memory),
             #[cfg(any(test, feature = "test-seams"))]
             source_handles_dropped_for_test: false,
             #[cfg(any(test, feature = "test-seams"))]
@@ -12396,15 +12496,13 @@ impl ReadImageSource {
                 "content-identity verifier escaped the registered snapshot",
             ));
         }
-        let cache_memory = Arc::clone(
-            &self
+        let cache_memory = self
                 .source_memory
                 .as_ref()
                 .ok_or_else(|| {
                     invalid_read_image_state("reader source memory reservation disappeared")
                 })?
-                .memory,
-        );
+                .memory.clone();
         // The verifier's own walks admit what they allocate through the same
         // accountant this session already reserves its image memory from.
         let mut content_identity = content_identity::ContentIdentityReadVerifier::open(
@@ -12456,10 +12554,10 @@ impl ReadImageSource {
                 invalid_read_image_state("reader source memory reservation disappeared")
             })?
             .detach_control(
-                crate::memory_accounting::writer_adapter_type_layout::<RetainedReadSource>().size(),
+                RetainedReadSource::layout().size(),
             )
             .map_err(read_image_error)?;
-        let source = Arc::new(RetainedReadSource {
+        let source = RetainedReadSource::try_new_prepaid(RetainedReadSourceData {
             database_path: self.database_path.clone(),
             database,
             snapshot,
@@ -12470,7 +12568,7 @@ impl ReadImageSource {
             registration,
             content_identity,
             history_open_control,
-            read_memory: image.open_context.read_memory(),
+            read_memory: (image.open_context.read_memory()).into(),
             content_proof: Mutex::new(content_identity::ReadAuthenticationNodes::new(
                 RETAINED_CONTENT_PROOF_BYTES,
                 Some(cache_memory.accountant.clone()),
@@ -12478,11 +12576,10 @@ impl ReadImageSource {
             physical_rows: Mutex::new(None),
             image_config_cache: Mutex::new(HashMap::new()),
             verified_ordered_runs: VerifiedOrderedRunCache::new(cache_memory),
-            _source_memory: Arc::clone(self.source_memory.as_ref().ok_or_else(|| {
+            _source_memory: self.source_memory.as_ref().ok_or_else(|| {
                 invalid_read_image_state("reader source memory reservation disappeared")
-            })?),
-            _own_control: own_control,
-        });
+            })?.clone(),
+        }, own_control).map_err(LoadReadImageError::Memory)?;
         source
             .authenticate_open_config(&image.config_values)
             .map_err(read_image_error)?;
@@ -12588,7 +12685,7 @@ const STORAGE_IO_ERROR_PREFIX: &str = "contextdb-engine-storage-io:";
 
 fn read_image_error(error: Error) -> LoadReadImageError {
     if let Error::Other(message) = &error
-        && let Some(reason) = message.strip_prefix(STORAGE_IO_ERROR_PREFIX)
+        && let Some(reason) = message.as_text().and_then(|message| message.strip_prefix(STORAGE_IO_ERROR_PREFIX))
     {
         return read_image_io("reading Redb storage", reason);
     }
@@ -12719,6 +12816,31 @@ fn read_database_open_error(error: redb::DatabaseError) -> LoadReadImageError {
         // What the caller must do next depends entirely on which of these it
         // is: a store that is not there is a dead end, a store somebody else
         // holds means asking that holder instead.
+        redb::DatabaseError::Storage(redb::StorageError::Native(
+            redb::NativeColdReadError::AdmissionRefusedAt(owner),
+        )) => {
+            let refusal = owner.inspect_failure(|cause| {
+                match cause.and_then(|cause| cause.downcast_ref::<native_storage_admission::NativeStorageFailure>()) {
+                    Some(native_storage_admission::NativeStorageFailure::Refused(refusal)) => Some(*refusal),
+                    _ => None,
+                }
+            });
+            match refusal {
+                Some(refusal) => LoadReadImageError::Memory(
+                    native_storage_admission::original_storage_error(
+                        native_storage_admission::NativeStorageFailure::Refused(refusal))),
+                // Preserve the existing foreign/legacy diagnosis. This fallback
+                // keeps its inherited allocating rendering, without claiming
+                // that an opaque foreign cause has the closed source protocol.
+                None => read_image_corruption(ReadImageCorruptionCause::MalformedRecord,
+                    redb::DatabaseError::Storage(redb::StorageError::Native(
+                        redb::NativeColdReadError::AdmissionRefusedAt(owner)))),
+            }
+        },
+        redb::DatabaseError::Storage(redb::StorageError::Native(
+            redb::NativeColdReadError::AllocatorFailed { site, layout },
+        )) => LoadReadImageError::Memory(Error::NativeEngineOther(
+            contextdb_core::read_memory::NativeRefusal::AllocatorFailed { site, layout })),
         redb::DatabaseError::Storage(redb::StorageError::Io(error)) => match error.kind() {
             std::io::ErrorKind::NotFound => LoadReadImageError::StoreMissing {
                 reason: error.to_string(),
@@ -12963,23 +13085,22 @@ fn decode_read_vectors_with_bounds(
 fn decode_vector_partition_record_payload<T: serde::de::DeserializeOwned>(
     expected_kind: VectorPartitionRecordKind,
     encoded: &[u8],
-) -> std::result::Result<T, String> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()
-        .map_err(|error| format!("payload decode failed: {error}"))?;
-    let payload = vector_partition_record_payload(expected_kind, encoded)?;
-    RedbPersistence::decode_exact(payload)
-        .map_err(|error| format!("payload decode failed: {error}"))
+) -> Result<T> {
+    decode_vector_partition_record_payload_checked(expected_kind, encoded).map_err(|failure| match failure {
+        RecordDecodeFailure::Refusal(error) => error,
+        RecordDecodeFailure::Damage(reason) => Error::Other(reason),
+    })
 }
 
 /// Why a record payload did not decode: a memory refusal or cancellation is
 /// the caller's to report as itself; anything else is damage to the record.
 enum RecordDecodeFailure {
     Refusal(Error),
-    Damage(String),
+    Damage(contextdb_core::error::DiagnosticText),
 }
 
 impl RecordDecodeFailure {
-    fn into_error(self, damage: impl FnOnce(String) -> Error) -> Error {
+    fn into_error(self, damage: impl FnOnce(contextdb_core::error::DiagnosticText) -> Error) -> Error {
         match self {
             Self::Refusal(error) => error,
             Self::Damage(reason) => damage(reason),
@@ -12989,19 +13110,34 @@ impl RecordDecodeFailure {
 
 /// `decode_vector_partition_record_payload` for read paths that must never
 /// relabel a declared-budget refusal as a corrupt store.
+struct PayloadDecodeDiagnostic(Error);
+impl std::fmt::Display for PayloadDecodeDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "payload decode failed: {}", self.0)
+    }
+}
+
 fn decode_vector_partition_record_payload_checked<T: serde::de::DeserializeOwned>(
     expected_kind: VectorPartitionRecordKind,
     encoded: &[u8],
 ) -> std::result::Result<T, RecordDecodeFailure> {
-    let classify = |error: Error| {
+    // This decoder already requires the source's existing operation owner.
+    // Prepare the receiver before invoking any failing decode producer.
+    let owner = crate::read_image_memory::active_owner().map_err(RecordDecodeFailure::Refusal)?;
+    let budget = owner.diagnostic_budget().map_err(RecordDecodeFailure::Refusal)?;
+    let mut prepared = Some(contextdb_core::error::DiagnosticText::try_prepare_shared::<PayloadDecodeDiagnostic>(
+        budget, "diagnostic", "decode_payload", "Raise the declared memory limit to decode this record.")
+        .map_err(RecordDecodeFailure::Refusal)?);
+    let mut classify = |error: Error| {
         if preserves_typed_read_refusal(&error) {
             RecordDecodeFailure::Refusal(error)
         } else {
-            RecordDecodeFailure::Damage(format!("payload decode failed: {error}"))
+            RecordDecodeFailure::Damage(contextdb_core::error::DiagnosticText::from_shared(
+                prepared.take().expect("first decode failure owns its prepared receiver")
+                    .publish(PayloadDecodeDiagnostic(error))))
         }
     };
-    let _decode_scope =
-        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(classify)?;
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call().map_err(&mut classify)?;
     let payload = vector_partition_record_payload(expected_kind, encoded)
         .map_err(RecordDecodeFailure::Damage)?;
     RedbPersistence::decode_exact(payload).map_err(classify)
@@ -13010,11 +13146,11 @@ fn decode_vector_partition_record_payload_checked<T: serde::de::DeserializeOwned
 fn vector_partition_record_payload(
     expected_kind: VectorPartitionRecordKind,
     encoded: &[u8],
-) -> std::result::Result<&[u8], String> {
+) -> std::result::Result<&[u8], contextdb_core::error::DiagnosticText> {
     let header_len = VECTOR_PARTITION_RECORD_MAGIC.len() + 2 + 1 + 8;
     let minimum_len = header_len + 32;
     if encoded.len() < minimum_len {
-        return Err("record is truncated".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("record is truncated"));
     }
     let checksum_offset = encoded.len() - 32;
     let expected_checksum = {
@@ -13048,38 +13184,38 @@ fn vector_partition_record_payload(
         });
     }
     if expected_checksum.as_bytes()[..] != encoded[checksum_offset..] {
-        return Err("checksum mismatch".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("checksum mismatch"));
     }
     if &encoded[..VECTOR_PARTITION_RECORD_MAGIC.len()] != VECTOR_PARTITION_RECORD_MAGIC {
-        return Err("magic mismatch".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("magic mismatch"));
     }
     let mut cursor = VECTOR_PARTITION_RECORD_MAGIC.len();
     let version = u16::from_be_bytes(
         encoded[cursor..cursor + 2]
             .try_into()
-            .map_err(|_| "version is truncated".to_owned())?,
+            .map_err(|_| contextdb_core::error::DiagnosticText::from("version is truncated"))?,
     );
     cursor += 2;
     if version != VECTOR_PARTITION_RECORD_VERSION {
-        return Err(format!("unsupported record version {version}"));
+        return Err(contextdb_core::error::DiagnosticText::from_unsigned("unsupported record version ", u64::from(version), ""));
     }
     let kind = encoded[cursor];
     cursor += 1;
     if kind != expected_kind as u8 {
-        return Err("record kind mismatch".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("record kind mismatch"));
     }
     let payload_len = usize::try_from(u64::from_be_bytes(
         encoded[cursor..cursor + 8]
             .try_into()
-            .map_err(|_| "length is truncated".to_owned())?,
+            .map_err(|_| contextdb_core::error::DiagnosticText::from("length is truncated"))?,
     ))
-    .map_err(|_| "payload length does not fit usize".to_owned())?;
+    .map_err(|_| contextdb_core::error::DiagnosticText::from("payload length does not fit usize"))?;
     cursor += 8;
     let payload_end = cursor
         .checked_add(payload_len)
-        .ok_or_else(|| "payload length overflow".to_owned())?;
+        .ok_or_else(|| contextdb_core::error::DiagnosticText::from("payload length overflow"))?;
     if payload_end != checksum_offset {
-        return Err("payload length mismatch".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("payload length mismatch"));
     }
     Ok(&encoded[cursor..payload_end])
 }
@@ -13238,46 +13374,46 @@ fn decode_image_vector_entry(bytes: &[u8], dimension: usize) -> Result<Persisted
         .map_err(|_| vector_paged::corruption("fixed vector body cannot be decoded"))
 }
 
-fn inspect_vector_partition_metadata_route(payload: &[u8]) -> std::result::Result<usize, String> {
+fn inspect_vector_partition_metadata_route(payload: &[u8]) -> std::result::Result<usize, contextdb_core::error::DiagnosticText> {
     // Struct/tuple field boundaries have no framing in the existing bincode
     // format: index.table, index.column, then the partition's component Vec.
     type Route<'a> = (&'a str, &'a str, InspectedVectorPartitionComponents);
     bincode::serde::borrow_decode_from_slice::<Route<'_>, _>(payload, bincode::config::standard())
         .map(|(_, consumed)| consumed)
-        .map_err(|_| "metadata route is truncated or invalid".to_owned())
+        .map_err(|_| contextdb_core::error::DiagnosticText::from("metadata route is truncated or invalid"))
 }
 
 /// Inspect native route capacity using borrowed fields before its owning
 /// serde decoder or any route/key clones can allocate. Vec growth is admitted
 /// through the next power-of-two capacity, including short scalar components.
-fn vector_partition_route_native_capacity(payload: &[u8]) -> std::result::Result<usize, String> {
+fn vector_partition_route_native_capacity(payload: &[u8]) -> std::result::Result<usize, contextdb_core::error::DiagnosticText> {
     type Route<'a> = (&'a str, &'a str, InspectedVectorPartitionComponents);
     let ((table, column, components), _) =
         bincode::serde::borrow_decode_from_slice::<Route<'_>, _>(
             payload,
             bincode::config::standard(),
         )
-        .map_err(|_| "metadata route is truncated or invalid".to_owned())?;
+        .map_err(|_| contextdb_core::error::DiagnosticText::from("metadata route is truncated or invalid"))?;
     let capacity = if components.count == 0 {
         0
     } else {
         components
             .count
             .checked_next_power_of_two()
-            .ok_or_else(|| "partition native capacity overflow".to_owned())?
+            .ok_or_else(|| contextdb_core::error::DiagnosticText::from("partition native capacity overflow"))?
     };
     capacity
         .checked_mul(std::mem::size_of::<contextdb_core::VectorPartitionComponent>())
         .and_then(|n| n.checked_add(components.text_bytes))
         .and_then(|n| n.checked_add(table.len()))
         .and_then(|n| n.checked_add(column.len()))
-        .ok_or_else(|| "partition native route bytes overflow".to_owned())
+        .ok_or_else(|| contextdb_core::error::DiagnosticText::from("partition native route bytes overflow"))
 }
 
 fn prevalidate_vector_partition_metadata_routes(
     kind: VectorPartitionRecordKind,
     payload: &[u8],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), contextdb_core::error::DiagnosticText> {
     if !matches!(
         kind,
         VectorPartitionRecordKind::Membership
@@ -13336,17 +13472,17 @@ fn prevalidate_vector_partition_metadata_routes(
             )
             .map(|(_, consumed)| consumed)
         }
-        .map_err(|_| "generation graph payload is truncated or invalid".to_owned())?;
+        .map_err(|_| contextdb_core::error::DiagnosticText::from("generation graph payload is truncated or invalid"))?;
         if consumed != tail.len() {
-            return Err("generation graph payload has trailing bytes".to_owned());
+            return Err(contextdb_core::error::DiagnosticText::from("generation graph payload has trailing bytes"));
         }
     }
     if kind == VectorPartitionRecordKind::Journal {
         let ((_, _, variant), fixed_bytes): ((Lsn, u64, u32), usize) =
             bincode::serde::decode_from_slice(&payload[route_end..], bincode::config::standard())
-                .map_err(|_| "journal fixed prefix is truncated or invalid".to_owned())?;
+                .map_err(|_| contextdb_core::error::DiagnosticText::from("journal fixed prefix is truncated or invalid"))?;
         if variant > 1 {
-            return Err("journal change variant is invalid".to_owned());
+            return Err(contextdb_core::error::DiagnosticText::from("journal change variant is invalid"));
         }
         inspect_vector_partition_metadata_route(&payload[route_end + fixed_bytes..])?;
     }
@@ -13360,7 +13496,7 @@ fn vector_partition_expected_route_prefix(
     payload: &[u8],
     index: &VectorIndexRef,
     partition_key: &VectorPartitionKey,
-) -> std::result::Result<usize, String> {
+) -> std::result::Result<usize, contextdb_core::error::DiagnosticText> {
     struct CompareWriter<'a> {
         remaining: &'a [u8],
     }
@@ -13381,14 +13517,14 @@ fn vector_partition_expected_route_prefix(
         &mut CompareWriter { remaining: payload },
         bincode::config::standard(),
     )
-    .map_err(|_| "record route prefix does not match its expected partition".to_owned())
+    .map_err(|_| contextdb_core::error::DiagnosticText::from("record route prefix does not match its expected partition"))
 }
 
 fn validate_raw_vector_entry_encoded_width(
     bytes: &[u8],
     index: &VectorIndexRef,
     dimension: usize,
-    corruption: impl Fn(String) -> Error,
+    corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
 ) -> Result<()> {
     // Identical envelope bound for writable and retained raw-body readers.
     const FRAMING_BYTES: usize = 2 * 9 + 9 + 5 + 9 + 2 * 4 + 5 + 9 + 1 + 9 + 9;
@@ -13399,10 +13535,10 @@ fn validate_raw_vector_entry_encoded_width(
         .and_then(|bytes| bytes.checked_add(FRAMING_BYTES))
         .ok_or_else(|| corruption("raw-vector encoded width bound overflow".into()))?;
     if bytes.len() > bound {
-        return Err(corruption(format!(
+        return Err(crate::funded_error::map_diagnostic(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), format_args!(
             "raw-vector encoded body width {} exceeds declared route/dimension bound {bound}",
             bytes.len()
-        )));
+        ), &corruption));
     }
     Ok(())
 }
@@ -13413,7 +13549,7 @@ fn decode_retained_raw_vector_entry(
     bytes: &[u8],
     membership: &VectorPartitionMembershipRecord,
     expected_dimension: usize,
-    corruption: impl Fn(String) -> Error,
+    corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
 ) -> Result<VectorEntry> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     validate_raw_vector_entry_encoded_width(
@@ -13426,9 +13562,9 @@ fn decode_retained_raw_vector_entry(
         if preserves_typed_read_refusal(&error) {
             return error;
         }
-        corruption(format!(
+        crate::funded_error::map_diagnostic(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), format_args!(
             "a raw-vector directory body cannot be decoded: {error}"
-        ))
+        ), &corruption)
     })?;
     if persisted.index != membership.index
         || persisted.row_id != membership.row_id
@@ -13442,17 +13578,17 @@ fn decode_retained_raw_vector_entry(
     let decoded_bytes = persisted.vector.decoded_bytes();
     let decoded_dimension = decoded_bytes / std::mem::size_of::<f32>();
     if decoded_dimension != expected_dimension {
-        return Err(corruption(format!(
+        return Err(crate::funded_error::map_diagnostic(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), format_args!(
             "raw-vector body dimension {decoded_dimension} does not match declared dimension {expected_dimension}"
-        )));
+        ), &corruption));
     }
     crate::read_image_memory::reserve(decoded_bytes).map_err(|error| {
         if preserves_typed_read_refusal(&error) {
             return error;
         }
-        corruption(format!(
+        crate::funded_error::map_diagnostic(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), format_args!(
             "a raw-vector directory body cannot be decoded: {error}"
-        ))
+        ), &corruption)
     })?;
     Ok(VectorEntry {
         index: persisted.index,
@@ -13471,7 +13607,7 @@ fn stream_raw_partition_memberships<T>(
     partition: &VectorPartitionRef,
     prepare: impl FnOnce(usize) -> Result<T>,
     mut visit: impl FnMut(&mut T, VectorPartitionMembershipRecord) -> Result<()>,
-    corruption: impl Fn(String) -> Error,
+    corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
 ) -> Result<T> {
     vector_membership_source::operation_checkpoint()?;
     let prefix =
@@ -13530,7 +13666,7 @@ fn stream_raw_partition_memberships<T>(
                     if preserves_typed_read_refusal(&error) {
                         error
                     } else {
-                        corruption(format!("raw membership payload decode failed: {error}"))
+                        crate::funded_error::map_diagnostic(window.diagnostic_budget(), format_args!("raw membership payload decode failed: {error}"), &corruption)
                     }
                 })?;
             if RedbPersistence::vector_partition_membership_key(&membership).as_slice()
@@ -13553,7 +13689,7 @@ fn vector_partition_expected_metadata_payload<'a>(
     encoded: &'a [u8],
     index: &VectorIndexRef,
     partition_key: &VectorPartitionKey,
-) -> std::result::Result<&'a [u8], String> {
+) -> std::result::Result<&'a [u8], contextdb_core::error::DiagnosticText> {
     let payload = vector_partition_record_payload(kind, encoded)?;
     let route_end = vector_partition_expected_route_prefix(payload, index, partition_key)?;
     if kind == VectorPartitionRecordKind::Journal {
@@ -13561,9 +13697,9 @@ fn vector_partition_expected_metadata_payload<'a>(
         // These fixed scalar fields are decoded by bincode without heap owners.
         let ((_, _, variant), fixed_bytes): ((Lsn, u64, u32), usize) =
             bincode::serde::decode_from_slice(&payload[route_end..], bincode::config::standard())
-                .map_err(|_| "journal fixed prefix is truncated or invalid".to_owned())?;
+                .map_err(|_| contextdb_core::error::DiagnosticText::from("journal fixed prefix is truncated or invalid"))?;
         if variant > 1 {
-            return Err("journal change variant is invalid".to_owned());
+            return Err(contextdb_core::error::DiagnosticText::from("journal change variant is invalid"));
         }
         vector_partition_expected_route_prefix(
             &payload[route_end + fixed_bytes..],
@@ -13642,33 +13778,33 @@ fn validate_vector_partition_journal_record(
     index: &VectorIndexRef,
     partition_key: &VectorPartitionKey,
     width_bound: usize,
-) -> std::result::Result<u64, String> {
+) -> std::result::Result<u64, contextdb_core::error::DiagnosticText> {
     if encoded.len() > width_bound {
-        return Err("journal record is wider than its route allows".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("journal record is wider than its route allows"));
     }
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Journal, encoded)?;
     let config = bincode::config::standard();
     let mut at = vector_partition_expected_route_prefix(payload, index, partition_key)?;
     let ((lsn, ordinal, variant), used): ((Lsn, u64, u32), usize) =
         bincode::serde::decode_from_slice(&payload[at..], config)
-            .map_err(|_| "journal fixed prefix is truncated or invalid".to_owned())?;
+            .map_err(|_| contextdb_core::error::DiagnosticText::from("journal fixed prefix is truncated or invalid"))?;
     at += used;
     if variant > 1 {
-        return Err("journal change variant is invalid".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("journal change variant is invalid"));
     }
     at += vector_partition_expected_route_prefix(&payload[at..], index, partition_key)?;
     let (_, used): ((RowId, TxId, Lsn, TxId, Lsn, TxId, Option<TxId>), usize) =
         bincode::serde::decode_from_slice(&payload[at..], config)
-            .map_err(|_| "journal membership is truncated or invalid".to_owned())?;
+            .map_err(|_| contextdb_core::error::DiagnosticText::from("journal membership is truncated or invalid"))?;
     at += used;
     if variant == 1 {
         let (_, used): ((TxId, Lsn, VectorPartitionTombstoneCause), usize) =
             bincode::serde::decode_from_slice(&payload[at..], config)
-                .map_err(|_| "journal tombstone is truncated or invalid".to_owned())?;
+                .map_err(|_| contextdb_core::error::DiagnosticText::from("journal tombstone is truncated or invalid"))?;
         at += used;
     }
     if at != payload.len() {
-        return Err("journal record has trailing bytes".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("journal record has trailing bytes"));
     }
     let lsn_end = prefix.len().saturating_add(8);
     let ordinal_end = lsn_end.saturating_add(8);
@@ -13677,7 +13813,7 @@ fn validate_vector_partition_journal_record(
         || key.get(prefix.len()..lsn_end) != Some(lsn.0.to_be_bytes().as_slice())
         || key.get(lsn_end..ordinal_end) != Some(ordinal.to_be_bytes().as_slice())
     {
-        return Err("journal truncation encountered a mismatched route or physical key".to_owned());
+        return Err(contextdb_core::error::DiagnosticText::from("journal truncation encountered a mismatched route or physical key"));
     }
     Ok(lsn.0)
 }
@@ -13808,7 +13944,7 @@ struct ReadRawVectorDirectory {
 /// bodies and journal pages deliberately remain untouched during hydration.
 fn decode_read_vector_generation_catalog(
     read_txn: &redb::ReadTransaction,
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> std::result::Result<
     (
         LoadedVectorPartitionGenerationCatalog,
@@ -13890,7 +14026,7 @@ fn decode_read_vector_generation_catalog(
     // key, decoded identity and map slot are admitted before allocation; the
     // map lives only for this decode, so the charge returns when it ends.
     struct RouteMapCharge {
-        owner: Arc<crate::read_image_memory::ImageMemory>,
+        owner: crate::read_image_memory::ImageMemoryHandle,
         bytes: usize,
     }
     impl Drop for RouteMapCharge {
@@ -14032,7 +14168,7 @@ fn decode_read_vector_generation_catalog(
                                 VectorPartitionRecordKind::Membership,
                                 value.value(),
                             )
-                            .map_err(|error| Error::Other(error.into()))?;
+                            ?;
                         if member.index == identity.index
                             && member.row_id == identity.row_id
                             && member.vector_created_tx == identity.created_tx
@@ -14833,7 +14969,7 @@ struct AuthenticatedHistoryFrontiers {
 fn read_authenticated_history_frontiers(
     read_txn: &redb::ReadTransaction,
     _path: &Path,
-    _memory: &Arc<crate::read_image_memory::ImageMemory>,
+    _memory: &crate::read_image_memory::ImageMemoryHandle,
     context: &contextdb_tx::ReadCommitContext<'_>,
 ) -> std::result::Result<AuthenticatedHistoryFrontiers, LoadReadImageError> {
     read_authenticated_history_frontiers_with_bounds(read_txn, context, None)
@@ -15415,7 +15551,7 @@ fn compatibility_read_vector_projection(
 fn decode_complete_read_image(
     read_txn: &redb::ReadTransaction,
     _path: &Path,
-    memory: Arc<crate::read_image_memory::ImageMemory>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
     open_context: crate::executor::bounded::ReadOpenContext,
 ) -> std::result::Result<ReadPersistenceImage, LoadReadImageError> {
     let _decode_scope =
@@ -16177,14 +16313,8 @@ fn companion_writer_record(
 fn companion_exists(path: &Path) -> Result<bool> {
     let companion = companion_path(path);
     match std::fs::symlink_metadata(&companion) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::StoreCorrupted {
-            path: companion.display().to_string(),
-            reason: "companion path is a symbolic link".to_owned(),
-        }),
-        Ok(metadata) if !metadata.file_type().is_file() => Err(Error::StoreCorrupted {
-            path: companion.display().to_string(),
-            reason: "companion path is not a regular file".to_owned(),
-        }),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(crate::funded_error::corruption_text(writer_open_diagnostic_budget(), companion.display(), "companion path is a symbolic link".into())),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(crate::funded_error::corruption_text(writer_open_diagnostic_budget(), companion.display(), "companion path is not a regular file".into())),
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(RedbPersistence::storage_error(error)),
@@ -16260,15 +16390,12 @@ fn validate_companion_metadata(
     {
         // Name the permission, because a mode is the one thing on this list an
         // operator can put right, and "corrupt" sends them to a backup instead.
-        return Err(Error::StoreCorrupted {
-            path: path.display().to_string(),
-            reason: format!(
+        return Err(crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                 "companion must remain one current-user-owned regular inode with mode {} across \
                  lock acquisition; this one is mode {:04o}",
                 intent.required_mode(),
                 path_metadata.mode() & 0o7777,
-            ),
-        });
+            )));
     }
     Ok(())
 }
@@ -16287,10 +16414,7 @@ fn validate_companion_metadata(
         || path_metadata.file_type().is_symlink()
         || !path_metadata.file_type().is_file()
     {
-        return Err(Error::StoreCorrupted {
-            path: path.display().to_string(),
-            reason: "companion must be a direct regular file".to_owned(),
-        });
+        return Err(crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), "companion must be a direct regular file"));
     }
     Ok(())
 }
@@ -16522,10 +16646,7 @@ fn remove_abandoned_replacement_target(path: &Path, fingerprint: &[u8; 32]) -> R
         }
         drop(candidate);
         if !unlink_verified_entry(&directory, &name, identity)? {
-            return Err(Error::StoreCorrupted {
-                path: directory_path.join(&name).display().to_string(),
-                reason: "the recorded replacement target could not be re-proven at its own name, so it was left in place".to_owned(),
-            });
+            return Err(crate::funded_error::corruption_text(writer_open_diagnostic_budget(), directory_path.join(&name).display(), "the recorded replacement target could not be re-proven at its own name, so it was left in place".into()));
         }
         let sidecar = contextdb_core::store_companion_path(&name);
         if let Ok(companion) = open_directory_entry(&directory, &sidecar)
@@ -16836,10 +16957,7 @@ impl CompanionGuard {
             },
             Err(error) => {
                 unlock_file(&file);
-                return Err(Error::StoreCorrupted {
-                    path: companion_path.display().to_string(),
-                    reason: format!("companion cannot be recovered: {error}"),
-                });
+                return Err(crate::funded_error::corruption_display(writer_open_diagnostic_budget(), companion_path.display(), format_args!("companion cannot be recovered: {error}")));
             }
         };
         let pending_matches_store = companion
@@ -16890,10 +17008,7 @@ impl CompanionGuard {
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, CompanionGuardState>> {
-        self.state.lock().map_err(|_| Error::StoreCorrupted {
-            path: self.path.display().to_string(),
-            reason: "companion guard state was poisoned by an interrupted operation".to_owned(),
-        })
+        self.state.lock().map_err(|_| crate::funded_error::corruption_text(writer_open_diagnostic_budget(), self.path.display(), "companion guard state was poisoned by an interrupted operation".into()))
     }
 
     fn finish_pending_replacement(
@@ -16990,15 +17105,8 @@ impl CompanionGuard {
                 }
                 Ok(())
             }
-            Some(false) => Err(Error::StoreCorrupted {
-                path: path.display().to_string(),
-                reason: "pending replacement does not identify this store and no prior companion generation survives"
-                    .to_owned(),
-            }),
-            None => Err(Error::StoreCorrupted {
-                path: path.display().to_string(),
-                reason: "pending replacement could not be matched to the store".to_owned(),
-            }),
+            Some(false) => Err(crate::funded_error::corruption_text(writer_open_diagnostic_budget(), path.display(), "pending replacement does not identify this store and no prior companion generation survives".into())),
+            None => Err(crate::funded_error::corruption_text(writer_open_diagnostic_budget(), path.display(), "pending replacement could not be matched to the store".into())),
         }
     }
 
@@ -17129,10 +17237,7 @@ impl CompanionGuard {
         let active_slot = state
             .companion
             .active_slot
-            .ok_or_else(|| Error::StoreCorrupted {
-                path: companion_path(path).display().to_string(),
-                reason: "replacement requires a published prior companion generation".to_owned(),
-            })?;
+            .ok_or_else(|| crate::funded_error::corruption_text(writer_open_diagnostic_budget(), companion_path(path).display(), "replacement requires a published prior companion generation".into()))?;
         let pending_slot = 1 - active_slot;
         write_companion_pending_slot(&mut state.file, pending_slot, &pending)
             .map_err(RedbPersistence::storage_error)?;
@@ -17151,11 +17256,7 @@ impl CompanionGuard {
             .ok_or_else(|| Error::Other(("replacement was not prepared".to_owned()).into()))?;
         let fingerprint = store_file_fingerprint(path)?;
         if fingerprint != pending.store_fingerprint {
-            return Err(Error::StoreCorrupted {
-                path: path.display().to_string(),
-                reason: "replacement path does not match the checksummed pending database identity"
-                    .to_owned(),
-            });
+            return Err(crate::funded_error::corruption_text(writer_open_diagnostic_budget(), path.display(), "replacement path does not match the checksummed pending database identity".into()));
         }
         state.companion.pending_matches_store = Some(true);
         Self::finish_pending_replacement(&mut state)?;
@@ -17414,8 +17515,10 @@ pub mod read_persistence_test_scaffold {
     }
 
     pub(super) fn crashed_capture_memory_for_test(
-        reader: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> {
+        reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::read_memory::ReadMemoryOwner {
+        let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
+
         let allowance = CRASHED_CAPTURE_ALLOWANCE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -17426,7 +17529,7 @@ pub mod read_persistence_test_scaffold {
                     .inner
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reader);
-                allowance
+                allowance.into()
             }
             None => reader,
         }
@@ -17436,14 +17539,14 @@ pub mod read_persistence_test_scaffold {
     #[derive(Debug)]
     pub(super) struct CrashedCaptureAllowance {
         inner: std::sync::Mutex<
-            Option<std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+            Option<contextdb_core::read_memory::ReadMemoryOwner>,
         >,
         limit: usize,
         held: std::sync::atomic::AtomicUsize,
     }
 
     impl CrashedCaptureAllowance {
-        fn reader(&self) -> std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> {
+        fn reader(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
             self.inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -22289,7 +22392,7 @@ pub mod read_persistence_test_scaffold {
                             super::VectorPartitionRecordKind::Membership,
                             value.value(),
                         )
-                        .map_err(|error| contextdb_core::Error::Other(error.into()))?;
+                        ?;
                     if member.index == *index
                         && member.row_id == row_id
                         && member.visible_from.0 <= snapshot.0
@@ -22339,6 +22442,7 @@ const REDB_CACHE_BYTES: usize = 8 * 1024 * 1024;
 struct CacheInstallation {
     capacity: std::sync::atomic::AtomicUsize,
     reserve: std::sync::atomic::AtomicUsize,
+    owner: parking_lot::Mutex<Option<redb::CacheReserveOwner>>,
 }
 
 impl CacheInstallation {
@@ -22424,7 +22528,9 @@ pub fn redb_writer_cache_bytes_for_limit_for_test(limit: Option<usize>) -> usize
 pub fn read_source_cache_reservation_for_limit_for_test(limit: Option<usize>) -> (usize, usize) {
     (
         redb_cache_bytes_for_limit(limit),
-        64 * 1024 + content_identity::READ_VERIFIER_MEMORY_BYTES,
+        64 * 1024 + content_identity::READ_VERIFIER_MEMORY_BYTES
+            + std::mem::size_of::<Lsn>()
+            + std::mem::size_of::<content_identity::ValidatedHistoryOpenControl>(),
     )
 }
 
@@ -22936,6 +23042,15 @@ impl Drop for ProofAccountantSlot {
     }
 }
 
+struct DiagnosticIndexName<'a> { table: &'a str, index: &'a str }
+impl std::fmt::Display for DiagnosticIndexName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut hash = blake3::Hasher::new();
+        hash.update(self.table.as_bytes()); hash.update(&[0]); hash.update(self.index.as_bytes());
+        write!(f, "__rel_index_{}", hash.finalize().to_hex())
+    }
+}
+
 pub struct RedbPersistence {
     path: std::path::PathBuf,
     /// An explicit runtime-state root; `None` selects the platform default.
@@ -22956,18 +23071,17 @@ pub struct RedbPersistence {
 
     writer_snapshots: Arc<parking_lot::Mutex<Vec<WriterSnapshotWeak>>>,
     writer_schema: parking_lot::Mutex<Option<Arc<writer_source::WriterSchema>>>,
-    /// What the owning database charged its accountant for this store's Redb
-    /// page cache when it opened it, so the close that stops holding the
-    /// cache hands back exactly that.
+    /// Writer charge metadata for this store's fixed reserve. Physical cache
+    /// owners, rather than close's numeric release, own its actual receipt.
     cache_charge_bytes: std::sync::OnceLock<usize>,
     /// The native cache as installed: the capacity the builder and the
     /// startup settlement were given, and the whole reserve that capacity
     /// settled to. A handle recycle reinstalls the capacity, never the
     /// reserve, and refuses a reserve its funding does not cover.
     cache_installation: CacheInstallation,
-    /// The native cache's constant per-stripe controls, held as named open
-    /// residue (bytes, credit) for as long as the cache exists.
-    cache_stripe_residue: std::sync::OnceLock<(usize, crate::memory_accounting::ControlCredit)>,
+    /// Process-residue metadata. The genuine credit is retained by the same
+    /// shared physical cache parent as a declared writer's original invoice.
+    cache_stripe_residue: std::sync::OnceLock<usize>,
     /// Set the first time a table's meta decodes only via an older
     /// `TableMeta`/`ColumnDef` layout (see
     /// [`Self::decode_table_meta_versioned`]) rather than the current one.
@@ -23226,7 +23340,7 @@ fn borrow_vector_partition_base<'a>(
     index: &VectorIndexRef,
     partition_key: &VectorPartitionKey,
     generation_id: u64,
-    corruption: impl Fn(String) -> Error,
+    corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
 ) -> Result<BorrowedVectorPartitionBaseGenerationRecord<'a>> {
     let payload =
         vector_partition_record_payload(VectorPartitionRecordKind::BaseGeneration, encoded)
@@ -23234,7 +23348,9 @@ fn borrow_vector_partition_base<'a>(
     vector_partition_expected_route_prefix(payload, index, partition_key).map_err(|_| corruption("base generation identity, dimension, or inclusion boundary is invalid: generation route prefix does not match its physical partition".into()))?;
     let (record, consumed): (BorrowedVectorPartitionBaseGenerationRecord<'_>, usize) =
         bincode::serde::borrow_decode_from_slice(payload, bincode::config::standard())
-            .map_err(|error| corruption(format!("payload decode failed: {error}")))?;
+            .map_err(|error| crate::funded_error::map_diagnostic(
+                crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+                format_args!("payload decode failed: {error}"), &corruption))?;
     if consumed != payload.len() {
         return Err(corruption(
             "payload decode failed: bincode exact decode left trailing bytes".into(),
@@ -23261,7 +23377,7 @@ fn borrow_vector_partition_change<'a>(
     partition_key: &VectorPartitionKey,
     base: &BorrowedVectorPartitionBaseGenerationRecord<'_>,
     generation_id: u64,
-    corruption: impl Fn(String) -> Error,
+    corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
 ) -> Result<BorrowedVectorPartitionChangeGenerationRecord<'a>> {
     let payload =
         vector_partition_record_payload(VectorPartitionRecordKind::ChangeGeneration, encoded)
@@ -23269,7 +23385,9 @@ fn borrow_vector_partition_change<'a>(
     vector_partition_expected_route_prefix(payload, index, partition_key).map_err(|_| corruption("base generation identity, dimension, or inclusion boundary is invalid: generation route prefix does not match its physical partition".into()))?;
     let (record, consumed): (BorrowedVectorPartitionChangeGenerationRecord<'_>, usize) =
         bincode::serde::borrow_decode_from_slice(payload, bincode::config::standard())
-            .map_err(|error| corruption(format!("payload decode failed: {error}")))?;
+            .map_err(|error| crate::funded_error::map_diagnostic(
+                crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+                format_args!("payload decode failed: {error}"), &corruption))?;
     if consumed != payload.len() {
         return Err(corruption(
             "payload decode failed: bincode exact decode left trailing bytes".into(),
@@ -23305,10 +23423,10 @@ impl VectorPartitionGraphBytes {
         Self { bytes, checksum }
     }
 
-    fn verify(&self, corruption: impl FnOnce(String) -> Error) -> Result<()> {
+    fn verify(&self, corruption: impl FnOnce(contextdb_core::error::DiagnosticText) -> Error) -> Result<()> {
         if *blake3::hash(&self.bytes).as_bytes() != self.checksum {
             return Err(corruption(
-                "immutable graph byte checksum mismatch".to_owned(),
+                "immutable graph byte checksum mismatch".into(),
             ));
         }
         Ok(())
@@ -23422,7 +23540,7 @@ pub(crate) struct LoadedVectorPartitionGenerationCatalog {
 #[derive(Clone)]
 pub(crate) struct ReadOnlyVectorGenerationSource {
     read: Arc<redb::ReadTransaction>,
-    source: Arc<RetainedReadSource>,
+    source: RetainedReadSource,
     snapshot_lsn: Lsn,
 }
 
@@ -23452,7 +23570,7 @@ pub(crate) struct ReadOnlyVectorGenerationGraph<'a> {
 
 #[derive(Clone)]
 struct RetainedVectorGraphPageSource {
-    source: Arc<RetainedReadSource>,
+    source: RetainedReadSource,
     key: Arc<Vec<u8>>,
     is_base: bool,
     graph_offset: usize,
@@ -23483,6 +23601,7 @@ impl ReadOnlyVectorGraphPageSource for RetainedVectorGraphPageSource {
             graph_len: self.graph_len,
             paged: self.paged.as_ref().map(Arc::clone),
             database_path: self.source.database_path.clone(),
+            read_memory: self.source.read_memory.clone(),
         }))
     }
 
@@ -23510,6 +23629,7 @@ impl ReadOnlyVectorGraphPageSource for RetainedVectorGraphPageSource {
 }
 
 struct RetainedVectorGraphPageReader {
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     transaction: redb::ReadTransaction,
     key: Arc<Vec<u8>>,
     is_base: bool,
@@ -23564,11 +23684,7 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                 let value = table
                     .get(key.as_slice())
                     .map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::StoreCorrupted {
-                        path: self.database_path.display().to_string(),
-                        reason: "vector partition graph page manifest points to a missing page"
-                            .to_string(),
-                    })?;
+                    .ok_or_else(|| crate::funded_error::corruption_text(Ok(self.read_memory.clone()), self.database_path.display(), "vector partition graph page manifest points to a missing page".into()))?;
                 let stored = value.value();
                 let expected_len = paged.page_bytes.min(
                     self.graph_len
@@ -23578,10 +23694,7 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                     || stored.len()
                         != expected_len.saturating_add(VECTOR_PARTITION_GRAPH_PAGE_HEADER_BYTES)
                 {
-                    return Err(Error::StoreCorrupted {
-                        path: self.database_path.display().to_string(),
-                        reason: "vector partition graph physical page is corrupt".to_string(),
-                    });
+                    return Err(crate::funded_error::corruption_text(Ok(self.read_memory.clone()), self.database_path.display(), "vector partition graph physical page is corrupt".into()));
                 }
                 let stored_page = u32::from_le_bytes(
                     stored[..4]
@@ -23592,10 +23705,7 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                 let bytes = &stored[VECTOR_PARTITION_GRAPH_PAGE_HEADER_BYTES..];
                 if stored_page != page_number || blake3::hash(bytes).as_bytes() != expected_checksum
                 {
-                    return Err(Error::StoreCorrupted {
-                        path: self.database_path.display().to_string(),
-                        reason: "vector partition graph physical page is corrupt".to_string(),
-                    });
+                    return Err(crate::funded_error::corruption_text(Ok(self.read_memory.clone()), self.database_path.display(), "vector partition graph physical page is corrupt".into()));
                 }
                 physical_page_lookups = physical_page_lookups.saturating_add(1);
                 authenticated_body_bytes = authenticated_body_bytes.saturating_add(bytes.len());
@@ -23606,10 +23716,7 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                 encoded.extend_from_slice(&bytes[copy_start..copy_end]);
             }
             if encoded.len() != len {
-                return Err(Error::StoreCorrupted {
-                    path: self.database_path.display().to_string(),
-                    reason: "vector partition graph physical page range is incomplete".to_string(),
-                });
+                return Err(crate::funded_error::corruption_text(Ok(self.read_memory.clone()), self.database_path.display(), "vector partition graph physical page range is incomplete".into()));
             }
             #[cfg(any(test, feature = "test-seams"))]
             read_persistence_test_scaffold::note_retained_graph_page_read_for_test(
@@ -23661,10 +23768,10 @@ impl RetainedReadSource {
     /// pinned source, retained together with the source itself.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn captured_vector_serving_selection_in_read(
-        self: &Arc<Self>,
+        &self,
         read: Arc<redb::ReadTransaction>,
         writer: Option<WriterSnapshotHandle>,
-        retained: Option<Arc<RetainedReadSource>>,
+        retained: Option<RetainedReadSource>,
         partition: &VectorPartitionRef,
         generations: Option<(
             VectorPartitionGenerationDescriptor,
@@ -23677,7 +23784,7 @@ impl RetainedReadSource {
         if writer.is_some()
             || !retained
                 .as_ref()
-                .is_some_and(|retained| Arc::ptr_eq(retained, self))
+                .is_some_and(|retained| RetainedReadSource::ptr_eq(retained, self))
         {
             return Err(vector_membership_source::damage(
                 "committed-image vector serving escaped its retained source",
@@ -23686,7 +23793,7 @@ impl RetainedReadSource {
         crate::database::vector_captured_serving::captured_serving_selection(
             crate::database::vector_captured_serving::CapturedVectorRootLease::retained(
                 read,
-                Arc::clone(self),
+                self.clone(),
             )?,
             partition,
             generations,
@@ -23697,8 +23804,26 @@ impl RetainedReadSource {
     }
 }
 
+pub(crate) struct IndexValidationFailure<'a> {
+    declaration: &'a IndexDecl,
+    column: Option<(&'a str, &'static str)>,
+    parts: Option<usize>,
+    suffix: &'static str,
+}
+impl std::fmt::Display for IndexValidationFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "durable index {} posting ", self.declaration.name)?;
+        if let Some(parts) = self.parts {
+            write!(f, "has {parts} key parts where the declaration has {}", self.declaration.columns.len())
+        } else {
+            let (column, prefix) = self.column.expect("column validation detail");
+            write!(f, "{prefix}{column}{}", self.suffix)
+        }
+    }
+}
+
 impl ReadOnlyVectorGenerationSource {
-    pub(crate) fn new(source: Arc<RetainedReadSource>, snapshot_lsn: Lsn) -> Result<Self> {
+    pub(crate) fn new(source: RetainedReadSource, snapshot_lsn: Lsn) -> Result<Self> {
         let read = Arc::new(source.begin_read()?);
         Ok(Self {
             read,
@@ -23707,25 +23832,25 @@ impl ReadOnlyVectorGenerationSource {
         })
     }
 
-    fn corruption(&self, reason: impl Into<String>) -> Error {
-        Error::StoreCorrupted {
-            path: self.source.database_path.display().to_string(),
-            reason: format!(
-                "vector partition durability record is corrupt: {}",
-                reason.into()
-            ),
-        }
+    fn corruption(&self, reason: impl std::fmt::Display) -> Error {
+        crate::funded_error::corruption_display(Ok(self.source.read_memory.clone()), self.source.database_path.display(), format_args!(
+                "vector partition durability record is corrupt: {reason}"
+            ))
     }
 
     fn generation_table_error(&self, error: redb::TableError, message: &str) -> Error {
-        let reason = format!("{message}: {error}");
-        if let redb::TableError::Storage(error) = error {
-            let mapped = RedbPersistence::storage_error(error);
-            if matches!(mapped, Error::MemoryBudgetExceeded { .. }) {
-                return mapped;
-            }
+        let memory_refusal = match &error {
+            redb::TableError::Storage(redb::StorageError::AdmissionRefused(error)) =>
+                matches!(error.downcast_ref::<Error>(), Some(Error::MemoryBudgetExceeded { .. })),
+            redb::TableError::Storage(redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefusedAt(owner))) =>
+                owner.inspect_failure(|cause| cause.and_then(|cause| cause.downcast_ref::<native_storage_admission::NativeStorageFailure>())
+                    .is_some_and(|cause| matches!(cause, native_storage_admission::NativeStorageFailure::Refused(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded { .. })))),
+            _ => false,
+        };
+        if memory_refusal {
+            if let redb::TableError::Storage(storage) = error { return RedbPersistence::storage_error(storage); }
         }
-        self.corruption(reason)
+        self.corruption(format_args!("{message}: {error}"))
     }
 
     fn with_read<T>(&self, read: impl FnOnce(&redb::ReadTransaction) -> Result<T>) -> Result<T> {
@@ -23734,11 +23859,11 @@ impl ReadOnlyVectorGenerationSource {
 
     /// Paged generation readers of a committed image read its pinned root.
     pub(crate) fn paged_root_capture(&self) -> vector_paged::PagedRootCapture {
-        let source = Arc::clone(&self.source);
+        let source = self.source.clone();
         let read = Arc::clone(&self.read);
         Arc::new(move || {
             vector_paged::CapturedPagedRoot::from_image(
-                Arc::clone(&read), Arc::clone(&source),
+                Arc::clone(&read), source.clone(),
             )
         })
     }
@@ -23878,7 +24003,7 @@ impl ReadOnlyVectorGenerationSource {
                 .map_err(|reason| self.corruption(reason))?;
             let (record, consumed): (BorrowedVectorPartitionBaseGenerationRecord<'_>, usize) =
                 bincode::serde::borrow_decode_from_slice(payload, bincode::config::standard())
-                    .map_err(|error| self.corruption(format!("payload decode failed: {error}")))?;
+                    .map_err(|error| self.corruption(format_args!("payload decode failed: {error}")))?;
             if consumed != payload.len()
                 || record.index != *index
                 || record.partition_key != *partition_key
@@ -23904,7 +24029,7 @@ impl ReadOnlyVectorGenerationSource {
             let graph_offset = record.graph.bytes.as_ptr() as usize - encoded.as_ptr() as usize;
             let source: Arc<dyn ReadOnlyVectorGraphPageSource> =
                 Arc::new(RetainedVectorGraphPageSource {
-                    source: Arc::clone(&self.source),
+                    source: self.source.clone(),
                     key: Arc::new(key.clone()),
                     is_base: true,
                     graph_offset,
@@ -23978,7 +24103,7 @@ impl ReadOnlyVectorGenerationSource {
                 .map_err(|reason| self.corruption(reason))?;
             let (record, consumed): (BorrowedVectorPartitionChangeGenerationRecord<'_>, usize) =
                 bincode::serde::borrow_decode_from_slice(payload, bincode::config::standard())
-                    .map_err(|error| self.corruption(format!("payload decode failed: {error}")))?;
+                    .map_err(|error| self.corruption(format_args!("payload decode failed: {error}")))?;
             if consumed != payload.len()
                 || record.index != *index
                 || record.partition_key != *partition_key
@@ -24012,7 +24137,7 @@ impl ReadOnlyVectorGenerationSource {
             let graph_offset = record.graph.bytes.as_ptr() as usize - encoded.as_ptr() as usize;
             let source: Arc<dyn ReadOnlyVectorGraphPageSource> =
                 Arc::new(RetainedVectorGraphPageSource {
-                    source: Arc::clone(&self.source),
+                    source: self.source.clone(),
                     key: Arc::new(key.clone()),
                     is_base: false,
                     graph_offset,
@@ -24522,7 +24647,7 @@ pub(crate) struct FlushDataSnapshots<'a> {
 
 pub(crate) struct LocalErasurePersistence<'a> {
     pub(crate) projection: &'a AuthoritativePurgePersistenceProjection,
-    pub(crate) accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+    pub(crate) accountant: contextdb_vector::MemoryBudgetOwner,
     pub(crate) operation: &'static str,
 }
 
@@ -24563,7 +24688,7 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     pub(crate) replace_vectors: bool,
     /// Independent writer-owned scratch for the derived complete metadata image.
     /// Payload-copy charges have already transferred to their own destinations.
-    pub(crate) vector_image_memory: Arc<crate::read_image_memory::ImageMemory>,
+    pub(crate) vector_image_memory: crate::read_image_memory::ImageMemoryHandle,
     /// Transaction-local cancellation receipts, consumed only after durability.
     /// The pre2-sized debit is contained by ReceivedSchemaStage's existing
     /// final `_vector_copy_owner`: its counted writer adapter outlives these
@@ -25310,10 +25435,7 @@ impl RedbPersistence {
     fn lock_companion_slot(
         &self,
     ) -> Result<std::sync::RwLockWriteGuard<'_, Option<CompanionGuard>>> {
-        self.lock_file.write().map_err(|_| Error::StoreCorrupted {
-            path: self.path.display().to_string(),
-            reason: "in-process companion ownership state was poisoned".to_owned(),
-        })
+        self.lock_file.write().map_err(|_| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "in-process companion ownership state was poisoned".into()))
     }
 
     /// Publish this writer's REAL serving state beside the store, so a later
@@ -25870,7 +25992,7 @@ impl RedbPersistence {
             }
         };
         let created = Self::open_hook_suppressed(|| {
-            redb_builder().create_with_backend_and_external_snapshots(
+            redb_builder().create_with_native_backend_and_external_snapshots(
                 replacement_owner.view(),
                 replacement_owner.external_snapshot_provider(),
             )
@@ -25885,10 +26007,7 @@ impl RedbPersistence {
             Err(_) => {
                 drop(replacement_owner);
                 let _ = std::fs::remove_file(&temp_path);
-                return Err(Error::StoreCorrupted {
-                    path: temp_path.display().to_string(),
-                    reason: "replacement Redb creation panicked".to_owned(),
-                });
+                return Err(crate::funded_error::corruption_text(writer_open_diagnostic_budget(), temp_path.display(), "replacement Redb creation panicked".into()));
             }
         };
         if let Err(error) = Self::write_format_marker(
@@ -26076,20 +26195,17 @@ impl RedbPersistence {
         let owner = LockedWriterFile::lock(store_file, runtime_dir)
             .map_err(|error| Self::storage_open_error(path, error))?;
         let created = Self::open_hook_suppressed(|| {
-            redb_builder_with_cache(cache_bytes).create_with_backend_and_external_snapshots(
+            redb_builder_with_cache(cache_bytes).create_with_native_backend_and_external_snapshots(
                 owner.view(),
                 owner.external_snapshot_provider(),
             )
         });
         let create_result = match created {
             Ok(inner) => inner.map_err(|err| Self::storage_open_error(path, err)),
-            Err(_) => Err(Error::StoreCorrupted {
-                path: path.display().to_string(),
-                reason: format!(
+            Err(_) => Err(crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                     "metadata/format read panicked; store may be truncated or corrupt — {}",
                     Self::CORRUPT_STORE_NEXT_STEP
-                ),
-            }),
+                ))),
         };
         match create_result {
             Ok(db) => match Self::write_format_marker(
@@ -26258,6 +26374,41 @@ impl RedbPersistence {
     /// Settle the native capacity after the effective persisted limit is known,
     /// before writable startup publishes any source or reader root.
     pub(crate) fn settle_writer_cache_budget(&self, bytes: usize) -> Result<usize> {
+        if self.cache_installation.owner.lock().is_none() {
+            // Standalone persistence has no fixed original cache funder. Keep
+            // it honestly unqualified, without a transient counterfeit receipt.
+            return self.settle_writer_cache_budget_prepared(bytes);
+        }
+        let accountant = self.require_decode_accountant()?;
+        cache_reserve::with_preparation(&accountant, true, || self.settle_writer_cache_budget_prepared(bytes))
+    }
+
+    /// Initial settlement holds preparation's actual new-index/window invoice
+    /// until the fixed reserve has taken custody. It never refunds in the gap
+    /// between returning the new size and installing its genuine payer.
+    pub(crate) fn settle_and_retain_writer_cache_budget(
+        &self,
+        accountant: &crate::memory_accounting::AccountantHandle,
+        capacity: usize,
+    ) -> Result<()> {
+        cache_reserve::with_preparation(accountant, true, || {
+            struct StartupCleanup<'a> { persistence: &'a RedbPersistence, armed: bool }
+            impl Drop for StartupCleanup<'_> {
+                fn drop(&mut self) {
+                    if self.armed { self.persistence.close(); }
+                }
+            }
+            // A failed admission or unwind must physically free the prepared
+            // cache before the preparation scope can refund its original grant.
+            let mut cleanup = StartupCleanup { persistence: self, armed: true };
+            let reserve = self.settle_writer_cache_budget_prepared(capacity)?;
+            self.retain_writer_cache_charge(accountant, reserve, accountant.usage().limit.is_none())?;
+            cleanup.armed = false;
+            Ok(())
+        })
+    }
+
+    fn settle_writer_cache_budget_prepared(&self, bytes: usize) -> Result<usize> {
         let reserve = self.with_db(|db| {
             db.settle_startup_cache_budget(bytes)
                 .map_err(Self::storage_error)
@@ -26272,8 +26423,22 @@ impl RedbPersistence {
         self.with_db(|db| Ok(db.cache_index_bytes()))
     }
 
-    pub(crate) fn record_cache_charge(&self, bytes: usize) {
-        let _ = self.cache_charge_bytes.set(bytes);
+    /// Install one original invoice and share its actual occupancy controls with
+    /// every page and later handle generation. Metadata below is never a refund.
+    pub(crate) fn retain_writer_cache_charge(
+        &self,
+        accountant: &crate::memory_accounting::AccountantHandle,
+        bytes: usize,
+        process_residue: bool,
+    ) -> Result<()> {
+        let reserve = cache_reserve::original(accountant, bytes, process_residue)?;
+        let owner = self.with_db(|db| Ok(db.retain_cache_reserve(reserve)))?;
+        let mut installed = self.cache_installation.owner.lock();
+        assert!(installed.is_none(), "writer cache funding is installed once");
+        *installed = Some(owner);
+        let _ = self.cache_charge_bytes.set(if process_residue { 0 } else { bytes });
+        let _ = self.cache_stripe_residue.set(if process_residue { bytes } else { 0 });
+        Ok(())
     }
 
     /// The constant per-stripe lock controls inside the native cache index.
@@ -26281,19 +26446,8 @@ impl RedbPersistence {
         self.with_db(|db| Ok(db.cache_stripe_control_bytes()))
     }
 
-    /// Hold the cache's constant stripe controls as open residue.
-    pub(crate) fn hold_cache_stripe_residue(
-        &self,
-        bytes: usize,
-        credit: crate::memory_accounting::ControlCredit,
-    ) {
-        let _ = self.cache_stripe_residue.set((bytes, credit));
-    }
-
     pub(crate) fn cache_stripe_residue_bytes(&self) -> usize {
-        self.cache_stripe_residue
-            .get()
-            .map_or(0, |(bytes, _)| *bytes)
+        self.cache_stripe_residue.get().copied().unwrap_or(0)
     }
 
     /// The capacity a handle recycle reinstalls: exactly the capacity the
@@ -26327,7 +26481,7 @@ impl RedbPersistence {
         )
     }
 
-    /// What the close hands back for this store's page cache.
+    /// Writer cache charge metadata; physical owners alone release its invoice.
     pub(crate) fn cache_charge(&self) -> usize {
         self.cache_charge_bytes.get().copied().unwrap_or(0)
     }
@@ -26633,6 +26787,10 @@ impl RedbPersistence {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         drop(db.take());
+        // Physical aliases retain the counters and the genuine parent after
+        // close. Drop only persistence's preparation owner here.
+        let cache_owner = self.cache_installation.owner.lock().take();
+        drop(cache_owner);
         let owner = self
             .writer_file
             .write()
@@ -26831,13 +26989,10 @@ impl RedbPersistence {
     }
 
     fn classification_panicked(path: &Path) -> Error {
-        Error::StoreCorrupted {
-            path: path.display().to_string(),
-            reason: format!(
+        crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                 "metadata/format read panicked; store may be truncated or corrupt — {}",
                 Self::CORRUPT_STORE_NEXT_STEP
-            ),
-        }
+            ))
     }
 
     /// The verdict, read at one committed root: `true` when the durable
@@ -27103,7 +27258,7 @@ impl RedbPersistence {
         // on a file that does not exist would be worse than useless.
         if absent == AbsentStoreAnswer::Typed && open_found_no_store(&err) {
             return Error::StoreMissing {
-                path: path.display().to_string(),
+                path: path.display().to_string().into(),
             };
         }
         if open_was_refused_by_permissions(&err) {
@@ -27124,11 +27279,11 @@ impl RedbPersistence {
             return Self::storage_error(err);
         }
         Error::StoreCorrupted {
-            path: path.display().to_string(),
+            path: path.display().to_string().into(),
             reason: format!(
                 "metadata/format could not be read: {err} — {}",
                 Self::CORRUPT_STORE_NEXT_STEP
-            ),
+            ).into(),
         }
     }
 
@@ -27136,10 +27291,32 @@ impl RedbPersistence {
         Self::open_writer_file_in_runtime_dir(path, absent, None)
     }
 
+    #[cfg(unix)]
+    fn prepare_open_diagnostic(path: &Path) -> Result<wait_diagnostic::PreparedOpenDiagnostic> {
+        let context = current_writer_wait();
+        let original = match context.payer.as_ref() {
+            Some(original) => original.wait_memory_owner().map_err(|error|
+                native_storage_admission::original_storage_error(
+                    native_storage_admission::NativeStorageFailure::Refused(error)))?,
+            None => crate::read_image_memory::active_owner()?.diagnostic_budget()?,
+        };
+        wait_diagnostic::PreparedOpenDiagnostic::new(original, path)
+    }
+
     fn open_writer_file_in_runtime_dir(
         path: &Path,
         absent: AbsentStoreAnswer,
         runtime_dir: Option<&Path>,
+    ) -> Result<Arc<LockedWriterFile>> {
+        #[cfg(unix)]
+        let mut diagnostic = Some(Self::prepare_open_diagnostic(path)?);
+        Self::open_writer_file_prepared(path, absent, runtime_dir,
+            #[cfg(unix)] &mut diagnostic)
+    }
+
+    fn open_writer_file_prepared(
+        path: &Path, absent: AbsentStoreAnswer, runtime_dir: Option<&Path>,
+        #[cfg(unix)] diagnostic: &mut Option<wait_diagnostic::PreparedOpenDiagnostic>,
     ) -> Result<Arc<LockedWriterFile>> {
         let mut options = OpenOptions::new();
         options.read(true).write(true);
@@ -27149,9 +27326,14 @@ impl RedbPersistence {
             options.custom_flags(libc::O_CLOEXEC);
         }
         let file = options.open(path).map_err(|error| {
-            Self::refused_open_error_in_runtime_dir(path, error.into(), absent, runtime_dir)
+            #[cfg(unix)]
+            { diagnostic.take().expect("prepared descriptor diagnostic")
+                .into_database_error(error.into(), path, absent, runtime_dir) }
+            #[cfg(not(unix))]
+            { Self::refused_open_error_in_runtime_dir(path, error.into(), absent, runtime_dir) }
         })?;
-        let owner = Self::acquire_writer_file(path, file, absent, runtime_dir)?;
+        let owner = Self::acquire_writer_file(path, file, absent, runtime_dir,
+            #[cfg(unix)] diagnostic)?;
         // Exclusive ownership can be acquired only after every older direct
         // reader has either completed registration or abandoned admission.
         // Capture that stable pre-writer set before redb opens a view and can
@@ -27173,18 +27355,18 @@ impl RedbPersistence {
     /// Take the physical store for this writer on the descriptor it keeps,
     /// waiting once for readers already admitted, within the caller's bounds.
     fn acquire_writer_file(
-        path: &Path,
-        file: File,
-        absent: AbsentStoreAnswer,
-        runtime_dir: Option<&Path>,
+        path: &Path, file: File, absent: AbsentStoreAnswer, runtime_dir: Option<&Path>,
+        #[cfg(unix)] diagnostic: &mut Option<wait_diagnostic::PreparedOpenDiagnostic>,
     ) -> Result<Arc<LockedWriterFile>> {
         #[cfg(unix)]
         {
             use physical_admission::{WriterAcquireRefusal, WriterWait, acquire_for_writer};
-            let (stop, deadline) = current_writer_wait();
+            let context = current_writer_wait();
             let wait = WriterWait {
-                stop: stop.as_ref(),
-                deadline: deadline
+                payer: context.payer.as_ref(),
+                stop: context.stop.as_ref(),
+                deadline: context
+                    .deadline
                     .as_ref()
                     .map(|deadline| (Arc::clone(&deadline.clock), deadline.deadline_ms)),
             };
@@ -27194,7 +27376,10 @@ impl RedbPersistence {
             ))]
             let identity = {
                 use std::os::unix::fs::MetadataExt as _;
-                let metadata = file.metadata().map_err(Self::storage_error)?;
+                let metadata = match file.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => return Err(diagnostic.take().expect("prepared writer acquisition diagnostic").into_storage_error(physical_admission::WaitIo::Io(error))),
+                };
                 (metadata.dev(), metadata.ino())
             };
             #[cfg(all(
@@ -27203,12 +27388,13 @@ impl RedbPersistence {
             ))]
             if writer_wait_helper::still_quarantined(identity) {
                 return Err(Error::ReaderWaitQuarantined {
-                    path: path.display().to_string(),
+                    path: diagnostic.take().expect("prepared quarantined path").path,
                 });
             }
             match acquire_for_writer(&file, &wait, path) {
                 Ok(()) => {
-                    LockedWriterFile::from_locked(file, runtime_dir).map_err(Self::storage_error)
+                    LockedWriterFile::from_locked(file, runtime_dir).map_err(|error|
+                        diagnostic.take().expect("prepared writer acquisition diagnostic").into_storage_error(physical_admission::WaitIo::Io(error)))
                 }
                 Err(WriterAcquireRefusal::HeldByWriter) => {
                     Err(Self::held_by_writer_error_from_record(path))
@@ -27221,7 +27407,7 @@ impl RedbPersistence {
                     Err(Error::ReaderWaitUnsupported)
                 }
                 Err(WriterAcquireRefusal::HelperFailed(reason)) => {
-                    Err(Error::ReaderWaitHelperFailed(reason))
+                    Err(Error::ReaderWaitHelperFailed(reason.0))
                 }
                 #[cfg(all(
                     target_os = "linux",
@@ -27230,17 +27416,16 @@ impl RedbPersistence {
                 Err(WriterAcquireRefusal::Quarantined(helper)) => {
                     writer_wait_helper::enter_quarantine(identity, file, helper);
                     Err(Error::ReaderWaitQuarantined {
-                        path: path.display().to_string(),
+                        path: diagnostic.take().expect("prepared quarantined path").path,
                     })
                 }
 
+                Err(WriterAcquireRefusal::Memory(error)) => Err(error),
+                Err(WriterAcquireRefusal::NativeIo(error)) => {
+                    Err(diagnostic.take().expect("prepared writer acquisition diagnostic").into_error(error, path, absent, runtime_dir))
+                }
                 Err(WriterAcquireRefusal::Io(error)) => {
-                    Err(Self::refused_open_error_in_runtime_dir(
-                        path,
-                        redb::DatabaseError::Storage(redb::StorageError::Io(error)),
-                        absent,
-                        runtime_dir,
-                    ))
+                    Err(diagnostic.take().expect("prepared writer acquisition diagnostic").into_error(physical_admission::WaitIo::Io(error), path, absent, runtime_dir))
                 }
             }
         }
@@ -27256,13 +27441,13 @@ impl RedbPersistence {
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<OpenedWriterDatabase> {
-        let owner = Self::open_writer_file_in_runtime_dir(path, absent, runtime_dir)?;
-        let database = Self::open_writer_view_checked_in_runtime_dir(
-            path,
-            absent,
-            &owner,
-            cache_bytes,
-            runtime_dir,
+        #[cfg(unix)]
+        let mut diagnostic = Some(Self::prepare_open_diagnostic(path)?);
+        let owner = Self::open_writer_file_prepared(path, absent, runtime_dir,
+            #[cfg(unix)] &mut diagnostic)?;
+        let database = Self::open_writer_view_prepared(
+            path, absent, &owner, cache_bytes, runtime_dir,
+            #[cfg(unix)] &mut diagnostic,
         )?;
         Ok(OpenedWriterDatabase { database, owner })
     }
@@ -27283,26 +27468,42 @@ impl RedbPersistence {
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<redb::Database> {
+        #[cfg(unix)]
+        let mut diagnostic = Some(Self::prepare_open_diagnostic(path)?);
+        Self::open_writer_view_prepared(path, absent, owner, cache_bytes, runtime_dir,
+            #[cfg(unix)] &mut diagnostic)
+    }
+
+    fn open_writer_view_prepared(
+        path: &Path, absent: AbsentStoreAnswer, owner: &Arc<LockedWriterFile>,
+        cache_bytes: usize, runtime_dir: Option<&Path>,
+        #[cfg(unix)] diagnostic: &mut Option<wait_diagnostic::PreparedOpenDiagnostic>,
+    ) -> Result<redb::Database> {
         let provider = owner.external_snapshot_provider();
         let opened = Self::open_hook_suppressed(|| {
             redb_builder_with_cache(cache_bytes)
-                .open_with_backend_and_external_snapshots(owner.view(), provider)
+                .open_with_native_backend_and_external_snapshots(owner.view(), provider)
         });
         match opened {
             Ok(Ok(db)) => Ok(db),
-            Ok(Err(err)) => Err(Self::refused_open_error_in_runtime_dir(
-                path,
-                err,
-                absent,
-                runtime_dir,
-            )),
-            Err(_) => Err(Error::StoreCorrupted {
-                path: path.display().to_string(),
-                reason: format!(
-                    "metadata/format read panicked; store may be truncated or corrupt — {}",
-                    Self::CORRUPT_STORE_NEXT_STEP
-                ),
-            }),
+            Ok(Err(err)) => {
+                #[cfg(unix)]
+                { Err(diagnostic.take().expect("prepared backend open diagnostic")
+                    .into_database_error(err, path, absent, runtime_dir)) }
+                #[cfg(not(unix))]
+                { Err(Self::refused_open_error_in_runtime_dir(path, err, absent, runtime_dir)) }
+            }
+            Err(_) => {
+                #[cfg(unix)]
+                { Err(diagnostic.take().expect("prepared backend panic diagnostic").into_panic_error()) }
+                #[cfg(not(unix))]
+                { Err(Error::StoreCorrupted {
+                    path: path.display().to_string().into(),
+                    reason: format!(
+                        "metadata/format read panicked; store may be truncated or corrupt — {}",
+                        Self::CORRUPT_STORE_NEXT_STEP).into(),
+                }) }
+            }
         }
     }
 
@@ -27392,13 +27593,10 @@ impl RedbPersistence {
     }
 
     fn validate_format_marker(db: &redb::Database, path: &Path) -> Result<()> {
-        let read_txn = db.begin_read().map_err(|err| Error::StoreCorrupted {
-            path: path.display().to_string(),
-            reason: format!(
+        let read_txn = db.begin_read().map_err(|err| crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                 "metadata read failed: {err} — {}",
                 Self::CORRUPT_STORE_NEXT_STEP
-            ),
-        })?;
+            )))?;
         let table = match read_txn.open_table(FORMAT_METADATA_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -27408,38 +27606,26 @@ impl RedbPersistence {
                 });
             }
             Err(err) => {
-                return Err(Error::StoreCorrupted {
-                    path: path.display().to_string(),
-                    reason: format!(
+                return Err(crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                         "metadata table could not be read: {err} — {}",
                         Self::CORRUPT_STORE_NEXT_STEP
-                    ),
-                });
+                    )));
             }
         };
         let value = table
             .get(FORMAT_VERSION_KEY)
-            .map_err(|err| Error::StoreCorrupted {
-                path: path.display().to_string(),
-                reason: format!(
+            .map_err(|err| crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                     "metadata format_version could not be read: {err} — {}",
                     Self::CORRUPT_STORE_NEXT_STEP
-                ),
-            })?
-            .ok_or_else(|| Error::StoreCorrupted {
-                path: path.display().to_string(),
-                reason: format!(
+                )))?
+            .ok_or_else(|| crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                     "metadata table is missing format_version — {}",
                     Self::CORRUPT_STORE_NEXT_STEP
-                ),
-            })?;
-        let marker: String = Self::decode(value.value()).map_err(|err| Error::StoreCorrupted {
-            path: path.display().to_string(),
-            reason: format!(
+                )))?;
+        let marker: String = Self::decode(value.value()).map_err(|err| crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!(
                 "metadata format_version is corrupt: {err} — {}",
                 Self::CORRUPT_STORE_NEXT_STEP
-            ),
-        })?;
+            )))?;
         if marker == CURRENT_FORMAT_VERSION {
             for definition in [
                 GRAPH_FWD_TABLE,
@@ -27450,10 +27636,7 @@ impl RedbPersistence {
             ] {
                 read_txn
                     .open_table(definition)
-                    .map_err(|error| Error::StoreCorrupted {
-                        path: path.display().to_string(),
-                        reason: format!("required graph proof table is unavailable: {error}"),
-                    })?;
+                    .map_err(|error| crate::funded_error::corruption_display(writer_open_diagnostic_budget(), path.display(), format_args!("required graph proof table is unavailable: {error}")))?;
             }
             Self::check_history_witness_schema(&read_txn)
         } else {
@@ -28455,13 +28638,9 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
 
             // Retain only this write set's actually tombstoned predecessors,
             // independently of older imported tombstones or retired receipts.
-            let selected_deletion_memory = match self.proof_accountant() {
-                Some(accountant) => crate::read_image_memory::ImageMemory::charging_for(
-                    accountant, "writer_source", "graph_selected_deletions",
-                    "Raise MEMORY_LIMIT to retain this commit's selected graph versions.",
-                ),
-                None => crate::read_image_memory::ImageMemory::new(None),
-            };
+            let selected_deletion_memory = crate::read_image_memory::ImageMemory::funded_for_original(
+                self.require_decode_original()?, "writer_source", "graph_selected_deletions",
+                "Raise MEMORY_LIMIT to retain this commit's selected graph versions.")?;
             type SelectedDeletion = Option<(Vec<u8>, TxId, (Lsn, TxId))>;
             selected_deletion_memory.reserve(
                 ws.adj_deletes.len().saturating_mul(std::mem::size_of::<SelectedDeletion>()),
@@ -28532,10 +28711,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                         let Some((key, mut edge)) = next else { break; };
                         if edge.source != *source || edge.target != *target
                             || edge.edge_type != *edge_type {
-                            return Err(Error::StoreCorrupted {
-                                path: self.path.display().to_string(),
-                                reason: "graph posting is outside its edge identity".into(),
-                            });
+                            return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "graph posting is outside its edge identity".into()));
                         }
                         if edge.deleted_tx.is_none() {
                             found = true;
@@ -28544,10 +28720,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                             if selected.as_ref().is_none_or(|(_, _, prior)| order > *prior) {
                                 if let Some((p, d, prior)) = selected {
                                     if p.len() != key.len() {
-                                        return Err(Error::StoreCorrupted {
-                                            path: self.path.display().to_string(),
-                                            reason: "selected graph predecessor width changed".into(),
-                                        });
+                                        return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "selected graph predecessor width changed".into()));
                                     }
                                     p.copy_from_slice(&key);
                                     *d = *deleted_tx;
@@ -28815,15 +28988,9 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     if let ChangeLogEntry::EdgeDelete { source, target, edge_type, .. } = entry {
                         let selected_index = ws.adj_deletes.iter().position(|(s, k, t, _)|
                             s == source && t == target && k == edge_type
-                        ).ok_or_else(|| Error::StoreCorrupted {
-                            path: self.path.display().to_string(),
-                            reason: "ordinary graph deletion has no selected write-set predecessor".into(),
-                        })?;
+                        ).ok_or_else(|| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "ordinary graph deletion has no selected write-set predecessor".into()))?;
                         let (p, d, _) = selected_deletions[selected_index].as_ref()
-                            .ok_or_else(|| Error::StoreCorrupted {
-                                path: self.path.display().to_string(),
-                                reason: "ordinary graph deletion selected predecessor is missing".into(),
-                            })?;
+                            .ok_or_else(|| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "ordinary graph deletion selected predecessor is missing".into()))?;
                         self.encode_change_log_with_selected_predecessor_in_write(
                             &write_txn, entry, Some((p.as_slice(), *d)), &mut encoded,
                         )?;
@@ -30933,10 +31100,64 @@ graph_commit_result }.map_err(Self::storage_error)?;
         lsn: Lsn,
         ddl: &DdlChange,
     ) -> Result<()> {
+        self.publish_table_metadata_and_ddl(
+            name,
+            meta,
+            config_values,
+            lsn,
+            std::slice::from_ref(ddl),
+            true,
+            None,
+            || {},
+        )
+    }
+
+    /// The caller has proved that only EF_SEARCH differs. Existing rows,
+    /// postings, counts, vector bodies and authored history remain valid.
+    pub(crate) fn publish_ef_search_metadata_and_ddl(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        after_commit: impl FnOnce(),
+    ) -> Result<()> {
+        let scope = native_storage_admission::StorageAdmissionScope::writer_original(original)?;
+        scope.run_original_unqualified(|| {
+            self.publish_table_metadata_and_ddl(
+                name,
+                meta,
+                config_values,
+                lsn,
+                ddl,
+                false,
+                Some(original),
+                after_commit,
+            )
+        })
+    }
+
+    fn publish_table_metadata_and_ddl(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        rebuild_indexes: bool,
+        original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
+        after_commit: impl FnOnce(),
+    ) -> Result<()> {
         let _decode_scope = self.writer_decode_scope()?;
         self.prepare_proof_owner()?;
-        let schema =
-            self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
+        let mut schema = match original {
+            Some(original) => self.prepare_writer_policy_schema_change(original, name, meta)?,
+            None => self
+                .prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?,
+        };
+        let mut after_commit = Some(after_commit);
         self.with_db(|db| {
             let write_txn = Self::begin_history_write(db)?;
             #[cfg(any(test, feature = "test-seams"))]
@@ -30948,12 +31169,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
                 let key = Self::meta_key(name);
-                let encoded_schema = self.schema_update_in_table(
-                    &meta_table,
-                    name,
-                    meta,
-                    std::slice::from_ref(ddl),
-                )?;
+                let encoded_schema = self.schema_update_in_table(&meta_table, name, meta, ddl)?;
                 let encoded = &encoded_schema.bytes;
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
@@ -30965,15 +31181,17 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     self.proof_accountant(),
                 )?;
             }
-            Self::rebuild_relational_indexes_in_write(
-                &write_txn,
-                &self.path,
-                name,
-                meta,
-                None,
-                &mut self.proof_admission(),
-                None,
-            )?;
+            if rebuild_indexes {
+                Self::rebuild_relational_indexes_in_write(
+                    &write_txn,
+                    &self.path,
+                    name,
+                    meta,
+                    None,
+                    &mut self.proof_admission(),
+                    None,
+                )?;
+            }
             {
                 let mut config_table = write_txn
                     .open_table(CONFIG_TABLE)
@@ -30992,19 +31210,25 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 let mut ddl_table = write_txn
                     .open_table(DDL_LOG_TABLE)
                     .map_err(Self::storage_error)?;
-                let key = Self::ddl_log_key(lsn);
-                self.append_ddl_summary_in_write(&write_txn, &key, ddl)?;
-                let encoded = Self::encode(ddl)?;
-                ddl_table
-                    .insert(key.as_str(), encoded.as_slice())
-                    .map_err(Self::storage_error)?;
-                identity_mutations.push(content_identity::encoded_history_mutation(&key, ddl)?);
+                for (ordinal, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, ordinal, ddl.len());
+                    self.append_ddl_summary_in_write(&write_txn, &key, change)?;
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations
+                        .push(content_identity::encoded_history_mutation(&key, change)?);
+                }
             }
             Self::apply_content_identity_mutations_in_write(
                 &write_txn,
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            if !rebuild_indexes {
+                Self::raise_table_read_lsn_in_write(&write_txn, name, lsn)?;
+            }
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
                 TxId(0),
@@ -31016,6 +31240,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
                 let graph_commit_result = write_txn.commit();
+                if !rebuild_indexes && graph_commit_result.is_ok() {
+                    self.complete_writer_schema_change(schema.take());
+                    after_commit.take().expect("prepared metadata publication")();
+                }
                 #[cfg(any(test, feature = "test-seams"))]
                 if graph_commit_result.is_ok() {
                     graph_publication_attempt.committed();
@@ -31024,7 +31252,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 graph_commit_result
             }
             .map_err(Self::storage_error)?;
-            self.complete_writer_schema_change(schema);
+            if rebuild_indexes {
+                self.complete_writer_schema_change(schema);
+                after_commit.take().expect("prepared metadata publication")();
+            }
             Ok(())
         })
     }
@@ -32353,7 +32584,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         after: Option<(u64, &str)>,
         accountant: crate::memory_accounting::AccountantHandle,
         source_lsn: F,
-    ) -> Result<Option<(String, T, Arc<crate::read_image_memory::ImageMemory>)>>
+    ) -> Result<Option<(String, T, crate::read_image_memory::ImageMemoryHandle)>>
     where
         T: serde::de::DeserializeOwned,
         F: Fn(&T) -> Option<u64>,
@@ -32365,7 +32596,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
                 Err(error) => return Err(Self::storage_error(error)),
             };
-            let mut candidate: Option<(String, T, Arc<crate::read_image_memory::ImageMemory>)> =
+            let mut candidate: Option<(String, T, crate::read_image_memory::ImageMemoryHandle)> =
                 None;
             for entry in config_table.range(prefix..).map_err(Self::storage_error)? {
                 let (key, value) = entry.map_err(Self::storage_error)?;
@@ -32532,7 +32763,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         prefix: &str,
         after: Option<&str>,
-        memory: &Arc<crate::read_image_memory::ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Option<String>> {
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
@@ -32567,7 +32798,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(crate) fn load_config_value_admitted<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
-        memory: &Arc<crate::read_image_memory::ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Option<T>> {
         let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
@@ -32597,7 +32828,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(crate) fn load_config_values_for_keys_admitted<T: serde::de::DeserializeOwned>(
         &self,
         keys: &[String],
-        memory: &Arc<crate::read_image_memory::ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Vec<T>> {
         let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
@@ -32627,7 +32858,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         mut keys: BTreeSet<String>,
         prefixes: &[String],
-        memory: &Arc<crate::read_image_memory::ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<Vec<(String, T)>> {
         let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
@@ -32721,10 +32952,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
         let row = Self::decode_versioned_row(bytes, Some(meta))
             .map_err(|error| Self::relational_decode_error(table, error))?;
-        validate_read_row(table, &row, meta).map_err(|error| Error::StoreCorrupted {
-            path: table.to_owned(),
-            reason: error.to_string(),
-        })?;
+        validate_read_row(table, &row, meta).map_err(|error| crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &table, error))?;
         Ok(row)
     }
 
@@ -32747,10 +32975,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let relation = match read.open_table(definition) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(Error::StoreCorrupted {
-                    path: database_path.display().to_string(),
-                    reason: format!("relational table {table} is absent from the {root_kind} root"),
-                });
+                return Err(crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), database_path.display(), format_args!("relational table {table} is absent from the {root_kind} root")));
             }
             Err(error) => return Err(Self::relational_table_error(table, error)),
         };
@@ -32779,12 +33004,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
             crate::writer_query_test_seams::note_target_entry(table);
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
             if Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn) != key.value() {
-                return Err(Error::StoreCorrupted {
-                    path: database_path.display().to_string(),
-                    reason: format!(
+                return Err(crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), database_path.display(), format_args!(
                         "relational table {table} row body disagrees with its saved version key"
-                    ),
-                });
+                    )));
             }
             if row.created_tx.0 <= snapshot.0
                 && row.deleted_tx.is_none_or(|deleted| deleted.0 > snapshot.0)
@@ -32813,10 +33035,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let relation = match read.open_table(definition) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(Error::StoreCorrupted {
-                    path: database_path.display().to_string(),
-                    reason: format!("relational table {table} is absent from the {root_kind} root"),
-                });
+                return Err(crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), database_path.display(), format_args!("relational table {table} is absent from the {root_kind} root")));
             }
             Err(error) => return Err(Self::relational_table_error(table, error)),
         };
@@ -32847,10 +33066,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 entry.map_err(|error| Self::relational_storage_error(table, error))?;
             let encoded_key = key.value();
             if encoded_key.len() != 24 {
-                return Err(Error::StoreCorrupted {
-                    path: database_path.display().to_string(),
-                    reason: format!("relational table {table} contains a malformed row key"),
-                });
+                return Err(crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), database_path.display(), format_args!("relational table {table} contains a malformed row key")));
             }
             let key_lsn = u64::from_be_bytes(
                 encoded_key[16..24]
@@ -32867,12 +33083,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 || row.lsn != lsn
                 || Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn) != encoded_key
             {
-                return Err(Error::StoreCorrupted {
-                    path: database_path.display().to_string(),
-                    reason: format!(
+                return Err(crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), database_path.display(), format_args!(
                         "relational table {table} row body disagrees with its point identity"
-                    ),
-                });
+                    )));
             }
             return Ok(Some(row));
         }
@@ -33015,12 +33228,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
             };
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
             if row.row_id != row_id || row.created_tx != created_tx || row.lsn != lsn {
-                return Err(Error::StoreCorrupted {
-                    path: self.path().display().to_string(),
-                    reason: format!(
+                return Err(crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), self.path().display(), format_args!(
                         "relational table {table} row body disagrees with its saved version key"
-                    ),
-                });
+                    )));
             }
             Ok(Some(row))
         })
@@ -33123,11 +33333,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let _page_scope = page_memory.enter();
         // The existing page callback's native Arc control precedes allocation.
         page_memory.reserve(
-            std::mem::size_of::<Arc<crate::read_image_memory::ImageMemory>>()
+            std::mem::size_of::<crate::read_image_memory::ImageMemoryHandle>()
                 + 2 * std::mem::size_of::<usize>(),
         )?;
         let admission = {
-            let memory = Arc::clone(&page_memory);
+            let memory = page_memory.clone();
             Arc::new(move |bytes: usize| {
                 memory
                     .reserve(bytes)
@@ -34103,9 +34313,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
             index,
             partition_key,
         )
-        .map_err(|reason| vector_membership_source::damage(&reason))?;
+        .map_err(|reason| vector_membership_source::damage(reason))?;
         let route_end = vector_partition_expected_route_prefix(payload, index, partition_key)
-            .map_err(|reason| vector_membership_source::damage(&reason))?;
+            .map_err(|reason| vector_membership_source::damage(reason))?;
         // The descriptor suffix contains only fixed scalars. Pricing a
         // frontier must not clone its route or allocate a graph body.
         let suffix = &payload[route_end..];
@@ -35328,8 +35538,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 payload,
                 &partition.index,
                 &partition.partition_key,
-            )
-            .map_err(|error| Error::Other(error.into()))?;
+            ).map_err(Error::Other)?;
             type Prefix = (u64, TxId, Lsn, TxId, Lsn, u32, VectorQuantization, u16, u16);
             let (prefix, _): (Prefix, usize) =
                 bincode::serde::decode_from_slice(&payload[route..], bincode::config::standard())
@@ -35413,14 +35622,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
         Ok(bytes)
     }
 
-    fn captured_generation_corruption(reason: impl Into<String>) -> Error {
-        Error::StoreCorrupted {
-            path: "vector_partition_generations".into(),
-            reason: format!(
-                "vector partition durability record is corrupt: {}",
-                reason.into()
-            ),
-        }
+    fn captured_generation_corruption(reason: impl std::fmt::Display) -> Error {
+        crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), "vector_partition_generations", format_args!(
+                "vector partition durability record is corrupt: {reason}"
+            ))
     }
 
     fn captured_generation_table(
@@ -35745,7 +35950,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         self: &Arc<Self>,
         read: Arc<redb::ReadTransaction>,
         writer: Option<WriterSnapshotHandle>,
-        retained: Option<Arc<RetainedReadSource>>,
+        retained: Option<RetainedReadSource>,
         partition: &VectorPartitionRef,
         generations: Option<(
             VectorPartitionGenerationDescriptor,
@@ -36597,7 +36802,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 VectorPartitionRecordKind::GraphPageManifest,
                 &manifest_bytes,
             )
-            .map_err(|error| Error::Other(error.into()))?;
+            ?;
         if decoded != manifest {
             return Err(Error::Other((
                 "saved graph page manifest failed its preparation round trip".to_string()).into()));
@@ -37811,28 +38016,26 @@ graph_commit_result }.map_err(Self::storage_error)?;
 
     pub fn load_change_log(&self) -> Result<Vec<ChangeLogEntry>> {
         let read_memory =
-            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16_777_216).child()?;
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16_777_216)?.child()?;
         let owner = writer_source::SourceWindowOwner::Read(read_memory.clone());
+        // Accountant and image cells now carry their own exact invoices;
+        // this existing scope covers only the table/range storage it names.
         let _controls = owner.reserve(
             std::mem::size_of::<redb::ReadOnlyTable<&str, &[u8]>>()
-                .saturating_add(std::mem::size_of::<redb::Range<'_, &str, &[u8]>>())
-                .saturating_add(std::mem::size_of::<
-                    crate::memory_accounting::MemoryAccountant,
-                >())
-                .saturating_add(std::mem::size_of::<crate::read_image_memory::ImageMemory>())
-                .saturating_add(128),
+                .saturating_add(std::mem::size_of::<redb::Range<'_, &str, &[u8]>>()),
             "history_load_control",
         )?;
         // This accountant identifies the decode bridge only. All read funding
         // comes from the operation child, including proof pool and output.
-        let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
-        let output = crate::read_image_memory::ImageMemory::charging_reader_for(
-            bridge.clone().into(),
+        let bridge = crate::memory_accounting::AccountantHandle::reader(
+            None, read_memory.clone().into(), false)?;
+        let output = crate::read_image_memory::ImageMemory::admitted_reader_for(
+            bridge.clone(),
             read_memory.clone(),
             "history_source",
             "load_change_log",
             "Raise the reader limit to load requested history.",
-        );
+        )?;
         graph_read::with_pages(read_memory.clone(), || {
             self.with_db(|db| {
                 let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -38141,7 +38344,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
 
     pub(crate) fn load_trigger_audit_history_with_read_memory(
         &self,
-        read_memory: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
+        read_memory: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         Vec<TriggerAuditEntry>,
         Option<contextdb_core::read_memory::ReadCredit>,
@@ -38254,15 +38457,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     crate::writer_query_test_seams::HistoryFamily::CommitBound,
                 );
                 let stored_last = Lsn(stored_last.value());
-                let memory = crate::read_image_memory::ImageMemory::new(None);
+                let memory = crate::read_image_memory::ImageMemory::funded_for_original(
+                    self.require_decode_original()?, "writer_source", "decode_stored_value",
+                    "Raise MEMORY_LIMIT to decode this writer operation's stored values.")?;
                 let checkpoint = || Ok(());
                 let context = contextdb_tx::ReadCommitContext::new(memory.clone(), &checkpoint);
                 let frontier =
                     read_authenticated_history_frontiers(&read, &self.path, &memory, &context)
-                        .map_err(|error| Error::StoreCorrupted {
-                            path: self.path.display().to_string(),
-                            reason: error.to_string(),
-                        })?
+                        .map_err(|error| crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), error))?
                         .commit_last
                         .map(|(lsn, _)| lsn);
                 (frontier, stored_last)
@@ -38606,10 +38808,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .map_err(Self::storage_error)?
                 .any(|t| t.name() == SUPPORT.name())
             {
-                return Err(Error::StoreCorrupted {
-                    path: self.path.display().to_string(),
-                    reason: "published graph commit-support scratch".into(),
-                });
+                return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "published graph commit-support scratch".into()));
             }
             {
                 let previous = write
@@ -39282,10 +39481,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     fn retention_deferred_edge_value_bytes(&self, value: &[u8]) -> Result<usize> {
         let (count, _) =
             bincode::serde::decode_from_slice::<usize, _>(value, bincode::config::standard())
-                .map_err(|error| Error::StoreCorrupted {
-                    path: self.path.display().to_string(),
-                    reason: format!("bincode retention count decode error: {error}"),
-                })?;
+                .map_err(|error| crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), format_args!("bincode retention count decode error: {error}")))?;
         Ok(count.saturating_mul(256).saturating_add(value.len()))
     }
 
@@ -39496,9 +39692,16 @@ graph_commit_result }.map_err(Self::storage_error)?;
         projection: &AuthoritativePurgePersistenceProjection,
         marker: Option<purge_publication::DurableMarker>,
         frontier: Lsn,
-        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
         operation: &str,
     ) -> Result<Vec<(VectorPartitionRef, u64, u64)>> {
+        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::commit_authoritative_purge");
+        #[cfg(test)]
+        content_identity::proof_allocation_oracle_tests::note_purge_publication_frontier(frontier.0);
         // Presence, including a malformed fence, is sufficient to refuse.
         // The write-transaction check below closes a concurrent retirement.
         if self.has_vector_repair_fence()? || self.has_paged_cleanup()? {
@@ -39506,11 +39709,19 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 "vector ownership cleanup is incomplete before authoritative erasure",
             ));
         }
+        #[cfg(test)]
+        let _purge_prepare_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::commit_authoritative_purge::prepare_vector_generations");
         let prepared_vector_generations =
             self.prepare_authoritative_purge_vector_generations(projection)?;
+        #[cfg(test)]
+        drop(_purge_prepare_producer);
         // A saved (paged) replacement is renumbered to its storage identity
         // when it is prepared; the caller's in-memory replacement adopts the
         // published identity so a restart registers the same generation.
+        #[cfg(test)]
+        let _purge_identities_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::commit_authoritative_purge::collect_published_identities");
         let published_identities = prepared_vector_generations
             .iter()
             .map(|prepared| {
@@ -39526,15 +39737,39 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        #[cfg(test)]
+        drop(_purge_identities_producer);
+        #[cfg(test)]
+        let _purge_with_db_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::commit_authoritative_purge::with_db");
         self.with_db(|db| {
+            #[cfg(test)]
+            let _purge_begin_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+                "RedbPersistence::commit_authoritative_purge::begin_history_write");
             let write_txn = Self::begin_history_write(db)?;
+            #[cfg(test)]
+            drop(_purge_begin_producer);
+
+            #[cfg(test)]
+            let _purge_graph_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+                "RedbPersistence::commit_authoritative_purge::begin_graph_publication_attempt");
             #[cfg(any(test, feature = "test-seams"))]
             let mut graph_publication_attempt =
                 crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+            #[cfg(test)]
+            drop(_purge_graph_producer);
+            #[cfg(test)]
+            let _purge_fence_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+                "RedbPersistence::commit_authoritative_purge::refuse_unresolved_vector_erasure");
             Self::refuse_unresolved_vector_erasure_in_write(
                 &write_txn,
                 &Self::preencoded_native_storage(&prepared_vector_generations),
             )?;
+            #[cfg(test)]
+            drop(_purge_fence_producer);
+            #[cfg(test)]
+            let _purge_erasure_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+                "RedbPersistence::commit_authoritative_purge::apply_local_erasure");
             self.apply_local_erasure(
                 &write_txn,
                 projection,
@@ -39544,14 +39779,29 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 operation,
                 None,
             )?;
+            #[cfg(test)]
+            drop(_purge_erasure_producer);
+            #[cfg(test)]
+            let _purge_floors_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+                "RedbPersistence::commit_authoritative_purge::raise_noncanonical_writer_floors");
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
                 TxId(0),
                 frontier,
                 RowId(0),
             )?;
+            #[cfg(test)]
+            drop(_purge_floors_producer);
+            #[cfg(test)]
+            let _purge_bounds_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+                "RedbPersistence::commit_authoritative_purge::write_writer_recovery_bounds");
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            #[cfg(test)]
+            drop(_purge_bounds_producer);
             {
+                #[cfg(test)]
+                let _purge_commit_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+                    "RedbPersistence::commit_authoritative_purge::commit");
                 #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
                 let graph_commit_result = write_txn.commit();
@@ -39564,6 +39814,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
             .map_err(Self::storage_error)
         })?;
+        #[cfg(test)]
+        drop(_purge_with_db_producer);
         Ok(published_identities)
     }
 
@@ -39573,6 +39825,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
         owner: &Arc<LockedWriterFile>,
         operation: &str,
     ) -> writer_file::ReaderAuditOutcome {
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::checked_reader_audit");
         use writer_file::ReaderAuditOutcome;
         match owner.audit_reader_snapshots_under_hold() {
             ReaderAuditOutcome::Proven(audit) => {
@@ -39656,6 +39911,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
     pub(crate) fn acquire_authoritative_purge_publication(
         &self,
     ) -> Result<Option<purge_publication::AcquiredPurgePublication>> {
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::acquire_authoritative_purge_publication");
         #[cfg(not(unix))]
         {
             let _ = self;
@@ -39757,6 +40015,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
         frontier: Lsn,
         tables: &BTreeSet<String>,
     ) -> Result<Option<purge_publication::PreparedPurgePublication>> {
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::prepare_acquired_authoritative_purge_publication");
         match fence {
             Some(fence) => fence.prepare(frontier, tables).map(Some),
             None => Ok(None),
@@ -39779,20 +40040,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
             };
             let bytes = bytes.value();
             if bytes.len() != 24 {
-                return Err(Error::StoreCorrupted {
-                    path: self.path.display().to_string(),
-                    reason: "durable purge publication marker has the wrong length".to_owned(),
-                });
+                return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "durable purge publication marker has the wrong length".into()));
             }
-            let token = bytes[..16].try_into().map_err(|_| Error::StoreCorrupted {
-                path: self.path.display().to_string(),
-                reason: "durable purge marker token width".to_owned(),
-            })?;
+            let token = bytes[..16].try_into().map_err(|_| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "durable purge marker token width".into()))?;
             let frontier = Lsn(u64::from_le_bytes(bytes[16..].try_into().map_err(
-                |_| Error::StoreCorrupted {
-                    path: self.path.display().to_string(),
-                    reason: "durable purge marker frontier width".to_owned(),
-                },
+                |_| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "durable purge marker frontier width".into()),
             )?));
             Ok(Some(purge_publication::DurableMarker { token, frontier }))
         })
@@ -39881,20 +40133,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     candidate.catalog.partition_key.clone(),
                 );
                 if !affected_partitions.contains(&partition) {
-                    return Err(Error::StoreCorrupted {
-                        path: self.path.display().to_string(),
-                        reason: format!(
+                    return Err(crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), format_args!(
                             "authoritative purge replacement generation is outside its affected partition: {}.{}",
                             partition.0.table, partition.0.column
-                        ),
-                    });
+                        )));
                 }
                 if !candidate_partitions.insert(partition) {
-                    return Err(Error::StoreCorrupted {
-                        path: self.path.display().to_string(),
-                        reason: "authoritative purge prepared two replacement generations for one partition"
-                            .to_string(),
-                    });
+                    return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "authoritative purge prepared two replacement generations for one partition".into()));
                 }
                 self.prepare_vector_partition_generation_candidate_inner(candidate, true, |_| Ok(()))
             })
@@ -39908,10 +40153,15 @@ graph_commit_result }.map_err(Self::storage_error)?;
         projection: &AuthoritativePurgePersistenceProjection,
         prepared_vector_generations: &[PreencodedVectorPartitionGenerationCandidate],
         marker: Option<purge_publication::DurableMarker>,
-        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
         operation: &str,
         original_history: Option<&OriginalPersistenceFrame<'_>>,
     ) -> Result<()> {
+        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
+
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::apply_local_erasure");
         let _decode_scope = self.writer_decode_scope()?;
         self.prepare_proof_owner()?;
         // Declared first, so dropped last: these charges outlive the mutations they pay for.
@@ -40234,10 +40484,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             forward_key.as_slice()
                         ))
                         .map_err(Self::storage_error)?
-                        .ok_or_else(|| Error::StoreCorrupted {
-                            path: self.path.display().to_string(),
-                            reason: "purged graph forward projection missing".into(),
-                        })?;
+                        .ok_or_else(|| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "purged graph forward projection missing".into()))?;
                     let other = reverse
                         .get(observed_graph_key!(
                             "graph_rev",
@@ -40245,15 +40492,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             reverse_key.as_slice()
                         ))
                         .map_err(Self::storage_error)?
-                        .ok_or_else(|| Error::StoreCorrupted {
-                            path: self.path.display().to_string(),
-                            reason: "purged graph reverse projection missing".into(),
-                        })?;
+                        .ok_or_else(|| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "purged graph reverse projection missing".into()))?;
                     if body.value() != other.value() {
-                        return Err(Error::StoreCorrupted {
-                            path: self.path.display().to_string(),
-                            reason: "purged graph projections disagree".into(),
-                        });
+                        return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "purged graph projections disagree".into()));
                     }
                     self.graph_writer_window(|| {
                         Self::reclaim_graph_creation_in_write(write_txn, &forward_key, body.value())
@@ -40666,22 +40907,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
                             let body = fwd
                                 .get(observed_graph_key!("graph_fwd", "get", fwd_key.as_slice()))
                                 .map_err(Self::storage_error)?
-                                .ok_or_else(|| Error::StoreCorrupted {
-                                    path: self.path.display().to_string(),
-                                    reason: "reclaimed graph forward projection missing".into(),
-                                })?;
+                                .ok_or_else(|| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "reclaimed graph forward projection missing".into()))?;
                             let other = rev
                                 .get(observed_graph_key!("graph_rev", "get", rev_key.as_slice()))
                                 .map_err(Self::storage_error)?
-                                .ok_or_else(|| Error::StoreCorrupted {
-                                    path: self.path.display().to_string(),
-                                    reason: "reclaimed graph reverse projection missing".into(),
-                                })?;
+                                .ok_or_else(|| crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "reclaimed graph reverse projection missing".into()))?;
                             if body.value() != other.value() {
-                                return Err(Error::StoreCorrupted {
-                                    path: self.path.display().to_string(),
-                                    reason: "reclaimed graph projections disagree".into(),
-                                });
+                                return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "reclaimed graph projections disagree".into()));
                             }
                             self.graph_writer_window(|| {
                                 Self::reclaim_graph_creation_in_write(
@@ -41043,116 +41275,126 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 drop(db.begin_external_read(root.storage_identity()).map_err(Self::storage_error)?);
             }
         }
-        for lease in &mut leases {
-            **lease = None;
-        }
-        if let Some(db) = db_guard.as_ref()
-            && db.has_live_read_transactions()
-        {
-            for (root, lease) in roots.iter().zip(leases.iter_mut()) {
-                **lease = Some(Arc::new(
-                    db.begin_external_read(root.storage_identity())
-                        .map_err(Self::storage_error)?,
-                ));
+        let preparation_accountant = self.require_decode_accountant()?;
+        let mut recycle = || {
+            for lease in &mut leases {
+                **lease = None;
             }
-            return Ok(None);
-        }
-        let recycle_started = std::time::Instant::now();
-        let owner = self.writer_file.read().map_err(Self::storage_error)?;
-        let owner = owner
-            .as_ref()
-            .ok_or_else(|| Error::StoreHandleRecycleFailed {
-                path: self.path.display().to_string(),
-                reason: "database physical ownership is closed".to_owned(),
-            })?;
-        #[cfg(any(test, feature = "test-seams"))]
-        owner.observe(read_persistence_test_scaffold::WriterFileRecycleBoundary::BeforeViewClose);
-        // The reopened handle keeps the growth step the store declared.
-        let growth_step_ratio = db_guard
-            .as_ref()
-            .and_then(redb::Database::growth_step_ratio);
-        let old = db_guard.take();
-        drop(old);
-        #[cfg(any(test, feature = "test-seams"))]
-        owner.observe(read_persistence_test_scaffold::WriterFileRecycleBoundary::AfterViewClose);
-        if take_handle_recycle_reopen_fault_for_test() {
-            return Err(Error::StoreHandleRecycleFailed {
-                path: self.path.display().to_string(),
-                reason: "injected reopen failure (test seam)".to_string(),
-            });
-        }
-        let external = owner.external_snapshot_provider();
-        let local = self.writer_root_provider();
-        let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let provider_installed = installed.clone();
-        // The fresh allocator must see old roots before its first housekeeping.
-        let provider: redb::ExternalSnapshotProvider = Arc::new(move || {
-            let mut roots = external()?;
-            if !provider_installed.load(std::sync::atomic::Ordering::Acquire) {
-                roots.extend(local()?);
-            }
-            Ok(roots)
-        });
-        let capacity = self.recycle_cache_capacity();
-        let reopened = Self::open_hook_suppressed(|| {
-            redb_builder_with_cache(capacity)
-                .open_with_backend_and_external_snapshots(owner.view(), provider)
-        });
-        match reopened {
-            Ok(Ok(fresh)) => {
-                // Settle the fresh cache at the installed capacity before any
-                // root is published on it, and refuse a reserve its funding
-                // does not cover: the reopened cache never holds memory no
-                // owner was charged for.
-                if self.cache_installation.capacity().is_some() {
-                    let reserve = fresh
-                        .settle_startup_cache_budget(capacity)
-                        .map_err(|error| Error::StoreHandleRecycleFailed {
-                            path: self.path.display().to_string(),
-                            reason: error.to_string(),
-                        })?;
-                    if let Some(funded) = self.cache_funded_bytes()
-                        && reserve > funded
-                    {
-                        return Err(Error::StoreHandleRecycleFailed {
-                            path: self.path.display().to_string(),
-                            reason: format!(
-                                "the reopened page cache needs {reserve} bytes; {funded} are funded"
-                            ),
-                        });
-                    }
-                    self.cache_installation.record(capacity, reserve);
-                }
-                fresh.install_local_snapshot_provider(self.writer_root_provider());
-                installed.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(db) = db_guard.as_ref()
+                && db.has_live_read_transactions()
+            {
                 for (root, lease) in roots.iter().zip(leases.iter_mut()) {
                     **lease = Some(Arc::new(
-                        fresh
-                            .begin_external_read(root.storage_identity())
-                            .map_err(|error| Error::StoreHandleRecycleFailed {
-                                path: self.path.display().to_string(),
-                                reason: error.to_string(),
-                            })?,
+                        db.begin_external_read(root.storage_identity())
+                            .map_err(Self::storage_error)?,
                     ));
                 }
-                if let Some(ratio) = growth_step_ratio {
-                    fresh.set_growth_step_ratio(ratio);
-                }
-                *db_guard = Some(fresh);
-                #[cfg(any(test, feature = "test-seams"))]
-                owner.observe(
-                    read_persistence_test_scaffold::WriterFileRecycleBoundary::AfterViewOpen,
-                );
-                Ok(Some(recycle_started.elapsed().as_micros() as u64))
+                return Ok(None);
             }
-            Ok(Err(err)) => Err(Error::StoreHandleRecycleFailed {
-                path: self.path.display().to_string(),
-                reason: err.to_string(),
-            }),
-            Err(_) => Err(Error::StoreHandleRecycleFailed {
-                path: self.path.display().to_string(),
-                reason: "reopen panicked; store may be truncated or corrupt".to_string(),
-            }),
+            let recycle_started = std::time::Instant::now();
+            let owner = self.writer_file.read().map_err(Self::storage_error)?;
+            let owner = owner
+                .as_ref()
+                .ok_or_else(|| Error::StoreHandleRecycleFailed {
+                    path: self.path.display().to_string(),
+                    reason: "database physical ownership is closed".to_owned(),
+                })?;
+            #[cfg(any(test, feature = "test-seams"))]
+            owner.observe(read_persistence_test_scaffold::WriterFileRecycleBoundary::BeforeViewClose);
+            // The reopened handle keeps the growth step the store declared.
+            let growth_step_ratio = db_guard
+                .as_ref()
+                .and_then(redb::Database::growth_step_ratio);
+            let old = db_guard.take();
+            drop(old);
+            #[cfg(any(test, feature = "test-seams"))]
+            owner.observe(read_persistence_test_scaffold::WriterFileRecycleBoundary::AfterViewClose);
+            if take_handle_recycle_reopen_fault_for_test() {
+                return Err(Error::StoreHandleRecycleFailed {
+                    path: self.path.display().to_string(),
+                    reason: "injected reopen failure (test seam)".to_string(),
+                });
+            }
+            let external = owner.external_snapshot_provider();
+            let local = self.writer_root_provider();
+            let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider_installed = installed.clone();
+            // The fresh allocator must see old roots before its first housekeeping.
+            let provider: redb::ExternalSnapshotProvider = Arc::new(move || {
+                let mut roots = external()?;
+                if !provider_installed.load(std::sync::atomic::Ordering::Acquire) {
+                    roots.extend(local()?);
+                }
+                Ok(roots)
+            });
+            let capacity = self.recycle_cache_capacity();
+            // Reuse the same actual occupancy controls: retired physical page
+            // aliases consume room in the new generation too. No second fixed
+            // reserve is invoiced, and constructor failure/unwind restores TLS.
+            let cache_owner = self.cache_installation.owner.lock().clone();
+            let reopen = || Self::open_hook_suppressed(|| {
+                redb_builder_with_cache(capacity)
+                    .open_with_native_backend_and_external_snapshots(owner.view(), provider)
+            });
+            let reopened = match cache_owner.as_ref() {
+                Some(cache_owner) => cache_owner.with_recycled_cache(reopen),
+                None => reopen(), // genuinely unowned standalone persistence
+            };
+            match reopened {
+                Ok(Ok(fresh)) => {
+                    // Settle the fresh cache at the installed capacity before any
+                    // root is published on it, and refuse a reserve its funding
+                    // does not cover: the reopened cache never holds memory no
+                    // owner was charged for.
+                    if self.cache_installation.capacity().is_some() {
+                        let reserve = fresh
+                            .settle_startup_cache_budget(capacity)
+                            .map_err(|error| self.recycle_storage_error(error))?;
+                        if let Some(funded) = self.cache_funded_bytes()
+                            && reserve > funded
+                        {
+                            return Err(Error::StoreHandleRecycleFailed {
+                                path: self.path.display().to_string(),
+                                reason: format!(
+                                    "the reopened page cache needs {reserve} bytes; {funded} are funded"
+                                ),
+                            });
+                        }
+                        self.cache_installation.record(capacity, reserve);
+                    }
+                    fresh.install_local_snapshot_provider(self.writer_root_provider());
+                    installed.store(true, std::sync::atomic::Ordering::Release);
+                    for (root, lease) in roots.iter().zip(leases.iter_mut()) {
+                        **lease = Some(Arc::new(
+                            fresh
+                                .begin_external_read(root.storage_identity())
+                                .map_err(|error| Error::StoreHandleRecycleFailed {
+                                    path: self.path.display().to_string(),
+                                    reason: error.to_string(),
+                                })?,
+                        ));
+                    }
+                    if let Some(ratio) = growth_step_ratio {
+                        fresh.set_growth_step_ratio(ratio);
+                    }
+                    *db_guard = Some(fresh);
+                    #[cfg(any(test, feature = "test-seams"))]
+                    owner.observe(
+                        read_persistence_test_scaffold::WriterFileRecycleBoundary::AfterViewOpen,
+                    );
+                    Ok(Some(recycle_started.elapsed().as_micros() as u64))
+                }
+                Ok(Err(err)) => Err(self.recycle_storage_error(err)),
+                Err(_) => Err(Error::StoreHandleRecycleFailed {
+                    path: self.path.display().to_string(),
+                    reason: "reopen panicked; store may be truncated or corrupt".to_string(),
+                }),
+            }
+        };
+        if self.cache_installation.owner.lock().is_some() {
+            cache_reserve::with_preparation(&preparation_accountant, false, recycle)
+        } else {
+            recycle()
         }
     }
 
@@ -42281,8 +42523,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
 
     pub(crate) fn checkpoint_read_source_with_read_memory(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CheckpointReadSource> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let accountant = self.proof_accountant().ok_or_else(|| {
             Error::Other("checkpoint source requires its installed accountant identity".into())
         })?;
@@ -42293,7 +42537,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
 
     fn checkpoint_read_source_with_owner(
         &self,
-        decode_memory: Arc<crate::read_image_memory::ImageMemory>,
+        decode_memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> Result<CheckpointReadSource> {
         let _scope = decode_memory.enter();
         self.prepare_proof_owner()?;
@@ -43424,26 +43668,21 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// is supposed to have written it. A stored key that disagrees with the
     /// declaration cannot be ordered against its siblings, so it is refused
     /// before it can contribute a row.
-    pub(crate) fn validated_index_position(
-        declaration: &IndexDecl,
+    pub(crate) fn validated_index_position<'a>(
+        declaration: &'a IndexDecl,
         meta: &TableMeta,
         position: &RelationalIndexPosition,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), IndexValidationFailure<'a>> {
         Self::validated_index_key(declaration, meta, &position.key)
     }
 
-    pub(crate) fn validated_index_key(
-        declaration: &IndexDecl,
+    pub(crate) fn validated_index_key<'a>(
+        declaration: &'a IndexDecl,
         meta: &TableMeta,
         key: &[DirectedValue],
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), IndexValidationFailure<'a>> {
         if key.len() != declaration.columns.len() {
-            return Err(format!(
-                "durable index {} posting has {} key parts where the declaration has {}",
-                declaration.name,
-                key.len(),
-                declaration.columns.len()
-            ));
+            return Err(IndexValidationFailure { declaration, column: None, parts: Some(key.len()), suffix: "" });
         }
         for (part, (column, direction)) in key.iter().zip(declaration.columns.iter()) {
             let (descending, value) = match part {
@@ -43451,20 +43690,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 DirectedValue::Desc(TotalOrdDesc(value)) => (true, value),
             };
             if descending != matches!(direction, contextdb_core::SortDirection::Desc) {
-                return Err(format!(
-                    "durable index {} posting orders {column} in the direction the declaration does not",
-                    declaration.name
-                ));
+                return Err(IndexValidationFailure { declaration, column: Some((column, "orders ")), parts: None, suffix: " in the direction the declaration does not" });
             }
             let Some(declared) = meta
                 .columns
                 .iter()
                 .find(|declared| declared.name.as_str() == column.as_str())
             else {
-                return Err(format!(
-                    "durable index {} posting names column {column}, which the table does not have",
-                    declaration.name
-                ));
+                return Err(IndexValidationFailure { declaration, column: Some((column, "names column ")), parts: None, suffix: ", which the table does not have" });
             };
             let matches_declared = match (&declared.column_type, value) {
                 (_, Value::Null) => true,
@@ -43478,10 +43711,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 _ => false,
             };
             if !matches_declared {
-                return Err(format!(
-                    "durable index {} posting holds a {column} value of a type the column does not declare",
-                    declaration.name
-                ));
+                return Err(IndexValidationFailure { declaration, column: Some((column, "holds a ")), parts: None, suffix: " value of a type the column does not declare" });
             }
         }
         Ok(())
@@ -43786,10 +44016,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         };
         let row = Self::decode_versioned_row(body.value(), Some(meta))?;
         if row.row_id != row_id || row.created_tx >= deleted_tx {
-            return Err(Error::StoreCorrupted {
-                path: table.into(),
-                reason: "index predecessor disagrees with its row-version coordinate".into(),
-            });
+            return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &table, "index predecessor disagrees with its row-version coordinate".into()));
         }
         Ok((row.deleted_tx == Some(deleted_tx)).then_some(row))
     }
@@ -43928,25 +44155,16 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         .map_err(Self::storage_error)?
                         .map(|value| Self::decode_exact(value.value()))
                         .transpose()?
-                        .ok_or_else(|| Error::StoreCorrupted {
-                            path: current_name.clone(),
-                            reason: "current index has no posting for a deleted row".into(),
-                        })?;
+                        .ok_or_else(|| crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &current_name, "current index has no posting for a deleted row".into()))?;
                     let key = DurableRelationalIndexKey::new(old_key, old.row_id, created_tx)?;
                     let stamp: Option<TxId> = index
                         .get(&key)
                         .map_err(Self::storage_error)?
                         .map(|value| Self::decode_exact(value.value()))
                         .transpose()?
-                        .ok_or_else(|| Error::StoreCorrupted {
-                            path: name.clone(),
-                            reason: "current index names a missing versioned posting".into(),
-                        })?;
+                        .ok_or_else(|| crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &name, "current index names a missing versioned posting".into()))?;
                     if stamp.is_some() {
-                        return Err(Error::StoreCorrupted {
-                            path: name.clone(),
-                            reason: "current index names a deleted posting".into(),
-                        });
+                        return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &name, "current index names a deleted posting".into()));
                     }
                     current.remove(&logical_key).map_err(Self::storage_error)?;
                     index.put(commitments, write_txn, key, Some(*deleted_tx))?;
@@ -44075,9 +44293,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         .checked_sub(decrements)
                         .and_then(|count| count.checked_add(increments))
                         .ok_or_else(|| Error::StoreCorrupted {
-                            path: "relational index count table".to_owned(),
-                            reason: "live index-prefix cardinality underflowed or overflowed"
-                                .to_owned(),
+                            path: "relational index count table".into(),
+                            reason: "live index-prefix cardinality underflowed or overflowed".into(),
                         })?;
                     #[cfg(any(test, feature = "test-seams"))]
                     observe_index_prefix_count_value(&key, (next > 0).then_some(next));
@@ -44147,10 +44364,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     // postings, so a posting that does not match it IS a damaged
                     // store and is reported as one.
                     Self::validated_index_position(&declaration, previous_meta, &position)
-                        .map_err(|reason| Error::StoreCorrupted {
-                            path: database_path.display().to_string(),
-                            reason,
-                        })?;
+                        .map_err(|reason| crate::funded_error::corruption_display(admission.diagnostic_budget(), database_path.display(), reason))?;
                     if deleted_tx.is_some() {
                         continue;
                     }
@@ -44248,10 +44462,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     .expect("an existing index iterator entry decodes");
                     let (_, position, deleted_tx) = decoded;
                     Self::validated_index_position(&declaration, meta, &position).map_err(
-                        |reason| Error::StoreCorrupted {
-                            path: database_path.display().to_string(),
-                            reason,
-                        },
+                        |reason| crate::funded_error::corruption_display(admission.diagnostic_budget(), database_path.display(), reason),
                     )?;
                     if deleted_tx.is_some() {
                         continue;
@@ -44891,7 +45102,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         };
         let prefix = row_id.0.to_be_bytes();
         let memory = crate::read_image_memory::active_owner()?;
-        let mut current = None::<(VersionedRow, Arc<crate::read_image_memory::ImageMemory>)>;
+        let mut current = None::<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>;
         let mut admitted_body_bytes = 0usize;
         for item in table
             .range(prefix.as_slice()..)
@@ -45389,7 +45600,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
         generation_id: u64,
-        corruption: impl Fn(String) -> Error,
+        corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
     ) -> Result<()> {
         if base.index != *index
             || base.partition_key != *partition_key
@@ -45399,7 +45610,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             || base.highest_included_lsn.0 < base.base_lsn.0
         {
             return Err(corruption(
-                "base generation identity, dimension, or inclusion boundary is invalid".to_owned(),
+                "base generation identity, dimension, or inclusion boundary is invalid".into(),
             ));
         }
         base.graph.verify(corruption)
@@ -45429,7 +45640,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         partition_key: &VectorPartitionKey,
         base: &VectorPartitionBaseGenerationRecord,
         generation_id: u64,
-        corruption: impl Fn(String) -> Error,
+        corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
     ) -> Result<()> {
         if change.index != *index
             || change.partition_key != *partition_key
@@ -45448,7 +45659,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             || change.fresh_tail_from_lsn.0 < change.covered_through_lsn.0
         {
             return Err(corruption(
-                "sealed change identity, format, or replay boundary is invalid".to_owned(),
+                "sealed change identity, format, or replay boundary is invalid".into(),
             ));
         }
         change.graph.verify(corruption)
@@ -46191,10 +46402,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         write_txn: &redb::WriteTransaction,
         identities: &[VectorPartitionVersionIdentity],
-        accountant: Arc<dyn contextdb_vector::MemoryBudget>,
+        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
         operation: &str,
         own_storage: &[u64],
     ) -> Result<()> {
+        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
+
         if identities.is_empty() {
             return Ok(());
         }
@@ -46474,14 +46687,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    fn vector_partition_corruption(&self, reason: impl Into<String>) -> Error {
-        Error::StoreCorrupted {
-            path: self.path.display().to_string(),
-            reason: format!(
-                "vector partition durability record is corrupt: {}",
-                reason.into()
-            ),
-        }
+    fn vector_partition_corruption(&self, reason: impl std::fmt::Display) -> Error {
+        crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), self.path.display(), format_args!(
+                "vector partition durability record is corrupt: {reason}"
+            ))
     }
 
     /// Envelope layout: magic bytes, u16 big-endian format version, u8 table
@@ -46519,7 +46728,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => {
                 error
             }
-            error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
+            error => self.vector_partition_corruption(format_args!("payload decode failed: {error}")),
         })
     }
 
@@ -46538,7 +46747,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => {
                 error
             }
-            error => self.vector_partition_corruption(format!("payload decode failed: {error}")),
+            error => self.vector_partition_corruption(format_args!("payload decode failed: {error}")),
         })
     }
 
@@ -47223,15 +47432,19 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )
     }
 
+    fn require_decode_original(&self) -> Result<crate::memory_accounting::StoreAccountantHandle> {
+        let accountant = self.require_decode_accountant()?;
+        self.proof_accountant_handle_for(&accountant)
+            .ok_or_else(|| Error::Other("decode accountant has no original provenance".into()))
+    }
+
     fn require_decode_accountant(&self) -> Result<crate::memory_accounting::AccountantHandle> {
-        Ok(self
-            .proof_accountant
-            .get_or_init(|| {
-                ProofAccountantSlot::attached(
-                    crate::read_image_memory::ImageMemory::default_decode_accountant(),
-                )
-            })
-            .accountant())
+        if let Some(slot) = self.proof_accountant.get() { return Ok(slot.accountant()); }
+        let accountant = crate::read_image_memory::active_owner()?.accountant.clone();
+        // OnceLock publishes only the winner; a racing unpublished original
+        // drops normally, including each physical native control invoice.
+        let _ = self.proof_accountant.set(ProofAccountantSlot::attached(accountant));
+        Ok(self.proof_accountant.get().expect("decode accountant published").accountant())
     }
 
     /// A route's maintained pending counters as `(covered_tx, inserts,
@@ -47297,6 +47510,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        let _purge_producer = content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::new::<T>(
+            "RedbPersistence::encode");
         bincode::serde::encode_to_vec(value, bincode::config::standard())
             .map_err(|err| Error::Other((format!("bincode encode error: {err}")).into()))
     }
@@ -47309,6 +47525,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
     }
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+        #[cfg(test)]
+        let _purge_producer = content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::new::<T>(
+            "RedbPersistence::decode");
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let (value, _) = crate::read_image_memory::decode(bytes)?;
         Ok(value)
@@ -47377,10 +47596,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     // recorded native-page refusals retain precedence over malformed bytes.
     fn relational_decode_error(path: &str, error: Error) -> Error {
         match error {
-            Error::Other(reason) => Error::StoreCorrupted {
-                path: path.into(),
-                reason: reason.into_owned(),
-            },
+            Error::Other(reason) => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &path, reason),
             other => other,
         }
     }
@@ -47388,10 +47604,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     fn relational_storage_error(path: &str, error: redb::StorageError) -> Error {
         let corrupted = matches!(&error, redb::StorageError::Corrupted(_));
         match Self::storage_error(error) {
-            Error::Other(reason) if corrupted => Error::StoreCorrupted {
-                path: path.into(),
-                reason: reason.into_owned(),
-            },
+            Error::Other(reason) if corrupted => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &path, reason),
             other => other,
         }
     }
@@ -47399,10 +47612,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     fn relational_table_error(path: &str, error: redb::TableError) -> Error {
         match error {
             redb::TableError::Storage(error) => Self::relational_storage_error(path, error),
-            redb::TableError::TableDoesNotExist(reason) => Error::StoreCorrupted {
-                path: path.into(),
-                reason: format!("required relational table is absent: {reason}"),
-            },
+            redb::TableError::TableDoesNotExist(reason) => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &path, format_args!("required relational table is absent: {reason}")),
             other => Self::storage_error(other),
         }
     }
@@ -47449,8 +47659,39 @@ graph_commit_result }.map_err(Self::storage_error)?;
         }
     }
 
+    fn scalar_storage_refusal(error: &redb::Error) -> Option<contextdb_core::read_memory::NativeRefusal> {
+        let redb::Error::Native(redb::NativeColdReadError::AdmissionRefusedAt(owner)) = error else { return None; };
+        owner.inspect_failure(|cause| cause.and_then(|cause| cause.downcast_ref::<
+            native_storage_admission::NativeStorageFailure>()).and_then(|cause| match cause {
+                native_storage_admission::NativeStorageFailure::Refused(refusal) => Some(*refusal),
+                _ => None,
+            }))
+    }
+
+    fn recycle_storage_error(&self, error: impl Into<redb::Error>) -> Error {
+        let error: redb::Error = error.into();
+        if let Some(refusal) = Self::scalar_storage_refusal(&error) {
+            return native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(refusal));
+        }
+        // Existing allocating backend/recycle diagnostics stay unqualified.
+        Error::StoreHandleRecycleFailed {
+            path: self.path.display().to_string(), reason: error.to_string(),
+        }
+    }
+
     pub(crate) fn storage_error(err: impl Into<redb::Error>) -> Error {
-        let err = err.into();
+        let err: redb::Error = err.into();
+        // Preserve the actual native allocator facts before any owning formatter.
+        if let redb::Error::Native(redb::NativeColdReadError::AllocatorFailed { site, layout }) = err {
+            return Error::NativeEngineOther(
+                contextdb_core::read_memory::NativeRefusal::AllocatorFailed { site, layout });
+        }
+        // Native markers lend only their prepaid scalar diagnosis here.
+        if let Some(refusal) = Self::scalar_storage_refusal(&err) {
+            return native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(refusal));
+        }
         if let redb::Error::AdmissionRefused(error) = err {
             return match error.downcast::<Error>() {
                 Ok(error) => *error,
@@ -47460,35 +47701,42 @@ graph_commit_result }.map_err(Self::storage_error)?;
         if let redb::Error::Corrupted(reason) = err {
             return Error::StoreCorrupted {
                 path: "storage".into(),
-                reason,
+                reason: reason.into(),
             };
         }
         Self::storage_message_error(err)
     }
 
     pub(crate) fn storage_error_funded(
+        diagnostic: crate::funded_error::PreparedDiagnostic,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         err: impl Into<redb::Error>,
     ) -> crate::funded_error::OriginalError {
-        let err = err.into();
+        let err: redb::Error = err.into();
         if matches!(&err, redb::Error::AdmissionRefused(_) | redb::Error::Corrupted(_)) {
-            return crate::funded_error::OriginalError::storage(err, original);
+            return diagnostic.storage(err, original);
         }
         if let Some((path, reason)) = writer_file::take_reader_coordination_refusal() {
-            return crate::funded_error::OriginalError::reader_coordination(path, reason, original);
+            return diagnostic.reader_coordination(path, reason, original);
+        }
+        if let redb::Error::Native(redb::NativeColdReadError::BackendIo(
+            redb::NativeIoCause::DiskGrowthRefused { current_bytes, limit_bytes, .. })) = &err {
+            // Consume the legacy consumer signal, but certify only this returned cause.
+            let _ = writer_file::take_disk_growth_refusal();
+            let (current_bytes, limit_bytes) = (*current_bytes, *limit_bytes);
+            return diagnostic.disk(current_bytes, limit_bytes, err, original);
         }
         if let Some(refusal) = writer_file::take_disk_growth_refusal() {
-            return crate::funded_error::OriginalError::disk(refusal.current_bytes, refusal.limit_bytes, original);
+            // Keep the legacy disk category, but the TLS signal cannot certify
+            // the allocation provenance of this independently returned failure.
+            return diagnostic.disk(refusal.current_bytes, refusal.limit_bytes, err, original);
         }
-        crate::funded_error::OriginalError::storage(err, original)
+        diagnostic.storage(err, original)
     }
 
     fn storage_source_error(path: &str, err: impl Into<redb::Error>) -> Error {
         match Self::storage_error(err) {
-            Error::StoreCorrupted { reason, .. } => Error::StoreCorrupted {
-                path: path.to_owned(),
-                reason,
-            },
+            Error::StoreCorrupted { reason, .. } => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &path, reason),
             other => other,
         }
     }
@@ -47652,12 +47900,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         f: impl FnOnce(&redb::Database) -> crate::funded_error::OriginalResult<T>,
     ) -> crate::funded_error::OriginalResult<T> {
-        let _decode_scope = self.reader_decode_scope()?;
-        self.prepare_proof_owner()?;
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        let _decode_scope = self.reader_decode_scope().map_err(|error| diagnostic.error(error))?;
+        self.prepare_proof_owner().map_err(|error| diagnostic.error(error))?;
         if redb::native_storage_active() {
             return self.with_db_handle_funded(original, f);
         }
-        let scope = native_storage_admission::StorageAdmissionScope::writer_original(original)?;
+        let scope = native_storage_admission::StorageAdmissionScope::writer_original_native(original)
+            .map_err(crate::funded_error::OriginalError::native)?;
         scope.run_original(crate::funded_error::OriginalStoragePhase::Database, || self.with_db_handle_funded(original, f))
     }
 
@@ -47671,14 +47921,16 @@ graph_commit_result }.map_err(Self::storage_error)?;
             &mut crate::database::event_bus::OwnedQueueCommitCleanup)
             -> crate::funded_error::OriginalResult<T>,
     ) -> crate::funded_error::OriginalResult<T> {
-        let _decode_scope = self.reader_decode_scope()?;
-        self.prepare_proof_owner()?;
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        let _decode_scope = self.reader_decode_scope().map_err(|error| diagnostic.error(error))?;
+        self.prepare_proof_owner().map_err(|error| diagnostic.error(error))?;
         // Preserve inherited-scope selection. The actual outer run_original
         // joins its own cause; no new scope, lookup or payer is fabricated here.
         if redb::native_storage_active() {
             return self.with_db_handle_funded(original, |db| f(db, cleanup));
         }
-        let scope = native_storage_admission::StorageAdmissionScope::writer_original(original)?;
+        let scope = native_storage_admission::StorageAdmissionScope::writer_original_native(original)
+            .map_err(crate::funded_error::OriginalError::native)?;
         cleanup.storage_scope = Some(scope.retain_admission());
         scope.run_original(crate::funded_error::OriginalStoragePhase::Queue,
             || self.with_db_handle_funded(original, |db| f(db, cleanup)))
@@ -47689,21 +47941,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
         original: &crate::memory_accounting::OwnedMemoryReservation,
         f: impl FnOnce(&redb::Database) -> crate::funded_error::OriginalResult<T>,
     ) -> crate::funded_error::OriginalResult<T> {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         #[cfg(test)]
         PERSISTENCE_OWNERSHIP_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
         if let Some(error) = self.saved_export_abandonment_error.lock().as_ref() {
             // Inherited producer gap: its source/formatting has not been
             // preadmitted. Do not pretend the caller's grant paid these bytes.
-            return Err(Error::Other(format!("saved generation abandonment failed: {error}").into()).into());
+            return Err(diagnostic.error(Error::Other(format!("saved generation abandonment failed: {error}").into())));
         }
         let companion = self.lock_file.read()
-            .map_err(|error| Self::storage_error_funded(original, error))?;
+            .map_err(|error| diagnostic.storage(original, error))?;
         if companion.is_none() {
-            return Err(Error::Other("database persistence is closed".into()).into());
+            return Err(diagnostic.error(Error::Other("database persistence is closed".into())));
         }
-        let database = self.db.read().map_err(|error| Self::storage_error_funded(original, error))?;
+        let database = self.db.read().map_err(|error| diagnostic.storage(original, error))?;
         let db = database.as_ref().ok_or_else(||
-            crate::funded_error::OriginalError::unqualified(Error::Other("database persistence is closed".into())))?;
+            diagnostic.error(Error::Other("database persistence is closed".into())))?;
         f(db)
     }
 
@@ -47815,6 +48068,9 @@ impl PersistenceConstruction {
                     9 => {
                         std::ptr::drop_in_place(std::ptr::addr_of_mut!(
                             (*self.source).cache_charge_bytes
+                        ));
+                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
+                            (*self.source).cache_installation
                         ));
                     }
                     18 => {
@@ -50761,6 +51017,11 @@ mod empty_declared_index_readiness_tests {
             ),
             (Some(false), Some(0))
         );
+        assert_eq!(dead.image_physical_free_returned, Some(true),
+            "the original image requires its actual allocator free event");
+        assert_eq!(dead.image_accountant_physical_free_returned, Some(true),
+            "the original accountant requires its actual allocator free event");
+
     }
 
     struct DirectoryProofClock;
@@ -51620,7 +51881,7 @@ mod empty_declared_index_readiness_tests {
             drop(answer);
             drop(file);
             assert!(
-                file_memory.upgrade().is_none(),
+                !file_memory.is_alive() && file_memory.is_physically_freed() && file_memory.accountant_is_physically_freed(),
                 "the final public File handle releases its actual image-memory owner"
             );
             assert_commit_directory_final_drop(&funding_scope);
@@ -53546,7 +53807,8 @@ mod empty_declared_index_readiness_tests {
         // native roots retain their actual registered descriptors; no page
         // from fixture publication or a prior direction can fund this read.
         let cold_roots = || {
-            let image_memory = crate::read_image_memory::ImageMemory::new(None);
+            let image_memory = crate::read_image_memory::ImageMemory::new(None)
+                .expect("unlimited graph admission fixture image owner");
             // Same non-cache source reservation as the production load door.
             // Zero is the existing fixture cache option, not a reader limit.
             let source_bytes = (64 * 1024)
@@ -55357,7 +55619,7 @@ macro_rules! raw_persistence_surface {
     ($visibility:vis) => {
         impl RedbPersistence {
     $visibility fn create(path: &Path) -> Result<Self> {
-        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant();
+        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant()?;
         let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
             owner.enter()
         } else {
@@ -55375,7 +55637,7 @@ macro_rules! raw_persistence_surface {
     /// open takes for itself while it is still deciding, which is taken back
     /// before the refusal is returned.
     $visibility fn open_existing_only(path: &Path) -> Result<Self> {
-        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant();
+        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant()?;
         let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
             owner.enter()
         } else {
@@ -55387,7 +55649,7 @@ macro_rules! raw_persistence_surface {
     }
 
     $visibility fn open(path: &Path) -> Result<Self> {
-        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant();
+        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant()?;
         let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
             owner.enter()
         } else {
@@ -55472,7 +55734,7 @@ fn admitted_relational_index_endpoint(
     key: &[DirectedValue],
     row_id: RowId,
     created_tx: TxId,
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> Result<Vec<u8>> {
     admitted_relational_index_endpoint_with_checkpoint(key, row_id, created_tx, memory, &mut || {
         Ok(())
@@ -55483,7 +55745,7 @@ fn admitted_relational_index_endpoint_with_checkpoint(
     key: &[DirectedValue],
     row_id: RowId,
     created_tx: TxId,
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     checkpoint: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<u8>> {
     admitted_relational_index_parts_with_checkpoint(
@@ -55503,7 +55765,7 @@ fn admitted_relational_row_index_endpoint_with_checkpoint(
     declaration: &IndexDecl,
     row: &VersionedRow,
     created_tx: TxId,
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     checkpoint: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<u8>> {
     // Borrow values from the already admitted row instead of deep cloning its key.
@@ -55527,7 +55789,7 @@ fn admitted_relational_index_parts_with_checkpoint<'v, I>(
     key: I,
     row_id: RowId,
     created_tx: TxId,
-    memory: &Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     checkpoint: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<u8>>
 where
@@ -56791,7 +57053,7 @@ mod bounded_journal_suffix_tests;
 pub(crate) struct OwnedEncodedEventSource<'s> {
     read: &'s redb::ReadTransaction,
     loaded: Option<&'s BTreeMap<String, Vec<(u64, Vec<u8>)>>>,
-    read_memory: &'s Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: &'s contextdb_core::read_memory::ReadMemoryOwner,
 }
 
 /// A synchronous cold queue loan. Its transaction pins the actual storage
@@ -56804,32 +57066,35 @@ pub(crate) struct OwnedColdEventSource<'s> {
 impl OwnedColdEventSource<'_> {
     pub(crate) fn extent(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         sink: &str) -> Result<(u64, u64, redb::StorageSnapshotIdentity)> {
-        self.extent_in(original, sink, RedbPersistence::storage_error)
+        self.extent_in(original, sink, RedbPersistence::storage_error, |error| error)
     }
     pub(crate) fn extent_funded(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         sink: &str) -> crate::funded_error::OriginalResult<(u64, u64, redb::StorageSnapshotIdentity)> {
-        self.extent_in(original, sink, |error| RedbPersistence::storage_error_funded(original, error))
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        self.extent_in(original, sink, |error| diagnostic.storage(original, error), |error| diagnostic.error(error))
     }
     pub(crate) fn visit_range(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         sink: &str, after: Option<u64>, upper: u64,
         visit: impl for<'e> FnMut(u64, &'e [u8]) -> Result<bool>) -> Result<bool> {
-        self.visit_range_in(original, sink, after, upper, visit, RedbPersistence::storage_error)
+        self.visit_range_in(original, sink, after, upper, visit, RedbPersistence::storage_error, |error| error)
     }
     pub(crate) fn visit_range_funded(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         sink: &str, after: Option<u64>, upper: u64,
         visit: impl for<'e> FnMut(u64, &'e [u8]) -> crate::funded_error::OriginalResult<bool>,
     ) -> crate::funded_error::OriginalResult<bool> {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         self.visit_range_in(original, sink, after, upper, visit,
-            |error| RedbPersistence::storage_error_funded(original, error))
+            |error| diagnostic.storage(original, error), |error| diagnostic.error(error))
     }
 
-    pub(crate) fn extent_in<E: From<Error>>(
+    pub(crate) fn extent_in<E>(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         sink: &str,
         storage: impl Fn(redb::Error) -> E,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<(u64, u64, redb::StorageSnapshotIdentity), E> {
-        let key = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
+        let key = OwnedEventKey::concatenated(original, "__sink_queue_", sink).map_err(&existing)?;
         let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(&key.value);
         let root = self.read.storage_snapshot_identity();
         let table = match self.read.open_table(definition) {
@@ -56846,7 +57111,7 @@ impl OwnedColdEventSource<'_> {
     /// Return true only when the selected interval is exhausted. A false
     /// callback stops immediately while the current value guard is live;
     /// there is no encoded-body staging vector or backlog count traversal.
-    pub(crate) fn visit_range_in<E: From<Error>>(
+    pub(crate) fn visit_range_in<E>(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         sink: &str,
@@ -56854,6 +57119,7 @@ impl OwnedColdEventSource<'_> {
         upper: u64,
         mut visit: impl for<'e> FnMut(u64, &'e [u8]) -> std::result::Result<bool, E>,
         storage: impl Fn(redb::Error) -> E,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<bool, E> {
         let start = match after {
             Some(id) => match id.checked_add(1) {
@@ -56863,7 +57129,7 @@ impl OwnedColdEventSource<'_> {
             None => 0,
         };
         if start > upper { return Ok(true); }
-        let key = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
+        let key = OwnedEventKey::concatenated(original, "__sink_queue_", sink).map_err(&existing)?;
         let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(&key.value);
         let table = match self.read.open_table(definition) {
             Ok(table) => table,
@@ -56880,14 +57146,14 @@ impl OwnedColdEventSource<'_> {
 
 struct OwnedEventReadKey {
     value: String,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
     bytes: usize,
 }
 
 impl OwnedEventReadKey {
     fn queue_table(
         sink: &str,
-        memory: &Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Self> {
         let bytes = "__sink_queue_"
             .len()
@@ -56941,9 +57207,10 @@ impl OwnedEncodedEventSource<'_> {
     pub(crate) fn decode_owned_config_funded<T: serde::de::DeserializeOwned>(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation, key: &str,
     ) -> crate::funded_error::OriginalResult<Option<OriginalDecoded<T>>> {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         self.decode_owned_config_in(original, key,
             RedbPersistence::decode_owned_config_value_funded,
-            |error| RedbPersistence::storage_error_funded(original, error))
+            |error| diagnostic.storage(original, error))
     }
 
     fn decode_owned_config_in<T, E>(
@@ -56976,7 +57243,8 @@ impl OwnedEncodedEventSource<'_> {
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         prefix: &str, sink: &str,
     ) -> crate::funded_error::OriginalResult<u64> {
-        let key = OwnedEventKey::concatenated(original, prefix, sink)?;
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        let key = OwnedEventKey::concatenated(original, prefix, sink).map_err(|error| diagnostic.error(error))?;
         Ok(self.decode_owned_config_funded::<u64>(original, &key.value)?
             .map_or(0, |decoded| decoded.value))
     }
@@ -56985,18 +57253,20 @@ impl OwnedEncodedEventSource<'_> {
         &self, sink: &str,
         visit: impl for<'e> FnMut(u64, &'e [u8]) -> Result<()>,
     ) -> Result<()> {
-        self.visit_in(sink, visit, RedbPersistence::storage_error)
+        self.visit_in(sink, visit, RedbPersistence::storage_error, |error| error)
     }
     pub(crate) fn visit_funded(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation, sink: &str,
         visit: impl for<'e> FnMut(u64, &'e [u8]) -> crate::funded_error::OriginalResult<()>,
     ) -> crate::funded_error::OriginalResult<()> {
-        self.visit_in(sink, visit, |error| RedbPersistence::storage_error_funded(original, error))
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        self.visit_in(sink, visit, |error| diagnostic.storage(original, error), |error| diagnostic.error(error))
     }
-    fn visit_in<E: From<Error>>(
+    fn visit_in<E>(
         &self, sink: &str,
         mut visit: impl for<'e> FnMut(u64, &'e [u8]) -> std::result::Result<(), E>,
         storage: impl Fn(redb::Error) -> E,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<(), E> {
         if let Some(entries) = self.loaded.and_then(|loaded| loaded.get(sink)) {
             for (id, bytes) in entries {
@@ -57004,7 +57274,7 @@ impl OwnedEncodedEventSource<'_> {
             }
             return Ok(());
         }
-        let name = OwnedEventReadKey::queue_table(sink, self.read_memory)?;
+        let name = OwnedEventReadKey::queue_table(sink, self.read_memory).map_err(&existing)?;
         let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(&name.value);
         let table = match self.read.open_table(definition) {
             Ok(table) => table,
@@ -57071,16 +57341,18 @@ impl RedbPersistence {
         original: &crate::memory_accounting::OwnedMemoryReservation,
         f: impl for<'s> FnOnce(&OwnedColdEventSource<'s>) -> crate::funded_error::OriginalResult<R>,
     ) -> crate::funded_error::OriginalResult<R> {
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         let _control = crate::memory_accounting::reserve_preparation_original_native(
             original,
             std::mem::size_of::<redb::ReadTransaction>()
                 .checked_add(std::mem::size_of::<OwnedColdEventSource<'_>>())
-                .ok_or_else(|| Error::Other("cold event source control overflow".into()))?,
+                .ok_or_else(|| crate::funded_error::OriginalError::native(contextdb_core::read_memory::NativeRefusal::Other("cold event source control overflow")))?,
             "events", "sink_queue_source", "Reduce concurrent deliveries or raise MEMORY_LIMIT.",
         ).map_err(crate::funded_error::OriginalError::native)?;
-        let storage_scope = native_storage_admission::StorageAdmissionScope::writer_original(original)?;
+        let storage_scope = native_storage_admission::StorageAdmissionScope::writer_original_native(original)
+            .map_err(crate::funded_error::OriginalError::native)?;
         storage_scope.run_original(crate::funded_error::OriginalStoragePhase::ColdSource, || self.with_db_handle_funded(original, |db| {
-            let read = db.begin_read().map_err(|error| Self::storage_error_funded(original, error))?;
+            let read = db.begin_read().map_err(|error| diagnostic.storage(original, error))?;
             f(&OwnedColdEventSource { read: &read })
         }))
     }
@@ -57088,21 +57360,26 @@ impl RedbPersistence {
     pub(crate) fn with_owned_encoded_event_source_funded<R>(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         f: impl for<'s> FnOnce(&'s OwnedEncodedEventSource<'s>)
             -> crate::funded_error::OriginalResult<R>,
     ) -> crate::funded_error::OriginalResult<R> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         self.with_db_original_funded(original, |db| {
-            let read = db.begin_read().map_err(|error| Self::storage_error_funded(original, error))?;
+            let read = db.begin_read().map_err(|error| diagnostic.storage(original, error))?;
             f(&OwnedEncodedEventSource { read: &read, loaded: None, read_memory: &read_memory })
         })
     }
 
     pub(crate) fn with_owned_encoded_event_source<R>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         f: impl for<'s> FnOnce(&'s OwnedEncodedEventSource<'s>) -> Result<R>,
     ) -> Result<R> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             let source = OwnedEncodedEventSource {
@@ -57119,9 +57396,11 @@ impl RetainedReadSource {
     pub(crate) fn with_owned_encoded_image_source<R>(
         &self,
         loaded: &BTreeMap<String, Vec<(u64, Vec<u8>)>>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         f: impl for<'s> FnOnce(&'s OwnedEncodedEventSource<'s>) -> Result<R>,
     ) -> Result<R> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // begin_read verifies this transaction against the registered image
         // snapshot; unloaded queues never reopen the latest writer root.
         let read = self.begin_read()?;
@@ -57220,25 +57499,37 @@ impl RedbPersistence {
     pub(crate) fn encode_owned_event<T: serde::Serialize>(
         original: &crate::memory_accounting::OwnedMemoryReservation, value: &T,
     ) -> Result<OwnedEncodedBytes> {
+        let mut diagnostic = Some(crate::funded_error::OriginalError::prepare(original,
+            "relational", "statement_overlay", "Reduce prepared event bodies or raise MEMORY_LIMIT.")
+            .map_err(|failure| native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(failure)))?);
         Self::encode_owned_event_in(original, value,
-            |error| Error::Other(format!("bincode encode error: {error}").into()))
+            |error| diagnostic.take().expect("one failed encoding pass").encode(error,
+                crate::memory_accounting::retain_preparation_original(original))
+                .into_public_prepared(), |error| error)
     }
     pub(crate) fn encode_owned_event_funded<T: serde::Serialize>(
         original: &crate::memory_accounting::OwnedMemoryReservation, value: &T,
     ) -> crate::funded_error::OriginalResult<OwnedEncodedBytes> {
-        Self::encode_owned_event_in(original, value, |error|
-            crate::funded_error::OriginalError::encode(error,
-                crate::memory_accounting::retain_preparation_original(original)))
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        Self::encode_owned_event_in(original, value,
+            |error| diagnostic.encode(error,
+                crate::memory_accounting::retain_preparation_original(original)),
+            |error| diagnostic.error(error))
     }
-    fn encode_owned_event_in<T: serde::Serialize, E: From<Error>>(
+    fn encode_owned_event_in<T: serde::Serialize, E>(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         value: &T,
-        codec: impl Fn(bincode::error::EncodeError) -> E,
+        mut codec: impl FnMut(bincode::error::EncodeError) -> E,
+        existing: impl Fn(Error) -> E,
     ) -> std::result::Result<OwnedEncodedBytes, E> {
+        #[cfg(test)]
+        let _purge_producer = content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::new::<T>(
+            "RedbPersistence::encode_owned_event_in");
         let mut measured = OwnedEventEncodedLength(0);
         bincode::serde::encode_into_std_write(value, &mut measured, bincode::config::standard())
-            .map_err(&codec)?;
-        let buffer = crate::memory_accounting::new_owned_native_vec::<u8>(original, measured.0)?;
+            .map_err(&mut codec)?;
+        let buffer = crate::memory_accounting::new_owned_native_vec::<u8>(original, measured.0).map_err(&existing)?;
         // Establish body-before-invoice custody before invoking Serialize,
         // which can return an error or unwind on its second pass.
         let mut encoded = OwnedEncodedBytes {
@@ -57253,8 +57544,8 @@ impl RedbPersistence {
         )
         .map_err(codec)?;
         if written != measured.0 || encoded.bytes.capacity() != measured.0 {
-            return Err(Error::Other(
-                "sink event encoding differs from its measured size".into()).into());
+            return Err(existing(Error::Other(
+                "sink event encoding differs from its measured size".into())));
         }
         Ok(encoded)
     }
@@ -57313,6 +57604,10 @@ pub(crate) struct OriginalDecoded<T> {
 /// A synchronous, stack-scoped native seed. Its pointer cannot leave this
 /// private codec: all access occurs before decode returns, including unwind.
 /// The returned typed value keeps its own exact original reservation.
+/// Compile-time selection for the two audited, allocation-free streamed blob
+/// projections. No blanket DeserializeOwned implementation is permitted.
+pub(crate) trait StreamedBlobProjection: serde::de::DeserializeOwned {}
+
 mod original_event_decode {
     use super::*;
     use serde::de::{self, DeserializeSeed, Visitor};
@@ -57320,6 +57615,10 @@ mod original_event_decode {
     #[derive(Debug)]
     struct Ledger {
         failure: Option<contextdb_core::read_memory::NativeRefusal>,
+        diagnostic: Option<crate::funded_error::OriginalError>,
+        messagepack: bool,
+        payload_allocates: bool,
+        json_diagnostic: Option<crate::funded_error::AdmittedJsonDiagnostic>,
         allocation: crate::memory_accounting::OwnedMemoryReservation,
     }
     // Serde's outer containers and core's nested JSON builder share this SAME
@@ -57328,18 +57627,24 @@ mod original_event_decode {
     #[derive(Debug)]
     struct DecodeBudget(parking_lot::Mutex<Ledger>);
     impl contextdb_core::read_memory::ReadMemoryBudget for DecodeBudget {
-        fn try_reserve(&self, bytes: usize, _: &'static str, _: &'static str,
-            _: &'static str) -> Result<()> {
+        fn try_reserve(&self, bytes: usize, subsystem: &'static str, operation: &'static str,
+            hint: &'static str) -> Result<()> {
+            self.try_reserve_native(bytes, subsystem, operation, hint)
+                .map_err(Error::NativeEngineOther)
+        }
+        fn native_reserve_supported(&self) -> bool { true }
+        fn try_reserve_native(&self, bytes: usize, _: &'static str, _: &'static str,
+            _: &'static str) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
             let mut ledger = self.0.lock();
-            if ledger.failure.is_some() {
-                return Err(Error::Other("original decode admission refused".into()));
-            }
+            if let Some(error) = ledger.failure { return Err(error); }
             if let Err(error) = crate::memory_accounting::grow_preparation_original_native(
                 &mut ledger.allocation, bytes, "events", "decode_sink_queue_entry",
                 "Reduce pending deliveries or raise MEMORY_LIMIT.",
             ) {
+                #[cfg(test)]
+                crate::persistence::content_identity::proof_allocation_oracle_tests::selected_json_producer_rows::refused(error);
                 ledger.failure = Some(error);
-                return Err(Error::Other("original decode admission refused".into()));
+                return Err(error);
             }
             Ok(())
         }
@@ -57354,64 +57659,154 @@ mod original_event_decode {
     impl Drop for Scope {
         fn drop(&mut self) { ACTIVE.with(|slot| slot.set(self.0)); }
     }
-    fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
+    fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), CodecError<E>> {
         use contextdb_core::read_memory::ReadMemoryBudget;
         ACTIVE.with(|slot| {
             let ptr = slot.get();
-            if ptr.is_null() { return Err(E::custom("original decode requires its pinned seed")); }
-            // SAFETY: decode retains the Arc through Scope restoration. No
-            // locked ledger borrow survives this synchronous admission call.
-            let budget = unsafe { &*ptr };
-            budget.try_reserve(bytes,"events","decode_sink_queue_entry",
+            assert!(!ptr.is_null(), "original decode requires its pinned seed");
+            // The two selected streamed projections have no allocating
+            // payload visitors, including Field and IgnoredAny. Their native
+            // reader scratch is separately prepaid by the structural scan.
+            {
+                let ledger = unsafe { &*ptr }.0.lock();
+                if ledger.failure.is_some() || ledger.diagnostic.is_some() { return Err(CodecError::Captured); }
+                if !ledger.payload_allocates { return Ok(()); }
+            }
+            // Scope owns this pointer until the synchronous decode completes.
+            unsafe { &*ptr }.try_reserve_native(bytes,"events","decode_sink_queue_entry",
                 "Reduce pending deliveries or raise MEMORY_LIMIT.")
-                .map_err(|_| E::custom("read image admission refused"))
+                .map_err(|_| CodecError::Captured)
         })
     }
     pub(super) fn decode<T: de::DeserializeOwned>(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         bytes: &[u8],
     ) -> Result<OriginalDecoded<T>> {
-        decode_with_route(original, bytes, true, |error| error,
+        let diagnostic = crate::funded_error::OriginalError::prepare(original,
+            "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT.")
+            .map_err(|failure| native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(failure)))?;
+        decode_with_route(original, bytes, true, false, |error| error,
             |bytes| crate::memory_accounting::reserve_preparation_from_original(original, bytes,
                 "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT."),
             |refusal| native_storage_admission::original_storage_error(native_storage_admission::NativeStorageFailure::Refused(refusal)),
-            |error, _ledger| {
-            Error::Other(format!("bincode decode error: {error}").into())
+            |error| error.into_public_prepared(),
+            move |error, ledger| diagnostic.decode(error, ledger).into_public_prepared())
+    }
+    // Concrete persisted-row root. Generic DeserializeOwned callers retain
+    // their unqualified legacy adapter, even when they happen to contain JSON.
+    pub(super) fn decode_row(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        bytes: &[u8],
+    ) -> Result<OriginalDecoded<PersistedVersionedRow>> {
+        decode_closed_json_root(original, bytes)
+    }
+    pub(super) fn decode_sink_entry(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        bytes: &[u8],
+    ) -> Result<OriginalDecoded<SinkQueueEntry>> {
+        decode_closed_json_root(original, bytes)
+    }
+    // These are the only selected JSON-bearing roots. A foreign Deserialize
+    // implementation cannot opt itself in through the generic decoder.
+    trait ClosedJsonRoot: de::DeserializeOwned {}
+    impl ClosedJsonRoot for PersistedVersionedRow {}
+    impl ClosedJsonRoot for SinkQueueEntry {}
+    fn decode_closed_json_root<T: ClosedJsonRoot>(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        bytes: &[u8],
+    ) -> Result<OriginalDecoded<T>> {
+        // Other targets retain their existing public behavior and honest
+        // generic provenance. The native Layout below is target-specific;
+        // compiler/dependency/profile/artifact identity is an acceptance gate.
+        if !cfg!(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu",
+            target_pointer_width = "64")) {
+            return decode(original, bytes);
+        }
+        let diagnostic = crate::funded_error::OriginalError::prepare(original,
+            "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT.")
+            .map_err(|error| native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(error)))?;
+        decode_with_route(original, bytes, true, true, |error| error,
+            |bytes| crate::memory_accounting::reserve_preparation_from_original(original, bytes,
+                "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT."),
+            |error| native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(error)),
+            |error| error.into_public_prepared(),
+            move |error, ledger| diagnostic.decode(error, ledger).into_public_prepared())
+    }
+    fn capture_json_refusal(error: contextdb_core::read_memory::NativeRefusal) {
+        #[cfg(test)]
+        crate::persistence::content_identity::proof_allocation_oracle_tests::selected_json_producer_rows::json_refusal();
+        ACTIVE.with(|slot| {
+            let ptr = slot.get();
+            assert!(!ptr.is_null(), "closed JSON stays inside the row producer");
+            let mut ledger = unsafe { &*ptr }.0.lock();
+            if ledger.diagnostic.is_none() {
+                let first = ledger.failure.unwrap_or(error);
+                ledger.failure = Some(first);
+                let output = ledger.json_diagnostic.take().expect("selected row prepared JSON refusal custody");
+                ledger.diagnostic = Some(output.refuse(first));
+            }
+        });
+    }
+    fn capture_json_diagnostic(error: serde_json::Error, finite: Option<&'static str>) -> std::result::Result<(), serde_json::Error> {
+        ACTIVE.with(|slot| {
+            let ptr = slot.get();
+            assert!(!ptr.is_null(), "closed JSON stays inside the row producer");
+            let mut ledger = unsafe { &*ptr }.0.lock();
+            if ledger.failure.is_some() || ledger.diagnostic.is_some() { return Ok(()); }
+            let output = ledger.json_diagnostic.take().expect("selected row prepared JSON destination");
+            let messagepack = ledger.messagepack;
+            match output.finish(error, finite, messagepack) {
+                Ok(error) => { ledger.diagnostic = Some(error); Ok(()) }
+                Err((error, output)) => { ledger.json_diagnostic = Some(output); Err(error) }
+            }
         })
     }
     pub(super) fn decode_config_compatible<T: de::DeserializeOwned>(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         bytes: &[u8],
     ) -> Result<OriginalDecoded<T>> {
-        decode_with_route(original, bytes, false, |error| error,
+        let diagnostic = crate::funded_error::OriginalError::prepare(original,
+            "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT.")
+            .map_err(|failure| native_storage_admission::original_storage_error(
+                native_storage_admission::NativeStorageFailure::Refused(failure)))?;
+        decode_with_route(original, bytes, false, false, |error| error,
             |bytes| crate::memory_accounting::reserve_preparation_from_original(original, bytes,
                 "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT."),
             |refusal| native_storage_admission::original_storage_error(native_storage_admission::NativeStorageFailure::Refused(refusal)),
-            |error, _ledger| {
-            Error::Other(format!("bincode decode error: {error}").into())
-        })
+            |error| error.into_public_prepared(),
+            move |error, ledger| diagnostic.decode(error, ledger).into_public_prepared())
     }
     pub(super) fn decode_funded<T: de::DeserializeOwned>(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         bytes: &[u8], exact: bool,
     ) -> crate::funded_error::OriginalResult<OriginalDecoded<T>> {
-        decode_with_route(original, bytes, exact,
-            crate::funded_error::OriginalError::unqualified,
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        decode_with_route(original, bytes, exact, false,
+            |error| diagnostic.error(error),
             |bytes| crate::memory_accounting::reserve_preparation_original_native(original, bytes,
                 "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT.")
                 .map_err(crate::funded_error::OriginalError::native),
             crate::funded_error::OriginalError::native,
-            crate::funded_error::OriginalError::decode)
+            |error| error,
+            |error, ledger| diagnostic.decode(error, ledger))
     }
     fn decode_with_route<T: de::DeserializeOwned, E>(
         _original: &crate::memory_accounting::OwnedMemoryReservation,
         bytes: &[u8],
         exact: bool,
+        closed_json: bool,
         existing: impl Fn(Error) -> E,
         reserve: impl Fn(usize) -> std::result::Result<crate::memory_accounting::OwnedMemoryReservation, E>,
         native: impl FnOnce(contextdb_core::read_memory::NativeRefusal) -> E,
+        captured: impl FnOnce(crate::funded_error::OriginalError) -> E,
         codec: impl FnOnce(bincode::error::DecodeError, crate::memory_accounting::OwnedMemoryReservation) -> E,
     ) -> std::result::Result<OriginalDecoded<T>, E> {
+        #[cfg(test)]
+        let _purge_producer = content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::new::<T>(
+            "original_event_decode::decode_with_route");
         let control = std::mem::size_of::<T>()
             .checked_mul(4)
             .and_then(|n| n.checked_add(128))
@@ -57419,13 +57814,27 @@ mod original_event_decode {
             .and_then(|n| n.checked_add(2 * std::mem::size_of::<usize>()))
             .ok_or_else(|| existing(Error::Other("decode control size overflow".into())))?;
         let _control = reserve(control)?;
+        let json_diagnostic = if closed_json {
+            Some(crate::funded_error::AdmittedJsonDiagnostic::prepare(_original)
+                .map_err(|error| existing(native_storage_admission::original_storage_error(
+                    native_storage_admission::NativeStorageFailure::Refused(error))))?)
+        } else { None };
         let budget = Arc::new(DecodeBudget(parking_lot::Mutex::new(Ledger {
             allocation: reserve(0)?,
             failure: None,
+            diagnostic: None,
+            messagepack: false,
+            payload_allocates: true,
+            json_diagnostic,
         })));
         let old = ACTIVE.with(|slot| slot.replace(Arc::as_ptr(&budget)));
         let scope = Scope(old);
-        let json = contextdb_core::types::JsonReadAdmissionGuard::enter(budget.clone());
+        let json = if closed_json {
+            contextdb_core::types::JsonReadAdmissionGuard::enter_closed(budget.clone(),
+                contextdb_core::types::ClosedJsonReadHooks {
+                    refused: capture_json_refusal, diagnostic: capture_json_diagnostic,
+                })
+        } else { contextdb_core::types::JsonReadAdmissionGuard::enter(budget.clone()) };
         let result = bincode::serde::seed_decode_from_slice(
             Seed(PhantomData::<T>),
             bytes,
@@ -57444,12 +57853,17 @@ mod original_event_decode {
                 return Err(existing(Error::Other("original JSON decode scope retained its owner".into())));
             }
         };
+        if let Some(error) = ledger.diagnostic.take() {
+            drop(result);
+            return Err(captured(error));
+        }
         if let Some(error) = ledger.failure.take() {
             drop(result);
             return Err(native(error));
         }
         let (value, consumed) = match result {
-            Ok(value) => value,
+            Ok((Some(value), consumed)) => (value, consumed),
+            Ok((None, _)) => unreachable!("captured codec error has a sideband owner"),
             Err(error) => return Err(codec(error, ledger.allocation)),
         };
         if exact && consumed != bytes.len() {
@@ -57466,6 +57880,23 @@ mod original_event_decode {
         original: &crate::memory_accounting::OwnedMemoryReservation,
         bytes: &[u8],
     ) -> Result<OriginalDecoded<T>> {
+        decode_blob_with(original, true, |seed| seed.deserialize(
+            &mut rmp_serde::Deserializer::from_read_ref(bytes)))
+    }
+    pub(super) fn decode_blob_reader<T: StreamedBlobProjection, R: std::io::Read>(
+        original: &crate::memory_accounting::OwnedMemoryReservation, reader: &mut R,
+    ) -> Result<OriginalDecoded<T>> {
+        decode_blob_with(original, false, |seed| seed.deserialize(
+            &mut rmp_serde::Deserializer::new(reader)))
+    }
+    fn decode_blob_with<T: de::DeserializeOwned>(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        payload_allocates: bool,
+        decode: impl FnOnce(Seed<PhantomData<T>>) -> std::result::Result<Option<T>, rmp_serde::decode::Error>,
+    ) -> Result<OriginalDecoded<T>> {
+        let diagnostic = crate::funded_error::OriginalError::prepare(original,
+            "events", "decode_sink_queue_entry", "Reduce pending deliveries or raise MEMORY_LIMIT.")
+            .map_err(Error::NativeEngineOther)?;
         let control = std::mem::size_of::<T>()
             .checked_mul(4)
             .and_then(|n| n.checked_add(128))
@@ -57488,12 +57919,15 @@ mod original_event_decode {
                 "Reduce pending deliveries or raise MEMORY_LIMIT.",
             )?,
             failure: None,
+            diagnostic: None,
+            messagepack: true,
+            payload_allocates,
+            json_diagnostic: None,
         })));
         let old = ACTIVE.with(|slot| slot.replace(Arc::as_ptr(&budget)));
         let scope = Scope(old);
         let json = contextdb_core::types::JsonReadAdmissionGuard::enter(budget.clone());
-        let result = Seed(PhantomData::<T>).deserialize(
-            &mut rmp_serde::Deserializer::from_read_ref(bytes));
+        let result = decode(Seed(PhantomData::<T>));
         drop(json);
         drop(scope);
         // The JSON guard restored its predecessor and released the only Arc
@@ -57507,578 +57941,463 @@ mod original_event_decode {
                 return Err(Error::Other("original JSON decode scope retained its owner".into()));
             }
         };
+        if let Some(error) = ledger.diagnostic.take() {
+            drop(result);
+            return Err(error.into_public_prepared());
+        }
         if let Some(error) = ledger.failure.take() {
             drop(result);
             return Err(native_storage_admission::original_storage_error(native_storage_admission::NativeStorageFailure::Refused(error)));
         }
-        let value = result.map_err(|error| Error::Other(format!("decode blob repository record: {error}").into()))?;
+        let value = match result {
+            Ok(Some(value)) => value,
+            Ok(None) => unreachable!("captured codec error has a sideband owner"),
+            Err(error) => return Err(diagnostic.messagepack(error, ledger.allocation).into_public_prepared()),
+        };
         Ok(OriginalDecoded {
             value,
             allocation: ledger.allocation,
         })
     }
+    /// A native codec transports only its own scalar/foreign errors. An
+    /// engine-owned diagnosis is moved through the existing operation ledger;
+    /// the native visitor returns unit so no allocating sentinel is needed.
+    #[derive(Debug)]
+    enum CodecError<E> { Native(E), Owned(crate::funded_error::OriginalError), Captured }
+    impl<E: std::fmt::Display> std::fmt::Display for CodecError<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Native(error) => std::fmt::Display::fmt(error, f),
+                Self::Owned(error) => std::fmt::Display::fmt(error, f),
+                Self::Captured => f.write_str("codec diagnosis retained by producer"),
+            }
+        }
+    }
+    impl<E: de::Error> std::error::Error for CodecError<E> {}
+    impl<E: de::Error> de::Error for CodecError<E> {
+        // An arbitrary Display is never counted, replayed or declared paid.
+        fn custom<T: std::fmt::Display>(msg: T) -> Self {
+            if terminal::<E>().is_err() { Self::Captured } else { Self::Native(E::custom(msg)) }
+        }
+        fn missing_field(field: &'static str) -> Self { Self::field(field, false) }
+        fn duplicate_field(field: &'static str) -> Self { Self::field(field, true) }
+    }
+    impl<E: de::Error> CodecError<E> {
+        fn field(field: &'static str, duplicate: bool) -> Self {
+            ACTIVE.with(|slot| {
+                let ptr = slot.get();
+                assert!(!ptr.is_null(), "closed diagnostic belongs to active decode");
+                let mut ledger = unsafe { &*ptr }.0.lock();
+                if ledger.failure.is_some() || ledger.diagnostic.is_some() { return Self::Captured; }
+                // Only the marker-selected streamed roots have audited
+                // visitor control flow. Generic roots may catch nested serde
+                // errors; preserve those native errors and keep them unpaid.
+                if ledger.payload_allocates {
+                    drop(ledger);
+                    return Self::Native(if duplicate { E::duplicate_field(field) } else { E::missing_field(field) });
+                }
+                match crate::funded_error::AdmittedDiagnostic::field(
+                    &ledger.allocation, field, duplicate, ledger.messagepack) {
+                    Ok(error) => Self::Owned(error),
+                    Err(error) => { if ledger.failure.is_none() { ledger.failure = Some(error); } Self::Captured }
+                }
+            })
+        }
+    }
+    fn payload_allocates() -> bool {
+        ACTIVE.with(|slot| {
+            let ptr = slot.get();
+            assert!(!ptr.is_null(), "sequence stays in its producer scope");
+            unsafe { &*ptr }.0.lock().payload_allocates
+        })
+    }
+    fn terminal<E>() -> std::result::Result<(), CodecError<E>> {
+        ACTIVE.with(|slot| {
+            let ptr = slot.get();
+            assert!(!ptr.is_null(), "codec adapter remains in its producer scope");
+            let ledger = unsafe { &*ptr }.0.lock();
+            if ledger.failure.is_some() || ledger.diagnostic.is_some() {
+                Err(CodecError::Captured)
+            } else { Ok(()) }
+        })
+    }
+    fn capture<T, E>(result: std::result::Result<T, CodecError<E>>,
+        output: &mut Option<T>,
+    ) -> std::result::Result<(), E> {
+        match result {
+            Ok(value) => { *output = Some(value); Ok(()) }
+            Err(CodecError::Native(error)) => Err(error),
+            Err(CodecError::Owned(error)) => {
+                ACTIVE.with(|slot| {
+                    let ptr = slot.get();
+                    assert!(!ptr.is_null(), "capture remains inside decode scope");
+                    let mut ledger = unsafe { &*ptr }.0.lock();
+                    if ledger.diagnostic.is_none() { ledger.diagnostic = Some(error); }
+                });
+                Ok(())
+            }
+            Err(CodecError::Captured) => Ok(()),
+        }
+    }
     struct Seed<S>(S);
     impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<S> {
-        type Value = S::Value;
-        fn deserialize<D: de::Deserializer<'de>>(
-            self,
-            d: D,
-        ) -> std::result::Result<Self::Value, D::Error> {
-            self.0.deserialize(Admitted(d))
+        type Value = Option<S::Value>;
+        fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> std::result::Result<Self::Value, D::Error> {
+            let mut output = None;
+            capture(self.0.deserialize(Admitted(d)), &mut output)?;
+            Ok(output)
         }
     }
     struct Admitted<D>(D);
-    struct V<VV> {
+    struct V<'a, VV, Out> {
         inner: VV,
         heap: bool,
+        output: &'a mut Option<Out>,
     }
-    impl<'de, VV: Visitor<'de>> Visitor<'de> for V<VV> {
-        type Value = VV::Value;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            self.inner.expecting(f)
+    impl<'de, VV: Visitor<'de>> Visitor<'de> for V<'_, VV, VV::Value> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.inner.expecting(f) }
+        fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<(), E> {
+            capture(self.inner.visit_bool::<CodecError<E>>(value), self.output)
         }
-        fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_bool(value)
+        fn visit_i8<E: de::Error>(self, value: i8) -> std::result::Result<(), E> {
+            capture(self.inner.visit_i8::<CodecError<E>>(value), self.output)
         }
-        fn visit_i8<E: de::Error>(self, value: i8) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_i8(value)
+        fn visit_i16<E: de::Error>(self, value: i16) -> std::result::Result<(), E> {
+            capture(self.inner.visit_i16::<CodecError<E>>(value), self.output)
         }
-        fn visit_i16<E: de::Error>(self, value: i16) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_i16(value)
+        fn visit_i32<E: de::Error>(self, value: i32) -> std::result::Result<(), E> {
+            capture(self.inner.visit_i32::<CodecError<E>>(value), self.output)
         }
-        fn visit_i32<E: de::Error>(self, value: i32) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_i32(value)
+        fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<(), E> {
+            capture(self.inner.visit_i64::<CodecError<E>>(value), self.output)
         }
-        fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_i64(value)
+        fn visit_i128<E: de::Error>(self, value: i128) -> std::result::Result<(), E> {
+            capture(self.inner.visit_i128::<CodecError<E>>(value), self.output)
         }
-        fn visit_i128<E: de::Error>(self, value: i128) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_i128(value)
+        fn visit_u8<E: de::Error>(self, value: u8) -> std::result::Result<(), E> {
+            capture(self.inner.visit_u8::<CodecError<E>>(value), self.output)
         }
-        fn visit_u8<E: de::Error>(self, value: u8) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_u8(value)
+        fn visit_u16<E: de::Error>(self, value: u16) -> std::result::Result<(), E> {
+            capture(self.inner.visit_u16::<CodecError<E>>(value), self.output)
         }
-        fn visit_u16<E: de::Error>(self, value: u16) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_u16(value)
+        fn visit_u32<E: de::Error>(self, value: u32) -> std::result::Result<(), E> {
+            capture(self.inner.visit_u32::<CodecError<E>>(value), self.output)
         }
-        fn visit_u32<E: de::Error>(self, value: u32) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_u32(value)
+        fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<(), E> {
+            capture(self.inner.visit_u64::<CodecError<E>>(value), self.output)
         }
-        fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_u64(value)
+        fn visit_u128<E: de::Error>(self, value: u128) -> std::result::Result<(), E> {
+            capture(self.inner.visit_u128::<CodecError<E>>(value), self.output)
         }
-        fn visit_u128<E: de::Error>(self, value: u128) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_u128(value)
+        fn visit_f32<E: de::Error>(self, value: f32) -> std::result::Result<(), E> {
+            capture(self.inner.visit_f32::<CodecError<E>>(value), self.output)
         }
-        fn visit_f32<E: de::Error>(self, value: f32) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_f32(value)
+        fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<(), E> {
+            capture(self.inner.visit_f64::<CodecError<E>>(value), self.output)
         }
-        fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_f64(value)
+        fn visit_char<E: de::Error>(self, value: char) -> std::result::Result<(), E> {
+            capture(self.inner.visit_char::<CodecError<E>>(value), self.output)
         }
-        fn visit_char<E: de::Error>(self, value: char) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_char(value)
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<(), E> {
+            capture(self.inner.visit_unit::<CodecError<E>>(), self.output)
         }
-        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_unit()
+        fn visit_none<E: de::Error>(self) -> std::result::Result<(), E> {
+            capture(self.inner.visit_none::<CodecError<E>>(), self.output)
         }
-        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-            self.inner.visit_none()
+        fn visit_some<D: de::Deserializer<'de>>(self, d: D) -> std::result::Result<(), D::Error> {
+            capture(self.inner.visit_some(Admitted(d)), self.output)
         }
-        fn visit_some<D: de::Deserializer<'de>>(
-            self,
-            d: D,
-        ) -> std::result::Result<Self::Value, D::Error> {
-            self.inner.visit_some(Admitted(d))
+        fn visit_newtype_struct<D: de::Deserializer<'de>>(self, d: D) -> std::result::Result<(), D::Error> {
+            capture(self.inner.visit_newtype_struct(Admitted(d)), self.output)
         }
-        fn visit_newtype_struct<D: de::Deserializer<'de>>(
-            self,
-            d: D,
-        ) -> std::result::Result<Self::Value, D::Error> {
-            self.inner.visit_newtype_struct(Admitted(d))
+        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<(), E> {
+            let result = admit::<E>(value.len()).and_then(|()| self.inner.visit_str::<CodecError<E>>(value));
+            capture(result, self.output)
         }
-        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
-            admit(value.len())?;
-            self.inner.visit_str(value)
+        fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> std::result::Result<(), E> {
+            let result = admit::<E>(value.len()).and_then(|()| self.inner.visit_borrowed_str::<CodecError<E>>(value));
+            capture(result, self.output)
         }
-        fn visit_borrowed_str<E: de::Error>(
-            self,
-            value: &'de str,
-        ) -> std::result::Result<Self::Value, E> {
-            admit(value.len())?;
-            self.inner.visit_borrowed_str(value)
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> std::result::Result<(), E> {
+            let result = admit::<E>(value.len()).and_then(|()| self.inner.visit_bytes::<CodecError<E>>(value));
+            capture(result, self.output)
         }
-        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> std::result::Result<Self::Value, E> {
-            admit(value.len())?;
-            self.inner.visit_bytes(value)
+        fn visit_borrowed_bytes<E: de::Error>(self, value: &'de [u8]) -> std::result::Result<(), E> {
+            let result = admit::<E>(value.len()).and_then(|()| self.inner.visit_borrowed_bytes::<CodecError<E>>(value));
+            capture(result, self.output)
         }
-        fn visit_borrowed_bytes<E: de::Error>(
-            self,
-            value: &'de [u8],
-        ) -> std::result::Result<Self::Value, E> {
-            admit(value.len())?;
-            self.inner.visit_borrowed_bytes(value)
+        fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<(), E> {
+            capture(self.inner.visit_string::<CodecError<E>>(value), self.output)
         }
-        fn visit_seq<A: de::SeqAccess<'de>>(
-            self,
-            a: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            self.inner.visit_seq(Seq {
-                inner: a,
-                heap: self.heap,
-                first: true,
-            })
+        fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> std::result::Result<(), E> {
+            capture(self.inner.visit_byte_buf::<CodecError<E>>(value), self.output)
         }
-        fn visit_map<A: de::MapAccess<'de>>(
-            self,
-            a: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            self.inner.visit_map(Map {
-                inner: a,
-                first_key: true,
-                first_value: true,
-            })
+        fn visit_seq<A: de::SeqAccess<'de>>(self, a: A) -> std::result::Result<(), A::Error> {
+            capture(self.inner.visit_seq(Seq { inner: a, heap: self.heap, first: true }), self.output)
         }
-        fn visit_enum<A: de::EnumAccess<'de>>(
-            self,
-            a: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            self.inner.visit_enum(Enum(a))
+        fn visit_map<A: de::MapAccess<'de>>(self, a: A) -> std::result::Result<(), A::Error> {
+            capture(self.inner.visit_map(Map { inner: a, first_key: true, first_value: true }), self.output)
+        }
+        fn visit_enum<A: de::EnumAccess<'de>>(self, a: A) -> std::result::Result<(), A::Error> {
+            capture(self.inner.visit_enum(Enum(a)), self.output)
         }
     }
-    struct Seq<A> {
-        inner: A,
-        heap: bool,
-        first: bool,
-    }
+    struct Seq<A> { inner: A, heap: bool, first: bool }
     impl<'de, A: de::SeqAccess<'de>> de::SeqAccess<'de> for Seq<A> {
-        type Error = A::Error;
-        fn next_element_seed<S: DeserializeSeed<'de>>(
-            &mut self,
-            seed: S,
-        ) -> std::result::Result<Option<S::Value>, A::Error> {
+        type Error = CodecError<A::Error>;
+        fn next_element_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> std::result::Result<Option<S::Value>, Self::Error> {
             if self.heap && self.inner.size_hint() != Some(0) {
-                // With size_hint hidden, Vec grows geometrically. Include its
-                // minimum capacity and both allocations during a reallocation.
                 let slots = if self.first { 12 } else { 4 };
                 admit(std::mem::size_of::<S::Value>().saturating_mul(slots))?;
                 self.first = false;
             }
-            self.inner.next_element_seed(Seed(seed))
-        }
-        fn size_hint(&self) -> Option<usize> {
-            if self.heap {
-                Some(0)
-            } else {
-                self.inner.size_hint()
+            match self.inner.next_element_seed(Seed(seed)).map_err(CodecError::Native)? {
+                Some(Some(value)) => Ok(Some(value)), None => Ok(None),
+                Some(None) => Err(CodecError::Captured),
             }
         }
+        fn size_hint(&self) -> Option<usize> { if self.heap { Some(0) } else { self.inner.size_hint() } }
     }
-    struct Map<A> {
-        inner: A,
-        first_key: bool,
-        first_value: bool,
-    }
+    struct Map<A> { inner: A, first_key: bool, first_value: bool }
     impl<'de, A: de::MapAccess<'de>> de::MapAccess<'de> for Map<A> {
-        type Error = A::Error;
-        fn next_key_seed<S: DeserializeSeed<'de>>(
-            &mut self,
-            seed: S,
-        ) -> std::result::Result<Option<S::Value>, A::Error> {
+        type Error = CodecError<A::Error>;
+        fn next_key_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> std::result::Result<Option<S::Value>, Self::Error> {
             if self.inner.size_hint() != Some(0) {
-                let slots = if self.first_key { 16 } else { 4 };
-                admit(
-                    std::mem::size_of::<S::Value>()
-                        .saturating_mul(slots)
-                        .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()),
-                )?;
+                let slots = if self.first_key {16} else {4};
+                admit(std::mem::size_of::<S::Value>().saturating_mul(slots)
+                    .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()))?;
                 self.first_key = false;
             }
-            self.inner.next_key_seed(Seed(seed))
+            match self.inner.next_key_seed(Seed(seed)).map_err(CodecError::Native)? {
+                Some(Some(value)) => Ok(Some(value)), None => Ok(None), Some(None) => Err(CodecError::Captured),
+            }
         }
-        fn next_value_seed<S: DeserializeSeed<'de>>(
-            &mut self,
-            seed: S,
-        ) -> std::result::Result<S::Value, A::Error> {
-            let slots = if self.first_value { 16 } else { 4 };
-            admit(
-                std::mem::size_of::<S::Value>()
-                    .saturating_mul(slots)
-                    .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()),
-            )?;
+        fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> std::result::Result<S::Value, Self::Error> {
+            let slots = if self.first_value {16} else {4};
+            admit(std::mem::size_of::<S::Value>().saturating_mul(slots)
+                .saturating_add(128 + 11 * std::mem::size_of::<S::Value>()))?;
             self.first_value = false;
-            self.inner.next_value_seed(Seed(seed))
+            self.inner.next_value_seed(Seed(seed)).map_err(CodecError::Native)?.ok_or(CodecError::Captured)
         }
-        fn size_hint(&self) -> Option<usize> {
-            Some(0)
-        }
+        fn size_hint(&self) -> Option<usize> { Some(0) }
     }
     struct Enum<A>(A);
     impl<'de, A: de::EnumAccess<'de>> de::EnumAccess<'de> for Enum<A> {
-        type Error = A::Error;
+        type Error = CodecError<A::Error>;
         type Variant = Variant<A::Variant>;
-        fn variant_seed<S: DeserializeSeed<'de>>(
-            self,
-            seed: S,
-        ) -> std::result::Result<(S::Value, Self::Variant), A::Error> {
-            self.0
-                .variant_seed(Seed(seed))
-                .map(|(value, variant)| (value, Variant(variant)))
+        fn variant_seed<S: DeserializeSeed<'de>>(self, seed: S) -> std::result::Result<(S::Value, Self::Variant), Self::Error> {
+            let (value, variant) = self.0.variant_seed(Seed(seed)).map_err(CodecError::Native)?;
+            Ok((value.ok_or(CodecError::Captured)?, Variant(variant)))
         }
     }
     struct Variant<A>(A);
     impl<'de, A: de::VariantAccess<'de>> de::VariantAccess<'de> for Variant<A> {
-        type Error = A::Error;
-        fn unit_variant(self) -> std::result::Result<(), A::Error> {
-            self.0.unit_variant()
+        type Error = CodecError<A::Error>;
+        fn unit_variant(self) -> std::result::Result<(), Self::Error> { self.0.unit_variant().map_err(CodecError::Native) }
+        fn newtype_variant_seed<S: DeserializeSeed<'de>>(self, seed: S) -> std::result::Result<S::Value, Self::Error> {
+            self.0.newtype_variant_seed(Seed(seed)).map_err(CodecError::Native)?.ok_or(CodecError::Captured)
         }
-        fn newtype_variant_seed<S: DeserializeSeed<'de>>(
-            self,
-            seed: S,
-        ) -> std::result::Result<S::Value, A::Error> {
-            self.0.newtype_variant_seed(Seed(seed))
+        fn tuple_variant<VV: Visitor<'de>>(self, len: usize, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            let mut output = None;
+            self.0.tuple_variant(len, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn tuple_variant<VV: Visitor<'de>>(
-            self,
-            len: usize,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, A::Error> {
-            self.0.tuple_variant(
-                len,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
-        }
-        fn struct_variant<VV: Visitor<'de>>(
-            self,
-            fields: &'static [&'static str],
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, A::Error> {
-            self.0.struct_variant(
-                fields,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
+        fn struct_variant<VV: Visitor<'de>>(self, fields: &'static [&'static str], visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            let mut output = None;
+            self.0.struct_variant(fields, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
     }
     impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Admitted<D> {
-        type Error = D::Error;
-        fn deserialize_any<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_any(V {
-                inner: visitor,
-                heap: false,
-            })
+        type Error = CodecError<D::Error>;
+        fn deserialize_any<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_any(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_bool<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_bool(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_bool<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_bool(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_i8<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_i8(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_i8<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_i8(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_i16<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_i16(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_i16<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_i16(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_i32<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_i32(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_i32<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_i32(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_i64<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_i64(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_i64<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_i64(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_i128<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_i128(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_i128<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_i128(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_u8<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_u8(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_u8<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_u8(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_u16<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_u16(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_u16<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_u16(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_u32<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_u32(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_u32<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_u32(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_u64<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_u64(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_u64<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_u64(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_u128<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_u128(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_u128<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_u128(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_f32<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_f32(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_f32<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_f32(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_f64<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_f64(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_f64<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_f64(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_char<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_char(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_char<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_char(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_str<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_str(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_str<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_str(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_string<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_str(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_string<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_str(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_bytes<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_bytes(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_bytes<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_bytes(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_byte_buf<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_bytes(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_byte_buf<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_bytes(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_option<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_option(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_option<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_option(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_unit<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_unit(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_unit<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_unit(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_seq<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_seq(V {
-                inner: visitor,
-                heap: true,
-            })
+        fn deserialize_seq<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_seq(V { inner: visitor, heap: payload_allocates(), output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_map<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_map(V {
-                inner: visitor,
-                heap: true,
-            })
+        fn deserialize_map<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_map(V { inner: visitor, heap: true, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_identifier<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_identifier(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_identifier<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_identifier(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_ignored_any<VV: Visitor<'de>>(
-            self,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_ignored_any(V {
-                inner: visitor,
-                heap: false,
-            })
+        fn deserialize_ignored_any<VV: Visitor<'de>>(self, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_ignored_any(V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_unit_struct<VV: Visitor<'de>>(
-            self,
-            name: &'static str,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_unit_struct(
-                name,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
+        fn deserialize_unit_struct<VV: Visitor<'de>>(self, name: &'static str, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_unit_struct(name, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_newtype_struct<VV: Visitor<'de>>(
-            self,
-            name: &'static str,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_newtype_struct(
-                name,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
+        fn deserialize_newtype_struct<VV: Visitor<'de>>(self, name: &'static str, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_newtype_struct(name, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_tuple<VV: Visitor<'de>>(
-            self,
-            len: usize,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_tuple(
-                len,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
+        fn deserialize_tuple<VV: Visitor<'de>>(self, len: usize, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_tuple(len, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_tuple_struct<VV: Visitor<'de>>(
-            self,
-            name: &'static str,
-            len: usize,
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_tuple_struct(
-                name,
-                len,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
+        fn deserialize_tuple_struct<VV: Visitor<'de>>(self, name: &'static str, len: usize, visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_tuple_struct(name, len, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_struct<VV: Visitor<'de>>(
-            self,
-            name: &'static str,
-            fields: &'static [&'static str],
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_struct(
-                name,
-                fields,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
+        fn deserialize_struct<VV: Visitor<'de>>(self, name: &'static str, fields: &'static [&'static str], visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_struct(name, fields, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn deserialize_enum<VV: Visitor<'de>>(
-            self,
-            name: &'static str,
-            variants: &'static [&'static str],
-            visitor: VV,
-        ) -> std::result::Result<VV::Value, D::Error> {
-            self.0.deserialize_enum(
-                name,
-                variants,
-                V {
-                    inner: visitor,
-                    heap: false,
-                },
-            )
+        fn deserialize_enum<VV: Visitor<'de>>(self, name: &'static str, variants: &'static [&'static str], visitor: VV) -> std::result::Result<VV::Value, Self::Error> {
+            terminal::<D::Error>()?;
+            let mut output = None;
+            self.0.deserialize_enum(name, variants, V { inner: visitor, heap: false, output: &mut output }).map_err(CodecError::Native)?;
+            output.ok_or(CodecError::Captured)
         }
-        fn is_human_readable(&self) -> bool {
-            self.0.is_human_readable()
-        }
+        fn is_human_readable(&self) -> bool { self.0.is_human_readable() }
     }
 }
 
@@ -58118,6 +58437,14 @@ impl RedbPersistence {
         bytes: &[u8],
     ) -> Result<OriginalDecoded<T>> {
         original_event_decode::decode_config_compatible(original, bytes)
+    }
+
+    /// The streamed blob projection uses exactly the same diagnostic adapter
+    /// as the slice path; its reader keeps the original storage failure.
+    pub(crate) fn decode_owned_blob_reader<T: StreamedBlobProjection, R: std::io::Read>(
+        original: &crate::memory_accounting::OwnedMemoryReservation, reader: &mut R,
+    ) -> Result<OriginalDecoded<T>> {
+        original_event_decode::decode_blob_reader(original, reader)
     }
 
     pub(crate) fn decode_owned_event<T: serde::de::DeserializeOwned>(
@@ -58373,16 +58700,17 @@ impl RedbPersistence {
         if remove_id.is_none() && put.is_none() {
             return Ok(());
         }
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         let prepared = (|| -> crate::funded_error::OriginalResult<_> {
             // All escaping serialization/key controls are paid by this immutable
             // seed before the transaction can publish their corresponding writes.
-            let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
+            let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink).map_err(|error| diagnostic.error(error))?;
             let remove_key = remove_id
                 .map(|id| OwnedEventKey::queue_identity(original, sink, id))
-                .transpose()?;
+                .transpose().map_err(|error| diagnostic.error(error))?;
             let put_key = put
                 .map(|(id, _)| OwnedEventKey::queue_identity(original, sink, id))
-                .transpose()?;
+                .transpose().map_err(|error| diagnostic.error(error))?;
             let encoded_put = put
                 .map(|(_, entry)| Self::encode_owned_event_funded(original, entry))
                 .transpose()?;
@@ -58394,7 +58722,7 @@ impl RedbPersistence {
                         sink,
                     )
                 })
-                .transpose()?;
+                .transpose().map_err(|error| diagnostic.error(error))?;
             let unconfirmed_key = (unconfirmed_delta != 0)
                 .then(|| {
                     OwnedEventKey::concatenated(
@@ -58403,17 +58731,17 @@ impl RedbPersistence {
                         sink,
                     )
                 })
-                .transpose()?;
-            let mut identity = content_identity::OriginalIdentityMutations::new(original, 4)?;
+                .transpose().map_err(|error| diagnostic.error(error))?;
+            let mut identity = content_identity::OriginalIdentityMutations::new(original, 4).map_err(|error| diagnostic.error(error))?;
             let proof = content_identity::original_writer::ProofAdmission::new(
                 original,
                 self.proof_scratch_owner(),
-            )?;
+            ).map_err(|error| diagnostic.error(error))?;
             if let Some(key) = &remove_key {
-                identity.push_status::<u64>(b"sink-queue", key.value.as_bytes(), None)?;
+                identity.push_status::<u64>(b"sink-queue", key.value.as_bytes(), None).map_err(|error| diagnostic.error(error))?;
             }
             if let (Some(key), Some((_, entry))) = (&put_key, put) {
-                identity.push_status(b"sink-queue", key.value.as_bytes(), Some(entry))?;
+                identity.push_status(b"sink-queue", key.value.as_bytes(), Some(entry)).map_err(|error| diagnostic.error(error))?;
             }
             Ok((
                 table_name,
@@ -58447,23 +58775,23 @@ impl RedbPersistence {
                     TableDefinition::new(&table_name.value);
                 let mut table = write_txn
                     .open_table(definition)
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
                 if let Some(id) = remove_id {
-                    table.remove(id).map_err(|error| Self::storage_error_funded(original, error))?;
+                    table.remove(id).map_err(|error| diagnostic.storage(original, error))?;
                 }
                 if let (Some((id, _)), Some(encoded)) = (put, &encoded_put) {
                     table
                         .insert(id, encoded.bytes.as_slice())
-                        .map_err(|error| Self::storage_error_funded(original, error))?;
+                        .map_err(|error| diagnostic.storage(original, error))?;
                 }
             }
             if let Some(key) = &uncertain_key {
                 let mut table = write_txn
                     .open_table(CONFIG_TABLE)
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
                 let previous: u64 = match table
                     .get(key.value.as_str())
-                    .map_err(|error| Self::storage_error_funded(original, error))?
+                    .map_err(|error| diagnostic.storage(original, error))?
                 {
                     Some(value) => Self::decode_owned_event_funded::<u64>(original, value.value())?.value,
                     None => 0,
@@ -58471,16 +58799,16 @@ impl RedbPersistence {
                 let encoded = Self::encode_owned_event_funded(original, &previous.saturating_add(1))?;
                 table
                     .insert(key.value.as_str(), encoded.bytes.as_slice())
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
-                identity.push_config(&key.value, Some(&encoded.bytes))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
+                identity.push_config(&key.value, Some(&encoded.bytes)).map_err(|error| diagnostic.error(error))?;
             }
             if let Some(key) = &unconfirmed_key {
                 let mut table = write_txn
                     .open_table(CONFIG_TABLE)
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
                 let previous: u64 = match table
                     .get(key.value.as_str())
-                    .map_err(|error| Self::storage_error_funded(original, error))?
+                    .map_err(|error| diagnostic.storage(original, error))?
                 {
                     Some(value) => Self::decode_owned_event_funded::<u64>(original, value.value())?.value,
                     None => 0,
@@ -58490,28 +58818,28 @@ impl RedbPersistence {
                 } else {
                     previous.checked_sub(1)
                 }
-                .ok_or_else(|| Error::Other(("sink attempt summary overflow".to_owned()).into()))?;
+                .ok_or_else(|| Error::Other("sink attempt summary overflow".into())).map_err(|error| diagnostic.error(error))?;
                 let encoded = Self::encode_owned_event_funded(original, &next)?;
                 table
                     .insert(key.value.as_str(), encoded.bytes.as_slice())
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
-                identity.push_config(&key.value, Some(&encoded.bytes))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
+                identity.push_config(&key.value, Some(&encoded.bytes)).map_err(|error| diagnostic.error(error))?;
             }
             Self::apply_owned_content_identity_with_manifests_in_write(
                 &write_txn,
                 &identity.mutations,
                 &[],
                 &mut proof,
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            ).map_err(|error| diagnostic.error(error))?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None).map_err(|error| diagnostic.error(error))?;
             {
                 #[cfg(any(test, feature = "test-seams"))]
-                graph_observation_checkpoint(10)?;
+                graph_observation_checkpoint(10).map_err(|error| diagnostic.error(error))?;
                 self.commit_exact_queue_root(write_txn, original, completion, cleanup)?;
                 #[cfg(any(test, feature = "test-seams"))]
                 {
                     graph_publication_attempt.committed();
-                    graph_observation_checkpoint(11)?;
+                    graph_observation_checkpoint(11).map_err(|error| diagnostic.error(error))?;
                 }
             }
             Ok(())
@@ -58530,9 +58858,10 @@ impl RedbPersistence {
         if remove_ids.is_empty() {
             return Ok(());
         }
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
         let prepared = (|| -> crate::funded_error::OriginalResult<_> {
-            let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink)?;
-            let removals = Self::prepare_owned_sink_queue_removals(original, sink, remove_ids)?;
+            let table_name = OwnedEventKey::concatenated(original, "__sink_queue_", sink).map_err(|error| diagnostic.error(error))?;
+            let removals = Self::prepare_owned_sink_queue_removals(original, sink, remove_ids).map_err(|error| diagnostic.error(error))?;
             let summary_key = (unconfirmed > 0)
                 .then(|| {
                     OwnedEventKey::concatenated(
@@ -58541,12 +58870,12 @@ impl RedbPersistence {
                         sink,
                     )
                 })
-                .transpose()?;
-            let identity = content_identity::OriginalIdentityMutations::new(original, 1)?;
+                .transpose().map_err(|error| diagnostic.error(error))?;
+            let identity = content_identity::OriginalIdentityMutations::new(original, 1).map_err(|error| diagnostic.error(error))?;
             let proof = content_identity::original_writer::ProofAdmission::new(
                 original,
                 self.proof_scratch_owner(),
-            )?;
+            ).map_err(|error| diagnostic.error(error))?;
             Ok((table_name, removals, summary_key, identity, proof))
         })();
         let (table_name, removals, summary_key, mut identity, mut proof) = prepared?;
@@ -58560,46 +58889,46 @@ impl RedbPersistence {
                     TableDefinition::new(&table_name.value);
                 let mut table = write_txn
                     .open_table(definition)
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
                 for id in remove_ids {
-                    table.remove(*id).map_err(|error| Self::storage_error_funded(original, error))?;
+                    table.remove(*id).map_err(|error| diagnostic.storage(original, error))?;
                 }
             }
             if let Some(key) = &summary_key {
                 let mut table = write_txn
                     .open_table(CONFIG_TABLE)
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
                 let previous: u64 = match table
                     .get(key.value.as_str())
-                    .map_err(|error| Self::storage_error_funded(original, error))?
+                    .map_err(|error| diagnostic.storage(original, error))?
                 {
                     Some(value) => Self::decode_owned_event_funded::<u64>(original, value.value())?.value,
                     None => 0,
                 };
                 let next = previous
                     .checked_sub(unconfirmed)
-                    .ok_or_else(|| Error::Other(("sink attempt summary overflow".to_owned()).into()))?;
+                    .ok_or_else(|| Error::Other("sink attempt summary overflow".into())).map_err(|error| diagnostic.error(error))?;
                 let encoded = Self::encode_owned_event_funded(original, &next)?;
                 table
                     .insert(key.value.as_str(), encoded.bytes.as_slice())
-                    .map_err(|error| Self::storage_error_funded(original, error))?;
-                identity.push_config(&key.value, Some(&encoded.bytes))?;
+                    .map_err(|error| diagnostic.storage(original, error))?;
+                identity.push_config(&key.value, Some(&encoded.bytes)).map_err(|error| diagnostic.error(error))?;
             }
             Self::apply_owned_content_identity_with_manifests_in_write(
                 &write_txn,
                 &removals.mutations,
                 &identity.mutations,
                 &mut proof,
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            ).map_err(|error| diagnostic.error(error))?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None).map_err(|error| diagnostic.error(error))?;
             {
                 #[cfg(any(test, feature = "test-seams"))]
-                graph_observation_checkpoint(10)?;
+                graph_observation_checkpoint(10).map_err(|error| diagnostic.error(error))?;
                 self.commit_exact_queue_root(write_txn, original, completion, cleanup)?;
                 #[cfg(any(test, feature = "test-seams"))]
                 {
                     graph_publication_attempt.committed();
-                    graph_observation_checkpoint(11)?;
+                    graph_observation_checkpoint(11).map_err(|error| diagnostic.error(error))?;
                 }
             }
             Ok(())
@@ -58663,12 +58992,45 @@ impl<'o> OriginalPersistenceFrame<'o> {
         &self,
         values: impl IntoIterator<Item = &'a Value>,
     ) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
-        let (bytes, _) = crate::memory_accounting::preparation_json_work_bytes(values)?;
+        use contextdb_core::read_memory::NativeRefusal;
+        struct Count(Option<usize>);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.and_then(|n| n.checked_add(bytes.len()));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut bytes = 0usize;
+        let mut diagnostic = None;
+        for value in values {
+            let Value::Json(json) = value else { continue; };
+            if diagnostic.is_none() {
+                diagnostic = Some(crate::funded_error::OriginalError::prepare(self.original,
+                    "persistence", "prepare_commit",
+                    "Raise MEMORY_LIMIT to admit commit preparation.")
+                    .map_err(Error::NativeEngineOther)?);
+            }
+            let mut count = Count(Some(0));
+            serde_json::to_writer(&mut count, json).map_err(|error| diagnostic.take()
+                .expect("measurement has its prepared unqualified cell")
+                .json_measure(error).into_public_prepared())?;
+            let measured = count.0.ok_or(Error::NativeEngineOther(NativeRefusal::Other(
+                "JSON serialization length overflow")))?;
+            bytes = bytes.max(measured);
+        }
+        drop(diagnostic);
         if bytes == 0 { return Ok(None); }
-        Ok(Some(crate::memory_accounting::reserve_preparation_from_original(
-            self.original, bytes, "persistence", "prepare_commit",
+        // Selected Value fields and both outer passes serialize sequentially.
+        // Their exact native temporaries die before reuse of this workspace;
+        // destination buffers and outer diagnostic sources remain additive.
+        let layout = std::alloc::Layout::array::<u8>(bytes).map_err(|_| {
+            Error::NativeEngineOther(NativeRefusal::Other("JSON serialization buffer layout overflow"))
+        })?;
+        Ok(Some(crate::memory_accounting::reserve_preparation_original_native(
+            self.original, layout.size(), "persistence", "prepare_commit",
             "Raise MEMORY_LIMIT to admit commit preparation.",
-        )?))
+        ).map_err(Error::NativeEngineOther)?))
     }
     pub(crate) fn record<T: serde::Serialize + ?Sized>(&self, value: &T) -> Result<()> {
         self.reserve(content_identity::original_record_work_bytes(value)?)
@@ -58832,7 +59194,7 @@ pub(crate) fn refuse_identity_growth_at_for_test(site: Option<&'static str>) {
 // flush. Its container is destroyed before that operation refunds its storage.
 struct WriterMutationVector {
     values: Vec<content_identity::ContentIdentityMutation>,
-    owner: Arc<crate::read_image_memory::ImageMemory>,
+    owner: crate::read_image_memory::ImageMemoryHandle,
 }
 impl WriterMutationVector {
     fn with_capacity(capacity: usize) -> Result<Self> {
@@ -59100,7 +59462,7 @@ impl OwnedEncodedEventSource<'_> {
             _allocation: allocation,
         };
         self.visit(sink, |id, bytes| {
-            let mut entry = RedbPersistence::decode_owned_event::<SinkQueueEntry>(original, bytes)?;
+            let mut entry = original_event_decode::decode_sink_entry(original, bytes)?;
             crate::memory_accounting::merge_preparation_original(
                 &mut loaded._allocation,
                 &mut entry.allocation,
@@ -59970,10 +60332,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                         let Some((key, mut edge)) = next else { break; };
                         if edge.source != *source || edge.target != *target
                             || edge.edge_type != *edge_type {
-                            return Err(Error::StoreCorrupted {
-                                path: self.path.display().to_string(),
-                                reason: "graph posting is outside its edge identity".into(),
-                            });
+                            return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), self.path.display(), "graph posting is outside its edge identity".into()));
                         }
                         if edge.deleted_tx.is_none() {
                             found = true;
@@ -59982,10 +60341,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                             if selected.as_ref().is_none_or(|(_, _, prior)| order > *prior) {
                                 if let Some((p, d, prior)) = selected {
                                     if p.len() != key.len() {
-                                        return Err(Error::StoreCorrupted {
-                                            path: self.path.display().to_string(),
-                                            reason: "selected graph predecessor width changed".into(),
-                                        });
+                                        return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(original), self.path.display(), "selected graph predecessor width changed".into()));
                                     }
                                     p.copy_from_slice(&key);
                                     *d = *deleted_tx;
@@ -60255,15 +60611,9 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                     if let ChangeLogEntry::EdgeDelete { source, target, edge_type, .. } = entry {
                         let selected_index = ws.adj_deletes.iter().position(|(s, k, t, _)|
                             s == source && t == target && k == edge_type
-                        ).ok_or_else(|| Error::StoreCorrupted {
-                            path: self.path.display().to_string(),
-                            reason: "ordinary graph deletion has no selected write-set predecessor".into(),
-                        })?;
+                        ).ok_or_else(|| crate::funded_error::corruption_text(crate::funded_error::original_budget(original), self.path.display(), "ordinary graph deletion has no selected write-set predecessor".into()))?;
                         let (p, d, _) = selected_deletions[selected_index].as_ref()
-                            .ok_or_else(|| Error::StoreCorrupted {
-                                path: self.path.display().to_string(),
-                                reason: "ordinary graph deletion selected predecessor is missing".into(),
-                            })?;
+                            .ok_or_else(|| crate::funded_error::corruption_text(crate::funded_error::original_budget(original), self.path.display(), "ordinary graph deletion selected predecessor is missing".into()))?;
                         self.encode_change_log_with_selected_predecessor_in_write(
                             &write_txn, entry, Some((p.as_slice(), *d)), &mut encoded,
                         )?;
@@ -61487,7 +61837,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 for item in table.iter().map_err(Self::storage_error)? {
                     let frame = OriginalPersistenceFrame::new(frame.original)?;
                     let (id, value) = item.map_err(Self::storage_error)?;
-                    let entry: SinkQueueEntry = frame.decode(value.value())?;
+                    let mut decoded = original_event_decode::decode_sink_entry(frame.original, value.value())?;
+                    frame.retain(&mut decoded.allocation)?;
+                    let entry = decoded.value;
                     frame.reserve(sink.len().saturating_add(128))?;
                     let key = format!("{}:{sink}:{}", sink.len(), id.value());
                     identity_mutations.push(
@@ -61583,7 +61935,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             graph_selection: None,
             graph_occurrences: false,
             replace_vectors: false,
-            vector_image_memory: crate::read_image_memory::ImageMemory::new(None),
+            vector_image_memory: crate::read_image_memory::ImageMemory::new(None)?,
             retired_vector_construction: parking_lot::Mutex::new(Vec::new()),
             table_meta: HashMap::new(),
             row_changed_tables: HashSet::new(),
@@ -62605,7 +62957,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
         bytes: &[u8],
         _meta: Option<&TableMeta>,
     ) -> Result<VersionedRow> {
-        let persisted: PersistedVersionedRow = frame.decode(bytes)?;
+        let mut decoded = original_event_decode::decode_row(frame.original, bytes)?;
+        frame.retain(&mut decoded.allocation)?;
+        let persisted = decoded.value;
         frame.reserve(
             persisted
                 .values
@@ -62795,25 +63149,16 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         .map_err(Self::storage_error)?
                         .map(|value| Self::decode_exact(value.value()))
                         .transpose()?
-                        .ok_or_else(|| Error::StoreCorrupted {
-                            path: current_name.clone(),
-                            reason: "current index has no posting for a deleted row".into(),
-                        })?;
+                        .ok_or_else(|| crate::funded_error::corruption_text(crate::funded_error::original_budget(frame.original), &current_name, "current index has no posting for a deleted row".into()))?;
                     let key = DurableRelationalIndexKey::new(old_key, old.row_id, created_tx)?;
                     let stamp: Option<TxId> = index
                         .get(&key)
                         .map_err(Self::storage_error)?
                         .map(|value| Self::decode_exact(value.value()))
                         .transpose()?
-                        .ok_or_else(|| Error::StoreCorrupted {
-                            path: name.clone(),
-                            reason: "current index names a missing versioned posting".into(),
-                        })?;
+                        .ok_or_else(|| crate::funded_error::corruption_text(crate::funded_error::original_budget(frame.original), &name, "current index names a missing versioned posting".into()))?;
                     if stamp.is_some() {
-                        return Err(Error::StoreCorrupted {
-                            path: name.clone(),
-                            reason: "current index names a deleted posting".into(),
-                        });
+                        return Err(crate::funded_error::corruption_text(crate::funded_error::original_budget(frame.original), &name, "current index names a deleted posting".into()));
                     }
                     current.remove(&logical_key).map_err(Self::storage_error)?;
                     index.put(commitments, write_txn, key, Some(*deleted_tx))?;
@@ -62918,9 +63263,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         .checked_sub(decrements)
                         .and_then(|count| count.checked_add(increments))
                         .ok_or_else(|| Error::StoreCorrupted {
-                            path: "relational index count table".to_owned(),
-                            reason: "live index-prefix cardinality underflowed or overflowed"
-                                .to_owned(),
+                            path: "relational index count table".into(),
+                            reason: "live index-prefix cardinality underflowed or overflowed".into(),
                         })?;
                     #[cfg(any(test, feature = "test-seams"))]
                     observe_index_prefix_count_value(&key, (next > 0).then_some(next));
@@ -62981,10 +63325,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     // postings, so a posting that does not match it IS a damaged
                     // store and is reported as one.
                     Self::validated_index_position(&declaration, previous_meta, &position)
-                        .map_err(|reason| Error::StoreCorrupted {
-                            path: database_path.display().to_string(),
-                            reason,
-                        })?;
+                        .map_err(|reason| crate::funded_error::corruption_display(crate::funded_error::original_budget(frame.original), database_path.display(), reason))?;
                     if deleted_tx.is_some() {
                         continue;
                     }
@@ -63090,10 +63431,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     .expect("an existing index iterator entry decodes");
                     let (_, position, deleted_tx) = decoded;
                     Self::validated_index_position(&declaration, meta, &position).map_err(
-                        |reason| Error::StoreCorrupted {
-                            path: database_path.display().to_string(),
-                            reason,
-                        },
+                        |reason| crate::funded_error::corruption_display(crate::funded_error::original_budget(frame.original), database_path.display(), reason),
                     )?;
                     if deleted_tx.is_some() {
                         continue;
@@ -63437,3 +63775,41 @@ impl RetainedReadSource {
         Ok((self.snapshot, self.logical_frontier, self.graph_lsn_frontier))
     }
 }
+
+#[cfg(all(test, feature = "test-seams"))]
+impl RedbPersistence {
+    pub(crate) fn recycle_cache_handle_for_test(&self) -> Result<Option<u64>> {
+        let mut handle = self.db.write().unwrap();
+        self.recycle_database_handle(&mut handle)
+    }
+    pub(crate) fn original_cache_reserve_for_test(&self) -> (usize, usize, usize) {
+        cache_reserve::last_reserve_for_test()
+    }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+impl RedbPersistence {
+    pub(crate) fn original_cache_controls_for_test(&self) -> redb::CacheReserveOwner {
+        self.cache_installation.owner.lock().as_ref().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_fixture_cache_reserve_for_test(
+    database: &redb::Database,
+    accountant: &crate::memory_accounting::AccountantHandle,
+    capacity: usize,
+) -> (redb::CacheReserveOwner, usize) {
+    // Exercise the SAME settlement and genuine original invoice as the engine.
+    // No disconnected parent or numeric-only capacity discharges a source bill.
+    cache_reserve::with_preparation(accountant, true, || {
+        let bytes = database.settle_startup_cache_budget(capacity).map_err(RedbPersistence::storage_error)?;
+        let reserve = cache_reserve::original(accountant, bytes, false)?;
+        let control = cache_reserve::last_reserve_for_test().1;
+        Ok((database.retain_cache_reserve(reserve), bytes + control))
+    }).unwrap()
+}
+
+#[cfg(test)]
+#[path = "persistence/direct_source_contract_rows.rs"]
+mod direct_source_contract_rows;

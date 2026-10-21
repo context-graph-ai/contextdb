@@ -110,10 +110,8 @@ impl RedbPersistence {
                 continue;
             };
             let name = Self::relational_index_table_name(table, &declaration.name);
-            let damage = |reason: &str| Error::StoreCorrupted {
-                path: name.clone(),
-                reason: reason.into(),
-            };
+            let damage = |reason: &str| crate::funded_error::corruption_display(
+                memory.diagnostic_budget(), &name, reason);
             let definition = TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(&name);
             let index = match write.open_table(definition) {
                 Ok(index) => index,
@@ -260,10 +258,7 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => continue,
                 Err(error) => return Err(Self::storage_error(error)),
             };
-            let corrupt = |reason: &str| Error::StoreCorrupted {
-                path: name.clone(),
-                reason: reason.to_owned(),
-            };
+            let corrupt = |reason: &str| crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), &name, reason);
             let normalized =
                 contextdb_relational::index_key_for_row(&declaration.columns, &row.values);
             let probe =
@@ -380,8 +375,8 @@ impl RedbPersistence {
                             .unwrap_or(0)
                             .checked_sub(1)
                             .ok_or_else(|| Error::StoreCorrupted {
-                                path: "relational index count table".to_owned(),
-                                reason: "live index-prefix cardinality underflowed".to_owned(),
+                                path: "relational index count table".into(),
+                                reason: "live index-prefix cardinality underflowed".into(),
                             })?;
                         if next == 0 {
                             counts

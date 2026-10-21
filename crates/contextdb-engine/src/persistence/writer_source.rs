@@ -205,10 +205,7 @@ impl WriterSnapshot {
             .get(key.as_slice())
             .map_err(RedbPersistence::storage_error)?
             .map(|value| value.value().len())
-            .ok_or_else(|| Error::StoreCorrupted {
-                path: table.to_owned(),
-                reason: "selected saved row is missing".into(),
-            })
+            .ok_or_else(|| crate::funded_error::corruption_text(owner.diagnostic_budget(), table, "selected saved row is missing".into()))
     }
 
     pub(crate) fn captured_table_meta(&self, table: &str) -> Option<TableMeta> {
@@ -398,6 +395,68 @@ impl RedbPersistence {
         })))
     }
 
+    /// The local policy publisher lends its Original explicitly. Unchanged
+    /// table bodies share their old paid Arcs; the successor map and changed
+    /// body each keep independent credit through their last captured reader.
+    pub(crate) fn prepare_writer_policy_schema_change(
+        &self,
+        original: &OwnedMemoryReservation,
+        name: &str,
+        meta: &TableMeta,
+    ) -> Result<Option<Arc<WriterSchema>>> {
+        self.prepare_proof_owner()?;
+        if self.proof_accountant().is_none() {
+            return Ok(None);
+        }
+        let base = self.prepared_writer_schema()?;
+        if !base.tables.contains_key(name) {
+            return Err(Error::TableNotFound(name.to_string()));
+        }
+        let map_plan = crate::memory_accounting::native_map_plan::<String, Arc<WriterTableMeta>>(
+            base.tables.len(),
+        )?;
+        let bytes = map_plan
+            .layout
+            .size()
+            .saturating_add(base.tables.keys().map(String::len).sum::<usize>());
+        let memory = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            bytes,
+            "writer_source",
+            "captured_policy_schema",
+            HINT,
+        )?
+        .with_enclosing_arc_control_original::<WriterSchema>()?;
+        let body_memory = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            meta.metadata_bytes().saturating_add(64),
+            "writer_source",
+            "captured_policy_schema",
+            HINT,
+        )?
+        .with_enclosing_arc_control_original::<WriterTableMeta>()?;
+        let body = Arc::new(WriterTableMeta {
+            meta: meta.clone(),
+            _memory: body_memory,
+        });
+        let mut tables = HashMap::with_capacity(base.tables.len());
+        crate::memory_accounting::validate_native_map_capacity(&tables, &map_plan)?;
+        for (table, owned) in &base.tables {
+            tables.insert(
+                table.clone(),
+                if table == name {
+                    body.clone()
+                } else {
+                    owned.clone()
+                },
+            );
+        }
+        Ok(Some(Arc::new(WriterSchema {
+            tables,
+            _memory: memory,
+        })))
+    }
+
     pub(crate) fn complete_writer_schema_change(&self, schema: Option<Arc<WriterSchema>>) {
         if let Some(schema) = schema {
             let prior = self.writer_schema.lock().replace(schema);
@@ -412,6 +471,9 @@ impl RedbPersistence {
         tables: &BTreeSet<String>,
         edges: &[AdjEntry],
     ) -> Result<PreparedWriterErasure> {
+        #[cfg(test)]
+        let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
+            "RedbPersistence::prepare_writer_erasure");
         let roots = {
             let mut roots = self.writer_snapshots.lock();
             roots.retain(|root| root.strong_count() != 0);
@@ -568,13 +630,14 @@ impl RedbPersistence {
         lsn: Lsn,
         control: &mut Option<OwnedMemoryReservation>,
     ) -> crate::funded_error::OriginalResult<PreparedWriterSnapshot> {
-        crate::memory_accounting::persistence_original_projection(original)?;
+        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
+        crate::memory_accounting::persistence_original_projection(original).map_err(|error| diagnostic.error(error))?;
         let accountant = original.accountant().clone();
         let schema = self.writer_schema.lock().as_ref().cloned()
-            .ok_or_else(|| Error::Other("publication schema was not prepared".into()))?;
+            .ok_or_else(|| diagnostic.error(Error::Other("publication schema was not prepared".into())))?;
         let custody_groups_complete = view.bytes_equal(super::custody_groups::GROUP_TABLE,
             super::custody_groups::COMPLETE, super::custody_groups::COMPLETE_VALUE)
-            .map_err(|error| Self::storage_error_funded(original, error))?;
+            .map_err(|error| diagnostic.storage(original, error))?;
         let root = WriterSnapshotHandle::native(WriterSnapshot {
             read: parking_lot::RwLock::new(None), identity: view.identity(),
             active: std::sync::atomic::AtomicBool::new(false), custody_groups_complete,
@@ -617,22 +680,22 @@ impl RedbPersistence {
     /// Exact read-preparation endpoint. The consuming write mints the identity;
     /// only its already-sealed tree is inspected. A caller must retain the
     /// private failure through its result loan, using the funded-error route.
-    /// The active OriginalResult consumer below still uses prepare_commit;
-    /// prepared-read cause materialization and producer funding remain unjoined.
+    /// The active queue consumer retains the producing scope across preparation,
+    /// commit and retirement. Opaque Storage errors remain unqualified.
     pub(crate) fn prepare_exact_queue_root_read(
         &self,
-        write: redb::WriteTransaction,
+        write: redb::PreparedReadInput,
         original: &OwnedMemoryReservation,
         snapshot: SnapshotId,
         lsn: Lsn,
-    ) -> std::result::Result<redb::PreparedWrite<PreparedWriterSnapshot>,
+    ) -> std::result::Result<(redb::PreparedWrite<PreparedWriterSnapshot>,
+        super::native_storage_admission::StorageAdmissionScope),
         super::native_storage_admission::PreparedReadFailure> {
         use super::native_storage_admission::{PreparedReadCause, StorageAdmissionScope};
         // All controls retain the existing exact Original reservation. New
         // page/control receipts are independent and survive scope destruction.
-        let write = write.into_prepared_read();
         let scope = StorageAdmissionScope::prepared_original(original)?;
-        scope.prepare_read(|scope, admission| {
+        let prepared = scope.prepare_read(|scope, admission| {
             // Schema capture was prepared before opening this write. Never
             // perform a new latest read or price that pre-existing owner again.
             let schema = self.writer_schema.lock().as_ref().cloned()
@@ -649,7 +712,7 @@ impl RedbPersistence {
             let mut control = Some(credit);
             write.prepare_commit_with_read(
                 admission,
-                |error| PreparedReadCause::Lower(redb::PreparedReadError::Storage(error)),
+                |error| PreparedReadCause::Lower(error.into()),
                 PreparedReadCause::Lower,
                 |view| {
                     let complete = view.bytes_equal_prepared(super::custody_groups::GROUP_TABLE,
@@ -659,7 +722,8 @@ impl RedbPersistence {
                         complete, &mut control))
                 },
             )
-        })
+        })?;
+        Ok((prepared, scope))
     }
 
     pub(crate) fn commit_exact_queue_root(
@@ -669,14 +733,30 @@ impl RedbPersistence {
         completion: &crate::database::event_bus::OwnedQueueCommitToken<'_>,
         cleanup: &mut crate::database::event_bus::OwnedQueueCommitCleanup,
     ) -> crate::funded_error::OriginalResult<()> {
+        // Abort custody precedes even diagnostic/control bootstrap refusal.
+        let write = write.into_prepared_read();
+        let diagnostic = crate::funded_error::OriginalError::prepare(original,
+            "relational", "statement_overlay", "Reduce prepared event bodies or raise MEMORY_LIMIT.")
+            .map_err(crate::funded_error::OriginalError::native)?;
+        let diagnostic = std::cell::RefCell::new(Some(diagnostic));
+        let take_diagnostic = || diagnostic.borrow_mut().take().expect("one escaping publication failure");
         crate::persistent_store::with_exact_queue_source_link(self, |source| {
-            let credit = self.reserve_exact_writer_snapshot(original)?;
-            let mut control = Some(credit);
-            let mut prepared = write.prepare_commit(|error| Self::storage_error_funded(original, error), |view| {
-                self.prepare_exact_writer_snapshot(original, view, completion.snapshot,
-                    completion.lsn, &mut control)
-            })?;
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepared.commit()));
+            let (mut prepared, scope) = self.prepare_exact_queue_root_read(
+                write, original, completion.snapshot, completion.lsn,
+            ).map_err(|error| error.into_original(take_diagnostic(), original))?;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scope.prepare_read(|_, admission| redb::with_native_storage_admission(admission, || {
+                    prepared.commit().map_err(|error| {
+                        // CommitError still carries the actual Storage producer.
+                        // Normalize native tags without classifying an I/O kind.
+                        use super::native_storage_admission::PreparedReadCause;
+                        match error {
+                            redb::CommitError::Storage(error) => PreparedReadCause::Lower(error.into()),
+                            error => PreparedReadCause::Commit(error),
+                        }
+                    })
+                }))
+            }));
             if let Some((read, root)) = prepared.take_durable() {
                 let root = root.activate(read);
                 cleanup.retired_source = Some(source.settle(&root));
@@ -685,10 +765,12 @@ impl RedbPersistence {
             // Build the original result BEFORE retirement. Secondary cleanup
             // unwinds move to the caller's fixed phase, outside held guards.
             let result = match outcome {
-                Ok(result) => Ok(result.map_err(|error| Self::storage_error_funded(original, error))),
+                Ok(result) => Ok(result.map_err(|error| error.into_original(take_diagnostic(), original))),
                 Err(panic) => Err(panic),
             };
-            let retirement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prepared)));
+            let retirement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                redb::with_native_storage_admission(scope.retain_admission(), || drop(prepared))
+            }));
             match (result, retirement) {
                 (Ok(Ok(())), Ok(())) => Ok(()),
                 (Ok(Ok(())), Err(panic)) => std::panic::resume_unwind(panic),
@@ -701,7 +783,7 @@ impl RedbPersistence {
                     std::panic::resume_unwind(panic)
                 }
             }
-        }).map_err(crate::funded_error::OriginalError::unqualified)?
+        }).map_err(|error| take_diagnostic().unqualified(error))?
     }
 
     pub(crate) fn reserve_exact_writer_snapshot(&self, original: &OwnedMemoryReservation) -> Result<OwnedMemoryReservation> {
@@ -915,7 +997,7 @@ pub(crate) enum WriterCursorFamily {
 /// Read ownership cannot be recovered from the writer accountant.
 #[derive(Clone)]
 pub(crate) enum SourceWindowOwner {
-    Read(Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>),
+    Read(contextdb_core::read_memory::ReadMemoryOwner),
     Write(
         crate::memory_accounting::AccountantHandle,
         Option<crate::memory_accounting::WriterUse>,
@@ -928,6 +1010,13 @@ pub(crate) enum SourceWindowCredit {
 }
 
 impl SourceWindowOwner {
+    pub(crate) fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+        match self {
+            Self::Read(owner) => Ok(owner.clone()),
+            Self::Write(accountant, original) => accountant.read_budget_for_original(original.clone()),
+        }
+    }
+
     pub(crate) fn writer(writer: crate::memory_accounting::AccountantHandle) -> Self {
         let token = crate::memory_accounting::WriterUse::retain_if_writer(&writer);
         Self::Write(writer, token)
@@ -936,9 +1025,9 @@ impl SourceWindowOwner {
         &self,
         bytes: usize,
     ) -> Result<contextdb_core::read_memory::ReadCredit> {
-        let budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = match self {
-            Self::Read(read) => Arc::clone(read),
-            Self::Write(writer, _) => writer.read_budget()?,
+        let budget: contextdb_core::read_memory::ReadMemoryOwner = match self {
+            Self::Read(read) => read.clone(),
+            Self::Write(writer, _) => writer.read_budget()?.into(),
         };
         contextdb_core::read_memory::ReadCredit::try_new(
             budget,
@@ -956,7 +1045,7 @@ impl SourceWindowOwner {
     ) -> Result<SourceWindowCredit> {
         let mut credit = match self {
             Self::Read(read) => SourceWindowCredit::Read(
-                contextdb_core::read_memory::ReadCredit::new(Arc::clone(read)),
+                contextdb_core::read_memory::ReadCredit::new(read.clone()),
             ),
             Self::Write(writer, _) => {
                 SourceWindowCredit::Write(OwnedMemoryReservation::new(writer.clone()))
@@ -1014,11 +1103,11 @@ impl SourceWindowOwner {
         Ok(Some(endpoint))
     }
 
-    pub(super) fn image(&self, root: &WriterSnapshot, operation: &'static str) -> Arc<ImageMemory> {
+    pub(super) fn image(&self, root: &WriterSnapshot, operation: &'static str) -> crate::read_image_memory::ImageMemoryHandle {
         match self {
             Self::Read(read) => ImageMemory::charging_reader_for(
                 root.accountant.clone(),
-                Arc::clone(read),
+                read.clone(),
                 "writer_source",
                 operation,
                 HINT,
@@ -1081,10 +1170,10 @@ pub(crate) struct WriterWindow<T> {
     pub(super) position: Box<[u8]>,
     _root: WriterSnapshotHandle,
     // The image retains its own original writer role through charge refund.
-    _memory: Arc<ImageMemory>,
+    _memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl<T> WriterWindow<T> {
-    pub(super) fn from_owned(root: &WriterSnapshotHandle, memory: Arc<ImageMemory>, value: T) -> Self {
+    pub(super) fn from_owned(root: &WriterSnapshotHandle, memory: crate::read_image_memory::ImageMemoryHandle, value: T) -> Self {
         Self { value, position: Box::default(), _root: root.clone(), _memory: memory }
     }
 }
@@ -1121,7 +1210,7 @@ impl<T> WriterWindow<T> {
         coerce: impl FnOnce(Box<Self>) -> Box<U>,
     ) -> Result<contextdb_core::read_memory::OwnedReadBox<U>> {
         let budget = self._memory.source_box_budget()?;
-        let credit = contextdb_core::read_memory::ReadCredit::try_new(
+        let credit = contextdb_core::read_memory::ReadCredit::try_new_owned(
             budget,
             std::alloc::Layout::new::<Self>().size(),
             "writer_source",
@@ -1164,9 +1253,11 @@ impl WriterSnapshot {
     }
     pub(crate) fn content_size_totals(
         &self,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before_table: &mut dyn FnMut() -> Result<()>,
     ) -> Result<super::content_size::ContentSizeTotals> {
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+
         let read = self.owner_read()?;
         super::content_size::read_totals(read.as_ref(), "writer source", memory, before_table)
     }
@@ -1179,13 +1270,15 @@ impl WriterSnapshot {
     /// table, list and prefix it was asked for.
     pub(crate) fn maintained_count_groups<E: From<Error>>(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         prefix: &[DirectedValue],
         before_touch: &mut dyn FnMut() -> std::result::Result<(), E>,
         visit: &mut dyn FnMut(IndexKey, u64) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.erasure
             .read()
             .check_scope(Some(table), RELATIONAL_INDEX_COUNT_TABLE.name())?;
@@ -1247,10 +1340,7 @@ impl WriterSnapshot {
         let counts =
             read.open_table(RELATIONAL_INDEX_COUNT_TABLE)
                 .map_err(|error| match error {
-                    redb::TableError::TableDoesNotExist(_) => Error::StoreCorrupted {
-                        path: "writer source".into(),
-                        reason: format!("maintained counts of ready table '{table}' are absent"),
-                    },
+                    redb::TableError::TableDoesNotExist(_) => crate::funded_error::corruption_display(Ok(read_memory.clone()), "writer source", format_args!("maintained counts of ready table '{table}' are absent")),
                     other => RedbPersistence::storage_error(other),
                 })?;
         let lower = RedbPersistence::relational_index_count_range_prefix(table, columns, prefix)?;
@@ -1260,10 +1350,7 @@ impl WriterSnapshot {
             None => counts.range::<&[u8]>(lower.as_slice()..),
         }
         .map_err(RedbPersistence::storage_error)?;
-        let corrupt = |reason: &str| Error::StoreCorrupted {
-            path: "writer source".into(),
-            reason: format!("maintained count of '{table}': {reason}"),
-        };
+        let corrupt = |reason: &str| crate::funded_error::corruption_display(Ok(read_memory.clone()), "writer source", format_args!("maintained count of '{table}': {reason}"));
         for entry in range {
             before_touch()?;
             self.erasure
@@ -1272,7 +1359,7 @@ impl WriterSnapshot {
             let (key, count) = entry.map_err(RedbPersistence::storage_error)?;
             let memory = ImageMemory::charging_reader_for(
                 self.accountant.clone(),
-                Arc::clone(&read_memory),
+                read_memory.clone(),
                 "writer_source",
                 "maintained_count_groups",
                 HINT,
@@ -1543,7 +1630,7 @@ impl WriterSnapshotHandle {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 if RedbPersistence::witnessed_row_count_in_read(&read, super::authored_history::BODIES.name())?.is_some() {
-                    return Err(Error::StoreCorrupted { path: table.into(), reason: "authored body relation is missing".into() });
+                    return Err(crate::funded_error::corruption_text(owner.diagnostic_budget(), table, "authored body relation is missing".into()));
                 }
                 return Ok(None);
             }
@@ -1560,7 +1647,7 @@ impl WriterSnapshotHandle {
         }
         let row = memory.scope(|| RedbPersistence::decode_versioned_row(value.value(), None))?;
         if RedbPersistence::rel_row_key(&row) != *key {
-            return Err(Error::StoreCorrupted { path: table.into(), reason: "authored body has a different occurrence key".into() });
+            return Err(crate::funded_error::corruption_text(owner.diagnostic_budget(), table, "authored body has a different occurrence key".into()));
         }
         #[cfg(any(test, feature = "test-seams"))]
         let row = {
@@ -1924,7 +2011,7 @@ impl WriterReadCursor {
 
     fn read_one<T>(
         &self,
-        memory: &Arc<ImageMemory>,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
         before: &mut dyn FnMut() -> Result<()>,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
     ) -> Result<Option<(SourceResume, T)>> {
@@ -1966,10 +2053,7 @@ impl WriterReadCursor {
                     }
                     let corrupted = graph && matches!(&error, redb::StorageError::Corrupted(_));
                     match RedbPersistence::storage_error(error) {
-                        Error::Other(reason) if corrupted => Error::StoreCorrupted {
-                            path: "graph adjacency".into(),
-                            reason: reason.into_owned(),
-                        },
+                        Error::Other(reason) if corrupted => crate::funded_error::corruption_display(memory.diagnostic_budget(), "graph adjacency", reason),
                         other => other,
                     }
                 };
@@ -1978,20 +2062,14 @@ impl WriterReadCursor {
                     Ok(table) => table,
                     Err(redb::TableError::TableDoesNotExist(_)) => {
                         if graph {
-                            return Err(Error::StoreCorrupted {
-                                path: "graph adjacency".into(),
-                                reason: "graph projection table missing".into(),
-                            });
+                            return Err(crate::funded_error::corruption_text(memory.diagnostic_budget(), "graph adjacency", "graph projection table missing".into()));
                         }
                         return Ok(None);
                     }
                     Err(redb::TableError::Storage(error)) => return Err(storage_error(error)),
                     Err(error) => {
                         return Err(match RedbPersistence::storage_error(error) {
-                            Error::Other(reason) if graph => Error::StoreCorrupted {
-                                path: "graph adjacency".into(),
-                                reason: reason.into_owned(),
-                            },
+                            Error::Other(reason) if graph => crate::funded_error::corruption_display(memory.diagnostic_budget(), "graph adjacency", reason),
                             other => other,
                         });
                     }
@@ -2076,10 +2154,7 @@ impl WriterReadCursor {
                     )) {
                     Ok(table) => table,
                     Err(redb::TableError::TableDoesNotExist(_)) => {
-                        return Err(Error::StoreCorrupted {
-                            path: self.table.as_ref().to_owned(),
-                            reason: "missing durable posting family".into(),
-                        });
+                        return Err(crate::funded_error::corruption_text(memory.diagnostic_budget(), self.table.as_ref(), "missing durable posting family".into()));
                     }
                     Err(e) => return Err(RedbPersistence::storage_error(e)),
                 };
@@ -2161,6 +2236,7 @@ impl WriterReadCursor {
     }
 
     pub(crate) fn next_authored_row(&mut self, table: &str) -> Result<Option<WriterWindow<VersionedRow>>> {
+        let diagnostic_owner = self.owner.clone();
         let root = self.root.clone();
         self.next_before_handoff(&mut || Ok(()), |key, value| {
             crate::read_image_memory::reserve(table.len().saturating_mul(3).saturating_add(256))?;
@@ -2173,7 +2249,7 @@ impl WriterReadCursor {
             let row = RedbPersistence::decode_versioned_row(value, None)?;
             let canonical = RedbPersistence::rel_row_key(&row);
             if super::authored_history::body_key(table, &canonical).as_bytes() != key {
-                return Err(Error::StoreCorrupted { path: table.into(), reason: "retained body has a mismatched occurrence key".into() });
+                return Err(crate::funded_error::corruption_text(diagnostic_owner.diagnostic_budget(), table, "retained body has a mismatched occurrence key".into()));
             }
             let erasure = root.erasure.read();
             let physical = RedbPersistence::rel_table_name(table);
@@ -2703,7 +2779,7 @@ impl WriterReadCursor {
                 let edge: AdjEntry = decode_window_exact(value).map_err(|error| match error {
                     Error::Other(reason) => Error::StoreCorrupted {
                         path: "graph adjacency".into(),
-                        reason: reason.into_owned(),
+                        reason: reason,
                     },
                     other => other,
                 })?;
@@ -2752,7 +2828,7 @@ impl WriterReadCursor {
                 vector_partition_record_payload(VectorPartitionRecordKind::Membership, value)
                     .map_err(|reason| Error::StoreCorrupted {
                         path: "vector_partition_membership".into(),
-                        reason,
+                        reason: reason.into(),
                     })?,
             )?;
             if RedbPersistence::vector_partition_membership_key(&record) != key {
@@ -3665,10 +3741,12 @@ impl WriterSnapshot {
         table: &str,
         row_id: Option<RowId>,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before: &mut dyn FnMut() -> Result<()>,
         visit: &mut dyn FnMut(WriterWindow<VersionedRow>) -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         WriterSnapshotHandle::from(self.clone()).visit_historical_rows(table, row_id, snapshot, read_memory, before, visit)
     }
 }
@@ -3679,10 +3757,12 @@ impl WriterSnapshotHandle {
         table: &str,
         row_id: Option<RowId>,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         before: &mut dyn FnMut() -> Result<()>,
         visit: &mut dyn FnMut(WriterWindow<VersionedRow>) -> Result<()>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use super::content_identity::version_manifest as manifest;
         self.check_table_scope(table)?;
         let owner = SourceWindowOwner::Read(read_memory.clone());

@@ -173,7 +173,7 @@ impl<'a> BorrowedTrace<'a> {
             indexes_considered: Candidates(&trace.indexes_considered),
             sort_elided: trace.sort_elided,
             query_vector_source: &trace.query_vector_source,
-            vector_search: trace.vector_search.as_ref().map(Into::into),
+            vector_search: trace.vector_search.as_deref().map(Into::into),
             rows_examined,
             maintained_count: trace.maintained_count.as_deref().map(Into::into),
             groups: &trace.groups,
@@ -195,11 +195,11 @@ impl<'a> BorrowedObservedPage<'a> {
 }
 #[derive(Deserialize)]
 pub(crate) struct CanonicalObservedCursorPage {
-    pub(crate) page: contextdb_core::read_contract::CursorPage,
+    pub(crate) page: CursorPage,
     pub(crate) trace: CanonicalQueryTrace,
     // Standalone validation owns its native payload until this DTO drops.
     #[serde(skip)]
-    memory: Option<std::sync::Arc<crate::read_image_memory::ImageMemory>>,
+    memory: Option<crate::read_image_memory::ImageMemoryHandle>,
 }
 
 pub(crate) fn encode_observed_cursor_page(
@@ -210,6 +210,24 @@ pub(crate) fn encode_observed_cursor_page(
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     encode(&BorrowedObservedPage::new(page, observation))
 }
+pub(crate) fn encode_observed_cursor_page_funded(
+    page: &CursorPage,
+    observation: &CursorObservation,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    memory_ceiling: u64,
+) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    encode_transport_funded(&BorrowedObservedPage::new(page, observation), Some(owner), memory_ceiling)
+}
+
+pub(crate) fn observed_cursor_page_encoded_size(
+    page: &CursorPage,
+    observation: &CursorObservation,
+) -> Result<usize, ReadEncodingError> {
+    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    encoded_size(&BorrowedObservedPage::new(page, observation))
+}
+
 pub(crate) fn decode_observed_cursor_page(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -223,7 +241,7 @@ pub(crate) fn decode_observed_cursor_page(
 
 pub(crate) fn decode_observed_cursor_page_with_memory(
     bytes: &[u8],
-    memory: &std::sync::Arc<crate::read_image_memory::ImageMemory>,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
     memory_ceiling: u64,
 ) -> Result<CanonicalObservedCursorPage, ReadEncodingError> {
     crate::local_transport::preflight_observed_cursor_page_payload(bytes, memory_ceiling)?;

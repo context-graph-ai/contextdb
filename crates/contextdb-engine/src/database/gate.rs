@@ -9,23 +9,27 @@ pub(super) struct AdmittedAclIds {
     map_bytes: usize,
 }
 impl AdmittedAclIds {
-    fn workspace(read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Self {
+    fn workspace(read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Self {
             ids: HashSet::new(),
             memory: contextdb_core::read_memory::ReadCredit::new(read_memory),
             map_bytes: 0,
         }
     }
-    fn new(read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Result<Self> {
-        let mut owner = Self::workspace(read_memory);
-        owner.memory.try_grow_for(
-            std::mem::size_of::<Self>().saturating_add(32),
-            "reader",
-            "acl_identities",
-            "Raise MEMORY_LIMIT to retain these ACL identities.",
-        )?;
-        Ok(owner)
+    fn new(read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
+        Ok(Self::workspace(read_memory))
     }
+    fn into_shared(mut self) -> Result<contextdb_core::read_memory::ReadShared<Self>> {
+        use contextdb_core::read_memory::ReadShared;
+        let mut invoice = self.memory.try_split_off(0)?;
+        invoice.try_grow_for(ReadShared::<Self>::layout().size(),
+            "reader", "acl_identities",
+            "Raise MEMORY_LIMIT to retain these ACL identities.")?;
+        ReadShared::try_from_prepaid_native(self, invoice).map_err(Error::NativeEngineOther)
+    }
+
     fn insert(&mut self, id: uuid::Uuid) -> Result<bool> {
         if self.ids.contains(&id) {
             return Ok(false);
@@ -49,9 +53,14 @@ impl AdmittedAclIds {
     }
     fn copy(
         &self,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Self> {
-        let mut copy = Self::new(read_memory)?;
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let mut copy = Self {
+            ids: HashSet::new(),
+            memory: contextdb_core::read_memory::ReadCredit::from_prepaid_owned(read_memory, 0),
+            map_bytes: 0,
+        };
         if !self.ids.is_empty() {
             let bytes = held::map::<uuid::Uuid, ()>(self.ids.len());
             copy.memory.try_grow_for(
@@ -82,7 +91,7 @@ pub(super) struct AdmittedAclGrantCache {
     map_memory: Option<contextdb_core::read_memory::ReadCredit>,
 }
 struct AdmittedAclGrantCacheEntry {
-    ids: Arc<AdmittedAclIds>,
+    ids: contextdb_core::read_memory::ReadShared<AdmittedAclIds>,
     _key_memory: contextdb_core::read_memory::ReadCredit,
 }
 impl AdmittedAclGrantCache {
@@ -401,8 +410,10 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(AclGrantCacheKey, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let principal_bytes = match principal {
             Principal::System => 0,
             Principal::Agent(id) | Principal::Human(id) => held::text(id),
@@ -543,8 +554,10 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.read_allowed_for_row_cached_in_tx(
             None,
             table,
@@ -565,8 +578,10 @@ impl Database {
         snapshot: SnapshotId,
         mut visit: impl FnMut(&VersionedRow) -> Result<()>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.assert_table_read_allowed(table)?;
         let meta = self
             .table_meta(table)
@@ -826,11 +841,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_allowed_for_row_with_tables(
             tx,
             None,
@@ -863,11 +880,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_allowed_for_row_with_tables(
             tx,
             Some(tables),
@@ -891,11 +910,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_denial_for_row_with_tables(
             tx,
             None,
@@ -924,11 +945,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_read_denial_for_row_with_tables(
             tx,
             Some(tables),
@@ -952,11 +975,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .bounded_read_denial_for_row_with_tables(
                 tx,
@@ -985,11 +1010,13 @@ impl Database {
         snapshot: SnapshotId,
         mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<Error>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(None);
         }
@@ -1106,11 +1133,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> std::result::Result<Arc<AdmittedAclIds>, E>
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         // Select the writer source once for both cache qualification and the
         // eventual stream. Retained authenticated sources never rebind here.
         let root = if self.retained_relational_source.is_none() {
@@ -1133,9 +1162,8 @@ impl Database {
         }
         let (kind, principal_id) = match principal {
             Principal::System => {
-                return Ok(Arc::new(
-                    AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?,
-                ));
+                return AdmittedAclIds::new(read_memory.clone())
+                    .and_then(AdmittedAclIds::into_shared).map_err(E::from);
             }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
@@ -1182,8 +1210,8 @@ impl Database {
             return Err(E::from(Error::Other((
                 "ACL source requested without a captured relational source".to_owned()).into())));
         }
-        let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, key_memory, Arc::clone(&allowed))
+        let allowed = allowed.into_shared().map_err(E::from)?;
+        self.remember_allowed_acl_ids(cache_key, key_memory, allowed.clone())
             .map_err(E::from)?;
         Ok(allowed)
     }
@@ -1201,11 +1229,13 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> std::result::Result<Arc<AdmittedAclIds>, E>
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (cache_key, key_memory) = self
             .admitted_acl_cache_key(principal, acl_ref, snapshot, read_memory.clone())
             .map_err(E::from)?;
@@ -1220,9 +1250,8 @@ impl Database {
         }
         let (kind, principal_id) = match principal {
             Principal::System => {
-                return Ok(Arc::new(
-                    AdmittedAclIds::new(read_memory.clone()).map_err(E::from)?,
-                ));
+                return AdmittedAclIds::new(read_memory.clone())
+                    .and_then(AdmittedAclIds::into_shared).map_err(E::from);
             }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
@@ -1244,8 +1273,8 @@ impl Database {
                 }
             }
         }
-        let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, key_memory, Arc::clone(&allowed))
+        let allowed = allowed.into_shared().map_err(E::from)?;
+        self.remember_allowed_acl_ids(cache_key, key_memory, allowed.clone())
             .map_err(E::from)?;
         Ok(allowed)
     }
@@ -1265,14 +1294,16 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-        committed: Arc<AdmittedAclIds>,
+        committed: contextdb_core::read_memory::ReadShared<AdmittedAclIds>,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> std::result::Result<Arc<AdmittedAclIds>, E>
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> std::result::Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(tx) = tx else {
             return Ok(committed);
         };
@@ -1361,7 +1392,7 @@ impl Database {
                 allowed.insert(*acl_id).map_err(E::from)?;
             }
         }
-        Ok(Arc::new(allowed))
+        allowed.into_shared().map_err(E::from)
     }
 
     fn read_allowed_for_row_cached(
@@ -1372,8 +1403,10 @@ impl Database {
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.read_allowed_for_row_cached_in_tx(
             None,
             table,
@@ -1393,8 +1426,10 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.read_allowed_for_row_cached_in_tx(
             tx,
             table,
@@ -1415,8 +1450,10 @@ impl Database {
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .read_denial_for_row_cached_in_tx(
                 tx,
@@ -1438,8 +1475,10 @@ impl Database {
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.read_denial_for_row_cached_in_tx(
             None,
             table,
@@ -1460,8 +1499,10 @@ impl Database {
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(None);
         }
@@ -1546,8 +1587,10 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() {
             return Ok(true);
@@ -1586,8 +1629,10 @@ impl Database {
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.filter_rows_for_read_in_tx(None, table, rows, snapshot, read_memory.clone())
     }
 
@@ -1598,8 +1643,10 @@ impl Database {
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() || rows.is_empty() {
             return Ok(rows);
@@ -1646,8 +1693,10 @@ impl Database {
         rows: Vec<VersionedRow>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.assert_table_read_allowed(table)?;
         if self.access_is_admin() || rows.is_empty() {
             return Ok(rows);
@@ -1706,8 +1755,10 @@ impl Database {
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
@@ -1792,8 +1843,10 @@ impl Database {
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(meta) = self.table_meta(table) else {
             return Err(Error::TableNotFound(table.to_string()));
         };
@@ -1807,8 +1860,10 @@ impl Database {
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.principal_has_acl_grant_in_tx(
             None,
             principal,
@@ -1827,8 +1882,10 @@ impl Database {
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         Ok(self
             .allowed_acl_ids_for_principal_in_tx(
                 tx,
@@ -1880,8 +1937,10 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Arc<AdmittedAclIds>> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.retained_relational_source.is_some() || self.writer_read_root()?.is_some() {
             return self.bounded_allowed_acl_ids_in_retained_source(
                 principal,
@@ -1907,14 +1966,14 @@ impl Database {
         }
         let (kind, principal_id) = match principal {
             Principal::System => {
-                return Ok(Arc::new(AdmittedAclIds::new(read_memory.clone())?));
+                return AdmittedAclIds::new(read_memory.clone())?.into_shared();
             }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
         let tables = self.relational_store.tables.read();
         let Some(rows) = tables.get(&acl_ref.ref_table) else {
-            return Ok(Arc::new(AdmittedAclIds::new(read_memory.clone())?));
+            return AdmittedAclIds::new(read_memory.clone())?.into_shared();
         };
         let mut allowed = AdmittedAclIds::new(read_memory.clone())?;
         for row in rows {
@@ -1928,8 +1987,8 @@ impl Database {
                 allowed.insert(*acl_id)?;
             }
         }
-        let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, key_memory, Arc::clone(&allowed))?;
+        let allowed = allowed.into_shared()?;
+        self.remember_allowed_acl_ids(cache_key, key_memory, allowed.clone())?;
         Ok(allowed)
     }
 
@@ -1944,20 +2003,20 @@ impl Database {
         &self,
         cache_key: AclGrantCacheKey,
         key_memory: contextdb_core::read_memory::ReadCredit,
-        allowed: Arc<AdmittedAclIds>,
+        allowed: contextdb_core::read_memory::ReadShared<AdmittedAclIds>,
     ) -> Result<()> {
         // Promotion is only an allocation optimization. Admission failure here
         // never changes the operation's already computed authorization answer.
         let promoted = (|| -> Result<_> {
             let budget = self.declared_read_memory.acl_cache_budget()?;
-            let ids = Arc::new(allowed.copy(budget.clone())?);
+            let ids = allowed.copy(budget.clone())?.into_shared()?;
             let bytes = held::text(&cache_key.ref_table)
                 .saturating_add(held::text(&cache_key.ref_column))
                 .saturating_add(match &cache_key.principal {
                     Principal::System => 0,
                     Principal::Agent(id) | Principal::Human(id) => held::text(id),
                 });
-            let parent_key_memory = contextdb_core::read_memory::ReadCredit::try_new(
+            let parent_key_memory = contextdb_core::read_memory::ReadCredit::try_new_owned(
                 budget.clone(),
                 bytes,
                 "reader_acl_cache",
@@ -1995,7 +2054,7 @@ impl Database {
             }
             let wanted = cache.entries.capacity().max(1).saturating_mul(2);
             drop(cache);
-            let memory = contextdb_core::read_memory::ReadCredit::try_new(
+            let memory = contextdb_core::read_memory::ReadCredit::try_new_owned(
                 budget.clone(),
                 held::map::<AclGrantCacheKey, AdmittedAclGrantCacheEntry>(wanted),
                 "reader_acl_cache",
@@ -2025,8 +2084,10 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<Arc<AdmittedAclIds>> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<contextdb_core::read_memory::ReadShared<AdmittedAclIds>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let committed =
             self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot, read_memory.clone())?;
         self.bounded_acl_ids_with_transaction(
@@ -2050,8 +2111,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(captured) = self.captured_graph_decisions().filter(|c| Some(c.tx) == tx) {
             captured.check_table(table)?;
             if let Some(rows) = captured.rows(table) {
@@ -2117,8 +2180,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(row) =
             self.raw_row_by_id_in_tx(tx, table, row_id, snapshot, read_memory.clone())?
         {
@@ -2143,8 +2208,10 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(row) =
             self.raw_row_by_id_in_tx(tx, table, row_id, snapshot, read_memory.clone())?
         else {
@@ -2164,8 +2231,10 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RoaringTreemap>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !self.table_has_read_gate(table)? {
             return Ok(None);
         }
@@ -2217,8 +2286,10 @@ impl Database {
         snapshot: SnapshotId,
         candidates: Option<&RoaringTreemap>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<RoaringTreemap>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(candidates) = candidates {
             if !self.table_has_read_gate(table)? {
                 return Ok(Some(candidates.clone()));
@@ -2281,8 +2352,10 @@ impl Database {
         values: &[Value],
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Vec<VersionedRow>>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if columns.is_empty() || columns.len() != values.len() {
             return Err(Error::Other((
                 "graph metadata probe requires a nonempty matching key".to_owned()).into()));
@@ -2342,13 +2415,10 @@ impl Database {
                 seen.insert(identity.row_id);
                 let row = self
                     .committed_row_at(table, identity.row_id, snapshot, read_memory.clone())?
-                    .ok_or_else(|| Error::StoreCorrupted {
-                        path: source.database_path().display().to_string(),
-                        reason: format!(
+                    .ok_or_else(|| crate::funded_error::corruption_display(Ok(read_memory.clone()), source.database_path().display(), format_args!(
                             "retained metadata index {} names missing row {}",
                             index.name, identity.row_id.0
-                        ),
-                    })?;
+                        )))?;
                 output.try_grow_for(
                     128,
                     "reader",
@@ -2473,8 +2543,10 @@ impl Database {
         node: NodeId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, VersionedRow)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.rows_for_node_in_tx(None, node, snapshot, read_memory.clone())
     }
 
@@ -2484,8 +2556,10 @@ impl Database {
         node: NodeId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, VersionedRow)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let id_column = vec!["id".to_string()];
         let id_value = vec![Value::Uuid(node)];
         let (table_names, _table_memory) =
@@ -2519,8 +2593,10 @@ impl Database {
     fn graph_metadata_tables(
         &self,
         matches: fn(&TableMeta) -> bool,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Vec<(String, bool)>, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut memory = contextdb_core::read_memory::ReadCredit::new(read_memory);
         if let Some(captured) = self.captured_graph_decisions() {
             let mut names = Vec::new();
@@ -2694,8 +2770,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<(String, VersionedRow)>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if let Some(captured) = self.captured_graph_decisions().filter(|c| Some(c.tx) == tx) {
             let mut output = Vec::new();
             let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
@@ -2860,8 +2938,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.edge_read_allowed_in_tx(
             None,
             source,
@@ -2880,8 +2960,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -2928,8 +3010,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
@@ -2963,8 +3047,10 @@ impl Database {
         direction: Direction,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<GatedGraphNeighbor>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let mut results = Vec::new();
         let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
 
@@ -3022,8 +3108,10 @@ impl Database {
         direction: Direction,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Vec<CountedGraphNeighbor>, u64)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if !self.access_is_admin()
             && !self.node_read_allowed_in_tx(tx, node, snapshot, read_memory.clone())?
         {
@@ -3397,8 +3485,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -3428,11 +3518,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -3472,11 +3564,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -3504,11 +3598,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let rows = self
             .rows_for_node_in_tx(tx, node, snapshot, read_memory.clone())
             .map_err(E::from)?;
@@ -3545,11 +3641,13 @@ impl Database {
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let edge_rows = self
             .edge_rows_for_graph_edge_in_tx(
                 tx,
@@ -3595,11 +3693,13 @@ impl Database {
         owner: &contextdb_tx::RowEdgeOwner,
         snapshot: SnapshotId,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -3648,8 +3748,10 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(true);
         }
@@ -3679,8 +3781,10 @@ impl Database {
         direction: Direction,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Vec<CountedGraphScanEdge>, u64)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (deleted, staged_inserts) = self.graph_tx_edge_overlay(tx)?;
         let mut candidates = Vec::<CountedGraphScanCandidate>::new();
 
@@ -3788,8 +3892,10 @@ impl Database {
         direction: Direction,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(Vec<NodeId>, u64)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (edges, examined) = self.graph_edges_scan_counted(
             tx,
             edge_types,
@@ -3814,8 +3920,10 @@ impl Database {
         direction: Direction,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(TraversalResult, u64)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (neighbors, examined) = self.graph_neighbors_counted_in_tx(
             tx,
             start,
@@ -3848,12 +3956,14 @@ impl Database {
         depth_range: std::ops::RangeInclusive<u32>,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(
         TraversalResult,
         u64,
         contextdb_core::read_memory::ReadCredit,
     )> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         use std::cell::{Cell, RefCell};
         let memory = RefCell::new(contextdb_core::read_memory::ReadCredit::new(
             read_memory.clone(),
@@ -4073,11 +4183,13 @@ impl Database {
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: impl FnMut(),
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.bounded_graph_edge_next_with_checkpoint(
             cursor, edge_types, tx, &|| Ok(()), before_edge, before_access,
             before_retain, release_retained, entry_read, read_memory,
@@ -4102,11 +4214,13 @@ impl Database {
         // walker reports and the same one the uncapped door calls examined.
         mut entry_read: impl FnMut(),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let staged_count = self.transaction_staged_edge_count(tx)?;
         loop {
             if matches!(
@@ -4456,11 +4570,13 @@ impl Database {
         release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: &mut impl FnMut(),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let reverse = match cursor.phase {
             BoundedGraphScanPhase::Forward => false,
             BoundedGraphScanPhase::Reverse => true,
@@ -4600,11 +4716,13 @@ impl Database {
         tx: Option<TxId>,
         before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if (reverse && matches!(cursor.direction, Direction::Both) && entry.source == entry.target)
             || !entry.visible_at(cursor.snapshot)
             || edge_types.is_some_and(|types| !types.contains(&entry.edge_type))
@@ -4682,11 +4800,13 @@ impl Database {
         release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: &mut impl FnMut(),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         while cursor.staged_position < staged_count {
             before_edge()?;
             let index = cursor.staged_position;
@@ -4801,11 +4921,13 @@ impl Database {
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<crate::database::EngineGraphBfsCursor>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let lease = self
             .graph_cursor_read_guard(tx, read_memory.clone())
             .map_err(E::from)?;
@@ -4876,11 +4998,13 @@ impl Database {
         // over the caller's own staged edges.
         tx: Option<TxId>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedTraversalNode>, E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let capture = cursor.lease.clone();
         let _decisions = capture.as_ref().map(|capture| capture.enter());
         if let Some(captured) = self.captured_graph_decisions() {
@@ -5001,8 +5125,10 @@ impl Database {
         &self,
         node: NodeId,
         snapshot: SnapshotId,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         self.node_read_allowed_in_tx(None, node, snapshot, read_memory.clone())
     }
 
@@ -5012,8 +5138,10 @@ impl Database {
         node: NodeId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let rows = self.rows_for_node_in_tx(tx, node, snapshot, read_memory.clone())?;
         if rows.is_empty() {
             return Ok(true);
@@ -5048,8 +5176,10 @@ impl Database {
         work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
         memory: &mut contextdb_core::read_memory::ReadCredit,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<Value>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         work(crate::executor::GraphPredicateWork::Checkpoint)?;
         if column == "id" {
             return Ok(vec![Value::Uuid(node)]);
@@ -5160,8 +5290,10 @@ impl Database {
         nodes: &[NodeId],
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
@@ -5218,11 +5350,13 @@ impl Database {
         snapshot: SnapshotId,
         mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
@@ -5271,8 +5405,10 @@ impl Database {
         node: NodeId,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         for (table, row) in self.rows_for_node(node, snapshot, read_memory.clone())? {
             self.assert_graph_endpoint_allowed(&table, &row, snapshot, read_memory.clone())?;
         }
@@ -5285,8 +5421,10 @@ impl Database {
         row: &VersionedRow,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         if self.access_is_admin() {
             return Ok(());
         }
@@ -5311,8 +5449,10 @@ impl Database {
         max_depth: u32,
         snapshot: SnapshotId,
 
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(TraversalResult, contextdb_core::read_memory::ReadCredit)> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let (result, _, credit) = self.graph_bfs_counted(
             None,
             start,
