@@ -154,6 +154,9 @@ fn invalid_purge_generation_candidates_report_typed_store_corruption() {
         purge_delivery_items: Vec::new(),
         blob_purge: Default::default(),
     };
+    assert!(projection.row_graph_entries.is_empty());
+    assert_eq!(projection.row_graph_credit.bytes(), 0);
+    let _writer_scope = persistence.writer_decode_scope().unwrap();
     assert_eq!(
         persistence
             .prepare_authoritative_purge_vector_generations(&projection)
