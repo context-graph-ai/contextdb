@@ -665,7 +665,7 @@ enum CursorRegistration {
 }
 
 enum PreparedOwnerMetadata {
-    CanonicalPage(MetadataPage),
+    CanonicalPage(crate::local_transport::query_funding::Funded<MetadataPage>),
     CanonicalComplete(crate::local_transport::query_funding::Funded<Vec<u8>>),
 }
 
@@ -1575,7 +1575,7 @@ impl OwnerReadService {
 
         let mut request_ordinal = 0_u64;
         loop {
-            match inbox.blocking_next() {
+            match inbox.blocking_next_with_clock(self.spec.clock.as_ref()) {
                 ConnectionEvent::ServiceStopping => {
                     let boundary = LocalProtocolBoundary::with_effective_limits(owner_limits);
                 boundary.set_query_funding(Some(connection_owner.clone()));
@@ -3337,7 +3337,7 @@ impl OwnerReadService {
         let payload = match prepared {
             PreparedOwnerMetadata::CanonicalPage(page) => {
                 crate::read_contract::encode_metadata_page_funded(
-                    &page, read_memory.clone(), lease.effective_limits().memory,
+                    &page.value, read_memory.clone(), lease.effective_limits().memory,
                 ).map_err(owner_encoding_error)?
             }
             PreparedOwnerMetadata::CanonicalComplete(payload) => payload,
@@ -3401,16 +3401,9 @@ impl OwnerReadService {
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
             }
             LocalMetadataRequest::Tables { continuation } => {
-                let items = crate::metadata_page::table_items(reading.table_names());
                 Ok(PreparedOwnerMetadata::CanonicalPage(
-                    crate::metadata_page::continuation_page(
-                        MetadataPageVocabulary::Tables,
-                        items,
-                        continuation.as_deref(),
-                        effective_limits.result_bytes,
-                        crate::metadata_page::metadata_table_key,
-                    )
-                    .map_err(Self::paging_error)?,
+                    reading.metadata_table_page(read_memory.clone(), continuation.as_deref(), effective_limits.result_bytes)
+                        .map_err(Self::paging_error)?,
                 ))
             }
             LocalMetadataRequest::Schema { table } => {
@@ -3428,19 +3421,11 @@ impl OwnerReadService {
                 Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
             }
             LocalMetadataRequest::EventsStatus { continuation } => {
-                let items = crate::metadata_page::event_status_items(
-                    &reading.event_bus_status(),
-                    &reading.cron_status(),
-                );
+                let source = reading.direct_events_status_funded(read_memory.clone())
+                    .map_err(OwnerReadScaffoldError::Database)?;
                 Ok(PreparedOwnerMetadata::CanonicalPage(
-                    crate::metadata_page::continuation_page(
-                        MetadataPageVocabulary::EventsStatus,
-                        items,
-                        continuation.as_deref(),
-                        effective_limits.result_bytes,
-                        crate::metadata_page::metadata_event_key,
-                    )
-                    .map_err(Self::paging_error)?,
+                    crate::metadata_page::borrowed_event_page(read_memory.clone(), &source.value,
+                        continuation.as_deref(), effective_limits.result_bytes).map_err(Self::paging_error)?,
                 ))
             }
             LocalMetadataRequest::VerifyHistory { table } => {
@@ -3498,6 +3483,9 @@ impl OwnerReadService {
             crate::metadata_page::MetadataPagingError::Continuation(failure)
             | crate::metadata_page::MetadataPagingError::Oversized(failure) => {
                 OwnerReadScaffoldError::Refused(failure)
+            }
+            crate::metadata_page::MetadataPagingError::Encoding(crate::read_contract::ReadEncodingError::Admission(error)) => {
+                OwnerReadScaffoldError::Database(error)
             }
             crate::metadata_page::MetadataPagingError::Encoding(_) => {
                 OwnerReadScaffoldError::unimplemented("canonical metadata page size")
@@ -3687,7 +3675,7 @@ impl OwnerReadService {
         let owner = self.spec.database.declared_read_request_provider().request_budget()
             .map_err(OwnerReadScaffoldError::Database)?;
         let operation = crate::local_transport::deadline_operation_funded(self.spec.clock.as_ref(),
-            crate::local_transport::DeadlineStage::ShutdownDrain, deadline_ms, owner,
+            crate::local_transport::DeadlineStage::ShutdownDrain, deadline_ms, owner.clone(),
             || std::future::poll_fn(|context| {
             if self.poll_requests_drained(context).is_pending() {
                 return Poll::Pending;
@@ -3706,10 +3694,10 @@ impl OwnerReadService {
             #[cfg(not(unix))]
             Poll::Ready(Ok(()))
         }));
-        let drained = wait_for_local_completion(operation).map_err(|error| match error {
-            error @ (crate::local_transport::LocalTransportError::MemoryAdmission { .. }
-                | crate::local_transport::LocalTransportError::NativeAdmission(_)
-                | crate::local_transport::LocalTransportError::OriginalAdmission(_)) => OwnerReadScaffoldError::from_local(error),
+        let drained = crate::local_transport::deadlines::drive_local(async {
+            operation.await.map_err(OwnerReadScaffoldError::from_local)
+        }, &self.spec.clock, owner).map_err(|error| match error {
+            error @ (OwnerReadScaffoldError::Database(_) | OwnerReadScaffoldError::Refused(_)) => error,
             _ => OwnerReadScaffoldError::Database(contextdb_core::Error::OwnerReadDrainTimeout),
         });
         if let Some(error) = stop_error {
@@ -4047,9 +4035,14 @@ fn run_owner_accept_loop(
             let spawned = std::thread::Builder::new()
                 .name("contextdb-owner-connection".to_owned())
                 .spawn(move || {
-                    let _served = wait_for_local_completion(
-                        connection_service.serve_accepted_stream(&mut stream, connection_id),
-                    );
+                    let owner = connection_service.reading_handle(connection_id)
+                        .declared_read_request_provider().request_budget();
+                    let _served = match owner {
+                        Ok(owner) => crate::local_transport::deadlines::drive_local(
+                            connection_service.serve_accepted_stream(&mut stream, connection_id),
+                            &connection_service.spec.clock, owner),
+                        Err(error) => Err(OwnerReadScaffoldError::Database(error)),
+                    };
                     let _released = connection_service.disconnect(connection_id);
                     drop(connection_service);
                     completion.mark_connection_completed(connection_id);
@@ -4999,16 +4992,33 @@ impl ConnectionInbox {
         self.arrived.notify_all();
     }
 
+    #[cfg(test)]
     fn blocking_next(&self) -> ConnectionEvent {
+        let mut state = self.state.lock().expect("owner connection inbox");
+        loop {
+            if let Some(event) = state.pop() { return event; }
+            state = self.arrived.wait(state).expect("owner connection inbox wait");
+        }
+    }
+
+    fn blocking_next_with_clock(&self, clock: &dyn DeadlineClock) -> ConnectionEvent {
         let mut state = self.state.lock().expect("owner connection inbox");
         loop {
             if let Some(event) = state.pop() {
                 return event;
             }
-            state = self
-                .arrived
-                .wait(state)
-                .expect("owner connection inbox wait");
+            if let Some(deadline) = clock.native_next_deadline_ms() {
+                let remaining = deadline.saturating_sub(clock.now_ms());
+                if remaining != 0 {
+                    state = self.arrived.wait_timeout(state, std::time::Duration::from_millis(remaining))
+                        .expect("owner connection inbox deadline wait").0;
+                }
+                drop(state);
+                clock.drive_native_deadlines();
+                state = self.state.lock().expect("owner connection inbox");
+            } else {
+                state = self.arrived.wait(state).expect("owner connection inbox wait");
+            }
         }
     }
 
@@ -5184,6 +5194,7 @@ impl RequestSlot {
 
 /// Drive one owner-side future to completion on the calling thread. The owner
 /// runs no executor; each connection and each drain owns exactly one thread.
+#[cfg(test)]
 fn wait_for_local_completion<F: std::future::Future>(future: F) -> F::Output {
     struct ParkedThread(std::thread::Thread);
 

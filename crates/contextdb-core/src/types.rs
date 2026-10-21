@@ -343,6 +343,19 @@ impl Serialize for SqlEqualityKey<'_> {
     }
 }
 
+thread_local! {
+    static BORROWED_JSON_WIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Internal bincode producer scope: the borrowed byte sequence has the same
+/// binary string representation. Other serializers keep Value's public shape.
+#[doc(hidden)]
+pub fn with_borrowed_json_wire<T>(make: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore { fn drop(&mut self) { BORROWED_JSON_WIRE.with(|slot| slot.set(self.0)); } }
+    let _restore = Restore(BORROWED_JSON_WIRE.with(|slot| slot.replace(true)));
+    make()
+}
+
 mod json_as_string {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -362,6 +375,31 @@ mod json_as_string {
         }
         let mut count = Count(Some(0));
         serde_json::to_writer(&mut count, value).map_err(serde::ser::Error::custom)?;
+        // Binary serde encodes a byte sequence with exactly the same length
+        // prefix and UTF-8 bytes as a string. Stream the closed JSON producer
+        // on both codec visits; no temporary text buffer exists to fund.
+        if super::BORROWED_JSON_WIRE.with(std::cell::Cell::get) && !ser.is_human_readable() {
+            use serde::ser::{Error, SerializeSeq};
+            struct BinaryText<S: SerializeSeq> { sequence: S, failure: Option<S::Error> }
+            impl<S: SerializeSeq> std::io::Write for BinaryText<S> {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    for byte in bytes {
+                        if let Err(error) = self.sequence.serialize_element(byte) {
+                            self.failure = Some(error);
+                            return Err(std::io::ErrorKind::InvalidData.into());
+                        }
+                    }
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let length = count.0.ok_or_else(|| S::Error::custom("JSON text length overflow"))?;
+            let mut output = BinaryText { sequence: ser.serialize_seq(Some(length))?, failure: None };
+            let encoded = serde_json::to_writer(&mut output, value);
+            if let Some(error) = output.failure { return Err(error); }
+            encoded.map_err(S::Error::custom)?;
+            return output.sequence.end();
+        }
         let layout = count
             .0
             .and_then(|bytes| std::alloc::Layout::array::<u8>(bytes).ok());

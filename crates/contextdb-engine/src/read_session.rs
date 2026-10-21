@@ -793,7 +793,17 @@ impl RouteResources {
 
 /// Poll one local-channel answer to completion on the calling thread. A read
 /// session owns no runtime and starts no thread of its own to wait.
-fn wait_for_local_answer<F: std::future::Future>(future: F) -> F::Output {
+#[cfg(target_os = "linux")]
+fn wait_for_local_answer<F, T>(
+    future: F, clock: &Arc<dyn DeadlineClock>,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> crate::owner_read::OwnerReadScaffoldResult<T>
+where F: std::future::Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
+    crate::local_transport::deadlines::drive_local(future, clock, owner)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_for_local_answer<F: std::future::Future>(future: F, _clock: &Arc<dyn DeadlineClock>, _owner: contextdb_core::read_memory::ReadMemoryOwner) -> F::Output {
     struct ParkedThread(std::thread::Thread);
 
     impl std::task::Wake for ParkedThread {
@@ -1293,14 +1303,16 @@ fn attempt_route_once(
                     .declaring(declared)
             }
         };
+        let channel_clock = read_clock();
+        let channel_owner = crate::local_transport::query_funding::QueryMemory::new(options.limits.memory.min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)))
+            .map_err(|error| RouteOpenRefusal { failure: ReadRouteOpenFailure::OwnerAuthentication, error })?.image().owner();
         match wait_for_local_answer(crate::owner_read::OwnerClient::connect(
             &channel_path,
             presented,
             options.timeouts,
-            read_clock(),
-            crate::local_transport::query_funding::QueryMemory::new(options.limits.memory.min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)))
-                .map_err(|error| RouteOpenRefusal { failure: ReadRouteOpenFailure::OwnerAuthentication, error })?.image().owner(),
-        )) {
+            channel_clock.clone(),
+            channel_owner.clone(),
+        ), &channel_clock, channel_owner) {
             Ok(client) => {
                 // An owner that is winding down accepts the connection and
                 // then refuses every statement. Selecting it would hand the
@@ -3635,20 +3647,24 @@ impl ReadSession {
                 let presented = crate::local_transport::LocalHandshake::current(
                     identity, writer_run, owner_user,
                 );
+                let channel_clock = read_clock();
+                let channel_owner = crate::local_transport::query_funding::QueryMemory::new(options.limits.memory.min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)))?.image().owner();
                 match wait_for_local_answer(crate::owner_read::OwnerClient::connect(
                     &channel_path,
                     presented,
                     options.timeouts,
-                    read_clock(),
-                    crate::local_transport::query_funding::QueryMemory::new(options.limits.memory.min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)))?.image().owner(),
-                )) {
+                    channel_clock.clone(),
+                    channel_owner.clone(),
+                ), &channel_clock, channel_owner) {
                     Ok(mut client) => {
+                        let request_clock = client.deadline_clock();
+                        let request_owner = client.original_connection_owner();
                         let answered = wait_for_local_answer(client.request(
                             crate::local_transport::LocalRequestEnvelope {
                                 limits: options.limits,
                                 request: crate::local_transport::LocalRequest::OwnerStatus,
                             },
-                        ))
+                        ), &request_clock, request_owner)
                         .map_err(owner_error)?;
                         for response in answered {
                             match response {
@@ -3805,9 +3821,10 @@ impl OwnerRoute {
                 observer.observe_event(ReadSessionEvent::ResponseFrameReceived { terminal });
             })));
         }
+        let request_clock = client.deadline_clock();
         let answered = wait_for_local_answer(client.request_watching_with_query_memory(
             request, limits, progress.as_ref(), cancellation, custody,
-        ));
+        ), &request_clock, custody.image().owner());
         #[cfg(any(test, feature = "test-seams"))]
         client.observe_response_frames_for_test(None);
         answered.map_err(|error| {
@@ -3848,13 +3865,14 @@ impl OwnerRoute {
                 owned_request.image().owner()
             }
         };
+        let request_clock = client.deadline_clock();
         let answered = wait_for_local_answer(client.request_watching_under_cursor_memory(
             crate::local_transport::LocalRequestEnvelope { limits, request },
             progress.as_ref(),
             cancellation,
             cursor_memory,
-            request_owner,
-        ));
+            request_owner.clone(),
+        ), &request_clock, request_owner);
         #[cfg(any(test, feature = "test-seams"))]
         client.observe_response_frames_for_test(None);
         answered.map_err(owner_error)

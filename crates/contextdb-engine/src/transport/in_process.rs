@@ -491,7 +491,7 @@ pub(crate) fn begin_native_in_process(
 // Native siblings run on the caller's existing thread. Each operation/frame
 // and wake control is admitted before construction; no executor task is spawned.
 #[cfg(target_os = "linux")]
-mod native_serving {
+pub(crate) mod native_serving {
     use super::*;
     use contextdb_core::read_contract::{
         NativeCancellationListener, NativeDriverPark, NativeReadCancellation,
@@ -584,8 +584,22 @@ mod native_serving {
     // control. Its handle is part of the admitted drain frame, with no std Arc
     // wrapper or second allocation. A local type keeps the companion impls
     // within Rust's trait coherence rules.
-    struct NativeInProcessPark {
+    pub(crate) struct NativeInProcessPark {
         wake: ReadShared<NativeInProcessWake>,
+    }
+    impl NativeInProcessPark {
+        pub(crate) fn try_new(owner: ReadMemoryOwner) -> contextdb_core::Result<Self> {
+            let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
+                owner, ReadShared::<NativeInProcessWake>::layout().size(),
+                "reader", "local_driver_wake", "Raise the declared reader memory limit.")?;
+            let wake = ReadShared::try_from_prepaid_native(
+                NativeInProcessWake { ready: AtomicU32::new(0) }, invoice)
+                .map_err(contextdb_core::Error::NativeEngineOther)?;
+            Ok(Self { wake })
+        }
+        pub(crate) fn waker(&self) -> std::task::Waker {
+            self.wake.clone().into_read_waker()
+        }
     }
     impl contextdb_core::read_memory::NativeReadWake for NativeInProcessPark {
         fn wake_read(&self) {

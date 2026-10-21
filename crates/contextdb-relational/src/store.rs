@@ -3453,6 +3453,21 @@ impl RelationalStore {
             })
     }
 
+    /// Borrow one captured catalog's names while an internal metadata reader
+    /// counts and admits its projection. No owning name escapes this borrow.
+    #[doc(hidden)]
+    pub fn with_table_name_view<R>(
+        &self, consume: impl FnOnce(&mut dyn ExactSizeIterator<Item = &str>) -> R,
+    ) -> R {
+        if self.uses_disk_backed_committed_bodies() {
+            let tables = self.table_meta.read();
+            consume(&mut tables.keys().map(String::as_str))
+        } else {
+            let tables = self.tables.read();
+            consume(&mut tables.keys().map(String::as_str))
+        }
+    }
+
     pub fn table_names(&self) -> Vec<String> {
         let mut names: Vec<_> = if self.uses_disk_backed_committed_bodies() {
             self.table_meta.read().keys().cloned().collect()

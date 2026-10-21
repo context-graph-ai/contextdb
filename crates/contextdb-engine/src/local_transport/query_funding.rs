@@ -701,14 +701,18 @@ pub(crate) fn owner_panic_responses(
     owner_diagnostic_response(&Diagnostic(payload), owner)
 }
 
-pub(crate) fn transport_error(error: contextdb_core::Error, _ceiling: u64) -> super::LocalTransportError {
+pub(crate) fn transport_error(error: contextdb_core::Error, ceiling: u64) -> super::LocalTransportError {
+    // Internal producers retain their original diagnostics. At the transport
+    // boundary a real memory refusal keeps the established actionable tag.
+    if crate::read_image_memory::is_memory_refusal(&error) {
+        return super::LocalTransportError::Payload(super::PayloadViolation::MemoryCeilingExceeded {
+            ceiling, required: None,
+        });
+    }
     match error {
         contextdb_core::Error::ReadFailure(failure) => super::LocalTransportError::Refusal(failure),
         contextdb_core::Error::ReadCancelled => super::owner_disconnected(),
-        contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint } =>
-            super::LocalTransportError::MemoryAdmission { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint },
-        contextdb_core::Error::NativeEngineOther(error) => super::LocalTransportError::NativeAdmission(error),
-        other => super::LocalTransportError::OriginalAdmission(other),
+        _ => super::invalid_channel_data(),
     }
 }
 

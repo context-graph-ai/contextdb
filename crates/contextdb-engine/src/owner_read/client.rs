@@ -187,6 +187,8 @@ impl OwnerClient {
         self.response_frames = observer;
     }
 
+    pub(crate) fn deadline_clock(&self) -> Arc<dyn DeadlineClock> { self.clock.clone() }
+
     pub(crate) fn original_connection_owner(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
         self.connection_owner.clone()
     }

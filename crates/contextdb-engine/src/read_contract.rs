@@ -902,10 +902,11 @@ pub(crate) fn encode_transport_funded<T: Serialize>(
     let len = encoded_size(value)?;
     let mut output = crate::local_transport::query_funding::Funded::allocate_owned(owner,
         len, || vec![0; len])
-        .map_err(|error| ReadEncodingError::Admission(error))?;
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     // A fixed slice cannot silently grow beyond the admitted allocation if a
     // serializer writes a different size on its second visit.
-    let written = bincode::serde::encode_into_slice(value, &mut output.value, standard())
+    let written = contextdb_core::types::with_borrowed_json_wire(||
+        bincode::serde::encode_into_slice(value, &mut output.value, standard()))
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     if written != len { return Err(ReadEncodingError::InvalidPayload); }
     Ok(output)
@@ -993,7 +994,7 @@ pub(crate) fn encode_metadata_body_funded(
     let len = encoded_metadata_body_len(body);
     let mut output = crate::local_transport::query_funding::Funded::allocate_owned(
         Some(owner), len, || Vec::with_capacity(len),
-    ).map_err(|error| ReadEncodingError::Admission(error))?;
+    ).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     let mut writer = CanonicalWriter {
         bytes: std::mem::take(&mut output.value), len: 0, counting: false,
         credit: None, overflowed: false,
@@ -1432,7 +1433,8 @@ fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodi
 
 pub(crate) fn encoded_size<T: Serialize>(value: &T) -> Result<usize, ReadEncodingError> {
     let mut measured = bincode::enc::write::SizeWriter::default();
-    bincode::serde::encode_into_writer(value, &mut measured, standard())
+    contextdb_core::types::with_borrowed_json_wire(||
+        bincode::serde::encode_into_writer(value, &mut measured, standard()))
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(measured.bytes_written)
 }
@@ -1442,7 +1444,8 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
     // Growing the output by doubling would reserve up to twice a large answer
     // and briefly hold the old and new buffers together while it copies.
     let mut measured = bincode::enc::write::SizeWriter::default();
-    bincode::serde::encode_into_writer(value, &mut measured, standard())
+    contextdb_core::types::with_borrowed_json_wire(||
+        bincode::serde::encode_into_writer(value, &mut measured, standard()))
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     let mut encoded = Vec::with_capacity(measured.bytes_written);
     bincode::serde::encode_into_std_write(value, &mut encoded, standard())

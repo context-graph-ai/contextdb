@@ -278,6 +278,32 @@ impl Database {
     /// fired, and how many times it has fired successfully. Backs the CLI's
     /// `.events status` introspection and is a real public accessor, not a
     /// test seam.
+    pub(crate) fn direct_cron_status_funded(
+        &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<crate::local_transport::query_funding::Funded<Vec<crate::direct_file_reader::DirectScheduleStatus>>> {
+        use crate::direct_file_reader::DirectScheduleStatus;
+        let _operation = self.assert_open_operation();
+        let callbacks = self.cron.callbacks.read();
+        let schedules = self.cron.schedules.lock();
+        let bytes = schedules.values().try_fold(schedules.len().checked_mul(std::mem::size_of::<DirectScheduleStatus>())
+            .ok_or_else(|| Error::Other("schedule status size overflow".into()))?, |bytes, schedule| {
+                bytes.checked_add(schedule.name.len()).and_then(|n| n.checked_add(schedule.every_text.len()))
+                    .and_then(|n| n.checked_add(schedule.callback.len()))
+                    .ok_or_else(|| Error::Other("schedule status size overflow".into()))
+            })?;
+        crate::local_transport::query_funding::Funded::allocate_owned(Some(owner), bytes, || {
+            let mut result = Vec::with_capacity(schedules.len());
+            for schedule in schedules.values() {
+                result.push(DirectScheduleStatus {
+                    name: schedule.name.clone(), every: schedule.every_text.clone(), callback: schedule.callback.clone(),
+                    callback_registered: callbacks.contains_key(&schedule.callback), next_fire_at_ms: schedule.next_fire_at_ms,
+                    last_fire_at_ms: schedule.last_fire_at_ms, fire_count: schedule.fire_count,
+                });
+            }
+            result
+        })
+    }
+
     pub fn cron_status(&self) -> Vec<CronScheduleStatus> {
         let _operation = self.assert_open_operation();
         let callbacks = self.cron.callbacks.read();

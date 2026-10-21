@@ -63889,6 +63889,20 @@ impl Database {
         Ok(result)
     }
 
+    pub(crate) fn metadata_table_page(
+        &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
+        continuation: Option<&str>, page_bytes: u64,
+    ) -> std::result::Result<crate::local_transport::query_funding::Funded<contextdb_core::read_contract::MetadataPage>, crate::metadata_page::MetadataPagingError> {
+        let _operation = self.assert_open_operation();
+        if let Some(root) = self.scoped_writer_root() {
+            return crate::metadata_page::borrowed_table_page(owner,
+                root.captured_table_metadata().map(|(name, _)| name), continuation, page_bytes);
+        }
+        self.relational_store.with_table_name_view(|names| {
+            crate::metadata_page::borrowed_table_page(owner, names, continuation, page_bytes)
+        })
+    }
+
     pub fn table_names(&self) -> Vec<String> {
         let _operation = self.assert_open_operation();
         if let Some(root) = self.scoped_writer_root() {
