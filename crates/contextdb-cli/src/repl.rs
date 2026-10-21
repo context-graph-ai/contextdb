@@ -2392,17 +2392,17 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
                 index,
                 vector_search,
                 ..
-            } = answer.body
+            } = &answer.body
             else {
                 return Err(Error::ReadSessionNotImplemented);
             };
             Ok(contextdb_engine::ExplainOutput {
-                physical_plan,
-                index_used: index,
+                physical_plan: physical_plan.clone(),
+                index_used: index.clone(),
                 predicates_pushed: Vec::new(),
                 indexes_considered: Vec::new(),
                 sort_elided: false,
-                vector_search,
+                vector_search: vector_search.clone(),
             })
         });
 
