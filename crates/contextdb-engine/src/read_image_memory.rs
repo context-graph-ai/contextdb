@@ -571,9 +571,10 @@ impl ImageMemory {
     pub(crate) fn operation_writer(
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<ImageMemoryHandle> {
-        let reader = accountant.query_reader_original().or_else(|| active_owner().ok()
-            .filter(|active| std::ptr::eq(active.accountant.as_ptr(), accountant.as_ptr()))
-            .and_then(|active| active.reader_budget()));
+        // A query-only accountant keeps its explicit reader provenance. A real
+        // writer accountant must fund write decoding itself: an enclosing answer
+        // image sharing its accountant is not the payer for commit scratch.
+        let reader = accountant.query_reader_original();
         if let Some(reader) = reader {
             return Self::admitted_reader_for(accountant, reader,
                 "writer_source", "decode_stored_value",

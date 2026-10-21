@@ -127,6 +127,16 @@ pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
     }
 }
 
+/// An application-created dynamic supplier of an already acquired native
+/// capability. The returned route carries its original invoice and typed refusal;
+/// the engine neither wraps it in an Arc nor acquires a second request.
+#[doc(hidden)]
+pub trait NativeReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
+    fn request_budget_owner_native(
+        &self,
+    ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure>;
+}
+
 /// An engine supplier aliases its existing parent directly. Host suppliers
 /// retain their original application-created Arc, including its Weak boundary.
 /// Constructing or cloning this handle never allocates a wrapper control.
@@ -137,6 +147,7 @@ pub struct ReadRequestProvider(ReadRequestProviderKind);
 enum ReadRequestProviderKind {
     Declared(DeclaredReadRoot),
     External(Arc<dyn ReadRequestBudgetProvider>),
+    Native(Arc<dyn NativeReadRequestBudgetProvider>),
 }
 impl ReadRequestProvider {
     pub(crate) fn declared(parent: DeclaredReadRoot) -> Self {
@@ -145,11 +156,20 @@ impl ReadRequestProvider {
     pub(crate) fn external(provider: Arc<dyn ReadRequestBudgetProvider>) -> Self {
         Self(ReadRequestProviderKind::External(provider))
     }
+    /// Retain host-created supplier storage without an engine allocation.
+    pub fn native(provider: Arc<dyn NativeReadRequestBudgetProvider>) -> Self {
+        Self(ReadRequestProviderKind::Native(provider))
+    }
     pub fn request_budget(&self) -> Result<ReadMemoryOwner> {
         match &self.0 {
             ReadRequestProviderKind::Declared(parent) => parent.child(),
             ReadRequestProviderKind::External(provider) =>
                 provider.request_budget().map(ReadMemoryOwner::from_legacy),
+            ReadRequestProviderKind::Native(provider) => provider.request_budget_owner_native()
+                .map(|request| match request.into_route() {
+                    RequestReadRoute::Legacy(owner) => ReadMemoryOwner::from_legacy(owner),
+                    RequestReadRoute::Native(receipt) => receipt.into_owner(),
+                }).map_err(RequestOwnerFailure::into_error),
         }
     }
     #[doc(hidden)]
@@ -157,6 +177,8 @@ impl ReadRequestProvider {
         match &self.0 {
             ReadRequestProviderKind::Declared(parent) => parent.request_budget_owner(),
             ReadRequestProviderKind::External(provider) => provider.request_budget_owner(),
+            ReadRequestProviderKind::Native(provider) => provider.request_budget_owner_native()
+                .map_err(RequestOwnerFailure::into_error),
         }
     }
     #[doc(hidden)]
@@ -165,6 +187,7 @@ impl ReadRequestProvider {
         match &self.0 {
             ReadRequestProviderKind::Declared(parent) => parent.request_budget_owner_native(),
             ReadRequestProviderKind::External(provider) => provider.request_budget_owner_native(),
+            ReadRequestProviderKind::Native(provider) => provider.request_budget_owner_native(),
         }
     }
 }
@@ -185,6 +208,15 @@ impl<T: ReadRequestBudgetProvider + 'static> From<Arc<T>> for ReadRequestProvide
 pub enum RequestOwnerFailure {
     Native(NativeRefusal),
     Legacy(contextdb_core::Error),
+}
+
+impl RequestOwnerFailure {
+    fn into_error(self) -> contextdb_core::Error {
+        match self {
+            Self::Native(refusal) => contextdb_core::Error::NativeEngineOther(refusal),
+            Self::Legacy(error) => error,
+        }
+    }
 }
 
 /// An acquired request capability whose native provenance is sealed here.
@@ -1017,7 +1049,7 @@ impl DeclaredReadRoot {
         self.native_child_unqualified()
             .map(RequestReadOwner::native)
     }
-    pub(crate) fn request_budget_owner_native(
+    pub fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {
         self.native_child()
