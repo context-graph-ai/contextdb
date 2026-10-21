@@ -338,10 +338,11 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
                 .unwrap(),
             catalogs[position]
         );
-        let rows = reopened.execute(
+        let fixture_answer_57 = reopened.execute(
             "SELECT id FROM items WHERE scope = $scope ORDER BY v <=> [0,1,0] USE VECTOR INDEXED LIMIT 3",
             &HashMap::from([("scope".into(), Value::Int64(position as i64))]),
-        ).unwrap().rows;
+        ).unwrap();
+        let rows = fixture_answer_57.rows();
         assert_eq!(
             rows.len(),
             3,
@@ -650,10 +651,11 @@ fn publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_f
             Some(expected_catalog),
             "startup installs the durable frontier without rebuilding candidates"
         );
-        let rows = reopened.execute(
+        let fixture_answer_58 = reopened.execute(
             "SELECT id FROM items WHERE scope = $scope ORDER BY v <=> [0,1,0] USE VECTOR INDEXED LIMIT 3",
             &HashMap::from([("scope".into(), Value::Int64(position as i64))]),
-        ).unwrap().rows;
+        ).unwrap();
+        let rows = fixture_answer_58.rows();
         assert_eq!(
             rows.len(),
             3,

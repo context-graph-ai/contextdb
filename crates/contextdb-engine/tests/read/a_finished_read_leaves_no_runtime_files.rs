@@ -139,7 +139,7 @@ fn read_all(session: &ReadSession) -> usize {
     session
         .execute("SELECT id FROM erased_rows", &HashMap::new())
         .unwrap()
-        .rows
+        .rows()
         .len()
 }
 
@@ -487,7 +487,7 @@ fn an_owner_cursor_never_waits_on_a_purging_writers_fence() {
         .expect("the purge commits while the cursor was refused");
     match client.open_cursor("SELECT id FROM erased_rows", &HashMap::new()) {
         Ok(cursor) => assert_eq!(
-            cursor.first_page().rows.len(),
+            cursor.first_page().rows().len(),
             0,
             "the cursor registered after the purge reads nothing purged"
         ),
@@ -560,7 +560,7 @@ fn an_owner_cursor_refused_in_one_root_rolls_back_every_root() {
     let cursor = client
         .open_cursor("SELECT id FROM erased_rows", &HashMap::new())
         .expect("asked again, the owner cursor registers in every root");
-    assert_eq!(cursor.first_page().rows.len(), 3);
+    assert_eq!(cursor.first_page().rows().len(), 3);
     drop(cursor);
     drop(client);
     writer.close().unwrap();

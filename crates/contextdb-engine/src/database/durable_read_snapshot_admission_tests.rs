@@ -138,7 +138,7 @@ fn captured_read_survives_compaction(cursor: bool) {
         )
         .expect("read the selected complete snapshot");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Int64(1), Value::Text("original".to_owned())],
             vec![Value::Int64(2), Value::Text("stable".to_owned())],
@@ -159,7 +159,7 @@ fn captured_read_survives_compaction(cursor: bool) {
     assert_eq!(
         db.execute("SELECT id, body FROM items ORDER BY id", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![
             vec![Value::Int64(1), Value::Text("replacement".to_owned())],
             vec![Value::Int64(2), Value::Text("stable".to_owned())]
@@ -318,7 +318,7 @@ fn fresh_snapshot_pin_does_not_borrow_an_older_readers_root() {
             snapshot,
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(1), Value::Text("original".to_owned())]],
         "current physical storage still filters out the later logical version"
     );
@@ -326,7 +326,7 @@ fn fresh_snapshot_pin_does_not_borrow_an_older_readers_root() {
     assert_eq!(
         db.execute("SELECT body FROM items", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("replacement".to_owned())]]
     );
     drop(fresh_pin);
@@ -430,8 +430,8 @@ fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
                 db.declared_reader_memory().unwrap(),
             );
             let answer = db.execute_at_snapshot(sql, &HashMap::new(), historical).unwrap();
-            assert_eq!(answer.rows, expected, "healthy successor: {case}");
-            let route = answer.trace.vector_search.as_ref()
+            assert_eq!(answer.rows(), expected, "healthy successor: {case}");
+            let route = answer.trace().vector_search.as_ref()
                 .expect("the healthy control must execute the vector consumer");
             assert_eq!(route.route_evidence, VectorSearchRouteEvidence::Executed, "{case}");
             assert_eq!(route.route, Some(VectorSearchRoute::Exact), "{case}");
@@ -555,7 +555,7 @@ fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
             assert_eq!(
                 db.execute_at_snapshot(sql, &HashMap::new(), historical)
                     .unwrap()
-                    .rows,
+                    .rows(),
                 expected,
                 "retained root: {case}"
             );

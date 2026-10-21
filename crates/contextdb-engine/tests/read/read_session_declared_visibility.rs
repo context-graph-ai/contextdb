@@ -272,7 +272,7 @@ fn declared_fixture() -> DeclaredFixture {
 
 fn payloads(result: QueryResult) -> BTreeSet<String> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [Value::Text(payload)] => payload.clone(),
@@ -282,7 +282,7 @@ fn payloads(result: QueryResult) -> BTreeSet<String> {
 }
 
 fn page_payloads(page: &CursorPage) -> BTreeSet<String> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Text(payload)] => payload.clone(),
@@ -530,9 +530,9 @@ fn indexed_counts_still_apply_declared_context_visibility() {
             &HashMap::from([("context".to_owned(), Value::Uuid(fixture.foreign_context.0))]),
         )
         .expect("the restricted indexed count answers through row visibility");
-    assert_eq!(answer.rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(answer.rows(), vec![vec![Value::Int64(0)]]);
     assert!(
-        answer.trace.rows_examined > 1,
+        answer.trace().rows_examined > 1,
         "an access-filtered count must retain the row-authenticating index path"
     );
 }
@@ -704,7 +704,7 @@ fn drain_cursor(
         .open_cursor(&select_payloads(DECLARED_TABLE), &HashMap::new())
         .expect("open a bounded cursor under the declared visibility");
     let mut seen = page_payloads(cursor.first_page());
-    let mut has_more = cursor.first_page().has_more;
+    let mut has_more = cursor.first_page().has_more();
     let mut pages = 1usize;
     assert_no_hidden_row(&seen, hidden, route, pages);
 
@@ -716,7 +716,7 @@ fn drain_cursor(
         let payloads = page_payloads(&page);
         assert_no_hidden_row(&payloads, hidden, route, pages);
         seen.extend(payloads);
-        has_more = page.has_more;
+        has_more = page.has_more();
     }
     cursor.close().expect("close the constrained cursor");
     assert!(

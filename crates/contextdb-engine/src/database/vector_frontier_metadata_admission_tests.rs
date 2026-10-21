@@ -278,7 +278,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
             &HashMap::new(),
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         3
     );
@@ -503,7 +503,7 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
             &HashMap::new(),
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         3
     );

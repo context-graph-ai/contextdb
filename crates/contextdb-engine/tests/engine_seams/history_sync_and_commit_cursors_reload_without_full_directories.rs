@@ -156,7 +156,7 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
                     *snapshot
                 )
                 .unwrap()
-                .rows,
+                .rows(),
                 vec![vec![Value::Int64(0)]]
             );
         }

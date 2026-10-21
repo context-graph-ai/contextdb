@@ -84,7 +84,7 @@ fn request(
 }
 
 fn page_target_count(page: &CursorPage) -> usize {
-    page.rows.len()
+    page.rows().len()
 }
 
 /// A source with eight outgoing edges, two of whose target rows are already
@@ -162,7 +162,7 @@ fn retention_reclaims_rows_a_cursor_stopped_being_entitled_to_when_its_idle_wind
     )
     .expect("open a bounded cursor over the whole edge set");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
     assert_eq!(
@@ -175,7 +175,7 @@ fn retention_reclaims_rows_a_cursor_stopped_being_entitled_to_when_its_idle_wind
         .fetch(NonZeroUsize::new(2), OwnerReadCancellation::new())
         .expect("page the graph cursor a second time");
     assert!(
-        second.page.has_more,
+        second.page.has_more(),
         "{journey}: the cursor must still be mid-adjacency when it is abandoned"
     );
 
@@ -219,7 +219,7 @@ fn retention_reclaims_rows_a_cursor_stopped_being_entitled_to_when_its_idle_wind
         other => panic!(
             "{journey}: {IDLE_PROMISE}. An abandoned cursor past its idle window must be refused, \
              got {other:?}",
-            other = other.map(|fetched| fetched.page.rows.len())
+            other = other.map(|fetched| fetched.page.rows().len())
         ),
     }
 }
@@ -238,7 +238,7 @@ fn a_cursor_left_past_its_idle_window_is_refused_its_next_page() {
     )
     .expect("open a bounded cursor over the whole edge set");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
 
@@ -254,7 +254,7 @@ fn a_cursor_left_past_its_idle_window_is_refused_its_next_page() {
         ),
         other => panic!(
             "{journey}: a cursor past its idle window must be refused, got {other:?}",
-            other = other.map(|fetched| fetched.page.rows.len())
+            other = other.map(|fetched| fetched.page.rows().len())
         ),
     }
 }

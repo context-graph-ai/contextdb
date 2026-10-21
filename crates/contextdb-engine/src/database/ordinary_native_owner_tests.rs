@@ -397,9 +397,9 @@ fn borrowed_refusal(error: Error, subsystem_expected: &str, operation_expected: 
         "Reduce simultaneous requests or raise the declared reader memory limit."
     } else { "Release retained read controls or raise MEMORY_LIMIT." };
     assert_eq!(hint, expected_hint);
-    assert!(matches!(subsystem, std::borrow::Cow::Borrowed(_)));
-    assert!(matches!(operation, std::borrow::Cow::Borrowed(_)));
-    assert!(matches!(hint, std::borrow::Cow::Borrowed(_)));
+    assert!(subsystem.static_text().is_some());
+    assert!(operation.static_text().is_some());
+    assert!(hint.static_text().is_some());
     assert_eq!(requested_bytes, requested);
     assert_eq!(available_bytes, available);
     assert_eq!(budget_limit_bytes, limit as usize);
@@ -480,7 +480,7 @@ fn ordinary_admission_and_allocator_refusals_preserve_typed_fields_and_cleanup()
                     assert_eq!(observation.capture().children, 0);
                 } else {
                     assert!(matches!(error, Error::Other(ref text)
-                        if text.as_ref() == "cannot allocate admitted shared control"));
+                        if text == "cannot allocate admitted shared control"));
                     assert_eq!(observation.capture().children, 1);
                 }
                 observation.assert_freed(&db);

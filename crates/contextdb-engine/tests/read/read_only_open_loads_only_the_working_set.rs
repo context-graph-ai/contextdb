@@ -124,7 +124,7 @@ fn measure(path: &Path, rows: usize) -> Measurement {
         )
         .expect("bounded selected-key query");
     assert_eq!(
-        answer.result.rows.len(),
+        answer.result.rows().len(),
         1,
         "selected key remains answerable"
     );
@@ -656,7 +656,7 @@ fn open_history_footprint_child() {
             &HashMap::from([("id".to_owned(), Value::Uuid(row_id(0)))]),
         )
         .expect("the selected working-set key still answers");
-    assert_eq!(answer.result.rows.len(), 1);
+    assert_eq!(answer.result.rows().len(), 1);
     // History left in the store at open is still complete when asked for.
     // The whole history is one answer, larger than the working-set reader's
     // result ceiling, so it is asked of a reader declared for it -- after

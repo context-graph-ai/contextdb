@@ -85,8 +85,8 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
             &params([("id", Value::Int64(17))]),
         )
         .unwrap();
-    assert_eq!(point.rows, vec![vec![Value::Text(payload(17))]]);
-    assert!(point.trace.index_used.is_some());
+    assert_eq!(point.rows(), vec![vec![Value::Text(payload(17))]]);
+    assert!(point.trace().index_used.is_some());
     let point_work = point_scope.counters();
     assert!(point_work.decoded_rows > 0 && point_work.decoded_rows <= 2);
     drop(point_scope);
@@ -102,16 +102,16 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
         )
         .unwrap();
     assert_eq!(
-        range.rows,
+        range.rows(),
         (100..116)
             .map(|sequence| vec![Value::Int64(sequence * BUCKETS as i64 + 3)])
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        range.trace.index_used.as_deref(),
+        range.trace().index_used.as_deref(),
         Some("relational_bucket_sequence")
     );
-    assert!(range.trace.sort_elided);
+    assert!(range.trace().sort_elided);
     let reverse = reader
         .execute(
             "SELECT id FROM relational_work WHERE bucket = $bucket AND sequence >= $low AND sequence < $high ORDER BY sequence DESC LIMIT 16",
@@ -123,13 +123,13 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
         )
         .unwrap();
     assert_eq!(
-        reverse.rows,
+        reverse.rows(),
         (100..116)
             .rev()
             .map(|sequence| vec![Value::Int64(sequence * BUCKETS as i64 + 3)])
             .collect::<Vec<_>>()
     );
-    assert!(reverse.trace.sort_elided);
+    assert!(reverse.trace().sort_elided);
 
     let physical = reader
         .execute(
@@ -137,8 +137,8 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
             &params([("payload", Value::Text(payload(0)))]),
         )
         .unwrap();
-    assert_eq!(physical.rows, vec![vec![Value::Int64(0)]]);
-    assert!(physical.trace.index_used.is_none());
+    assert_eq!(physical.rows(), vec![vec![Value::Int64(0)]]);
+    assert!(physical.trace().index_used.is_none());
 
     let writer = Database::open(&path).unwrap();
     writer
@@ -163,7 +163,7 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
         )
         .unwrap();
     drop(observation);
-    assert_eq!(old.rows, vec![vec![Value::Text(payload(5_000))]]);
+    assert_eq!(old.rows(), vec![vec![Value::Text(payload(5_000))]]);
     assert!(backend_bytes.load(Ordering::SeqCst) > 0);
     assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
     assert_eq!(
@@ -173,7 +173,7 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(5_000)]]
     );
 
@@ -184,8 +184,8 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
                 &params([("bucket", Value::Int64(bucket as i64))]),
             )
             .unwrap();
-        assert_eq!(rows.rows.len(), ROWS / BUCKETS);
-        assert_eq!(rows.rows[0], vec![Value::Text(payload(bucket))]);
+        assert_eq!(rows.rows().len(), ROWS / BUCKETS);
+        assert_eq!(rows.rows()[0], vec![Value::Text(payload(bucket))]);
         assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
     }
     let reloaded_bytes = Arc::new(AtomicU64::new(0));
@@ -200,7 +200,7 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
         )
         .unwrap();
     drop(observation);
-    assert_eq!(reloaded.rows.len(), ROWS / BUCKETS);
+    assert_eq!(reloaded.rows().len(), ROWS / BUCKETS);
     assert!(reloaded_bytes.load(Ordering::SeqCst) > 0);
     assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
     routes.file_only();
@@ -219,7 +219,7 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(5_000),
             Value::Text("new-snapshot-value".to_owned())
@@ -232,7 +232,7 @@ fn public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recyc
                 &HashMap::new(),
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
 }
@@ -263,7 +263,7 @@ fn authenticated_index_count_stays_snapshot_exact_without_loading_matching_row_b
 
     let (before, before_work) = count(&old, 3);
     assert_eq!(
-        before.rows,
+        before.rows(),
         vec![vec![Value::Int64((ROWS / BUCKETS) as i64)]]
     );
     assert_eq!(
@@ -301,7 +301,7 @@ fn authenticated_index_count_stays_snapshot_exact_without_loading_matching_row_b
     writer.close().unwrap();
 
     let (old_after_commit, old_after_work) = count(&old, 3);
-    assert_eq!(old_after_commit.rows, before.rows);
+    assert_eq!(old_after_commit.rows(), before.rows());
     assert_eq!(old_after_work.decoded_rows, 0);
     drop(old);
 
@@ -312,17 +312,17 @@ fn authenticated_index_count_stays_snapshot_exact_without_loading_matching_row_b
     );
     let (matching, matching_work) = count(&fresh, 3);
     assert_eq!(
-        matching.rows,
+        matching.rows(),
         vec![vec![Value::Int64((ROWS / BUCKETS + 1) as i64)]]
     );
     assert_eq!(matching_work.decoded_rows, 0);
     assert_eq!(matching_work.hashed_rows, 0);
     let (unrelated, unrelated_work) = count(&fresh, 0);
-    assert_eq!(unrelated.rows, before.rows);
+    assert_eq!(unrelated.rows(), before.rows());
     assert_eq!(unrelated_work.decoded_rows, 0);
     assert_eq!(unrelated_work.hashed_rows, 0);
     let (absent, absent_work) = count(&fresh, i64::MAX);
-    assert_eq!(absent.rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(absent.rows(), vec![vec![Value::Int64(0)]]);
     assert_eq!(
         absent_work.decoded_rows, 0,
         "authenticated count absence is an exact zero without row fallback: {absent_work:?}"
@@ -441,7 +441,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(2)]]
     );
     assert_eq!(
@@ -451,7 +451,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
     drop(reader);
@@ -481,7 +481,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(3)]]
     );
     // The bounded case, asserted rather than assumed: storing no count for a
@@ -494,7 +494,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]],
         "a primary key that holds a row counts one although no count is stored for it"
     );
@@ -505,7 +505,7 @@ fn shared_index_prefixes_have_one_exact_count_per_row_and_prefix() {
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(0)]],
         "and a primary key that holds none counts zero"
     );
@@ -556,7 +556,7 @@ fn authenticated_exact_counts_encode_the_planners_variant_exact_probe_values() {
             .unwrap();
         let work = scope.counters();
         drop(scope);
-        assert_eq!(result.rows, vec![vec![Value::Int64(1)]], "{column} count");
+        assert_eq!(result.rows(), vec![vec![Value::Int64(1)]], "{column} count");
         assert_eq!(
             work.decoded_rows, 0,
             "the variant-exact {column} probe reaches the matching authenticated count key: {work:?}"
@@ -573,7 +573,7 @@ fn authenticated_exact_counts_encode_the_planners_variant_exact_probe_values() {
             &params([("probe", Value::Int64(999))]),
         )
         .unwrap();
-    assert_eq!(absent.rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(absent.rows(), vec![vec![Value::Int64(0)]]);
 }
 
 const NEAR_LIMIT_INDEX_TEXT_BYTES: usize = 60 * 1024;
@@ -629,10 +629,11 @@ fn a_seventy_kibibyte_indexed_text_value_commits_reads_and_authenticates() {
         fixture::options(),
         Arc::new(fixture::Routes::default()),
     );
-    let ordered = reader
+    let fixture_answer_23 = reader
         .execute("SELECT id FROM wide_rows ORDER BY label", &HashMap::new())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let ordered = fixture_answer_23
+        .rows();
     assert_eq!(
         ordered,
         vec![
@@ -642,13 +643,14 @@ fn a_seventy_kibibyte_indexed_text_value_commits_reads_and_authenticates() {
         ],
         "the authenticated index answers in declared order across every key size"
     );
-    let selected = reader
+    let fixture_answer_24 = reader
         .execute(
             "SELECT id FROM wide_rows WHERE label = $label",
             &params([("label", Value::Text(wide_label('c', WIDE_INDEX_TEXT_BYTES)))]),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let selected = fixture_answer_24
+        .rows();
     assert_eq!(selected, vec![vec![Value::Int64(2)]]);
     drop(reader);
 
@@ -947,7 +949,7 @@ fn a_damaged_physical_index_key_is_typed_corruption_on_point_and_both_range_dire
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         (0..8)
             .map(|row| vec![Value::Int64(row)])
             .collect::<Vec<_>>()
@@ -959,7 +961,7 @@ fn a_damaged_physical_index_key_is_typed_corruption_on_point_and_both_range_dire
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         (0..8)
             .rev()
             .map(|row| vec![Value::Int64(row)])
@@ -1157,7 +1159,7 @@ fn trailing_truncated_and_noncanonical_posting_keys_are_typed_corruption_everywh
             let error = match answer {
                 Ok(result) => panic!(
                     "{what} on the {route} answered {:?} instead of reporting stored corruption",
-                    result.rows
+                    result.rows()
                 ),
                 Err(error) => error,
             };
@@ -1284,7 +1286,7 @@ const EXACT_IN_LIST: &str = "SELECT id FROM exact_candidates \
 
 fn exact_ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     let mut ids = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,

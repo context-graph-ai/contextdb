@@ -200,5 +200,5 @@ fn the_same_declaration_is_adopted_where_an_index_carries_it() {
             &HashMap::from([("owner".to_string(), Value::Text("ada".into()))]),
         )
         .expect("count over the adopted declaration");
-    assert_eq!(answer.rows[0][0], Value::Int64(3));
+    assert_eq!(answer.rows()[0][0], Value::Int64(3));
 }

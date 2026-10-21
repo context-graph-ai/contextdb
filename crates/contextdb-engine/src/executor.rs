@@ -23333,8 +23333,8 @@ mod tests {
         )
         .unwrap();
         let pull = scoped.execute(sql, &HashMap::new()).unwrap();
-        assert_eq!(eager.rows, pull.rows);
-        assert_eq!(pull.rows, vec![vec![Value::Int64(1)]]);
+        assert_eq!(eager.rows, pull.rows());
+        assert_eq!(pull.rows(), vec![vec![Value::Int64(1)]]);
         assert!(scoped.__debug_last_query_vector_used_hnsw_for_test());
         let ready = passive(sql);
         assert_eq!(ready.route, Some(VectorSearchRoute::FilteredIndexed));
@@ -23355,8 +23355,8 @@ mod tests {
             disclosure.budget_terminal = actual.budget_terminal.clone();
             disclosure
         };
-        for result in [&eager, &pull] {
-            let disclosure = result.trace.vector_search.as_deref().unwrap();
+        for trace in [&eager.trace, pull.trace()] {
+            let disclosure = trace.vector_search.as_deref().unwrap();
             assert_eq!(
                 disclosure.route_evidence,
                 VectorSearchRouteEvidence::Executed
@@ -23384,8 +23384,8 @@ mod tests {
         )
         .unwrap();
         let auto_pull = scoped.execute(&auto, &HashMap::new()).unwrap();
-        assert_eq!(auto_eager.rows, pull.rows);
-        assert_eq!(auto_eager.rows, auto_pull.rows);
+        assert_eq!(auto_eager.rows, pull.rows());
+        assert_eq!(auto_eager.rows, auto_pull.rows());
         let auto_executed = auto_eager.trace.vector_search.as_ref().unwrap();
         assert_eq!(
             auto_executed.route_evidence,
@@ -23393,7 +23393,7 @@ mod tests {
         );
         assert_eq!(auto_executed.refusal, auto_ready.refusal);
         assert_eq!(auto_executed.recovery, auto_ready.recovery);
-        assert_eq!(auto_pull.trace.vector_search.as_ref(), Some(auto_executed));
+        assert_eq!(auto_pull.trace().vector_search.as_ref(), Some(auto_executed));
 
         db.execute(
             "DROP INDEX readable_context ON readable_vectors",
@@ -23424,7 +23424,7 @@ mod tests {
         .unwrap();
         assert!(!scoped.__debug_last_query_vector_used_hnsw_for_test());
         let pull = scoped.execute(&auto, &HashMap::new()).unwrap();
-        assert_eq!(eager.rows, pull.rows);
+        assert_eq!(eager.rows, pull.rows());
         let eager_disc = eager.trace.vector_search.as_ref().unwrap();
         assert_eq!(
             eager_disc.route_evidence,
@@ -23432,7 +23432,7 @@ mod tests {
         );
         assert_eq!(eager_disc.refusal, auto_exact.refusal);
         assert_eq!(eager_disc.recovery, auto_exact.recovery);
-        assert_eq!(pull.trace.vector_search.as_ref(), Some(eager_disc));
+        assert_eq!(pull.trace().vector_search.as_ref(), Some(eager_disc));
     }
 
     #[test]
@@ -23657,7 +23657,7 @@ mod composite_resume_range_tests {
                             _ => ascending.clone(),
                         };
                         assert_eq!(
-                            answer.rows,
+                            answer.rows(),
                             expected
                                 .into_iter()
                                 .map(|id| vec![Value::Int64(id)])
@@ -23667,12 +23667,12 @@ mod composite_resume_range_tests {
                         // Only matching entries contribute, including when the
                         // seek skips duplicate ordinals at an exclusive edge.
                         if ordinal_direction == id_direction {
-                            assert_eq!(answer.trace.rows_examined, answer.rows.len() as u64);
+                            assert_eq!(answer.trace().rows_examined, answer.rows().len() as u64);
                         }
                         // Mixed physical directions may need the ordinary SQL
                         // sort; agreeing directions must walk the index directly.
                         if ordinal_direction == id_direction {
-                            assert!(answer.trace.sort_elided);
+                            assert!(answer.trace().sort_elided);
                         }
                     }
                 }

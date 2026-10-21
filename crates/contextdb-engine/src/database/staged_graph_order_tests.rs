@@ -34,7 +34,7 @@ fn interleaved_staged_row_owners_and_standalone_edges_share_logical_reachability
         db.insert_edge(tx, source, b, "LINKS".into(), HashMap::new())
             .unwrap()
     );
-    assert_eq!(db.execute("SELECT t FROM GRAPH_TABLE(links MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(source))])).unwrap().rows.len(), 7,
+    assert_eq!(db.execute("SELECT t FROM GRAPH_TABLE(links MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(source))])).unwrap().rows().len(), 7,
         "physical depth-one matching retains every declared owner plus standalone");
 
     let memory = db.declared_reader_memory().unwrap();
@@ -82,7 +82,7 @@ fn interleaved_staged_row_owners_and_standalone_edges_share_logical_reachability
     reached.sort_unstable();
     assert_eq!(reached, vec![a, b]);
     db.execute("ROLLBACK", &HashMap::new()).unwrap();
-    assert_eq!(db.execute("SELECT t FROM GRAPH_TABLE(links MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(source))])).unwrap().rows.len(), 2);
+    assert_eq!(db.execute("SELECT t FROM GRAPH_TABLE(links MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(source))])).unwrap().rows().len(), 2);
 }
 
 #[test]

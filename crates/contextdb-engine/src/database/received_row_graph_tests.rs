@@ -89,7 +89,7 @@ fn assert_witnesses(db: &Database, expected: &[OwnedAdjEntry], expected_standalo
             )
             .unwrap();
         assert_eq!(
-            rows.rows.len(),
+            rows.rows().len(),
             expected
                 .iter()
                 .filter(|e| e.owner.table == owned.owner.table)
@@ -359,14 +359,16 @@ fn received_missing_witness_refuses(drop_selected: bool, reverse: bool) {
     let row_id = selected.owner.row_id;
     let generation = selected.owner.table_generation;
     let before_lsn = db.current_lsn();
-    let before_selected = db
+    let fixture_answer_96 = db
         .execute("SELECT * FROM selected_links", &HashMap::new())
-        .unwrap()
-        .rows;
-    let before_other = db
+        .unwrap();
+    let before_selected = fixture_answer_96
+        .rows();
+    let fixture_answer_97 = db
         .execute("SELECT * FROM other_links", &HashMap::new())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let before_other = fixture_answer_97
+        .rows();
     let before_schema = format!("{:?}", db.table_meta("selected_links"));
     db.close().unwrap();
     drop(db);
@@ -396,13 +398,13 @@ fn received_missing_witness_refuses(drop_selected: bool, reverse: bool) {
     assert_eq!(
         db.execute("SELECT * FROM selected_links", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         before_selected
     );
     assert_eq!(
         db.execute("SELECT * FROM other_links", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         before_other
     );
     db.close().unwrap();
@@ -418,14 +420,14 @@ fn received_missing_witness_refuses(drop_selected: bool, reverse: bool) {
         reopened
             .execute("SELECT * FROM selected_links", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         before_selected
     );
     assert_eq!(
         reopened
             .execute("SELECT * FROM other_links", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         before_other
     );
 }

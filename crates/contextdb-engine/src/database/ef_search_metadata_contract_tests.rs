@@ -93,7 +93,7 @@ fn visible(db: &Database) -> Vec<Vec<Value>> {
         &empty(),
     )
     .unwrap()
-    .rows
+    .rows().to_vec()
 }
 fn graphs(db: &Database) -> Vec<(Option<u64>, Option<u64>)> {
     ["embedding", "compressed"]
@@ -356,7 +356,7 @@ fn ef_search_only_keeps_populated_rows_postings_and_graphs_in_place() {
                     old_snapshot
                 )
                 .unwrap()
-                .rows,
+                .rows(),
                 vec![vec![Value::Int64(1), Value::Text("replacement".into())]]
             );
             if let Some(root) = &old_root {
@@ -478,7 +478,7 @@ fn ef_search_history_survives_later_shape_change_reopen_export_and_replay() {
                 old_snapshot
             )
             .unwrap()
-            .rows,
+            .rows(),
             vec![vec![Value::Int64(1), Value::Text("replacement".into())]]
         );
         run(&db, "ALTER TABLE breadth_rows DROP COLUMN body");
@@ -503,13 +503,14 @@ fn ef_search_history_survives_later_shape_change_reopen_export_and_replay() {
         }
         let expected_schema = canonical(&db.table_meta("breadth_rows").unwrap());
         let expected_ddl = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
-        let expected_rows = db
+        let fixture_answer_98 = db
             .execute(
                 "SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id",
                 &empty(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let expected_rows = fixture_answer_98
+            .rows();
         // Replay the source's exact ordered changes, never manufacture a new
         // CREATE with the final schema and compare unrelated history digests.
         let expected_identity = declared_identity(&db);
@@ -535,7 +536,7 @@ fn ef_search_history_survives_later_shape_change_reopen_export_and_replay() {
             canonical(&replay.table_meta("breadth_rows").unwrap()),
             expected_schema
         );
-        assert_eq!(replay.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows, expected_rows);
+        assert_eq!(replay.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows(), expected_rows);
         assert_eq!(
             canonical(&replay.ddl_log_since(Lsn(0)).unwrap()),
             expected_ddl
@@ -552,7 +553,7 @@ fn ef_search_history_survives_later_shape_change_reopen_export_and_replay() {
             canonical(&restored.table_meta("breadth_rows").unwrap()),
             expected_schema
         );
-        assert_eq!(restored.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows, expected_rows);
+        assert_eq!(restored.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows(), expected_rows);
         if expected_identity.is_some() {
             assert_eq!(declared_identity(&restored), expected_identity);
         }
@@ -571,7 +572,7 @@ fn ef_search_history_survives_later_shape_change_reopen_export_and_replay() {
                 canonical(&reopened.table_meta("breadth_rows").unwrap()),
                 expected_schema
             );
-            assert_eq!(reopened.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows, expected_rows);
+            assert_eq!(reopened.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows(), expected_rows);
             assert_eq!(declared_identity(&reopened), expected_identity);
             reopened.close().unwrap();
         }
@@ -672,13 +673,13 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
         assert_eq!(
             db.execute("SELECT added FROM breadth_rows WHERE id = 1", &empty())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Null]]
         );
         assert_eq!(
             db.execute("SELECT body FROM breadth_rows WHERE id = 1", &empty())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("replacement".into())]]
         );
         db.close().unwrap();
@@ -854,20 +855,21 @@ async fn authenticated_pull_preserves_the_same_authored_history_through_ef_searc
             canonical(&source.table_meta("breadth_rows").unwrap())
         );
         let receiver_ddl = canonical(&edge.ddl_log_since(Lsn(0)).unwrap());
-        let expected_rows = source
+        let fixture_answer_99 = source
             .execute(
                 "SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id",
                 &empty(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let expected_rows = fixture_answer_99
+            .rows();
         assert_eq!(
             edge.execute(
                 "SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id",
                 &empty()
             )
             .unwrap()
-            .rows,
+            .rows(),
             expected_rows
         );
         drop(client);
@@ -882,7 +884,7 @@ async fn authenticated_pull_preserves_the_same_authored_history_through_ef_searc
             canonical(&reopened.ddl_log_since(Lsn(0)).unwrap()),
             receiver_ddl
         );
-        assert_eq!(reopened.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows, expected_rows);
+        assert_eq!(reopened.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows(), expected_rows);
         reopened.close().unwrap();
         source.close().unwrap();
     }

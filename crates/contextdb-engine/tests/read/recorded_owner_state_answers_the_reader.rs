@@ -158,5 +158,5 @@ fn a_store_nobody_owns_still_reads_from_the_committed_file() {
     let answer = session
         .execute("SELECT label FROM held ORDER BY id", &HashMap::new())
         .expect("the committed file answers");
-    assert_eq!(answer.rows.len(), 1, "the seeded row is still there");
+    assert_eq!(answer.rows().len(), 1, "the seeded row is still there");
 }

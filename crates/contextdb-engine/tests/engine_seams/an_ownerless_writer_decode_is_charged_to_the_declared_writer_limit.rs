@@ -63,7 +63,7 @@ fn an_alter_on_a_table_larger_than_the_shipped_reader_memory_is_charged_to_the_w
     assert_eq!(
         db.execute("SELECT COUNT(*) FROM points", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(ROWS)]]
     );
 }

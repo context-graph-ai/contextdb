@@ -53,7 +53,9 @@ fn credit(budget: impl Into<contextdb_vector::MemoryBudgetOwner>, bytes: usize) 
 
 // Real received-body installation followed by loaded-state header promotion
 // drives quantized funder matching and directory settlement without test seams.
-fn mixed_payload_owners(body: Arc<dyn MemoryBudget>, header: Arc<dyn MemoryBudget>) -> VectorStore {
+fn mixed_payload_owners(body: impl Into<contextdb_vector::MemoryBudgetOwner>, header: impl Into<contextdb_vector::MemoryBudgetOwner>) -> VectorStore {
+    let body = body.into();
+    let header = header.into();
     let store = VectorStore::default();
     let index = VectorIndexRef::new("funder_payload", "v");
     let publication = store
@@ -131,8 +133,8 @@ fn default_funder_identity_preserves_trait_data_address() {
         erased.stable_funder_identity()
     );
     assert_ne!(
-        Arc::as_ptr(&adapter_a) as *const () as usize,
-        Arc::as_ptr(&adapter_b) as *const () as usize
+        adapter_a.accounting_identity(),
+        adapter_b.accounting_identity()
     );
     drop(adapter_a);
     drop(adapter_b);
@@ -165,7 +167,7 @@ fn independent_writer_invocations_keep_caller_credit_and_allocation_dedup() {
         .vector_budget()
         .unwrap();
     assert!(
-        !Arc::ptr_eq(&first, &second),
+        first.accounting_identity() != second.accounting_identity(),
         "independent factory calls allocate separate adapters"
     );
     let second_credit = credit(second.clone(), 19);

@@ -111,6 +111,10 @@ cp "$repo_root/Cargo.lock" "$unpacked_root/Cargo.lock"
 metadata="$package_root/metadata.json"
 # The copied source lock retains dependency pins, but Cargo must rewrite the
 # local package-source entries for this unpacked workspace before locked use.
+# Fetch every package the unpacked workspace can resolve (its dev-dependencies
+# included, e.g. criterion's alloca) so the offline resolution and the locked
+# build below cannot depend on what an earlier job step happened to cache.
+cargo fetch --manifest-path "$unpacked_root/Cargo.toml"
 cargo metadata --manifest-path "$unpacked_root/Cargo.toml" --offline --format-version 1 > /dev/null
 cargo metadata --manifest-path "$unpacked_root/Cargo.toml" --locked --format-version 1 > "$metadata"
 python3 - "$metadata" "$repo_root" "$unpacked_root" <<'PY'

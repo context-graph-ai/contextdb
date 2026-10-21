@@ -189,16 +189,16 @@ fn run(
 ) -> Result<(Vec<Vec<Value>>, bounded::TestTelemetry), bounded::TestError> {
     if !cursor {
         return bounded::execute(&reader, request)
-            .map(|result| (result.result.rows, result.telemetry));
+            .map(|result| (result.result.rows().to_vec(), result.telemetry));
     }
     let mut opened = bounded::open_cursor(reader, request)?;
-    let mut rows = opened.first_page.rows;
-    let mut more = opened.first_page.has_more;
+    let mut rows = opened.first_page.rows().to_vec();
+    let mut more = opened.first_page.has_more();
     let mut telemetry = opened.telemetry;
     while more {
         let fetched = opened.cursor.fetch(None, OwnerReadCancellation::new())?;
-        more = fetched.page.has_more;
-        rows.extend(fetched.page.rows);
+        more = fetched.page.has_more();
+        rows.extend(fetched.page.rows().iter().cloned());
         // Each fetch reports that request's own work. Preserve the opening
         // grant lookup when a final empty page performs no authorization work.
         let page = fetched.telemetry;
@@ -335,7 +335,7 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
             reader
                 .execute(SQL, &request(Arc::new(Probe::new(None))).params)
                 .unwrap()
-                .rows,
+                .rows(),
             expected()
         );
         reader.execute("BEGIN", &HashMap::new()).unwrap();
@@ -363,14 +363,14 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
             reader
                 .execute(SQL, &request(Arc::new(Probe::new(None))).params)
                 .unwrap()
-                .rows,
+                .rows(),
             staged_expected
         );
         assert_eq!(
             separate
                 .execute(SQL, &request(Arc::new(Probe::new(None))).params)
                 .unwrap()
-                .rows,
+                .rows(),
             expected()
         );
         for cursor in [false, true] {
@@ -409,7 +409,7 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
             reader
                 .execute(SQL, &request(Arc::new(Probe::new(None))).params)
                 .unwrap()
-                .rows,
+                .rows(),
             expected()
         );
         drop(reader);

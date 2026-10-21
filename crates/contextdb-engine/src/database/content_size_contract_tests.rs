@@ -159,7 +159,7 @@ fn assert_sql_totals(database: &Database, expected: &BodyBytes) {
         .execute("SHOW CONTENT_SIZE", &HashMap::new())
         .expect("inspect committed body sizes");
     assert_eq!(
-        answer.columns,
+        answer.columns(),
         [
             "live_row_bytes",
             "live_vector_bytes",
@@ -178,7 +178,7 @@ fn assert_sql_totals(database: &Database, expected: &BodyBytes) {
     .into_iter()
     .map(|n| Value::Int64(i64::try_from(n).expect("fixture byte count fits SQL integer")))
     .collect::<Vec<_>>();
-    assert_eq!(answer.rows, vec![values]);
+    assert_eq!(answer.rows(), vec![values]);
 }
 
 fn mutate(database: &Database, sql: &str, params: HashMap<String, Value>) {
@@ -211,10 +211,10 @@ fn file_content_totals_match_persisted_values_through_replacement_delete_and_pru
     assert_sql_totals(&database, &first);
     let mut held_cursor = open_size_cursor(database.clone());
     assert_eq!(
-        held_cursor.first_page.rows[0][2],
+        held_cursor.first_page.rows()[0][2],
         Value::Int64((first.live_rows + first.live_vectors) as i64)
     );
-    assert!(!held_cursor.first_page.has_more);
+    assert!(!held_cursor.first_page.has_more());
     let snapshot = database.snapshot();
     let pin = database.pin_snapshot(snapshot).unwrap();
     mutate(
@@ -230,11 +230,11 @@ fn file_content_totals_match_persisted_values_through_replacement_delete_and_pru
     assert_sql_totals(&database, &replaced);
     let mut current_cursor = open_size_cursor(database.clone());
     assert_eq!(
-        current_cursor.first_page.rows[0][2],
+        current_cursor.first_page.rows()[0][2],
         Value::Int64((replaced.live_rows + replaced.live_vectors) as i64)
     );
     assert_eq!(
-        held_cursor.first_page.rows[0][2],
+        held_cursor.first_page.rows()[0][2],
         Value::Int64((first.live_rows + first.live_vectors) as i64)
     );
     current_cursor
@@ -905,7 +905,7 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
         assert_eq!(
             db.execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Vector(vector.clone())]],
             "non-vector partition-key update preserves the F32 body"
         );
@@ -915,7 +915,7 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
         assert_eq!(
             db.execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Vector(vector.clone())]],
             "non-vector update preserves the F32 body through reopen"
         );
@@ -930,55 +930,62 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
             },
         )
         .expect("open reader before vector clear");
-        let old_before_clear = old_reader
+        let fixture_answer_79 = old_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("read committed vector before clear")
-            .rows;
+            .expect("read committed vector before clear");
+        let old_before_clear = fixture_answer_79
+            .rows();
         let mut active_cursor = old_reader
             .open_cursor("SELECT v FROM items ORDER BY id", &HashMap::new())
             .expect("start the vector statement before clear");
-        assert_eq!(active_cursor.first_page().rows, vec![vec![Value::Null]]);
+        assert_eq!(active_cursor.first_page().rows(), vec![vec![Value::Null]]);
         assert!(
-            active_cursor.first_page().has_more,
+            active_cursor.first_page().has_more(),
             "target vector must remain unfetched"
         );
         db.execute("UPDATE items SET v = NULL WHERE id = 1", &HashMap::new())
             .unwrap();
-        let fresh_answer = db
+        let fixture_answer_80 = db
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .unwrap()
-            .rows;
-        let old_after_clear = active_cursor
+            .unwrap();
+        let fresh_answer = fixture_answer_80
+            .rows();
+        let fixture_answer_81 = active_cursor
             .fetch(None)
-            .expect("active statement keeps its vector after clear")
-            .rows;
+            .expect("active statement keeps its vector after clear");
+        let old_after_clear = fixture_answer_81
+            .rows();
         active_cursor.close().unwrap();
-        let retained_session_after_clear = old_reader
+        let fixture_answer_82 = old_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("new statement on retained session sees clear")
-            .rows;
+            .expect("new statement on retained session sees clear");
+        let retained_session_after_clear = fixture_answer_82
+            .rows();
         let new_reader = crate::ReadSession::open(&path).expect("open reader after vector clear");
-        let new_after_clear = new_reader
+        let fixture_answer_83 = new_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("new reader sees the committed clear")
-            .rows;
+            .expect("new reader sees the committed clear");
+        let new_after_clear = fixture_answer_83
+            .rows();
         drop(new_reader);
         drop(old_reader);
         db.close().unwrap();
         drop(db);
         let db = open();
-        let reopened_answer = db
+        let fixture_answer_84 = db
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .unwrap()
-            .rows;
+            .unwrap();
+        let reopened_answer = fixture_answer_84
+            .rows();
         eprintln!(
             "VECTOR_MOVE_CLEAR_ANSWER arm={arm} phase=reopened-after-clear answer={reopened_answer:?}"
         );
         let reopened_reader = crate::ReadSession::open(&path).expect("open reader after reopen");
-        let reader_after_reopen = reopened_reader
+        let fixture_answer_85 = reopened_reader
             .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("reopened reader sees the committed clear")
-            .rows;
+            .expect("reopened reader sees the committed clear");
+        let reader_after_reopen = fixture_answer_85
+            .rows();
         drop(reopened_reader);
         db.close().unwrap();
         assert_eq!(
@@ -1084,10 +1091,11 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
     drop(db);
     // Reopen removes any staged payload and requires the persisted SQ8 body.
     let db = open();
-    let live_answer = db
+    let fixture_answer_86 = db
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("hydrate live quantized vector after reopen")
-        .rows;
+        .expect("hydrate live quantized vector after reopen");
+    let live_answer = fixture_answer_86
+        .rows();
     let old_reader = crate::ReadSession::open_with_options(
         &path,
         crate::ReadSessionOptions {
@@ -1099,16 +1107,17 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
         },
     )
     .expect("capture live SQ8 reader");
-    let old_before_clear = old_reader
+    let fixture_answer_87 = old_reader
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("reader hydrates live quantized body")
-        .rows;
+        .expect("reader hydrates live quantized body");
+    let old_before_clear = fixture_answer_87
+        .rows();
     let mut active_cursor = old_reader
         .open_cursor("SELECT v FROM compact_items ORDER BY id", &HashMap::new())
         .expect("start SQ8 vector statement before clear");
-    assert_eq!(active_cursor.first_page().rows, vec![vec![Value::Null]]);
+    assert_eq!(active_cursor.first_page().rows(), vec![vec![Value::Null]]);
     assert!(
-        active_cursor.first_page().has_more,
+        active_cursor.first_page().has_more(),
         "SQ8 target must remain unfetched"
     );
     db.execute(
@@ -1116,33 +1125,38 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
         &HashMap::new(),
     )
     .expect("commit quantized clear");
-    let cleared_answer = db
+    let fixture_answer_88 = db
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("read cleared quantized vector")
-        .rows;
-    let old_after_clear = active_cursor
+        .expect("read cleared quantized vector");
+    let cleared_answer = fixture_answer_88
+        .rows();
+    let fixture_answer_89 = active_cursor
         .fetch(None)
-        .expect("active statement keeps live quantized body")
-        .rows;
+        .expect("active statement keeps live quantized body");
+    let old_after_clear = fixture_answer_89
+        .rows();
     active_cursor.close().unwrap();
-    let retained_session_after_clear = old_reader
+    let fixture_answer_90 = old_reader
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("new SQ8 statement on retained session sees clear")
-        .rows;
+        .expect("new SQ8 statement on retained session sees clear");
+    let retained_session_after_clear = fixture_answer_90
+        .rows();
     let new_reader = crate::ReadSession::open(&path).expect("capture cleared SQ8 reader");
-    let new_after_clear = new_reader
+    let fixture_answer_91 = new_reader
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("new reader sees quantized clear")
-        .rows;
+        .expect("new reader sees quantized clear");
+    let new_after_clear = fixture_answer_91
+        .rows();
     drop(new_reader);
     drop(old_reader);
     db.close().unwrap();
     drop(db);
     let db = open();
-    let reopened_answer = db
+    let fixture_answer_92 = db
         .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("quantized clear stays NULL after reopen")
-        .rows;
+        .expect("quantized clear stays NULL after reopen");
+    let reopened_answer = fixture_answer_92
+        .rows();
     db.close().unwrap();
     assert_eq!(
         live_answer, expected,
@@ -1187,7 +1201,7 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
 
     #[derive(Debug)]
     struct ObservedReadBudget {
-        source: Arc<dyn ReadMemoryBudget>,
+        source: contextdb_core::read_memory::ReadMemoryOwner,
         used: AtomicUsize,
         peak: AtomicUsize,
         materialize_answer_bytes: AtomicUsize,
@@ -1305,7 +1319,7 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
             "all operation availability returns before public output destruction"
         );
         let credit = ReadCredit::try_new(
-            db.declared_read_memory.clone(),
+            db.declared_read_memory.original_owner(),
             available as usize,
             "reader",
             "test_available_declared_capacity",
@@ -1418,8 +1432,8 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         owner.used.load(Ordering::SeqCst) > 0,
         "internal lifetime retains executing reader credit"
     );
-    let converted = owned.into_public();
-    assert_eq!(converted.rows, expected);
+    let converted = owned.into_public().expect("publish the admitted fixture answer");
+    assert_eq!(converted.rows(), expected);
     assert_eq!(
         owner.used.load(Ordering::SeqCst),
         0,
@@ -1434,7 +1448,7 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
     let explicit = db
         .execute_with_read_memory(sql, &HashMap::new(), owner.clone())
         .unwrap();
-    assert_eq!(explicit.rows, expected);
+    assert_eq!(explicit.rows(), expected);
     assert_control_freed(&control, control_layout);
     assert_eq!(owner.materialize_answer_bytes.load(Ordering::SeqCst), control_layout.0,
         "public explicit-owner route also creates no eager image beyond its actual control");
@@ -1451,11 +1465,11 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
     drop(owner);
     assert_parent_baseline();
     let ordinary = db.execute(sql, &HashMap::new()).unwrap();
-    assert_eq!(ordinary.rows, expected);
+    assert_eq!(ordinary.rows(), expected);
     assert_parent_baseline();
     // Keep all three public values alive through the final baseline-availability probe.
-    assert_eq!(converted.rows, ordinary.rows);
-    assert_eq!(explicit.rows, ordinary.rows);
+    assert_eq!(converted.rows(), ordinary.rows());
+    assert_eq!(explicit.rows(), ordinary.rows());
     // Owned configuration follows the captured root; scalar decoding ends at return.
     let config_tx = db.begin_or_panic();
     let config_text = "owned configuration image".repeat(128);

@@ -155,7 +155,7 @@ fn a_read_only_open_does_the_same_work_after_a_short_or_long_unindexed_vector_hi
             .open_cursor("SELECT COUNT(*) FROM points", &HashMap::new())
             .unwrap();
         assert_eq!(
-            cursor.first_page().rows,
+            cursor.first_page().rows(),
             vec![vec![Value::Int64(rows)]],
             "the read-only open sees every committed vector row"
         );
@@ -180,12 +180,12 @@ fn a_read_only_open_does_the_same_work_after_a_short_or_long_history_of_deleted_
         let cursor = session
             .open_cursor("SELECT COUNT(*) FROM gone", &HashMap::new())
             .unwrap();
-        assert_eq!(cursor.first_page().rows, vec![vec![Value::Int64(0)]]);
+        assert_eq!(cursor.first_page().rows(), vec![vec![Value::Int64(0)]]);
         let cursor = session
             .open_cursor("SELECT body FROM kept WHERE id = 1", &HashMap::new())
             .unwrap();
         assert_eq!(
-            cursor.first_page().rows,
+            cursor.first_page().rows(),
             vec![vec![Value::Text("live".into())]]
         );
     }

@@ -120,7 +120,7 @@ struct OversizedFetchPage;
 impl ReadSessionTestObserver for OversizedFetchPage {
     fn cursor_fetch_payload_for_test(&self, payload: &[u8]) -> Option<Vec<u8>> {
         let mut page = decode_cursor_page(payload).expect("owner published a valid page");
-        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows().len(), 1);
         page.rows[0][1] = Value::Text("x".repeat(128 * 1024));
         Some(replace_owner_cursor_page(payload, &page).expect("encode one oversized valid page"))
     }
@@ -143,7 +143,7 @@ impl ReadSessionTestObserver for OversizedFirstPageOnce {
             return None;
         }
         let mut page = decode_cursor_page(payload).expect("owner published a valid first page");
-        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows().len(), 1);
         page.rows[0][1] = Value::Text("x".repeat(128 * 1024));
         Some(
             replace_owner_cursor_page(payload, &page)
@@ -223,7 +223,7 @@ fn oversized_owner_fetch_page_releases_cursor_slot_snapshot_and_presence() {
     let mut cursor = session
         .open_cursor("SELECT id, payload FROM rows ORDER BY id", &HashMap::new())
         .expect("open first small page");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     assert_eq!(
         session.route_resources_for_test().unwrap().active_cursors,
         1
@@ -391,6 +391,6 @@ fn oversized_owner_first_page_closes_the_owner_cursor_and_preserves_the_refusal(
     let cursor = session
         .open_cursor("SELECT id, payload FROM rows ORDER BY id", &HashMap::new())
         .expect("next cursor opens after owner-side close");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     cursor.close().expect("close second cursor");
 }

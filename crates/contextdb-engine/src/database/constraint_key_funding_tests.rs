@@ -44,7 +44,7 @@ fn a_unique_key_larger_than_the_read_limit_validates_on_the_writer_budget() {
         .execute("INSERT INTO notes VALUES (2, $body)", &body("k"))
         .unwrap();
     assert_eq!(
-        duplicate.rows_affected, 0,
+        duplicate.rows_affected(), 0,
         "validation found the committed key and stored nothing"
     );
     db.close().unwrap();
@@ -82,7 +82,7 @@ fn a_constraint_key_the_writer_budget_cannot_fund_refuses_typed_with_nothing_all
     assert_eq!(
         db.execute("SELECT COUNT(*) FROM notes", &HashMap::new())
             .unwrap()
-            .rows[0][0],
+            .rows()[0][0],
         Value::Int64(0),
         "the refused write stored nothing"
     );

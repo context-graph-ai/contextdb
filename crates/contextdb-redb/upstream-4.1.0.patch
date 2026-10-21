@@ -1816,7 +1816,7 @@
 +        deferred_free_budget: (usize, usize),
 +        keep_pace_reclaim: bool,
      ) -> Result<Self, DatabaseError> {
-+        let file = file.into();
++        let file: Backend = file.into();
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
          #[cfg(feature = "logging")]
@@ -14050,7 +14050,18 @@
  use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
  use std::cmp::Ordering;
  #[cfg(debug_assertions)]
-@@ -104,6 +104,11 @@
+@@ -9,9 +9,8 @@
+ use std::marker::PhantomData;
+ use std::mem;
+ use std::ops::Range;
+-use std::sync::Arc;
+ #[cfg(debug_assertions)]
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex};
+
+ pub(crate) const MAX_VALUE_LENGTH: usize = 3 * 1024 * 1024 * 1024;
+ pub(crate) const MAX_PAIR_LENGTH: usize = 3 * 1024 * 1024 * 1024 + 768 * 1024 * 1024;
+@@ -104,6 +103,11 @@
              page_index: index,
              page_order: order,
          }
@@ -14062,7 +14073,7 @@
      }
 
      #[cfg(test)]
-@@ -177,14 +182,17 @@
+@@ -177,14 +181,17 @@
  }
 
  pub struct PageImpl {
@@ -14082,7 +14093,7 @@
          self.mem.clone()
      }
  }
-@@ -204,13 +212,16 @@
+@@ -204,13 +211,16 @@
          *value -= 1;
          if *value == 0 {
              open_pages.remove(&self.page_number);
@@ -14100,7 +14111,7 @@
      }
 
      fn get_page_number(&self) -> PageNumber {
-@@ -267,14 +278,30 @@
+@@ -267,14 +277,30 @@
  impl Drop for PageMut<'_> {
      fn drop(&mut self) {
          #[cfg(debug_assertions)]
@@ -14848,6 +14859,15 @@
          // Don't enable when fuzzing, because this is kind of expensive
          #[cfg(all(debug_assertions, not(fuzzing)))]
          {
+@@ -318,7 +409,7 @@
+                         let buddy = buddy_page(page);
+                         if buddy < allocator.len() {
+                             let buddy_allocated = allocator.get(buddy);
+-                            assert!(buddy_allocated, "order={order} page={page} buddy={buddy}",);
++                            assert!(buddy_allocated, "order={order} page={page} buddy={buddy}");
+                         }
+                     }
+                 }
 @@ -328,16 +419,57 @@
 
      // Allocates a page of the given order at the lowest index possible. Will split a higher order page,
@@ -20033,7 +20053,7 @@
 +        external_read: bool,
 +        allocator_free: bool,
      ) -> Result<Self, DatabaseError> {
-+        let file = file.into();
++        let file: crate::db::Backend = file.into();
          assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
 -
 +        assert!(!external_read || read_only);

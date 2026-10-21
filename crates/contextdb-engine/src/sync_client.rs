@@ -5730,7 +5730,7 @@ mod tests {
             .execute(&format!("SELECT id FROM {table}"), &HashMap::new())
             .expect("receiver must expose replayed rows after split apply");
         assert_eq!(
-            rows.rows.len(),
+            rows.rows().len(),
             row_count,
             "fresh receiver must contain every row after applying split snapshot batches"
         );
@@ -5744,12 +5744,12 @@ mod tests {
             )
             .expect("receiver must expose replayed vector index after split apply");
         let id_idx = nearest
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "id")
             .expect("nearest query must project id");
         assert_eq!(
-            nearest.rows[0][id_idx],
+            nearest.rows()[0][id_idx],
             Value::Uuid(ids[0]),
             "replayed vector index must route to the declared table+column after split apply"
         );

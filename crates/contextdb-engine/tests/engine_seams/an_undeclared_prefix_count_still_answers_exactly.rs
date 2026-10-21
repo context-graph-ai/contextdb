@@ -67,11 +67,11 @@ fn answer(db: &Database, sql: &str, params: HashMap<String, Value>) -> (i64, Que
     let result = db
         .execute(sql, &params)
         .unwrap_or_else(|error| panic!("count `{sql}`: {error}"));
-    let count = match &result.rows[0][0] {
+    let count = match &result.rows()[0][0] {
         Value::Int64(count) => *count,
         other => panic!("a count is an integer, got {other:?}"),
     };
-    (count, result.trace)
+    (count, result.trace().clone())
 }
 
 fn by_owner(owner: &str) -> HashMap<String, Value> {

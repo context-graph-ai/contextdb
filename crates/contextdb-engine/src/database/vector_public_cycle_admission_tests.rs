@@ -355,7 +355,7 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
             &HashMap::new()
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         3
     );
@@ -629,7 +629,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
                 vec![vec![Value::Text(format!("{id}:{}", "p".repeat(64 * 1024)))]]
             );
         }
@@ -1042,7 +1042,7 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
         assert_eq!(
             db.execute("SHOW VECTOR_PARTITIONS FOR slot_items.v", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             3,
             "the replacement setup leaves every route active before staging retirement"
@@ -1066,13 +1066,14 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
     }
     drop(retirement_snapshot);
     let assert_serving_answers = || {
-        let rows = db
+        let fixture_answer_59 = db
             .execute(
                 "SELECT id FROM slot_items WHERE scope = 0 ORDER BY v <=> [0,1,0] USE VECTOR INDEXED LIMIT 16",
                 &HashMap::new(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let rows = fixture_answer_59
+            .rows();
         assert_eq!(rows.len(), 16);
         for id in 0..16 {
             assert!(rows.contains(&vec![Value::Int64(id)]));
@@ -1097,7 +1098,7 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
         assert_eq!(
             db.execute("SHOW VECTOR_PARTITIONS FOR slot_items.v", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             3,
             "the deleted route remains active before the closing-slot refusal"
@@ -1185,7 +1186,7 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
         assert_eq!(
             db.execute("SHOW VECTOR_PARTITIONS FOR slot_items.v", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             3,
             "the incomplete closing sample grants no retirement authority"
@@ -1220,7 +1221,7 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
         assert_eq!(
             db.execute("SHOW VECTOR_PARTITIONS FOR slot_items.v", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             2,
             "the complete retry retires the deleted route while retaining historical raw state"

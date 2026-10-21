@@ -53,7 +53,7 @@ fn records(
     (base, change)
 }
 
-fn corruption(reason: String) -> Error {
+fn corruption(reason: contextdb_core::error::DiagnosticText) -> Error {
     Error::StoreCorrupted {
         path: "test".into(),
         reason,

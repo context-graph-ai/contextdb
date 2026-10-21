@@ -266,7 +266,7 @@ fn while_a_maintenance_commit_is_held<T>(
 }
 
 fn rows_of(result: contextdb_core::Result<contextdb_engine::QueryResult>) -> Vec<Vec<Value>> {
-    result.expect("the read is answered").rows
+    result.expect("the read is answered").rows().to_vec()
 }
 
 /// A relational point read is answered with the exact captured row, with no
@@ -338,7 +338,7 @@ fn a_cursor_continues_while_a_maintenance_commit_holds_the_commit_gate() {
     let mut cursor = session
         .open_cursor("SELECT id FROM plain ORDER BY id", &no_params())
         .expect("open a cursor");
-    assert_eq!(cursor.first_page().rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(cursor.first_page().rows(), vec![vec![Value::Int64(0)]]);
     let ((page, waits, held_when_answered), _) =
         while_a_maintenance_commit_is_held(&fixture.database, |held| {
             let (page, waits) = held.observed(|| cursor.fetch(NonZeroUsize::new(1)));
@@ -353,7 +353,7 @@ fn a_cursor_continues_while_a_maintenance_commit_holds_the_commit_gate() {
         "the page arrived while the commit was still held"
     );
     assert_eq!(
-        page.expect("the next page").rows,
+        page.expect("the next page").rows(),
         vec![vec![Value::Int64(1)]]
     );
 }
@@ -379,7 +379,7 @@ fn a_result_captured_before_a_purge_is_refused_as_erased_while_a_maintenance_com
     let mut cursor = capturing
         .open_cursor("SELECT payload FROM erasable ORDER BY id", &no_params())
         .expect("open a cursor over the erasable table");
-    assert_eq!(cursor.first_page().rows.len(), 1);
+    assert_eq!(cursor.first_page().rows().len(), 1);
     fixture
         .database
         .execute("PURGE FROM erasable WHERE id = 3", &no_params())
@@ -503,12 +503,12 @@ fn a_cursor_never_substitutes_a_newer_state_into_a_later_page() {
             &no_params(),
         )
         .expect("a later commit");
-    let mut seen = cursor.first_page().rows.clone();
-    let mut has_more = cursor.first_page().has_more;
+    let mut seen = cursor.first_page().rows().to_vec();
+    let mut has_more = cursor.first_page().has_more();
     while has_more {
         let page = cursor.fetch(NonZeroUsize::new(1)).expect("a later page");
-        seen.extend(page.rows.clone());
-        has_more = page.has_more;
+        seen.extend(page.rows().to_vec());
+        has_more = page.has_more();
     }
     assert_eq!(
         seen,

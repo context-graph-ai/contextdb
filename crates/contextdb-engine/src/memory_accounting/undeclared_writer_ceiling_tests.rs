@@ -121,7 +121,7 @@ fn an_undeclared_writer_page_cache_fits_the_process_ceiling() {
             let rows = db
                 .execute("SELECT id, v FROM points", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len();
             assert_eq!(rows, 48 * 680);
             let high_water = db.write_memory_high_water_for_test();
@@ -342,7 +342,7 @@ fn a_handle_recycle_reinstalls_the_undeclared_writer_cache_capacity() {
             let rows = db
                 .execute("SELECT id FROM points", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len();
             assert_eq!(rows, 512 - 384 + 32);
             db.close().unwrap();
@@ -413,11 +413,11 @@ fn a_failed_ceiling_refresh_keeps_the_last_valid_ceiling() {
             // The failed read is visible where the limits are inspected.
             let shown = db.execute("SHOW MEMORY_LIMIT", &HashMap::new()).unwrap();
             let column = shown
-                .columns
+                .columns()
                 .iter()
                 .position(|name| name == "ceiling_refresh_failures")
                 .expect("SHOW MEMORY_LIMIT reports failed ceiling reads");
-            assert_eq!(shown.rows[0][column], Value::Int64(1));
+            assert_eq!(shown.rows()[0][column], Value::Int64(1));
             crate::memory_accounting::set_os_ceiling_source_for_test(None);
             db.close().unwrap();
         },

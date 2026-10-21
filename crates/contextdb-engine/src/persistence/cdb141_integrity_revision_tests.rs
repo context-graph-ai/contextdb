@@ -51,7 +51,7 @@ fn seed(path: &Path) {
 }
 fn refusal(result: Result<QueryResult>, label: &str) {
     assert!(
-        matches!(result, Err(Error::StoreCorrupted { ref path, ref reason }) if !path.is_empty() && !reason.is_empty()),
+        matches!(result, Err(Error::StoreCorrupted { ref path, ref reason }) if !(path == "") && !(reason == "")),
         "{label}: {result:?}"
     );
 }
@@ -96,7 +96,7 @@ fn empty_index_and_maintained_groups_refuse_both_roots_on_both_public_routes() {
         let before = {
             let file = ReadSession::open(&path).unwrap();
             assert_eq!(file.route(), ReadRoute::File);
-            queries.map(|query| file.execute(query, &HashMap::new()).unwrap().rows)
+            queries.map(|query| file.execute(query, &HashMap::new()).unwrap().rows().to_vec())
         };
         assert!(
             before[0].is_empty()
@@ -116,7 +116,7 @@ fn empty_index_and_maintained_groups_refuse_both_roots_on_both_public_routes() {
             assert_eq!(session.route(), ReadRoute::Owner);
             for (query, expected) in queries.into_iter().zip(&before) {
                 assert_eq!(
-                    session.execute(query, &HashMap::new()).unwrap().rows,
+                    session.execute(query, &HashMap::new()).unwrap().rows(),
                     *expected
                 );
             }
@@ -131,7 +131,7 @@ fn empty_index_and_maintained_groups_refuse_both_roots_on_both_public_routes() {
                 // This JOIN uses Scan and never selects by_bucket. Its relevant
                 // protected root is the canonical body, not an unused index.
                 if index && position == 2 {
-                    assert_eq!(result.unwrap().rows, before[position]);
+                    assert_eq!(result.unwrap().rows(), before[position]);
                 } else {
                     refusal(result, &format!("file index_damage={index}: {query}"));
                 }
@@ -147,7 +147,7 @@ fn empty_index_and_maintained_groups_refuse_both_roots_on_both_public_routes() {
         for (position, query) in queries.into_iter().enumerate() {
             let result = session.execute(query, &HashMap::new());
             if index && position == 2 {
-                assert_eq!(result.unwrap().rows, before[position]);
+                assert_eq!(result.unwrap().rows(), before[position]);
             } else {
                 refusal(result, &format!("owner index_damage={index}: {query}"));
             }
@@ -215,7 +215,7 @@ fn owner_consumed_cold_body_checksums_are_typed_and_unvisited_damage_is_irreleva
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
                 1
             );
@@ -243,7 +243,7 @@ fn owner_consumed_cold_body_checksums_are_typed_and_unvisited_damage_is_irreleva
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             1
         );
@@ -265,7 +265,7 @@ fn storage_checksum_mapping_preserves_native_corruption_and_distinct_io() {
         "checksum mismatch in directory page".into(),
     ));
     assert!(
-        matches!(error, Error::StoreCorrupted { path, reason } if !path.is_empty() && reason.contains("checksum"))
+        matches!(error, Error::StoreCorrupted { path, reason } if !(path == "") && reason.contains("checksum"))
     );
     let io = RedbPersistence::storage_error(redb::StorageError::Io(std::io::Error::from(
         std::io::ErrorKind::PermissionDenied,
@@ -332,7 +332,7 @@ fn actual_current_point_list_and_index_work_stays_bounded_at_n_2n_4n_on_both_rou
             for query in queries {
                 observation.0.store(0, Ordering::Relaxed);
                 let result = file.execute(query, &HashMap::new()).unwrap();
-                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows().len(), 1);
                 let touches = observation.0.load(Ordering::Relaxed);
                 assert!(
                     touches > 0 && touches <= 160,
@@ -367,7 +367,7 @@ fn actual_current_point_list_and_index_work_stays_bounded_at_n_2n_4n_on_both_rou
         for query in queries {
             observation.0.store(0, Ordering::Relaxed);
             assert_eq!(
-                session.execute(query, &HashMap::new()).unwrap().rows.len(),
+                session.execute(query, &HashMap::new()).unwrap().rows().len(),
                 1
             );
             let touches = observation.0.load(Ordering::Relaxed);
@@ -421,7 +421,7 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows
+            .rows()
             .len(),
             1
         );
@@ -489,7 +489,7 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
             &HashMap::new()
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         1
     );

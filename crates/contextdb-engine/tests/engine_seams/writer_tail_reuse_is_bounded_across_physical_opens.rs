@@ -90,7 +90,7 @@ fn population(history: usize, intervening_writer: bool) -> usize {
                     &HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
                 )
                 .unwrap();
-            assert_eq!(result.rows, vec![vec![Value::Int64(20_000)]]);
+            assert_eq!(result.rows(), vec![vec![Value::Int64(20_000)]]);
         }
         db.detach_writer_vector_session(&session, &route);
         drop(db);

@@ -377,9 +377,9 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
                 None,
             )
             .unwrap();
-            let first = opened.first_page.into_public();
-            assert_eq!(ids(&first.rows), vec![0]);
-            assert!(first.has_more);
+            let first = opened.first_page.into_public().expect("publish the admitted fixture answer");
+            assert_eq!(ids(&first.rows()), vec![0]);
+            assert!(first.has_more());
             let (pointer, invoice, live) = retained_filter(&opened.cursor);
             {
                 let lifecycle = cursor_lifecycle(&opened.cursor);
@@ -423,9 +423,9 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
                 None,
             )
             .unwrap();
-            let second = fetched.page.into_public();
-            assert_eq!(ids(&second.rows), vec![1]);
-            assert!(second.has_more);
+            let second = fetched.page.into_public().expect("publish the admitted fixture answer");
+            assert_eq!(ids(&second.rows()), vec![1]);
+            assert!(second.has_more());
             let (later_pointer, later_invoice, later_live) = retained_filter(&opened.cursor);
             assert_eq!((later_pointer, later_invoice), (pointer, invoice));
             drop(later_live);
@@ -477,11 +477,11 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
                 "terminal cleanup returns all request-owned bytes"
             );
             assert_eq!(
-                ids(&first.rows),
+                ids(&first.rows()),
                 vec![0],
                 "public pages survive later cleanup"
             );
-            assert_eq!(ids(&second.rows), vec![1]);
+            assert_eq!(ids(&second.rows()), vec![1]);
         }
     }
 }
@@ -575,13 +575,13 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
             None,
         )
         .unwrap();
-        let first = opened.first_page.into_public();
+        let first = opened.first_page.into_public().expect("publish the admitted fixture answer");
         assert_eq!(
-            ids(&first.rows),
+            ids(&first.rows()),
             vec![0],
             "{mode} enforces predicate, labels and grants"
         );
-        assert!(first.has_more);
+        assert!(first.has_more());
         if mode == "INDEXED" {
             assert!(
                 reader.__debug_last_query_vector_used_hnsw_for_test(),
@@ -614,8 +614,8 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
         )
         .unwrap();
     for (mode, _, mut cursor, observation, first) in held {
-        let mut rows = ids(&first.rows);
-        let mut more = first.has_more;
+        let mut rows = ids(&first.rows());
+        let mut more = first.has_more();
         while more {
             let fetched = fetch_cursor(
                 &mut cursor,
@@ -624,9 +624,9 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
                 None,
             )
             .unwrap();
-            let page = fetched.page.into_public();
-            rows.extend(ids(&page.rows));
-            more = page.has_more;
+            let page = fetched.page.into_public().expect("publish the admitted fixture answer");
+            rows.extend(ids(&page.rows()));
+            more = page.has_more();
         }
         assert_eq!(
             rows,
@@ -637,7 +637,7 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
         drop(cursor);
         drop(observation);
         assert_eq!(
-            ids(&first.rows),
+            ids(&first.rows()),
             vec![0],
             "public answer survives later writes and cursor release"
         );
@@ -656,8 +656,8 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
         None,
     )
     .unwrap();
-    let public = fresh.result.into_public();
-    assert_eq!(ids(&public.rows), vec![92, 93]);
+    let public = fresh.result.into_public().expect("publish the admitted fixture answer");
+    assert_eq!(ids(&public.rows()), vec![92, 93]);
     reader.__reset_last_query_vector_trace_for_test();
     admin.__reset_last_query_vector_trace_for_test();
     // execute is an internal helper: converting its answer does not finish
@@ -665,7 +665,7 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
     drop(fresh.publication);
     assert_eq!(owner.usage().used, 0);
     assert_eq!(
-        ids(&public.rows),
+        ids(&public.rows()),
         vec![92, 93],
         "the final public answer carries no cross-operation invoice"
     );

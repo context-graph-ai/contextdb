@@ -346,7 +346,7 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
     assert_eq!(
         db.execute("SELECT id FROM recordings", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(0)], vec![Value::Int64(1)]]
     );
     assert!(db.run_maintenance_cycle().unwrap().compaction.ran);
@@ -393,7 +393,7 @@ fn automatic_storage_batches_allow_recording_and_readback_before_completion() {
         assert_eq!(
             read.execute("SELECT COUNT(*) FROM recordings", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(id + 1)]]
         );
         if !active {
@@ -425,7 +425,7 @@ fn automatic_storage_batches_allow_recording_and_readback_before_completion() {
         reopened
             .execute("SELECT COUNT(*) FROM recordings", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(batches)]]
     );
     println!("automatic_batches={batches} pages_relocated={total_moved}");

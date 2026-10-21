@@ -72,7 +72,7 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
                     "SELECT id FROM saved_items WHERE scope = 1 ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 128"
                 );
                 assert_eq!(
-                    reader.execute(&sql, &params).unwrap().rows,
+                    reader.execute(&sql, &params).unwrap().rows(),
                     expected,
                     "fresh, warm and exact reader requests all return every saved identity"
                 );
@@ -121,7 +121,7 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
             observe(|| with_hnsw_build_observer(builds.clone(), || database.execute(sql, &params)));
         let first = first.unwrap();
         assert_eq!(
-            first.rows,
+            first.rows(),
             (1..=ROWS)
                 .map(|id| vec![Value::Int64(id)])
                 .collect::<Vec<_>>(),
@@ -138,7 +138,7 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
         );
         let (warm, warm_work) =
             observe(|| with_hnsw_build_observer(builds.clone(), || database.execute(sql, &params)));
-        assert_eq!(warm.unwrap().rows, first.rows);
+        assert_eq!(warm.unwrap().rows(), first.rows());
         assert_eq!(
             builds.0.load(Ordering::SeqCst),
             0,

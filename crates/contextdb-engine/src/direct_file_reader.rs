@@ -123,6 +123,7 @@ pub struct DirectTypedImageDigest {
 /// One owned relational row in the committed image.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredRow {
     pub table: String,
     pub row_id: RowId,
@@ -132,6 +133,7 @@ pub struct DirectStoredRow {
 /// One owned graph edge, including all persisted edge properties.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredEdge {
     pub source: Uuid,
     pub target: Uuid,
@@ -150,6 +152,7 @@ pub enum DirectVectorQuantization {
 /// owned queryable values during hydration, never by consulting the file later.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredVector {
     pub index: VectorIndexRef,
     pub row_id: RowId,
@@ -580,7 +583,39 @@ impl DirectCursorPage {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub struct DirectCursorPageViewForTest<'a> {
+    pub columns: &'a [String],
+    pub rows: &'a [Vec<contextdb_core::Value>],
+    pub has_more: bool,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
 impl DirectCursorPage {
+    /// Borrow the real retained page without exposing its private owning builder.
+    #[doc(hidden)]
+    pub fn page_for_test(&self) -> DirectCursorPageViewForTest<'_> {
+        DirectCursorPageViewForTest {
+            columns: &self.page.columns, rows: &self.page.rows, has_more: self.page.has_more,
+        }
+    }
+    /// Preserve the fixture's explicit copy request and its genuine payer.
+    #[doc(hidden)]
+    pub fn try_clone_page_for_test(
+        &self,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<contextdb_core::read_contract::CursorPage> {
+        let prepared = crate::owned_cursor_page::OwnedCursorPage::try_prepare_public(owner.clone())?;
+        let mut page = self.page.try_clone(owner)?;
+        page.attach_publication(prepared);
+        page.into_public()
+    }
+    /// Move the existing prepared publication with all original invoices intact.
+    #[doc(hidden)]
+    pub fn into_public_page_for_test(self) -> contextdb_core::Result<contextdb_core::read_contract::CursorPage> {
+        self.page.into_public()
+    }
+
     /// Encode the real retained private page by borrow, through the same
     /// canonical serializer; observing it never copies columns or acquires a child.
     #[doc(hidden)]

@@ -60,22 +60,24 @@ fn run(history: usize) -> usize {
         append(&db, id, vec![1.0, 0.0, 0.0]);
         // A raw commit advances the operation root without changing saved
         // native pages. Both layers must still read that selected root.
-        let before = db
+        let fixture_answer_38 = db
             .execute(
                 "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let before = fixture_answer_38
+            .rows();
         assert_eq!(before, vec![vec![Value::Int64(10_000)]]);
         assert!(db.persist_import_vector_tails().unwrap());
-        let rows = db
+        let fixture_answer_39 = db
             .execute(
                 "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let rows = fixture_answer_39
+            .rows();
         assert_eq!(rows, vec![vec![Value::Int64(10_000)]]);
     }
     count.load(Ordering::SeqCst)
@@ -158,7 +160,7 @@ fn completed_native_import_stays_searchable_while_replacement_is_queued() {
     let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1";
     let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
     assert_eq!(
-        db.execute(query, &params).unwrap().rows,
+        db.execute(query, &params).unwrap().rows(),
         vec![vec![Value::Int64(10_000)]]
     );
     let mut finished = false;
@@ -178,7 +180,7 @@ fn completed_native_import_stays_searchable_while_replacement_is_queued() {
     );
     assert_required_recall(&db);
     assert_eq!(
-        db.execute(query, &params).unwrap().rows,
+        db.execute(query, &params).unwrap().rows(),
         vec![vec![Value::Int64(10_000)]]
     );
 }
@@ -190,18 +192,20 @@ fn partition_status(db: &Database) -> HashMap<String, Value> {
             &HashMap::new(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     result
-        .columns
-        .into_iter()
-        .zip(result.rows.into_iter().next().unwrap())
+        .columns()
+        .iter().cloned()
+        .zip(result.rows().iter().next().unwrap().iter().cloned())
         .collect()
 }
 
 fn assert_required_recall(db: &Database) {
     let params = HashMap::from([("q".into(), Value::Vector(vec![0.0, 1.0, 0.0]))]);
-    let exact = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 32", &params).unwrap().rows;
-    let indexed = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 32", &params).unwrap().rows;
+    let fixture_answer_40 = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 32", &params).unwrap();
+    let exact = fixture_answer_40.rows();
+    let fixture_answer_41 = db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 32", &params).unwrap();
+    let indexed = fixture_answer_41.rows();
     assert_eq!(
         indexed.len(),
         exact.len(),
@@ -261,7 +265,7 @@ fn native_tail_publication_answers_exactly_before_the_serving_cache_installs() {
     });
     release_tx.send(()).unwrap();
     assert!(worker.join().unwrap().unwrap());
-    assert_eq!(query.unwrap().rows, vec![vec![Value::Int64(10_000)]]);
+    assert_eq!(query.unwrap().rows(), vec![vec![Value::Int64(10_000)]]);
     let roots: Vec<_> = work
         .physical_sources
         .into_iter()
@@ -331,7 +335,7 @@ fn native_tail_crash_recovers_a_complete_catalog_and_graph_at_both_commit_bounda
             .env("CG_GROWTH_NATIVE_CRASH_CUT", cut).status().unwrap();
         assert_eq!(child.code(), Some(77), "actual {cut} cut reached");
         let db = Database::open_with_options(&path, options()).unwrap();
-        assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows, vec![vec![Value::Int64(10_000)]]);
+        assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows(), vec![vec![Value::Int64(10_000)]]);
         assert!(db.persist_import_vector_tails().unwrap());
         assert_required_recall(&db);
     }
@@ -350,7 +354,7 @@ fn native_tail_purge_erases_selected_points_and_preserves_survivor_search_after_
     assert!(
         db.execute("SELECT id FROM points WHERE id = 10000", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     db.close().unwrap();
@@ -358,7 +362,7 @@ fn native_tail_purge_erases_selected_points_and_preserves_survivor_search_after_
     assert_required_recall(&db);
     append(&db, 10_001, vec![1.0, 0.0, 0.0]);
     assert!(db.persist_import_vector_tails().unwrap());
-    assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows, vec![vec![Value::Int64(10_001)]]);
+    assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows(), vec![vec![Value::Int64(10_001)]]);
 }
 
 #[test]
@@ -374,7 +378,7 @@ fn native_tail_reopens_and_appends_inside_one_fixed_writer_budget() {
         let db = Database::open_with_options(&path, DatabaseOpenOptions { memory_limit: Some(64 * 1024 * 1024), ..options() }).unwrap();
         append(&db, 10000, vec![1.0, 0.0, 0.0]);
         assert!(db.persist_import_vector_tails().unwrap());
-        assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows, vec![vec![Value::Int64(10000)]]);
+        assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows(), vec![vec![Value::Int64(10000)]]);
         let receipt = db.vector_memory_ownership_receipt_for_test();
         eprintln!("native fixed-budget history={history} high_water={} receipt={receipt:?}", db.write_memory_high_water_for_test());
         assert!(db.write_memory_high_water_for_test() <= 64 * 1024 * 1024);
@@ -399,15 +403,16 @@ fn native_tail_publications_preserve_an_existing_transaction_snapshot() {
     let snapshot = db.begin().unwrap();
     let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
     let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
-    let before = db.execute_in_tx(snapshot, query, &params).unwrap().rows;
+    let fixture_answer_42 = db.execute_in_tx(snapshot, query, &params).unwrap();
+    let before = fixture_answer_42.rows();
     append(&db, 10000, vec![1.0, 0.0, 0.0]);
     assert!(db.persist_import_vector_tails().unwrap());
     assert_eq!(
-        db.execute_in_tx(snapshot, query, &params).unwrap().rows,
+        db.execute_in_tx(snapshot, query, &params).unwrap().rows(),
         before
     );
     assert_eq!(
-        db.execute(query, &params).unwrap().rows,
+        db.execute(query, &params).unwrap().rows(),
         vec![vec![Value::Int64(10000)]]
     );
     db.rollback(snapshot).unwrap();
@@ -478,7 +483,8 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
     let snapshot = db.begin().unwrap();
     let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
     let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
-    let held = db.execute_in_tx(snapshot, query, &params).unwrap().rows;
+    let fixture_answer_43 = db.execute_in_tx(snapshot, query, &params).unwrap();
+    let held = fixture_answer_43.rows();
     // Pure adoption preserves the complete logical identity before any suffix.
     assert!(db.persist_import_vector_tails().unwrap());
     let index = contextdb_core::VectorIndexRef::new("points", "embedding");
@@ -490,7 +496,7 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
         .unwrap();
     assert_eq!(after.change.or(after.dormant_change), Some(before));
     assert_eq!(
-        db.execute_in_tx(snapshot, query, &params).unwrap().rows,
+        db.execute_in_tx(snapshot, query, &params).unwrap().rows(),
         held
     );
     db.rollback(snapshot).unwrap();
@@ -502,7 +508,8 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
         .unwrap();
     assert_eq!(reopened.change.or(reopened.dormant_change), Some(before));
     let snapshot = db.begin().unwrap();
-    let held = db.execute_in_tx(snapshot, query, &params).unwrap().rows;
+    let fixture_answer_44 = db.execute_in_tx(snapshot, query, &params).unwrap();
+    let held = fixture_answer_44.rows();
     append(&db, 10000, vec![1.0, 0.0, 0.0]);
     assert!(db.persist_import_vector_tails().unwrap());
     let extended = db
@@ -518,7 +525,7 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
         before.generation_id
     );
     assert_eq!(
-        db.execute_in_tx(snapshot, query, &params).unwrap().rows,
+        db.execute_in_tx(snapshot, query, &params).unwrap().rows(),
         held
     );
     db.rollback(snapshot).unwrap();
@@ -527,7 +534,7 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
     let db = Database::open_with_options(&path, options()).unwrap();
     append(&db, 10001, vec![0.0, 0.0, 1.0]);
     assert!(db.persist_import_vector_tails().unwrap());
-    assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows, vec![vec![Value::Int64(10000)]]);
+    assert_eq!(db.execute("SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1", &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))])).unwrap().rows(), vec![vec![Value::Int64(10000)]]);
     let mut landed = false;
     for _ in 0..128 {
         let report = db.run_maintenance_cycle().unwrap().vector;
@@ -549,14 +556,14 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
     assert!(
         db.execute("SELECT id FROM points WHERE id = 77", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert_required_recall(&db);
     append(&db, 10000, vec![1.0, 0.0, 0.0]);
     assert!(db.persist_import_vector_tails().unwrap());
     assert_eq!(
-        db.execute(query, &params).unwrap().rows,
+        db.execute(query, &params).unwrap().rows(),
         vec![vec![Value::Int64(10000)]]
     );
     for cut in ["before", "after"] {
@@ -585,7 +592,7 @@ fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
         append(&db, 10000, vec![1.0, 0.0, 0.0]);
         assert!(db.persist_import_vector_tails().unwrap());
         assert_eq!(
-            db.execute(query, &params).unwrap().rows,
+            db.execute(query, &params).unwrap().rows(),
             vec![vec![Value::Int64(10000)]]
         );
         eprintln!(

@@ -587,7 +587,7 @@ fn logical_history_key(kind: u8, position: &[u8]) -> Vec<u8> {
 
 pub fn committed_content_for_test(
     path: &Path,
-    operation_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    operation_read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
 ) -> Result<CommittedContentForTest> {
     let open_context = crate::executor::bounded::ReadOpenContext::new(
@@ -837,7 +837,7 @@ fn project_test_content(
     vectors: Vec<DirectStoredVector>,
     commit_index: Vec<(Lsn, TxId)>,
     maintained_digest: DirectTypedImageDigest,
-    read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<CommittedContentForTest> {
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
     let snapshot_id = database.snapshot();

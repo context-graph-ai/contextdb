@@ -1111,13 +1111,14 @@ mod undeclared_limit_tests {
         );
         let db = Database::open_with_options(&path, options()).unwrap();
         assert_eq!(pending(&db), 0, "the whole suffix is covered");
-        let nearest = db
+        let fixture_answer_55 = db
             .execute(
                 "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vector_for(1_000_000 + 5_000)))]),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let nearest = fixture_answer_55
+            .rows();
         assert_eq!(nearest, vec![vec![Value::Int64(1_000_000 + 5_000)]]);
     }
 }
@@ -1357,13 +1358,14 @@ mod complete_candidate_catch_up_tests {
             db.run_maintenance_cycle().unwrap();
         }
         let newest = 100_000 + LATE_COMMITS - 1;
-        let nearest = db
+        let fixture_answer_56 = db
             .execute(
                 "SELECT id FROM points ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vector_for(newest)))]),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let nearest = fixture_answer_56
+            .rows();
         assert_eq!(nearest, vec![vec![Value::Int64(newest)]]);
     }
 }

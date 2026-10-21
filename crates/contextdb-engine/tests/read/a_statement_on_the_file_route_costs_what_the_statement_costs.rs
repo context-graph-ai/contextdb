@@ -75,7 +75,7 @@ fn point_read(session: &ReadSession) {
         )
         .expect("a warm bounded point read on an idle store answers");
     assert_eq!(
-        answered.rows,
+        answered.rows(),
         vec![vec![Value::Text("rendered".to_owned())]]
     );
 }

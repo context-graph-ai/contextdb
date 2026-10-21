@@ -78,7 +78,7 @@ fn read_back(sealed: &Sealed) -> contextdb_core::Result<Vec<Vec<Value>>> {
         );
         Ok(session
             .execute("SELECT payload FROM sealed_rows", &HashMap::new())?
-            .rows)
+            .rows().to_vec())
     })
 }
 

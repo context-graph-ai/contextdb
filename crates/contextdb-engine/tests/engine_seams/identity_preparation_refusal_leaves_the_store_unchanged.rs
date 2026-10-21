@@ -20,7 +20,7 @@ fn open(path: &Path) -> Database {
 fn rows(db: &Database) -> Vec<Vec<Value>> {
     db.execute("SELECT id FROM items ORDER BY id", &HashMap::new())
         .unwrap()
-        .rows
+        .rows().to_vec()
 }
 
 #[test]

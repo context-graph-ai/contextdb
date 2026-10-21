@@ -59,7 +59,8 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         .unwrap();
     assert_ne!(catalog, old);
     let query = "SELECT id FROM retry_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3";
-    let old_rows = db.execute(query, &HashMap::new()).unwrap().rows;
+    let fixture_answer_60 = db.execute(query, &HashMap::new()).unwrap();
+    let old_rows = fixture_answer_60.rows();
     // Give the task-owned snapshot its own writer identity, then carry the
     // exact published generation and pending journal bytes into it. The
     // logical export deliberately omits these rebuildable generation tables.
@@ -193,7 +194,7 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
             .unwrap(),
         catalog
     );
-    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows, old_rows);
+    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows(), old_rows);
     let fixture_operation_reader_2 = context
         .read_request_provider
         .request_budget()
@@ -235,7 +236,7 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
             .unwrap(),
         catalog
     );
-    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows.len(), 3);
+    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows().len(), 3);
     assert_eq!(
         db.vector_memory_ownership_receipt_for_test()
             .temporary_workspace,

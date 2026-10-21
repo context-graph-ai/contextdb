@@ -53,7 +53,7 @@ fn indexed_ids(db: &Database) -> Vec<i64> {
         )
         .unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(id) => id,
@@ -72,7 +72,7 @@ fn assert_refusal(db: &Database, error: Error) {
     assert_eq!(
         db.execute("SELECT id FROM items ORDER BY id", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
     assert_eq!(
@@ -142,7 +142,7 @@ fn local_current_identity_admission_refuses_the_complete_transaction_before_dura
         reopened
             .execute("SELECT embedding FROM items WHERE id = 1", &HashMap::new())
             .unwrap()
-            .rows[0][0],
+            .rows()[0][0],
         Value::Vector(vec![1.0, 0.01])
     );
 }

@@ -76,7 +76,7 @@ pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
                     &empty(),
                 )
                 .unwrap()
-                .rows;
+                .rows().to_vec();
             assert_eq!(
                 result,
                 vec![vec![
@@ -94,7 +94,7 @@ pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
                     &query
                 )
                 .unwrap()
-                .rows,
+                .rows(),
                 vec![vec![Value::Int64(1)]],
                 "the affected table's vector remains searchable"
             );
@@ -131,7 +131,7 @@ pub fn assert_constraints_and_callback(db: &Database, calls: &Calls) {
     assert!(
         db.execute("SELECT id FROM schema_099 WHERE id = 3", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "refused observation leaves no durable record"
     );
@@ -152,7 +152,7 @@ pub fn assert_constraints_and_callback(db: &Database, calls: &Calls) {
     assert_eq!(
         db.execute("SELECT id FROM schema_099 WHERE id = 2", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(2)]],
         "accepted observation is durable"
     );

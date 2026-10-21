@@ -138,7 +138,7 @@ pub(crate) fn assert_reported_as_damage(
             DirectStoreDiagnostic::MalformedRecord,
             reason,
         )) => {
-            assert!(!reason.is_empty(), "{damage}: the damage carries a reason")
+            assert!(!(reason == ""), "{damage}: the damage carries a reason")
         }
         Ok(changes) => panic!(
             "{damage} must not be answered as a history: commits={} rows={} tables={:?}",
@@ -269,7 +269,7 @@ fn assert_open_refuses(damage: HistoryDamage, what: &str) {
             DirectStoreDiagnostic::MalformedRecord,
             reason,
         )) => {
-            assert!(!reason.is_empty(), "{what}: the refusal carries a reason")
+            assert!(!(reason == ""), "{what}: the refusal carries a reason")
         }
         Ok(reader) => {
             let frontiers =

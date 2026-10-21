@@ -8389,7 +8389,7 @@ mod general_checkpoint_native_fixture {
         fn apply(
             &self,
             _: &WriteSet,
-            _: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+            _: contextdb_core::read_memory::ReadMemoryOwner,
         ) -> Result<()> {
             panic!("checkpoint proof must not publish to a durable store")
         }

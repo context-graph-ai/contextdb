@@ -16,7 +16,7 @@ fn incomplete(error: &Error) -> bool {
 fn bodies(db: &Database) -> Vec<Vec<Value>> {
     db.execute("SELECT id, body FROM records ORDER BY id", &p())
         .unwrap()
-        .rows
+        .rows().to_vec()
 }
 
 #[tokio::test(flavor = "multi_thread")]

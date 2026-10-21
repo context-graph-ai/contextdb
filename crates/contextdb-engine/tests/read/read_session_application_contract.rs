@@ -54,7 +54,7 @@ fn seed_rows(database: &Database, table: &str, row_count: usize) {
 }
 
 fn cursor_page_ids(page: &CursorPage) -> Vec<i64> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -191,7 +191,7 @@ fn application_fixture() -> ApplicationFixture {
 
 fn payloads(result: QueryResult) -> BTreeSet<String> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [Value::Text(payload)] => payload.clone(),
@@ -237,7 +237,7 @@ fn under_limit_application_query_runs_cross_thread_on_the_derived_owner_view() {
             .expect("the application read thread completes")
     })
     .expect("the bounded kernel serves the scoped live view directly");
-    assert_eq!(result.rows.len(), fixture.visible_rows);
+    assert_eq!(result.rows().len(), fixture.visible_rows);
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn database_execute_plans_once_and_drains_the_shared_pull_kernel_once_without_a_
             )
         })
         .expect("the established embedding API remains uncapped");
-    assert_eq!(uncapped.rows.len(), row_count);
+    assert_eq!(uncapped.rows().len(), row_count);
     assert_eq!(
         database.__relational_scan_rows_touched(),
         u64::try_from(row_count).unwrap(),
@@ -692,7 +692,7 @@ fn no_token_convenience_methods_create_independent_fresh_tokens() {
     let mut cursor = session
         .open_cursor("SELECT id FROM fresh_token_rows", &HashMap::new())
         .expect("no-token cursor open reaches the bounded source loop");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     cursor
         .fetch(NonZeroUsize::new(1))
         .expect("no-token cursor fetch reaches the bounded source loop");
@@ -754,7 +754,7 @@ fn production_cursor_retains_a_real_multi_page_continuation_after_opening_handle
         .expect("open a production-owned suspended cursor");
     assert_eq!(cursor.retained_state_owners_for_test(), 1);
     assert_eq!(cursor.retained_session_owners_for_test(), 2);
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     assert_eq!(
         cursor_page_ids(cursor.first_page()),
         (0..page_rows)
@@ -776,7 +776,7 @@ fn production_cursor_retains_a_real_multi_page_continuation_after_opening_handle
             .collect::<Vec<_>>(),
     );
     assert!(
-        next_page.has_more,
+        next_page.has_more(),
         "the dynamic fixture retains another page"
     );
     cursor.close().expect("close the production-owned cursor");
@@ -839,7 +839,7 @@ fn reader_startup_memory_ceiling_admits_loaded_state_without_rewriting_store_con
             reader
                 .execute("SELECT id FROM reader_memory ORDER BY id", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             16
         );

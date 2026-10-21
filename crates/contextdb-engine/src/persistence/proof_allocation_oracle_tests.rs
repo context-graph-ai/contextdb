@@ -3921,7 +3921,7 @@ mod original_failure_contract {
             fn commit_failed(&self, _: &WriteSet, _: CommitSource, error: &Error) {
                 if let Error::Other(message) = error {
                     self.callback_pointer
-                        .store(message.as_ptr() as usize, AtomicOrdering::SeqCst);
+                        .store(message.as_text().expect("original application text").as_ptr() as usize, AtomicOrdering::SeqCst);
                 }
                 self.callbacks.fetch_add(1, AtomicOrdering::SeqCst);
             }
@@ -3956,9 +3956,9 @@ mod original_failure_contract {
             let Error::Other(ref message) = error else {
                 panic!("preserve plugin error variant");
             };
-            assert_eq!(message.as_ptr() as usize, pointer);
-            assert_eq!(message.len(), length);
-            assert!(message.bytes().all(|byte| byte == b'x'));
+            assert_eq!(message.as_text().expect("original application text").as_ptr() as usize, pointer);
+            assert_eq!(message.as_text().expect("original application text").len(), length);
+            assert!(message.as_text().expect("original application text").bytes().all(|byte| byte == b'x'));
             assert_eq!(plugin.callbacks.load(AtomicOrdering::SeqCst), 1);
             assert_eq!(
                 plugin.callback_pointer.load(AtomicOrdering::SeqCst),

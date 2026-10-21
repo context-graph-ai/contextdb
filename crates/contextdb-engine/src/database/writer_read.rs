@@ -3578,7 +3578,7 @@ mod vector_write_copy_budget_tests {
         let rows = db
             .execute("SELECT COUNT(*) FROM vectors", &HashMap::new())
             .unwrap();
-        assert_eq!(rows.rows, vec![vec![Value::Int64(0)]]);
+        assert_eq!(rows.rows(), vec![vec![Value::Int64(0)]]);
     }
 }
 

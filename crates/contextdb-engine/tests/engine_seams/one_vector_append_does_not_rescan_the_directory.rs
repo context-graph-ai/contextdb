@@ -103,7 +103,7 @@ fn search_scope(db: &Database, scope: Uuid, query: &[f32], limit: usize) -> Vec<
         ]),
     )
     .expect("a scoped vector search is served")
-    .rows
+    .rows()
     .iter()
     .map(|row| match row.first() {
         Some(Value::Uuid(id)) => *id,

@@ -304,9 +304,9 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
         )
     };
     let exact = db.execute(&query("EXACT"), &HashMap::new()).unwrap();
-    assert_eq!(exact.rows.len(), VISIBLE_ROWS);
+    assert_eq!(exact.rows().len(), VISIBLE_ROWS);
     let visible_ids: HashSet<_> = exact
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(id) => *id,
@@ -343,7 +343,7 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
         .__take_last_query_vector_trace_for_test(fixture_operation_reader_1.clone())
         .expect("read the admitted trace observation")
         .unwrap();
-    assert_eq!(auto.rows, exact.rows);
+    assert_eq!(auto.rows(), exact.rows());
     assert!(
         !trace.used_hnsw,
         "AUTO follows its costing decision: {trace:?}"
@@ -381,8 +381,8 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     assert_eq!(retry.vector.built_partitions, 1, "{retry:?}");
     assert!(retry.vector.first_failure.is_none(), "{retry:?}");
     assert_eq!(
-        db.execute(&query("INDEXED"), &HashMap::new()).unwrap().rows,
-        exact.rows
+        db.execute(&query("INDEXED"), &HashMap::new()).unwrap().rows(),
+        exact.rows()
     );
     assert_eq!(
         db.vector_memory_ownership_receipt_for_test()

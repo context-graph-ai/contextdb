@@ -22,10 +22,10 @@ fn exact(reader: &ReadSession, context: usize, query_row: usize) -> Vec<Vec<Valu
         )
         .expect("bounded exact search reads raw bodies on demand");
     assert_eq!(
-        answer.trace.vector_search.unwrap().resolved_mode,
+        answer.trace().vector_search.as_ref().unwrap().resolved_mode,
         VectorSearchMode::Exact
     );
-    answer.rows
+    answer.rows().to_vec()
 }
 
 fn exact_ground_truth(context: usize, query_row: usize) -> Vec<Vec<Value>> {
@@ -79,7 +79,7 @@ fn mixed_file_reads_point_load_exact_vectors_and_keep_their_snapshot_after_recyc
                 &HashMap::from([("id".into(), Value::Uuid(fixture::row_id(0)))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text(fixture::payload(0))]]
     );
     assert!(
@@ -89,7 +89,7 @@ fn mixed_file_reads_point_load_exact_vectors_and_keep_their_snapshot_after_recyc
                 &HashMap::from([("context".into(), Value::Uuid(fixture::context_id(2)))])
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the direct source must preserve declared context authorization"
     );
@@ -100,7 +100,7 @@ fn mixed_file_reads_point_load_exact_vectors_and_keep_their_snapshot_after_recyc
                 &params(2, fixture::ROWS_PER_CONTEXT * 2),
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "an exact vector search must not load or return an unauthorized partition"
     );
@@ -127,10 +127,10 @@ fn mixed_file_reads_point_load_exact_vectors_and_keep_their_snapshot_after_recyc
         )
         .expect("the saved indexed route remains complete when its graph working set fits");
     assert_eq!(
-        indexed.trace.vector_search.unwrap().resolved_mode,
+        indexed.trace().vector_search.as_ref().unwrap().resolved_mode,
         VectorSearchMode::Indexed
     );
-    assert_eq!(indexed.rows, expected);
+    assert_eq!(indexed.rows(), expected);
     drop(indexed_reader);
 
     let writer = Database::open(&path).unwrap();
@@ -188,7 +188,7 @@ fn mixed_file_reads_point_load_exact_vectors_and_keep_their_snapshot_after_recyc
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("unrelated-write".into())]]
     );
     let writer = Database::open(&path).unwrap();

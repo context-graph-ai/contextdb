@@ -162,7 +162,7 @@ fn file_session_registration_survives_alias_and_replacement_and_releases_with_it
         .execute("SELECT value FROM items ORDER BY id", &HashMap::new())
         .expect("fixed file session still answers its original hydrated snapshot");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![contextdb_core::Value::Text("original".into())]]
     );
     let cursor = session
@@ -254,7 +254,7 @@ fn exact_external_page_retention_is_shared_once_and_released_with_the_last_sessi
         .execute("SELECT value FROM page_items WHERE id = 0", &HashMap::new())
         .expect("first session reads its original snapshot after writer commit");
     assert!(matches!(
-        original.rows.as_slice(),
+        original.rows(),
         [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("snapshot-0-"))
     ));
 
@@ -428,7 +428,7 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .execute("SELECT value FROM page_items WHERE id = 0", &HashMap::new())
         .expect("retained reader remains usable after writer refusal");
     assert!(matches!(
-        original.rows.as_slice(),
+        original.rows(),
         [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("snapshot-0-"))
     ));
     writer
@@ -617,7 +617,7 @@ fn read_rows(session: &ReadSession) -> Vec<Vec<contextdb_core::Value>> {
     session
         .execute("SELECT value FROM items ORDER BY id", &HashMap::new())
         .expect("the reader answers")
-        .rows
+        .rows().to_vec()
 }
 
 #[test]

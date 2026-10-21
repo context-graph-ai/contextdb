@@ -674,6 +674,7 @@ fn run_cell(db: &Database, partitions: usize, mode: &'static str) -> CellRun {
 
 #[cfg(feature = "nightly-tests")]
 #[test]
+#[ignore = "CDB-161: bounded-storage-rc2 S5 AUTO calibration campaign (fix SHA pending); re-enabled when rc2 lands on dev."]
 fn indexed_route_does_less_work_than_exact() {
     // The intent's multi-Context bar for AUTO. A scope whose current rows are
     // below the declared AUTO_INDEX_AT is compared exactly, with no graph

@@ -140,7 +140,7 @@ fn a_statement_held_inside_its_drain_reports_only_the_rows_it_read_itself() {
                 Arc::clone(&hold) as Arc<dyn ReadExecutionConvergenceObserver>,
                 || {
                     execute(&database, "SELECT id FROM held_scan")
-                        .trace
+                        .trace()
                         .rows_examined
                 },
             )
@@ -165,7 +165,7 @@ fn a_statement_held_inside_its_drain_reports_only_the_rows_it_read_itself() {
          read itself, not a figure another statement moved while it waited"
     );
     assert_eq!(
-        overlapping.trace.rows_examined, OVERLAPPING_ROWS,
+        overlapping.trace().rows_examined, OVERLAPPING_ROWS,
         "the statement over the {OVERLAPPING_ROWS}-row table must report the \
          rows it read itself, with none of the held statement's reading in it"
     );

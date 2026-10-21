@@ -251,7 +251,7 @@ fn reader_child() -> bool {
                     &HashMap::new(),
                 )
                 .expect("the reader reads the committed rows")
-                .rows
+                .rows()
                 .into_iter()
                 .map(|row| match row.as_slice() {
                     [Value::Int64(id)] => id.to_string(),
@@ -374,7 +374,7 @@ fn rows_after_repair(store: &Path) -> Vec<i64> {
     let rows = database
         .execute("SELECT id FROM crash_rows ORDER BY id", &HashMap::new())
         .expect("the repaired store reads")
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,

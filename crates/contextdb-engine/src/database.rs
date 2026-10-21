@@ -39,7 +39,7 @@ mod vector_import_tail;
 mod vector_journal_cleanup_cancellation_tests;
 mod vector_maintenance_inventory;
 pub(crate) mod vector_paged_build;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 mod vector_public_cycle_admission_tests;
 #[cfg(test)]
 mod vector_published_retry_source_admission_tests;
@@ -893,7 +893,7 @@ mod received_schema_stage_tests {
             hub.db
                 .execute("SELECT body FROM notes", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
         let records = hub
@@ -961,7 +961,7 @@ mod received_schema_stage_tests {
             hub.db
                 .execute("SELECT body FROM notes", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("pending".into())]; expected_rows]
         );
         // Recreate the crash window: the applied payload survived cleanup.
@@ -995,7 +995,7 @@ mod received_schema_stage_tests {
             hub.db
                 .execute("SELECT body FROM notes", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             expected_rows
         );
@@ -3500,7 +3500,7 @@ mod received_schema_stage_tests {
                 index.clone(),
                 2,
                 contextdb_core::VectorQuantization::F32,
-                Arc::clone(&db.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&db.finalization.vector_accountant),
             )
             .expect("read or publish the admitted vector fixture");
         accountant
@@ -3519,7 +3519,7 @@ mod received_schema_stage_tests {
                     deleted_tx: None,
                     lsn: Lsn(1),
                 },
-                Arc::clone(&db.finalization.vector_accountant),
+                contextdb_vector::MemoryBudgetOwner::clone(&db.finalization.vector_accountant),
             )
             .expect("read or publish the admitted vector fixture");
         let state = db.vector_store.try_state(&index).unwrap();
@@ -3969,7 +3969,7 @@ mod received_schema_stage_tests {
         assert_eq!(
             db.execute("SELECT id FROM t", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Uuid(row_id)]],
             "the row itself is still installed"
         );
@@ -4149,13 +4149,13 @@ mod received_schema_stage_tests {
         assert_eq!(
             db.execute("SELECT id FROM s", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(1)]]
         );
         assert_eq!(
             db.execute("SELECT source_id FROM d", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(1)]],
             "the including-sync callback's write actually committed with the received row"
         );
@@ -4274,7 +4274,7 @@ mod received_schema_stage_tests {
         assert_eq!(
             db.execute("SELECT * FROM events", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             1
         );
@@ -4365,7 +4365,7 @@ mod received_schema_stage_tests {
             reopened
                 .execute("SELECT * FROM events", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             1
         );
@@ -4511,7 +4511,7 @@ mod received_schema_stage_tests {
                 &params,
             )
             .expect("the declared vector index must be searchable after installing whole");
-        assert_eq!(nearest.rows.len(), 1);
+        assert_eq!(nearest.rows().len(), 1);
     }
 
     /// A mixed schema + rows + vectors unit installs whole on
@@ -4663,7 +4663,7 @@ mod received_schema_stage_tests {
             .db
             .execute("SELECT id FROM vector_events", &HashMap::new())
             .expect("the rows answer an ordinary SELECT after restart");
-        assert_eq!(rows.rows.len(), 2, "both rows installed with the schema");
+        assert_eq!(rows.rows().len(), 2, "both rows installed with the schema");
         let nearest = hub
             .db
             .execute(
@@ -4671,7 +4671,7 @@ mod received_schema_stage_tests {
                 &HashMap::from([("q".to_string(), Value::Vector(vec![1.0, 0.0]))]),
             )
             .expect("the vectors are searchable after restart");
-        assert_eq!(nearest.rows, vec![vec![Value::Uuid(near)]]);
+        assert_eq!(nearest.rows(), vec![vec![Value::Uuid(near)]]);
         hub.db.close().expect("close the hub");
         author.db.close().expect("close the author");
     }
@@ -4995,7 +4995,7 @@ mod received_schema_stage_tests {
                 .db
                 .execute("SELECT id FROM notes", &HashMap::new())
                 .unwrap_or_else(|error| panic!("the edge's table answers {when}: {error:?}"))
-                .rows
+                .rows()
                 .into_iter()
                 .map(|row| row[0].clone())
                 .collect::<Vec<_>>();
@@ -6585,7 +6585,7 @@ mod received_schema_stage_tests {
             reopened
                 .execute("SELECT id FROM unwind_notes", &params)
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             1,
             "and what the handle already held is still whole"
@@ -7151,7 +7151,7 @@ mod received_schema_stage_tests {
         let err = db
             .authoritative_table_generations_for_detached_working()
             .expect_err("malformed generation bytes must fail before detached schema planning");
-        assert!(matches!(err, Error::StoreCorrupted { path, .. } if path == key));
+        assert!(matches!(err, Error::StoreCorrupted { path, .. } if path == key.as_str()));
     }
 
     #[test]
@@ -7176,7 +7176,7 @@ mod received_schema_stage_tests {
         let err = db
             .authoritative_table_generations_for_detached_working()
             .expect_err("an otherwise-valid generation with trailing bytes is corrupt");
-        assert!(matches!(err, Error::StoreCorrupted { path, .. } if path == key));
+        assert!(matches!(err, Error::StoreCorrupted { path, .. } if path == key.as_str()));
     }
 
     #[test]
@@ -7729,9 +7729,9 @@ mod persisted_state_snapshot_tests {
                                     .execute_at_snapshot(sql, &HashMap::new(), snapshot)
                                     .unwrap();
                                 (
-                                    result.rows,
-                                    result.trace.physical_plan,
-                                    result.trace.index_used,
+                                    result.rows().to_vec(),
+                                    result.trace().physical_plan,
+                                    result.trace().index_used.clone(),
                                 )
                             })
                         });
@@ -7764,7 +7764,7 @@ mod persisted_state_snapshot_tests {
                                     #[cfg(any(test, feature = "test-seams"))]
                                     {
                                         assert_eq!(
-                                            result.rows, rows.0,
+                                            result.rows().to_vec(), rows.0,
                                             "{shape}/{damage}: the public read returns the fresh control for the exact requested snapshot"
                                         );
                                         if !rows.0.is_empty() {
@@ -7774,9 +7774,9 @@ mod persisted_state_snapshot_tests {
                                     }
                                     assert_eq!(
                                         (
-                                            result.rows,
-                                            result.trace.physical_plan,
-                                            result.trace.index_used
+                                            result.rows().to_vec(),
+                                            result.trace().physical_plan,
+                                            result.trace().index_used.clone()
                                         ),
                                         *rows,
                                         "{shape}/{damage}: public historical/current SQL after reopen equals fresh same-snapshot complete values and actual plan"
@@ -7915,7 +7915,7 @@ mod persisted_state_snapshot_tests {
                                             "{damage}: the fixture selects the damaged logical table"
                                         );
                                         assert!(
-                                            !reason.is_empty(),
+                                            !(reason == ""),
                                             "{damage}: public SQL corruption has an explanation"
                                         );
                                     }
@@ -8175,11 +8175,11 @@ mod persisted_state_snapshot_tests {
                         }) => {
                             assert_eq!(
                                 actual,
-                                path.display().to_string(),
+                                path.display().to_string().as_str(),
                                 "{damage}: identity refusal identifies the affected store"
                             );
                             assert!(
-                                !reason.is_empty(),
+                                !(reason == ""),
                                 "{damage}: identity refusal explains corruption"
                             );
                         }
@@ -8218,11 +8218,11 @@ mod persisted_state_snapshot_tests {
                         }) => {
                             assert_eq!(
                                 actual,
-                                path.display().to_string(),
+                                path.display().to_string().as_str(),
                                 "{damage}: physical refusal identifies the affected store"
                             );
                             assert!(
-                                !reason.is_empty(),
+                                !(reason == ""),
                                 "{damage}: physical refusal explains corruption"
                             );
                         }
@@ -8257,11 +8257,11 @@ mod persisted_state_snapshot_tests {
                         }) => {
                             assert_eq!(
                                 actual,
-                                path.display().to_string(),
+                                path.display().to_string().as_str(),
                                 "{damage}: scan refusal identifies the affected store"
                             );
                             assert!(
-                                !reason.is_empty(),
+                                !(reason == ""),
                                 "{damage}: scan refusal explains corruption"
                             );
                         }
@@ -8286,11 +8286,11 @@ mod persisted_state_snapshot_tests {
                     }) => {
                         assert_eq!(
                             actual,
-                            path.display().to_string(),
+                            path.display().to_string().as_str(),
                             "{damage}: exact-LSN refusal identifies the affected store"
                         );
                         assert!(
-                            !reason.is_empty(),
+                            !(reason == ""),
                             "{damage}: exact-LSN refusal explains corruption"
                         );
                     }
@@ -40506,7 +40506,7 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-seams"))]
+    #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn write_set_lock_is_held_for_test(&self) -> bool {
         self.tx_mgr.write_set_lock_is_held_for_test()
@@ -41813,8 +41813,8 @@ impl Database {
             let suffix = key
                 .strip_prefix(Self::DURABLE_LINEAGE_TABLE_GENERATION_PREFIX)
                 .ok_or_else(|| Error::StoreCorrupted {
-                    path: key.clone(),
-                    reason: "table-generation key lacks its canonical prefix".to_string(),
+                    path: key.clone().into(),
+                    reason: "table-generation key lacks its canonical prefix".to_string().into(),
                 })?;
             if suffix.is_empty()
                 || suffix.len() % 2 != 0
@@ -41823,10 +41823,10 @@ impl Database {
                     .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
             {
                 return Err(Error::StoreCorrupted {
-                    path: key,
+                    path: key.into(),
                     reason:
                         "table-generation key has a malformed canonical lowercase hex table suffix"
-                            .to_string(),
+                            .to_string().into(),
                 });
             }
             let table_bytes = suffix
@@ -41839,21 +41839,21 @@ impl Database {
                 })
                 .collect::<Vec<_>>();
             let table = String::from_utf8(table_bytes).map_err(|_| Error::StoreCorrupted {
-                path: key.clone(),
-                reason: "table-generation key table suffix is not UTF-8".to_string(),
+                path: key.clone().into(),
+                reason: "table-generation key table suffix is not UTF-8".to_string().into(),
             })?;
             let generation = RedbPersistence::decode_config_value_exact::<u64>(&raw_generation)
                 .map_err(|err| Error::StoreCorrupted {
-                    path: key.clone(),
-                    reason: format!("table-generation value is not an exact canonical u64: {err}"),
+                    path: key.clone().into(),
+                    reason: format!("table-generation value is not an exact canonical u64: {err}").into(),
                 })?;
             let canonical_generation =
                 RedbPersistence::encode_config_value(&generation).map_err(|err| {
                     Error::StoreCorrupted {
-                        path: key.clone(),
+                        path: key.clone().into(),
                         reason: format!(
                             "table-generation value cannot be canonically encoded: {err}"
-                        ),
+                        ).into(),
                     }
                 })?;
             if generation == 0
@@ -41862,19 +41862,19 @@ impl Database {
                 || generations.insert(table, generation).is_some()
             {
                 return Err(Error::StoreCorrupted {
-                    path: key,
+                    path: key.into(),
                     reason: "table-generation key or value is zero, duplicate, or noncanonical"
-                        .to_string(),
+                        .to_string().into(),
                 });
             }
         }
         for table in self.relational_store.table_meta.read().keys() {
             if !generations.contains_key(table) {
                 return Err(Error::StoreCorrupted {
-                    path: Self::durable_lineage_table_generation_key(table),
+                    path: Self::durable_lineage_table_generation_key(table).into(),
                     reason: format!(
                         "table {table} has schema metadata but no authoritative generation"
-                    ),
+                    ).into(),
                 });
             }
         }
@@ -43225,7 +43225,7 @@ impl Database {
         renamed_vector_sources: &HashSet<contextdb_core::VectorIndexRef>,
         replaced_vector_refs: &HashSet<contextdb_core::VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<(MetadataCopyCharges, Database)> {
         self.detached_received_schema_working_database_with_sources(
             projected_tables, self.tx_mgr.peek_next_tx(), false, false,
@@ -46944,7 +46944,7 @@ impl Database {
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         fail_after_stage_registration: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         self.commit_received_schema_stage_with_receipt_for_test(
             changes,
@@ -47409,7 +47409,7 @@ impl Database {
         receipt: Option<SyncApplyReceipt>,
         fail_after_stage_registration: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::protocol::WireApplyResult> {
         let dependency_complete = receipt
             .as_ref()
@@ -50308,7 +50308,7 @@ impl Database {
         tenant_id: &TenantId,
         changes: ChangeSet,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<AcceptedDeleteSuppression> {
         self.validate_received_row_lineages(tenant_id, &changes, lineages, read_memory.clone())?;
         self.suppress_accepted_lineage_replays(changes, lineages, true, read_memory.clone())
@@ -54277,11 +54277,7 @@ impl Database {
         );
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(stage_wall_nanos) = stats.stage_wall_nanos {
-            for (counter, delta) in self
-                .commit_stage_wall_nanos
-                .iter()
-                .zip(stage_wall_nanos.into_iter())
-            {
+            for (counter, delta) in self.commit_stage_wall_nanos.iter().zip(stage_wall_nanos) {
                 Self::add_commit_stat(counter, delta);
             }
         }
@@ -65804,7 +65800,7 @@ impl Database {
         &self,
         selection: &AuthoritativePurgeSelection,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Lsn> {
         self.commit_authoritative_purge_kernel_batch(
             std::slice::from_ref(selection),
@@ -67388,7 +67384,7 @@ impl Database {
         &self,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<(SnapshotId, Lsn, Box<dyn Send + Sync>)>> {
         Ok(self
             .bounded_read_snapshot_registration_with_root(
@@ -67412,7 +67408,7 @@ impl Database {
         idle_ms: u64,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<
         Option<(
             SnapshotId,
@@ -80388,7 +80384,7 @@ impl Database {
         // parked in a durable hold.
         let index_structures = {
             let (bytes, count) = self.relational_store.table_index_structure_bytes(table);
-            let per_index = if count == 0 { 0 } else { bytes / count } as i128;
+            let per_index = bytes.checked_div(count).unwrap_or(0) as i128;
             let old_indexes = old_meta.indexes.len() as i128;
             let new_indexes = new_meta.indexes.len() as i128;
             (new_indexes - old_indexes) * per_index
@@ -84870,12 +84866,7 @@ impl Database {
         let superseded = self.superseded_ddl_occurrence_marks(source, read_memory.clone())?;
         let mut ddl = Vec::with_capacity(changes.ddl.len());
         let mut ddl_lsn = Vec::with_capacity(changes.ddl_lsn.len());
-        for ((change, lsn), entry) in changes
-            .ddl
-            .into_iter()
-            .zip(changes.ddl_lsn.into_iter())
-            .zip(entries)
-        {
+        for ((change, lsn), entry) in changes.ddl.into_iter().zip(changes.ddl_lsn).zip(entries) {
             // Locally authored schema an authenticated vector has already
             // restated is settled provenance, so it never reaches the
             // fail-closed origin check below.
@@ -86747,7 +86738,7 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         dependency_complete: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<ApplyResult> {
         self.apply_authenticated_received_changes_with_lineages_impl(
             changes,
@@ -86924,7 +86915,7 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<ApplyResult> {
         self.apply_authenticated_received_changes_with_outcome(
             changes,
@@ -100533,7 +100524,7 @@ fn commit_index_across_all(
     // needed here, so startup bookkeeping never faults a raw body.
     let declared_reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
         contextdb_core::read_contract::ReadLimits::default().memory,
-    );
+    ).expect("admit the declared fixture root");
     let mut copy_owner = crate::vector_read_memory::admission(
         declared_reader
             .child()
@@ -103241,7 +103232,7 @@ mod commit_index_reconstruction_tests {
                     .limits
                     .limits
                     .memory,
-            );
+            ).expect("admit the declared fixture root");
         let vector_fixture_reader_12 = vector_fixture_parent_12
             .child()
             .expect("admit the declared fixture reader child");
@@ -103690,8 +103681,8 @@ mod currency_version_compaction_tests {
                 &HashMap::new(),
             )
             .expect("select advertised_at");
-        assert_eq!(result.rows.len(), 1, "exactly one live capability row");
-        match &result.rows[0][0] {
+        assert_eq!(result.rows().len(), 1, "exactly one live capability row");
+        match &result.rows()[0][0] {
             Value::Timestamp(ms) => *ms,
             other => panic!("advertised_at should be a Timestamp, got {other:?}"),
         }
@@ -103816,7 +103807,7 @@ mod currency_version_compaction_tests {
                 assert_eq!(deferred.versions_deferred_for_readers, count as u64);
                 for name in &names {
                     assert_eq!(db.execute_at_snapshot(&format!("SELECT revision FROM {name}"),
-                        &HashMap::new(), snapshot).unwrap().rows, vec![vec![Value::Int64(0)]],
+                        &HashMap::new(), snapshot).unwrap().rows(), vec![vec![Value::Int64(0)]],
                         "admitted cleanup preserves each pinned reader's original answer");
                 }
                 drop(pin);
@@ -103826,7 +103817,7 @@ mod currency_version_compaction_tests {
                     "retry must still find every refused stale version");
                 for name in &names {
                     assert_eq!(physical_versions(&db, name), 1);
-                    assert_eq!(db.execute(&format!("SELECT revision FROM {name}"), &HashMap::new()).unwrap().rows,
+                    assert_eq!(db.execute(&format!("SELECT revision FROM {name}"), &HashMap::new()).unwrap().rows(),
                         vec![vec![Value::Int64(1)]]);
                 }
                 copies.push((count, name_bytes, refusal.requested.load(Ordering::SeqCst), native_payload_bytes));
@@ -103846,9 +103837,9 @@ mod currency_version_compaction_tests {
 
             #[derive(Debug)]
             struct ObserveCopy {
-                ordinary: Arc<dyn ReadMemoryBudget>,
+                ordinary: contextdb_core::read_memory::ReadMemoryOwner,
                 writer: crate::memory_accounting::AccountantHandle,
-                parent: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+                parent: crate::vector_read_memory::DeclaredReadRoot,
                 baseline: usize,
                 requested: AtomicUsize,
                 calls: AtomicUsize,
@@ -104300,8 +104291,8 @@ mod currency_version_compaction_tests {
             use std::sync::atomic::{AtomicUsize, Ordering};
             #[derive(Debug)]
             struct MetadataOwner {
-                ordinary: Arc<dyn ReadMemoryBudget>,
-                refused: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+                ordinary: contextdb_core::read_memory::ReadMemoryOwner,
+                refused: crate::vector_read_memory::DeclaredReadRoot,
                 refuse: bool,
                 answer_admissions: Arc<AtomicUsize>,
                 metadata_calls: AtomicUsize,
@@ -104913,7 +104904,7 @@ mod stale_staged_delete_tests {
         let staged = db
             .execute_in_tx(stale, "DELETE FROM notes WHERE id = $id", &by_id(id))
             .expect("stage the delete while the row is still there");
-        assert_eq!(staged.rows_affected, 1, "the delete staged one row");
+        assert_eq!(staged.rows_affected(), 1, "the delete staged one row");
 
         db.execute("DELETE FROM notes WHERE id = $id", &by_id(id))
             .expect("another writer removes the same row first");
@@ -104946,7 +104937,7 @@ mod stale_staged_delete_tests {
         assert!(
             db.execute("SELECT id FROM notes", &HashMap::new())
                 .expect("read the table back")
-                .rows
+                .rows()
                 .is_empty(),
             "the row is gone, deleted exactly once"
         );
@@ -104957,7 +104948,7 @@ mod stale_staged_delete_tests {
             reopened
                 .execute("SELECT id FROM notes", &HashMap::new())
                 .expect("read the reopened table")
-                .rows
+                .rows()
                 .is_empty(),
             "the reopened store holds what the one real delete left"
         );
@@ -105247,7 +105238,7 @@ mod table_size_estimate_tests {
             &mut database.declared_read_memory,
             crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 used.saturating_add(8),
-            ),
+            ).expect("admit the declared fixture root"),
         );
         let refused = database
             .table_size_estimates()
@@ -105480,9 +105471,9 @@ mod cdb141_current_root_witness_tests {
                                     .execute_at_snapshot(sql, &HashMap::new(), snapshot)
                                     .unwrap();
                                 (
-                                    result.rows,
-                                    result.trace.physical_plan,
-                                    result.trace.index_used,
+                                    result.rows().to_vec(),
+                                    result.trace().physical_plan,
+                                    result.trace().index_used.clone(),
                                 )
                             })
                         });
@@ -105515,7 +105506,7 @@ mod cdb141_current_root_witness_tests {
                                     #[cfg(any(test, feature = "test-seams"))]
                                     {
                                         assert_eq!(
-                                            result.rows, rows.0,
+                                            result.rows().to_vec(), rows.0,
                                             "{shape}/{damage}: the public read returns the fresh control for the exact requested snapshot"
                                         );
                                         if !rows.0.is_empty() {
@@ -105525,9 +105516,9 @@ mod cdb141_current_root_witness_tests {
                                     }
                                     assert_eq!(
                                         (
-                                            result.rows,
-                                            result.trace.physical_plan,
-                                            result.trace.index_used
+                                            result.rows().to_vec(),
+                                            result.trace().physical_plan,
+                                            result.trace().index_used.clone()
                                         ),
                                         *rows,
                                         "{shape}/{damage}: public historical/current SQL after reopen equals fresh same-snapshot complete values and actual plan"
@@ -105661,7 +105652,7 @@ mod cdb141_current_root_witness_tests {
                                             "{damage}: public SQL names the corrupted logical table or version"
                                         );
                                         assert!(
-                                            !reason.is_empty(),
+                                            !(reason == ""),
                                             "{damage}: public SQL corruption has an explanation"
                                         );
                                     }
@@ -106430,7 +106421,7 @@ fn initialized_prepaid_controls_for_test() {
     let vector: Arc<dyn contextdb_vector::MemoryBudget> = owner.clone();
     let charge = StagedCopyCharge::admit(
         &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
-        vector.clone(),
+        vector.clone().into(),
         23,
         "prepaid_initialized_proof",
     )
@@ -106459,7 +106450,7 @@ fn initialized_prepaid_controls_for_test() {
     let other = Arc::new(MemoryAccountant::no_limit());
     let charge = StagedCopyCharge::admit(
         &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
-        vector.clone(),
+        vector.clone().into(),
         23,
         "prepaid_initialized_proof",
     )
@@ -106473,7 +106464,7 @@ fn initialized_prepaid_controls_for_test() {
     assert_eq!(other.usage().used, 0);
     let charge = StagedCopyCharge::admit(
         &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
-        vector.clone(),
+        vector.clone().into(),
         23,
         "prepaid_initialized_proof",
     )

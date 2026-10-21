@@ -233,7 +233,7 @@ impl Database {
     pub fn __maintenance_with_stop_for_test(
         &self,
         stop: Arc<AtomicBool>,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<MaintenanceReport> {
         let mut context = self.maintenance_context();
         context.worker_stop = Some(stop);
@@ -637,7 +637,7 @@ impl SavedVectorRootForTest {
     pub fn with_public_calls<T>(
         &self,
         database: &Database,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         action: impl FnOnce(&Database, &crate::read_session::ReadSession) -> Result<T>,
     ) -> Result<T> {
         if self.manager != database.tx_mgr.identity() {
@@ -788,8 +788,9 @@ impl Database {
         partition: &VectorPartitionRef,
         require_change: bool,
         max_cycles: usize,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<SavedTopologyFixtureForTest> {
+        let read_memory = read_memory.into();
         let sources = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&sources);
         let selected_partition = partition.clone();

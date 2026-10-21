@@ -457,7 +457,7 @@ pub fn assert_cg_artifacts(db: &Database, seed: u128) {
         db.column_has_covering_index("edges", "source_id"),
         "the actual cg composite source index is installed"
     );
-    assert_cg_artifact_queries(|sql, p| db.execute(sql, p).unwrap().rows, seed);
+    assert_cg_artifact_queries(|sql, p| db.execute(sql, p).unwrap().rows().to_vec(), seed);
     let mut p = cg_artifact_params(seed);
     p.insert(
         "back_edge".into(),

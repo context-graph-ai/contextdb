@@ -120,7 +120,7 @@ fn nearest(db: &Database, id: i64) -> Vec<Vec<Value>> {
         &HashMap::from([("q".into(), Value::Vector(vector_for(id)))]),
     )
     .unwrap()
-    .rows
+    .rows().to_vec()
 }
 
 fn count(db: &Database) -> i64 {
@@ -130,7 +130,7 @@ fn count(db: &Database) -> i64 {
             &HashMap::new(),
         )
         .unwrap()
-        .rows[0][0]
+        .rows()[0][0]
     {
         Value::Int64(count) => count,
         ref other => panic!("{other:?}"),
@@ -310,7 +310,8 @@ fn a_pinned_reader_keeps_its_answer_while_the_large_commit_is_rebuilt_and_publis
     let query = "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
     let params = HashMap::from([("q".into(), Value::Vector(vector_for(1_000_123)))]);
     let pinned = db.begin().unwrap();
-    let before = db.execute_in_tx(pinned, query, &params).unwrap().rows;
+    let fixture_answer_45 = db.execute_in_tx(pinned, query, &params).unwrap();
+    let before = fixture_answer_45.rows();
     assert_eq!(before, vec![vec![Value::Int64(1_000_123)]]);
     assert!(db.persist_import_vector_tails().unwrap());
     db.execute(
@@ -322,11 +323,12 @@ fn a_pinned_reader_keeps_its_answer_while_the_large_commit_is_rebuilt_and_publis
     let cycle = db.run_maintenance_cycle().unwrap().vector;
     assert!(cycle.first_failure.is_none(), "{:?}", cycle.first_failure);
     assert_eq!(
-        db.execute_in_tx(pinned, query, &params).unwrap().rows,
+        db.execute_in_tx(pinned, query, &params).unwrap().rows(),
         before,
         "the pinned reader keeps its original answer"
     );
-    let fresh = db.execute(query, &params).unwrap().rows;
+    let fixture_answer_46 = db.execute(query, &params).unwrap();
+    let fresh = fixture_answer_46.rows();
     assert_ne!(fresh, before, "a fresh reader sees the delete");
     assert_eq!(nearest(&db, 3_000_000), vec![vec![Value::Int64(3_000_000)]]);
     db.rollback(pinned).unwrap();

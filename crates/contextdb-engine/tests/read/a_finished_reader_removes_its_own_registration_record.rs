@@ -79,7 +79,7 @@ fn a_finished_reader_leaves_no_registration_record_of_its_own() {
         session
             .execute("SELECT id FROM records", &HashMap::new())
             .expect("the reader reads")
-            .rows
+            .rows()
             .len(),
         1
     );

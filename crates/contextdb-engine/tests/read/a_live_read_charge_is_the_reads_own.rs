@@ -32,7 +32,7 @@ fn one_cursor_charge(db: &Database) -> (u64, u64, u64) {
     let reader = db.read_session(limits()).expect("live read session");
     let baseline = reader.charged_bytes().expect("baseline");
     let cursor = reader.open_cursor(QUERY, &HashMap::new()).expect("cursor");
-    assert!(cursor.first_page().has_more, "three rows exceed one page");
+    assert!(cursor.first_page().has_more(), "three rows exceed one page");
     let held = reader.charged_bytes().expect("held");
     cursor.close().expect("close cursor");
     let after = reader.charged_bytes().expect("after");

@@ -317,7 +317,7 @@ fn durable_accepted_delete_classification_restores_the_retained_reader_root() {
         receiver
             .execute_at_snapshot("SELECT id, body FROM events ORDER BY id", &empty, snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Text("original".to_string())]],
         "classification restores the external reader's original durable view"
     );
@@ -354,7 +354,7 @@ fn durable_accepted_delete_classification_restores_the_retained_reader_root() {
         receiver
             .execute_at_snapshot("SELECT body FROM events WHERE id = 1", &empty, snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("original".to_string())]]
     );
     drop(scope);

@@ -177,7 +177,7 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
                 &HashMap::new(),
             )
             .expect("read authored vector row");
-        assert_eq!(&actual.rows, expected, "{table} row and vector membership");
+        assert_eq!(&actual.rows(), expected, "{table} row and vector membership");
     }
     let schemas = reader
         .metadata(MetadataRequest::Tables, None)
@@ -214,7 +214,7 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
                 &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
             )
             .expect("read authenticated generation")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
 }
@@ -406,7 +406,7 @@ fn vector_match_ids(path: &Path) -> contextdb_core::Result<Vec<Vec<Value>>> {
                 }),
             )]),
         )
-        .map(|answer| answer.rows)
+        .map(|answer| answer.rows().to_vec())
 }
 
 #[test]
@@ -630,7 +630,7 @@ fn a_custody_copy_missing_one_policy_cannot_return_a_shortened_show_list() {
         healthy
             .execute("SHOW TENANT TABLE POLICY", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         2,
         "the committed set contains both policy records"

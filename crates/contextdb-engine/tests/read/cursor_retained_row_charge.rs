@@ -97,11 +97,11 @@ fn a_row_the_cursor_defers_is_charged_for_until_a_page_publishes_it() {
     let request = request(one_row_per_page_limits());
     let opened = bounded::open_cursor(Arc::clone(&db), &request).expect("open a wide-row cursor");
     assert_eq!(
-        opened.first_page.rows.len(),
+        opened.first_page.rows().len(),
         1,
         "the byte ceiling admits one wide row"
     );
-    assert!(opened.first_page.has_more);
+    assert!(opened.first_page.has_more());
 
     // The page stopped at the byte ceiling, so the row it had already pulled
     // is waiting inside the cursor. A cursor that only carried scaffolding
@@ -113,14 +113,14 @@ fn a_row_the_cursor_defers_is_charged_for_until_a_page_publishes_it() {
     );
 
     let mut cursor = opened.cursor;
-    let mut answered = opened.first_page.rows.len();
-    let mut has_more = opened.first_page.has_more;
+    let mut answered = opened.first_page.rows().len();
+    let mut has_more = opened.first_page.has_more();
     while has_more {
         let fetched = cursor
             .fetch(None, OwnerReadCancellation::new())
             .expect("the wide-row cursor keeps answering");
-        answered = answered.saturating_add(fetched.page.rows.len());
-        has_more = fetched.page.has_more;
+        answered = answered.saturating_add(fetched.page.rows().len());
+        has_more = fetched.page.has_more();
     }
     assert_eq!(
         i64::try_from(answered).expect("the fixture row count fits this platform"),
@@ -142,8 +142,8 @@ fn an_interrupted_fetch_keeps_the_rows_the_cursor_is_still_holding_charged() {
     let opened = bounded::open_cursor(Arc::clone(&db), &request(one_row_per_page_limits()))
         .expect("open a wide-row cursor");
     let mut cursor = opened.cursor;
-    let mut answered = opened.first_page.rows.len();
-    assert!(opened.first_page.has_more);
+    let mut answered = opened.first_page.rows().len();
+    assert!(opened.first_page.has_more());
 
     // A fetch that is already withdrawn when it starts publishes nothing and
     // leaves the cursor exactly as it was: still alive, still holding the row
@@ -166,8 +166,8 @@ fn an_interrupted_fetch_keeps_the_rows_the_cursor_is_still_holding_charged() {
         let fetched = cursor
             .fetch(None, OwnerReadCancellation::new())
             .expect("the resumed cursor keeps answering");
-        answered = answered.saturating_add(fetched.page.rows.len());
-        has_more = fetched.page.has_more;
+        answered = answered.saturating_add(fetched.page.rows().len());
+        has_more = fetched.page.has_more();
     }
     assert_eq!(
         i64::try_from(answered).expect("the fixture row count fits this platform"),

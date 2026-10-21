@@ -45,7 +45,7 @@ fn memory_content_size_refuses_without_inventing_persisted_bytes() {
         .execute("SELECT payload FROM memory_sizes WHERE id = 1", &params)
         .expect("typed size refusal leaves the store usable");
     assert_eq!(
-        answer.rows,
+        answer.rows(),
         vec![vec![Value::Text("persisted size is unavailable".into())]]
     );
 }

@@ -134,7 +134,7 @@ fn an_older_catalog_charge_is_recomputed_before_graph_decode() {
     );
     assert_eq!(db.vector_memory_ownership_receipt_for_test().base_graph, 0);
     db.set_memory_limit(None).unwrap();
-    assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows.len(), 3);
+    assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows().len(), 3);
     let reloaded = db.vector_memory_ownership_receipt_for_test().base_graph;
     assert!(
         reloaded > CATALOG_DECLARED_RESIDENT_BYTES && reloaded <= before,
@@ -146,7 +146,7 @@ fn an_older_catalog_charge_is_recomputed_before_graph_decode() {
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         (0..32).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
     );
     eprintln!(

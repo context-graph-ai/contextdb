@@ -163,7 +163,7 @@ fn a_dropped_index_takes_its_commitment_and_a_recreated_one_starts_fresh() {
     assert_eq!(
         db.execute_at_snapshot("SELECT id FROM tagged WHERE tag = 'b'", &empty(), early)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(2)]],
         "the recreated index answers the older snapshot from fresh postings"
     );
@@ -184,7 +184,7 @@ fn a_reader_refuses_a_commitment_that_does_not_authenticate() {
     assert_eq!(
         db.execute_at_snapshot("SELECT id FROM tagged WHERE tag = 'b'", &empty(), early)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(2)]]
     );
     db.close().unwrap();
@@ -434,7 +434,7 @@ fn retention_never_hides_a_version_a_pinned_snapshot_still_sees() {
     assert_eq!(
         db.execute_at_snapshot("SELECT id FROM expiring WHERE tag = 'a'", &empty(), early)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]],
         "the pinned snapshot still finds the expired row through its index"
     );

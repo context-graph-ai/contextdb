@@ -152,7 +152,7 @@ fn charge_for_an_open_cursor(db: &Arc<Database>, sql: &str) -> (u64, usize) {
     let mut opened = bounded::open_cursor(Arc::clone(db), &request(sql, roomy()))
         .expect("a listed-value cursor must open under a roomy ceiling");
     let charged = opened.telemetry.peak_temporary_bytes;
-    let rows = opened.first_page.rows.len();
+    let rows = opened.first_page.rows().len();
     opened.cursor.close().expect("the cursor closes");
     (charged, rows)
 }
@@ -217,7 +217,7 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
     .unwrap();
     let mut writer_ids = writer_answer
         .result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(id) => *id,
@@ -226,12 +226,12 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
         .collect::<Vec<_>>();
     writer_ids.sort_unstable();
     assert_eq!(writer_ids, (0..STORED_MATCHES).collect::<Vec<_>>());
-    assert_eq!(writer_answer.result.trace.physical_plan, "IndexScan");
+    assert_eq!(writer_answer.result.trace().physical_plan, "IndexScan");
     assert_eq!(
-        writer_answer.result.trace.index_used.as_deref(),
+        writer_answer.result.trace().index_used.as_deref(),
         Some(DECLARED_INDEX)
     );
-    let writer_delivered = writer_answer.result.rows.len() as u64;
+    let writer_delivered = writer_answer.result.rows().len() as u64;
     assert_eq!(
         writer_answer
             .telemetry
@@ -242,7 +242,7 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
         "the reopened writable IN walk examines exactly its delivered postings"
     );
     assert_eq!(
-        writer_answer.result.trace.rows_examined, writer_delivered,
+        writer_answer.result.trace().rows_examined, writer_delivered,
         "the reopened writable IN walk examines exactly its delivered rows"
     );
     writer_reopened.close().unwrap();
@@ -317,13 +317,13 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
     .map(|(label, answer)| {
         (
             label,
-            answer.rows,
-            answer.trace.physical_plan,
-            answer.trace.sort_elided,
+            answer.rows().to_vec(),
+            answer.trace().physical_plan,
+            answer.trace().sort_elided,
             answer
-                .trace
+                .trace()
                 .groups
-                .into_iter()
+                .iter()
                 .map(|group| (group.route, group.returned_rows, group.examined_entries))
                 .collect::<Vec<_>>(),
         )
@@ -369,16 +369,16 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
     // Proving the route first is what keeps the rest from reporting a clean
     // bill on a branch it never entered.
     assert_eq!(
-        outcome.result.trace.physical_plan, "IndexScan",
+        outcome.result.trace().physical_plan, "IndexScan",
         "a listed-value predicate is answered through the declared index"
     );
     assert_eq!(
-        outcome.result.trace.index_used.as_deref(),
+        outcome.result.trace().index_used.as_deref(),
         Some(DECLARED_INDEX),
         "the read names the index that answered it"
     );
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         STORED_MATCHES as usize,
         "one listed value names every stored row, and the rest name nothing"
     );
@@ -416,7 +416,7 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
     let expected_rows = (0..STORED_MATCHES).collect::<Vec<_>>();
     let mut control_rows = control
         .result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(id) => *id,
@@ -425,9 +425,9 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
         .collect::<Vec<_>>();
     control_rows.sort_unstable();
     assert_eq!(control_rows, expected_rows);
-    assert_eq!(control.result.trace.physical_plan, "IndexScan");
+    assert_eq!(control.result.trace().physical_plan, "IndexScan");
     assert_eq!(
-        control.result.trace.index_used.as_deref(),
+        control.result.trace().index_used.as_deref(),
         Some(DECLARED_INDEX)
     );
     let control_index_work = control
@@ -452,7 +452,7 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
     let after = bounded::execute(&durable, &request(&sql, roomy())).unwrap();
     let mut after_rows = after
         .result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(id) => *id,
@@ -462,12 +462,12 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
     after_rows.sort_unstable();
     assert_eq!(after_rows, expected_rows);
     assert_eq!(
-        after.result.trace.physical_plan,
-        control.result.trace.physical_plan
+        after.result.trace().physical_plan,
+        control.result.trace().physical_plan
     );
     assert_eq!(
-        after.result.trace.index_used,
-        control.result.trace.index_used
+        after.result.trace().index_used,
+        control.result.trace().index_used
     );
     assert_eq!(
         after
@@ -481,7 +481,7 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
         "a short IN query owes no index entry from the following unselected prefix"
     );
     assert_eq!(
-        after.result.trace.rows_examined, control.result.trace.rows_examined,
+        after.result.trace().rows_examined, control.result.trace().rows_examined,
         "the same selected runs examine the same rows after another prefix is appended"
     );
     durable.close().unwrap();
@@ -572,7 +572,7 @@ fn a_ceiling_that_does_not_cover_the_owed_runs_refuses_the_cursor() {
     )
     .expect("a ceiling with room for the runs it owes serves the same cursor");
     assert_eq!(
-        opened.first_page.rows.len(),
+        opened.first_page.rows().len(),
         1,
         "the served cursor answers with the one row a listed value names"
     );

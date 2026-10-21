@@ -49206,7 +49206,7 @@ mod empty_declared_index_readiness_tests {
                 .verify_stored_graph_history_at_root(
                     &key,
                     &bytes,
-                    &SourceWindowOwner::Read(memory.clone()),
+                    &SourceWindowOwner::Read(memory.clone().into()),
                 )
                 .unwrap(),
             graph_read::GraphReadRoot::Image(source) => source
@@ -49521,7 +49521,7 @@ mod empty_declared_index_readiness_tests {
             let declared_reader_limit = owner_reads.limits.limits.memory;
             let written_edges = database.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
             assert_eq!(
-                written_edges.rows,
+                written_edges.rows(),
                 vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]],
                 "the store has the authored edge before every writing handle is dropped"
             );
@@ -49833,7 +49833,7 @@ mod empty_declared_index_readiness_tests {
         assert!(cache_after_query.0 >= cache_before_query.0);
         assert!(cache_after_query.1 >= cache_before_query.1);
         assert_eq!(
-            actual_edges.rows,
+            actual_edges.rows(),
             vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]
         );
         let loaded = scope
@@ -49966,7 +49966,7 @@ mod empty_declared_index_readiness_tests {
         let binding = scope.bind_owner(&database, "graph-observer-row");
         let result = session.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
         assert_eq!(
-            result.rows,
+            result.rows(),
             vec![vec![Value::Uuid(uuid::Uuid::from_u128(2))]]
         );
         let observed = scope
@@ -50048,7 +50048,7 @@ mod empty_declared_index_readiness_tests {
                 let key: [u8; 24] = RedbPersistence::rel_row_key(&expected).try_into().unwrap();
                 let mut cursor = root
                     .exact_row(
-                        writer_source::SourceWindowOwner::Read(memory),
+                        writer_source::SourceWindowOwner::Read(memory.into()),
                         "removed_rows",
                         &key,
                     )
@@ -50220,7 +50220,7 @@ mod empty_declared_index_readiness_tests {
                     position[8..].copy_from_slice(&(*ordinal as u64).to_be_bytes());
                     let mut cursor = root
                         .cursor(
-                            SourceWindowOwner::Read(memory.clone()),
+                            SourceWindowOwner::Read(memory.clone().into()),
                             writer_history::WRITER_CHANGE_LOG_TABLE.name(),
                             writer_source::WriterCursorFamily::Bytes,
                             Bound::Included(&position),
@@ -50233,7 +50233,7 @@ mod empty_declared_index_readiness_tests {
                 }
                 let mut cursor = root
                     .change_log_cursor(
-                        SourceWindowOwner::Read(memory),
+                        SourceWindowOwner::Read(memory.into()),
                         coordinates.first().unwrap().0,
                         coordinates.last().unwrap().0,
                     )
@@ -50803,7 +50803,7 @@ mod empty_declared_index_readiness_tests {
                 position[8..].copy_from_slice(&(requested as u64).to_be_bytes());
                 let mut addressed = root
                     .cursor(
-                        SourceWindowOwner::Read(memory.clone()),
+                        SourceWindowOwner::Read(memory.clone().into()),
                         writer_history::WRITER_CHANGE_LOG_TABLE.name(),
                         writer_source::WriterCursorFamily::Bytes,
                         Bound::Included(&position),
@@ -50818,7 +50818,7 @@ mod empty_declared_index_readiness_tests {
                 assert!(addressed.next_change().unwrap().is_none());
                 drop(addressed);
                 let mut cursor = root
-                    .change_log_cursor(SourceWindowOwner::Read(memory), Lsn(30), Lsn(30))
+                    .change_log_cursor(SourceWindowOwner::Read(memory.into()), Lsn(30), Lsn(30))
                     .unwrap();
                 while let Some(window) = cursor.next_change().unwrap() {
                     changes.push(window.value.clone());
@@ -50936,7 +50936,7 @@ mod empty_declared_index_readiness_tests {
             }
             assert_eq!(scope.commit_directory_residency(), Some((0, expected.len() as u64)), "cursor output does not become resident directory state");
             let refusal_limits = ReadLimits::default();
-            let refusal_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(refusal_limits.memory);
+            let refusal_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(refusal_limits.memory).expect("admit the declared fixture root");
             let refusal_open = crate::executor::bounded::ReadOpenContext::new(refusal_parent.child()?, refusal_limits, Arc::new(DirectoryProofClock), OwnerReadCancellation::new())?;
             let refusal_child = refusal_open.read_memory();
             let refusal_checkpoint = || refusal_open.checkpoint();
@@ -51164,7 +51164,7 @@ mod empty_declared_index_readiness_tests {
             commit_suffix_fixture(&path, frontier, &suffix);
             let durable_before = std::fs::read(&path).unwrap();
             let parent =
-                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024).expect("admit the declared fixture root");
             let baseline = parent.retained_bytes_for_test();
             let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
             let open = crate::executor::bounded::ReadOpenContext::new(
@@ -51244,7 +51244,7 @@ mod empty_declared_index_readiness_tests {
             commit_suffix_fixture(&path, frontier, &[(21, 101), (22, 103), (23, 102)]);
             let before = std::fs::read(&path).unwrap();
             let parent =
-                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024);
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(16 * 1024 * 1024).expect("admit the declared fixture root");
             let baseline = parent.retained_bytes_for_test();
             let scope = Arc::new(ReadWorkObservationScope::enter(ReadWorkPhase::Open));
             let cancellation = OwnerReadCancellation::new();
@@ -51526,9 +51526,9 @@ mod empty_declared_index_readiness_tests {
             // child. The image ceiling remains the existing fixture ceiling.
             let limits = ReadSessionOptions::default().limits;
             let declared_read_memory =
-                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory).expect("admit the declared fixture root");
             let raw_parent_baseline = declared_read_memory.retained_bytes_for_test();
-            let raw_parent_identity = Arc::as_ptr(&declared_read_memory) as usize;
+            let raw_parent_identity = declared_read_memory.as_ref() as *const crate::vector_read_memory::DeclaredReadMemory as usize;
             let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
             assert_eq!(observation.commit_directory_funding(), None);
             let open_context = crate::executor::bounded::ReadOpenContext::new(
@@ -51564,7 +51564,7 @@ mod empty_declared_index_readiness_tests {
             // Complete the SAME real captured Database construction while
             // this Open scope is active. Keep the original empty-map and
             // legacy zero-work assertions above byte-identical.
-            let raw_image_owner_identity = Arc::as_ptr(&image.memory) as usize;
+            let raw_image_owner_identity = (&*image.memory) as *const crate::read_image_memory::ImageMemory as usize;
             let raw_image_accountant_identity = image.memory.accountant.as_ptr() as usize;
             let raw_image_held = image.memory.held();
             let raw_accountant_used = image.memory.accountant.usage().used;
@@ -52975,10 +52975,11 @@ mod empty_declared_index_readiness_tests {
         let source_pin = control_source.storage_identity();
         drop(_fixture_decode_scope_43155);
         let session_image = control_session.file_snapshot_for_test().unwrap();
-        let row_answer = control_session
+        let fixture_answer_101 = control_session
             .execute("SELECT body FROM removed_rows", &HashMap::new())
-            .unwrap()
-            .rows;
+            .unwrap();
+        let row_answer = fixture_answer_101
+            .rows();
         assert_eq!(
             row_answer,
             vec![vec![Value::Text(
@@ -53104,7 +53105,7 @@ mod empty_declared_index_readiness_tests {
             control_session
                 .execute("SELECT body FROM removed_rows", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             row_answer
         );
         assert_eq!(
@@ -53205,7 +53206,7 @@ mod empty_declared_index_readiness_tests {
             published_session
                 .execute("SELECT body FROM removed_rows", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             row_answer
         );
         drop(published_session);
@@ -53236,7 +53237,7 @@ mod empty_declared_index_readiness_tests {
                     old_session
                         .execute("SELECT body FROM removed_rows", &HashMap::new())
                         .unwrap()
-                        .rows,
+                        .rows(),
                     row_answer
                 );
                 assert_eq!(
@@ -53413,7 +53414,7 @@ mod empty_declared_index_readiness_tests {
                     old_session
                         .execute("SELECT body FROM removed_rows", &HashMap::new())
                         .unwrap()
-                        .rows,
+                        .rows(),
                     row_answer
                 );
                 assert_eq!(
@@ -53471,7 +53472,7 @@ mod empty_declared_index_readiness_tests {
                     fresh_session
                         .execute("SELECT body FROM removed_rows", &HashMap::new())
                         .unwrap()
-                        .rows,
+                        .rows(),
                     row_answer
                 );
                 assert_eq!(
@@ -53578,7 +53579,7 @@ mod empty_declared_index_readiness_tests {
                     panic!("the redeclared index answers {label}: {error:?}");
                 });
             result
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row.first().expect("one projected column") {
                     Value::Int64(id) => *id,
@@ -53818,7 +53819,7 @@ mod empty_declared_index_readiness_tests {
                 SourceMemoryReservation::new(image_memory.clone(), source_bytes).unwrap();
             let limits = crate::read_session::ReadSessionOptions::default().limits;
             let declared =
-                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory);
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory).expect("admit the declared fixture root");
             let open_context = crate::executor::bounded::ReadOpenContext::new(
                 declared.child().unwrap(),
                 limits,
@@ -53870,7 +53871,7 @@ mod empty_declared_index_readiness_tests {
         let key_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
             declared_child,
         ));
-        let endpoint = SourceWindowOwner::Read(key_memory.clone())
+        let endpoint = SourceWindowOwner::Read(key_memory.clone().into())
             .endpoint(&[key.as_slice()], "graph_cursor")
             .unwrap();
         assert_eq!(
@@ -53885,7 +53886,7 @@ mod empty_declared_index_readiness_tests {
             "the endpoint credit returns at its own lifetime boundary"
         );
         key_memory.set_budget(Some(key.len() - 1)).unwrap();
-        let error = SourceWindowOwner::Read(key_memory.clone())
+        let error = SourceWindowOwner::Read(key_memory.clone().into())
             .endpoint(&[key.as_slice()], "graph_cursor")
             .err()
             .expect("one byte below the actual endpoint request refuses");
@@ -54320,7 +54321,7 @@ mod empty_declared_index_readiness_tests {
                 for query in std::iter::once(query).chain((!allow_source).then_some(
                 "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $anchor AND b.id = $target COLUMNS (b.id AS t))"
             )) {
-            assert_eq!(database.execute(query, &params).unwrap().rows, vec![vec![Value::Uuid(target)]], "admin control confirms the actual stored graph edge");
+            assert_eq!(database.execute(query, &params).unwrap().rows(), vec![vec![Value::Uuid(target)]], "admin control confirms the actual stored graph edge");
             }
                 database.close().unwrap();
                 drop(database);
@@ -54451,7 +54452,7 @@ mod empty_declared_index_readiness_tests {
                     &HashMap::from([("target".into(), Value::Uuid(target))])
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Uuid(target)]],
             "the principal genuinely holds the target grant"
         );
@@ -54459,7 +54460,7 @@ mod empty_declared_index_readiness_tests {
             session
                 .execute("SELECT edge_type FROM edges", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("LINKS".into())]],
             "the principal genuinely holds the edge grant"
         );
@@ -54467,7 +54468,7 @@ mod empty_declared_index_readiness_tests {
             session
                 .execute("SELECT id FROM nodes WHERE id = $source", params)
                 .unwrap()
-                .rows,
+                .rows(),
             if allow_source {
                 vec![vec![params["source"].clone()]]
             } else {
@@ -54508,7 +54509,7 @@ mod empty_declared_index_readiness_tests {
             "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $anchor AND b.id = $target COLUMNS (b.id AS t))"
         };
         assert_eq!(
-            session.execute(query, params).unwrap().rows,
+            session.execute(query, params).unwrap().rows(),
             expected,
             "denied source plus allowed target and edge yields zero on this real route"
         );
@@ -54543,7 +54544,7 @@ mod empty_declared_index_readiness_tests {
                 "cancelled statement releases its cursor lifetime"
             );
             assert_eq!(
-                session.execute(query, params).unwrap().rows,
+                session.execute(query, params).unwrap().rows(),
                 expected,
                 "fresh operation survives cancellation without changing the pinned source"
             );
@@ -54558,7 +54559,7 @@ mod empty_declared_index_readiness_tests {
             "pre-cancelled public read keeps cancellation distinct from denied permission: {error:?}"
         );
         assert_eq!(
-            session.execute(query, params).unwrap().rows,
+            session.execute(query, params).unwrap().rows(),
             expected,
             "typed refusal and cancellation leave authorization and source answers unchanged"
         );
@@ -54620,7 +54621,7 @@ mod empty_declared_index_readiness_tests {
                         database
                             .execute_at_snapshot(sql, &HashMap::new(), snapshot)
                             .unwrap()
-                            .rows
+                            .rows().to_vec()
                     });
                     assert!(
                         controls.iter().all(|rows| !rows.is_empty()),
@@ -54711,7 +54712,7 @@ mod empty_declared_index_readiness_tests {
                             ReadSession::open_with_options(&path, ReadSessionOptions::default())
                                 .unwrap();
                         assert_eq!(
-                            reader.execute(statements[2], &HashMap::new()).unwrap().rows,
+                            reader.execute(statements[2], &HashMap::new()).unwrap().rows(),
                             controls[2],
                             "tight-budget refusal preserves the healthy store and its complete answer"
                         );
@@ -54721,7 +54722,7 @@ mod empty_declared_index_readiness_tests {
                                 .and_then(|reader| reader.execute(statements[2], &HashMap::new()));
                         match result {
                             Err(Error::StoreCorrupted { reason, .. }) => assert!(
-                                !reason.is_empty(),
+                                !(reason == ""),
                                 "native relational page corruption explains its refusal"
                             ),
                             other => panic!(
@@ -54737,7 +54738,7 @@ mod empty_declared_index_readiness_tests {
                             } else {
                                 database.execute_at_snapshot(sql, &HashMap::new(), snapshot)
                             } {
-                                Err(Error::StoreCorrupted { reason, .. }) if !reason.is_empty() => {
+                                Err(Error::StoreCorrupted { reason, .. }) if !(reason == "") => {
                                 }
                                 other => failed_doors.push((sql, format!("{other:?}"))),
                             }
@@ -54796,10 +54797,10 @@ mod empty_declared_index_readiness_tests {
                         .unwrap();
                     eprintln!(
                         "CDB137_PUBLIC_CONTROL {damage}: plan={:?}, index={:?}",
-                        expected.trace.physical_plan, expected.trace.index_used
+                        expected.trace().physical_plan, expected.trace().index_used
                     );
                     let index_name = expected
-                        .trace
+                        .trace()
                         .index_used
                         .clone()
                         .expect("the public control selects a maintained index");
@@ -54822,7 +54823,7 @@ mod empty_declared_index_readiness_tests {
                         );
                     }
                     assert!(
-                        !expected.rows.is_empty(),
+                        !expected.rows().is_empty(),
                         "{damage}: a real historical answer is owed"
                     );
                     database
@@ -54837,7 +54838,7 @@ mod empty_declared_index_readiness_tests {
                         .execute_at_snapshot(sql, &HashMap::new(), historical)
                         .unwrap();
                     assert_eq!(
-                        complete.rows, expected.rows,
+                        complete.rows(), expected.rows(),
                         "{damage}: cold public historical control equals the pre-close answer"
                     );
                     drop(reopened);
@@ -54929,13 +54930,13 @@ mod empty_declared_index_readiness_tests {
                             reason,
                         }) => {
                             assert!(
-                                !logical.is_empty() && !reason.is_empty(),
+                                !(logical == "") && !(reason == ""),
                                 "{damage}: typed corruption identifies its logical source"
                             );
                         }
                         Ok(actual) => panic!(
                             "{damage}: required corruption refusal before wrong historical answer; actual={:?}; fresh_control={:?}",
-                            actual.rows, expected.rows
+                            actual.rows(), expected.rows()
                         ),
                         Err(other) => panic!("{damage}: required typed corruption, got {other:?}"),
                     }
@@ -55327,11 +55328,11 @@ mod empty_declared_index_readiness_tests {
                                             }) => {
                                                 assert_eq!(
                                                     actual,
-                                                    path.display().to_string(),
+                                                    path.display().to_string().as_str(),
                                                     "{damage}/{snapshot_name}/{door}: pre-exposure refusal names the damaged store"
                                                 );
                                                 assert!(
-                                                    !reason.is_empty(),
+                                                    !(reason == ""),
                                                     "{damage}/{snapshot_name}/{door}: pre-exposure refusal explains the incomplete group"
                                                 );
                                             }
@@ -55475,7 +55476,7 @@ mod empty_declared_index_readiness_tests {
             )
             .expect("the public ordered read uses the committed empty posting table");
         assert!(
-            ordered.rows.is_empty(),
+            ordered.rows().is_empty(),
             "an ordered read of the declared empty index has no phantom rows"
         );
         assert_eq!(
@@ -55574,7 +55575,7 @@ mod retained_raw_body_guard_tests;
 #[path = "persistence/journal_record_validation_tests.rs"]
 mod journal_record_validation_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 mod change_reload_decode_tests;
 
 #[cfg(any(test, feature = "test-seams"))]

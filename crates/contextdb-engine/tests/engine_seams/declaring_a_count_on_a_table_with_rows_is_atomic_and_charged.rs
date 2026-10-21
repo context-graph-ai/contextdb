@@ -37,7 +37,7 @@ fn count(db: &Database, sql: &str, params: HashMap<String, Value>) -> i64 {
     let result = db
         .execute(sql, &params)
         .unwrap_or_else(|error| panic!("count `{sql}`: {error}"));
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Int64(count) => *count,
         other => panic!("a count is an integer, got {other:?}"),
     }

@@ -75,7 +75,7 @@ fn submit_blob_job(db: &Database, job_id: &str, input_refs: Vec<InputRef>) {
 fn work_job_ids(db: &Database) -> Vec<Vec<Value>> {
     db.execute("SELECT job_id FROM work_jobs ORDER BY job_id", &params())
         .expect("read work-ledger job ids")
-        .rows
+        .rows().to_vec()
 }
 
 fn report_rows(mut pairs: Vec<(String, String)>) -> Vec<Vec<Value>> {
@@ -94,7 +94,7 @@ fn rows(db: &Database) -> Vec<Vec<Value>> {
         &params(),
     )
     .expect("read public purge fixture rows")
-    .rows
+    .rows().to_vec()
 }
 
 fn observable_state(db: &Database) -> ObservablePurgeState {
@@ -206,12 +206,12 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
                 let survivor_history = history_for_id(&history, 3);
                 let (result, success_peak, _, success_origin) = oracle::measured_purge(|| fixture.db.execute(
                     "PURGE FROM purge_contract_rows WHERE cohort = 'selected'", &params()));
-                assert_eq!(result.unwrap().rows_affected, 2);
+                assert_eq!(result.unwrap().rows_affected(), 2);
                 assert_selected_absent_and_survivor_intact(&fixture.db);
                 assert_successful_batch_history(&fixture.db, &survivor_history);
                 for table in 0..2 {
                     assert_eq!(fixture.db.execute(&format!(
-                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows,
+                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows(),
                         vec![vec![Value::Int64(77)]]);
                 }
                 fixture.db.close().unwrap();
@@ -220,7 +220,7 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
                 assert_successful_batch_history(&reopened, &survivor_history);
                 for table in 0..2 {
                     assert_eq!(reopened.execute(&format!(
-                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows,
+                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows(),
                         vec![vec![Value::Int64(77)]]);
                 }
                 reopened.close().unwrap();
@@ -380,7 +380,7 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
         assert_eq!(
             db.execute("SELECT id FROM purge_target", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(1)]]
         );
         assert!(footprint().1 && footprint().0 > 0);
@@ -400,7 +400,7 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
         assert!(
             db.execute("SELECT id FROM purge_target", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
     }
@@ -470,7 +470,7 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
             &params(),
         )
         .expect("one public predicate purge succeeds after the isolated failure run");
-    assert_eq!(result.rows_affected, 2);
+    assert_eq!(result.rows_affected(), 2);
     assert_selected_absent_and_survivor_intact(&fixture.db);
     assert_successful_batch_history(&fixture.db, &survivor_history_before);
     fixture
@@ -538,14 +538,14 @@ fn public_purge_reports_only_distinct_sorted_work_job_blob_survivors() {
         )
         .expect("purge the two selected work jobs");
 
-    assert_eq!(result.rows_affected, 2, "the selected count remains exact");
+    assert_eq!(result.rows_affected(), 2, "the selected count remains exact");
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec!["blob_hash".to_string(), "remaining_job_id".to_string()],
         "the public survivor-report schema stays explicit"
     );
     assert_eq!(
-        result.rows,
+        result.rows(),
         report_rows(vec![
             (first_hash.to_hex(), "remaining-zeta".to_string()),
             (second_hash.to_hex(), "remaining-alpha".to_string()),
@@ -571,9 +571,9 @@ fn public_purge_reports_only_distinct_sorted_work_job_blob_survivors() {
             &params(),
         )
         .expect("purge every remaining referent for the selected blobs");
-    assert_eq!(all_selected.rows_affected, 2);
+    assert_eq!(all_selected.rows_affected(), 2);
     assert!(
-        all_selected.columns.is_empty() && all_selected.rows.is_empty(),
+        all_selected.columns().is_empty() && all_selected.rows().is_empty(),
         "when no remaining work job refers to a selected blob, PURGE returns no report rows"
     );
 }
@@ -614,7 +614,7 @@ fn public_purge_reports_blob_referent_from_a_superseded_selected_work_job_versio
                 &params(),
             )
             .expect("read selected work job's current input refs")
-            .rows,
+            .rows(),
         vec![vec![Value::Json(serde_json::json!([{
             "kind": "blob_ref",
             "detail": { "hash": current_hash.to_hex() }
@@ -627,13 +627,13 @@ fn public_purge_reports_blob_referent_from_a_superseded_selected_work_job_versio
         .execute("PURGE FROM work_jobs WHERE job_id = 'selected'", &params())
         .expect("purge destroys every version of the selected work job");
 
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec!["blob_hash".to_string(), "remaining_job_id".to_string()]
     );
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![
             Value::Text(historical_hash.to_hex()),
             Value::Text("survivor".to_string()),
@@ -688,7 +688,7 @@ fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
             .durable_lineage_table_generation(TABLE, reader.clone())
             .unwrap_err();
         let original_message = format!("{original:?}");
-        assert!(matches!(original, Error::StoreCorrupted { ref path, .. } if path == &key));
+        assert!(matches!(original, Error::StoreCorrupted { ref path, .. } if path == key.as_str()));
         let mut copy = crate::vector_read_memory::admission(reader.clone());
         let outcome = fixture
             .db
@@ -809,7 +809,7 @@ fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
                 &params(),
             )
             .expect("read retained malformed survivor")
-            .rows,
+            .rows(),
         vec![vec![malformed_input_refs]],
         "the malformed unrelated survivor remains untouched by inbound delivery"
     );
@@ -852,9 +852,9 @@ fn public_purge_does_not_report_ordinary_lookalike_rows() {
             &params(),
         )
         .expect("purge ordinary lookalike row");
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
     assert!(
-        result.columns.is_empty() && result.rows.is_empty(),
+        result.columns().is_empty() && result.rows().is_empty(),
         "only the canonical work_jobs table receives a blob-survivor report"
     );
 }

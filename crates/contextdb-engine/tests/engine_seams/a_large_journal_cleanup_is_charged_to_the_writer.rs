@@ -22,11 +22,11 @@ fn partition_status(db: &Database) -> HashMap<String, Value> {
             &HashMap::new(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     result
-        .columns
-        .into_iter()
-        .zip(result.rows.into_iter().next().unwrap())
+        .columns()
+        .iter().cloned()
+        .zip(result.rows().iter().next().unwrap().iter().cloned())
         .collect()
 }
 
@@ -101,7 +101,7 @@ fn a_journal_larger_than_the_shipped_reader_memory_is_cleaned_under_the_writer()
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(ROWS + 1)]]
     );
     assert_eq!(
@@ -110,7 +110,7 @@ fn a_journal_larger_than_the_shipped_reader_memory_is_cleaned_under_the_writer()
             &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(ROWS)]]
     );
 }

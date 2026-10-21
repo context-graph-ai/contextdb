@@ -551,7 +551,7 @@ impl SyncServer {
         tenant_id: TenantId,
         local_node_id: String,
         identity: Arc<crate::identity::FabricIdentity>,
-        read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+        read_budget_provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
     ) -> Result<Self, Error> {
         Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(db, transport, tenant_id, local_node_id, identity, read_budget_provider.into())
     }

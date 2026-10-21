@@ -224,7 +224,7 @@ pub(super) fn initialized_rows_for_test() {
     let charge = || {
         StagedCopyCharge::admit(
             &crate::memory_accounting::AccountantHandle::from_host(accountant.clone()),
-            accountant.clone(),
+            accountant.clone().into(),
             0,
             "metadata_initialized_proof",
         )

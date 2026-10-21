@@ -49,7 +49,7 @@ fn work_claim_is_absent(db: &Database, claim_key: &str) -> bool {
         &HashMap::from([("claim_key".to_string(), Value::Text(claim_key.to_string()))]),
     )
     .expect("query work claim")
-    .rows
+    .rows()
     .is_empty()
 }
 
@@ -89,7 +89,7 @@ fn note_is_absent(db: &Database, id: Uuid) -> bool {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("query note")
-    .rows
+    .rows()
     .is_empty()
 }
 
@@ -2140,7 +2140,7 @@ fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
             reopened
                 .execute("SELECT body FROM notes", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("newer-hub-value".to_string())]]
         );
         let other =
@@ -2467,7 +2467,7 @@ fn failed_ordinary_apply_never_publishes_an_outcome_or_consumed_progress() {
     assert!(
         hub.execute("SELECT id FROM notes", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert!(hub.replay_sync_push_outcome(&key).unwrap().is_none());

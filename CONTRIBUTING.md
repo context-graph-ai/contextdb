@@ -17,6 +17,13 @@ cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
 
 ## Before Submitting a PR
 
+The local CI routing patch is a policy proposal pending owner acceptance. Its
+normal route uses bounded functional schema checks; original full schema, oversized
+transport and corpus qualification remains executable with `CI_GATE_MODE=full`.
+See [the CI guide](.github/CI.md) for exact routing and commands. Normal success
+cannot certify full qualification or the unmeasured thirty-minute end-to-end budget.
+The nine-command precommit requirement below remains in force.
+
 All nine must pass before any commit, release, or "done" claim. The last installs isolated
 release binaries and drives the production ticketed-Iroh durability smoke; its
 feature-gated verifier is not part of the ordinary product CLI.
@@ -45,6 +52,13 @@ CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" \
 CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
   scripts/installed-release-durable-sync-smoke.sh
 ```
+
+`bash scripts/verify pr` runs the same local stages the PR checks run — lint, every test shard,
+release build, feature shapes and the installed smoke — sequentially in one process (local cross
+builds only when `CI_TARGET` is set). It complements the nine commands above; it does not replace
+them. [`.github/CI.md`](.github/CI.md) maps each PR check to its local command.
+Performance measurement is a separate, manual journey on a controlled native host; see
+[`docs/performance/README.md`](docs/performance/README.md).
 
 ## Crate Layout
 

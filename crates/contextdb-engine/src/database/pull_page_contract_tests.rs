@@ -16,7 +16,7 @@ const PAGE_BYTES: usize = 64 * 1024;
 /// handed everything back.
 #[derive(Debug)]
 struct CountingBudget {
-    inner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    inner: contextdb_core::read_memory::ReadMemoryOwner,
     reserved: AtomicUsize,
     released: AtomicUsize,
     held_high: AtomicUsize,
@@ -25,7 +25,7 @@ struct CountingBudget {
     refuse_selected_copy: bool,
 }
 impl CountingBudget {
-    fn new(inner: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>) -> Arc<Self> {
+    fn new(inner: contextdb_core::read_memory::ReadMemoryOwner) -> Arc<Self> {
         Arc::new(Self {
             inner,
             reserved: AtomicUsize::new(0),
@@ -103,10 +103,10 @@ fn page_from(
     db: &Database,
     since: Lsn,
     page_bytes: usize,
-    budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    budget: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> (Result<Pulled>, Arc<CountingBudget>) {
     let counting = CountingBudget::new(budget);
-    let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = counting.clone();
+    let memory: contextdb_core::read_memory::ReadMemoryOwner = counting.clone().into();
     let outcome = (|| {
         let mut vector_copy = crate::vector_read_memory::admission(memory.clone());
         let mut credit = contextdb_core::read_memory::ReadCredit::new(memory.clone());
@@ -328,7 +328,7 @@ fn a_resident_page_admits_the_same_bytes_as_the_tail_doubles() {
         let _ = page(&db, since, 1);
         let mut counting = CountingBudget::new(db.engine_sync_read_memory().expect("page owner"));
         Arc::get_mut(&mut counting).unwrap().watch_native = true;
-        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = counting.clone();
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = counting.clone().into();
         let (outcome, _, _) =
             crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| {
                 db.with_checked_changes_page_for_test(since, 1, memory, |changes, _| {
@@ -365,7 +365,7 @@ fn a_refused_resident_page_releases_everything_it_admitted() {
     let db = caller_driven(Database::open_memory());
     synced_notes(&db);
     commit_uuid_rows(&db, 0, 200);
-    let tiny = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1024)
+    let tiny = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1024).expect("admit the declared fixture root")
         .child()
         .expect("a tiny reader");
     let (outcome, counting) = page_from(&db, Lsn(0), PAGE_BYTES, tiny);
@@ -406,7 +406,7 @@ fn a_refused_resident_page_releases_everything_it_admitted() {
         let options = Arc::get_mut(&mut counting).unwrap();
         options.watch_native = true;
         options.refuse_selected_copy = true;
-        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = counting.clone();
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = counting.clone().into();
         let (outcome, _, _) =
             crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| {
                 db.with_checked_changes_page_for_test(since, 1, memory, |_, _| {
@@ -460,7 +460,7 @@ fn a_refused_resident_page_releases_everything_it_admitted() {
         let options = Arc::get_mut(&mut counting).unwrap();
         options.watch_native = true;
         options.refuse_selected_copy = true;
-        let memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> = counting.clone();
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = counting.clone().into();
         let (outcome, _, _) =
             crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| {
                 db.with_checked_changes_page_for_test(since, 1, memory, |_, _| {
@@ -494,7 +494,7 @@ fn a_resident_tail_larger_than_the_reader_budget_pulls_in_pages() {
     let db = caller_driven(Database::open_memory());
     synced_notes(&db);
     commit_uuid_rows(&db, 0, 3_000);
-    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024 * 1024);
+    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024 * 1024).expect("admit the declared fixture root");
     let mut since = Lsn(0);
     let mut delivered = Vec::new();
     loop {
@@ -1543,7 +1543,7 @@ fn wide_group_hub(members: usize, member_bytes: usize) -> (tempfile::TempDir, Da
 fn an_oversized_group_after_a_log_gap_is_refused_before_any_copy() {
     let (_dir, db) = wide_group_hub(10, 512 * 1024);
     let limit = 2 * 1024 * 1024;
-    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limit);
+    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
     for attempt in 0..2 {
         let (outcome, counting) = page_from(
             &db,
@@ -1561,7 +1561,7 @@ fn an_oversized_group_after_a_log_gap_is_refused_before_any_copy() {
             "attempt {attempt}: admission never exceeded the limit, so no copy outran it"
         );
     }
-    let roomy = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(64 << 20);
+    let roomy = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(64 << 20).expect("admit the declared fixture root");
     let (outcome, counting) = page_from(
         &db,
         Lsn(0),
@@ -1585,7 +1585,7 @@ fn an_oversized_group_after_a_log_gap_is_refused_before_any_copy() {
 fn an_exhausted_budget_refuses_the_cut_selector_and_leaves_no_trace() {
     let (_dir, db) = gap_hub(150, 2);
     db.__force_change_log_gap_for_test();
-    let starved = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024);
+    let starved = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024).expect("admit the declared fixture root");
     let (outcome, counting) = page_from(
         &db,
         Lsn(0),
@@ -1659,7 +1659,7 @@ fn live_body(db: &Database, id: i64) -> Vec<Vec<Value>> {
         &HashMap::from([("id".to_string(), Value::Int64(id))]),
     )
     .expect("read the live incarnation")
-    .rows
+    .rows().to_vec()
 }
 
 // Policy 16: a snapshot exported after DROP/recreate still replays the authored

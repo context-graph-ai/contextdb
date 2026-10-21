@@ -3307,7 +3307,7 @@ mod tests {
         fn apply(
             &self,
             ws: &WriteSet,
-            _executing_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+            _executing_read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         ) -> Result<()> {
             let reservation = self.store.reserve_writer_snapshot()?;
             self.store.flush_data(ws)?;
@@ -3393,7 +3393,7 @@ mod tests {
                         assert_eq!(observed_identity.user_root, old_identity.user_root);
                     }
                     assert!(
-                        old.row_cursor(SourceWindowOwner::Read(reader.clone()), "items", RowId(7))
+                        old.row_cursor(SourceWindowOwner::Read(reader.clone().into()), "items", RowId(7))
                             .unwrap()
                             .next_row()
                             .unwrap()
@@ -3415,7 +3415,7 @@ mod tests {
                             assert!(
                                 captured
                                     .row_cursor(
-                                        SourceWindowOwner::Read(reader.clone()),
+                                        SourceWindowOwner::Read(reader.clone().into()),
                                         "items",
                                         RowId(7)
                                     )?
@@ -3434,7 +3434,7 @@ mod tests {
         assert_eq!((current.snapshot, current.lsn), (SnapshotId(1), Lsn(1)));
         let baseline = reader.usage().used;
         let mut cursor = current
-            .row_cursor(SourceWindowOwner::Read(reader.clone()), "items", RowId(7))
+            .row_cursor(SourceWindowOwner::Read(reader.clone().into()), "items", RowId(7))
             .unwrap();
         let cursor_only = reader.usage().used;
         let window = cursor.next_row().unwrap().unwrap();
@@ -3446,7 +3446,7 @@ mod tests {
         drop(cursor);
         assert_eq!(reader.usage().used, baseline);
         assert!(
-            old.row_cursor(SourceWindowOwner::Read(reader.clone()), "items", RowId(7))
+            old.row_cursor(SourceWindowOwner::Read(reader.clone().into()), "items", RowId(7))
                 .unwrap()
                 .next_row()
                 .unwrap()
@@ -3546,7 +3546,7 @@ mod tests {
             .unwrap();
         let mut current = root
             .index_cursor(
-                SourceWindowOwner::Read(reader.clone()),
+                SourceWindowOwner::Read(reader.clone().into()),
                 "items",
                 "by_body",
                 true,
@@ -3565,7 +3565,7 @@ mod tests {
         assert!(current.next_index(true).unwrap().is_none());
         let mut historical = root
             .index_cursor(
-                SourceWindowOwner::Read(reader.clone()),
+                SourceWindowOwner::Read(reader.clone().into()),
                 "items",
                 "by_body",
                 false,
@@ -3581,7 +3581,7 @@ mod tests {
         assert_eq!(count, 25);
         let mut pk = root
             .index_cursor(
-                SourceWindowOwner::Read(reader.clone()),
+                SourceWindowOwner::Read(reader.clone().into()),
                 "items",
                 "__pk_id",
                 true,
@@ -3640,7 +3640,7 @@ mod tests {
             .unwrap();
         for (root, stamp) in [(&before, None), (&after, Some(TxId(3)))] {
             let mut fwd = root
-                .graph_cursor(SourceWindowOwner::Read(reader.clone()), node(1), false)
+                .graph_cursor(SourceWindowOwner::Read(reader.clone().into()), node(1), false)
                 .unwrap();
             let mut selected = 0;
             while let Some(window) = fwd.next_edge().unwrap() {
@@ -3653,7 +3653,7 @@ mod tests {
             }
             assert_eq!(selected, 2);
             let mut rev = root
-                .graph_cursor(SourceWindowOwner::Read(reader.clone()), node(200), true)
+                .graph_cursor(SourceWindowOwner::Read(reader.clone().into()), node(200), true)
                 .unwrap();
             let mut count = 0;
             while let Some(window) = rev.next_edge().unwrap() {
@@ -3695,14 +3695,14 @@ mod tests {
             .unwrap();
         assert_eq!(old.change_log_occurrences(Lsn(9)).unwrap(), 2);
         let mut selected = old
-            .table_change_cursor(SourceWindowOwner::Read(reader.clone()), "a", Lsn(9), Lsn(9))
+            .table_change_cursor(SourceWindowOwner::Read(reader.clone().into()), "a", Lsn(9), Lsn(9))
             .unwrap();
         for entry in &entries {
             assert_eq!(&selected.next_table_change().unwrap().unwrap().value, entry);
         }
         assert!(selected.next_table_change().unwrap().is_none());
         let mut cursor = old
-            .change_log_cursor(SourceWindowOwner::Read(reader.clone()), Lsn(9), Lsn(9))
+            .change_log_cursor(SourceWindowOwner::Read(reader.clone().into()), Lsn(9), Lsn(9))
             .unwrap();
         for entry in &entries {
             assert_eq!(&cursor.next_change().unwrap().unwrap().value, entry);
@@ -3719,12 +3719,12 @@ mod tests {
         assert_eq!(new.change_log_occurrences(Lsn(9)).unwrap(), 1);
         assert_eq!(old.change_log_occurrences(Lsn(9)).unwrap(), 2);
         let mut cursor = new
-            .change_log_cursor(SourceWindowOwner::Read(reader.clone()), Lsn(9), Lsn(9))
+            .change_log_cursor(SourceWindowOwner::Read(reader.clone().into()), Lsn(9), Lsn(9))
             .unwrap();
         assert_eq!(cursor.next_change().unwrap().unwrap().value, entries[0]);
         assert!(cursor.next_change().unwrap().is_none());
         assert!(
-            old.change_log_cursor(SourceWindowOwner::Read(reader.clone()), Lsn(9), Lsn(9))
+            old.change_log_cursor(SourceWindowOwner::Read(reader.clone().into()), Lsn(9), Lsn(9))
                 .unwrap()
                 .next_change()
                 .unwrap()

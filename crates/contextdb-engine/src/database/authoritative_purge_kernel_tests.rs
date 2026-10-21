@@ -127,7 +127,7 @@ fn exact_rows(
         None => db.execute(&sql, &arguments),
     }
     .expect("read exact fixture row")
-    .rows
+    .rows().to_vec()
 }
 
 fn secondary_index_rows(db: &Database, body: &str) -> SecondaryIndexProbe {
@@ -138,8 +138,8 @@ fn secondary_index_rows(db: &Database, body: &str) -> SecondaryIndexProbe {
         )
         .expect("probe secondary index");
     SecondaryIndexProbe {
-        rows: result.rows,
-        index_used: result.trace.index_used,
+        rows: result.rows().to_vec(),
+        index_used: result.trace().index_used.clone(),
     }
 }
 
@@ -303,7 +303,7 @@ fn exact_edge_rows(db: &Database, id: Uuid) -> Vec<Vec<Value>> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact durable edge owner row")
-    .rows
+    .rows().to_vec()
 }
 
 fn captured(selection: &AuthoritativePurgeSelection, row_id: RowId) -> CapturedLineage {
@@ -597,7 +597,7 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
             &HashMap::new(),
         )
         .expect("materialize HNSW");
-    assert!(hnsw_query.trace.physical_plan.contains("HNSWSearch"));
+    assert!(hnsw_query.trace().physical_plan.contains("HNSWSearch"));
 
     let selected_edge = Uuid::new_v4();
     let survivor_edge = Uuid::new_v4();
@@ -857,7 +857,7 @@ fn assert_snapshot_is_fenced_or_empty(db: &Database, fixture: &Fixture, frontier
         fixture.pinned_snapshot,
     ) {
         Ok(result) => assert!(
-            result.rows.is_empty(),
+            result.rows().is_empty(),
             "pinned read cannot expose purged bytes"
         ),
         Err(error) => assert_exact_purge_fence(error, &fixture.selected_note, frontier),
@@ -1070,17 +1070,17 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
         "the INDEXED coverage query must not publish another graph build"
     );
     assert!(
-        result.trace.physical_plan.contains("HNSWSearch"),
+        result.trace().physical_plan.contains("HNSWSearch"),
         "INDEXED coverage must execute the maintained route, plan {}",
-        result.trace.physical_plan
+        result.trace().physical_plan
     );
     assert!(
-        !result.trace.physical_plan.contains("BruteForce"),
+        !result.trace().physical_plan.contains("BruteForce"),
         "INDEXED coverage must not fall back to an exact scan, plan {}",
-        result.trace.physical_plan
+        result.trace().physical_plan
     );
     let disclosure = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed query publishes its vector route receipt");
@@ -1123,7 +1123,7 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
         trace.partition_routes
     );
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         trace.final_row_ids.len(),
         "the public INDEXED rows and the executed row-id trace cover the same answer"
     );

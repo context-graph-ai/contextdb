@@ -188,11 +188,11 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
                         &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(1)))]),
                     )
                     .unwrap();
-                assert_eq!(selected.rows.len(), usize::from(!expire));
+                assert_eq!(selected.rows().len(), usize::from(!expire));
                 assert_eq!(
                     db.execute("SELECT COUNT(*) FROM retained_nodes", &HashMap::new())
                         .unwrap()
-                        .rows,
+                        .rows(),
                     vec![vec![Value::Int64(
                         (unrelated + 64 + 2 + u128::from(!expire) + u128::from(future)) as i64
                     )]]

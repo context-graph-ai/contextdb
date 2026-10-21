@@ -98,20 +98,21 @@ fn reads_decode_only_under_the_declared_reader_never_the_writer() {
     let db = store(&path, 64 * 1024 * 1024, 1 << 30);
     let artifact = root.path().join("reads.snapshot");
     db.export_snapshot(&artifact).unwrap();
-    let parent = DeclaredReadMemory::from_reader_limit(1 << 30);
+    let parent = DeclaredReadMemory::from_reader_limit(1 << 30).expect("admit the declared fixture root");
     let inspector =
         SnapshotInspector::open(&artifact, parent.child().unwrap(), parent.clone()).unwrap();
 
     watch_budget_ledger_for_test();
     watch_reader_budget_ledger_for_test();
     let history = db.trigger_audit_history(Default::default()).unwrap();
-    let nearest = db
+    let fixture_answer_47 = db
         .execute(
             "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
             &HashMap::from([("q".into(), Value::Vector(vector(1000)))]),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let nearest = fixture_answer_47
+        .rows();
     let inspection = inspector.inspect_sync_apply_state();
     let writer = take_budget_ledger_for_test();
     let reader = take_reader_budget_ledger_for_test();

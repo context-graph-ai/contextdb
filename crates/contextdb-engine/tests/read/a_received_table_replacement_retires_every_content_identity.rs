@@ -223,7 +223,7 @@ fn prepared() -> (Paths, DropFrontiers) {
                     .limits
                     .limits
                     .memory,
-            );
+            ).expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -344,7 +344,7 @@ fn assert_identity_describes_the_store(path: &Path, phase: &str) -> CommittedCon
                     .limits
                     .limits
                     .memory,
-            );
+            ).expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -493,7 +493,7 @@ fn a_received_drop_whose_durable_commit_fails_leaves_the_old_identity_and_store(
                     .limits
                     .limits
                     .memory,
-            );
+            ).expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -620,7 +620,7 @@ fn crash_at(boundary: CrashBoundary) {
                     .limits
                     .limits
                     .memory,
-            );
+            ).expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -690,7 +690,7 @@ fn crash_at(boundary: CrashBoundary) {
                         .limits
                         .limits
                         .memory,
-                );
+                ).expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");

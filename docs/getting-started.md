@@ -46,7 +46,7 @@ contextdb ./my.db --write
 `--write` creates the store if it is missing and authorizes mutation. `:memory:` is always
 writable with no flag; a file-backed store is different — see
 [`docs/cli.md`](cli.md#cli-client-contextdb). Example tables such as `decisions` are yours to
-define; see the [README](../README.md).
+define; see the [README](https://github.com/context-graph-ai/contextdb/blob/dev/README.md).
 
 Try the state machine — the feature that makes contextdb different from plain SQL:
 

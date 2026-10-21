@@ -235,12 +235,12 @@ fn writer_reopen(row: &Row) {
         .execute("SELECT COUNT(id) FROM json_decode_rows", &HashMap::new())
         .expect("count persisted row after reopening 16 MiB document");
     assert_eq!(
-        answer.rows.len(),
+        answer.rows().len(),
         1,
         "16 MiB writer/reopen returns one count row"
     );
     assert_eq!(
-        answer.rows[0].first(),
+        answer.rows()[0].first(),
         Some(&Value::Int64(1)),
         "16 MiB writer/reopen preserves the committed row"
     );
@@ -527,7 +527,7 @@ fn json_decode_rows_are_admitted_before_allocation_and_release_to_their_baseline
                         panic!("{}: shipped memory must answer, got {error:?}", row.name)
                     });
                     assert_eq!(
-                        answer.rows.len(),
+                        answer.rows().len(),
                         1,
                         "{}: selected row answers once",
                         row.name

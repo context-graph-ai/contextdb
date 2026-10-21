@@ -183,7 +183,7 @@ fn a_traversal_that_resolves_no_start_is_not_refused_for_a_frontier_it_never_bui
         )
     });
     assert!(
-        rows.rows.is_empty(),
+        rows.rows().is_empty(),
         "a traversal whose filter matches no start answers no rows"
     );
 }

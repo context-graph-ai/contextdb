@@ -168,13 +168,14 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
             },
         )
         .unwrap();
-        let rows = recovered
+        let fixture_answer_36 = recovered
             .execute(
                 "SELECT id FROM atomic_items WHERE scope = 42 ORDER BY id",
                 &params,
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let rows = fixture_answer_36
+            .rows();
         let old = vec![vec![Value::Int64(1)]];
         let new = vec![vec![Value::Int64(1)], vec![Value::Int64(2)]];
         assert!(
@@ -213,7 +214,7 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
         } else {
             old.clone()
         };
-        assert_eq!(recovered.execute("SELECT id FROM atomic_items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 2", &vector_params).unwrap().rows, expected_vectors, "{selected} searchable vectors agree with recovered rows");
+        assert_eq!(recovered.execute("SELECT id FROM atomic_items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 2", &vector_params).unwrap().rows(), expected_vectors, "{selected} searchable vectors agree with recovered rows");
         recovered.close().unwrap();
         drop(recovered);
         let persistence = RedbPersistence::open(&path).unwrap();
@@ -255,9 +256,9 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
                 &params,
             )
             .unwrap();
-        assert_eq!(indexed.trace.index_used.as_deref(), Some("atomic_scope"));
+        assert_eq!(indexed.trace().index_used.as_deref(), Some("atomic_scope"));
         assert_eq!(
-            indexed.rows, rows,
+            indexed.rows(), rows,
             "{selected} physical index postings agree with the complete row state"
         );
         // Keep all cutpoint names tied to the real seam vocabulary.

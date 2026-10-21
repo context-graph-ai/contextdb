@@ -105,7 +105,7 @@ fn assert_online_compaction(explicit: bool) {
             read_db
                 .execute("SELECT id FROM recordings", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             0
         );
@@ -127,7 +127,7 @@ fn assert_online_compaction(explicit: bool) {
         assert_eq!(
             db.execute("SELECT id FROM recordings", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             1
         );
@@ -171,7 +171,7 @@ fn assert_online_compaction(explicit: bool) {
     assert!(
         !db.execute("SELECT id FROM recordings", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     drop(old_table);
@@ -185,7 +185,7 @@ fn assert_online_compaction(explicit: bool) {
         !reopened
             .execute("SELECT id FROM recordings", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
 }

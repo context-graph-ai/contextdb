@@ -25,7 +25,7 @@ fn vector_ids(reader: &ReadSession, scope: &str, mode: &str) -> Vec<Uuid> {
         .unwrap_or_else(|error| panic!("{mode} search in {scope}: {error}"));
     if mode == "INDEXED" {
         assert_eq!(
-            result.trace.vector_search.as_ref().unwrap().resolved_mode,
+            result.trace().vector_search.as_ref().unwrap().resolved_mode,
             VectorSearchMode::Indexed
         );
     }
@@ -34,7 +34,7 @@ fn vector_ids(reader: &ReadSession, scope: &str, mode: &str) -> Vec<Uuid> {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Uuid(id)) => *id,
@@ -115,7 +115,7 @@ fn committed_vector_update_then_compact_publishes_one_generation_to_new_readers(
                 &params([("id", Value::Uuid(rolled_back))]),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Vector(vec![0.0, 1.0, 0.0])]],
         "rollback publishes neither a vector body nor membership",
     );

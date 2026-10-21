@@ -519,8 +519,8 @@ fn capture_query(
         label: label.into(),
         sql,
         params,
-        columns: result.columns,
-        rows: result.rows,
+        columns: result.columns().to_vec(),
+        rows: result.rows().to_vec(),
     }
 }
 
@@ -897,16 +897,16 @@ fn seed_fixture_from_seed(
             &HashMap::from([("id".to_owned(), Value::Uuid(rows[0].id))]),
         )
         .expect("capture the ordinary explain route");
-    let explain_physical_plan = explain_result.trace.physical_plan.to_owned();
-    let explain_index = explain_result.trace.index_used;
+    let explain_physical_plan = explain_result.trace().physical_plan.to_owned();
+    let explain_index = explain_result.trace().index_used.clone();
 
     let cursor_sql =
         format!("SELECT id, ordinal, payload, note FROM {rows_table} ORDER BY ordinal");
     let cursor_result = db
         .execute(&cursor_sql, &HashMap::new())
         .expect("capture exact cursor rows");
-    let cursor_columns = cursor_result.columns;
-    let cursor_rows = cursor_result.rows;
+    let cursor_columns = cursor_result.columns();
+    let cursor_rows = cursor_result.rows();
 
     let (changes, arrivals) = db
         .changes_since_with_arrivals(Lsn(0))
@@ -1224,8 +1224,8 @@ fn seed_fixture_from_seed(
         rows,
         queries,
         cursor_sql,
-        cursor_columns,
-        cursor_rows,
+        cursor_columns: cursor_columns.to_vec(),
+        cursor_rows: cursor_rows.to_vec(),
         schemas,
         changes: changes_state,
         sync,
@@ -1283,17 +1283,17 @@ fn assert_query(reader: &DirectFileReader, expected: &ExpectedQuery) -> (Vec<u8>
         .execute(&expected.sql, &expected.params)
         .unwrap_or_else(|error| panic!("execute {}: {error}", expected.label));
     assert_eq!(
-        result.result.columns, expected.columns,
+        result.result.columns(), expected.columns,
         "{} columns",
         expected.label
     );
-    assert_eq!(result.result.rows, expected.rows, "{} rows", expected.label);
+    assert_eq!(result.result.rows(), expected.rows, "{} rows", expected.label);
     assert_eq!(
         result.canonical_bytes,
         encode_query_result(&result.result)
             .expect("shared canonical encoder supplies ordinary-result bytes")
     );
-    (result.canonical_bytes, result.snapshot)
+    (result.canonical_bytes.to_vec(), result.snapshot)
 }
 
 fn expected_table_names(fixture: &Fixture) -> Vec<String> {
@@ -1445,7 +1445,7 @@ fn assert_complete_public_image_state(
                 &HashMap::from([("source".to_owned(), Value::Uuid(edge.source))]),
             )
             .unwrap_or_else(|error| panic!("read complete graph edge set: {error}"));
-        for row in answer.result.rows {
+        for row in answer.result.rows() {
             match row.as_slice() {
                 [Value::Uuid(target)] => {
                     answered_edges.push((edge.source, edge.edge_type.clone(), *target));
@@ -1496,7 +1496,7 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
         .open_cursor(&fixture.cursor_sql, &HashMap::new(), one)
         .unwrap_or_else(|error| panic!("open direct cursor: {error}"));
     let mut pages = vec![opened.first_page];
-    while pages.last().expect("first cursor page").page.has_more {
+    while pages.last().expect("first cursor page").page_for_test().has_more {
         pages.push(
             opened
                 .cursor
@@ -1506,9 +1506,9 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
     }
     assert_eq!(pages.len(), fixture.cursor_rows.len());
     for (ordinal, page) in pages.iter().enumerate() {
-        assert_eq!(page.page.columns, fixture.cursor_columns);
-        assert_eq!(&*page.page.rows, &[fixture.cursor_rows[ordinal].clone()]);
-        assert_eq!(page.page.has_more, ordinal + 1 < fixture.cursor_rows.len());
+        assert_eq!(page.page_for_test().columns, fixture.cursor_columns);
+        assert_eq!(&*page.page_for_test().rows, &[fixture.cursor_rows[ordinal].clone()]);
+        assert_eq!(page.page_for_test().has_more, ordinal + 1 < fixture.cursor_rows.len());
         assert_eq!(
             page.canonical_bytes,
             page.encode_page_for_test()
@@ -2432,7 +2432,12 @@ fn assert_core_has_no_cfg_or_macro_dependency_bypass(source: &Path, syntax: &syn
         cfg.visit_item(item);
         let sanctioned_lint_only_cfg_attr = source.file_name().is_some_and(|name| {
             name == "direct_file_reader.rs"
-                && matches!(item, Item::Struct(item) if item.ident == "DirectReaderConfig")
+                && matches!(
+                    item,
+                    Item::Struct(item)
+                        if ["DirectReaderConfig", "DirectStoredRow", "DirectStoredEdge", "DirectStoredVector"]
+                            .contains(&item.ident.to_string().as_str())
+                )
         }) && matches!(
             cfg.cfg_attributes.as_slice(),
             [attribute]
@@ -3062,7 +3067,7 @@ fn direct_file_reader_child() {
                     .execute(&sql, &HashMap::from([("id".to_owned(), Value::Uuid(id))]))
                     .unwrap_or_else(|error| panic!("query released child image: {error}"));
                 assert_eq!(
-                    result.result.rows,
+                    result.result.rows(),
                     vec![vec![Value::Uuid(id), Value::Text(payload.clone())]]
                 );
                 println!("{CHILD_QUERY_OK}");
@@ -3735,7 +3740,7 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
         .expect("open cursor before source change");
     let mut pages = vec![existing.first_page];
     let changed = change_source_row(&fixture);
-    while pages.last().expect("cursor first page").page.has_more {
+    while pages.last().expect("cursor first page").page_for_test().has_more {
         pages.push(
             existing
                 .cursor
@@ -3757,7 +3762,7 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
         .execute(&fixture.relation_sql(), &fixture.relation_params())
         .expect("fresh reader sees post-release writer change");
     assert_eq!(
-        fresh_row.result.rows,
+        fresh_row.result.rows(),
         vec![vec![
             Value::Uuid(fixture.first_row().id),
             Value::Text(changed),
@@ -3887,7 +3892,7 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
         .cursor
         .fetch(Some(one))
         .expect("cancelled cursor resumes");
-    assert_eq!(&*resumed.page.rows, &[fixture.cursor_rows[1].clone()]);
+    assert_eq!(&*resumed.page_for_test().rows, &[fixture.cursor_rows[1].clone()]);
     opened.cursor.close().expect("close resumed cursor");
     assert_cursor_resources_released(&witness);
 }
@@ -3960,7 +3965,7 @@ fn terminal_page_immediately_releases_image_memory_and_cursor_state() {
     assert_ne!(after_open.retained_cursor_bytes, 0);
     let retained = after_open.retained_cursor_bytes;
     let mut terminal = opened.first_page;
-    while terminal.page.has_more {
+    while terminal.page_for_test().has_more {
         terminal = opened
             .cursor
             .fetch(Some(one))
@@ -4164,7 +4169,7 @@ fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources(
         .cursor
         .fetch(Some(one))
         .expect("activity refreshes idle deadline");
-    assert_eq!(&*active_page.page.rows, &[fixture.cursor_rows[1].clone()]);
+    assert_eq!(&*active_page.page_for_test().rows, &[fixture.cursor_rows[1].clone()]);
     assert_cursor_resources_retained(&witness);
     clock.advance(5);
     let failure = match opened.cursor.fetch(Some(one)) {
@@ -4314,13 +4319,13 @@ fn query_embedding_rows(
         )
         .unwrap_or_else(|error| panic!("query {declaration} column directly: {error:?}"));
     assert_eq!(
-        query.result.columns,
+        query.result.columns(),
         vec!["id".to_owned(), "note".to_owned(), store.column.clone()]
     );
     let row = |id| {
         query
             .result
-            .rows
+            .rows()
             .iter()
             .find(|row| row.first() == Some(&Value::Uuid(id)))
             .cloned()
@@ -4338,7 +4343,7 @@ fn assert_loaded_embedding_corruption(
             DirectStoreDiagnostic::MalformedRecord,
             reason,
         )) => assert!(
-            !reason.is_empty(),
+            !(reason == ""),
             "{expected} carries a concrete diagnosis"
         ),
         Ok(_) => panic!("{expected} must not contribute an answer"),
@@ -4389,7 +4394,7 @@ fn a_row_with_no_embedding_keeps_the_store_directly_readable() {
                     .limits
                     .limits
                     .memory,
-            );
+            ).expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -4660,7 +4665,7 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
                         .limits
                         .limits
                         .memory,
-                );
+                ).expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");
@@ -4817,7 +4822,7 @@ fn historical_row_versions_remain_readable_through_their_current_version() {
         .execute("SELECT id, payload FROM history_rows", &HashMap::new())
         .expect("read the authenticated current version");
     assert_eq!(
-        answer.result.rows,
+        answer.result.rows(),
         vec![vec![Value::Int64(1), Value::Text("current".to_owned())]]
     );
 }
@@ -4871,7 +4876,7 @@ fn a_nullable_quantized_column_with_no_embedding_stays_directly_readable() {
                         .limits
                         .limits
                         .memory,
-                );
+                ).expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");

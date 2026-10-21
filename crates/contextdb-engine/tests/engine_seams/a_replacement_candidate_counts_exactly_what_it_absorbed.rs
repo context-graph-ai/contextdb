@@ -129,10 +129,10 @@ fn drive_to_idle(db: &Database) {
                 )
                 .unwrap();
             let state = status
-                .columns
+                .columns()
                 .iter()
                 .position(|column| column == "maintenance_state")
-                .map(|at| status.rows[0][at].clone());
+                .map(|at| status.rows()[0][at].clone());
             if state == Some(Value::Text("idle".into())) {
                 return;
             }
@@ -147,7 +147,7 @@ fn nearest(db: &Database, query: Vec<f32>) -> Vec<Vec<Value>> {
         &HashMap::from([("q".into(), Value::Vector(query))]),
     )
     .unwrap()
-    .rows
+    .rows().to_vec()
 }
 
 #[test]

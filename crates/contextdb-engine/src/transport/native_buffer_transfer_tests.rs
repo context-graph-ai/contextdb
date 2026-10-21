@@ -2,12 +2,12 @@
 //! selection as the same physical bytes under the same invoice.
 use super::{AdmittedWireVec, BoundedWireBody};
 use crate::custody::native_selection::{Failure, NativeBuffer};
-use crate::vector_read_memory::DeclaredReadMemory;
+use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadRoot};
 use contextdb_core::read_memory::ReadMemoryOwner;
 use std::sync::Arc;
 
-fn native_owner(limit: u64) -> (Arc<DeclaredReadMemory>, ReadMemoryOwner) {
-    let parent = DeclaredReadMemory::from_reader_limit(limit);
+fn native_owner(limit: u64) -> (DeclaredReadRoot, ReadMemoryOwner) {
+    let parent = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
     let owner = parent
         .native_child()
         .expect("admit one native request owner")

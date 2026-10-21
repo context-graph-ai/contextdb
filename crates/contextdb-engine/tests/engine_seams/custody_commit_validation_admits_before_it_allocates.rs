@@ -42,7 +42,7 @@ fn roots(db: &Database) -> u64 {
 fn rows(db: &Database) -> usize {
     db.execute("SELECT id FROM records", &p())
         .unwrap()
-        .rows
+        .rows()
         .len()
 }
 

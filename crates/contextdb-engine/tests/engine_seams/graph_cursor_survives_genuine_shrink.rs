@@ -81,16 +81,16 @@ fn request(
 
 fn page_targets(page: &CursorPage) -> Vec<Uuid> {
     let target = page
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "t" || column.ends_with(".t"))
         .unwrap_or_else(|| {
             panic!(
                 "cursor page carries the target column, got {:?}",
-                page.columns
+                page.columns()
             )
         });
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row[target] {
             Value::Uuid(value) => value,
@@ -116,7 +116,7 @@ fn drain(
                 )
             });
         collected.extend(page_targets(&fetched.page));
-        has_more = fetched.page.has_more;
+        has_more = fetched.page.has_more();
     }
     collected
 }
@@ -142,12 +142,12 @@ fn visible_edge_targets(db: &Database) -> Vec<Uuid> {
         )
         .expect("uncapped read of the whole edge set");
     let target = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "t" || column.ends_with(".t"))
         .expect("uncapped read returns the target column");
     let mut targets = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[target] {
             Value::Uuid(value) => value,
@@ -278,7 +278,7 @@ fn a_graph_edge_cursor_emits_every_visible_edge_when_retention_compacts_entries_
     )
     .expect("open a bounded cursor over the whole edge set");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
     let mut emitted = page_targets(&opened.first_page);
@@ -288,7 +288,7 @@ fn a_graph_edge_cursor_emits_every_visible_edge_when_retention_compacts_entries_
         .expect("page the graph cursor a second time");
     emitted.extend(page_targets(&second.page));
     assert!(
-        second.page.has_more,
+        second.page.has_more(),
         "{journey}: the cursor must still be mid-adjacency when retention runs"
     );
     assert_eq!(
@@ -345,7 +345,7 @@ fn a_graph_edge_cursor_emits_every_visible_edge_when_retention_compacts_entries_
          receive every deferred edge"
     );
 
-    emitted.extend(drain(&mut opened.cursor, 2, second.page.has_more, journey));
+    emitted.extend(drain(&mut opened.cursor, 2, second.page.has_more(), journey));
 
     assert_emitted_exactly_once(&emitted, &visible, journey);
 

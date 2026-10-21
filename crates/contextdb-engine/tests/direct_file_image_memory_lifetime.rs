@@ -424,7 +424,7 @@ fn a_read_within_limit_succeeds_and_keeps_its_page_charged_until_the_session_dro
     let read_peak = PEAK.load(Ordering::SeqCst);
     MEASURE.store(false, Ordering::SeqCst);
     let result = result.expect("a read within the memory limit succeeds");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 
     let peak_over_floor = read_peak - floor_live;
     println!(

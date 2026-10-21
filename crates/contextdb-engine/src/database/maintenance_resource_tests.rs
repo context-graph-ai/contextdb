@@ -260,15 +260,15 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
             .unwrap();
         let state = |column| {
             let position = shown
-                .columns
+                .columns()
                 .iter()
                 .position(|name| name == column)
                 .unwrap();
-            shown.rows[0][position].clone()
+            shown.rows()[0][position].clone()
         };
         assert_eq!(
             (
-                shown.rows.len(),
+                shown.rows().len(),
                 state("query_state"),
                 state("maintenance_state")
             ),
@@ -279,7 +279,7 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
             &HashMap::new(),
         ).unwrap();
         assert_eq!(
-            answer.rows,
+            answer.rows(),
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
     }
@@ -456,17 +456,17 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         db.execute("UPDATE funded_items SET v = '[0,1,0]'", &HashMap::new())
             .unwrap();
         let parent =
-            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824);
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824).expect("admit the declared fixture root");
         let child = parent.child().unwrap();
         let child_control = parent.retained_bytes_for_test();
         let observer = crate::vector_read_memory::declared_child_observer(&child).unwrap();
         let spy = MaintenanceReaderSpy::new(child.clone(), db.__accountant_handle_for_test());
         let probe =
             ImageMemory::operation_reader(db.__accountant_handle_for_test(), spy.clone()).unwrap();
-        assert!(Arc::ptr_eq(
-            &probe.reader_budget().unwrap(),
-            &(spy.clone() as Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>)
-        ));
+        assert_eq!(
+            probe.reader_budget().unwrap().accounting_identity(),
+            Arc::as_ptr(&spy) as usize
+        );
         let operation_control = probe.held();
         drop(probe);
         let persistence = db.persistence.as_ref().unwrap();
@@ -478,7 +478,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         let writer_before = db.accountant().usage().used;
         let small_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             child_control + operation_control as u64 - 1,
-        );
+        ).expect("admit the declared fixture root");
         let small_child = small_parent.child().unwrap();
         let error = db
             .maintenance_context()
@@ -526,7 +526,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         assert_eq!(
             db.execute("SELECT id FROM funded_items ORDER BY id", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             (0..4).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
         );
         drop(spy);
@@ -786,7 +786,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
             &HashMap::new()
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         3
     );
@@ -899,7 +899,7 @@ fn cancellation_after_durable_repair_publication_preserves_repair_and_skips_cycl
             &HashMap::new(),
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         3
     );
@@ -921,7 +921,7 @@ fn cancellation_after_durable_repair_publication_preserves_repair_and_skips_cycl
                 &HashMap::new(),
             )
             .unwrap()
-            .rows
+            .rows()
             .len(),
         3
     );
@@ -1062,13 +1062,14 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
                 Ok(())
             })
             .unwrap();
-        let exact = db
+        let fixture_answer_66 = db
             .execute(
                 "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR EXACT LIMIT 1",
                 &HashMap::new(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let exact = fixture_answer_66
+            .rows();
         assert_eq!(exact.len(), 1);
         let context = db.maintenance_context();
         for _ in 0..16 {
@@ -1090,7 +1091,7 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
             exact
         );
     }
@@ -1184,13 +1185,13 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
         assert!(
             db.execute("SELECT id FROM vectors", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
         assert!(
             db.execute("SELECT id FROM scalar", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
         eprintln!("retention_crash={case} generation_tables=4 scalar_commit_entries=2 retry=ok");
@@ -1218,17 +1219,17 @@ fn assert_stopped_maintenance_is_pending(db: &Database, partition: &VectorPartit
     let shown = db
         .execute("SHOW VECTOR_PARTITIONS FOR items.v", &HashMap::new())
         .unwrap();
-    assert_eq!(shown.rows.len(), 1);
+    assert_eq!(shown.rows().len(), 1);
     for (column, expected) in [
         ("maintenance_state", "idle"),
         ("recovery_action", "run_maintenance_cycle"),
     ] {
         let position = shown
-            .columns
+            .columns()
             .iter()
             .position(|name| name == column)
             .unwrap();
-        assert_eq!(shown.rows[0][position], Value::Text(expected.into()));
+        assert_eq!(shown.rows()[0][position], Value::Text(expected.into()));
     }
 }
 
@@ -1367,23 +1368,23 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
                         .execute(sql, &HashMap::new())
                         .map_err(|error| format!("{error:?}"))
                         .map(|shown| {
-                            if shown.rows.len() != 1 {
+                            if shown.rows().len() != 1 {
                                 return Err(format!(
                                     "unexpected inspection rows: {:?}",
-                                    shown.rows
+                                    shown.rows()
                                 ));
                             }
                             columns
                                 .iter()
                                 .map(|column| {
                                     let position = shown
-                                        .columns
+                                        .columns()
                                         .iter()
                                         .position(|name| name.as_str() == *column)
                                         .ok_or_else(|| {
                                             format!("missing inspection column {column}")
                                         })?;
-                                    Ok(shown.rows[0][position].clone())
+                                    Ok(shown.rows()[0][position].clone())
                                 })
                                 .collect::<std::result::Result<Vec<_>, String>>()
                         })
@@ -1590,7 +1591,7 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows
+            .rows()
             .len(),
             3
         );
@@ -1789,15 +1790,17 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         );
         let query = "SELECT id FROM repair_items WHERE scope_id = $scope ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2";
         let healthy_params = HashMap::from([("scope".into(), Value::Int64(2))]);
-        let healthy = db.execute(query, &healthy_params).unwrap().rows;
+        let fixture_answer_67 = db.execute(query, &healthy_params).unwrap();
+        let healthy = fixture_answer_67.rows();
         assert_eq!(healthy.len(), 2);
         let a_params = HashMap::from([("scope".into(), Value::Int64(0))]);
-        let exact = db
+        let fixture_answer_68 = db
             .execute(&query.replace("INDEXED", "EXACT"), &a_params)
-            .unwrap()
-            .rows;
+            .unwrap();
+        let exact = fixture_answer_68
+            .rows();
         for _ in 0..32 {
-            assert_eq!(db.execute(query, &healthy_params).unwrap().rows, healthy);
+            assert_eq!(db.execute(query, &healthy_params).unwrap().rows(), healthy);
             db.run_maintenance_cycle()
                 .expect("a corrupt B catalog stays local while A and other routes advance");
             if persistence
@@ -1814,8 +1817,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
             .expect("A publishes its replacement despite B's present corrupt catalog");
         assert!(replacement.base.generation_id > old_a);
         assert!(db.vector_store.partition_has_paged_storage(&a));
-        assert_eq!(db.execute(query, &a_params).unwrap().rows, exact);
-        assert_eq!(db.execute(query, &healthy_params).unwrap().rows, healthy);
+        assert_eq!(db.execute(query, &a_params).unwrap().rows(), exact);
+        assert_eq!(db.execute(query, &healthy_params).unwrap().rows(), healthy);
     }
     use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
     // A whole generation that outgrows the declared reader is replaced even
@@ -1977,7 +1980,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
             "SELECT id FROM reader_items ORDER BY v <=> [1,0,0] USE VECTOR EXACT LIMIT 2";
         let indexed_sql =
             "SELECT id FROM reader_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2";
-        let control = seed.execute(exact_sql, &HashMap::new()).unwrap().rows;
+        let fixture_answer_69 = seed.execute(exact_sql, &HashMap::new()).unwrap();
+        let control = fixture_answer_69.rows();
         seed.close().unwrap();
         drop(seed);
         let mut options = crate::DatabaseOpenOptions {
@@ -1991,7 +1995,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
             before, combined,
             "reopen leaves the old catalog selected until maintenance publishes"
         );
-        let old_answer = reader.execute(indexed_sql, &HashMap::new()).unwrap().rows;
+        let fixture_answer_70 = reader.execute(indexed_sql, &HashMap::new()).unwrap();
+        let old_answer = fixture_answer_70.rows();
         for _ in 0..64 {
             reader.run_maintenance_cycle().unwrap();
             if selected(&reader).base.generation_id != before.base.generation_id {
@@ -2000,7 +2005,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         }
         let replacement = selected(&reader);
         let replacement_format = format(&reader, replacement.base.generation_id);
-        let replacement_answer = reader.execute(indexed_sql, &HashMap::new()).unwrap().rows;
+        let fixture_answer_71 = reader.execute(indexed_sql, &HashMap::new()).unwrap();
+        let replacement_answer = fixture_answer_71.rows();
         let replacement_no_change = replacement.change.is_none();
         let replacement_changed = replacement.base.generation_id != before.base.generation_id;
         reader.close().unwrap();
@@ -2020,8 +2026,10 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         create(&fresh, false);
         let published = selected(&fresh);
         let published_format = format(&fresh, published.base.generation_id);
-        let fresh_control = fresh.execute(exact_sql, &HashMap::new()).unwrap().rows;
-        let published_answer = fresh.execute(indexed_sql, &HashMap::new()).unwrap().rows;
+        let fixture_answer_72 = fresh.execute(exact_sql, &HashMap::new()).unwrap();
+        let fresh_control = fixture_answer_72.rows();
+        let fixture_answer_73 = fresh.execute(indexed_sql, &HashMap::new()).unwrap();
+        let published_answer = fixture_answer_73.rows();
         fresh.close().unwrap();
         drop(fresh);
         let paged = crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
@@ -2089,10 +2097,11 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         db.execute("DELETE FROM items", &HashMap::new()).unwrap();
         let snapshot = db.snapshot();
         let pin = db.pin_snapshot(snapshot).unwrap();
-        let old_rows = db
+        let fixture_answer_74 = db
             .execute_at_snapshot(sql, &HashMap::new(), snapshot)
-            .unwrap()
-            .rows;
+            .unwrap();
+        let old_rows = fixture_answer_74
+            .rows();
         assert!(old_rows.is_empty());
         insert(2, 100);
         insert(3, 100);
@@ -2159,14 +2168,15 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         assert_eq!(
             db.execute_at_snapshot(sql, &HashMap::new(), snapshot)
                 .unwrap()
-                .rows,
+                .rows(),
             old_rows
         );
         insert(4, 2_000_000);
         insert(5, 2_000_000);
         db.run_maintenance_cycle()
             .expect("reinsertion maintains the retained catalog successfully");
-        let rows = db.execute(sql, &HashMap::new()).unwrap().rows;
+        let fixture_answer_75 = db.execute(sql, &HashMap::new()).unwrap();
+        let rows = fixture_answer_75.rows();
         let ids = rows
             .iter()
             .map(|row| match row[0] {
@@ -2178,7 +2188,7 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         assert_eq!(
             db.execute_at_snapshot(sql, &HashMap::new(), snapshot)
                 .unwrap()
-                .rows,
+                .rows(),
             old_rows
         );
         drop(pin);
@@ -2611,10 +2621,11 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         let pin = db.pin_snapshot(old_snapshot).unwrap();
         let query = "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
         let query_params = HashMap::new();
-        let old_answer = db
+        let fixture_answer_76 = db
             .execute_at_snapshot(query, &query_params, old_snapshot)
-            .unwrap()
-            .rows;
+            .unwrap();
+        let old_answer = fixture_answer_76
+            .rows();
         for value in [2, 3] {
             db.execute(&format!("UPDATE t SET v = '[{value}]'"), &HashMap::new())
                 .unwrap();
@@ -2624,12 +2635,14 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         }
         let before = catalog().unwrap();
         assert!(before.base.generation_id > original.base.generation_id);
-        let exact = db
+        let fixture_answer_77 = db
             .execute(&query.replace("INDEXED", "EXACT"), &query_params)
-            .unwrap()
-            .rows;
+            .unwrap();
+        let exact = fixture_answer_77
+            .rows();
         let healthy_sql = "SELECT id, v FROM healthy ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
-        let healthy = db.execute(healthy_sql, &HashMap::new()).unwrap().rows;
+        let fixture_answer_78 = db.execute(healthy_sql, &HashMap::new()).unwrap();
+        let healthy = fixture_answer_78.rows();
         let catalog_key = persistence
             .with_db(|storage| {
                 let read = storage.begin_read().unwrap();
@@ -2739,7 +2752,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         let context = db.maintenance_context();
         for _ in 0..64 {
             assert_eq!(
-                db.execute(healthy_sql, &HashMap::new()).unwrap().rows,
+                db.execute(healthy_sql, &HashMap::new()).unwrap().rows(),
                 healthy
             );
             context.persist_built_vector_partition(&partition, db.declared_reader_memory().unwrap())
@@ -2753,15 +2766,15 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         let repaired = catalog().expect("bounded repair publishes a complete generation");
         assert!(repaired.base.generation_id > before.base.generation_id);
         assert!(db.vector_store.partition_has_paged_storage(&partition));
-        assert_eq!(db.execute(query, &query_params).unwrap().rows, exact);
+        assert_eq!(db.execute(query, &query_params).unwrap().rows(), exact);
         assert_eq!(
             db.execute_at_snapshot(query, &query_params, old_snapshot)
                 .unwrap()
-                .rows,
+                .rows(),
             old_answer
         );
         assert_eq!(
-            db.execute(healthy_sql, &HashMap::new()).unwrap().rows,
+            db.execute(healthy_sql, &HashMap::new()).unwrap().rows(),
             healthy
         );
         assert_eq!(
@@ -2985,7 +2998,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
                 &HashMap::new(),
             )
             .unwrap()
-            .rows,
+            .rows(),
             vec![vec![Value::Int64(0)]]
         );
         drop(current);

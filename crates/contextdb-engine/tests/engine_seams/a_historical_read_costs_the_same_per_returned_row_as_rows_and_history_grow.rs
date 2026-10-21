@@ -64,7 +64,7 @@ fn versions_decoded_by_a_snapshot_read(
     let decoded = work.counters().decoded_rows;
     drop(work);
     assert_eq!(
-        read.rows,
+        read.rows(),
         (0..rows)
             .map(|id| vec![Value::Int64(id), Value::Int64(0)])
             .collect::<Vec<_>>(),

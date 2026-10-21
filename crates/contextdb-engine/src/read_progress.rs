@@ -295,7 +295,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the committed file answers");
-        assert_eq!(answer.rows.len(), 3);
+        assert_eq!(answer.rows().len(), 3);
 
         assert!(
             recorder
@@ -337,7 +337,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT COUNT(*) FROM counted", &HashMap::new())
             .expect("the committed file folds the count");
-        assert_eq!(answer.rows.len(), 1, "an aggregate answers one row");
+        assert_eq!(answer.rows().len(), 1, "an aggregate answers one row");
 
         let totals = recorder.totals();
         assert_eq!(
@@ -368,7 +368,7 @@ mod final_accounting_proofs {
         let cursor = session
             .open_cursor("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the committed file opens a cursor");
-        let published = cursor.first_page().rows.len();
+        let published = cursor.first_page().rows().len();
         assert!(published > 0, "the first page hands back rows");
 
         let totals = recorder.totals();
@@ -418,7 +418,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT COUNT(*) FROM counted", &HashMap::new())
             .expect("the live store folds the count");
-        assert_eq!(answer.rows.len(), 1, "an aggregate answers one row");
+        assert_eq!(answer.rows().len(), 1, "an aggregate answers one row");
 
         let totals = recorder.totals();
         assert_eq!(
@@ -437,7 +437,7 @@ mod final_accounting_proofs {
         let cursor = session
             .open_cursor("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the live store opens a cursor");
-        let published = cursor.first_page().rows.len();
+        let published = cursor.first_page().rows().len();
         assert!(published > 0, "the first page hands back rows");
         let paged = recorder.totals();
         let examined = paged.iter().map(|total| total.work).max().unwrap_or(0);
@@ -466,7 +466,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("an empty table answers");
-        assert!(answer.rows.is_empty(), "there is nothing to find");
+        assert!(answer.rows().is_empty(), "there is nothing to find");
 
         assert_eq!(
             recorder.totals().len(),
@@ -496,7 +496,7 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT COUNT(*) FROM counted", &HashMap::new())
             .expect("the committed file folds the count");
-        assert_eq!(answer.rows.len(), 1);
+        assert_eq!(answer.rows().len(), 1);
 
         let liveness = recorder.liveness();
         assert!(
@@ -532,6 +532,6 @@ mod final_accounting_proofs {
         let answer = session
             .execute("SELECT label FROM counted ORDER BY id", &HashMap::new())
             .expect("the committed file answers");
-        assert_eq!(answer.rows.len(), 2, "the read is unaffected by the seam");
+        assert_eq!(answer.rows().len(), 2, "the read is unaffected by the seam");
     }
 }

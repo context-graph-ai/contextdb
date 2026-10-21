@@ -167,7 +167,7 @@ fn a_single_large_refused_outcome_is_admitted_before_decode() {
     db.set_memory_limit(Some(used.saturating_add(4096)))
         .expect("leave less room than the encoded outcome needs");
     let fixture_operation_reader_5 =
-        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096).expect("admit the declared fixture root")
             .child()
             .expect("admit the bounded fixture reader");
 
@@ -266,7 +266,7 @@ fn a_large_local_refusal_fact_is_admitted_before_decode_and_survives_refusal() {
             hub,
             hub_life,
             &[[1; 32]],
-            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096)
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(4096).expect("admit the declared fixture root")
                 .child()
                 .expect("admit the bounded fixture reader"),
         )

@@ -49,13 +49,14 @@ fn an_indexed_vector_search_decodes_nothing_without_its_request_owner() {
     )
     .unwrap();
     let before = unowned_decodes_for_test();
-    let rows = db
+    let fixture_answer_37 = db
         .execute(
             "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
             &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = fixture_answer_37
+        .rows();
     let unowned = unowned_decodes_for_test() - before;
     assert_eq!(rows, vec![vec![Value::Int64(1000)]]);
     assert_eq!(

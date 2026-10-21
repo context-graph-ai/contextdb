@@ -128,14 +128,14 @@ fn writable_open_never_touches_history_families() {
             )
             .unwrap();
         assert_eq!(
-            current.rows,
+            current.rows(),
             (1..=rows)
                 .map(|id| vec![Value::Int64(id), Value::Text("current".to_owned())])
                 .collect::<Vec<_>>()
         );
         let vectors = database.execute("SELECT id FROM history_items WHERE scope = 1 ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 64", &HashMap::from([("query".to_owned(), Value::Vector(vec![0.0, 1.0]))])).unwrap();
         assert_eq!(
-            vectors.rows,
+            vectors.rows(),
             (1..=rows)
                 .map(|id| vec![Value::Int64(id)])
                 .collect::<Vec<_>>(),
@@ -405,7 +405,7 @@ fn prepare_sidecars(path: &Path, n: usize) {
             expiry_frontier
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64((n / 4) as i64)]]
     );
     drop(pin);

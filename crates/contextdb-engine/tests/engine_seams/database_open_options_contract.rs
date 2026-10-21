@@ -460,7 +460,7 @@ fn intercept_result_opener(
     let interceptor = Arc::new(FullOptionsInterceptor::new());
     let result = Database::with_common_open_interceptor_for_test(interceptor.clone(), open);
     match result {
-        Err(Error::Other(message)) if message == interceptor.refusal => {}
+        Err(Error::Other(message)) if message == interceptor.refusal.as_str() => {}
         Ok(database) => {
             database
                 .close()

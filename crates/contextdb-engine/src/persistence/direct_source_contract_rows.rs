@@ -357,7 +357,7 @@ fn direct_session_native_sources_prepay_and_keep_original_invoices_until_last_ph
                             &HashMap::new()
                         )
                         .unwrap()
-                        .rows,
+                        .rows(),
                     vec![
                         vec![Value::Int64(1), Value::Text("one".into())],
                         vec![Value::Int64(2), Value::Text("two".into())]
@@ -590,7 +590,7 @@ fn direct_session_source_constructor_refusals_and_native_nulls_leave_no_original
             retry
                 .execute("SELECT COUNT(*) FROM source_rows", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(2)]]
         );
         drop(retry);
@@ -608,7 +608,7 @@ fn direct_session_source_constructor_refusals_and_native_nulls_leave_no_original
             "caught native constructor unwind returns the original source invoices");
         drop(observation);
         let retry = open(&path, LIMIT).unwrap();
-        assert_eq!(retry.execute("SELECT COUNT(*) FROM source_rows", &HashMap::new()).unwrap().rows,
+        assert_eq!(retry.execute("SELECT COUNT(*) FROM source_rows", &HashMap::new()).unwrap().rows(),
             vec![vec![Value::Int64(2)]]);
         drop(retry);
     }
@@ -660,7 +660,7 @@ fn direct_session_source_constructor_refusals_and_native_nulls_leave_no_original
             retry
                 .execute("SELECT COUNT(*) FROM source_rows", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(2)]]
         );
         drop(retry);

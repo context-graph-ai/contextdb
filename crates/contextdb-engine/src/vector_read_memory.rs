@@ -1407,7 +1407,7 @@ pub(crate) mod native_ownership_proof {
         // The allocator oracle can refuse one selected live cache Layout.  It
         // is test-only and consumed before System is called, exactly like the
         // native-owner null row below.
-        static REFUSE_ONE_LAYOUT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, root_bytes)) };
+        static REFUSE_ONE_LAYOUT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
         static REFUSE_LAYOUT_SKIP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
     static POINTER: AtomicUsize = AtomicUsize::new(0);
@@ -1492,7 +1492,7 @@ pub(crate) mod native_ownership_proof {
                         let remaining = skip.get();
                         if remaining == 0 { false } else { skip.set(remaining - 1); true }
                     }) { return false; }
-                    armed.set((0, root_bytes));
+                    armed.set((0, 0));
                     true
                 } else {
                     false

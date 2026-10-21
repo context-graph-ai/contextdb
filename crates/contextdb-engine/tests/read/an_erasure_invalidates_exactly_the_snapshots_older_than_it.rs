@@ -136,7 +136,7 @@ fn options() -> ReadSessionOptions {
 }
 
 fn ids(page: &CursorPage) -> Vec<i64> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -179,7 +179,7 @@ fn open(session: &ReadSession, table: &str) -> ReadCursor {
     let cursor = session
         .open_cursor(&format!("SELECT id FROM {table} ORDER BY id"), &none())
         .expect("open a cursor");
-    assert!(cursor.first_page().has_more, "the cursor has further pages");
+    assert!(cursor.first_page().has_more(), "the cursor has further pages");
     cursor
 }
 
@@ -194,10 +194,10 @@ fn assert_erased(result: contextdb_core::Result<CursorPage>) {
 
 fn drain(mut cursor: ReadCursor) -> Vec<i64> {
     let mut seen = ids(cursor.first_page());
-    while cursor.first_page().has_more {
+    while cursor.first_page().has_more() {
         let page = cursor.fetch(None).expect("a served continuation page");
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             break;
         }
     }
@@ -247,7 +247,7 @@ fn open_across(path: &Path, table: &str, during: impl FnOnce()) -> ReadCursor {
     resume_tx.send(()).expect("finish registration");
     let (_session, cursor) = opening.join().expect("join the opener");
     let cursor = cursor.expect("register the older snapshot");
-    assert!(cursor.first_page().has_more, "the cursor has further pages");
+    assert!(cursor.first_page().has_more(), "the cursor has further pages");
     cursor
 }
 
@@ -277,7 +277,7 @@ fn a_committed_discard_refuses_a_cursor_opened_before_it() {
             .fetch(None)
             .expect("the unrelated table is served");
         seen.extend(ids(&page));
-        if !page.has_more {
+        if !page.has_more() {
             break;
         }
     }
@@ -338,7 +338,7 @@ fn a_fresh_row_with_a_purged_rows_key_is_read_by_a_later_cursor() {
     let fresh = session
         .execute("SELECT body FROM notes WHERE id = 7", &none())
         .expect("point read of the fresh row");
-    assert_eq!(fresh.rows, vec![vec![Value::Text("fresh".into())]]);
+    assert_eq!(fresh.rows(), vec![vec![Value::Text("fresh".into())]]);
     writer.release();
 }
 

@@ -105,7 +105,7 @@ fn retained_vector_cursor(db: Arc<Database>, table: &str) -> bounded::TestCursor
     );
     let opened = bounded::open_cursor(db, &request).expect("open a vector cursor");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "a vector cursor must stay open past its first page so it keeps holding \
          its schema read guard"
     );

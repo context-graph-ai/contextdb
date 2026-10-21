@@ -2,7 +2,7 @@
 //! allocator windows. All byte expectations derive from concrete Layout values.
 use super::*;
 use crate::persistence::native_storage_admission::StorageAdmissionScope;
-use crate::vector_read_memory::{DeclaredReadMemory, declared_child_observer};
+use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadRoot, declared_child_observer};
 use contextdb_core::read_memory::ReadMemoryBudget;
 use redb::ScanAllowance;
 use std::sync::{Arc, Barrier};
@@ -29,14 +29,14 @@ pub(super) fn allocator_null(layout: Layout) {
 
 type Request = (usize, usize, usize);
 struct Reader {
-    parent: Arc<DeclaredReadMemory>,
-    child: Arc<dyn ReadMemoryBudget>,
+    parent: DeclaredReadRoot,
+    child: contextdb_core::read_memory::ReadMemoryOwner,
     scope: StorageAdmissionScope,
     counter: usize,
 }
 impl Reader {
     fn new(limit: u64) -> Self {
-        let parent = DeclaredReadMemory::from_reader_limit(limit);
+        let parent = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
         let child = parent.child().unwrap();
         let counter = declared_child_observer(&child)
             .unwrap()

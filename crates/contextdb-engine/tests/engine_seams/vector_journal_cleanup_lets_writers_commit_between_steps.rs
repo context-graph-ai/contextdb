@@ -125,7 +125,7 @@ fn a_writer_commits_between_two_steps_of_a_covered_journal_cleanup() {
     assert_eq!(
         db.execute("SELECT body FROM notes WHERE id = 1", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text(
             "written while the backlog remains".into()
         )]]

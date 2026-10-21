@@ -6,7 +6,7 @@ use super::*;
 use crate::protocol::{DependencyCompletePullResponse, PullRequest, PullResponse, decode, encode};
 use crate::subjects::pull_subject;
 use crate::transport::in_process::InProcessBroker;
-use crate::vector_read_memory::DeclaredReadMemory;
+use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadRoot};
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;
 use std::time::Duration;
@@ -25,11 +25,11 @@ async fn within<F: std::future::Future>(future: F) -> F::Output {
 /// default limit, and keeps each one, so a request's own peak is observable.
 #[derive(Debug)]
 struct PerRequestReader {
-    parents: std::sync::Mutex<Vec<Arc<DeclaredReadMemory>>>,
+    parents: std::sync::Mutex<Vec<DeclaredReadRoot>>,
 }
 impl PerRequestReader {
-    fn next(&self) -> Arc<DeclaredReadMemory> {
-        let parent = DeclaredReadMemory::from_reader_limit(ReadLimits::SHIPPED_MEMORY);
+    fn next(&self) -> DeclaredReadRoot {
+        let parent = DeclaredReadMemory::from_reader_limit(ReadLimits::SHIPPED_MEMORY).expect("admit the declared fixture root");
         self.parents.lock().unwrap().push(parent.clone());
         parent
     }

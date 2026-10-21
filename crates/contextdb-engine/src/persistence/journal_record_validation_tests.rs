@@ -80,6 +80,7 @@ fn check(
         &key,
         vector_partition_journal_record_width_bound(&index, &key),
     )
+    .map_err(|error| error.to_string())
 }
 
 fn payload(record: &VectorPartitionJournalRecord) -> Vec<u8> {

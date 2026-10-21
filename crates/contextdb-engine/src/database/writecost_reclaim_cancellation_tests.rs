@@ -76,7 +76,7 @@ fn store_with_backlog_in(path: PathBuf, dir: Option<tempfile::TempDir>) -> Store
     let cursor = session
         .open_cursor("SELECT id FROM bulk ORDER BY id", &p())
         .unwrap();
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     churn(&db, 140);
     drop(cursor);
     drop(session);
@@ -258,7 +258,7 @@ fn foreground_writes_between_steps_do_not_extend_the_cycle_or_lose_data() {
     }
     assert!(backlog(&store.db).1 <= 400, "{:?}", backlog(&store.db));
     let rows = store.db.execute("SELECT COUNT(*) FROM bulk", &p()).unwrap();
-    assert_eq!(rows.rows, vec![vec![Value::Int64(400)]]);
+    assert_eq!(rows.rows(), vec![vec![Value::Int64(400)]]);
 }
 
 /// Row 10: a crash between steps. A child process aborts at the checkpoint after its first
@@ -299,7 +299,7 @@ fn a_crash_between_steps_leaves_the_remainder_and_reopen_resumes_it() {
     let db = Database::open(&path).unwrap();
     let rows = db.execute("SELECT COUNT(*) FROM bulk", &p()).unwrap();
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Int64(400)]],
         "committed data survives the crash"
     );

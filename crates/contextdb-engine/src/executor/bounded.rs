@@ -20431,7 +20431,7 @@ mod paged_vector_accounting_tests {
             None,
         )
         .expect("open a paged vector cursor");
-        let first_page = opened.first_page.into_public();
+        let first_page = opened.first_page.into_public().expect("publish the admitted fixture answer");
 
         let held_open = accountant.usage().used;
         assert!(
@@ -20439,8 +20439,8 @@ mod paged_vector_accounting_tests {
             "an open cursor holds its continuation: baseline={baseline} open={held_open}"
         );
 
-        let mut delivered = ids(&first_page.rows);
-        let mut more = first_page.has_more;
+        let mut delivered = ids(&first_page.rows());
+        let mut more = first_page.has_more();
         let page = NonZeroUsize::new(8).expect("a non-zero page");
         while more {
             let fetched = fetch_cursor(
@@ -20450,9 +20450,9 @@ mod paged_vector_accounting_tests {
                 None,
             )
             .expect("a paged vector cursor fetches its next page");
-            let fetched_page = fetched.page.into_public();
-            delivered.extend(ids(&fetched_page.rows));
-            more = fetched_page.has_more;
+            let fetched_page = fetched.page.into_public().expect("publish the admitted fixture answer");
+            delivered.extend(ids(&fetched_page.rows()));
+            more = fetched_page.has_more();
         }
         assert_eq!(delivered.len(), rows, "every row, once: {delivered:?}");
         let mut sorted = delivered.clone();
@@ -20485,9 +20485,9 @@ mod paged_vector_accounting_tests {
             None,
         )
         .expect("a second query replaces the retained last-query trace");
-        let replacement_first_page = replacement.first_page.into_public();
+        let replacement_first_page = replacement.first_page.into_public().expect("publish the admitted fixture answer");
         assert!(
-            !replacement_first_page.rows.is_empty(),
+            !replacement_first_page.rows().is_empty(),
             "the second query performs real vector work"
         );
         drop(replacement_first_page);
@@ -20598,8 +20598,8 @@ mod paged_vector_accounting_tests {
             None,
         )
         .expect("open a paged vector cursor");
-        let first_page = opened.first_page.into_public();
-        assert!(first_page.has_more, "this cursor has more pages to give");
+        let first_page = opened.first_page.into_public().expect("publish the admitted fixture answer");
+        assert!(first_page.has_more(), "this cursor has more pages to give");
         let page = NonZeroUsize::new(8).expect("a non-zero page");
         let _ = fetch_cursor(
             &mut opened.cursor,

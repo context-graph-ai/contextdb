@@ -70,7 +70,7 @@ fn eager(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Result<us
         &mut vector_copy,
         db.declared_reader_memory()?,
     )
-    .map(|result| result.into_public().rows.len())
+    .and_then(|result| result.into_public().map(|result| result.rows().len()))
 }
 
 #[test]

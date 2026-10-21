@@ -2490,7 +2490,7 @@ fn runtime_cleanup_case(case: &str) {
         fs::remove_file(unknown).unwrap();
     }
     if let Some(reader) = live_reader {
-        assert_eq!(reader.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows,
+        assert_eq!(reader.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows(),
             vec![vec![Value::Int64(1)]], "other live registration remains usable");
         drop(reader);
     }
@@ -2501,12 +2501,12 @@ fn runtime_cleanup_case(case: &str) {
             owner_reads: contextdb_engine::OwnerReadConfig { enabled: false, ..Default::default() },
             ..Default::default()
         }).expect("writer recovers real Pending crash state");
-        assert_eq!(recovery.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows,
+        assert_eq!(recovery.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows(),
             vec![vec![Value::Int64(1)]], "pre-durable failed purge erases no row");
         recovery.close().unwrap();
     }
     let final_reader = ReadSession::open(&path).expect("restored coordination is usable");
-    assert_eq!(final_reader.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows,
+    assert_eq!(final_reader.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows(),
         vec![vec![Value::Int64(1)]]);
     drop(final_reader);
     assert!(!fence.exists(), "later safe cleanup removes the now-Clear unheld fence");

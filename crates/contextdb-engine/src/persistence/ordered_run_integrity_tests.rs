@@ -54,7 +54,7 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
                 .limit
                 .map(|bytes| bytes as u64)
                 .unwrap_or(u64::MAX),
-        );
+        ).expect("admit the declared fixture root");
     let persistence_fixture_reader_1 = persistence_fixture_parent_1
         .child()
         .expect("admit the persistence fixture reader child");
@@ -148,7 +148,7 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
                             .limit
                             .map(|bytes| bytes as u64)
                             .unwrap_or(u64::MAX),
-                    );
+                    ).expect("admit the declared fixture root");
                 let persistence_fixture_reader_2 = persistence_fixture_parent_2
                     .child()
                     .expect("admit the persistence fixture reader child");
@@ -512,11 +512,11 @@ fn canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings() {
                             }) => {
                                 assert_eq!(
                                     actual,
-                                    path.display().to_string(),
+                                    path.display().to_string().as_str(),
                                     "{door}/{damage}: corruption identifies the affected store"
                                 );
                                 assert!(
-                                    !reason.is_empty(),
+                                    !(reason == ""),
                                     "{door}/{damage}: corruption has an explanation"
                                 );
                             }
@@ -741,7 +741,7 @@ fn the_pinned_working_set_does_not_grow_with_the_range() {
                     .limit
                     .map(|bytes| bytes as u64)
                     .unwrap_or(u64::MAX),
-            );
+            ).expect("admit the declared fixture root");
         let persistence_fixture_reader_3 = persistence_fixture_parent_3
             .child()
             .expect("admit the persistence fixture reader child");
@@ -867,7 +867,7 @@ fn a_small_window_reserves_what_it_needs_and_is_answered_with_little_left_free()
     //    build's ceiling, so nothing about it may be refused.
     {
         let load = load_read_image_with_memory(&path, Some(DECLARED_MEMORY)).unwrap();
-        let memory = Arc::clone(&load.source.verified_ordered_runs.memory);
+        let memory = load.source.verified_ordered_runs.memory.clone();
         let free = DECLARED_MEMORY.saturating_sub(memory.accountant.usage().used);
         memory
             .reserve(free.saturating_sub(LEFT_FREE))
@@ -917,7 +917,7 @@ fn a_small_window_reserves_what_it_needs_and_is_answered_with_little_left_free()
     {
         const BETWEEN_DEMAND_AND_PARTITION: usize = 40 * 1024;
         let load = load_read_image_with_memory(&path, Some(DECLARED_MEMORY)).unwrap();
-        let memory = Arc::clone(&load.source.verified_ordered_runs.memory);
+        let memory = load.source.verified_ordered_runs.memory.clone();
         let free = DECLARED_MEMORY.saturating_sub(memory.accountant.usage().used);
         memory
             .reserve(free.saturating_sub(BETWEEN_DEMAND_AND_PARTITION))
@@ -953,7 +953,7 @@ fn a_small_window_reserves_what_it_needs_and_is_answered_with_little_left_free()
     {
         const FITS_SHORTFALL_NOT_PARTITION: usize = 80 * 1024;
         let load = load_read_image_with_memory(&path, Some(DECLARED_MEMORY)).unwrap();
-        let memory = Arc::clone(&load.source.verified_ordered_runs.memory);
+        let memory = load.source.verified_ordered_runs.memory.clone();
         let free = DECLARED_MEMORY.saturating_sub(memory.accountant.usage().used);
         memory
             .reserve(free.saturating_sub(FITS_SHORTFALL_NOT_PARTITION))

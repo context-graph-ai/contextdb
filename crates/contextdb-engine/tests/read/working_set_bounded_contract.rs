@@ -26,18 +26,18 @@ fn indexed(reader: &ReadSession, context: usize) -> Vec<Vec<Value>> {
     let answer = reader.execute(
         "SELECT id FROM reader_work WHERE context_id = $context ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 10", &params(context))
         .expect("a selected Context fits the unchanged session and query declarations");
-    assert_eq!(answer.rows.len(), 10);
+    assert_eq!(answer.rows().len(), 10);
     assert_eq!(
-        answer.trace.vector_search.as_ref().unwrap().resolved_mode,
+        answer.trace().vector_search.as_ref().unwrap().resolved_mode,
         VectorSearchMode::Indexed
     );
-    for row in &answer.rows {
+    for row in answer.rows() {
         let Value::Uuid(id) = row[0] else {
             panic!("expected UUID id")
         };
         assert_eq!(fixture::ordinal(id) / fixture::ROWS_PER_CONTEXT, context);
     }
-    answer.rows
+    answer.rows().to_vec()
 }
 fn charged(reader: &ReadSession) -> usize {
     let (usage, held, peak, _) = reader.file_memory_for_test().unwrap();
@@ -81,12 +81,12 @@ fn complete_context(reader: &ReadSession, context: usize) {
     let rows = reader.execute(
         "SELECT id, payload, embedding FROM reader_work WHERE context_id = $context ORDER BY id",
         &params(context)).expect("one indexed Context's complete data fits");
-    assert_eq!(rows.rows.len(), fixture::ROWS_PER_CONTEXT);
+    assert_eq!(rows.rows().len(), fixture::ROWS_PER_CONTEXT);
     assert!(
-        rows.trace.index_used.is_some(),
+        rows.trace().index_used.is_some(),
         "real declared index serves the Context read"
     );
-    for (offset, row) in rows.rows.iter().enumerate() {
+    for (offset, row) in rows.rows().iter().enumerate() {
         let id = context * fixture::ROWS_PER_CONTEXT + offset;
         assert_eq!(
             row,
@@ -245,15 +245,15 @@ fn read_only_open_loads_only_the_working_set() {
     let all = reader.execute(
         "SELECT id FROM reader_work WHERE context_id IN ($c0,$c1,$c2,$c3,$c4,$c5,$c6,$c7) ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 10",
         &fixture::all_context_params()).expect("one indexed query spans all eight Contexts inside the same ceiling");
-    assert_eq!(all.rows.len(), 10);
+    assert_eq!(all.rows().len(), 10);
     assert_eq!(
-        all.trace.vector_search.as_ref().unwrap().resolved_mode,
+        all.trace().vector_search.as_ref().unwrap().resolved_mode,
         VectorSearchMode::Indexed
     );
     let exact_all = peer.execute(
         "SELECT id FROM reader_work WHERE context_id IN ($c0,$c1,$c2,$c3,$c4,$c5,$c6,$c7) ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 10",
         &fixture::all_context_params()).unwrap();
-    assert_eq!(all.rows, exact_all.rows);
+    assert_eq!(all.rows(), exact_all.rows());
     charged(&reader);
     drop(all);
     drop(exact_all);
@@ -348,7 +348,7 @@ fn read_only_open_loads_only_the_working_set() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("unrelated-write".into())]]
     );
     drop(newer);

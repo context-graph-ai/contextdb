@@ -402,7 +402,7 @@ fn pull_identity(
                 .limit
                 .map(|bytes| bytes as u64)
                 .unwrap_or(u64::MAX),
-        );
+        ).expect("admit the declared fixture root");
     let persistence_fixture_reader_1 = persistence_fixture_parent_1
         .child()
         .expect("admit the persistence fixture reader child");

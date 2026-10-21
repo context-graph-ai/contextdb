@@ -186,7 +186,7 @@ fn lineage_projection_repair_preserves_a_discard_only_frontier() {
     assert_eq!(
         db.execute("SELECT body FROM items WHERE id = 1", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![contextdb_core::Value::Text("fresh".into())]]
     );
     db.close().unwrap();
@@ -243,7 +243,7 @@ fn export_preserves_canonical_control(memory_source: bool) {
                 .unwrap()
                 .execute("SELECT body FROM items WHERE id = 1", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![contextdb_core::Value::Text("fresh".into())]]
         );
     }
@@ -353,7 +353,7 @@ fn scope(
         OwnerReadCancellation::new(),
         0,
     );
-    scope.read_memory = Some(memory);
+    scope.read_memory = Some(memory.into());
     scope
 }
 fn measured_authorization(db: &Database, names: &[&str]) -> usize {
@@ -490,7 +490,7 @@ fn an_aborted_multi_table_discard_keeps_rows_and_all_frontiers_unchanged() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
             vec![
                 vec![contextdb_core::Value::Int64(1)],
                 vec![contextdb_core::Value::Int64(2)]
@@ -558,13 +558,14 @@ fn crashed_discard_is_atomic(committed: bool) {
     let db = Database::open(&path).unwrap();
     let recovered_lsn = db.current_lsn();
     for table in ["items", "unrelated"] {
-        let rows = db
+        let fixture_answer_103 = db
             .execute(
                 &format!("SELECT id FROM {table} ORDER BY id"),
                 &HashMap::new(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let rows = fixture_answer_103
+            .rows();
         assert_eq!(
             rows,
             if committed {

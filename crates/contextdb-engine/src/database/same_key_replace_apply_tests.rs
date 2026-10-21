@@ -52,16 +52,16 @@ fn held(db: &Database, context: Uuid, decision: Uuid) -> Option<(Uuid, String)> 
         )
         .expect("query decisions");
     let id_col = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id")
         .expect("id column");
     let body_col = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "body")
         .expect("body column");
-    result.rows.first().map(|row| {
+    result.rows().first().map(|row| {
         let id = match &row[id_col] {
             Value::Uuid(id) => *id,
             other => panic!("unexpected id: {other:?}"),

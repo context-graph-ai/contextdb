@@ -8,7 +8,7 @@ use crate::sync_client::{ApplicationTablePolicyExpectation, SyncClient};
 use crate::sync_types::NaturalKey;
 use crate::transport::NativeStop;
 use crate::transport::in_process::InProcessBroker;
-use crate::vector_read_memory::DeclaredReadMemory;
+use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadRoot};
 use contextdb_core::Value;
 use std::time::Duration;
 
@@ -140,7 +140,7 @@ impl World {
     }
 
     /// A hub over the same store whose delivery requests are funded by `requests`.
-    fn server(&self, requests: &Arc<DeclaredReadMemory>) -> Arc<SyncServer> {
+    fn server(&self, requests: &DeclaredReadRoot) -> Arc<SyncServer> {
         Arc::new(
             SyncServer::with_authenticated_transport_and_identity_for_test_with_read_budget_provider(
                 self.hub_db.clone(),
@@ -148,13 +148,13 @@ impl World {
                 TenantId::from(TENANT),
                 self.hub_node.clone(),
                 self.hub_identity.clone(),
-                Arc::new(requests.clone()),
+                requests.clone(),
             )
             .expect("hub"),
         )
     }
 
-    fn edge_reader(&self) -> Arc<dyn contextdb_core::read_memory::ReadMemoryBudget> {
+    fn edge_reader(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
         self.edge_db.declared_reader_memory().expect("edge reader")
     }
 
@@ -285,7 +285,7 @@ impl World {
     }
 
     /// The exact bytes the Legacy outcomes handler answers for `request`.
-    fn legacy_reply(&self, reader: &Arc<DeclaredReadMemory>, request: &[u8]) -> Vec<u8> {
+    fn legacy_reply(&self, reader: &DeclaredReadRoot, request: &[u8]) -> Vec<u8> {
         legacy_delivery_reply(
             &self.hub_db,
             &TenantId::from(TENANT),
@@ -449,12 +449,12 @@ fn handed_off(result: &crate::transport::WireResult<()>) -> Option<contextdb_cor
                     budget_limit_bytes,
                     hint,
                 } => contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.clone(),
-                    operation: operation.clone(),
+                    subsystem: subsystem.as_ref().to_owned().into(),
+                    operation: operation.as_ref().to_owned().into(),
                     requested_bytes: *requested_bytes,
                     available_bytes: *available_bytes,
                     budget_limit_bytes: *budget_limit_bytes,
-                    hint: hint.clone(),
+                    hint: hint.as_ref().to_owned().into(),
                 },
                 other => contextdb_core::Error::SyncError(other.to_string().into()),
             },
@@ -476,7 +476,7 @@ fn handed_off(result: &crate::transport::WireResult<()>) -> Option<contextdb_cor
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_native_delivery_request_serves_three_outcomes_and_releases_every_byte() {
     let world = World::new();
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);
     let hub = start_native(&world, &server).await;
     world.bind().await;
@@ -512,7 +512,7 @@ async fn one_native_delivery_request_serves_three_outcomes_and_releases_every_by
     let transport = world.broker.client_as(&world.edge_node);
     let body = crate::transport::BoundedWireBody::from_legacy_reply(
         request.clone(),
-        contextdb_core::read_memory::ReadMemoryOwner::from_legacy(world.edge_reader()),
+        world.edge_reader(),
     )
     .expect("request body");
     let native = transport
@@ -527,7 +527,7 @@ async fn one_native_delivery_request_serves_three_outcomes_and_releases_every_by
     let reply = native;
     let native = reply.contiguous_bytes().expect("contiguous").to_vec();
     drop(reply);
-    let legacy = world.legacy_reply(&DeclaredReadMemory::from_reader_limit(LIMIT), &request);
+    let legacy = world.legacy_reply(&DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root"), &request);
     assert_eq!(decode_outcomes(&native), 3);
     assert_eq!(native, legacy);
     assert_eq!(server.delivery_route_counts_for_test(), (2, 0));
@@ -546,7 +546,7 @@ async fn one_native_delivery_request_serves_three_outcomes_and_releases_every_by
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_companions_serve_beside_the_native_delivery_root_byte_for_byte() {
     let world = World::new();
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);
     let native = start_native(&world, &server).await;
     world.bind().await;
@@ -740,7 +740,7 @@ fn without_hub_clock(subject: &str, reply: &[u8]) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusal_and_cancellation_release_every_request_byte() {
     let world = World::new();
-    let seeding = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let seeding = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let seeder = world.server(&seeding);
     let hub = start_legacy(&world, &seeder).await;
     world.bind().await;
@@ -750,7 +750,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
     let installation_parent = world.hub_db.declared_read_memory_for_test();
 
     // Measure one successful request: its peak child charge and reply size.
-    let measured = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let measured = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let route = installation(&world.server(&measured));
     let (result, reply) = drive(&world, &route, &request, |_| {});
     result.expect("measured request");
@@ -761,7 +761,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
     assert_eq!(measured.retained_bytes_for_test(), 0);
 
     // Refusal: the request parent holds one byte less than the request's peak.
-    let tight = DeclaredReadMemory::from_reader_limit(control + peak - 1);
+    let tight = DeclaredReadMemory::from_reader_limit(control + peak - 1).expect("admit the declared fixture root");
     let route = installation(&world.server(&tight));
     let installation_before = installation_parent.retained_bytes_for_test();
     let (refused, body) = drive(&world, &route, &request, |_| {});
@@ -777,7 +777,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
     );
 
     // Cancellation before the first poll.
-    let before = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let before = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let route = installation(&world.server(&before));
     let installation_before = installation_parent.retained_bytes_for_test();
     let (cancelled_early, body) = drive(&world, &route, &request, |cancel| cancel.cancel());
@@ -794,7 +794,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
 
     // Cancellation after custody selection, sampling the installation parent
     // while the selected request is still alive.
-    let after = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let after = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let route = installation(&world.server(&after));
     let installation_before = installation_parent.retained_bytes_for_test();
     let during = Arc::new(std::sync::Mutex::new(None));
@@ -844,7 +844,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
 struct ReadMemoryOwnerLayout;
 impl ReadMemoryOwnerLayout {
     fn control_bytes() -> u64 {
-        let parent = DeclaredReadMemory::from_reader_limit(LIMIT);
+        let parent = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
         let owner = parent.native_child().expect("one owner");
         let bytes = parent.retained_bytes_for_test();
         drop(owner);
@@ -872,7 +872,7 @@ fn decode_page(reply: &[u8]) -> (Vec<crate::protocol::WireDeliveryOutcome>, bool
 
 /// The resumable cursor after one served outcome, as the edge derives it.
 fn cursor_after(world: &World, outcome: &crate::protocol::WireDeliveryOutcome) -> Vec<u8> {
-    let reader = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let reader = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         world.hub_db.bounded_read_accountant(),
         reader.child().expect("decode reader"),
@@ -893,7 +893,7 @@ fn native_pages(world: &World, since: Option<Vec<u8>>) -> Vec<Page> {
     let mut pages = Vec::new();
     let mut since = since;
     loop {
-        let parent = DeclaredReadMemory::from_reader_limit(LIMIT);
+        let parent = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
         let route = installation(&world.server(&parent));
         crate::database::native_custody_selection::NATIVE_ORDERS_EXAMINED
             .with(|seen| seen.set((0, 0)));
@@ -975,7 +975,7 @@ async fn cursor_scaling(prior: usize) -> Scaling {
         world.hub_db.current_lsn().0,
         world.edge_db.current_lsn().0
     );
-    let seeding = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let seeding = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let seeder = world.server(&seeding);
     let hub = start_legacy(&world, &seeder).await;
     world.bind().await;
@@ -994,7 +994,7 @@ async fn cursor_scaling(prior: usize) -> Scaling {
     eprintln!("S4_SCALE prior={prior} seeded; driving native");
     let request = world.request_bytes(3, Some(cursor));
 
-    let measured = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let measured = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let route = installation(&world.server(&measured));
     crate::database::native_custody_selection::NATIVE_ORDERS_EXAMINED.with(|seen| seen.set((0, 0)));
     // The peak is reached inside selection. Split it there into what the
@@ -1019,7 +1019,7 @@ async fn cursor_scaling(prior: usize) -> Scaling {
     let reply_len = reply.len();
     let outcomes = decode_outcomes(&reply);
 
-    let legacy = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let legacy = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let control = world.legacy_reply(&legacy, &request);
     assert_eq!(decode_outcomes(&control), outcomes);
     let native_peak = measured.file_child_high_water();
@@ -1310,7 +1310,7 @@ impl crate::transport::ClientTransport for LoseDeliveryAfter {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page() {
     let world = World::new();
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);
     let hub = start_native(&world, &server).await;
     world.bind().await;
@@ -1397,7 +1397,7 @@ type HeldControls = Arc<std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>>>;
 /// as a further holder; otherwise it is dropped at once.
 #[cfg(feature = "iroh")]
 fn record_reply_controls(
-    requests: &Arc<DeclaredReadMemory>,
+    requests: &DeclaredReadRoot,
     held: Option<HeldControls>,
 ) -> Arc<std::sync::Mutex<ReplyControls>> {
     use crate::transport::iroh::NativeReplyEvent as Event;
@@ -1478,13 +1478,13 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
     hub_db
         .__seed_tenant_table_policies_for_test(tenant.clone(), expectation())
         .expect("declare the tenant policy");
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = Arc::new(
-        SyncServer::new_with_read_budget_provider(
+        SyncServer::new_with_read_budget_provider_handle(
             hub_db.clone(),
             &endpoint,
             tenant.clone(),
-            Arc::new(requests.clone()),
+            requests.clone().into(),
         )
         .expect("hub"),
     );
@@ -1584,11 +1584,11 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
     let probe = vec![7u8; 64 * 1024];
     let mut peaks = Vec::new();
     for admitted in [false, true] {
-        let parent = DeclaredReadMemory::from_reader_limit(LIMIT);
+        let parent = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
         let child = parent.child().expect("probe reader");
         let body = crate::transport::BoundedWireBody::from_legacy_reply(
             probe.clone(),
-            contextdb_core::read_memory::ReadMemoryOwner::from_legacy(child.clone()),
+            child.clone(),
         )
         .expect("probe body");
         let result = if admitted {
@@ -1645,8 +1645,8 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
 /// one, so a refusal is exercised on the real route without starving binding.
 #[derive(Debug)]
 struct SwitchableProvider {
-    roomy: Arc<DeclaredReadMemory>,
-    tight: std::sync::Mutex<Arc<DeclaredReadMemory>>,
+    roomy: DeclaredReadRoot,
+    tight: std::sync::Mutex<DeclaredReadRoot>,
     use_tight: AtomicBool,
 }
 impl crate::vector_read_memory::ReadRequestBudgetProvider for SwitchableProvider {
@@ -1663,7 +1663,7 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for SwitchableProvider
         } else {
             self.roomy.clone()
         };
-        crate::vector_read_memory::ReadRequestBudgetProvider::request_budget_owner(&parent)
+        parent.request_budget_owner()
     }
     fn request_budget_owner_native(
         &self,
@@ -1676,7 +1676,7 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for SwitchableProvider
         } else {
             self.roomy.clone()
         };
-        crate::vector_read_memory::ReadRequestBudgetProvider::request_budget_owner_native(&parent)
+        parent.request_budget_owner_native()
     }
 }
 
@@ -1700,16 +1700,16 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
         .__seed_tenant_table_policies_for_test(tenant.clone(), expectation())
         .expect("declare the tenant policy");
     let provider = Arc::new(SwitchableProvider {
-        roomy: DeclaredReadMemory::from_reader_limit(LIMIT),
-        tight: std::sync::Mutex::new(DeclaredReadMemory::from_reader_limit(LIMIT)),
+        roomy: DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root"),
+        tight: std::sync::Mutex::new(DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root")),
         use_tight: AtomicBool::new(false),
     });
     let server = Arc::new(
-        SyncServer::new_with_read_budget_provider(
+        SyncServer::new_with_read_budget_provider_handle(
             hub_db.clone(),
             &endpoint,
             tenant.clone(),
-            provider.clone(),
+            provider.clone().into(),
         )
         .expect("hub"),
     );
@@ -1770,7 +1770,7 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
     let mut lines = Vec::new();
     // 1. Memory refusal during selection, then before the body is held.
     for (case, limit) in [("selection", 20_000u64), ("body", 100u64)] {
-        let tight = DeclaredReadMemory::from_reader_limit(limit);
+        let tight = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
         *provider.tight.lock().unwrap() = tight.clone();
         provider.use_tight.store(true, Ordering::SeqCst);
         let before = server.delivery_route_counts_for_test();
@@ -1852,7 +1852,7 @@ async fn the_iroh_native_root_is_retired_by_every_way_its_serve_ends() {
         .__seed_tenant_table_policies_for_test(tenant.clone(), expectation())
         .expect("declare the tenant policy");
     let installs = hub_db.declared_read_memory_for_test();
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let bind = |name: &str| {
         let path = dir.path().join(format!("{name}.key"));
         async move {
@@ -1863,11 +1863,11 @@ async fn the_iroh_native_root_is_retired_by_every_way_its_serve_ends() {
     };
     let server_on = |endpoint: &crate::transport::iroh::IrohServer| {
         Arc::new(
-            SyncServer::new_with_read_budget_provider(
+            SyncServer::new_with_read_budget_provider_handle(
                 hub_db.clone(),
                 endpoint,
                 tenant.clone(),
-                Arc::new(requests.clone()),
+                requests.clone().into(),
             )
             .expect("hub"),
         )
@@ -2001,7 +2001,7 @@ async fn the_iroh_native_root_is_retired_by_every_way_its_serve_ends() {
 async fn an_in_memory_hub_keeps_legacy_delivery_under_run_until_stopped() {
     let world = World::with_hub_store(true);
     assert!(world.hub_db.is_memory_backed());
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);
     let hub = start_native(&world, &server).await;
     assert!(
@@ -2041,7 +2041,7 @@ async fn each_hub_names_its_delivery_route_and_only_a_durable_hub_is_served_nati
     let mut lines = Vec::new();
     for (memory_hub, route, counts) in [(true, "legacy", (0, 1)), (false, "native", (1, 0))] {
         let world = World::with_hub_store(memory_hub);
-        let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+        let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
         let server = world.server(&requests);
         let hub = start_native(&world, &server).await;
         let (chosen, reason) = server.delivery_route_for_test();
@@ -2079,14 +2079,14 @@ struct IrohHub {
 
 #[cfg(feature = "iroh")]
 impl IrohHub {
-    async fn start(requests: &Arc<DeclaredReadMemory>) -> Self {
-        Self::start_with(Arc::new(requests.clone()), None).await
+    async fn start(requests: &DeclaredReadRoot) -> Self {
+        Self::start_with(requests.clone(), None).await
     }
 
     /// A hub whose requests are funded by `provider`, its reader declaring
     /// `page_bytes` per page when given.
     async fn start_with(
-        provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+        provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
         page_bytes: Option<u64>,
     ) -> Self {
         Self::start_seeded(provider, page_bytes, 0).await
@@ -2096,7 +2096,7 @@ impl IrohHub {
     /// `large_members` is not zero: a root with that many member rows, whose
     /// diagnostics name every row, so it is much larger than the others.
     async fn start_seeded(
-        provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
+        provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
         page_bytes: Option<u64>,
         large_members: usize,
     ) -> Self {
@@ -2117,7 +2117,7 @@ impl IrohHub {
             .__seed_tenant_table_policies_for_test(tenant.clone(), expectation())
             .expect("declare the tenant policy");
         let server = Arc::new(
-            SyncServer::new_with_read_budget_provider(hub_db, &endpoint, tenant.clone(), provider)
+            SyncServer::new_with_read_budget_provider_handle(hub_db, &endpoint, tenant.clone(), provider.into())
                 .expect("hub"),
         );
         let stop = server
@@ -2253,7 +2253,7 @@ impl IrohHub {
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_iroh_native_reply_control_is_charged_until_its_last_holder_drops() {
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let hub = IrohHub::start(&requests).await;
     let held: HeldControls = Arc::default();
     let controls = record_reply_controls(&requests, Some(held.clone()));
@@ -2360,15 +2360,15 @@ async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_
         &endpoint.ticket(),
         &dir.path().join("edge.key"),
     ));
-    let body = |parent: &Arc<DeclaredReadMemory>| {
+    let body = |parent: &DeclaredReadRoot| {
         let child = parent.child().expect("request reader");
-        BoundedWireBody::from_legacy_reply(vec![1u8; 64], ReadMemoryOwner::from_legacy(child))
+        BoundedWireBody::from_legacy_reply(vec![1u8; 64], child)
             .expect("request body")
     };
     let receipts = || controller.observations_for_test().successful_reply_receipts;
 
     // A roomy reader receives the reply, charged to it, and releases it.
-    let roomy = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let roomy = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let reply = within(async {
         match client.request_stream_admitted("s4.large", body(&roomy), Duration::from_secs(60)) {
             Ok(future) => future.await,
@@ -2387,7 +2387,7 @@ async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_
     // which can trail the edge's own return, so the count settles first.
     within(controller.wait_until_requests_idle_for_test()).await;
     let before = receipts();
-    let tight = DeclaredReadMemory::from_reader_limit(32 * 1024);
+    let tight = DeclaredReadMemory::from_reader_limit(32 * 1024).expect("admit the declared fixture root");
     let refused = within(async {
         match client.request_stream_admitted("s4.large", body(&tight), Duration::from_secs(60)) {
             Ok(future) => future.await.map(drop),
@@ -2399,7 +2399,7 @@ async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_
     let tight_after = tight.retained_bytes_for_test();
     // The connection serves its streams in order, so once the next request
     // answers, the hub has finished with the refused reply.
-    let next = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let next = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     within(async {
         match client.request_stream_admitted("s4.large", body(&next), Duration::from_secs(60)) {
             Ok(future) => future.await.map(drop),
@@ -2412,14 +2412,14 @@ async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_
     let receipts_for_refused_and_next = receipts() - before;
 
     // Dropped unpolled, and cancelled while the hub withholds its reply.
-    let unpolled = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let unpolled = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     drop(
         client
             .request_stream_admitted("s4.large", body(&unpolled), Duration::from_secs(60))
             .expect("admit the request"),
     );
     let unpolled_after = unpolled.retained_bytes_for_test();
-    let cancelled = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let cancelled = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let mut pending = Box::pin(
         client
             .request_stream_admitted("s4.stall", body(&cancelled), Duration::from_secs(600))
@@ -2779,7 +2779,7 @@ fn native_refusal_strings_fit_the_terminal_bound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_declared_page_byte_bound_cuts_native_pages_in_delivery_order() {
     let world = World::with_page_bytes(9_000);
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);
     let hub = start_legacy(&world, &server).await;
     world.bind().await;
@@ -2810,13 +2810,13 @@ async fn a_page_that_cannot_fit_refuses_with_the_typed_page_byte_limit() {
     let mut lines = Vec::new();
     for page_bytes in [100u64, 1_500] {
         let world = World::with_page_bytes(page_bytes);
-        let seeding = DeclaredReadMemory::from_reader_limit(LIMIT);
+        let seeding = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
         let seeder = world.server(&seeding);
         let hub = start_legacy(&world, &seeder).await;
         world.bind().await;
         world.seed_outcomes(1).await;
         hub.stop().await;
-        let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+        let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
         let route = installation(&world.server(&requests));
         let request = world.request_bytes(9, None);
         let (result, reply) = drive(&world, &route, &request, |_| {});
@@ -2864,7 +2864,7 @@ fn the_page_bound_is_the_declared_page_bytes_unless_the_frame_ceiling_binds() {
 #[cfg(feature = "iroh")]
 #[derive(Debug)]
 struct RouteSwitchProvider {
-    parent: Arc<DeclaredReadMemory>,
+    parent: DeclaredReadRoot,
     legacy: AtomicBool,
 }
 #[cfg(feature = "iroh")]
@@ -2882,7 +2882,7 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for RouteSwitchProvide
                 .child()
                 .map(crate::vector_read_memory::RequestReadOwner::legacy)
         } else {
-            crate::vector_read_memory::ReadRequestBudgetProvider::request_budget_owner(&self.parent)
+            self.parent.request_budget_owner()
         }
     }
     fn request_budget_owner_native(
@@ -2897,9 +2897,7 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for RouteSwitchProvide
                 .map(crate::vector_read_memory::RequestReadOwner::legacy)
                 .map_err(crate::vector_read_memory::RequestOwnerFailure::Legacy)
         } else {
-            crate::vector_read_memory::ReadRequestBudgetProvider::request_budget_owner_native(
-                &self.parent,
-            )
+            self.parent.request_budget_owner_native()
         }
     }
 }
@@ -2937,7 +2935,7 @@ async fn each_admitted_reply_is_classified_by_its_own_status_on_one_connection()
     use crate::transport::{BoundedWireBody, HandlerRegistration, IncomingRequest};
     use contextdb_core::read_memory::ReadMemoryOwner;
     const OVERSIZED: usize = 69 * 1024 * 1024 + 137;
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let (dir, hub_db, edge_db) = stop_keeping_store(IrohHub::start(&requests).await).await;
     let endpoint = crate::transport::iroh::IrohServer::bind(&format!(
         "iroh:?identity={}",
@@ -2950,11 +2948,11 @@ async fn each_admitted_reply_is_classified_by_its_own_status_on_one_connection()
         legacy: AtomicBool::new(false),
     });
     let server = Arc::new(
-        SyncServer::new_with_read_budget_provider(
+        SyncServer::new_with_read_budget_provider_handle(
             hub_db,
             &endpoint,
             TenantId::from(TENANT),
-            provider.clone(),
+            provider.clone().into(),
         )
         .expect("hub"),
     );
@@ -3012,10 +3010,10 @@ async fn each_admitted_reply_is_classified_by_its_own_status_on_one_connection()
         )
         .expect("encode request")
     };
-    let reader = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let reader = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let ask = |subject: String, bytes: Vec<u8>| {
         let child = reader.child().expect("request reader");
-        let body = BoundedWireBody::from_legacy_reply(bytes, ReadMemoryOwner::from_legacy(child))
+        let body = BoundedWireBody::from_legacy_reply(bytes, child)
             .expect("request body");
         let client = client.clone();
         async move {
@@ -3066,7 +3064,7 @@ async fn each_admitted_reply_is_classified_by_its_own_status_on_one_connection()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_delivery_page_refuses_with_the_codec_class_and_retains_nothing() {
     use crate::transport::{HandlerRegistration, IncomingRequest};
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let (dir, _hub_db, edge_db) = stop_keeping_store(IrohHub::start(&requests).await).await;
     let endpoint = crate::transport::iroh::IrohServer::bind(&format!(
         "iroh:?identity={}",
@@ -3150,8 +3148,8 @@ async fn every_hub_admission_site_refuses_before_its_allocation() {
         "native_control_payload",
     ];
     let provider = Arc::new(SwitchableProvider {
-        roomy: DeclaredReadMemory::from_reader_limit(LIMIT),
-        tight: std::sync::Mutex::new(DeclaredReadMemory::from_reader_limit(LIMIT)),
+        roomy: DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root"),
+        tight: std::sync::Mutex::new(DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root")),
         use_tight: AtomicBool::new(false),
     });
     let hub = IrohHub::start_with(provider.clone(), None).await;
@@ -3162,7 +3160,7 @@ async fn every_hub_admission_site_refuses_before_its_allocation() {
             .accepted
     };
     // The witnessed run.
-    let probe = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let probe = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     *provider.tight.lock().unwrap() = probe.clone();
     provider.use_tight.store(true, Ordering::SeqCst);
     watch_native_admissions_for_test();
@@ -3196,7 +3194,7 @@ async fn every_hub_admission_site_refuses_before_its_allocation() {
         let mut landed = None;
         for back in 0..256u64 {
             let limit = site.retained_after.saturating_sub(1 + back);
-            let tight = DeclaredReadMemory::from_reader_limit(limit);
+            let tight = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
             *provider.tight.lock().unwrap() = tight.clone();
             watch_native_admissions_for_test();
             let refused = within(hub.client.fetch_delivery_outcomes(None)).await;
@@ -3255,8 +3253,8 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
         "delivery_result",
         "delivery_cursor",
     ];
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
-    let hub = IrohHub::start_with(Arc::new(requests.clone()), Some(9_000)).await;
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
+    let hub = IrohHub::start_with(requests.clone(), Some(9_000)).await;
     let edge = hub._edge_db.declared_read_memory_for_test();
     watch_native_admissions_for_test();
     let fetched = within(hub.client.fetch_delivery_outcomes(None))
@@ -3291,7 +3289,7 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
     );
 
     // A caller reader sized from a recorded caller run refuses on page two.
-    let caller = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let caller = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let child = caller.child().expect("caller reader");
     let roomy = within(
         hub.client
@@ -3305,7 +3303,7 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
     assert_eq!(caller.retained_bytes_for_test(), 0);
     let mut refused_on_page_two = None;
     for limit in (2_000..2_000_000u64).step_by(2_000) {
-        let tight = DeclaredReadMemory::from_reader_limit(limit);
+        let tight = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
         let child = tight.child().expect("tight reader");
         let served_before = hub.server.delivery_route_counts_for_test().0;
         let result = within(
@@ -3351,7 +3349,7 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aborted_hub_task_releases_every_charge_in_receive_dispatch_and_write() {
     use crate::transport::native_pause::{self, Point};
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let hub = IrohHub::start(&requests).await;
     let edge = hub._edge_db.declared_read_memory_for_test();
     let mut lines = Vec::new();
@@ -3407,7 +3405,7 @@ async fn an_aborted_hub_task_releases_every_charge_in_receive_dispatch_and_write
 async fn a_drain_mid_dispatch_closes_the_request_unanswered_and_releases_every_charge() {
     use crate::transport::iroh::TERMINAL_WRITES;
     use crate::transport::native_pause::{self, Point};
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let hub = IrohHub::start(&requests).await;
     let edge = hub._edge_db.declared_read_memory_for_test();
     let edge_before = edge.retained_bytes_for_test();
@@ -3456,10 +3454,10 @@ async fn a_drain_mid_dispatch_closes_the_request_unanswered_and_releases_every_c
 async fn a_terminal_the_edge_no_longer_reads_fails_its_write_and_releases_every_charge() {
     use crate::transport::iroh::TERMINAL_WRITES;
     use crate::transport::native_pause::{self, Point};
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     // A 100-byte page cannot hold one outcome: every delivery request fails in
     // dispatch with the typed page-byte refusal, while its control is alive.
-    let hub = IrohHub::start_with(Arc::new(requests.clone()), Some(100)).await;
+    let hub = IrohHub::start_with(requests.clone(), Some(100)).await;
     let edge = hub._edge_db.declared_read_memory_for_test();
     let edge_before = edge.retained_bytes_for_test();
     TERMINAL_WRITES.lock().unwrap().clear();
@@ -3529,7 +3527,7 @@ async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
     // A parameter of the exchange, not a synchronization: the hub holds the
     // first attempt until the test releases it, however long that is.
     const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let hub = IrohHub::start(&requests).await;
     let client = crate::transport::client_transport(&crate::transport::peer_dial_spec(
         &hub.ticket,
@@ -3552,10 +3550,10 @@ async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
         },
     )
     .expect("encode request");
-    let reader = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let reader = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let gate = native_pause::arm(Point::AfterSelection);
     let child = reader.child().expect("request reader");
-    let body = BoundedWireBody::from_legacy_reply(request, ReadMemoryOwner::from_legacy(child))
+    let body = BoundedWireBody::from_legacy_reply(request, child)
         .expect("request body");
     let subject = delivery_outcomes_subject(TENANT);
     let reply = within(async {
@@ -3607,7 +3605,7 @@ struct PerRequestProvider {
     limit: std::sync::atomic::AtomicU64,
     /// Limits for the next requests, in order; the default once spent.
     planned: std::sync::Mutex<std::collections::VecDeque<u64>>,
-    parents: std::sync::Mutex<Vec<Arc<DeclaredReadMemory>>>,
+    parents: std::sync::Mutex<Vec<DeclaredReadRoot>>,
 }
 #[cfg(feature = "iroh")]
 impl PerRequestProvider {
@@ -3618,21 +3616,21 @@ impl PerRequestProvider {
             parents: std::sync::Mutex::new(Vec::new()),
         }
     }
-    fn next(&self) -> Arc<DeclaredReadMemory> {
+    fn next(&self) -> DeclaredReadRoot {
         let limit = self
             .planned
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| self.limit.load(Ordering::SeqCst));
-        let parent = DeclaredReadMemory::from_reader_limit(limit);
+        let parent = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
         self.parents.lock().unwrap().push(parent.clone());
         parent
     }
     fn served(&self) -> usize {
         self.parents.lock().unwrap().len()
     }
-    fn served_since(&self, from: usize) -> Vec<Arc<DeclaredReadMemory>> {
+    fn served_since(&self, from: usize) -> Vec<DeclaredReadRoot> {
         self.parents.lock().unwrap()[from..].to_vec()
     }
 }
@@ -3646,7 +3644,7 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for PerRequestProvider
     fn request_budget_owner(
         &self,
     ) -> contextdb_core::Result<crate::vector_read_memory::RequestReadOwner> {
-        crate::vector_read_memory::ReadRequestBudgetProvider::request_budget_owner(&self.next())
+        self.next().request_budget_owner()
     }
     fn request_budget_owner_native(
         &self,
@@ -3654,9 +3652,7 @@ impl crate::vector_read_memory::ReadRequestBudgetProvider for PerRequestProvider
         crate::vector_read_memory::RequestReadOwner,
         crate::vector_read_memory::RequestOwnerFailure,
     > {
-        crate::vector_read_memory::ReadRequestBudgetProvider::request_budget_owner_native(
-            &self.next(),
-        )
+        self.next().request_budget_owner_native()
     }
 }
 
@@ -3798,8 +3794,8 @@ async fn a_result_refusal_leaves_its_page_without_durable_delivery_status() {
     const SLACK: u64 = 64;
     let mut lines = Vec::new();
     for (page_bytes, target_page) in [(None, 1usize), (Some(9_000u64), 2usize)] {
-        let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
-        let hub = IrohHub::start_with(Arc::new(requests.clone()), page_bytes).await;
+        let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
+        let hub = IrohHub::start_with(requests.clone(), page_bytes).await;
         let accepted = || {
             hub._edge_db
                 .delivery_status(ROOT_TABLE)
@@ -3814,7 +3810,7 @@ async fn a_result_refusal_leaves_its_page_without_durable_delivery_status() {
         loop {
             steps += 1;
             assert!(steps < 400, "page {target_page}: the walk did not finish");
-            let tight = DeclaredReadMemory::from_reader_limit(limit);
+            let tight = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
             // Taking the caller's reader is itself charged; a limit below it
             // steps past it like any other site.
             let child = match tight.child() {
@@ -3920,7 +3916,7 @@ impl World {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transaction_repair_restores_native_delivery_after_reopen() {
     let mut world = World::new();
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let mut lines = Vec::new();
     let serve = |world: &World| world.server(&requests);
 
@@ -4006,7 +4002,7 @@ async fn transaction_repair_restores_native_delivery_after_reopen() {
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_custody_marker_refuses_over_iroh_with_the_typed_owner_route_refusal() {
-    let requests = DeclaredReadMemory::from_reader_limit(LIMIT);
+    let requests = DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let IrohHub {
         dir,
         server,
@@ -4042,11 +4038,11 @@ async fn a_lost_custody_marker_refuses_over_iroh_with_the_typed_owner_route_refu
     .await
     .expect("rebind the hub endpoint");
     let server = Arc::new(
-        SyncServer::new_with_read_budget_provider(
+        SyncServer::new_with_read_budget_provider_handle(
             hub_db,
             &endpoint,
             TenantId::from(TENANT),
-            Arc::new(requests.clone()),
+            requests.clone().into(),
         )
         .expect("restarted hub"),
     );

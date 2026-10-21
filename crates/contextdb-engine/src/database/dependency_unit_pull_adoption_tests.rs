@@ -53,11 +53,11 @@ fn schema_version_value(db: &Database, id: Uuid) -> Option<String> {
         )
         .expect("query schema version");
     let column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "version")
         .expect("version column present");
-    result.rows.first().map(|row| match &row[column] {
+    result.rows().first().map(|row| match &row[column] {
         Value::Text(version) => version.clone(),
         other => panic!("unexpected version value: {other:?}"),
     })
@@ -90,11 +90,11 @@ fn reading_value(db: &Database, id: Uuid) -> Option<String> {
         )
         .expect("query reading");
     let column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "body")
         .expect("body column present");
-    result.rows.first().map(|row| match &row[column] {
+    result.rows().first().map(|row| match &row[column] {
         Value::Text(body) => body.clone(),
         other => panic!("unexpected body value: {other:?}"),
     })
@@ -103,7 +103,7 @@ fn reading_value(db: &Database, id: Uuid) -> Option<String> {
 fn record_count(db: &Database) -> usize {
     db.execute("SELECT id FROM records", &HashMap::new())
         .expect("query records")
-        .rows
+        .rows()
         .len()
 }
 

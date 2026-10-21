@@ -88,9 +88,9 @@ fn reclaimable(db: &Database) -> f64 {
 /// `(setting, value, source)` rows of `SHOW STORAGE_COMPACTION`.
 fn shown(db: &Database) -> Vec<(String, String, String)> {
     let result = db.execute("SHOW STORAGE_COMPACTION", &p()).unwrap();
-    assert_eq!(result.columns, vec!["setting", "value", "source"]);
+    assert_eq!(result.columns(), vec!["setting", "value", "source"]);
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             let text = |value: &Value| match value {

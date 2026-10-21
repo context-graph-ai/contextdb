@@ -106,13 +106,14 @@ fn exercise(route: ReadRoute, operation: Operation) {
     .unwrap();
     assert_eq!(reader.route(), route);
     let snapshot = reader.file_snapshot_for_test();
-    let baseline = reader
+    let fixture_answer_29 = reader
         .execute(
             "SELECT id, payload FROM expiry_rows ORDER BY id",
             &HashMap::new(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let baseline = fixture_answer_29
+        .rows();
     match operation {
         Operation::Statement => {
             advance.armed.store(true, Ordering::SeqCst);
@@ -138,7 +139,7 @@ fn exercise(route: ReadRoute, operation: Operation) {
                     &HashMap::new(),
                 )
                 .unwrap();
-            assert!(cursor.first_page().has_more);
+            assert!(cursor.first_page().has_more());
             let file_resources = cursor.file_resource_witness_for_test().unwrap();
             if route == ReadRoute::File {
                 let held = file_resources
@@ -161,7 +162,7 @@ fn exercise(route: ReadRoute, operation: Operation) {
                             cursor
                                 .fetch(std::num::NonZeroUsize::new(1))
                                 .unwrap()
-                                .has_more
+                                .has_more()
                         );
                     }
                     clock.advance_to(101);
@@ -202,7 +203,7 @@ fn exercise(route: ReadRoute, operation: Operation) {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         baseline,
         "the same live session accepts a later valid statement after {operation:?} on {route:?}"
     );
@@ -216,7 +217,7 @@ fn exercise(route: ReadRoute, operation: Operation) {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         baseline
     );
     assert_eq!(reader.file_snapshot_for_test(), snapshot);

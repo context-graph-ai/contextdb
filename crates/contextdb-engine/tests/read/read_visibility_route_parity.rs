@@ -157,7 +157,7 @@ fn parity_fixture() -> ParityFixture {
 
 fn payloads(result: QueryResult) -> BTreeSet<String> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [Value::Text(payload)] => payload.clone(),

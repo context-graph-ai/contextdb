@@ -2415,7 +2415,7 @@ mod tests {
             reopened
                 .execute("SELECT id FROM cron_notes ORDER BY id", &params)
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             2,
             "a reopen recovers the complete committed state, the scheduled row included"

@@ -181,24 +181,26 @@ fn absorb(suffix_rows: usize) -> Absorbed {
         receipt.temporary_workspace, 0,
         "import workspace releases at completion"
     );
-    let rows = db
+    let fixture_answer_33 = db
         .execute(
             "SELECT COUNT(*) FROM points WHERE bucket = 1",
             &HashMap::new(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = fixture_answer_33
+        .rows();
     assert_eq!(
         rows,
         vec![vec![Value::Int64(BASE_ROWS + suffix_rows as i64 + 1)]]
     );
-    let nearest = db
+    let fixture_answer_34 = db
         .execute(
             "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
             &HashMap::from([("q".into(), Value::Vector(target))]),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let nearest = fixture_answer_34
+        .rows();
     assert_eq!(nearest, vec![vec![Value::Int64(TARGET_ID)]]);
     Absorbed {
         vectors: suffix_rows + 1,

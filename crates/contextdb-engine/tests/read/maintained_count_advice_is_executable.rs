@@ -109,7 +109,7 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
     // The count over `b` is the one that is not declared, so it is the one the
     // engine advises about.
     let undeclared = db.execute(OVER_B, &over_b()).expect("count over b");
-    let advice = advised_statement(&render_explain_trace(&undeclared.trace));
+    let advice = advised_statement(&render_explain_trace(&undeclared.trace()));
     eprintln!("the engine advises: {advice}");
 
     // Run it exactly as printed — that is the whole point of printing it.
@@ -131,7 +131,7 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
         (OVER_B, over_b(), "the count the advice was about"),
     ] {
         let answered = db.execute(sql, &params).expect("count after the advice");
-        let rendered = render_explain_trace(&answered.trace);
+        let rendered = render_explain_trace(&answered.trace());
         assert!(
             rendered.contains("maintained count: declared"),
             "{what} is reported as declared after the advice ran: {rendered}"
@@ -142,11 +142,11 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
         );
     }
     assert_eq!(
-        db.execute(OVER_A, &over_a()).unwrap().rows[0][0],
+        db.execute(OVER_A, &over_a()).unwrap().rows()[0][0],
         Value::Int64(6)
     );
     assert_eq!(
-        db.execute(OVER_B, &over_b()).unwrap().rows[0][0],
+        db.execute(OVER_B, &over_b()).unwrap().rows()[0][0],
         Value::Int64(4)
     );
 
@@ -159,7 +159,7 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
         let answered = owner_session
             .execute(sql, &params)
             .expect("owner-route count");
-        let rendered = render_explain_trace(&answered.trace);
+        let rendered = render_explain_trace(&answered.trace());
         assert!(
             rendered.contains("maintained count: declared") && !rendered.contains("not declared"),
             "the owner route carries the same disclosure the owner made: {rendered}"
@@ -180,8 +180,8 @@ fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
         let answered = file_session
             .execute(sql, &params)
             .expect("file-route count");
-        assert_eq!(answered.rows[0][0], expected);
-        let rendered = render_explain_trace(&answered.trace);
+        assert_eq!(answered.rows()[0][0], expected);
+        let rendered = render_explain_trace(&answered.trace());
         assert!(
             rendered.contains("maintained count: used"),
             "the file route serves both counts from the declaration the advice produced: \

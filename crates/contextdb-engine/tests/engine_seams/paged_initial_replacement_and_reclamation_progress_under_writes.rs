@@ -493,7 +493,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         assert_eq!(
             answer
                 .expect("the pinned complete generation remains indexed")
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(id as i64)]],
             "deleted identity {id} must use its pinned old indexed generation"
         );
@@ -836,7 +836,7 @@ fn current_only_maintenance_crash_cuts() {
             let answer = db.execute("SELECT id FROM current_build WHERE scope = $scope ORDER BY v <=> $v USE VECTOR INDEXED LIMIT 1", &std::collections::HashMap::from([
                 ("scope".into(),Value::Int64(scope)), ("v".into(),Value::Vector(query))])).unwrap();
             assert_eq!(
-                answer.rows,
+                answer.rows(),
                 vec![vec![Value::Int64(id as i64)]],
                 "resumed maintained search returns the verified committed suffix: {cut}; {id}"
             );

@@ -134,7 +134,7 @@ fn graceful_close_publishes_quiescence_before_withdrawing_the_channel() {
             fresh
                 .execute("SELECT id FROM retained", &HashMap::new())
                 .expect("complete committed row remains readable")
-                .rows[0][0],
+                .rows()[0][0],
             contextdb_core::Value::Int64(7)
         );
         if expected == QuiescentStopPhase::WritesStopped {
@@ -173,7 +173,7 @@ fn graceful_close_publishes_quiescence_before_withdrawing_the_channel() {
         fresh
             .execute("SELECT id FROM retained", &HashMap::new())
             .expect("complete committed row after drain")
-            .rows[0][0],
+            .rows()[0][0],
         contextdb_core::Value::Int64(7)
     );
     resume_sent.send(()).expect("release owner hold");
@@ -239,7 +239,7 @@ fn dropped_owner_finishes_an_accepted_request_before_releasing_the_store() {
     assert_eq!(
         idle.execute("SELECT COUNT(*) FROM retained", &HashMap::new())
             .expect("read committed table")
-            .rows[0][0],
+            .rows()[0][0],
         contextdb_core::Value::Int64(0)
     );
 }
@@ -416,7 +416,7 @@ fn concurrent_callback_and_ordinary_close_complete_one_shutdown_and_preserve_pen
         fresh
             .execute("SELECT id FROM events", &HashMap::new())
             .expect("committed row remains readable")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
     drop(fresh);
@@ -627,7 +627,7 @@ fn two_ordinary_close_callers_wait_for_one_complete_shutdown() {
         fresh
             .execute("SELECT id FROM retained", &HashMap::new())
             .expect("read durable row")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(7)]]
     );
 }
@@ -746,7 +746,7 @@ fn a_draining_owner_keeps_its_exact_channel_until_admitted_work_leaves() {
         fresh
             .execute("SELECT id FROM retained", &HashMap::new())
             .expect("the fresh reader reads the committed file")
-            .rows[0][0],
+            .rows()[0][0],
         contextdb_core::Value::Int64(7)
     );
     drop(fresh);

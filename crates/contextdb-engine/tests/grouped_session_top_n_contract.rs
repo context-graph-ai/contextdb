@@ -34,7 +34,7 @@ fn execute(db: &Database, sql: &str) -> QueryResult {
         };
         #[derive(Debug)]
         struct RankedPeakBudget {
-            source: Arc<dyn ReadMemoryBudget>,
+            source: contextdb_core::read_memory::ReadMemoryOwner,
             live: AtomicUsize,
             peak: AtomicUsize,
         }
@@ -95,7 +95,7 @@ fn execute(db: &Database, sql: &str) -> QueryResult {
         let real_sql = "WITH ranked AS (SELECT id,p,ROW_NUMBER() OVER (PARTITION BY p ORDER BY id) AS rn FROM rank_real_probe) SELECT id,p,rn FROM ranked WHERE p = 1.0 AND rn <= 1";
         let real_answer = probe
             .execute(real_sql, &HashMap::new())
-            .map(|answer| answer.rows)
+            .map(|answer| answer.rows().to_vec())
             .map_err(|error| error.to_string());
         let int_prefix = "WITH ranked AS (SELECT id,p,ROW_NUMBER() OVER (PARTITION BY p ORDER BY id) AS rn FROM rank_int_probe) SELECT id,p,rn FROM ranked";
         let no_ceiling = (0..256)
@@ -107,7 +107,7 @@ fn execute(db: &Database, sql: &str) -> QueryResult {
                 &format!("{int_prefix} WHERE {no_ceiling} LIMIT 1"),
                 &HashMap::new(),
             )
-            .map(|answer| answer.rows)
+            .map(|answer| answer.rows().to_vec())
             .map_err(|error| error.to_string());
         let mut peak_observations = Vec::new();
         for tail in [
@@ -125,7 +125,7 @@ fn execute(db: &Database, sql: &str) -> QueryResult {
                     &HashMap::new(),
                     peak_owner.clone(),
                 )
-                .map(|answer| answer.rows)
+                .map(|answer| answer.rows().to_vec())
                 .map_err(|error| error.to_string());
             peak_observations.push((peak_answer, peak_owner.peak.load(Ordering::SeqCst)));
         }
@@ -134,14 +134,14 @@ fn execute(db: &Database, sql: &str) -> QueryResult {
                 &format!("{int_prefix} WHERE 10 / (2 - id) > 0 AND rn <= 1"),
                 &HashMap::new(),
             )
-            .map(|answer| answer.rows)
+            .map(|answer| answer.rows().to_vec())
             .map_err(|error| error.to_string());
         let division_control = probe
             .execute(
                 &format!("{int_prefix} WHERE 10 / (2 - id) > 0"),
                 &HashMap::new(),
             )
-            .map(|answer| answer.rows)
+            .map(|answer| answer.rows().to_vec())
             .map_err(|error| error.to_string());
         // All shapes are observed before any regression assertion can stop the row.
         assert_eq!(
@@ -239,16 +239,16 @@ fn expected(ordinals: &[usize]) -> Vec<Vec<Value>> {
 }
 fn check(answer: QueryResult, rows: &[Vec<Value>], route: GroupRoute) -> Vec<u64> {
     assert_eq!(
-        answer.rows, rows,
+        answer.rows(), rows,
         "rows follow context ASC then exact session rank ASC"
     );
-    assert_eq!(answer.trace.groups.len(), 2);
+    assert_eq!(answer.trace().groups.len(), 2);
     if route == GroupRoute::Index {
-        assert_eq!(answer.trace.physical_plan, "IndexScan");
-        assert!(answer.trace.sort_elided);
+        assert_eq!(answer.trace().physical_plan, "IndexScan");
+        assert!(answer.trace().sort_elided);
     }
     answer
-        .trace
+        .trace()
         .groups
         .iter()
         .enumerate()
@@ -371,7 +371,7 @@ fn grouped_session_top_n_has_exact_context_ranks_and_fixed_declared_index_work()
     assert_eq!(
         db.execute_in_tx(tx, NEWEST, &bindings())
             .expect("rank with staged insert")
-            .rows,
+            .rows(),
         inserted_rows
     );
     db.execute_in_tx(tx, "DELETE FROM event_context_sessions WHERE context_id = $context AND connector_id = 'a' AND session_ref = 'a'", &staged)
@@ -380,7 +380,7 @@ fn grouped_session_top_n_has_exact_context_ranks_and_fixed_declared_index_work()
     assert_eq!(
         db.execute_in_tx(tx, NEWEST, &bindings())
             .expect("rank with staged insert and delete")
-            .rows,
+            .rows(),
         inserted_rows
     );
     db.rollback(tx).expect("release the staged ranked control");
@@ -427,8 +427,8 @@ fn assert_ranked_cursor_pages(path: &std::path::Path, expected_rows: &[Vec<Value
     let mut cursor = reader
         .open_cursor(NEWEST, &bindings())
         .expect("open ranked cursor with one-row pages");
-    let mut rows = cursor.first_page().rows.clone();
-    let mut more = cursor.first_page().has_more;
+    let mut rows = cursor.first_page().rows().to_vec();
+    let mut more = cursor.first_page().has_more();
     let mut examined = HashMap::new();
     loop {
         let groups = &cursor.trace().groups;
@@ -460,9 +460,9 @@ fn assert_ranked_cursor_pages(path: &std::path::Path, expected_rows: &[Vec<Value
             break;
         }
         let page = cursor.fetch(None).expect("fetch the next ranked page");
-        assert!(page.rows.len() <= 1);
-        rows.extend(page.rows);
-        more = page.has_more;
+        assert!(page.rows().len() <= 1);
+        rows.extend(page.rows().iter().cloned());
+        more = page.has_more();
     }
     assert_eq!(rows, expected_rows);
     assert_eq!(cursor.trace().groups.len(), 2);

@@ -129,7 +129,7 @@ fn assert_searchable(db: &Database, suffix_rows: usize) {
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(BASE_ROWS + suffix_rows as i64 + 1)]]
     );
     let mut target = vec![0.0; DIMENSION];
@@ -140,7 +140,7 @@ fn assert_searchable(db: &Database, suffix_rows: usize) {
             &HashMap::from([("q".into(), Value::Vector(target))]),
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(TARGET_ID)]]
     );
 }
@@ -633,7 +633,7 @@ fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds()
     let nearest = |db: &Database, q: Vec<f32>| {
         db.execute(query, &HashMap::from([("q".into(), Value::Vector(q))]))
             .unwrap()
-            .rows
+            .rows().to_vec()
     };
     assert_eq!(
         nearest(&db, vec![1.0, 0.0, 0.0]),
@@ -669,7 +669,7 @@ fn nearest(db: &Database, query: Vec<f32>) -> Vec<Vec<Value>> {
         &HashMap::from([("q".into(), Value::Vector(query))]),
     )
     .unwrap()
-    .rows
+    .rows().to_vec()
 }
 
 /// The one route's serving coverage: its LSN, its transaction, the commit
@@ -950,7 +950,7 @@ fn absorb_quantized(quantization: &str) {
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(BASE_ROWS + suffix as i64 + 1)]]
     );
     assert_eq!(
@@ -959,7 +959,7 @@ fn absorb_quantized(quantization: &str) {
             &HashMap::from([("q".into(), Value::Vector(target))]),
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(TARGET_ID)]],
         "{quantization}"
     );

@@ -178,7 +178,7 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
         published.base.generation_id
     );
     let query = "SELECT id FROM items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3";
-    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows.len(), 3);
+    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows().len(), 3);
     assert_eq!(
         db.vector_memory_ownership_receipt_for_test()
             .temporary_workspace,
@@ -190,7 +190,7 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
     let reopened = Database::open(&path).unwrap();
     reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     assert_eq!(
-        reopened.execute(query, &HashMap::new()).unwrap().rows.len(),
+        reopened.execute(query, &HashMap::new()).unwrap().rows().len(),
         3
     );
     assert_eq!(

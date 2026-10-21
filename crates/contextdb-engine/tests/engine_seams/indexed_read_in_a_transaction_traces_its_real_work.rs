@@ -124,7 +124,7 @@ fn read(db: &Database, sql: &str, sql_params: &HashMap<String, Value>) -> QueryR
 
 fn ids(result: &QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
@@ -163,7 +163,7 @@ fn a_range_over_a_declared_index_traces_its_walk_with_a_transaction_open() {
     // The same read against committed state alone. It is the oracle: same
     // rows, same index, the only difference below is an open transaction.
     let committed = read(&db, RANGE_SQL, &range_params());
-    assert_reached_through_the_index("committed range", &committed.trace);
+    assert_reached_through_the_index("committed range", &committed.trace());
     assert_eq!(ids(&committed).len(), RANGE_ROWS);
 
     db.execute("BEGIN", &empty())
@@ -180,16 +180,16 @@ fn a_range_over_a_declared_index_traces_its_walk_with_a_transaction_open() {
         ids(&committed),
         "a row staged outside the range does not change the range's answer"
     );
-    assert_reached_through_the_index("in-transaction range", &staged.trace);
-    let ceiling = committed.trace.rows_examined + 1 + WALK_SLACK;
+    assert_reached_through_the_index("in-transaction range", &staged.trace());
+    let ceiling = committed.trace().rows_examined + 1 + WALK_SLACK;
     assert!(
-        staged.trace.rows_examined <= ceiling,
+        staged.trace().rows_examined <= ceiling,
         "with a transaction open the range examined {} rows against {} for the same range on \
          committed state alone, over a table of {STORED_ROWS} rows; a read that reports \
          IndexScan and walks the whole table gives an operator a work ceiling that holds on a \
          small table and refuses the identical query on a large one",
-        staged.trace.rows_examined,
-        committed.trace.rows_examined
+        staged.trace().rows_examined,
+        committed.trace().rows_examined
     );
 }
 
@@ -198,7 +198,7 @@ fn an_ordered_read_of_a_declared_index_traces_its_walk_with_a_transaction_open()
     let db = indexed_events();
 
     let committed = read(&db, ORDERED_SQL, &empty());
-    assert_reached_through_the_index("committed ordered", &committed.trace);
+    assert_reached_through_the_index("committed ordered", &committed.trace());
     assert_eq!(ids(&committed), vec![0, 1, 2, 3, 4]);
 
     db.execute("BEGIN", &empty())
@@ -209,7 +209,7 @@ fn an_ordered_read_of_a_declared_index_traces_its_walk_with_a_transaction_open()
     let staged = read(&db, ORDERED_SQL, &empty());
     db.execute("ROLLBACK", &empty())
         .expect("discard the staged row");
-    report("in-transaction ordered", &staged.trace);
+    report("in-transaction ordered", &staged.trace());
 
     assert_eq!(
         ids(&staged),
@@ -221,19 +221,19 @@ fn an_ordered_read_of_a_declared_index_traces_its_walk_with_a_transaction_open()
     // shows the route the read took AND what that route cost, rather than
     // stopping at whichever is reported first.
     let mut broken = Vec::new();
-    if staged.trace.physical_plan != "IndexScan" {
+    if staged.trace().physical_plan != "IndexScan" {
         broken.push(format!(
             "with a transaction open the ordered read is planned as {} over {:?} instead of \
              walking the declared index it uses on committed state",
-            staged.trace.physical_plan, staged.trace.index_used
+            staged.trace().physical_plan, staged.trace().index_used
         ));
     }
-    let ceiling = committed.trace.rows_examined + 1 + WALK_SLACK;
-    if staged.trace.rows_examined > ceiling {
+    let ceiling = committed.trace().rows_examined + 1 + WALK_SLACK;
+    if staged.trace().rows_examined > ceiling {
         broken.push(format!(
             "with a transaction open the ordered read examined {} rows against {} for the same \
              five-row answer on committed state alone, over a table of {STORED_ROWS} rows",
-            staged.trace.rows_examined, committed.trace.rows_examined
+            staged.trace().rows_examined, committed.trace().rows_examined
         ));
     }
     assert!(
@@ -258,7 +258,7 @@ fn an_index_read_with_a_transaction_open_still_answers_with_the_rows_it_staged()
     db.execute("ROLLBACK", &empty())
         .expect("discard the staged row");
 
-    assert_reached_through_the_index("in-transaction range with a staged match", &staged.trace);
+    assert_reached_through_the_index("in-transaction range with a staged match", &staged.trace());
     assert!(
         ids(&staged).contains(&(STORED_ROWS + 2)),
         "a row the reader staged inside the range is part of the answer: {:?}",

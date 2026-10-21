@@ -366,7 +366,7 @@ fn prepare(path: &Path, n: usize) {
             expiry_frontier
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64((n / 4) as i64)]]
     );
     drop(pin);
@@ -1030,11 +1030,12 @@ fn received_and_exported_partition_control_components_are_fixed_at_n_2n_4n() {
                             .collect::<Vec<_>>()
                     );
                     for scope in 0..2 {
-                        let rows = db.execute("SELECT id FROM controls WHERE scope = $scope ORDER BY v <=> $q USE VECTOR EXACT LIMIT 1",
+                        let fixture_answer_35 = db.execute("SELECT id FROM controls WHERE scope = $scope ORDER BY v <=> $q USE VECTOR EXACT LIMIT 1",
                             &std::collections::HashMap::from([
                                 ("scope".into(), Value::Int64(scope)),
                                 ("q".into(), Value::Vector(vector(scope as usize, 16))),
-                            ])).unwrap().rows;
+                            ])).unwrap();
+                        let rows = fixture_answer_35.rows();
                         assert_eq!(rows, vec![vec![Value::Int64(scope)]]);
                     }
                 }

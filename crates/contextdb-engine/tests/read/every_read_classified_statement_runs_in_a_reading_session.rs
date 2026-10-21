@@ -78,7 +78,7 @@ fn served_store(directory: &Path, runtime_root: PathBuf) -> (Database, PathBuf) 
 }
 
 fn document_rows(answered: &QueryResult) -> usize {
-    answered.rows.len()
+    answered.rows().len()
 }
 
 fn explained(body: &MetadataBody) -> (String, Option<String>) {
@@ -106,7 +106,7 @@ fn the_idle_file_runs_every_read_classified_statement() {
                 panic!("`{statement}` is classified a read, so a reading session runs it: {error}")
             });
         assert!(
-            !answered.columns.is_empty(),
+            !answered.columns().is_empty(),
             "`{statement}` answers with named columns: {answered:?}"
         );
     }
@@ -131,7 +131,7 @@ fn a_live_owner_runs_every_read_classified_statement_over_its_channel() {
                 panic!("`{statement}` runs over the owner channel too: {error}")
             });
         assert!(
-            !answered.columns.is_empty(),
+            !answered.columns().is_empty(),
             "`{statement}` answers with named columns over the channel: {answered:?}"
         );
     }
@@ -190,13 +190,13 @@ fn explaining_a_write_answers_its_plan_and_leaves_the_rows_alone() {
         document_rows(&still_there),
         2,
         "explaining three writes changed nothing: {:?}",
-        still_there.rows
+        still_there.rows()
     );
     assert_eq!(
-        still_there.rows.first().and_then(|row| row.first()),
+        still_there.rows().first().and_then(|row| row.first()),
         Some(&Value::Int64(1)),
         "the row the explained DELETE named is still there: {:?}",
-        still_there.rows
+        still_there.rows()
     );
 }
 
@@ -235,7 +235,7 @@ fn a_live_owner_explains_a_write_over_its_channel_and_leaves_the_rows_alone() {
         document_rows(&still_there),
         2,
         "explaining a write over the channel changed nothing: {:?}",
-        still_there.rows
+        still_there.rows()
     );
 
     drop(session);

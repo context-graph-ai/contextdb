@@ -41,7 +41,7 @@ fn query_trace_rows_examined_stays_with_the_select_that_examined_the_rows() {
         std::thread::spawn(move || {
             mark_this_thread_for_query_trace_rows_examined_capture_pause_for_test();
             execute(&db, "SELECT id FROM trace_small")
-                .trace
+                .trace()
                 .rows_examined
         })
     };
@@ -60,7 +60,7 @@ fn query_trace_rows_examined_stays_with_the_select_that_examined_the_rows() {
         "the smaller SELECT retains its own examined-row count after the larger SELECT completes"
     );
     assert_eq!(
-        large_query.trace.rows_examined, 7,
+        large_query.trace().rows_examined, 7,
         "the larger SELECT reports its own examined-row count"
     );
 }

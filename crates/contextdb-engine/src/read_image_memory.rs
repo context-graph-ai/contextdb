@@ -142,6 +142,13 @@ impl From<ImageMemoryHandle> for contextdb_core::read_memory::ReadMemoryOwner {
 }
 
 impl ImageMemoryHandle {
+    #[cfg(test)]
+    pub(crate) fn strong_count_for_test(&self) -> usize {
+        match self {
+            Self::Arc(image) => Arc::strong_count(image),
+            Self::Native(image) => image.strong_count_for_test(),
+        }
+    }
     fn arc_new(image: ImageMemory) -> Self { Self::Arc(Arc::new(image)) }
     fn get_mut(image: &mut Self) -> Option<&mut ImageMemory> {
         match image { Self::Arc(image) => Arc::get_mut(image), Self::Native(_) => None }
@@ -2745,7 +2752,7 @@ mod exact_sequence_tests {
     #[test]
     fn a_per_call_reader_holds_one_decode_at_a_time_and_returns_it_on_drop() {
         let values: Vec<f32> = (0..1536).map(|lane| lane as f32).collect();
-        let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1 << 20);
+        let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1 << 20).expect("admit the declared fixture root");
         let reader = declared.child().unwrap();
         let owner = ImageMemory::charging_reader_per_call(accountant(1 << 20), reader.clone());
         let before = declared.retained_bytes_for_test();
@@ -2936,7 +2943,7 @@ mod native_decode_tests {
     use contextdb_core::read_memory::{NativeRefusal, ReadShared};
 
     fn native_owner(
-        parent: &Arc<DeclaredReadMemory>,
+        parent: &crate::vector_read_memory::DeclaredReadRoot,
     ) -> contextdb_core::read_memory::ReadMemoryOwner {
         parent.native_child().expect("native owner").into_owner()
     }
@@ -2946,7 +2953,7 @@ mod native_decode_tests {
     // and the charge returns to zero only when the last holder frees it.
     #[test]
     fn the_native_decode_accountant_settles_after_its_last_holder_frees_it() {
-        let parent = DeclaredReadMemory::from_reader_limit(1 << 20);
+        let parent = DeclaredReadMemory::from_reader_limit(1 << 20).expect("admit the declared fixture root");
         let owner = native_owner(&parent);
         let baseline = parent.retained_bytes_for_test();
         let first = NativeDecodeMemory::try_new(owner.clone()).expect("accountant");
@@ -2972,14 +2979,14 @@ mod native_decode_tests {
     #[test]
     fn a_refused_native_decode_returns_the_refusal_by_value_and_its_bytes() {
         let block = ReadShared::<NativeDecodeMemory>::layout().size() as u64;
-        let probe = DeclaredReadMemory::from_reader_limit(1 << 20);
+        let probe = DeclaredReadMemory::from_reader_limit(1 << 20).expect("admit the declared fixture root");
         let child = {
             let owner = native_owner(&probe);
             let control = probe.retained_bytes_for_test();
             drop(owner);
             control
         };
-        let parent = DeclaredReadMemory::from_reader_limit(child + block + 64);
+        let parent = DeclaredReadMemory::from_reader_limit(child + block + 64).expect("admit the declared fixture root");
         let owner = native_owner(&parent);
         let memory = NativeDecodeMemory::try_new(owner.clone()).expect("accountant");
         let encoded = rmp_serde::to_vec(&vec!["x".repeat(4096)]).unwrap();
@@ -3007,7 +3014,7 @@ mod native_decode_tests {
     // Malformed input answers the static codec class; nothing stays admitted.
     #[test]
     fn a_malformed_native_decode_answers_the_codec_class_and_retains_nothing() {
-        let parent = DeclaredReadMemory::from_reader_limit(1 << 20);
+        let parent = DeclaredReadMemory::from_reader_limit(1 << 20).expect("admit the declared fixture root");
         let owner = native_owner(&parent);
         let memory = NativeDecodeMemory::try_new(owner.clone()).expect("accountant");
         let failed = decode_msgpack_native::<Vec<String>>(&memory, &[0x92, 0xa3, b'a']);

@@ -627,7 +627,7 @@ fn surviving_wide_index_rebuild_is_admitted_before_durable_reclamation() {
                 )])
             )
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -891,6 +891,6 @@ fn current_row_identity_body_is_admitted_for_selected_lifetime_only() {
     let rows = reopened
         .execute("SELECT payload FROM retained", &HashMap::new())
         .unwrap();
-    assert!(matches!(&rows.rows[0][0], Value::Text(body) if body.len() > 128 * 1024));
+    assert!(matches!(&rows.rows()[0][0], Value::Text(body) if body.len() > 128 * 1024));
     reopened.close().unwrap();
 }

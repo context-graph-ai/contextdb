@@ -135,7 +135,7 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
             database
                 .execute("SELECT id FROM tuples WHERE a IS NULL ORDER BY id", &params)
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(2)], vec![Value::Int64(3)]],
             "nullable composite unique values do not collide"
         );
@@ -216,7 +216,7 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
             database
                 .execute_in_tx(tx, "SELECT payload FROM parents WHERE id = 1", &params)
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(777)]],
             "staged replacement is visible to its constraint checks and reads"
         );
@@ -224,7 +224,7 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
             database
                 .execute("SELECT payload FROM parents WHERE id = 1", &params)
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(history - 1)]],
             "replacement remains private before commit"
         );
@@ -251,7 +251,7 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
             database
                 .execute("SELECT id, payload FROM parents ORDER BY id", &params)
                 .unwrap()
-                .rows,
+                .rows(),
             vec![
                 vec![Value::Int64(1), Value::Int64(777)],
                 vec![Value::Int64(2), Value::Int64(1)],
@@ -267,7 +267,7 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
                     historical
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(0)]],
             "pinned historical parent survives displaced replacement and competing commits"
         );
@@ -275,7 +275,7 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
             database
                 .execute_at_snapshot("SELECT a,b FROM tuples WHERE id = 1", &params, historical)
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(7), Value::Int64(8)]],
             "pinned composite key remains visible independently of current postings"
         );

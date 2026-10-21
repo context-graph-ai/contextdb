@@ -79,10 +79,10 @@ fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
             let exact = database
                 .execute(&format!("{prefix} USE VECTOR EXACT LIMIT 65"), &params)
                 .unwrap();
-            assert_eq!(exact.rows.len(), total as usize);
+            assert_eq!(exact.rows().len(), total as usize);
             assert!(
                 exact
-                    .rows
+                    .rows()
                     .iter()
                     .all(|row| row[0] != Value::Int64(900) && row[0] != Value::Int64(901)),
                 "the exact oracle excludes both neighbouring scope and residual nonmember"
@@ -92,11 +92,11 @@ fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
             });
             let automatic = automatic.unwrap();
             assert_eq!(
-                automatic.rows, exact.rows,
+                automatic.rows(), exact.rows(),
                 "automatic planning preserves complete scope, ties and global order at total={total}, sizes={sizes:?}"
             );
             let disclosure = automatic
-                .trace
+                .trace()
                 .vector_search
                 .as_ref()
                 .expect("completed route evidence");

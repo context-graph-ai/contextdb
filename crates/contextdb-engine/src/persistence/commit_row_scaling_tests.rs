@@ -147,7 +147,7 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
         .map(|table| {
             db.execute(&format!("SELECT id FROM {table}"), &HashMap::new())
                 .expect("read the committed rows")
-                .rows
+                .rows()
                 .len()
         })
         .sum();
@@ -164,7 +164,7 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
         let remaining = db
             .execute("SELECT id FROM imported", &HashMap::new())
             .expect("read the remaining rows");
-        assert!(remaining.rows.is_empty(), "every deleted row is gone");
+        assert!(remaining.rows().is_empty(), "every deleted row is gone");
     }
     if measured == Measured::AlternatingUpdate {
         let tx = db.begin().expect("one transaction for the whole update");
@@ -198,7 +198,7 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
                     &HashMap::new(),
                 )
                 .expect("read the updated rows")
-                .rows
+                .rows()
                 .len()
             })
             .sum();
@@ -431,7 +431,7 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
                 &HashMap::new(),
             )
             .expect("read one table")
-            .rows
+            .rows()
             .len()
         })
         .sum();

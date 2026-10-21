@@ -221,7 +221,7 @@ fn replace_generation(db: &Database) {
     let count = db
         .execute("SELECT COUNT(*) FROM continuity_vectors", &HashMap::new())
         .unwrap();
-    let Value::Int64(rows) = count.rows[0][0] else {
+    let Value::Int64(rows) = count.rows()[0][0] else {
         panic!("integer row count")
     };
     let tx = db.begin().unwrap();
@@ -254,7 +254,7 @@ fn replace_generation(db: &Database) {
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Text("new".into())]]
     );
 }
@@ -551,10 +551,10 @@ fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
             .join()
             .unwrap()
             .expect("active original-snapshot statement survives writer commit/reclamation");
-        assert_eq!(answer.rows.len(), 1250);
+        assert_eq!(answer.rows().len(), 1250);
         assert!(
             answer
-                .rows
+                .rows()
                 .iter()
                 .all(|r| r[1] == Value::Text("old".into()))
         );
@@ -569,7 +569,7 @@ fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("old".into())]]
         );
         assert_eq!(reader.file_snapshot_for_test(), Some(snapshot));
@@ -588,7 +588,7 @@ fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("new".into())]]
     );
 }
@@ -617,11 +617,13 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     let baseline = ReadSession::with_runtime_directory_for_test(&runtime, || {
         fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()))
     });
-    let before_auto = baseline.execute(SQL, &q()).unwrap().rows;
-    let before_indexed = baseline
+    let fixture_answer_25 = baseline.execute(SQL, &q()).unwrap();
+    let before_auto = fixture_answer_25.rows();
+    let fixture_answer_26 = baseline
         .execute(&SQL.replace("AUTO", "INDEXED"), &q())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let before_indexed = fixture_answer_26
+        .rows();
     drop(baseline);
     let auto_routes = Arc::new(fixture::Routes::default());
     let indexed_routes = Arc::new(fixture::Routes::default());
@@ -671,11 +673,11 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
             &before_indexed
         };
         assert_eq!(
-            &answer.rows, expected,
+            &answer.rows(), expected,
             "the identical query on the original snapshot retains its answer"
         );
         assert_eq!(
-            answer.trace.vector_search.unwrap().resolved_mode,
+            answer.trace().vector_search.as_ref().unwrap().resolved_mode,
             VectorSearchMode::Indexed
         );
         assert_eq!(reader.file_snapshot_for_test(), snapshot);
@@ -684,7 +686,7 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     writer.expect("writer-closed");
     writer.expect("writer-restarted");
     for reader in [&auto, &indexed] {
-        assert_eq!(reader.execute(SQL, &q()).unwrap().rows, before_auto);
+        assert_eq!(reader.execute(SQL, &q()).unwrap().rows(), before_auto);
     }
     auto_routes.file_only();
     indexed_routes.file_only();
@@ -719,7 +721,7 @@ fn read_journey(reader: &ReadSession) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, Vec<
     let find = reader.execute("SELECT id FROM reader_work WHERE context_id = $context ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 10",
         &HashMap::from([("q".into(), Value::Vector(fixture::vector(0))), ("context".into(), Value::Uuid(fixture::context_id(0)))])).unwrap();
     assert_eq!(
-        find.trace.vector_search.unwrap().resolved_mode,
+        find.trace().vector_search.as_ref().unwrap().resolved_mode,
         VectorSearchMode::Indexed
     );
     let show = reader
@@ -733,8 +735,8 @@ fn read_journey(reader: &ReadSession) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, Vec<
     let status = reader
         .execute("SHOW VECTOR_INDEXES", &HashMap::new())
         .unwrap();
-    assert!(!find.rows.is_empty() && !show.rows.is_empty() && !status.rows.is_empty());
-    (find.rows, show.rows, status.rows)
+    assert!(!find.rows().is_empty() && !show.rows().is_empty() && !status.rows().is_empty());
+    (find.rows().to_vec(), show.rows().to_vec(), status.rows().to_vec())
 }
 #[test]
 fn schema_replay_does_not_interrupt_active_readers() {
@@ -806,7 +808,7 @@ fn schema_replay_does_not_interrupt_active_readers() {
             &HashMap::new(),
         )
         .unwrap();
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     let mut writer = Process::start(
         "schema_replay_does_not_interrupt_active_readers",
         "writer",
@@ -825,7 +827,7 @@ fn schema_replay_does_not_interrupt_active_readers() {
         "find/show/status while received-schema publication is parked"
     );
     let page = cursor.fetch(std::num::NonZeroUsize::new(2)).unwrap();
-    assert_eq!(page.rows[0][0], Value::Uuid(fixture::row_id(2)));
+    assert_eq!(page.rows()[0][0], Value::Uuid(fixture::row_id(2)));
     writer.send("publish");
     writer.expect("schema-published");
     assert_eq!(read_journey(&reader), before);
@@ -840,7 +842,7 @@ fn schema_replay_does_not_interrupt_active_readers() {
         reader
             .execute("SELECT body FROM schema_099", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("kept".into())]]
     );
     cursor.close().unwrap();
@@ -853,14 +855,14 @@ fn schema_replay_does_not_interrupt_active_readers() {
         restarted
             .execute("SELECT body, revised FROM schema_099", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("kept".into()), Value::Null]]
     );
     assert_eq!(
         restarted
             .execute("SELECT body, revised FROM schema_000", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("kept".into()), Value::Null]]
     );
 }
@@ -897,7 +899,7 @@ fn a_dead_reader_process_does_not_prevent_later_write_maintenance_and_restart() 
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("new".into())]]
     );
 }
@@ -909,10 +911,11 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
     let runtime = fixture::runtime(root.path());
     seed(&path);
     let baseline = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
-    let expected = baseline
+    let fixture_answer_28 = baseline
         .execute(&SQL.replace("AUTO", "EXACT"), &q())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let expected = fixture_answer_28
+        .rows();
     drop(baseline);
     let (tx, reached) = mpsc::channel();
     let park = Arc::new(Park {
@@ -965,7 +968,7 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
             .unwrap()
             .expect("owner query completes its registered snapshot");
         progress.expect("the writer made progress before the reader was released");
-        assert_eq!(answer.rows, expected);
+        assert_eq!(answer.rows(), expected);
     });
     assert_eq!(
         reader
@@ -974,7 +977,7 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("new".into())]],
         "later owner statements correctly see the later committed state"
     );

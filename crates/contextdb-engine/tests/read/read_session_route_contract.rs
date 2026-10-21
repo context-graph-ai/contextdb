@@ -163,7 +163,7 @@ fn seed_committed_rows(path: &std::path::Path) -> usize {
 }
 
 fn cursor_page_ids(page: &CursorPage) -> Vec<i64> {
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -310,18 +310,18 @@ fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
         .execute("SELECT * FROM route_rows_missing", &HashMap::new())
         .expect_err("owner route reports the missing table");
 
-    assert_eq!(file_result.columns, owner_result.columns);
-    assert_eq!(file_result.rows, owner_result.rows);
-    assert_eq!(file_result.rows_affected, owner_result.rows_affected);
+    assert_eq!(file_result.columns(), owner_result.columns());
+    assert_eq!(file_result.rows(), owner_result.rows());
+    assert_eq!(file_result.rows_affected(), owner_result.rows_affected());
     assert_eq!(
-        format!("{:?}", file_result.trace),
-        format!("{:?}", owner_result.trace)
+        format!("{:?}", file_result.trace()),
+        format!("{:?}", owner_result.trace())
     );
     assert_eq!(
-        format!("{:?}", file_result.cascade),
-        format!("{:?}", owner_result.cascade)
+        format!("{:?}", file_result.cascade()),
+        format!("{:?}", owner_result.cascade())
     );
-    assert_eq!(file_result.rows.len(), row_count);
+    assert_eq!(file_result.rows().len(), row_count);
     assert_eq!(
         encode_query_result(&file_result).expect("encode file result canonically"),
         encode_query_result(&owner_result).expect("encode owner result canonically"),
@@ -1225,7 +1225,7 @@ fn cancel_cursor_fetch_inside_kernel(
     let cursor = session
         .open_cursor("SELECT id FROM route_rows", &HashMap::new())
         .expect("open a cursor with a suspended continuation before fetch cancellation");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     let first_page_ids = cursor_page_ids(cursor.first_page());
     let requested_rows = usize::try_from(cancellation_batch_rows())
         .expect("cancellation batch size fits this platform");
@@ -1310,7 +1310,7 @@ fn cancel_cursor_fetch_inside_kernel(
             .collect::<Vec<_>>(),
         "a cancelled unpublished page must not advance the suspended continuation",
     );
-    assert!(next_page.has_more, "the cursor remains genuinely suspended");
+    assert!(next_page.has_more(), "the cursor remains genuinely suspended");
     let after_resume = session
         .route_resources_for_test()
         .expect("inspect the selected route after cursor resume");

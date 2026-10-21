@@ -679,7 +679,7 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
                             &std::collections::HashMap::new(),
                         )
                         .expect("read")
-                        .rows
+                        .rows()
                         .len()
                     })
                     .sum();

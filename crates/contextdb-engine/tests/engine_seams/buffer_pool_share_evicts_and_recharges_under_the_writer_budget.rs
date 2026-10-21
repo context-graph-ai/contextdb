@@ -62,9 +62,9 @@ fn buffer_pool_share_evicts_and_recharges_under_the_writer_budget() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(indexed.trace.index_used.as_deref(), Some("pages_probe"));
+    assert_eq!(indexed.trace().index_used.as_deref(), Some("pages_probe"));
     assert_eq!(
-        indexed.rows,
+        indexed.rows(),
         (0..4).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
     );
     let indexes = db.__writer_cache_stats_for_test().unwrap();
@@ -99,9 +99,9 @@ fn buffer_pool_share_evicts_and_recharges_under_the_writer_budget() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(indexed.trace.index_used.as_deref(), Some("pages_probe"));
+    assert_eq!(indexed.trace().index_used.as_deref(), Some("pages_probe"));
     assert_eq!(
-        indexed.rows,
+        indexed.rows(),
         (0..4).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
     );
     let index_reload = db.__writer_cache_stats_for_test().unwrap();
@@ -368,7 +368,7 @@ fn assert_native_cache_index_charge_on_writer_settle_and_read_only_open() {
                     &std::collections::HashMap::new()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(1), Value::Text("held exactly".into())]]
         );
         assert_eq!(

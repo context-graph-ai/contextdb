@@ -3,9 +3,30 @@ use contextdb_core::read_contract::CursorPage;
 use contextdb_engine::read_contract::{CanonicalQueryTrace, ReadEncodingError};
 use serde::{Deserialize, Serialize};
 
+// The observing application owns its decoded fixture and may mutate it before
+// injecting replacement wire bytes. It is never an engine-owned answer handle.
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename = "CursorPage")]
+pub struct OwnerPageFixture {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<contextdb_core::Value>>,
+    pub has_more: bool,
+}
+impl OwnerPageFixture {
+    pub fn rows(&self) -> &[Vec<contextdb_core::Value>] { &self.rows }
+    pub fn columns(&self) -> &[String] { &self.columns }
+    pub fn has_more(&self) -> bool { self.has_more }
+    fn validate(&self) -> Result<(), ReadEncodingError> {
+        if self.rows.iter().any(|row| row.len() != self.columns.len()) {
+            return Err(ReadEncodingError::InvalidPayload);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct ObservedPage {
-    page: CursorPage,
+    page: OwnerPageFixture,
     trace: CanonicalQueryTrace,
 }
 
@@ -23,20 +44,20 @@ fn decode(bytes: &[u8]) -> Result<ObservedPage, ReadEncodingError> {
     Ok(observed)
 }
 
-pub fn decode_owner_cursor_page(bytes: &[u8]) -> Result<CursorPage, ReadEncodingError> {
+pub fn decode_owner_cursor_page(bytes: &[u8]) -> Result<OwnerPageFixture, ReadEncodingError> {
     Ok(decode(bytes)?.page)
 }
 
 pub fn replace_owner_cursor_page(
     bytes: &[u8],
-    page: &CursorPage,
+    page: &OwnerPageFixture,
 ) -> Result<Vec<u8>, ReadEncodingError> {
     let observed = decode(bytes)?;
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     #[derive(Serialize)]
     struct BorrowedPage<'a> {
-        page: &'a CursorPage,
+        page: &'a OwnerPageFixture,
         trace: &'a CanonicalQueryTrace,
     }
     bincode::serde::encode_to_vec(
@@ -52,7 +73,7 @@ pub fn replace_owner_cursor_page(
 pub fn with_empty_observation(page_bytes: Vec<u8>) -> Vec<u8> {
     // Decode the typed page without admission/validation: callers deliberately
     // construct oversized pages to test the receiver's admission boundary.
-    let (page, consumed): (CursorPage, usize) =
+    let (page, consumed): (OwnerPageFixture, usize) =
         bincode::serde::decode_from_slice(&page_bytes, bincode::config::standard())
             .expect("fixture contains a complete typed page");
     assert_eq!(consumed, page_bytes.len());
@@ -63,7 +84,8 @@ pub fn with_empty_observation(page_bytes: Vec<u8>) -> Vec<u8> {
 
 pub fn assert_empty_observation(bytes: &[u8], page: &CursorPage) {
     let observed = decode(bytes).expect("decode the complete owner observation");
-    assert_eq!(&observed.page, page);
+    assert_eq!((&observed.page.columns[..], &observed.page.rows[..], observed.page.has_more),
+        (page.columns(), page.rows(), page.has_more()));
     assert_eq!(observed.trace.physical_plan, "Scan");
     assert_eq!(observed.trace.index_used, None);
     assert_eq!(observed.trace.rows_examined, 0);

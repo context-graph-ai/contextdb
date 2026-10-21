@@ -70,7 +70,7 @@ fn malformed_retention_deferred_edge_count_reports_typed_store_corruption() {
         .unwrap_err();
     assert!(
         matches!(&error, Error::StoreCorrupted { path, reason }
-        if path == &persistence.path().display().to_string()
+        if path == persistence.path().display().to_string().as_str()
             && reason == "bincode retention count decode error: UnexpectedEnd { additional: 2 }"),
         "malformed retention count must report typed corruption, path, and decode reason: {error:?}"
     );
@@ -103,7 +103,7 @@ fn malformed_durable_purge_marker_bytes_report_typed_store_corruption() {
         let error = persistence.durable_purge_publication_marker().unwrap_err();
         assert!(
             matches!(&error, Error::StoreCorrupted { path, reason }
-            if path == &persistence.path().display().to_string()
+            if path == persistence.path().display().to_string().as_str()
                 && reason.contains("durable purge publication marker has the wrong length")),
             "malformed marker length {length} must name typed corruption and path: {error:?}"
         );
@@ -168,7 +168,7 @@ fn invalid_purge_generation_candidates_report_typed_store_corruption() {
         .unwrap();
     assert!(
         matches!(&error, Error::StoreCorrupted { path, reason }
-        if path == &persistence.path().display().to_string()
+        if path == persistence.path().display().to_string().as_str()
             && reason.contains("two replacement generations for one partition")),
         "duplicate candidate must report typed corruption: {error:?}"
     );
@@ -180,7 +180,7 @@ fn invalid_purge_generation_candidates_report_typed_store_corruption() {
         .unwrap();
     assert!(
         matches!(&error, Error::StoreCorrupted { path, reason }
-        if path == &persistence.path().display().to_string()
+        if path == persistence.path().display().to_string().as_str()
             && reason.contains("outside its affected partition: items.v")),
         "out-of-boundary candidate must report typed corruption: {error:?}"
     );

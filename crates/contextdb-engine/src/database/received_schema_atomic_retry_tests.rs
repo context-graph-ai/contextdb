@@ -789,13 +789,14 @@ fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
             )
         };
     let assert_visible = |db: &Database| {
-        let actual = db
+        let fixture_answer_61 = db
             .execute(
                 "SELECT id, parent_id, previous_body, body FROM mixed_children ORDER BY id",
                 &HashMap::new(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let actual = fixture_answer_61
+            .rows();
         assert_eq!(
             actual,
             vec![
@@ -817,7 +818,7 @@ fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
         assert_eq!(
             db.execute("SELECT id FROM mixed_parents", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(7)]]
         );
     };
@@ -830,7 +831,7 @@ fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
     assert!(
         db.execute("SELECT id FROM mixed_parents", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the parent exists only later in this unit"
     );
@@ -1242,13 +1243,14 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
             )
         };
     let assert_visible = |db: &Database| {
-        let actual = db
+        let visible_answer = db
             .execute(
                 "SELECT id, parent_id, previous_body, body FROM mixed_children ORDER BY id",
                 &HashMap::new(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let actual = visible_answer
+            .rows();
         assert_eq!(
             actual,
             vec![
@@ -1270,7 +1272,7 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
         assert_eq!(
             db.execute("SELECT id FROM mixed_parents", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(7)]]
         );
     };
@@ -1295,11 +1297,11 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
             let selected = handle.execute_in_tx(
                 context.tx, "SELECT body FROM mixed_children WHERE id = $id",
                 &HashMap::from([("id".to_string(), id.clone())]),
-            )?.rows;
+            )?.rows().to_vec();
             assert_eq!(selected, vec![vec![body.clone()]]);
             let parents = handle.execute_in_tx(
                 context.tx, "SELECT id FROM mixed_parents ORDER BY id", &HashMap::new(),
-            )?.rows;
+            )?.rows().to_vec();
             let expected = if id == Value::Int64(1) { Vec::new() }
                 else { vec![vec![Value::Int64(7)]] };
             assert_eq!(parents, expected, "a callback sees its source prefix, not the final parent overlay");
@@ -1317,12 +1319,12 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
     let rollback_commits = db.tx_mgr.commit_index_snapshot();
     let tx = db.begin().unwrap();
     db.execute_in_tx(tx, "INSERT INTO mixed_parents VALUES (999)", &HashMap::new()).unwrap();
-    assert_eq!(db.execute_in_tx(tx, "SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows,
+    assert_eq!(db.execute_in_tx(tx, "SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows(),
         vec![vec![Value::Int64(999)]]);
     db.rollback(tx).unwrap();
     assert_eq!(db.tx_mgr.published_read_snapshot(), rollback_root);
     assert_eq!(db.tx_mgr.commit_index_snapshot(), rollback_commits);
-    assert!(db.execute("SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows.is_empty());
+    assert!(db.execute("SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows().is_empty());
 
     if matches!(case, NativeMemoryReplayCase::GraphGuard) {
         changes.edges.push(EdgeChange {
@@ -1341,7 +1343,7 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
     assert!(
         db.execute("SELECT id FROM mixed_parents", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the parent exists only later in this unit"
     );
@@ -1374,8 +1376,8 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
         assert_eq!(format!("{:?}", db.table_meta(child)), schema_before);
         assert_eq!(format!("{:?}", db.published_state_snapshot_for_test()), publication_before);
         assert_eq!(format!("{:?}", db.trigger_audit_log()), audits_before);
-        assert!(db.execute("SELECT id FROM mixed_children", &HashMap::new()).unwrap().rows.is_empty());
-        assert!(db.execute("SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows.is_empty());
+        assert!(db.execute("SELECT id FROM mixed_children", &HashMap::new()).unwrap().rows().is_empty());
+        assert!(db.execute("SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows().is_empty());
         let refused_history = db.changes_since(before).unwrap();
         assert!(refused_history.rows.is_empty());
         assert!(refused_history.ddl.is_empty());
@@ -1395,7 +1397,7 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
         (Value::Int64(1), Value::Text(text_uuid.clone()), Vec::new()),
         (Value::Int64(2), Value::Uuid(later_uuid), vec![vec![Value::Int64(7)]]),
     ], "one callback per source row, with its authored type and current prefix");
-    assert_eq!(db.execute("SELECT id, body FROM mixed_unrelated", &HashMap::new()).unwrap().rows,
+    assert_eq!(db.execute("SELECT id, body FROM mixed_unrelated", &HashMap::new()).unwrap().rows(),
         vec![vec![Value::Int64(99), Value::Text("preserved".to_string())]]);
     assert_eq!(outcome.applied_rows, 3);
     assert_eq!(outcome.skipped_rows, 0);
@@ -1585,7 +1587,7 @@ mod edge_column_owner_contract {
     fn sql(db: &Database, query: &str) -> Vec<Vec<Value>> {
         db.execute(query, &HashMap::new())
             .unwrap_or_else(|e| panic!("{query}: {e:?}"))
-            .rows
+            .rows().to_vec()
     }
 
     fn open(path: &std::path::Path) -> Database {
@@ -1633,15 +1635,17 @@ mod edge_column_owner_contract {
     // Use a surviving edge-shaped table to ask the global graph after links
     // loses its shape or is dropped. A missing-table error cannot mask a ghost.
     fn assert_links(db: &Database, count: usize) {
-        let actual = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
-            &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap().rows;
+        let fixture_answer_62 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
+            &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap();
+        let actual = fixture_answer_62.rows();
         assert_eq!(
             actual,
             vec![vec![Value::Uuid(TARGET)]; count],
             "exact forward bindings including independent owners"
         );
-        let reverse = db.execute("SELECT s FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE b.id = $t COLUMNS (a.id AS s))",
-            &HashMap::from([("t".into(), Value::Uuid(TARGET))])).unwrap().rows;
+        let fixture_answer_63 = db.execute("SELECT s FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE b.id = $t COLUMNS (a.id AS s))",
+            &HashMap::from([("t".into(), Value::Uuid(TARGET))])).unwrap();
+        let reverse = fixture_answer_63.rows();
         assert_eq!(
             reverse,
             vec![vec![Value::Uuid(SOURCE)]; count],
@@ -1836,8 +1840,9 @@ mod edge_column_owner_contract {
                     let tx = db.begin().unwrap();
                     db.delete_edge(tx, SOURCE, TARGET, "LINK").unwrap();
                     db.commit(tx).unwrap();
-                    let actual = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
-                        &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap().rows;
+                    let fixture_answer_64 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
+                        &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap();
+                    let actual = fixture_answer_64.rows();
                     assert_eq!(
                         actual,
                         if column == "note" {
@@ -2097,13 +2102,14 @@ mod edge_column_owner_contract {
                 } else {
                     "previous_body"
                 };
-                let actual = handle
+                let fixture_answer_65 = handle
                     .execute_in_tx(
                         context.tx,
                         &format!("SELECT {name} FROM prefix_notes WHERE id = $id"),
                         &HashMap::from([("id".into(), id.clone())]),
-                    )?
-                    .rows;
+                    )?;
+                let actual = fixture_answer_65
+                    .rows();
                 assert_eq!(
                     actual,
                     vec![vec![Value::Text("prefix".into())]],

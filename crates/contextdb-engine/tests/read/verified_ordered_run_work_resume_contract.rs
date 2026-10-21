@@ -116,7 +116,7 @@ const DECLARED_SESSION_MEMORY: usize = 32 * 1024 * 1024;
 
 fn ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -149,10 +149,10 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
         .expect("cached direct vector query completes");
     let warm_work = warm_scope.counters();
     drop(warm_scope);
-    assert_eq!(warm.result.rows, expected.result.rows);
+    assert_eq!(warm.result.rows(), expected.result.rows());
     assert_eq!(
         cold_work.decoded_rows,
-        expected.result.rows.len() as u64,
+        expected.result.rows().len() as u64,
         "the cold range proof does not decode posting row bodies: {cold_work:?}"
     );
     assert_eq!(warm_work.decoded_rows, cold_work.decoded_rows);
@@ -161,7 +161,7 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
         "the cached run reuses authenticated posting pages: cold={cold_work:?}, warm={warm_work:?}"
     );
     assert!(
-        warm.result.trace.rows_examined >= 5,
+        warm.result.trace().rows_examined >= 5,
         "cached postings still count as examined work"
     );
     drop(cold);
@@ -201,7 +201,7 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
     let resumed_work = resumed_scope.counters();
     drop(resumed_scope);
     arm_verified_ordered_run_eviction_for_test(&resumed, 0);
-    assert_eq!(actual.result.rows, expected.result.rows);
+    assert_eq!(actual.result.rows(), expected.result.rows());
     assert_eq!(ids(&actual.result), vec![0, 1, 2, 3, 4]);
     // Each identity is delivered exactly once, from the authenticated walk, and
     // never from the physical index: the resume decodes no row body the cold
@@ -279,9 +279,9 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
         "verified run work: cold={cold_work:?} warm={warm_work:?} resumed={resumed_work:?}; \
          examined cold={} warm={} resumed={}; work ceiling cold={cold_ceiling} \
          resumed={resumed_ceiling}",
-        expected.result.trace.rows_examined,
-        warm.result.trace.rows_examined,
-        actual.result.trace.rows_examined
+        expected.result.trace().rows_examined,
+        warm.result.trace().rows_examined,
+        actual.result.trace().rows_examined
     );
 }
 
@@ -417,7 +417,7 @@ fn measure_scale(rows: usize) -> ScaleMeasurement {
     drop(scope);
     arm_verified_ordered_run_eviction_for_test(&reader, 0);
     assert_eq!(
-        answer.result.rows.len(),
+        answer.result.rows().len(),
         rows,
         "every row of the range is delivered exactly once"
     );
@@ -431,7 +431,7 @@ fn measure_scale(rows: usize) -> ScaleMeasurement {
     ScaleMeasurement {
         rows,
         counters,
-        examined: answer.result.trace.rows_examined,
+        examined: answer.result.trace().rows_examined,
     }
 }
 
@@ -497,10 +497,10 @@ fn a_result_limited_read_succeeds_when_the_whole_matching_range_exceeds_the_budg
         .expect("a result-limited read is answered from a bounded working window");
     let counters = scope.counters();
     drop(scope);
-    assert_eq!(answer.result.rows.len(), 3);
+    assert_eq!(answer.result.rows().len(), 3);
     eprintln!(
         "result-limited read over {rows} wide postings: {counters:?} examined={}",
-        answer.result.trace.rows_examined
+        answer.result.trace().rows_examined
     );
     // The answer is authenticated, so it costs proof work, and it costs far
     // less than proving the whole range would.
@@ -593,26 +593,26 @@ fn measure_paged_scale(rows: usize) -> (PagedMeasurement, PagedMeasurement, usiz
         let mut second = reader
             .open_cursor(&wide_statement(rows), &group_params('b'), page)
             .expect("open the second paged cursor");
-        let mut first_ids = cursor_page_ids(&first.first_page.page.rows);
-        let mut second_ids = cursor_page_ids(&second.first_page.page.rows);
-        let mut first_more = first.first_page.page.has_more;
-        let mut second_more = second.first_page.page.has_more;
+        let mut first_ids = cursor_page_ids(&first.first_page.page_for_test().rows);
+        let mut second_ids = cursor_page_ids(&second.first_page.page_for_test().rows);
+        let mut first_more = first.first_page.page_for_test().has_more;
+        let mut second_more = second.first_page.page_for_test().has_more;
         while first_more || second_more {
             if first_more {
                 let fetched = first
                     .cursor
                     .fetch(Some(page))
                     .expect("the first paged cursor fetches its next page");
-                first_ids.extend(cursor_page_ids(&fetched.page.rows));
-                first_more = fetched.page.has_more;
+                first_ids.extend(cursor_page_ids(&fetched.page_for_test().rows));
+                first_more = fetched.page_for_test().has_more;
             }
             if second_more {
                 let fetched = second
                     .cursor
                     .fetch(Some(page))
                     .expect("the second paged cursor fetches its next page");
-                second_ids.extend(cursor_page_ids(&fetched.page.rows));
-                second_more = fetched.page.has_more;
+                second_ids.extend(cursor_page_ids(&fetched.page_for_test().rows));
+                second_more = fetched.page_for_test().has_more;
             }
         }
         first.cursor.close().expect("the first paged cursor closes");
@@ -772,20 +772,18 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
                 .map(|opened| {
                     opened
                         .first_page
-                        .page
-                        .try_clone(
+                        .try_clone_page_for_test(
                             reader
                                 .request_read_memory_for_test()
                                 .expect("admit the fixture page copy reader"),
                         )
                         .expect("share the admitted first page")
-                        .into_public()
-                        .rows
+                        .rows().to_vec()
                 })
                 .collect::<Vec<_>>();
             let mut more = cursors
                 .iter()
-                .map(|opened| opened.first_page.page.has_more)
+                .map(|opened| opened.first_page.page_for_test().has_more)
                 .collect::<Vec<_>>();
             while more.iter().any(|has_more| *has_more) {
                 for (index, opened) in cursors.iter_mut().enumerate() {
@@ -796,9 +794,9 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
                         .cursor
                         .fetch(Some(page))
                         .expect("a cursor continues after its window is evicted");
-                    let terminal = fetched.page.into_public();
-                    collected[index].extend(terminal.rows);
-                    more[index] = terminal.has_more;
+                    let terminal = fetched.into_public_page_for_test().expect("publish the fetched fixture page");
+                    collected[index].extend(terminal.rows().iter().cloned());
+                    more[index] = terminal.has_more();
                 }
             }
             collected
@@ -883,15 +881,15 @@ fn drain_cursor(
     opened: &mut contextdb_engine::direct_file_reader::test_seams::DirectCursorOpen,
     page: NonZeroUsize,
 ) -> Vec<i64> {
-    let mut delivered = cursor_page_ids(&opened.first_page.page.rows);
-    let mut more = opened.first_page.page.has_more;
+    let mut delivered = cursor_page_ids(&opened.first_page.page_for_test().rows);
+    let mut more = opened.first_page.page_for_test().has_more;
     while more {
         let fetched = opened
             .cursor
             .fetch(Some(page))
             .expect("a paged cursor fetches its next page");
-        delivered.extend(cursor_page_ids(&fetched.page.rows));
-        more = fetched.page.has_more;
+        delivered.extend(cursor_page_ids(&fetched.page_for_test().rows));
+        more = fetched.page_for_test().has_more;
     }
     delivered
 }

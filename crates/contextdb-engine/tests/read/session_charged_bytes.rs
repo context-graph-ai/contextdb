@@ -9,13 +9,13 @@ fn exercise(reader: &ReadSession, route: ReadRoute) {
     let first = reader
         .open_cursor(query, &HashMap::new())
         .expect("first cursor");
-    assert!(first.first_page().has_more, "three rows exceed one page");
+    assert!(first.first_page().has_more(), "three rows exceed one page");
     let one = reader.charged_bytes().expect("first cursor charge");
     assert!(one > baseline, "hydrated rows retain a nonzero charge");
     let second = reader
         .open_cursor(query, &HashMap::new())
         .expect("second cursor");
-    assert!(second.first_page().has_more);
+    assert!(second.first_page().has_more());
     let two = reader.charged_bytes().expect("both cursor charges");
     assert!(
         two >= one,

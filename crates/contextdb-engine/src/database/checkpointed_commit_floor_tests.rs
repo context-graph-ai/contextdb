@@ -148,7 +148,7 @@ fn append(db: &Database, from: u64, count: u64, checkpointed: bool) {
         let seen = db
             .execute_in_tx(tx, "SELECT event_count FROM event_context_sessions WHERE context_id = $c AND connector_id = 'claude' AND session_ref = 'sess'", &p)
             .unwrap();
-        let sql = if seen.rows.is_empty() {
+        let sql = if seen.rows().is_empty() {
             "INSERT INTO event_context_sessions VALUES ($c, 'claude', 'sess', $n, NULL)"
         } else {
             "UPDATE event_context_sessions SET event_count = $n WHERE context_id = $c AND connector_id = 'claude' AND session_ref = 'sess'"
@@ -524,7 +524,7 @@ fn fingerprint(db: &Database) -> Vec<String> {
         "SELECT id FROM events WHERE context_id = $c AND connector_id = 'claude' AND session_ref = 's0' ORDER BY seq",
     ] {
         let result = db.execute(sql, &params()).expect("read recovered state");
-        lines.push(format!("{sql} => {:?}", result.rows));
+        lines.push(format!("{sql} => {:?}", result.rows()));
     }
     lines.push(format!("lsn {}", db.current_lsn().0));
     let tables = [

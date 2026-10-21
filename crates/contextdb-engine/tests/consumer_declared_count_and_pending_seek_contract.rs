@@ -51,11 +51,11 @@ fn stream_counts(db: &Database, id: u128, expected: &[(&str, &str, i64)]) -> u64
         execute(db, GROUP_COUNT, &params(&[("context_id", context(id))]))
     });
     assert_eq!(
-        answer.columns,
+        answer.columns(),
         ["connector_id", "source_instance_ref", "event_count"]
     );
     let mut actual = answer
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [
@@ -73,7 +73,7 @@ fn stream_counts(db: &Database, id: u128, expected: &[(&str, &str, i64)]) -> u64
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
     assert_eq!(
-        answer.trace.maintained_count.as_deref(),
+        answer.trace().maintained_count.as_deref(),
         Some(&MaintainedCountDisclosure::Used {
             table: "events".into(),
             columns: vec![
@@ -90,9 +90,9 @@ fn stream_counts(db: &Database, id: u128, expected: &[(&str, &str, i64)]) -> u64
     );
     println!(
         "grouped stream count rows_examined={} history={:?}",
-        answer.trace.rows_examined, work.history
+        answer.trace().rows_examined, work.history
     );
-    answer.trace.rows_examined
+    answer.trace().rows_examined
 }
 
 #[test]
@@ -146,7 +146,8 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
         execute(&historical_db, count_insert, &row);
     }
     let historical_snapshot = historical_db.snapshot();
-    let historical_count = execute(&historical_db, count_sql, &count_bindings).rows;
+    let historical_answer = execute(&historical_db, count_sql, &count_bindings);
+    let historical_count = historical_answer.rows();
     assert_eq!(historical_count, vec![vec![Value::Int64(3)]]);
     for ordinal in 3..5_i64 {
         let mut row = count_bindings.clone();
@@ -158,7 +159,8 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
         ]));
         execute(&historical_db, count_insert, &row);
     }
-    let current_count = execute(&historical_db, count_sql, &count_bindings).rows;
+    let current_answer = execute(&historical_db, count_sql, &count_bindings);
+    let current_count = current_answer.rows();
     assert_ne!(
         current_count, historical_count,
         "the historical fixture appends matching rows after its snapshot"
@@ -167,7 +169,7 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
         historical_db
             .execute_at_snapshot(count_sql, &count_bindings, historical_snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         historical_count,
         "a historical exact-key count returns its snapshot's total, never the current root's total"
     );
@@ -215,9 +217,9 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
         count_observations.push((
             completed,
             neighbours,
-            answer.rows,
-            answer.trace.maintained_count.as_deref().cloned(),
-            answer.trace.rows_examined,
+            answer.rows().to_vec(),
+            answer.trace().maintained_count.as_deref().cloned(),
+            answer.trace().rows_examined,
         ));
         count_db.close().unwrap();
     }
@@ -346,14 +348,14 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
         );
         let page = cursor.first_page();
         assert!(
-            !page.has_more,
+            !page.has_more(),
             "all three groups fit the default first page"
         );
         assert_eq!(
-            page.columns,
+            page.columns(),
             ["connector_id", "source_instance_ref", "event_count"]
         );
-        let mut rows = page.rows.clone();
+        let mut rows = page.rows().to_vec();
         rows.sort_by(|left, right| {
             let key = |row: &[Value]| match row {
                 [Value::Text(connector), Value::Text(source), Value::Int64(_)] => {
@@ -411,9 +413,9 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
             contextdb_core::read_contract::ReadRoute::File
         );
         let page = cursor.first_page();
-        assert!(!page.has_more);
+        assert!(!page.has_more());
         assert_eq!(
-            page.columns,
+            page.columns(),
             [
                 "context_id",
                 "connector_id",
@@ -422,7 +424,7 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
             ]
         );
         let mut groups = page
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.as_slice() {
                 [
@@ -494,7 +496,7 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
         );
         let empty_page = empty_cursor.first_page();
         assert_eq!(
-            empty_page.columns,
+            empty_page.columns(),
             [
                 "context_id",
                 "connector_id",
@@ -503,10 +505,10 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
             ]
         );
         assert!(
-            empty_page.rows.is_empty(),
+            empty_page.rows().is_empty(),
             "an empty table creates no counted group"
         );
-        assert!(!empty_page.has_more);
+        assert!(!empty_page.has_more());
         let empty_trace = empty_cursor.trace();
         println!(
             "read-only unpinned empty groups=0 rows_examined={} maintained_count={:?}",
@@ -557,12 +559,12 @@ fn grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen
             contextdb_core::read_contract::ReadRoute::File
         );
         let page = cursor.first_page();
-        assert!(!page.has_more);
+        assert!(!page.has_more());
         assert_eq!(
-            page.columns,
+            page.columns(),
             ["connector_id", "source_instance_ref", "event_count"]
         );
-        let mut rows = page.rows.clone();
+        let mut rows = page.rows().to_vec();
         rows.sort_by(|left, right| match (&left[1], &right[1]) {
             (Value::Text(left), Value::Text(right)) => left.cmp(right),
             other => panic!("exact grouped source names: {other:?}"),
@@ -670,7 +672,7 @@ fn pending_rows(db: &Database, pending: bool, expected: &[(&str, &str, &str)]) -
         )
     });
     assert_eq!(
-        answer.columns,
+        answer.columns(),
         ["connector_id", "source_instance_ref", "session_ref"]
     );
     let expected = expected
@@ -684,20 +686,20 @@ fn pending_rows(db: &Database, pending: bool, expected: &[(&str, &str, &str)]) -
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        answer.rows, expected,
+        answer.rows(), expected,
         "boolean equality selects exactly its declared Context and generation in index suffix order"
     );
-    assert_eq!(answer.trace.index_used.as_deref(), Some(PENDING_INDEX));
-    assert_eq!(answer.trace.physical_plan, "IndexScan");
+    assert_eq!(answer.trace().index_used.as_deref(), Some(PENDING_INDEX));
+    assert_eq!(answer.trace().physical_plan, "IndexScan");
     assert!(
-        answer.trace.sort_elided,
+        answer.trace().sort_elided,
         "the declared index already supplies the requested suffix order"
     );
     println!(
         "pending seek rows_examined={} history={:?}",
-        answer.trace.rows_examined, work.history
+        answer.trace().rows_examined, work.history
     );
-    (answer.trace.rows_examined, work.history.row_versions)
+    (answer.trace().rows_examined, work.history.row_versions)
 }
 
 #[test]
@@ -862,20 +864,20 @@ fn an_in_transaction_context_count_is_served_from_the_declaration() {
             .execute_in_tx(tx, EVENTS_COUNT, &params(&[("context_id", context(1))]))
             .unwrap();
         let expected = i64::try_from(committed).unwrap() + 3 - 2;
-        assert_eq!(answer.rows, vec![vec![Value::Int64(expected)]]);
+        assert_eq!(answer.rows(), vec![vec![Value::Int64(expected)]]);
         println!(
             "in-tx context count committed={committed} rows_examined={} maintained_count={:?}",
-            answer.trace.rows_examined, answer.trace.maintained_count
+            answer.trace().rows_examined, answer.trace().maintained_count
         );
         assert_eq!(
-            answer.trace.maintained_count.as_deref(),
+            answer.trace().maintained_count.as_deref(),
             Some(&MaintainedCountDisclosure::Used {
                 table: "events".into(),
                 columns: count_columns.clone(),
             }),
             "the declared count answers the writer's in-transaction read"
         );
-        examined.push(answer.trace.rows_examined);
+        examined.push(answer.trace().rows_examined);
         db.rollback(tx).unwrap();
         db.close().unwrap();
     }
@@ -925,12 +927,12 @@ fn an_in_transaction_count_after_a_value_delete_stays_exact() {
             )
             .unwrap();
         assert_eq!(
-            answer.rows,
+            answer.rows().to_vec(),
             vec![vec![Value::Int64(expected)]],
             "context {context_id}"
         );
         assert_eq!(
-            answer.trace.maintained_count.as_deref(),
+            answer.trace().maintained_count.as_deref(),
             Some(&MaintainedCountDisclosure::DeclaredNotServed {
                 table: "events".into(),
                 columns: vec![("context_id".into(), SortDirection::Asc)],
@@ -981,7 +983,7 @@ fn an_in_transaction_count_answers_its_own_snapshot_after_another_commit() {
     let before_other = db
         .execute_in_tx(tx_a, EVENTS_COUNT, &params(&[("context_id", context(1))]))
         .unwrap();
-    assert_eq!(before_other.rows, vec![vec![Value::Int64(32)]]);
+    assert_eq!(before_other.rows(), vec![vec![Value::Int64(32)]]);
     // Another transaction commits two more context-1 rows.
     let tx_b = db.begin().unwrap();
     for n in 0..2 {
@@ -1009,20 +1011,20 @@ fn an_in_transaction_count_answers_its_own_snapshot_after_another_commit() {
         .unwrap();
     println!(
         "in-tx count after another commit: served {:?} ({:?}), ordinary {:?}",
-        served.rows, served.trace.maintained_count, ordinary.rows
+        served.rows(), served.trace().maintained_count, ordinary.rows()
     );
     assert_eq!(
-        served.rows, ordinary.rows,
+        served.rows(), ordinary.rows(),
         "the declared count and the ordinary count agree on the transaction's view"
     );
     assert!(
         matches!(
-            served.trace.maintained_count.as_deref(),
+            served.trace().maintained_count.as_deref(),
             Some(MaintainedCountDisclosure::Used { .. })
                 | Some(MaintainedCountDisclosure::DeclaredNotServed { .. })
         ),
         "the read discloses which route answered: {:?}",
-        served.trace.maintained_count
+        served.trace().maintained_count
     );
     db.rollback(tx_a).unwrap();
     db.close().unwrap();
@@ -1078,10 +1080,10 @@ fn an_in_transaction_count_matches_float_keys_by_index_order() {
         &zero,
     );
     let two = vec![vec![Value::Int64(2)]];
-    assert_eq!(served.rows, two, "the served count sees -0.0 as 0.0");
-    assert_eq!(ordinary.rows, two, "the ordinary count sees -0.0 as 0.0");
+    assert_eq!(served.rows(), two, "the served count sees -0.0 as 0.0");
+    assert_eq!(ordinary.rows(), two, "the ordinary count sees -0.0 as 0.0");
     assert_eq!(
-        committed.rows, two,
+        committed.rows(), two,
         "the committed count keys -0.0 and 0.0 as one value"
     );
     db.close().unwrap();

@@ -1,0 +1,25 @@
+name: Docs Dev
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: docs-dev
+  cancel-in-progress: true
+
+jobs:
+  dispatch-docs:
+    if: github.repository == 'context-graph-ai/contextdb' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to website repo
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
+        with:
+          token: ${{ secrets.WEBSITE_DEPLOY_TOKEN }}
+          repository: context-graph-ai/contextdb-website
+          event-type: docs-update
+          client-payload: '{"ref": "refs/heads/dev"}'

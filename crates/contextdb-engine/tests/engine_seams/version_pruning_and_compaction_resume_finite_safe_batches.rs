@@ -36,7 +36,7 @@ fn survivors(db: &contextdb_engine::Database, old: contextdb_core::SnapshotId, i
             old
         )
         .unwrap()
-        .rows,
+        .rows(),
         (0..256)
             .map(|id| vec![Value::Int64(id), Value::Int64(0)])
             .collect::<Vec<_>>(),
@@ -137,7 +137,7 @@ fn version_pruning_and_compaction_resume_finite_safe_batches() {
                 &empty()
             )
             .unwrap()
-            .rows,
+            .rows(),
         pinned_oracle
     );
     let db = open(&path, None);
@@ -166,7 +166,7 @@ fn version_pruning_and_compaction_resume_finite_safe_batches() {
                 &empty()
             )
             .unwrap()
-            .rows,
+            .rows(),
         pinned_oracle
     );
     let (retention, first_retention_work) = observe(|| db.run_pruning_cycle_checked());
@@ -193,7 +193,7 @@ fn version_pruning_and_compaction_resume_finite_safe_batches() {
         external
             .execute("SELECT id FROM parents ORDER BY id", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         (1..=258)
             .map(|id| vec![Value::Int64(id)])
             .collect::<Vec<_>>()
@@ -216,7 +216,7 @@ fn version_pruning_and_compaction_resume_finite_safe_batches() {
                     &empty()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("d".repeat(65536))]]
         );
     }
@@ -225,7 +225,7 @@ fn version_pruning_and_compaction_resume_finite_safe_batches() {
         external
             .execute("SELECT body FROM current_versions WHERE id = 255", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("r".repeat(8192))]],
         "late old body read remains intact after physical displacement without a local pin"
     );

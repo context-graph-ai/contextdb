@@ -36,13 +36,13 @@ fn note_body(db: &Database, id: Uuid) -> String {
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .expect("query note");
-    assert_eq!(result.rows.len(), 1, "exactly one note for this id");
+    assert_eq!(result.rows().len(), 1, "exactly one note for this id");
     let column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "body")
         .expect("body column present");
-    match &result.rows[0][column] {
+    match &result.rows()[0][column] {
         Value::Text(body) => body.clone(),
         other => panic!("unexpected body value: {other:?}"),
     }

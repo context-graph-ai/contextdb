@@ -519,7 +519,7 @@ mod completed_query_refusal_tests {
         let inbox = ConnectionInbox::new(None);
         let original = before;
         let pressure = if constrain_parent {
-            Some(ReadCredit::try_new(parent.clone(),
+            Some(ReadCredit::try_new(parent.original_owner(),
                 (ReadLimits::SHIPPED_MEMORY - before - 64 * 1024) as usize,
                 "reader", "test_pressure", "test pressure").unwrap())
         } else { None };
@@ -617,7 +617,7 @@ mod completed_query_refusal_tests {
         let database = Database::open_memory();
         let parent = database.query_request_provider();
         let before = parent.charged_bytes();
-        let pressure = ReadCredit::try_new(parent.clone(),
+        let pressure = ReadCredit::try_new(parent.original_owner(),
             (ReadLimits::SHIPPED_MEMORY - before) as usize, "reader", "test_pressure", "test pressure").unwrap();
         let held = parent.charged_bytes();
         let inbox = ConnectionInbox::new(None);

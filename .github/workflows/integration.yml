@@ -1,0 +1,126 @@
+name: Extended integration
+
+on:
+  workflow_call:
+    inputs:
+      enabled:
+        type: boolean
+        default: true
+      impact_reason:
+        type: string
+        default: manual-integration
+      path_classes:
+        type: string
+        default: '{}'
+      performance_qualification:
+        type: string
+        default: pending-controlled-native-qualification
+      gate_mode:
+        type: string
+        default: full
+      run_default:
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      gate_mode:
+        description: Full original qualification or bounded normal correctness (policy proposal)
+        type: choice
+        options: [full, normal]
+        default: full
+      run_default:
+        description: Include the default workspace/redb suite before nightly feature fixtures
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: ""
+  CI_INTEGRATION_ENABLED: ${{ github.event_name == 'workflow_dispatch' || inputs.enabled }}
+  CI_INTEGRATION_DEFAULT: ${{ inputs.run_default }}
+  CI_GATE_MODE: ${{ inputs.gate_mode }}
+
+jobs:
+  plan:
+    name: inventory and classified routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      enabled: ${{ steps.plan.outputs.enabled }}
+      run_default: ${{ steps.plan.outputs.run_default }}
+      gate_mode: ${{ steps.plan.outputs.gate_mode }}
+      dedup_sha: ${{ steps.plan.outputs.dedup_sha }}
+      dedup_reason: ${{ steps.plan.outputs.dedup_reason }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      source_fingerprint: ${{ steps.plan.outputs.source_fingerprint }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: plan
+        env:
+          IMPACT_REASON: ${{ inputs.impact_reason }}
+          PATH_CLASSES: ${{ inputs.path_classes }}
+          PERFORMANCE_QUALIFICATION: ${{ inputs.performance_qualification }}
+        run: python3 -B scripts/ci-integration.py plan
+
+  slice:
+    needs: plan
+    if: needs.plan.outputs.enabled == 'true'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ needs.plan.outputs.gate_mode == 'normal' && 30 || 330 }}
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk space
+        run: bash scripts/ci-free-disk.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: integration-${{ matrix.id }}-debug0-jobs2
+          workspaces: |
+            . -> target
+            crates/contextdb-redb -> ../../target/redb
+      - name: Run named integration slice
+        env:
+          CI_INTEGRATION_SLICE: ${{ matrix.id }}
+          CI_INTEGRATION_PLAN: ${{ toJSON(matrix) }}
+        run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: extended-integration-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-integration-out/
+          if-no-files-found: error
+          retention-days: 14
+
+  result:
+    name: required integration results
+    needs: [plan, slice]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - env:
+          CI_INTEGRATION_NEEDS: ${{ toJSON(needs) }}
+        run: python3 -B scripts/ci-integration.py required

@@ -67,7 +67,7 @@ fn nearest(db: &Database, target: i64, mode: &str) -> Result<Vec<Vec<Value>>, Er
         ),
         &HashMap::from([("q".into(), Value::Vector(vector(target)))]),
     )
-    .map(|result| result.rows)
+    .map(|result| result.rows().to_vec())
 }
 
 fn insert_batch(db: &Database, first: i64, rows: i64) {
@@ -232,9 +232,9 @@ fn damage_past_the_first_uncovered_record_is_reported_by_the_first_indexed_read(
             &HashMap::new(),
         )
         .unwrap();
-    let column = |name: &str| shown.columns.iter().position(|c| c == name).unwrap();
+    let column = |name: &str| shown.columns().iter().position(|c| c == name).unwrap();
     assert_eq!(
-        shown.rows[0][column("availability_reason")],
+        shown.rows()[0][column("availability_reason")],
         Value::Text("corrupt_changes".into())
     );
     assert_eq!(

@@ -220,7 +220,7 @@ fn assert_clean(db: &Database, obsolete_lsns: &[Lsn], untouched: &serde_json::Va
     assert_eq!(
         db.execute("SELECT value FROM currency_scalar", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64((VERSIONS - 1) as i64)]]
     );
 }
@@ -475,7 +475,7 @@ fn currency_cleanup_reclaims_eligible_generations_at_its_durable_boundary() {
                 &HashMap::new()
             )
             .unwrap()
-            .rows
+            .rows()
             .len(),
             3
         );

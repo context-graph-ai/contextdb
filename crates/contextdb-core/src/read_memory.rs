@@ -282,6 +282,9 @@ impl<T> std::ops::Deref for NativeReadMemory<T> {
 impl<T> NativeReadMemory<T> {
     /// The same strong capability, with no forwarding allocation or new child.
     pub fn owner(&self) -> ReadMemoryOwner { self.owner.clone() }
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn strong_count_for_test(&self) -> usize { self.owner.strong_count_for_test() }
 }
 
 struct NativeReadBlock<T, I> {
@@ -309,6 +312,8 @@ struct NativeVtable {
     reserve_native: NativeReserve,
     reserve: unsafe fn(NonNull<()>, usize, &'static str, &'static str, &'static str) -> Result<()>,
     release: unsafe fn(NonNull<()>, usize),
+    #[cfg(any(test, feature = "test-seams"))]
+    strong_count: unsafe fn(NonNull<()>) -> usize,
     clone_owner: unsafe fn(NonNull<()>),
     drop_owner: unsafe fn(NonNull<()>),
 }
@@ -366,6 +371,8 @@ impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T,
         reserve_native: Self::reserve_native,
         reserve: Self::reserve,
         release: Self::release,
+        #[cfg(any(test, feature = "test-seams"))]
+        strong_count: Self::strong_count,
         clone_owner: Self::clone_owner,
         drop_owner: Self::drop_owner,
     };
@@ -413,6 +420,11 @@ impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T,
     unsafe fn release(block: NonNull<()>, bytes: usize) {
         // SAFETY: same strong-owner/type invariant as reserve.
         unsafe { block.cast::<Self>().as_ref().payload.release(bytes) };
+    }
+    #[cfg(any(test, feature = "test-seams"))]
+    unsafe fn strong_count(block: NonNull<()>) -> usize {
+        // SAFETY: the observing strong owner pins this exact typed block.
+        unsafe { block.cast::<Self>().as_ref().owners.load(Ordering::SeqCst) }
     }
     unsafe fn clone_owner(block: NonNull<()>) {
         // SAFETY: the calling strong owner excludes destruction.
@@ -684,6 +696,17 @@ impl ReadMemoryOwner {
         match &self.0 {
             OwnerKind::Legacy(owner, _) => Arc::as_ptr(owner) as *const () as usize,
             OwnerKind::Native(owner) => owner.block.as_ptr() as usize,
+        }
+    }
+
+    /// Inspect the real control count without retaining another observer alias.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn strong_count_for_test(&self) -> usize {
+        match &self.0 {
+            OwnerKind::Legacy(owner, _) => Arc::strong_count(owner),
+            // SAFETY: this strong owner pins its correctly typed control.
+            OwnerKind::Native(owner) => unsafe { (owner.vtable.strong_count)(owner.block) },
         }
     }
 

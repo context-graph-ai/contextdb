@@ -56,7 +56,7 @@ fn nearest(db: &Database, target: i64) -> Vec<Vec<Value>> {
         &HashMap::from([("q".into(), Value::Vector(vector(target)))]),
     )
     .unwrap()
-    .rows
+    .rows().to_vec()
 }
 
 /// A built route over 16 rows, then `suffix` rows committed after the build

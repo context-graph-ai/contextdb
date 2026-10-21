@@ -52,7 +52,7 @@ fn submit_blob_job(db: &Database, job_id: &str, hash: &BlobHash) {
 fn work_job_ids(db: &Database) -> Vec<Vec<Value>> {
     db.execute("SELECT job_id FROM work_jobs ORDER BY job_id", &params())
         .expect("read surviving work jobs")
-        .rows
+        .rows().to_vec()
 }
 
 fn exact_blob_roles(db: &Database, hash: &BlobHash) -> BTreeSet<String> {

@@ -86,7 +86,7 @@ fn kept_rows(path: &std::path::Path) -> usize {
                     .limits
                     .limits
                     .memory,
-            );
+            ).expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");

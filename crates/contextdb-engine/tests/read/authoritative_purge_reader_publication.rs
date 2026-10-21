@@ -134,7 +134,7 @@ fn different_roots_without_platform_root_refuse_unsafe_reclamation_and_purge() {
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("secret".to_owned())]],
         );
         return;
@@ -347,7 +347,7 @@ fn mixed_root_purge(reader_supplied: bool) {
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("secret".to_owned())]]
         );
         let mut cursor = session
@@ -356,7 +356,7 @@ fn mixed_root_purge(reader_supplied: bool) {
                 &HashMap::new(),
             )
             .unwrap();
-        assert!(cursor.first_page().has_more);
+        assert!(cursor.first_page().has_more());
 
         let writer = Database::open_with_options(
             &path,
@@ -386,7 +386,7 @@ fn mixed_root_purge(reader_supplied: bool) {
             session
                 .execute("SELECT payload FROM unrelated_rows", &HashMap::new())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("kept".to_owned())]]
         );
         writer.close().unwrap();
@@ -395,7 +395,7 @@ fn mixed_root_purge(reader_supplied: bool) {
             fresh
                 .execute("SELECT id FROM erased_rows", &HashMap::new())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
     }
@@ -477,7 +477,7 @@ fn an_unreadable_candidate_refuses_purge_without_blocking_database_open() {
         writer
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         3,
     );
@@ -691,7 +691,7 @@ fn owner_publication_honors_active_deadline_before_any_purge_durability() {
         session
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         3,
         "deadline refusal precedes durable erasure and changes no row"
@@ -706,7 +706,7 @@ fn owner_publication_honors_active_deadline_before_any_purge_durability() {
         session
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     database.close().unwrap();
@@ -786,7 +786,7 @@ fn held_owner_publication_does_not_hold_the_commit_mutex_and_purge_waits() {
         session
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     database.close().unwrap();
@@ -826,7 +826,7 @@ fn owner_cursor_paused_before_carrier_publication_cannot_emit_after_purge() {
             &HashMap::new(),
         )
         .unwrap();
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
 
     let fetch = std::thread::spawn(move || {
         let mut cursor = cursor;
@@ -872,14 +872,14 @@ fn owner_cursor_paused_before_carrier_publication_cannot_emit_after_purge() {
         session
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert_eq!(
         session
             .execute("SELECT payload FROM unrelated_rows", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("kept".to_owned())]]
     );
     database.close().unwrap();
@@ -897,7 +897,7 @@ fn cross_process_reader_child() {
         session
             .execute("SELECT payload FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         3
     );
@@ -1124,7 +1124,7 @@ fn stopped_direct_publication_releases_on_process_death_without_holding_commit_l
         fresh
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
 }
@@ -1173,7 +1173,7 @@ fn crash_before_durable_commit_recovers_as_rollback() {
         session
             .execute("SELECT payload FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         3
     );
@@ -1205,7 +1205,7 @@ fn crash_after_durable_commit_recovers_as_committed_erasure() {
         fresh
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
 }
@@ -1265,7 +1265,7 @@ fn companion_inspection_failure_refuses_purge_with_database_path() {
         writer
             .execute("SELECT id FROM erased_rows", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         3,
         "a refused purge leaves its rows intact"

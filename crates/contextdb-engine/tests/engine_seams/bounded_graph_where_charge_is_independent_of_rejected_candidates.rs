@@ -130,7 +130,7 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
             let baseline = db.accountant().usage().used;
             db.accountant().reset_high_water_for_test();
             let rows = if mode == 0 {
-                db.execute(&identity_sql, &identity_params).unwrap().rows
+                db.execute(&identity_sql, &identity_params).unwrap().rows().to_vec()
             } else {
                 let mut request = bounded::BoundedReadRequest::new(
                     &identity_sql,
@@ -141,20 +141,20 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
                 if mode == 1 {
                     let result = bounded::execute(&db, &request).unwrap();
                     identity_request_peak = result.telemetry.peak_temporary_bytes;
-                    result.result.rows
+                    result.result.rows().to_vec()
                 } else {
                     request.limits.cursor_page_rows = 1;
                     let mut opened = bounded::open_cursor(db.clone(), &request).unwrap();
-                    let mut rows = opened.first_page.rows;
-                    let mut more = opened.first_page.has_more;
+                    let mut rows = opened.first_page.rows().to_vec();
+                    let mut more = opened.first_page.has_more();
                     while more {
                         let page = opened
                             .cursor
                             .fetch(None, OwnerReadCancellation::new())
                             .unwrap()
                             .page;
-                        more = page.has_more;
-                        rows.extend(page.rows);
+                        more = page.has_more();
+                        rows.extend(page.rows().iter().cloned());
                     }
                     opened.cursor.close().unwrap();
                     rows
@@ -169,7 +169,7 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
         for mode in 0..3 {
             db.accountant().reset_high_water_for_test();
             let rows = if mode == 0 {
-                db.execute(sql, &params).unwrap().rows
+                db.execute(sql, &params).unwrap().rows().to_vec()
             } else {
                 let mut request = bounded::BoundedReadRequest::new(
                     sql,
@@ -179,20 +179,20 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
                 );
                 if mode == 1 {
                     let result = bounded::execute(&db, &request).unwrap();
-                    result.result.rows
+                    result.result.rows().to_vec()
                 } else {
                     request.limits.cursor_page_rows = 1;
                     let mut opened = bounded::open_cursor(db.clone(), &request).unwrap();
-                    let mut rows = opened.first_page.rows;
-                    let mut more = opened.first_page.has_more;
+                    let mut rows = opened.first_page.rows().to_vec();
+                    let mut more = opened.first_page.has_more();
                     while more {
                         let page = opened
                             .cursor
                             .fetch(None, OwnerReadCancellation::new())
                             .unwrap()
                             .page;
-                        more = page.has_more;
-                        rows.extend(page.rows);
+                        more = page.has_more();
+                        rows.extend(page.rows().iter().cloned());
                     }
                     opened.cursor.close().unwrap();
                     rows

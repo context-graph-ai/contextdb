@@ -197,7 +197,7 @@ pub(super) fn search(
     reader
         .execute(statement, &params(context, query_row))
         .expect("the file-route vector search answers")
-        .rows
+        .rows()
         .len()
 }
 
@@ -208,7 +208,7 @@ pub(super) fn show(reader: &ReadSession, row: usize) -> usize {
             &HashMap::from([("id".into(), Value::Uuid(row_uuid(row)))]),
         )
         .expect("the file-route point read answers")
-        .rows
+        .rows()
         .len()
 }
 
@@ -299,7 +299,7 @@ fn walk_rows(load: &ReadPersistenceLoad) -> Result<usize> {
             .limit
             .map(|bytes| bytes as u64)
             .unwrap_or(u64::MAX),
-    );
+    ).expect("admit the declared fixture root");
     let read_memory = declared_reader.child()?;
     load.source.bounded_visit_relational_rows::<Error>(
         TABLE,
@@ -768,11 +768,11 @@ fn retained_proof_pages_are_accounted_to_the_declared_session() {
             .expect("open a saved-graph search cursor");
         let page = cursor.first_page().clone();
         assert!(
-            page.has_more,
+            page.has_more(),
             "the fixture must need more than one page, so the cursor -- and its retained \
              proof pages -- are still open when this checks them"
         );
-        page.rows.len()
+        page.rows().len()
     });
     let charged = reader
         .charged_bytes()
@@ -940,7 +940,7 @@ fn a_proof_page_a_statement_still_holds_stays_charged_after_the_cache_evicts_it(
         .open_cursor(FIND, &params(0, 3))
         .expect("open a saved-graph search cursor");
     assert!(
-        cursor.first_page().has_more,
+        cursor.first_page().has_more(),
         "the fixture must need more than one page, so this statement's retained proof pages \
          are still resident when eviction is forced below"
     );
@@ -1053,7 +1053,7 @@ fn statement_cleanup_after_success_refusal_and_cancellation_leaves_no_uncharged_
             .open_cursor(FIND, &params(0, 3))
             .expect("open a saved-graph search cursor");
         let mut page = cursor.first_page().clone();
-        while page.has_more {
+        while page.has_more() {
             page = cursor
                 .fetch(std::num::NonZeroUsize::new(1))
                 .expect("the drained walk answers every remaining page");
@@ -1120,7 +1120,7 @@ fn statement_cleanup_after_success_refusal_and_cancellation_leaves_no_uncharged_
             .open_cursor(FIND, &params(0, 3))
             .expect("open a saved-graph search cursor");
         assert!(
-            cursor.first_page().has_more,
+            cursor.first_page().has_more(),
             "the fixture must need more than one page, so this cursor is closed while the \
              search still has work left -- a genuine cancellation, not an early success"
         );

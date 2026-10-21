@@ -92,12 +92,12 @@ fn top_ranked(db: &Database, table: &str, limit: usize) -> Vec<(Uuid, f64)> {
         )
         .unwrap();
     let id_idx = ids
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id")
         .expect("vector result should include id");
     let ids = ids
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.get(id_idx) {
             Some(Value::Uuid(id)) => *id,

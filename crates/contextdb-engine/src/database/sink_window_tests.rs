@@ -106,7 +106,7 @@ fn a_removal_published_after_the_plan_refuses_its_install_forward_or_wrapping() 
         );
         assert_eq!(queue.pending_refill, None);
         assert_eq!(
-            Arc::strong_count(&read_owner),
+            read_owner.strong_count_for_test(),
             1,
             "the refused window is destroyed with its charge"
         );

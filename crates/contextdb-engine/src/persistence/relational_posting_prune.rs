@@ -541,7 +541,7 @@ mod tests {
                 db.execute("SELECT id FROM expired WHERE tag = 'same'", &HashMap::new())
             })
             .unwrap()
-            .rows
+            .rows().to_vec()
         };
         assert_eq!(read(&db), vec![vec![Value::Int64(1)]]);
         let pin = db.pin_snapshot(snapshot).unwrap();

@@ -218,7 +218,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let (initial_transaction, initial_transaction_work) = observe_target("reader_items", || {
         database.execute_in_tx(transaction, sql, &HashMap::new())
     });
-    assert_eq!(initial_transaction.unwrap().rows, expected_old);
+    assert_eq!(initial_transaction.unwrap().rows(), expected_old);
     let clock = Arc::new(ManualDeadlineClock::at(0));
     let limits = ReadLimits {
         cursor_page_rows: 1,
@@ -257,7 +257,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         opened.cursor.continuation_bytes().unwrap().total > 0,
         "open cursor owns real continuation scratch"
     );
-    assert_eq!(opened.first_page.rows, expected_old[..1]);
+    assert_eq!(opened.first_page.rows(), &expected_old[..1]);
     let (statement_reached, statement_started) = mpsc::channel();
     let statement_release = Arc::new(Barrier::new(2));
     let pause = Arc::new(StatementPause {
@@ -335,7 +335,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     });
     cleanup.unwrap();
     assert_eq!(
-        statement.0.unwrap().result.rows,
+        statement.0.unwrap().result.rows(),
         expected_old,
         "an active statement retains its original rows, keys and vectors across commit and cleanup"
     );
@@ -357,7 +357,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         database
             .execute(successor_sql, &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         expected_new,
         "a newer reader sees the complete successor"
     );
@@ -365,12 +365,12 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let (historical_result, historical_work) = observe_target("reader_items", || {
         database.execute_at_snapshot(sql, &HashMap::new(), old_snapshot)
     });
-    assert_eq!(historical_result.unwrap().rows, expected_old);
+    assert_eq!(historical_result.unwrap().rows(), expected_old);
     displace();
     let (transaction_result, transaction_work) = observe_target("reader_items", || {
         database.execute_in_tx(transaction, sql, &HashMap::new())
     });
-    assert_eq!(transaction_result.unwrap().rows, expected_old);
+    assert_eq!(transaction_result.unwrap().rows(), expected_old);
     displace();
     let (successor_result, successor_work) = observe_target("reader_items", || {
         bounded::execute(
@@ -378,7 +378,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             &bounded::BoundedReadRequest::new(successor_sql, HashMap::new(), limits, clock.clone()),
         )
     });
-    assert_eq!(successor_result.unwrap().result.rows, expected_new);
+    assert_eq!(successor_result.unwrap().result.rows(), expected_new);
     let successor_physical = successor_work
         .physical_sources
         .iter()
@@ -404,7 +404,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         for (offset, vector) in old_vectors.iter().enumerate() {
             assert_eq!(database.execute_in_tx(transaction,
                 "SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-                &HashMap::from([("q".into(), Value::Vector(vector.clone()))])).unwrap().rows,
+                &HashMap::from([("q".into(), Value::Vector(vector.clone()))])).unwrap().rows(),
                 vec![vec![Value::Int64(offset as i64 + 1)]]);
         }
     });
@@ -427,7 +427,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let (_, indexed_work) = observe_target("reader_items", || {
         for (offset, vector) in old_vectors.iter().enumerate() {
             assert_eq!(database.execute_at_snapshot("SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-                &HashMap::from([("q".into(),Value::Vector(vector.clone()))]),old_snapshot).unwrap().rows,
+                &HashMap::from([("q".into(),Value::Vector(vector.clone()))]),old_snapshot).unwrap().rows(),
                 vec![vec![Value::Int64(offset as i64 + 1)]], "old reader traverses its maintained vector generation");
         }
     });
@@ -451,7 +451,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             &HashMap::from([("q".into(), Value::Vector(old_vectors[1].clone()))]))
     });
     assert_eq!(
-        raw_reload.unwrap().rows,
+        raw_reload.unwrap().rows(),
         vec![expected_old[1].clone()],
         "the next indexed pull reloads the same old vector answer"
     );
@@ -497,8 +497,8 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     // their pages again. Displace after those checks, immediately before
     // testing continuation reloads from the last holder of the old root.
     displace();
-    let mut has_more = opened.first_page.has_more;
-    let mut continued = opened.first_page.rows;
+    let mut has_more = opened.first_page.has_more();
+    let mut continued = opened.first_page.rows().to_vec();
     let mut continuation_sources = Vec::new();
     for _ in 0..expected_old.len() {
         if !has_more {
@@ -523,8 +523,8 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             database.__writer_cache_stats_for_test().unwrap(),
         );
         let page = page.unwrap().page;
-        has_more = page.has_more;
-        continued.extend(page.rows);
+        has_more = page.has_more();
+        continued.extend(page.rows().iter().cloned());
         if sources.physical_source_calls > 0 {
             continuation_sources.push(sources);
         }
@@ -622,9 +622,9 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         .fetch(None, Default::default())
         .unwrap()
         .page;
-    assert_eq!(resumed.rows, vec![expected_new[1].clone()]);
+    assert_eq!(resumed.rows(), vec![expected_new[1].clone()]);
     assert!(
-        resumed.has_more,
+        resumed.has_more(),
         "the same cursor remains suspended after resuming its cancelled fetch"
     );
     assert!(cancelled_cursor.cursor.continuation_bytes().unwrap().total > 0);
@@ -663,7 +663,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         .unwrap()
         .1;
     let mut refused_cursor = refused_cursor.unwrap();
-    assert!(refused_cursor.first_page.has_more);
+    assert!(refused_cursor.first_page.has_more());
     assert!(refused_cursor.cursor.continuation_bytes().unwrap().total > 0);
     database
         .execute(
@@ -722,7 +722,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         "a statement starting while a commit is paused must capture the published root without waiting for that commit"
     );
     assert_eq!(during_work.captured_read_snapshot, Some(old_snapshot.0));
-    assert_eq!(during.unwrap().result.rows, expected_old);
+    assert_eq!(during.unwrap().result.rows(), expected_old);
     let mut observed_families = [false; 4];
     for (label, work) in [
         ("admission", admission_sources),
@@ -1168,7 +1168,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
     });
     let mut opened = opened.unwrap();
     assert_eq!(
-        opened.first_page.rows,
+        opened.first_page.rows(),
         vec![vec![Value::Int64(2), Value::Vector(vec![0.0, 1.0, 0.0])]],
         "the first paged answer retains its captured row and vector after successor publication"
     );

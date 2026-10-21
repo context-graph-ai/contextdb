@@ -422,7 +422,7 @@ fn source_refusal_after_durable_publication_keeps_built_count_and_cleanup_detail
         old
     );
     let query = "SELECT id FROM items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3";
-    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows.len(), 3);
+    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows().len(), 3);
     // This uncovered journal entry is ignored by the initial retry, then
     // covered by T1 and selected by repaired-generation cleanup.
     db.execute("INSERT INTO items VALUES (16, '[1,0,0]')", &HashMap::new())
@@ -494,7 +494,7 @@ fn source_refusal_after_durable_publication_keeps_built_count_and_cleanup_detail
             .partition_route_quarantine(&partition)
             .is_none()
     );
-    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows.len(), 3);
+    assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows().len(), 3);
     assert_eq!(
         db.vector_memory_ownership_receipt_for_test()
             .temporary_workspace,
@@ -527,7 +527,7 @@ fn source_refusal_after_durable_publication_keeps_built_count_and_cleanup_detail
         ready
     );
     assert_eq!(
-        reopened.execute(query, &HashMap::new()).unwrap().rows.len(),
+        reopened.execute(query, &HashMap::new()).unwrap().rows().len(),
         3
     );
     reopened.close().unwrap();
@@ -622,7 +622,7 @@ fn foreground_projection_query_preserves_page_refusal_before_the_admission_scope
         "the enclosing image page owner releases its charge"
     );
     let retry = db.execute(QUERY, &params).unwrap();
-    assert_eq!(retry.rows[0][0], Value::Int64(1));
+    assert_eq!(retry.rows()[0][0], Value::Int64(1));
     db.close().unwrap();
 }
 
@@ -909,7 +909,7 @@ fn source_bootstrap_allocator_null_rolls_back_its_genuine_prepaid_invoice() {
     // This producer currently uses an exact static allocator reason. Do not
     // misclassify its actual null as a budget denial or accept arbitrary Other.
     assert!(matches!(result, Err(Error::Other(ref message))
-        if message.as_ref() == "source refusal control allocation failed"));
+        if message == "source refusal control allocation failed"));
     assert_eq!(accountant.usage().used, 0);
     assert_eq!(accountant.underflow_count_for_test(), 0);
 }
@@ -944,7 +944,7 @@ fn a_caught_source_refusal_does_not_replace_the_original_unrelated_error() {
         assert!(read.open_table(GENERATIONS).is_err());
         Err(Error::Other("independent storage failure".into()))
     });
-    assert!(matches!(result, Err(Error::Other(ref message)) if message.as_ref() == "independent storage failure"));
+    assert!(matches!(result, Err(Error::Other(ref message)) if message == "independent storage failure"));
     assert_eq!(accountant.usage().used, 0);
 }
 

@@ -114,14 +114,14 @@ fn live_vector_count(db: &Database) -> usize {
         &HashMap::new(),
     )
     .expect("query digest vectors")
-    .rows
+    .rows()
     .len()
 }
 
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &HashMap::new())
         .unwrap_or_else(|err| panic!("query {table}: {err}"))
-        .rows
+        .rows()
         .len()
 }
 

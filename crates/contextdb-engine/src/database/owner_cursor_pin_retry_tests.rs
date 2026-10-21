@@ -87,7 +87,7 @@ fn busy_cursor_pin_retries_outside_commit_and_recaptures_the_complete_root() {
     assert_eq!(
         db.execute_at_snapshot("SELECT body FROM items", &HashMap::new(), snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("replacement".to_owned())]],
     );
     drop((storage, registration));
@@ -386,7 +386,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         )
         .unwrap()
         .page;
-        assert_eq!(page.rows, vec![vec![expected_first]]);
+        assert_eq!(&*page.rows, vec![vec![expected_first]]);
         assert!(page.has_more);
     }
     reader.join().unwrap();
@@ -490,7 +490,7 @@ fn healthy_registry_scan_contention_never_refuses_concurrent_cursors() {
                 for round in 0..100 {
                     match session.open_cursor("SELECT id FROM facts", &HashMap::new()) {
                         Ok(cursor) => {
-                            assert_eq!(cursor.first_page().rows, vec![vec![Value::Int64(1)]]);
+                            assert_eq!(cursor.first_page().rows(), vec![vec![Value::Int64(1)]]);
                             cursor.close().unwrap();
                         }
                         Err(error) => failures.push((worker, round, error)),
@@ -676,7 +676,7 @@ fn owner_channel_registry_teardown(outcome: RegistryTeardownOutcome) {
             )
             .unwrap()
             .page;
-            assert_eq!(page.rows, vec![vec![Value::Int64(1)]]);
+            assert_eq!(&*page.rows, vec![vec![Value::Int64(1)]]);
             assert!(page.has_more);
             assert_eq!(
                 descriptor_pause.attempts_for_test(),

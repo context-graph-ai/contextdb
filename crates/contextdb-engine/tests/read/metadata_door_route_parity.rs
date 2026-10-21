@@ -551,7 +551,7 @@ fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_executio
         .execute(sql, &params)
         .expect("the live writer executes the vector query");
     let local_trace = local
-        .trace
+        .trace()
         .vector_search
         .clone()
         .expect("local execution publishes its bounded vector disclosure");
@@ -568,7 +568,7 @@ fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_executio
         .execute(sql, &params)
         .expect("the live owner returns the executed query");
     assert_eq!(
-        owner_result.trace.vector_search.as_ref(),
+        owner_result.trace().vector_search.as_ref(),
         Some(&local_trace),
         "the canonical owner result restores the exact bounded and redacted vector trace"
     );
@@ -582,7 +582,7 @@ fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_executio
     let file_result = file
         .execute(sql, &params)
         .expect("the committed file executes the same query");
-    assert_eq!(file_result.trace.vector_search.as_ref(), Some(&local_trace));
+    assert_eq!(file_result.trace().vector_search.as_ref(), Some(&local_trace));
 }
 
 #[test]

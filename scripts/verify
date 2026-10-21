@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# The same tier vocabulary as the sibling repos; never publishes.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [[ $# == 0 || ${1:-} == --help || ${1:-} == -h ]]; then
+  cat <<'HELP'
+Usage: scripts/verify pr [lint|shard|build|features|installed|cross]
+       scripts/verify integration [<slice-id>]
+       scripts/verify performance [--help|manifest|report|run ...]
+       scripts/verify publication
+PR stages use existing shard, packaged-engine and installed-smoke primitives.
+pr with no stage runs all local correctness stages and all shards sequentially.
+Local cross is optional: it runs only when CI_TARGET is set, with its installed
+linker/toolchain. Hosted CI still requires all three supported cross targets.
+Explicit pr cross requires CI_TARGET; see the supported targets in the script.
+shard needs CI_CRATE/CI_SHARD and optional CI_FEATURES, exactly as CI does.
+CI_GATE_MODE=normal selects bounded correctness; full (default) retains original
+qualification. Normal integration requires CI_INTEGRATION_DEFAULT=false.
+integration adds nightly-tests debug/release fixtures. CI_INTEGRATION_DEFAULT=true
+also runs workspace/redb and production nightly fixtures (scheduled/manual; false in PR calls).
+performance run is explicit native-host only. See performance --help.
+publication prints the existing owner-controlled tag workflow; it publishes nothing.
+HELP
+  exit 0
+fi
+tier=$1
+shift
+case "$tier" in
+  performance) exec python3 scripts/ci-performance.py "$@" ;;
+  publication)
+    [[ $# == 0 ]] || exit 2
+    printf '%s\n' 'Publication: .github/workflows/release.yml, existing owner-authorized v* tag mechanism. No publication performed.'
+    exit 0 ;;
+  integration)
+    exec python3 -B scripts/ci-integration.py run "$@" ;;
+  pr) ;;
+  *) echo "Unknown tier: $tier (see --help)" >&2; exit 2 ;;
+esac
+stage=${1:-all}
+[[ $# -le 1 ]] || exit 2
+python3 scripts/ci-inventory.py
+case "$stage" in
+  all)
+    for item in lint build features installed; do bash scripts/verify pr "$item"; done
+    if [[ -n ${CI_TARGET:-} ]]; then
+      bash scripts/verify pr cross
+    else
+      echo 'Local cross skipped: set CI_TARGET and install its toolchain; hosted CI requires all three targets.'
+    fi
+    # Read the canonical manifest; hosted and local entrypoints share one inventory.
+    while IFS=' ' read -r crate shard features; do
+      CI_CRATE=$crate CI_SHARD=$shard CI_FEATURES=$features bash scripts/verify pr shard
+    done < <(python3 - <<'PY'
+import json
+manifest = json.load(open('scripts/ci-integration-targets.json'))
+for job in manifest['pr_jobs']:
+    for row in job.get('constituents', [job]):
+        print(row['crate'], row['shard'], row['features'])
+PY
+    ) ;;
+  lint)
+    cargo fmt --all --check
+    RUSTFLAGS='-D warnings' cargo clippy --workspace --all-targets -- -D warnings
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/redb" cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check
+    RUSTFLAGS='-D warnings' cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --target-dir "${CARGO_TARGET_DIR:-$PWD/target}/redb" --all-targets -- -D warnings ;;
+  shard) exec bash scripts/ci-test-shard.sh ;;
+  build)
+    RUSTFLAGS='-D warnings' cargo build --locked --release
+    bash scripts/verify-packaged-engine.sh ;;
+  features)
+    cargo check --locked -p contextdb-engine
+    cargo check --locked -p contextdb-engine --features mdns
+    cargo check --locked -p contextdb-server --features mdns,production-smoke-driver
+    cargo doc --locked --workspace --no-deps ;;
+  installed)
+    install_root=${CI_INSTALL_ROOT:-$(mktemp -d)}
+    RUSTFLAGS='-D warnings' cargo install --locked --path crates/contextdb-cli --root "$install_root"
+    RUSTFLAGS='-D warnings' cargo install --locked --path crates/contextdb-server --root "$install_root" --features production-smoke-driver --bins
+    CONTEXTDB_CLI="$install_root/bin/contextdb" CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" CONTEXTDB_SERVER="$install_root/bin/contextdb-server" scripts/installed-release-durable-sync-smoke.sh ;;
+  cross)
+    case ${CI_TARGET:-} in
+      aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;;
+      *) echo 'CI_TARGET must name an existing supported cross target (see --help)' >&2; exit 2 ;;
+    esac
+    RUSTFLAGS='-D warnings' cargo build --release --target "$CI_TARGET" -p contextdb-cli -p contextdb-server ;;
+  *) echo "Unknown PR stage: $stage" >&2; exit 2 ;;
+esac
