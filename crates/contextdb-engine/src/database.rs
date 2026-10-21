@@ -60162,9 +60162,17 @@ impl Database {
         index: VectorIndexRef,
         row_id: RowId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
-        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        // The reverse membership lookup decodes temporary records even when
+        // the row is becoming NULL. Keep them on this caller's exact budget.
+        let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader_per_call_for(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            read_memory, "reader", "materialize_answer",
+            "Reduce the statement's output or raise the declared reader memory limit.",
+        )?.enter();
 
         self.record_vector_schema_epoch(tx, &index)?;
         let existing_live = self.vector_store.has_live_entry_for_row(
