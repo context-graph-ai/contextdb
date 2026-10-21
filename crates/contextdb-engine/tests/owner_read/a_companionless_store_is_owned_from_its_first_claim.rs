@@ -662,8 +662,8 @@ fn an_unwritable_directory_still_reports_what_is_wrong_with_the_file() {
 
     match refusal {
         Error::StoreCorrupted { path: named, .. } => assert_eq!(
-            named.as_str(),
-            path.display().to_string(),
+            named,
+            path.display().to_string().as_str(),
             "the refusal names the file the caller pointed at",
         ),
         Error::LegacyVectorStoreDetected { .. } => {}
