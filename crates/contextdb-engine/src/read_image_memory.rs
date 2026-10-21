@@ -573,14 +573,24 @@ impl ImageMemory {
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
     ) -> Result<ImageMemoryHandle> {
+        Self::operation_reader_per_call_for(accountant, reader_budget,
+            "vector_maintenance", "prepare_vector_generation",
+            "Raise MEMORY_LIMIT before inspecting this maintained route.")
+    }
+
+    pub(crate) fn operation_reader_per_call_for(
+        accountant: crate::memory_accounting::AccountantHandle,
+        reader_budget: impl Into<ReadMemoryOwner>,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<ImageMemoryHandle> {
         use contextdb_core::read_memory::ReadCredit;
         let reader_budget = reader_budget.into();
         let credit = ReadCredit::try_new_owned(reader_budget.clone(),
-            Self::admitted_control_bytes(), "vector_maintenance", "prepare_vector_generation",
-            "Raise MEMORY_LIMIT before inspecting this maintained route.")?;
+            Self::admitted_control_bytes(), subsystem, operation, hint)?;
         let mut payload = Self::reader_payload(accountant, reader_budget,
-            "vector_maintenance", "prepare_vector_generation",
-            "Raise MEMORY_LIMIT before inspecting this maintained route.");
+            subsystem, operation, hint);
         payload.per_call = Some(parking_lot::Mutex::new(None));
         ReadMemoryOwner::try_native_typed(payload, credit)
             .map(ImageMemoryHandle::Native).map_err(Error::NativeEngineOther)

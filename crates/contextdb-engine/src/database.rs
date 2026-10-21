@@ -60420,6 +60420,14 @@ impl Database {
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        // Reverse membership decoding is part of this move, on the exact
+        // supplied read capability. Each temporary record ends its own invoice.
+        let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader_per_call_for(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            read_memory.clone(), "reader", "materialize_answer",
+            "Reduce the statement's output or raise the declared reader memory limit.",
+        )?.enter();
+
         let _vector_schema = self.vector_schema_read(&index);
         self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "move_vector")?;
