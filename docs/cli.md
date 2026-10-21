@@ -33,7 +33,7 @@ The same command works whether the store is idle or already owned by a live proc
 | Idle or missing store | `contextdb <path> --write` | Full read-write session; the store is created if missing. <!-- enforced by: read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing, read_cli_journeys_invocation::write_flag_creates_the_store_a_read_refused_to_create --> |
 | Live file-backed owner | `contextdb <path>` | Reading session over that owner's authenticated local channel. <!-- enforced by: read_cli_journeys_live_owner::a_reading_session_routes_through_the_live_owner_and_says_so_once --> |
 | Live file-backed owner | `contextdb <path> --write` | Refused with `held_by_writer`; the refusal says a read session (drop `--write`) reaches the live owner's channel. <!-- enforced by: read_cli_journeys_machine_surface::every_refusal_carries_its_ratified_class_and_kind --> |
-| Readers hydrating | `contextdb <path> --write` | Refused with `held_by_readers`, listing the readers when identifiable, else "N direct readers are hydrating or finishing with this store; retry in a moment". A reader that is finishing holds the store for the same short, retryable span while it removes its runtime registry. <!-- unbound: no wall test yet — a hydrating-readers race needs a second process holding the shared lock --> |
+| Reader selecting its snapshot | `contextdb <path> --write` | Waits once for the OS store lock; the reader releases its admission hold after fixed-cost snapshot selection and registration, before heavy loading. Only caller cancellation/deadline ends the wait early; an already-expired deadline yields typed `held_by_readers` with the actual count and identifiable names. |
 
 ### Options
 
@@ -939,7 +939,7 @@ teaching its recovery: <!-- enforced by: read_cli_journeys_machine_surface::ever
 | `write_requires_flag` | sql | A read session got a mutating statement/command; add `--write`. |
 | `store_not_found` | io | The store does not exist; `--write` creates it. |
 | `held_by_writer` | io | A writer owns the store; a read session (drop `--write`) reaches its channel. The refusal names the store in `store_path` and, when the holder has published a record about itself, the holding process in `process_id`. |
-| `held_by_readers` | io | Readers hold the file during hydration; the refusal lists them or says to retry in a moment. |
+| `held_by_readers` | io | The caller's expired writer-open deadline ended admission while starting readers held the snapshot-selection window; includes the real observed reader count and identifiable names. |
 | `owner_not_running` | io | Rust `request_owner` was called on a direct-file route. |
 | `owner_not_serving` | io | A writer holds the store but has no usable inspection channel — including a writer that has claimed the store and not published its serving decision inside the caller's declared deadlines, or a draining owner that released the requested cursor/page before delivery. |
 | `owner_user_mismatch` | io | The owner belongs to a different operating-system user. |

@@ -410,6 +410,8 @@ impl Drop for ManualDeadlineWait {
 pub struct MonotonicDeadlineClock {
     origin: std::time::Instant,
     owned_waits: Mutex<MonotonicWaitList>,
+    #[cfg(target_os = "linux")]
+    owned_driver_wake: Mutex<Option<contextdb_core::read_memory::ReadShared<super::native_driver::NativeCallerWake>>>,
     #[cfg(feature = "test-seams")]
     thread_lifecycle: Option<DeadlineThreadLifecycle>,
     #[cfg(any(test, feature = "test-seams"))]
@@ -444,6 +446,8 @@ impl MonotonicDeadlineClock {
         Self {
             origin: std::time::Instant::now(),
             owned_waits: Mutex::new(MonotonicWaitList::default()),
+            #[cfg(target_os = "linux")]
+            owned_driver_wake: Mutex::new(None),
             #[cfg(feature = "test-seams")]
             thread_lifecycle: None,
             #[cfg(any(test, feature = "test-seams"))]
@@ -466,6 +470,8 @@ impl MonotonicDeadlineClock {
         Self {
             origin: std::time::Instant::now(),
             owned_waits: Mutex::new(MonotonicWaitList::default()),
+            #[cfg(target_os = "linux")]
+            owned_driver_wake: Mutex::new(None),
             thread_lifecycle: Some(DeadlineThreadLifecycle { started, exited }),
             fail_timer_arm: false,
             timer_arm_failure_waits: AtomicUsize::new(0),
@@ -483,6 +489,8 @@ impl MonotonicDeadlineClock {
         Self {
             origin: std::time::Instant::now(),
             owned_waits: Mutex::new(MonotonicWaitList::default()),
+            #[cfg(target_os = "linux")]
+            owned_driver_wake: Mutex::new(None),
             #[cfg(feature = "test-seams")]
             thread_lifecycle: None,
             fail_timer_arm: true,
@@ -1119,6 +1127,15 @@ impl Future for OwnedMonotonicWait<'_> {
             drop(list);
             drop(previous);
         }
+        // Registration can introduce a deadline earlier than the worker's
+        // current park. The paid wake cell latches a wake across park entry.
+        #[cfg(target_os = "linux")]
+        {
+            let wake = this.clock.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(wake) = wake {
+                contextdb_core::read_memory::NativeReadWake::wake_read(&*wake);
+            }
+        }
         Poll::Pending
     }
 }
@@ -1369,5 +1386,64 @@ where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
             Poll::Ready(result) => return result,
             Poll::Pending => std::thread::park(),
         }
+    }
+}
+
+
+/// One fixed driver retained by a standalone session's resource owner. The
+/// existing clock/list remain the only deadline source and pending-wait queue.
+#[cfg(target_os = "linux")]
+pub(crate) struct OwnedClockDriver {
+    clock: Arc<MonotonicDeadlineClock>,
+    stop: contextdb_core::read_memory::ReadShared<std::sync::atomic::AtomicBool>,
+    wake: contextdb_core::read_memory::ReadShared<super::native_driver::NativeCallerWake>,
+    worker: Option<crate::owned_worker::OwnedWorker>,
+}
+#[cfg(target_os = "linux")]
+impl MonotonicDeadlineClock {
+    pub(crate) fn start_owned_driver(
+        self: &Arc<Self>, owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<OwnedClockDriver> {
+        use contextdb_core::read_memory::{ReadCredit, ReadShared};
+        let wake = super::native_driver::NativeCallerWake::try_new_owned(owner.clone())?;
+        let stop = ReadShared::try_from_prepaid(std::sync::atomic::AtomicBool::new(false),
+            ReadCredit::try_new_owned(owner.clone(), ReadShared::<std::sync::atomic::AtomicBool>::layout().size(),
+                "reader", "session_expiry_stop", "Raise the reader memory limit.")?)?;
+        let clock: Arc<dyn DeadlineClock> = self.clone();
+        let binding = contextdb_core::read_contract::NativeClockBinding::try_select(&clock, &owner)?;
+        let thread_clock = self.clone();
+        let thread_stop = stop.clone();
+        let park = super::native_driver::NativeCallerPark { wake: wake.clone() };
+        // Publish the permanent driver before a foreground caller can arm a
+        // cursor. The session serializes startup; failure removes this lease.
+        self.native_driver_started();
+        *self.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake.clone());
+        let worker = crate::owned_worker::OwnedWorker::spawn(owner, move || {
+            struct Lease(Arc<MonotonicDeadlineClock>);
+            impl Drop for Lease { fn drop(&mut self) { self.0.native_driver_ended(); } }
+            let _lease = Lease(thread_clock.clone());
+            while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                thread_clock.drive_native_deadlines();
+                let deadline = thread_clock.native_next_deadline_ms().unwrap_or(u64::MAX);
+                if binding.park_until(deadline, &park).is_err() { break; }
+            }
+        });
+        match worker {
+            Ok(worker) => Ok(OwnedClockDriver { clock: self.clone(), stop, wake, worker: Some(worker) }),
+            Err(error) => {
+                self.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()).take();
+                self.native_driver_ended();
+                Err(error)
+            }
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for OwnedClockDriver {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        contextdb_core::read_memory::NativeReadWake::wake_read(&*self.wake);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        self.clock.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
 }

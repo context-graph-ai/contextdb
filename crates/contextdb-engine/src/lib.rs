@@ -84,6 +84,7 @@ mod memory_accounting;
 #[cfg(feature = "test-seams")]
 pub mod memory_accounting;
 mod metadata_page;
+mod owned_worker;
 #[cfg(not(feature = "test-seams"))]
 mod owned_cursor_page;
 #[cfg(feature = "test-seams")]
