@@ -736,7 +736,7 @@ fn drain_timeout_preserves_database_resources_until_a_retry_finishes_close() {
         )
         .expect("read the committed fixture after drain timeout");
     assert_eq!(
-        persisted.rows,
+        persisted.rows(),
         vec![vec![contextdb_core::Value::Text(
             "ordinary operations survive draining".to_owned()
         )]]
@@ -773,7 +773,7 @@ fn cleanup_error_survives_owner_read_timeout_and_retry() {
     let cleanup_cursor = cleanup_session
         .open_cursor("SELECT id FROM lifecycle_rows ORDER BY id", &HashMap::new())
         .expect("hold cleanup snapshot");
-    assert!(cleanup_cursor.first_page().has_more);
+    assert!(cleanup_cursor.first_page().has_more());
     for generation in 0..70 {
         database
             .execute(
@@ -885,7 +885,7 @@ fn cleanup_error_survives_owner_read_timeout_and_retry() {
         )
         .expect("read the committed fixture after drain timeout");
     assert_eq!(
-        persisted.rows,
+        persisted.rows(),
         vec![vec![contextdb_core::Value::Text(
             "ordinary operations survive draining".to_owned()
         )]]
@@ -993,7 +993,7 @@ fn handoff_error_survives_owner_read_timeout_and_retry() {
         )
         .expect("read the committed fixture after drain timeout");
     assert_eq!(
-        persisted.rows,
+        persisted.rows(),
         vec![vec![contextdb_core::Value::Text(
             "ordinary operations survive draining".to_owned()
         )]]
@@ -1048,8 +1048,8 @@ fn a_suspended_cursor_is_cancelled_and_released_when_its_owner_closes() {
         cursor.route(),
         contextdb_core::read_contract::ReadRoute::Owner
     );
-    assert_eq!(cursor.first_page().rows.len(), 1);
-    assert!(cursor.first_page().has_more);
+    assert_eq!(cursor.first_page().rows().len(), 1);
+    assert!(cursor.first_page().has_more());
     drop(opening_session);
     assert_eq!(
         database
@@ -1092,13 +1092,13 @@ fn a_suspended_cursor_is_cancelled_and_released_when_its_owner_closes() {
         .fetch(None)
         .expect("continue the registered snapshot");
     assert_eq!(
-        page.rows,
+        page.rows(),
         vec![vec![
             contextdb_core::Value::Int64(cursor_row_id),
             contextdb_core::Value::Text("cursor-retained-row".to_owned()),
         ]]
     );
-    assert!(!page.has_more);
+    assert!(!page.has_more());
     cursor.close().expect("release the retained snapshot");
 
     drop(database);
@@ -1186,7 +1186,7 @@ fn active_cursor_fetch_completes_before_graceful_owner_close_releases_it() {
             &HashMap::new(),
         )
         .expect("open the retained owner cursor before shutdown");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     drop(session);
     assert_eq!(
         database
@@ -1231,7 +1231,7 @@ fn active_cursor_fetch_completes_before_graceful_owner_close_releases_it() {
     publication.release();
     let (cursor, fetched) = fetching.join().expect("cursor fetch thread joins");
     let page = fetched.expect("accepted fetch completes across graceful close");
-    assert_eq!(page.rows.len(), 2);
+    assert_eq!(page.rows().len(), 2);
     assert!(!held_fetch.cancellation_observed());
     drop(cursor);
     closed_at
@@ -1329,7 +1329,7 @@ fn graceful_close_delivers_a_completed_cursor_page_before_releasing_owner() {
             &HashMap::new(),
         )
         .expect("open the retained cursor before its delivery race");
-    assert!(cursor.first_page().has_more);
+    assert!(cursor.first_page().has_more());
     drop(session);
 
     publication.arm();
@@ -1367,7 +1367,7 @@ fn graceful_close_delivers_a_completed_cursor_page_before_releasing_owner() {
     publication.release();
     let (cursor, fetched) = fetching.join().expect("cursor delivery fetch thread joins");
     let page = fetched.expect("accepted cursor page is delivered across graceful close");
-    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows().len(), 1);
     drop(cursor);
     closed_at
         .recv_timeout(LIFECYCLE_WATCHDOG)
@@ -1491,7 +1491,7 @@ fn accepted_first_cursor_page_publishes_before_owner_drop_releases_it() {
     publication.release();
     let (session, opened) = opening.join().expect("cursor open thread joins");
     let cursor = opened.expect("accepted first page publishes across ordinary drop");
-    assert_eq!(cursor.first_page().rows.len(), 1);
+    assert_eq!(cursor.first_page().rows().len(), 1);
     drop(cursor);
     drop(session);
     accept_exited_at

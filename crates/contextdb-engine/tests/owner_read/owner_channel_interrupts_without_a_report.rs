@@ -305,7 +305,7 @@ fn a_statement_cancelled_before_it_is_sent_is_refused_without_reaching_the_owner
     let served = reader
         .execute("SELECT id FROM interrupt_rows ORDER BY id", &HashMap::new())
         .expect("the same statement, uncancelled, is served");
-    assert_eq!(served.rows.len(), FIXTURE_ROWS as usize);
+    assert_eq!(served.rows().len(), FIXTURE_ROWS as usize);
     assert!(
         owner
             .owner_received_request_count_for_test()
@@ -321,7 +321,7 @@ fn a_statement_cancelled_before_it_is_sent_is_refused_without_reaching_the_owner
             &HashMap::new(),
         )
         .expect("the same session's next statement succeeds on the same connection");
-    assert_eq!(next.rows.len(), 1);
+    assert_eq!(next.rows().len(), 1);
 }
 
 #[test]
@@ -390,7 +390,7 @@ fn a_cursor_fetch_that_walks_the_store_reports_and_can_be_stopped_from_inside_th
         .fetch(None)
         .expect("the cursor survives the cancelled fetch and answers the next one");
     assert!(
-        !page.rows.is_empty() || !page.has_more,
+        !page.rows().is_empty() || !page.has_more(),
         "the cursor resumes cleanly after the cancelled fetch: {page:?}"
     );
     cursor.close().expect("close the cursor");

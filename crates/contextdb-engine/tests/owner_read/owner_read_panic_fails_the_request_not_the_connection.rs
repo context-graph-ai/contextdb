@@ -157,7 +157,7 @@ fn a_read_that_panics_in_the_owner_is_answered_and_leaves_the_connection_usable(
         Err(error) => error,
         Ok(result) => panic!(
             "a read whose owner died mid-flight is answered with a failure, not with {} rows",
-            result.rows.len()
+            result.rows().len()
         ),
     };
     let rendered = failure.to_string();
@@ -177,7 +177,7 @@ fn a_read_that_panics_in_the_owner_is_answered_and_leaves_the_connection_usable(
         .execute(&format!("SELECT id FROM {TABLE}"), &empty())
         .expect("the same session's next statement is served on the same connection");
     assert_eq!(
-        next.rows.len(),
+        next.rows().len(),
         1,
         "and it answers with the row it was asked for"
     );

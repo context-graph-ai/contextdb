@@ -313,7 +313,7 @@ fn a_live_owner_is_still_the_route_a_reader_selects() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the live owner answers");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
 
     drop(session);
     database.close().expect("the writer closes cleanly");
@@ -526,7 +526,7 @@ fn a_reader_finding_nobody_listening_reads_the_idle_file() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the idle file answers");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
 
     assert!(
         !channel.exists(),
@@ -571,7 +571,7 @@ fn a_reader_finding_no_authenticated_owner_reads_the_idle_file() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the idle committed file answers");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
     drop(session);
 
     assert_eq!(
@@ -731,7 +731,7 @@ fn an_untrusted_idle_companion_does_not_hide_an_existing_idle_store() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the existing idle file answers directly");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
     drop(session);
 
     std::fs::set_permissions(&companion, std::fs::Permissions::from_mode(0o600))
@@ -823,7 +823,7 @@ fn selecting_a_route_against_a_draining_owner_takes_none_of_its_capacity() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the one-slot owner answers after the earlier route selection");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
 
     drop(session);
     database.close().expect("the writer closes cleanly");

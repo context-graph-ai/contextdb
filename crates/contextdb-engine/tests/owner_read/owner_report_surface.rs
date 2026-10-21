@@ -297,7 +297,7 @@ fn a_store_nobody_owns_has_no_owner_report_to_give() {
         session
             .execute("SELECT payload FROM report_rows", &HashMap::new())
             .expect("the idle file answers")
-            .rows
+            .rows()
             .len(),
         1
     );

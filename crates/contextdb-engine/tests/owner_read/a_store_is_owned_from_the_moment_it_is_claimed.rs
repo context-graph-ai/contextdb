@@ -386,7 +386,7 @@ fn a_caller_inside_the_claim_gets_the_writer_s_answer_once_it_publishes() {
     let rows = session
         .execute("SELECT id FROM claim_rows", &HashMap::new())
         .expect("the owner answers the caller that waited for it");
-    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows().len(), 1);
     drop(session);
 
     assert_eq!(writer.finish(), OwnerServingState::Serving);

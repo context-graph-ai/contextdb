@@ -420,7 +420,7 @@ fn a_writer_that_publishes_serving_inside_the_budget_answers_the_caller() {
     let rows = session
         .execute("SELECT id FROM claim_rows", &HashMap::new())
         .expect("the owner answers the caller that waited for it");
-    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows().len(), 1);
     drop(session);
 
     assert_eq!(
