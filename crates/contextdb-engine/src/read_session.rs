@@ -745,9 +745,8 @@ struct RouteResources {
     channel_source_items: Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
-
-/// Session-lifetime custody, also retained by every suspended cursor. Closing
-/// the session handle cannot stop expiry while one of its cursors remains.
+/// The session's shared deadline source. Driver custody lives in the public
+/// session and cursor handles, outside callback-upgraded suspended state.
 struct SessionExpiry {
     clock: Arc<dyn DeadlineClock>,
     #[cfg(target_os = "linux")]
@@ -757,13 +756,17 @@ impl Default for SessionExpiry {
     fn default() -> Self {
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(clock) = ROUTE_SELECTION_CLOCK.with(|slot| slot.borrow().clone()) {
-            return Self { clock,
-                #[cfg(target_os = "linux")] native: None,
+            return Self {
+                clock,
+                #[cfg(target_os = "linux")]
+                native: None,
             };
         }
         let clock = Arc::new(crate::local_transport::MonotonicDeadlineClock::new());
-        Self { clock: clock.clone(),
-            #[cfg(target_os = "linux")] native: Some(clock),
+        Self {
+            clock: clock.clone(),
+            #[cfg(target_os = "linux")]
+            native: Some(clock),
         }
     }
 }
@@ -3215,7 +3218,8 @@ impl ReadSession {
                     ),
                 )?.into_cursor_owner()?;
                 let public_carrier = OwnedCursorPage::try_prepare_public(retained_owner.clone())?;
-                let expiry_waker: OwnerExpirySlot = owner_expiry_shared(retained_owner.clone(), Mutex::new(None))?;
+                let expiry_waker: OwnerExpirySlot =
+                    owner_expiry_shared(retained_owner.clone(), Mutex::new(None))?;
                 let operation_deadline = now.saturating_add(self.options.limits.active_ms);
                 let handoff =
                     crate::persistence::ReadSnapshotRegistrationGuard::owner_handoff_start_within(
@@ -3414,13 +3418,24 @@ impl ReadSession {
                 first_page.attach_publication(public_carrier);
                 let complete = !first_page.has_more;
                 if !complete {
-                    if let Err(error) = self.resources.expiry.ensure_driver(
-                        &self.expiry_driver, &clock,
-                        || Ok(owner.client.lock().expect("owner client").original_connection_owner()),
-                    ) {
-                        let _ = owner.ask(limits,
-                            crate::local_transport::LocalRequest::CursorClose { cursor_id }, None,
-                            #[cfg(any(test, feature = "test-seams"))] self.observer.as_ref());
+                    if let Err(error) =
+                        self.resources
+                            .expiry
+                            .ensure_driver(&self.expiry_driver, &clock, || {
+                                Ok(owner
+                                    .client
+                                    .lock()
+                                    .expect("owner client")
+                                    .original_connection_owner())
+                            })
+                    {
+                        let _ = owner.ask(
+                            limits,
+                            crate::local_transport::LocalRequest::CursorClose { cursor_id },
+                            None,
+                            #[cfg(any(test, feature = "test-seams"))]
+                            self.observer.as_ref(),
+                        );
                         return Err(error);
                     }
                 }
@@ -3432,7 +3447,11 @@ impl ReadSession {
                 let owner_rows_examined = observation.rows_examined;
                 let (trace, observation) = take_cursor_observation(observation);
                 let cursor = ReadCursor {
-                    _expiry_driver: self.expiry_driver.lock().expect("session expiry worker").clone(),
+                    _expiry_driver: self
+                        .expiry_driver
+                        .lock()
+                        .expect("session expiry worker")
+                        .clone(),
                     trace,
                     observation,
                     owner_trace_charge: Some(owner_trace_charge),
@@ -3471,7 +3490,9 @@ impl ReadSession {
                     }),
                 };
                 if !complete {
-                    if let Err(error) = start_owner_cursor_expiry_watch(&cursor.state, retained_owner.clone()) {
+                    if let Err(error) =
+                        start_owner_cursor_expiry_watch(&cursor.state, retained_owner.clone())
+                    {
                         let _ = cursor.close();
                         return Err(error);
                     }
@@ -3479,7 +3500,11 @@ impl ReadSession {
                 Ok(cursor)
             }
             ReadSessionState::DirectFile(reader) => {
-                self.resources.expiry.ensure_driver(&self.expiry_driver, &self.session_clock(), || Ok(reader.expiry_memory_owner()))?;
+                self.resources.expiry.ensure_driver(
+                    &self.expiry_driver,
+                    &self.session_clock(),
+                    || Ok(reader.expiry_memory_owner()),
+                )?;
                 let rows = NonZeroUsize::new(
                     usize::try_from(self.options.limits.cursor_page_rows).unwrap_or(usize::MAX),
                 )
@@ -3501,7 +3526,11 @@ impl ReadSession {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let (trace, observation) = take_cursor_observation(opened.first_page.observation);
                 Ok(ReadCursor {
-                    _expiry_driver: self.expiry_driver.lock().expect("session expiry worker").clone(),
+                    _expiry_driver: self
+                        .expiry_driver
+                        .lock()
+                        .expect("session expiry worker")
+                        .clone(),
                     trace,
                     observation,
                     owner_trace_charge: None,
@@ -3559,7 +3588,11 @@ impl ReadSession {
                     || {
                         let (trace, observation) = take_cursor_observation(opened.observation);
                         Ok(ReadCursor {
-                    _expiry_driver: self.expiry_driver.lock().expect("session expiry worker").clone(),
+                            _expiry_driver: self
+                                .expiry_driver
+                                .lock()
+                                .expect("session expiry worker")
+                                .clone(),
                             trace,
                             observation,
                             owner_trace_charge: None,
@@ -5161,8 +5194,14 @@ impl OwnerCursorExecution {
         self.resources
             .active_cursors
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        let watcher = self.expiry_waker.lock().expect("cursor expiry watcher").take();
-        if let Some(watcher) = watcher { watcher.retire(); }
+        let watcher = self
+            .expiry_waker
+            .lock()
+            .expect("cursor expiry watcher")
+            .take();
+        if let Some(watcher) = watcher {
+            watcher.retire();
+        }
     }
 
     fn expiry_kind(&self, now: u64) -> Option<contextdb_core::read_contract::CursorExpiryKind> {
@@ -5243,7 +5282,9 @@ impl OwnerCursorExecution {
 
 impl OwnedCursorExecution for OwnerCursorExecution {
     fn refuse_expiry_watch(&mut self, error: Error) {
-        if self.closed { return; }
+        if self.closed {
+            return;
+        }
         self.expiry_failure = Some(error);
         self.release_local_cursor_slot();
     }
@@ -5283,7 +5324,9 @@ impl OwnedCursorExecution for OwnerCursorExecution {
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ObservedCursorPage> {
-        if let Some(error) = self.expiry_failure.take() { return Err(error); }
+        if let Some(error) = self.expiry_failure.take() {
+            return Err(error);
+        }
         let now = self.clock.now_ms();
         self.expire_if_due(now);
         if let Some(expiry) = self.expired {
@@ -5463,13 +5506,8 @@ impl OwnedCursorExecution for OwnerCursorExecution {
         u64,
         OwnerExpirySlot,
     )> {
-        self.expiry_deadline_ms().map(|deadline| {
-            (
-                Arc::clone(&self.clock),
-                deadline,
-                self.expiry_waker.clone(),
-            )
-        })
+        self.expiry_deadline_ms()
+            .map(|deadline| (Arc::clone(&self.clock), deadline, self.expiry_waker.clone()))
     }
 
     fn expire_from_watch(&mut self, now: u64) {
@@ -5618,7 +5656,9 @@ trait OwnedCursorExecution: Send {
     }
 
     fn expire_from_watch(&mut self, _now: u64) {}
-    fn refuse_expiry_watch(&mut self, _error: Error) { let _ = self.close(); }
+    fn refuse_expiry_watch(&mut self, _error: Error) {
+        let _ = self.close();
+    }
 }
 
 /// Concrete owner-channel expiry callback on the session's existing clock.
@@ -5953,11 +5993,16 @@ impl ReadCursor {
     /// `.cursor open` while every fetch and close says the cursor is gone,
     /// which leaves the session with no cursor and no way to get one.
     pub fn is_live(&self) -> bool {
-        self.state
+        let live = self
+            .state
             .execution
             .lock()
             .expect("read cursor state")
-            .is_live()
+            .is_live();
+        // A deadline wake racing this short observation defers on its mutex.
+        // Retry after releasing it, just as the foreground fetch does.
+        drive_owner_cursor_expiry(&self.state);
+        live
     }
 
     /// Release the cursor's snapshot and route resources.

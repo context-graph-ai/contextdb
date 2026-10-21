@@ -84462,6 +84462,13 @@ impl Database {
 
         (|| {
             let _operation = self.open_operation()?;
+            // Match the ordinary history reader: durable decodes retain the
+            // caller's supplied child instead of borrowing a writer owner.
+            let decode = crate::read_image_memory::ImageMemory::operation_reader(
+                self.accountant.clone(),
+                read_memory.clone(),
+            )?;
+            let _decode = decode.enter();
             let output = std::cell::RefCell::new(contextdb_core::read_memory::ReadCredit::new(
                 read_memory.clone(),
             ));
