@@ -6079,6 +6079,30 @@ fn execute_plan_once(
 ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+    // Schema helpers do not need the eager executor's row, graph and sort
+    // working state. Keep that state off their call stack.
+    match plan {
+        PhysicalPlan::CreateTable(p) =>
+            execute_create_table_plan(db, p, vector_copy_owner, read_memory),
+        PhysicalPlan::AlterTable(p) =>
+            execute_alter_table_plan(db, p, tx, vector_copy_owner, read_memory),
+        _ => execute_plan_with_working_state(db, plan, params, tx,
+            materialized_columns, pending_sort_keys, vector_copy_owner, read_memory),
+    }
+}
+
+fn execute_plan_with_working_state(
+    db: &Database,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    materialized_columns: Option<&[String]>,
+    pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<OwnedQueryResult> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     #[cfg(test)]
     let __frame_probe = 0u8;
     #[cfg(test)]

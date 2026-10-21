@@ -832,6 +832,20 @@ impl PagedCachedFile {
         self.flush_write_buffer()
     }
 
+    /// Retire only this failed request's cache misses. A preexisting hit or a
+    /// page still held outside the cache keeps its ownership and backing.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn retire_read_cache_request(&self, request: u64) {
+        for stripe in &self.read_cache {
+            let mut cache = stripe.write().unwrap();
+            while let Some((_, page)) = cache.pop_lowest_priority_where(|page|
+                page.belongs_to_request(request) && PageAllocation::strong_count(page) == 1)
+            {
+                drop(page);
+            }
+        }
+    }
+
     // Read directly from the file, ignoring any cached data
     pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buffer = vec![0; len];

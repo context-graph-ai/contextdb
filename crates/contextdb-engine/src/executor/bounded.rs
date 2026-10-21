@@ -17726,11 +17726,15 @@ pub(crate) fn kernel_can_answer(plan: &PhysicalPlan) -> bool {
 
 struct StatementProofReuse<'a> {
     db: &'a dyn ReadExecutionTarget,
+    cache: Option<redb::ReadCacheRequest>,
 }
 
 impl Drop for StatementProofReuse<'_> {
     fn drop(&mut self) {
-        self.db.release_statement_proof_reuse();
+        match &self.cache {
+            Some(cache) => cache.release(|| self.db.release_statement_proof_reuse()),
+            None => self.db.release_statement_proof_reuse(),
+        }
     }
 }
 
@@ -17768,7 +17772,7 @@ pub(crate) fn drain_chosen_plan(
             )
             .map_err(BoundedExecutionError::from);
     }
-    let _release_proofs = StatementProofReuse { db };
+    let _release_proofs = StatementProofReuse { db, cache: None };
     let context = RequestContext::new(
         read_memory.clone(),
         uncapped_ceilings(),
@@ -18081,7 +18085,7 @@ pub(super) fn execute(
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-    let _release_proofs = StatementProofReuse { db };
+    let mut release_proofs = StatementProofReuse { db, cache: Some(redb::ReadCacheRequest::enter()) };
     let statement = contextdb_parser::parse(sql)?;
     db.plugin().on_query(sql)?;
     let plugin_started_ms = clock.now_ms();
@@ -18377,6 +18381,9 @@ pub(super) fn execute(
             telemetry: context.telemetry(),
         })
     })();
+    if execution.is_ok() {
+        release_proofs.cache.as_mut().expect("bounded request cache scope").commit();
+    }
     let execution = execution.map_err(|error| work_refusal_naming_the_statement(sql, error));
     let plugin_outcome = bounded_query_outcome(&execution);
     db.plugin().post_query(

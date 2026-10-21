@@ -67994,6 +67994,11 @@ impl Database {
         if let Some(source) = &self.retained_relational_source {
             source.clear_statement_proofs();
         }
+        if let Some(request) = redb::ReadCacheRequest::retiring()
+            && let Some(persistence) = &self.persistence
+        {
+            persistence.retire_read_cache_request(request);
+        }
     }
 
     /// How many distinct prefix values this store currently holds a

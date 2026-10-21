@@ -975,3 +975,21 @@ unchanged. The independent engine test module
 OS calls, poisoned growth mutexes and quota refusals. Source is uncompiled;
 runtime, strict linting, and mutation validation remain unrun. The complete
 source delta is regenerated in `upstream-4.1.0.patch`.
+
+
+## Request cache retirement
+
+A failed engine read retires only cache misses created by that request and no
+longer held outside the cache. An inline monotone request identity tags the
+original complete page allocation; hits never change the existing tag. The
+engine commits successful request scopes and asks the existing statement cleanup
+boundary to retire failed scopes. `src/read_admission.rs`, `src/lib.rs`,
+`src/tree_store/page_store/page_allocation.rs`,
+`src/tree_store/page_store/cached_file.rs`,
+`src/tree_store/page_store/page_manager.rs` and `src/db.rs` implement this
+feature-internal primitive. No reader alias, allocation, limit, backend read or
+wire change is introduced by retirement. Actual page drops settle the existing
+occupancy receipts after physical free. Upstream proposal: an operation-scoped
+cache insertion identity with selective idle-page retirement after refusal.
+The source patch is regenerated from every current src file against the pinned,
+checksum-verified archive; no prior source hunks are removed by reconstruction.

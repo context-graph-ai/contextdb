@@ -168,6 +168,9 @@ pub use native_storage_admission::{
 };
 
 mod read_admission;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use read_admission::ReadCacheRequest;
 #[doc(hidden)]
 pub use read_admission::{BackendReadObservation, observe_backend_reads};
 #[doc(hidden)]

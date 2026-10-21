@@ -1503,7 +1503,9 @@ pub(super) fn decode_forward_for_route(
     if consumed != suffix.len() {
         return Err(damage("membership identity suffix has trailing bytes"));
     }
-    crate::read_image_memory::reserve_output(index.table.len()
+    // Membership names are transient metadata, not the vector bodies whose
+    // output storage the import cohort prepaid.
+    crate::read_image_memory::reserve(index.table.len()
         .checked_add(index.column.len()).ok_or_else(|| damage("membership route size overflow"))?)?;
     let record = VectorPartitionMembershipRecord {
         index: index.clone(),

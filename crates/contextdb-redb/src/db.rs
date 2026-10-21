@@ -1407,6 +1407,12 @@ impl Database {
         self.mem.settle_startup_cache_budget(bytes)
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn retire_read_cache_request(&self, request: u64) {
+        self.mem.retire_read_cache_request(request);
+    }
+
     /// Retain the engine's original fixed cache invoice through physical free.
     /// Call once at quiescent startup; the owner also seeds handle recycling.
     #[cfg(feature = "contextdb-internal")]

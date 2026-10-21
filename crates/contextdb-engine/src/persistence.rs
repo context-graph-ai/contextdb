@@ -26411,6 +26411,15 @@ impl RedbPersistence {
         })
     }
 
+    /// Cache retirement performs no I/O or allocation and needs no new payer.
+    /// Closing the store already frees this same backing under exclusive access.
+    pub(crate) fn retire_read_cache_request(&self, request: u64) {
+        let database = self.db.read().unwrap_or_else(|error| error.into_inner());
+        if let Some(db) = database.as_ref() {
+            db.retire_read_cache_request(request);
+        }
+    }
+
     fn settle_writer_cache_budget_prepared(&self, bytes: usize) -> Result<usize> {
         let reserve = self.with_db(|db| {
             db.settle_startup_cache_budget(bytes)
@@ -28246,6 +28255,10 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             let graph_commit_support=Self::capture_graph_commit_support(&write_txn,ws.commit_lsn)?;
             #[cfg(any(test, feature = "test-seams"))]
             let mut stage_started = std::time::Instant::now();
+            // Physical row/index/log writes finish before proof construction.
+            // Their transient working state leaves the stack here; the exact
+            // manifests and mutation invoices still span proof publication.
+            let (pending_manifests, identity_mutations_commitment_credits, identity_mutations) = (|| {
             let mut pending_manifests = relational_version_manifest::PendingManifestPublication::new(self.proof_admission());
             // Declared first, so dropped last: these charges outlive the mutations they pay for.
             crate::read_image_memory::reserve(std::mem::size_of::<historical_index_commitment::CommitmentCredit>())?;
@@ -29280,6 +29293,9 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             // directory before returning its dedicated writer credit.
             drop(f32_row_vectors);
             drop(f32_witness_owner);
+                Ok::<_, Error>((pending_manifests, identity_mutations_commitment_credits,
+                    identity_mutations))
+            })()?;
             Self::apply_content_identity_with_manifests_in_write(
                 &write_txn,
                 &identity_mutations,
@@ -43602,7 +43618,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
             };
             crate::read_image_memory::reserve_output(len.checked_mul(std::mem::size_of::<f32>())
                 .ok_or_else(|| Error::Other("vector body size overflow".into()))?)?;
-            crate::read_image_memory::reserve_output(table.len().checked_add(column.len())
+            // The vector body's prepaid workspace does not cover index names.
+            crate::read_image_memory::reserve(table.len().checked_add(column.len())
                 .ok_or_else(|| Error::Other("vector index size overflow".into()))?)?;
             let mut vector = Vec::with_capacity(len);
             match body {

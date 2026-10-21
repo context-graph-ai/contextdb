@@ -586,3 +586,52 @@ impl ScanReads {
         (self.node.as_ptr() as usize, std::alloc::Layout::new::<ScanScopeNode>(), receipt)
     }
 }
+
+
+// Cache misses are attributed to the enclosing engine request without retaining
+// a reader, callback or allocation. Existing hits retain their original tag.
+#[cfg(feature = "contextdb-internal")]
+thread_local! {
+    static CACHE_REQUEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static RETIRING_CACHE_REQUEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(feature = "contextdb-internal")]
+static NEXT_CACHE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct ReadCacheRequest {
+    id: u64,
+    previous: u64,
+    committed: bool,
+    _thread: PhantomData<Rc<()>>,
+}
+#[cfg(feature = "contextdb-internal")]
+impl ReadCacheRequest {
+    pub fn enter() -> Self {
+        use std::sync::atomic::Ordering;
+        let id = NEXT_CACHE_REQUEST.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |next| next.checked_add(1)).expect("cache request identity exhausted");
+        let previous = CACHE_REQUEST.with(|slot| slot.replace(id));
+        Self { id, previous, committed: false, _thread: PhantomData }
+    }
+    pub fn commit(&mut self) { self.committed = true; }
+    pub fn release(&self, release: impl FnOnce()) {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) { RETIRING_CACHE_REQUEST.with(|slot| slot.set(self.0)); }
+        }
+        let _restore = Restore(RETIRING_CACHE_REQUEST.with(|slot|
+            slot.replace(if self.committed { 0 } else { self.id })));
+        release();
+    }
+    pub fn retiring() -> Option<u64> {
+        RETIRING_CACHE_REQUEST.with(|slot| match slot.get() { 0 => None, id => Some(id) })
+    }
+}
+#[cfg(feature = "contextdb-internal")]
+impl Drop for ReadCacheRequest {
+    fn drop(&mut self) { CACHE_REQUEST.with(|slot| slot.set(self.previous)); }
+}
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn cache_request() -> u64 { CACHE_REQUEST.with(std::cell::Cell::get) }

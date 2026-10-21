@@ -751,6 +751,11 @@ impl TransactionalMemory {
     }
 
     #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn retire_read_cache_request(&self, request: u64) {
+        self.storage.retire_read_cache_request(request);
+    }
+
+    #[cfg(feature = "contextdb-internal")]
     pub(crate) fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize> {
         // The allocator window set takes its allotment of the share first;
         // the page cache settles on the rest, so the reserve stays one charge.

@@ -196,6 +196,8 @@ enum PagePayer {
 }
 struct PageBlock {
     owners: AtomicUsize,
+    #[cfg(feature = "contextdb-internal")]
+    request: u64,
     len: usize,
     checksum: Mutex<Option<u128>>,
     payer: Mutex<Option<PagePayer>>,
@@ -240,6 +242,8 @@ impl PageAllocation {
         unsafe {
             block.as_ptr().write(PageBlock {
                 owners: AtomicUsize::new(1),
+                #[cfg(feature = "contextdb-internal")]
+                request: crate::read_admission::cache_request(),
                 len,
                 checksum: Mutex::new(None),
                 payer: Mutex::new(Some(payer)),
@@ -333,6 +337,10 @@ impl PageAllocation {
     /// genuine payer, so every alias stays continuously covered during transfer.
     pub(super) fn transfer(&self, payment: CachePayment) {
         self.transfer_counted(payment, true);
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(super) fn belongs_to_request(&self, request: u64) -> bool {
+        request != 0 && unsafe { self.block.as_ref() }.request == request
     }
     pub(crate) fn strong_count(this: &Self) -> usize {
         unsafe { this.block.as_ref() }
