@@ -1288,6 +1288,7 @@ struct BorrowedActiveOwner {
     owner: std::mem::ManuallyDrop<ImageMemoryHandle>,
     generation: usize,
 }
+const _: () = assert!(!std::mem::needs_drop::<Option<BorrowedActiveOwner>>());
 impl BorrowedActiveOwner {
     fn new(owner: &ImageMemoryHandle, generation: usize) -> Self {
         // SAFETY: the scope retains this exact existing capability. This copies
@@ -1473,7 +1474,12 @@ impl Drop for ImageMemoryScope {
 
 pub(crate) fn active_owner() -> Result<crate::read_image_memory::ImageMemoryHandle> {
     ACTIVE
-        .with(|active| active.borrow().as_ref().map(|active| ImageMemoryHandle::clone(&active.owner)))
+        .with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .map(|active| ImageMemoryHandle::clone(&active.owner))
+        })
         .ok_or_else(|| Error::Other("engine decode requires an operation memory owner".into()))
 }
 
@@ -2733,11 +2739,15 @@ impl ImageMemoryHandle {
         // JSON entry can unwind; install ACTIVE only after both keepers exist.
         let json = contextdb_core::types::JsonReadAdmissionGuard::enter_owned(owner.owner());
         let generation = ACTIVE_GENERATION.with(|next| {
-            let generation = next.get().checked_add(1).unwrap_or_else(|| std::process::abort());
+            let generation = next
+                .get()
+                .checked_add(1)
+                .unwrap_or_else(|| std::process::abort());
             next.set(generation);
             generation
         });
-        let previous = ACTIVE.with(|active| active.replace(Some(BorrowedActiveOwner::new(&owner, generation))));
+        let previous = ACTIVE
+            .with(|active| active.replace(Some(BorrowedActiveOwner::new(&owner, generation))));
         ImageMemoryScope {
             previous,
             generation,

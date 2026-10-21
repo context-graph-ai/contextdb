@@ -3406,14 +3406,13 @@ impl OwnerReadService {
                 ))
             }
             LocalMetadataRequest::Schema { table } => {
-                let meta = reading.table_meta(&table).ok_or_else(|| {
-                    OwnerReadScaffoldError::Database(contextdb_core::Error::TableNotFound(
-                        table.clone(),
-                    ))
-                })?;
+                let schema = reading.metadata_schema(&table, read_memory.clone())
+                    .map_err(OwnerReadScaffoldError::Database)?.ok_or_else(|| {
+                        OwnerReadScaffoldError::Database(contextdb_core::Error::TableNotFound(table))
+                    })?;
                 let payload = crate::read_contract::encode_metadata_body_funded(
                     &crate::direct_file_reader::DirectMetadataBody::Schema {
-                        schema: crate::read_image::project_schema(&table, &meta),
+                        schema: schema.value,
                     }, read_memory.clone(), effective_limits.memory,
                 )
                 .map_err(owner_encoding_error)?;
