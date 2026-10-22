@@ -5411,7 +5411,7 @@ impl MemoryAccountant {
 #[derive(Debug)]
 pub(crate) struct WriterVectorBudget {
     accountant: Option<AccountantHandle>,
-    layout: Layout,
+    _layout: Layout,
     _writer_use: Option<WriterUse>,
 }
 impl WriterVectorBudget {
@@ -5578,7 +5578,7 @@ impl AccountantHandle {
         );
         let adapter = WriterVectorBudget {
             accountant: Some(self.clone()),
-            layout: Layout::new::<()>(),
+            _layout: Layout::new::<()>(),
             _writer_use: WriterUse::retain_if_writer(self),
         };
         writer_adapter_layout(&adapter)
@@ -5755,7 +5755,7 @@ impl AccountantHandle {
     ) -> contextdb_core::Result<contextdb_vector::MemoryBudgetOwner> {
         let original = self.original_for_adapter(writer_use.as_ref());
         let adapter = WriterVectorBudget {
-            accountant: Some(self.clone()), layout: Layout::new::<()>(),
+            accountant: Some(self.clone()), _layout: Layout::new::<()>(),
             _writer_use: writer_use,
         };
         let bytes = writer_adapter_layout(&adapter).size().checked_add(

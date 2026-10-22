@@ -1195,7 +1195,7 @@ pub(crate) enum QueryAnswerCharge {
 }
 #[derive(Debug)]
 pub(crate) struct QueryImageCharge {
-    previous: QueryAnswerCharge,
+    _previous: QueryAnswerCharge,
     image: crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
 }
 impl QueryAnswerCharge {
@@ -1216,7 +1216,7 @@ impl QueryAnswerCharge {
             let mut result = run(&image.value)?;
             let previous = std::mem::take(&mut result.vector_copy_charge);
             published = Some(result);
-            Ok(QueryImageCharge { previous, image })
+            Ok(QueryImageCharge { _previous: previous, image })
         }).map_err(|error| match error {
             NativeProduce::Refused(refusal) => Error::NativeEngineOther(refusal),
             NativeProduce::Producer(error) => error,
