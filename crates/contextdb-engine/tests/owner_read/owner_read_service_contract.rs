@@ -934,6 +934,7 @@ struct ObserverState {
     request_deadline_signals: u64,
     shutdown_signals: u64,
     finished_requests: u64,
+    released_connections: u64,
     active_clock_base_ms: u64,
     record_budget: bool,
     blocked_budget_ledger: Vec<contextdb_engine::memory_accounting::BudgetLedgerEntry>,
@@ -1058,6 +1059,17 @@ impl ProductionObserver {
             state,
             "request deadline or disconnect signal wait",
             |state| state.request_deadline_signals + state.disconnect_signals >= expected,
+        ));
+    }
+
+    fn wait_for_released_connections(&self, expected: u64) {
+        let (lock, changed) = &*self.state;
+        let state = lock.lock().expect("bounded observer state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "connection storage release wait",
+            |state| state.released_connections >= expected,
         ));
     }
 
@@ -1226,6 +1238,13 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().expect("bounded observer state");
         state.request_deadline_signals = state.request_deadline_signals.saturating_add(1);
+        changed.notify_all();
+    }
+
+    fn connection_storage_released(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("bounded observer state");
+        state.released_connections = state.released_connections.saturating_add(1);
         changed.notify_all();
     }
 
@@ -1628,6 +1647,10 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
     assert_eq!(harness.service.cancellation_signal_count(), 1);
     drop(client);
     harness.clients.lock().expect("owner client registry").clear();
+    // The carrier future has returned and disconnect has released this
+    // connection's storage. Service teardown must not be needed to refund it.
+    observer.wait_for_released_connections(1);
+    assert_resources(&harness.service, baseline);
     harness
         .service
         .shutdown_and_drain()

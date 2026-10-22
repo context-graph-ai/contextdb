@@ -135,6 +135,10 @@ pub trait OwnerBoundedExecutionObserver: Send + Sync {
     fn shutdown_cancellation_signalled(&self) {}
 
     fn request_finished(&self) {}
+
+    /// The returned carrier future and disconnect cleanup have dropped their
+    /// storage. Notification only, before the connection is marked completed.
+    fn connection_storage_released(&self) {}
 }
 
 /// Test-only observation of the owner carrier's cursor-page commit point.
@@ -4045,6 +4049,10 @@ fn run_owner_accept_loop(
                         Err(error) => Err(OwnerReadScaffoldError::Database(error)),
                     };
                     let _released = connection_service.disconnect(connection_id);
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if let Some(observer) = &connection_service.spec.execution_observer {
+                        observer.connection_storage_released();
+                    }
                     drop(connection_service);
                     completion.mark_connection_completed(connection_id);
                 });

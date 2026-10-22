@@ -736,6 +736,10 @@ struct SyncRouteLifecycle {
 
 #[derive(Default)]
 struct SyncRouteState {
+    #[cfg(any(feature = "test-seams", feature = "in-process-test-seams"))]
+    routes_ready: AtomicBool,
+    #[cfg(any(feature = "test-seams", feature = "in-process-test-seams"))]
+    routes_ready_notice: Notify,
     lifecycle: Mutex<SyncRouteLifecycle>,
     /// Native routes served beside the Legacy route map, for one serve call.
     /// The one native root served beside the Legacy route map, tagged with
@@ -1419,8 +1423,6 @@ struct LargeRequestTestControlState {
     response_control_reset: AtomicBool,
     response_control_paused_notice: Notify,
     response_control_resume_notice: Notify,
-    routes_ready: AtomicBool,
-    routes_ready_notice: Notify,
     shutdown_admission_closed: AtomicBool,
     shutdown_admission_closed_notice: Notify,
     force_graceful_drain_timeout: AtomicBool,
@@ -1460,8 +1462,6 @@ impl Default for LargeRequestTestControlState {
             response_control_reset: AtomicBool::new(false),
             response_control_paused_notice: Notify::new(),
             response_control_resume_notice: Notify::new(),
-            routes_ready: AtomicBool::new(false),
-            routes_ready_notice: Notify::new(),
             shutdown_admission_closed: AtomicBool::new(false),
             shutdown_admission_closed_notice: Notify::new(),
             force_graceful_drain_timeout: AtomicBool::new(false),
@@ -1471,12 +1471,28 @@ impl Default for LargeRequestTestControlState {
 
 /// Test-only controls for the real Iroh serving path. They are absent from
 /// default builds and are not connected to endpoint configuration.
-#[cfg(feature = "test-seams")]
+#[cfg(any(feature = "test-seams", feature = "in-process-test-seams"))]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct LargeRequestTestController {
+    #[cfg(feature = "test-seams")]
     stage: DurableLargeRequestStage,
     sync_routes: SyncRoutes,
+}
+
+#[cfg(any(feature = "test-seams", feature = "in-process-test-seams"))]
+impl LargeRequestTestController {
+    pub async fn wait_until_routes_ready_for_test(&self) {
+        loop {
+            let notice = self.sync_routes.routes_ready_notice.notified();
+            tokio::pin!(notice);
+            notice.as_mut().enable();
+            if self.sync_routes.routes_ready.load(Ordering::SeqCst) {
+                return;
+            }
+            notice.await;
+        }
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -1595,18 +1611,6 @@ impl LargeRequestTestController {
             .control
             .response_control_resume_notice
             .notify_waiters();
-    }
-
-    pub async fn wait_until_routes_ready_for_test(&self) {
-        loop {
-            let notice = self.stage.control.routes_ready_notice.notified();
-            tokio::pin!(notice);
-            notice.as_mut().enable();
-            if self.stage.control.routes_ready.load(Ordering::SeqCst) {
-                return;
-            }
-            notice.await;
-        }
     }
 
     pub fn force_graceful_drain_timeout_for_test(&self) {
@@ -2627,10 +2631,11 @@ impl IrohServer {
         })
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(feature = "test-seams", feature = "in-process-test-seams"))]
     #[doc(hidden)]
     pub fn large_request_test_controller(&self) -> LargeRequestTestController {
         LargeRequestTestController {
+            #[cfg(feature = "test-seams")]
             stage: self.large_request_stage.clone(),
             sync_routes: self.sync_routes.clone(),
         }
@@ -3912,8 +3917,11 @@ impl ServerTransport for IrohServerTransport {
                 self.control
                     .shutdown_admission_closed
                     .store(false, Ordering::SeqCst);
-                self.control.routes_ready.store(true, Ordering::SeqCst);
-                self.control.routes_ready_notice.notify_waiters();
+            }
+            #[cfg(any(feature = "test-seams", feature = "in-process-test-seams"))]
+            {
+                self.sync_routes.routes_ready.store(true, Ordering::SeqCst);
+                self.sync_routes.routes_ready_notice.notify_waiters();
             }
             #[cfg(feature = "production-smoke-driver")]
             production_smoke_routes_ready();

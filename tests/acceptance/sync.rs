@@ -1229,6 +1229,12 @@ async fn sync_e2e_value_txid_round_trip() {
     let server_handle = server.clone();
     let shutdown_handle = shutdown.clone();
     let task = tokio::spawn(async move { server_handle.run_until(shutdown_handle).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        endpoint.large_request_test_controller().wait_until_routes_ready_for_test(),
+    )
+    .await
+    .expect("the tenant routes are registered before edge clients connect");
     // Edge clients share the same authenticated tenant route as the server.
     let edge_a = SyncClient::new(
         edge_a_db.clone(),
