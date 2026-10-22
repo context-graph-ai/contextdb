@@ -6541,6 +6541,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                         .as_ref()
                                         .and_then(|selection| selection.streamed_tail.as_ref())
                                     {
+                                        // This membership door has no admission callback.
+                                        // Retire optional navigation before its mandatory
+                                        // source window, using the same original funder.
+                                        navigation_session.release_navigation_before_body();
                                         match tail.includes_row(
                                             row_id,
                                             snapshot,
@@ -6571,10 +6575,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                         return visible.is_some();
                                     }
                                     if let Some(covered_tx) = source.journal_suffix_frontier() {
-                                        match source.state.try_visible_directory_entry_by_row(
+                                        match source.state.bounded_visible_directory_entry_by_row_with_copy_admission::<Error>(
                                             row_id,
                                             snapshot,
+                                            &mut || Ok(()),
                                             &mut admitted_owner.borrow_mut(),
+                                            Some(&mut |token, bytes, component, operation, hint| {
+                                                navigation_session.reserve_for(token, bytes, component, operation, hint)
+                                            }),
                                         ) {
                                             Ok(entry) => {
                                                 let visible = entry
@@ -6622,7 +6630,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                 ledger.borrow_mut().admit(
                                     partitions[position].source_position,
                                     row_id,
-                                    &mut |bytes| (*retained.borrow_mut())(bytes),
+                                    &mut |bytes| {
+                                        let mut admission = owner.scratch();
+                                        navigation_session
+                                            .reserve(&mut admission, bytes)
+                                            .map_err(E::from)?;
+                                        drop(admission);
+                                        (*retained.borrow_mut())(bytes)
+                                    },
                                     &mut || (*source_checkpoints.borrow_mut())(),
                                 )
                             })
