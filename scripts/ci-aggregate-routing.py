@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import tomllib
 
-CERTIFICATE_SHA256 = '905ca74e8df2fe59d498e063df45722a492e87d1dbf4a2b791ce0f61b4474fc5'
+CERTIFICATE_SHA256 = '1e00a0c290f9d464bff74e18423a133b9ee0c4ccea84be8adde4fa9d5b59a6e0'
 AGGREGATES = ('custody', 'vector')
 FULL_ONLY_RULE = {'module': 'schema_replay_is_proportional_to_affected_tables', 'source': 'crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs', 'normal_owner': 'custody_schema_replay_bounded_contract', 'full_owner': 'custody_schema_replay_is_proportional_to_affected_tables', 'full_skip_owner': 'custody_schema_replay_bounded_contract'}
 PROFILES = (frozenset(('test-seams', 'iroh')),
