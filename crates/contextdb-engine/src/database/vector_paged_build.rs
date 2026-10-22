@@ -107,22 +107,26 @@ pub(super) fn paged_build_hooks(
     partition: &VectorPartitionRef,
     record: &PagedBuildRecord,
 ) -> Result<PagedBuildHooks> {
-    record.progress()?;
+    let progress = record.progress()?;
+    let insertion_progress = vector.begin_partition_maintenance_progress(
+        partition,
+        record.reason.as_str(),
+        progress.total_points,
+        progress.frontier_tx,
+        progress_state(record.reason),
+    )?;
     let closed = Arc::clone(resource_closed);
     let interrupted = Arc::clone(publication_interrupted);
     let gate_manager = tx_mgr.downgrade();
-    let insertion_progress = {
+    #[cfg(any(test, feature = "test-seams"))]
+    let insertion_pause = {
         let vector = Arc::downgrade(vector);
         let partition = partition.clone();
-        // A restored builder can be armed after open. Resolve the existing
-        // pause at insertion time rather than freezing its state at registration.
-        Arc::new(move |done| {
+        move |done| {
             if let Some(vector) = vector.upgrade() {
-                vector.advance_partition_paged_build_inspection(&partition, done);
-                #[cfg(any(test, feature = "test-seams"))]
                 vector.maybe_pause_paged_build_insertion_for_test(&partition, done);
             }
-        })
+        }
     };
     Ok(PagedBuildHooks {
         checkpoint: Arc::new(move || {
@@ -137,7 +141,11 @@ pub(super) fn paged_build_hooks(
         // Live inspection advances after a complete identity insertion. Durable
         // progress still advances only when its entire batch commits; the caller
         // restores that durable value after either success or abort.
-        inserted: insertion_progress,
+        inserted: Arc::new(move |done| {
+            insertion_progress.advance(done);
+            #[cfg(any(test, feature = "test-seams"))]
+            insertion_pause(done);
+        }),
         gate: Arc::new(move |work| {
             let manager = gate_manager
                 .upgrade()
