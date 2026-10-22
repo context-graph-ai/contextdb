@@ -110,21 +110,21 @@ fn every_route(
     let narrowed = db.scoped_with_contexts(contexts(&[CTX_A]));
     let mut answers = vec![(
         "eager",
-        classify(narrowed.execute(sql, binds).map(|r| r.rows.len())),
+        classify(narrowed.execute(sql, binds).map(|r| r.rows().len())),
     )];
     let session = narrowed
         .read_session(roomy())
         .expect("open a bounded read view");
     answers.push((
         "bounded",
-        classify(session.execute(sql, binds).map(|r| r.rows.len())),
+        classify(session.execute(sql, binds).map(|r| r.rows().len())),
     ));
     answers.push((
         "retained cursor",
         classify(
             session
                 .open_cursor(sql, binds)
-                .map(|cursor| cursor.first_page().rows.len()),
+                .map(|cursor| cursor.first_page().rows().len()),
         ),
     ));
     let tx = narrowed.begin().expect("begin");
@@ -137,7 +137,7 @@ fn every_route(
         .expect("stage a row of the reader's own");
     answers.push((
         "transaction with staged rows",
-        classify(narrowed.execute_in_tx(tx, sql, binds).map(|r| r.rows.len())),
+        classify(narrowed.execute_in_tx(tx, sql, binds).map(|r| r.rows().len())),
     ));
     narrowed.rollback(tx).expect("rollback");
     answers

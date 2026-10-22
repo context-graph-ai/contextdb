@@ -26,7 +26,7 @@ fn open(path: &std::path::Path) -> Database {
 }
 
 fn count(answer: QueryResult) -> i64 {
-    match answer.rows.as_slice() {
+    match answer.rows() {
         [row] => match row.as_slice() {
             [Value::Int64(count)] => *count,
             other => panic!("a count is one integer: {other:?}"),
@@ -159,19 +159,19 @@ fn rows_on_every_route(
     path: &std::path::Path,
     sql: &str,
     bound: &HashMap<String, Value>,
-) -> Vec<(&'static str, Vec<Vec<Value>>)> {
+) -> Vec<(&'static str, QueryResult)> {
     let db = open(path);
-    let committed = db.execute(sql, bound).unwrap().rows;
+    let committed = db.execute(sql, bound).unwrap();
     let tx = db.begin().unwrap();
-    let in_transaction = db.execute_in_tx(tx, sql, bound).unwrap().rows;
+    let in_transaction = db.execute_in_tx(tx, sql, bound).unwrap();
     db.rollback(tx).unwrap();
     db.close().unwrap();
     drop(db);
     let reader = contextdb_engine::ReadSession::open(path).expect("read-only open");
-    let file_route = reader.execute(sql, bound).unwrap().rows;
+    let file_route = reader.execute(sql, bound).unwrap();
     drop(reader);
     let db = open(path);
-    let reopened = db.execute(sql, bound).unwrap().rows;
+    let reopened = db.execute(sql, bound).unwrap();
     db.close().unwrap();
     vec![
         ("committed", committed),
@@ -199,7 +199,7 @@ fn distinct_keeps_one_row_per_float8_value() {
     let none = HashMap::new();
     for (route, rows) in rows_on_every_route(&path, "SELECT DISTINCT score FROM plain", &none) {
         assert_eq!(
-            rows.len(),
+            rows.rows().len(),
             3,
             "{route}: DISTINCT over {{0, -0, NaN, -NaN, 1}} is {{0, NaN, 1}}: {rows:?}"
         );
@@ -248,10 +248,10 @@ fn an_indexed_float_range_with_one_bound_answers_like_a_scan() {
                 format!("SELECT id FROM {table} WHERE grp = $grp AND score {operator} $score");
             for (route, rows) in rows_on_every_route(&path, &sql, &bound) {
                 assert_eq!(
-                    rows.len(),
+                    rows.rows().len(),
                     expected,
                     "{route}: {table} WHERE grp = 1 AND score {operator} 1.0 answered {} rows",
-                    rows.len()
+                    rows.rows().len()
                 );
             }
         }
@@ -262,10 +262,8 @@ fn an_indexed_float_range_with_one_bound_answers_like_a_scan() {
             "SELECT id FROM grouped WHERE grp = $grp AND score <= $score",
             &params(&[("grp", Value::Int64(1)), ("score", Value::Float64(1.0))]),
         )
-        .unwrap()
-        .trace
-        .physical_plan;
-    assert_eq!(plan, "IndexScan", "the one-bound range reads the index");
+        .unwrap();
+    assert_eq!(plan.trace().physical_plan, "IndexScan", "the one-bound range reads the index");
     db.close().unwrap();
 }
 
@@ -336,7 +334,7 @@ fn a_rank_policy_joins_float_keys_by_float8_equality() {
     .filter(|(route, _)| *route != "file route")
     {
         assert_eq!(
-            rows,
+            rows.rows(),
             vec![vec![id(3)], vec![id(1)], vec![id(2)]],
             "{route}: every decision joins the outcome whose bucket it equals"
         );

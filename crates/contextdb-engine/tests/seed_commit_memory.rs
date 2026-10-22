@@ -10,7 +10,6 @@
 mod heap_oracle;
 
 use contextdb_core::Value;
-use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 use std::process::Command;
