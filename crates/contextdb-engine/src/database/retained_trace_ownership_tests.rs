@@ -1126,8 +1126,10 @@ fn retained_trace_row(row: Row) {
     assert!(allowance > parent.retained_bytes_for_test());
     let writer_before = db.accountant().usage().used;
     let _capture = Capture::begin();
-    let (answer, first) = statement::observe(&parent, allowance, || query(&db));
-    assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    let (_, first) = statement::observe(&parent, allowance, || {
+        let answer = query(&db);
+        assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    });
     let first_invoice = invoice(&db);
     let first_owner = OWNER.with(Cell::get);
     let controls = assert_owner_request(first_owner, first_invoice, &first);
