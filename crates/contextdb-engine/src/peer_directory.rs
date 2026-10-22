@@ -22,12 +22,14 @@ pub(crate) const CREATE_PEER_DIRECTORY: &str = "CREATE TABLE peer_directory (\
 /// CURRENT ONLY, so the table is never observed keep-first while the
 /// declaration is in force) — matching `install_work_ledger_schema`'s
 /// reconciliation of `work_capabilities`.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn install_peer_directory_schema(db: &Database) -> Result<()> {
     let read_memory = db.declared_reader_memory()?;
     install_peer_directory_schema_with_read_memory(db, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn install_peer_directory_schema_with_read_memory(
     db: &Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -95,12 +97,14 @@ pub(crate) fn apply_peer_directory_policy_overrides(policies: &mut ConflictPolic
 /// Upsert `node_id -> ticket`: a node's row is keyed on its own `node_id`, so
 /// a re-enrolling node (a rotated ticket) overwrites its prior row rather
 /// than accumulating history.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn register_peer_ticket(db: &Database, node_id: &str, ticket: &str, now_ms: i64) -> Result<()> {
     let read_memory = db.declared_reader_memory()?;
     register_peer_ticket_with_read_memory(db, node_id, ticket, now_ms, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn register_peer_ticket_with_read_memory(
     db: &Database,
     node_id: &str,
@@ -125,12 +129,14 @@ pub fn register_peer_ticket_with_read_memory(
 }
 
 /// Resolve `node_id` to its current dialable ticket, if enrolled.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn lookup_peer_ticket(db: &Database, node_id: &str) -> Result<Option<String>> {
     let read_memory = db.declared_reader_memory()?;
     lookup_peer_ticket_with_read_memory(db, node_id, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn lookup_peer_ticket_with_read_memory(
     db: &Database,
     node_id: &str,

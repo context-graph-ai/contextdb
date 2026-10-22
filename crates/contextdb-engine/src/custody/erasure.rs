@@ -14,6 +14,7 @@ pub(crate) enum PurgeReportShape {
 
 // Every authenticated source copy of the selected key belongs
 // to its purge, including equivalent and refused submissions with local lives.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn lineage_roots(
     db: &Database,
     table: &str,
@@ -48,6 +49,7 @@ pub(crate) fn lineage_roots(
     Ok(roots.into_iter().collect())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn metadata_keys(
     db: &Database,
     selected: &[RowRef],
@@ -60,6 +62,7 @@ pub(crate) fn metadata_keys(
 
 /// Retired occurrences cannot erase custody for a new same-key incarnation.
 /// Immutable creator evidence or an exact materialized local life must match.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn metadata_keys_for_retired_lives(
     db: &Database,
     selected: &[(RowRef, u64, u64, String)],
@@ -80,6 +83,7 @@ pub(crate) fn metadata_keys_for_retired_lives(
     metadata_keys_matching(db, &references, Some(selected), read_memory)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn metadata_keys_matching(
     db: &Database,
     selected: &[RowRef],

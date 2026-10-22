@@ -58,6 +58,7 @@ fn issued_continuation(vocabulary: MetadataPageVocabulary, key: &str) -> String 
 
 /// Where a resumed page starts, or the refusal for a token this question did
 /// not issue.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn resume_after(
     vocabulary: MetadataPageVocabulary,
     token: &str,
@@ -122,6 +123,7 @@ pub(crate) fn metadata_event_key(item: &MetadataItem) -> String {
 
 /// Cut one page out of a complete inventory. The continuation is the key of
 /// the last item published, so a resumed page starts strictly after it.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn continuation_page(
     vocabulary: MetadataPageVocabulary,
     items: Vec<MetadataItem>,
@@ -197,6 +199,7 @@ fn key_of(item: &MetadataItem) -> String {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn finish_metadata_page(
     page: MetadataPage,
 ) -> std::result::Result<MetadataPage, MetadataPagingError> {
@@ -523,6 +526,7 @@ pub(crate) fn events_of(page: &MetadataPage) -> DirectEventsStatus {
 
 /// Admit only the actual new promotion buffers; original page storage retains
 /// its separate original decode/source invoice throughout this borrow.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn table_names_of_funded(
     page: &MetadataPage, memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<Vec<String>> {
@@ -538,6 +542,7 @@ pub(crate) fn table_names_of_funded(
 fn promotion_size_error() -> contextdb_core::Error {
     contextdb_core::Error::Other("metadata promotion size overflow".into())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn events_of_funded(
     page: &MetadataPage, memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<DirectEventsStatus> {
@@ -608,6 +613,7 @@ impl Serialize for EventProjection<'_> {
         map.end()
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn inventory_text(owner: &ReadMemoryOwner, text: std::fmt::Arguments<'_>) -> contextdb_core::Result<Funded<String>> {
     struct Count(usize);
     impl std::fmt::Write for Count {
@@ -621,6 +627,7 @@ fn inventory_text(owner: &ReadMemoryOwner, text: std::fmt::Arguments<'_>) -> con
     std::fmt::write(&mut output.value, text).map_err(|_| promotion_size_error())?;
     Ok(output)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn event_projection<'a>(
     owner: &ReadMemoryOwner, kind: &'static str, name: &str,
     fields: &[(&'static str, InventoryValue<'a>)],
@@ -662,6 +669,7 @@ struct InventoryPage<'a> {
     has_more: bool,
     continuation: Option<&'a str>,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn inventory_page(
     owner: ReadMemoryOwner, vocabulary: MetadataPageVocabulary, inventory: Inventory<'_>,
     continuation: Option<&str>, page_bytes: u64,
@@ -701,6 +709,7 @@ fn inventory_page(
     page.value.validate().map_err(|_| MetadataPagingError::Encoding(ReadEncodingError::InvalidPayload))?;
     Ok(page)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn borrowed_table_page<'a>(
     owner: ReadMemoryOwner, names: impl ExactSizeIterator<Item = &'a str>,
     continuation: Option<&str>, page_bytes: u64,
@@ -712,6 +721,7 @@ pub(crate) fn borrowed_table_page<'a>(
     names.value.sort_unstable(); names.value.dedup();
     inventory_page(owner, MetadataPageVocabulary::Tables, Inventory::Tables(&names.value), continuation, page_bytes)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn borrowed_event_page(
     owner: ReadMemoryOwner, status: &DirectEventsStatus, continuation: Option<&str>, page_bytes: u64,
 ) -> Result<Funded<MetadataPage>, MetadataPagingError> {

@@ -24,6 +24,7 @@ impl std::fmt::Debug for SourceRegistration {
     }
 }
 impl SourceRegistration {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare(
         &self,
         db: &Database,
@@ -61,7 +62,9 @@ pub(crate) trait CommitWriteSource {
     fn vector_inserts(&self) -> &[contextdb_core::VectorEntry];
     fn config_writes(&self) -> &[(String, Vec<u8>)];
     fn commit_lsn(&self) -> Option<contextdb_core::Lsn>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn push_config(&mut self, body: (String, Vec<u8>)) -> Result<()>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_config(&mut self, key: String) -> Result<()>;
 }
 impl CommitWriteSource for contextdb_tx::WriteSet {
@@ -103,7 +106,9 @@ impl CommitWriteSource for contextdb_tx::manager::EngineGuard<'_> {
 /// The legacy private callback seam remains usable by existing callers. The
 /// migrated production callbacks also implement preparation on a native guard.
 pub(crate) trait CommitPreparation {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(&mut self, db: &Database, ws: &mut contextdb_tx::WriteSet) -> Result<Vec<Record>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_owned(&mut self, db: &Database, held: &mut contextdb_tx::manager::EngineGuard<'_>) -> Result<Vec<Record>>;
 }
 impl<F> CommitPreparation for F
@@ -133,6 +138,7 @@ pub(crate) struct OwnedPreparationValue<T> {
     _debit: crate::memory_accounting::OwnedMemoryReservation,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn preparation_array_bytes<T>(count: usize) -> Result<usize> {
     std::alloc::Layout::array::<T>(count)
         .map(|layout| layout.size())
@@ -140,6 +146,7 @@ pub(crate) fn preparation_array_bytes<T>(count: usize) -> Result<usize> {
 }
 
 impl<T> OwnedPreparationValue<T> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_produce(
         db: &Database,
         native_bytes: usize,
@@ -158,6 +165,7 @@ impl<T> OwnedPreparationValue<T> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn copy_row_owned(
     db: &Database,
     row: &contextdb_core::VersionedRow,
@@ -180,6 +188,7 @@ impl std::ops::Deref for FinalRow {
 }
 impl Drop for FinalRow { fn drop(&mut self) {} }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn final_staged_row_owned(
     db: &Database,
     ws: &dyn CommitWriteSource,
@@ -246,6 +255,7 @@ fn final_staged_row_owned(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn final_row(
     db: &Database,
     ws: &dyn CommitWriteSource,
@@ -317,6 +327,7 @@ pub(crate) fn random_digest() -> [u8; 32] {
     getrandom::fill(&mut digest).expect("operating system entropy");
     digest
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn next_state(
     db: &Database,
     incarnation: Incarnation,
@@ -374,6 +385,7 @@ pub(crate) fn next_state(
             .unwrap_or_else(empty_history_root),
     })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn state_records(
     db: &Database,
     state: StateRecord,
@@ -431,6 +443,7 @@ pub(crate) fn state_records(
     Ok(records)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn normalized(
     table: &str,
     mut policy: ApplicationTablePolicy,
@@ -444,6 +457,7 @@ pub(crate) fn normalized(
     policy_digest(table, &policy)?;
     Ok(policy)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn binding(
     db: &Database,
     edge: &str,
@@ -477,6 +491,7 @@ pub(crate) fn binding(
         })
         .ok_or_else(invalid)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn actual_row(
     db: &Database,
     r: &RowRef,
@@ -493,6 +508,7 @@ pub(crate) fn actual_row(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn actual_policy(
     db: &Database,
     table: &str,
@@ -527,6 +543,7 @@ pub(crate) fn actual_policy(
 }
 // Registration validates the writing transaction immediately;
 // final preparation repeats it after ordinary commit validation has run.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn validate_registration(
     db: &Database,
     ws: &dyn CommitWriteSource,
@@ -584,6 +601,7 @@ pub(crate) fn validate_registration(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn prepare_manifest(
     db: &Database,
     ws: &mut dyn CommitWriteSource,
@@ -896,6 +914,7 @@ pub(crate) struct TerminalInput {
 }
 
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn prepare_terminal(
     db: &Database,
     ws: &mut dyn CommitWriteSource,
@@ -923,6 +942,7 @@ pub(crate) fn prepare_terminal(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prepare_terminal_at(
     db: &Database,
     ws: &mut dyn CommitWriteSource,
@@ -1196,6 +1216,7 @@ pub(crate) struct BindingInput {
     pub expectation: ApplicationTablePolicyExpectation,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn committed_certificate(
     db: &Database,
     namespace: &Namespace,
@@ -1211,6 +1232,7 @@ pub(crate) fn committed_certificate(
     certificate_from_records(&records, namespace, state, signer)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn certificate_from_records(
     records: &[Record],
     namespace: &Namespace,
@@ -1247,6 +1269,7 @@ pub(crate) fn certificate_from_records(
     certificate.verify()?;
     Ok(certificate)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn edge_authority(
     db: &Database,
     namespace: &Namespace,
@@ -1288,6 +1311,7 @@ fn edge_authority(
     }
 }
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn commit_binding(
     db: &Database,
     tenant_id: TenantId,
@@ -1458,6 +1482,7 @@ pub(crate) fn commit_binding(
         certificate,
     })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn admit_binding(
     db: &Database,
     tenant: &TenantId,
@@ -1576,6 +1601,7 @@ pub(crate) fn admit_binding(
 }
 // Changed application rows have no current registration;
 // malformed or damaged journal records still fail their canonical verification.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn current_manifest(
     db: &Database,
     table: &str,
@@ -1621,6 +1647,7 @@ pub(crate) fn current_manifest(
     Ok(Some(m.clone()))
 }
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn commit_terminal(
     db: &Database,
     tenant: TenantId,
@@ -1820,6 +1847,7 @@ pub(crate) fn admit_terminal(
 
 // One admission transaction for the complete returned
 // cohort; no row scan, no truncated acceptance position, no partial credit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn admit_terminals(
     db: &Database,
     tenant: &TenantId,
@@ -2039,6 +2067,7 @@ impl OwnedPreparationValue<Vec<BirthRef>> {
 }
 
 impl OwnedPreparationValue<Vec<String>> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_names(db: &Database, capacity: usize) -> Result<Self> {
         Self::try_produce(db, preparation_array_bytes::<String>(capacity)?, || {
             let values = Vec::with_capacity(capacity);
@@ -2046,6 +2075,7 @@ impl OwnedPreparationValue<Vec<String>> {
             Ok(values)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push_name(&mut self, name: &str) -> Result<()> {
         if self.value.len() == self.value.capacity() { return Err(invalid()); }
         crate::memory_accounting::grow_preparation_from_original(&mut self._debit,
@@ -2053,6 +2083,7 @@ impl OwnedPreparationValue<Vec<String>> {
         self.value.push(crate::memory_accounting::preparation_copy_string(name)?);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sort_dedup_names(&mut self) -> Result<()> {
         self.value.sort_unstable();
         let released = self.value.windows(2).filter(|pair| pair[0] == pair[1])

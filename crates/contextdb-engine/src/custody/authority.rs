@@ -90,6 +90,7 @@ impl StateRecord {
     }
 }
 impl Certificate {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::domain("delivery-committed-state.v1");
         e.u32(self.format);
@@ -101,12 +102,14 @@ impl Certificate {
         e.raw(&self.retirement_digest);
         Ok(e.0)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn id(&self) -> Result<Digest> {
         let mut e = Encoder::domain("delivery-state-certificate-id.v1");
         e.bytes(&self.bytes()?);
         e.bytes(&self.signature);
         Ok(e.digest())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn verify(&self) -> Result<()> {
         if self.format != 1
             || BirthRef::from(&self.state.state) != self.birth.identity
@@ -131,6 +134,7 @@ pub(crate) struct EdgeAuthority {
     pub validity_revision: u64,
 }
 impl EdgeAuthority {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn encode(&self, e: &mut Encoder) -> Result<()> {
         e.u64(self.destination_epoch);
         e.string(self.namespace.tenant.as_str());
@@ -150,6 +154,7 @@ pub(crate) struct Admission {
     pub certificate: Digest,
 }
 impl Admission {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn key(&self) -> Result<String> {
         let mut e = Encoder::default();
         e.raw(&self.object_digest);
@@ -184,6 +189,7 @@ pub(crate) fn history_root(states: &[StateRecord]) -> Digest {
 }
 /// The Owned history root keeps borrowed selected states and prepaid sort and
 /// encoder scratch; the ordinary history's token order and domains are exact.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn history_root_owned(db: &crate::Database, states: &[&StateRecord]) -> Result<Digest> {
     use super::preparation::{OwnedPreparationValue, preparation_array_bytes};
     let sorted = OwnedPreparationValue::try_produce(
@@ -249,6 +255,7 @@ fn birth_key(b: &BirthRef) -> Vec<u8> {
 }
 
 /// Commit the complete ordered birth descriptors, never a list of unproven UUIDs.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn retirement_root(births: &[Birth]) -> Result<Digest> {
     if births.is_empty() {
         return Ok(empty_history_root());
@@ -267,6 +274,7 @@ pub(crate) fn retirement_root(births: &[Birth]) -> Result<Digest> {
     Ok(e.digest())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn validate_retirement_closure(active: &Birth, retired: &[Birth]) -> Result<()> {
     retirement_root(retired)?;
     if active.retired.len() != retired.len()
@@ -322,6 +330,7 @@ pub(crate) fn validate_retirement_closure(active: &Birth, retired: &[Birth]) -> 
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn retired_descriptors(records: &[Record], active: &Birth) -> Result<Vec<Birth>> {
     active
         .retired
@@ -359,6 +368,7 @@ impl Birth {
             b.encode_finite(e);
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn digest_finite(&self) -> Result<Digest> {
         finite_hash(|e| {
             e.string("delivery-incarnation-birth.v1");
@@ -387,6 +397,7 @@ fn compare_birth(a: &BirthRef, b: &BirthRef) -> std::cmp::Ordering {
         })
         .then_with(|| a.birth_id.as_bytes().cmp(b.birth_id.as_bytes()))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn retirement_root_finite(births: &[Birth]) -> Result<Digest> {
     retirement_root_finite_with_error(births.iter().map(Ok), invalid)
 }
@@ -429,6 +440,7 @@ pub(crate) fn retirement_root_finite_with_error<'a, E>(
         &invalid,
     )
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn validate_retirement_closure_owned(
     db: &crate::Database,
     active: &Birth,
@@ -518,6 +530,7 @@ pub(crate) fn validate_retirement_closure_owned(
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn certificate_bytes_finite(
     e: &mut FiniteEncoder<'_>,
     format: u32,
@@ -538,6 +551,7 @@ pub(crate) fn certificate_bytes_finite(
     Ok(())
 }
 impl Certificate {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bytes_finite(&self, e: &mut FiniteEncoder<'_>) -> Result<()> {
         certificate_bytes_finite(
             e,
@@ -549,6 +563,7 @@ impl Certificate {
             &self.retirement_digest,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn id_finite(&self) -> Result<Digest> {
         finite_hash(|e| {
             e.string("delivery-state-certificate-id.v1");
@@ -559,6 +574,7 @@ impl Certificate {
         })
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn object_digest_finite(
     tag: u8,
     walk: impl Fn(&mut FiniteEncoder<'_>) -> Result<()>,

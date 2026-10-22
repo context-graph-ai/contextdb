@@ -139,6 +139,7 @@ struct PerEdgeAppliedPushWatermarks {
 impl PerEdgeAppliedPushWatermarks {
     /// What this hub holds from this life of `node_id`, `Lsn(0)` when it holds
     /// nothing.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         db: &Database,
@@ -164,6 +165,7 @@ impl PerEdgeAppliedPushWatermarks {
             .or_insert(candidate);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_locked(
         cache: &mut HashMap<(String, Incarnation), Lsn>,
         db: &Database,
@@ -354,6 +356,7 @@ pub struct SyncServer {
 
 impl SyncServer {
     crate::transport::peer_endpoint_available! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(
         db: Arc<Database>,
         endpoint: &crate::transport::PeerEndpoint,
@@ -366,6 +369,7 @@ impl SyncServer {
     }
 
     crate::transport::peer_endpoint_available! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new_with_read_budget_provider(
         db: Arc<Database>,
         endpoint: &crate::transport::PeerEndpoint,
@@ -377,6 +381,7 @@ impl SyncServer {
     }
 
     crate::transport::peer_endpoint_available! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new_with_read_budget_provider_handle(
         db: Arc<Database>,
         endpoint: &crate::transport::PeerEndpoint,
@@ -400,6 +405,7 @@ impl SyncServer {
     }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn build(
         db: Arc<Database>,
         transport: Arc<dyn ServerTransport>,
@@ -1289,6 +1295,7 @@ async fn handle_status(
 /// Select only exact signed units from this request, in this authenticated
 /// pushing peer's tenant and store lives. Historical refusals never describe
 /// a later correction, even if it touches the same table.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn refused_outcomes_for_request(
     db: &Database,
     tenant: &TenantId,
@@ -1409,6 +1416,7 @@ async fn refuse_push_for_memory(
     publish_push_response(responder, response, protocol_version, read_memory).await
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn handle_push(
     state: Arc<PushHandlerState>,
     req: IncomingRequest,
@@ -1906,6 +1914,7 @@ async fn handle_push(
 // These separate inputs jointly determine one atomic sync-page decision;
 // keeping them explicit preserves the page's holdback, cursor, and wire rules.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn handle_pull(
     db: Arc<Database>,
     lineage_signer: Option<LineageSigner>,
@@ -2726,6 +2735,7 @@ impl PeerSchemaCapabilities {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn unsupported_schema_capabilities_for_table(
     db: &Database,
     table: &str,
@@ -2747,6 +2757,7 @@ pub(crate) fn unsupported_schema_capabilities_for_table(
 /// Include the vocabulary of immutable authored history, even when a later
 /// ALTER or DROP removed it from the current schema. A peer must be able to
 /// replay the entire source vector before this table can leave holdback.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn unsupported_schema_capabilities_in_changes(
     db: &Database,
     changes: &ChangeSet,
@@ -2794,6 +2805,7 @@ struct CapabilityHoldbackSplit {
     remaining: BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn holdback_for_capabilities(
     db: &Database,
     state: &PeerSchemaSyncHoldbackState,
@@ -2862,6 +2874,7 @@ fn drop_rows_past_retention_window(db: &Database, changes: ChangeSet) -> ChangeS
     changes
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()> {
     let PushApplyWork {
         read_memory,
@@ -3455,6 +3468,7 @@ mod tests {
 /// The Legacy delivery answer: decode, fetch through the custody cache, encode.
 /// Shared by the ordinary route and by the native installation's Legacy arm,
 /// so a host-provided Legacy reader keeps exactly today's reply bytes.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn legacy_delivery_reply(
     db: &Database,
     tenant: &TenantId,
@@ -3523,6 +3537,7 @@ fn legacy_delivery_reply(
 /// Explicit-owner Legacy arm of the native delivery route. The installation's
 /// begin_request supplies the exact capability; this arm never reacquires it,
 /// and its reply is admitted on that same reader before the responder sees it.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn legacy_delivery_arm(
     db: Arc<Database>,
     tenant: TenantId,
@@ -3586,6 +3601,7 @@ impl SyncServer {
     /// every other subject on its Legacy handler, unchanged; bounded delivery
     /// is not claimed for in-memory hubs.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn native_stop(
         &self,
         flag: Arc<AtomicBool>,

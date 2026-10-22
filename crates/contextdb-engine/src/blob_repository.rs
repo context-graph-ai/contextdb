@@ -243,6 +243,7 @@ struct BlobRepositoryOperationGate {
 }
 
 impl BlobRepositoryOperationGate {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin(self: &Arc<Self>) -> Result<BlobRepositoryOperationGuard> {
         let mut state = self.state.lock();
         if state.closing || state.closed {
@@ -321,14 +322,17 @@ struct BlobExclusion {
 }
 impl BlobExcludedHashes {
     fn len(&self) -> u64 { match self { Self::Resident(hashes)=>hashes.len() as u64, Self::Disk(hashes)=>hashes.len() } }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn at(&self,index:u64) -> Result<[u8;32]> { match self {
         Self::Resident(hashes)=>hashes.get(index as usize).copied().ok_or_else(blob_fence_invalid),
         Self::Disk(hashes)=>hashes.at(index),
     }}
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn contains(&self,hash:&[u8;32]) -> Result<bool> { match self {
         Self::Resident(hashes)=>Ok(hashes.binary_search(hash).is_ok()),
         Self::Disk(hashes)=>hashes.contains(hash),
     }}
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn snapshot_memory(&self,count:usize) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
         match self {
             Self::Disk(selector)=>Ok(Some(selector.registry_memory(
@@ -336,6 +340,7 @@ impl BlobExcludedHashes {
             Self::Resident(_)=>Ok(None),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn overlaps(&self,other:&Self) -> Result<bool> {
         let (mut left,mut right)=(0,0);
         while left < self.len() && right < other.len() {
@@ -362,18 +367,22 @@ impl BlobHashFenceRegistry {
     // union merges run outside the registry and revalidate registration.
     // Backend reads never acquire store, source, Original or operation gates.
     // A failed membership check leaves existing exclusions owned and installed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn excluded(states:&BlobFenceState,hash:&[u8;32]) -> Result<bool> {
         for exclusion in &states.exclusions { if exclusion.hashes.contains(hash)? { return Ok(true); } }
         Ok(false)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_shared(self:&Arc<Self>,hash:[u8;32],generation:u64,
         operation:BlobRepositoryOperationGuard) -> Result<BlobSharedGenerationGuard> {
         self.acquire_one(hash,generation,false,operation)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_writer(self:&Arc<Self>,hash:[u8;32],generation:u64,
         operation:BlobRepositoryOperationGuard) -> Result<BlobSharedGenerationGuard> {
         self.acquire_one(hash,generation,true,operation)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_one(self:&Arc<Self>,hash:[u8;32],generation:u64,writer:bool,
         operation:BlobRepositoryOperationGuard) -> Result<BlobSharedGenerationGuard> {
         let mut states=self.states.lock();
@@ -388,6 +397,7 @@ impl BlobHashFenceRegistry {
             self.changed.wait(&mut states);
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_shared_sorted(self:&Arc<Self>,generations:&BTreeMap<[u8;32],u64>,
         operation:BlobRepositoryOperationGuard) -> Result<BlobSharedHashSetGuard> {
         let mut states=self.states.lock();
@@ -406,6 +416,7 @@ impl BlobHashFenceRegistry {
             self.changed.wait(&mut states);
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_exclusion(self:&Arc<Self>,exclusion:Arc<BlobExclusion>) -> Result<()> {
         let mut states=loop {
             let (registration,count)={
@@ -460,6 +471,7 @@ impl BlobHashFenceRegistry {
         exclusion.draining.store(false,Ordering::Release);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_exclusive_sorted(self:&Arc<Self>,hashes:&BTreeSet<[u8;32]>,
         operation:BlobRepositoryOperationGuard) -> Result<BlobExclusiveHashSetGuard> {
         let hashes:Arc<[[u8;32]]>=hashes.iter().copied().collect::<Vec<_>>().into();
@@ -527,6 +539,7 @@ pub(crate) struct BlobExclusiveSelectorGuard {
 }
 impl BlobExclusiveSelectorGuard {
     pub(crate) fn selector(&self) -> &Arc<FrozenBlobSelector> { &self.selector }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn require(&self,repository:&BlobRepository) -> Result<()> {
         if !Arc::ptr_eq(&self.registry,&repository.fences) {return Err(blob_fence_invalid());} Ok(())
     }
@@ -651,15 +664,18 @@ impl BlobReadSession {
 
     /// Read at most one repository value from the payload. Large exports
     /// iterate this method and therefore never hydrate a whole blob.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn read_payload_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.repository.read_session_at(self, offset, len, false)
     }
 
     /// Read at most one repository value from the Bao outboard.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn read_outboard_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.repository.read_session_at(self, offset, len, true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn contiguous_payload_prefix(&self) -> Result<u64> {
         if self.manifest.state == BlobManifestState::Complete {
             return Ok(self.manifest.total_size);
@@ -713,6 +729,7 @@ impl BlobTagRecord {
 }
 
 impl BlobPartialState {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn from_exact_indices(
         payload_indices: impl IntoIterator<Item = u64>,
         outboard_indices: impl IntoIterator<Item = u64>,
@@ -750,6 +767,7 @@ impl BlobRepository {
 
     /// The durable store behind this repository, or the refusal that says
     /// this handle never had one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn store(&self) -> Result<&RedbPersistence> {
         self.persistence.as_deref().ok_or_else(|| {
             Error::Other((
@@ -772,6 +790,7 @@ impl BlobRepository {
     }
 
     /// Create a disk-bounded ephemeral repository for `Database::open_memory`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ephemeral() -> Result<Arc<Self>> {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_blob_repository_open();
@@ -791,6 +810,7 @@ impl BlobRepository {
         }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_operation(&self) -> Result<BlobRepositoryOperationGuard> {
         self.operation_gate.begin()
     }
@@ -810,11 +830,13 @@ impl BlobRepository {
     }
 
     /// Load the durable generation fence without hydrating blob data.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn generation_state(&self, hash: &[u8; 32]) -> Result<BlobHashGenerationState> {
         let _operation = self.begin_operation()?;
         self.generation_state_under_operation(hash)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn generation_state_under_operation(&self, hash: &[u8; 32]) -> Result<BlobHashGenerationState> {
         self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
@@ -837,6 +859,7 @@ impl BlobRepository {
 
     /// Acquire a real shared generation and revalidate after waiting for any
     /// quiescing purge to finish.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_shared_generation(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -860,6 +883,7 @@ impl BlobRepository {
     /// Acquire the generation a writer must use. A hash without an active
     /// manifest leases `next_generation`; an idempotent existing hash leases
     /// its current active generation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_write_generation(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -883,6 +907,7 @@ impl BlobRepository {
         Ok(guard)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_shared_generation_set(
         self: &Arc<Self>,
         hashes: &BTreeSet<[u8; 32]>,
@@ -913,6 +938,7 @@ impl BlobRepository {
 
     /// Acquire the complete sorted candidate set before the database commit
     /// mutex. A retry drops this guard and reacquires the expanded union.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn acquire_exclusive_sorted(
         self: &Arc<Self>,
         hashes: &BTreeSet<[u8; 32]>,
@@ -921,6 +947,7 @@ impl BlobRepository {
         self.fences.acquire_exclusive_sorted(hashes, operation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn acquire_exclusive_selector(self:&Arc<Self>,selector:Arc<FrozenBlobSelector>)
         -> Result<BlobExclusiveSelectorGuard> {
         selector.require_store(self.store()?)?;
@@ -936,6 +963,7 @@ impl BlobRepository {
     /// monotonically but deliberately does not advance the authoritative
     /// PURGE frontier. `force == false` preserves any canonically tagged
     /// generation; `force == true` removes both tag indexes as well.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn delete_ordinary(self: &Arc<Self>, hash: [u8; 32], force: bool) -> Result<bool> {
         let hashes = BTreeSet::from([hash]);
         let guard = self.acquire_exclusive_sorted(&hashes)?;
@@ -1101,6 +1129,7 @@ impl BlobRepository {
     /// Create staging already owned by a known hash generation. The durable
     /// association and its current purge frontier are committed before any
     /// payload or outboard byte may be written.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_import_staging_for_generation(
         &self,
         guard: &BlobSharedGenerationGuard,
@@ -1145,6 +1174,7 @@ impl BlobRepository {
         Ok(staging)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn list_import_staging_for_hash(
         &self,
         hash: &[u8; 32],
@@ -1182,6 +1212,7 @@ impl BlobRepository {
 
     /// Page hash-associated provisional staging by durable object id without
     /// hydrating any payload or outboard value.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn list_provisional_staging_page(
         &self,
         after: Option<&[u8; 16]>,
@@ -1224,6 +1255,7 @@ impl BlobRepository {
 
     /// Reclaim one still-provisional object under the same exclusive hash
     /// fence used by purge. A live writer finishes or aborts before removal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn delete_provisional_staging(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -1265,6 +1297,7 @@ impl BlobRepository {
 
     /// Discard this writer's prior provisional object before rebuilding the
     /// same hash from a complete trusted local source.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn discard_staging_for_writer(
         &self,
         guard: &BlobSharedGenerationGuard,
@@ -1320,6 +1353,7 @@ impl BlobRepository {
         clippy::too_many_arguments,
         reason = "one fragment checkpoint must validate its writer lease, byte range, and before/after adapter state in the same durable operation"
     )]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn checkpoint_staging_fragment(
         &self,
         guard: &BlobSharedGenerationGuard,
@@ -1530,6 +1564,7 @@ impl BlobRepository {
     /// holds this hash's shared writer guard and the database commit mutex.
     /// A pre-frontier staging refusal commits synchronous cleanup before the
     /// purge/generation error is returned.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn bind_staging(
         &self,
         guard: &BlobSharedGenerationGuard,
@@ -1873,6 +1908,7 @@ impl BlobRepository {
     }
 
     /// Synchronously remove every unbound staging role.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn discard_staging(&self, object_id: [u8; 16]) -> Result<()> {
         let _operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -1898,6 +1934,7 @@ impl BlobRepository {
     /// exclusive hash set. The returned projection contains bounded metadata
     /// only and is applied by `RedbPersistence` inside the row purge's one
     /// write transaction.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_authoritative_purge(
         &self,
         guard: &BlobExclusiveHashSetGuard,
@@ -2569,6 +2606,7 @@ impl BlobRepository {
     /// Open the active canonical generation without hydrating payload or
     /// outboard bytes. The returned session owns the shared generation guard
     /// until it is dropped.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_read(self: &Arc<Self>, hash: [u8; 32]) -> Result<Option<BlobReadSession>> {
         if self.generation_state(&hash)?.active.is_none() {
             return Ok(None);
@@ -2615,6 +2653,7 @@ impl BlobRepository {
         }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_session_at(
         &self,
         session: &BlobReadSession,
@@ -2700,6 +2739,7 @@ impl BlobRepository {
     /// List canonical tags directly from Redb. Callers use these records as
     /// the sole serving/protection authority; no process-local mirror is
     /// involved.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn list_tags_page(&self, after: Option<&[u8]>, limit: usize) -> Result<Vec<BlobTagRecord>> {
         const MAX_TAG_PAGE: usize = 256;
         if limit == 0 || limit > MAX_TAG_PAGE {
@@ -2730,6 +2770,7 @@ impl BlobRepository {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn list_active_hashes_page(
         &self,
         after: Option<&[u8; 32]>,
@@ -2773,6 +2814,7 @@ impl BlobRepository {
     }
 
     /// Canonical addressability predicate used immediately before serving.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn has_tag_role(&self, hash: &[u8; 32], role: BlobTagRole) -> Result<bool> {
         let _operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -2837,6 +2879,7 @@ impl BlobRepository {
 
     /// Atomically install or replace one canonical tag on an active
     /// generation. The shared guard is retained through both tag indexes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn set_tag(
         self: &Arc<Self>,
         name: Vec<u8>,
@@ -2907,6 +2950,7 @@ impl BlobRepository {
     /// Delete a half-open tag range in bounded pages. Each page atomically
     /// acquires the complete sorted owner set and revalidates every name in
     /// the same Redb transaction that removes both indexes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn delete_tags(self: &Arc<Self>, from: Option<&[u8]>, to: Option<&[u8]>) -> Result<u64> {
         const DELETE_PAGE: usize = 256;
         let mut cursor = from.map(ToOwned::to_owned);
@@ -2992,6 +3036,7 @@ impl BlobRepository {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn rename_tag(self: &Arc<Self>, from: &[u8], to: Vec<u8>) -> Result<()> {
         let record = self
             .tag_by_name(from)?
@@ -3061,6 +3106,7 @@ impl BlobRepository {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn tag_by_name(&self, name: &[u8]) -> Result<Option<BlobTagRecord>> {
         let _operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -3080,6 +3126,7 @@ impl BlobRepository {
 
     /// Capture an owning Redb read transaction. It remains readable while a
     /// later purge commits, and does not hold the database commit mutex.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_export_snapshot(&self) -> Result<BlobExportSnapshot> {
         let operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -3132,6 +3179,7 @@ impl BlobRepository {
 impl BlobExportSnapshot {
     /// Copy only canonical manifest-owned roles plus durable generation
     /// fences. Unbound staging and orphan chunks are deliberately excluded.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_canonical_into(&self, artifact: &RedbPersistence) -> Result<()> {
         let table_names = self
             .read
@@ -3299,6 +3347,7 @@ impl BlobExportSnapshot {
         clippy::too_many_arguments,
         reason = "the export kernel must carry the manifest's exact chunk projection and validation bounds together"
     )]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_chunks_at_indices<I>(
         &self,
         artifact: &RedbPersistence,
@@ -3379,6 +3428,7 @@ impl BlobExportSnapshot {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_tags(
         &self,
         artifact: &RedbPersistence,
@@ -3499,6 +3549,7 @@ fn object_has_chunks_in_read(
         .is_some())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_canonical_chunk_witnesses_in_read(
     read: &redb::ReadTransaction,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -3559,6 +3610,7 @@ fn validate_canonical_chunk_witnesses_in_read(
 // Erasure authenticates the tag's own format and role by complete typed
 // equality, never by equating its independent format with a manifest format.
 // Both lookups and the eventual removals belong to the caller's same write.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn require_tag_owner_in_write(
     write: &redb::WriteTransaction,
     tag: &BlobTagRecord,
@@ -3594,6 +3646,7 @@ fn require_tag_owner_in_write(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn collect_tag_purge_witnesses_in_read(
     read: &redb::ReadTransaction,
     hash: &[u8; 32],
@@ -3692,6 +3745,7 @@ fn collect_tag_purge_witnesses_in_read(
 /// Apply the preflighted blob projection inside the authoritative row purge's
 /// existing Redb write transaction. Every witness mismatch names the blob
 /// boundary and aborts the whole transaction.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn apply_authoritative_purge_in_write(
     write: &redb::WriteTransaction,
     projection: &BlobAuthoritativePurgeProjection,
@@ -3788,6 +3842,7 @@ pub(crate) fn apply_authoritative_purge_in_write(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn remove_exact_blob_value_in_write(
     write: &redb::WriteTransaction,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -3811,6 +3866,7 @@ fn remove_exact_blob_value_in_write(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_canonical_chunk_witnesses_in_write(
     write: &redb::WriteTransaction,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -3868,6 +3924,7 @@ fn validate_canonical_chunk_witnesses_in_write(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn insert_raw_entries(
     persistence: &RedbPersistence,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -3892,6 +3949,7 @@ fn insert_raw_entries(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn remove_staging_in_write(
     write: &redb::WriteTransaction,
     staging: &BlobImportStaging,
@@ -3918,6 +3976,7 @@ fn remove_staging_in_write(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn remove_object_chunks_in_write(
     write: &redb::WriteTransaction,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -3951,6 +4010,7 @@ fn remove_object_chunks_in_write(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn encode_chunk_indices(indices: &roaring::RoaringTreemap) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     indices
@@ -3959,11 +4019,13 @@ fn encode_chunk_indices(indices: &roaring::RoaringTreemap) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_chunk_indices(bytes: &[u8]) -> Result<roaring::RoaringTreemap> {
     roaring::RoaringTreemap::deserialize_from(bytes)
         .map_err(|err| Error::Other((format!("decode exact blob chunk set: {err}")).into()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_partial_state(
     partial: &BlobPartialState,
     payload_count: u64,
@@ -3988,6 +4050,7 @@ fn logical_block_count(size: u64) -> u64 {
     size.div_ceil(BLOB_LOGICAL_BLOCK_BYTES as u64)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_complete_block_count(size: u64, count: u64, role: &str) -> Result<()> {
     let expected = logical_block_count(size);
     if count != expected {
@@ -3998,6 +4061,7 @@ fn validate_complete_block_count(size: u64, count: u64, role: &str) -> Result<()
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_staging_bind_metadata(
     staging: &BlobImportStaging,
     bind: &BlobStagingBind<'_>,
@@ -4041,6 +4105,7 @@ fn validate_staging_bind_metadata(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_staged_blocks_in_write(
     write: &redb::WriteTransaction,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -4081,6 +4146,7 @@ fn validate_staged_blocks_in_write(
     Ok(verified_bytes)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_dense_indices(indices: &roaring::RoaringTreemap, count: u64, role: &str) -> Result<()> {
     if indices.len() != count || !indices.iter().eq(0..count) {
         return Err(Error::Other((format!(
@@ -4092,6 +4158,7 @@ fn validate_dense_indices(indices: &roaring::RoaringTreemap, count: u64, role: &
 
 /// Build versioned partial state from exact logical chunk indices.
 #[doc(hidden)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn new_partial_state(
     payload_indices: impl IntoIterator<Item = u64>,
     outboard_indices: impl IntoIterator<Item = u64>,
@@ -4113,11 +4180,13 @@ pub fn new_partial_state(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     rmp_serde::to_vec_named(value)
         .map_err(|err| Error::Other((format!("encode blob repository record: {err}")).into()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     rmp_serde::from_slice(bytes)
         .map_err(|err| Error::Other((format!("decode blob repository record: {err}")).into()))
@@ -4125,6 +4194,7 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> 
 
 /// Construct an unbound staging record at a database frontier.
 #[doc(hidden)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn new_import_staging(start_lsn: Lsn, expected_size: Option<u64>) -> Result<BlobImportStaging> {
     let empty = roaring::RoaringTreemap::new();
     Ok(BlobImportStaging {

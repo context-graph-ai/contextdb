@@ -15,6 +15,7 @@ impl std::ops::Deref for Bytes {
     fn deref(&self) -> &[u8] { &self.bytes }
 }
 impl Bytes {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn copy(original: &OwnedMemoryReservation, bytes: &[u8]) -> Result<Self> {
         let frame = OriginalPersistenceFrame::new(original)?;
         let bytes = frame.copy_bytes(bytes)?;
@@ -25,14 +26,17 @@ pub(super) struct Source<'a, 't> {
     handle: &'a redb::BoundedByteHandle<'t>,
 }
 impl Source<'_, '_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn key_prefix(&self, prefix: &[u8]) -> Result<bool> {
         if self.handle.key_len() < prefix.len() { return Ok(false); }
         self.handle.with_bytes(true,0..prefix.len(),|key| key==prefix)
             .map_err(RedbPersistence::storage_error)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn key_matches(&self, key: &[u8]) -> Result<bool> {
         self.handle.key_matches(key).map_err(RedbPersistence::storage_error)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn object_prefix(&self, id: &mut [u8;16]) -> Result<bool> {
         if self.handle.key_len()<id.len() {return Ok(false);}
         self.handle.with_bytes(true,0..16,|bytes|id.copy_from_slice(bytes)).map_err(RedbPersistence::storage_error)?;
@@ -40,19 +44,24 @@ impl Source<'_, '_> {
     }
 
     pub(super) fn value_len(&self) -> usize {self.handle.value_len()}
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_key<R>(&self, consume:impl FnOnce(&[u8])->Result<R>)->Result<R> {
         self.handle.with_bytes(true,0..self.handle.key_len(),consume).map_err(RedbPersistence::storage_error)?
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn value_window(&self,range:std::ops::Range<usize>,consume:&mut dyn FnMut(&[u8])->Result<()>)->Result<()> {
         self.handle.with_bytes(false,range,consume).map_err(RedbPersistence::storage_error)?
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_record<R>(&self, consume: impl FnOnce(&[u8], &[u8])->Result<R>) -> Result<R> {
         let (key,value) = self.handle.materialize().map_err(RedbPersistence::storage_error)?;
         consume(key.value(),value.value())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn key_is_object(&self, id: &[u8;16]) -> Result<bool> { self.key_matches(id) }
     /// The projection uses the actual record schema. CheckedBytes consumes and
     /// validates every u8 without constructing the Vec that it replaces.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn probe<T: crate::persistence::StreamedBlobProjection>(&self, original: &OwnedMemoryReservation) -> Result<T> {
         let frame = OriginalPersistenceFrame::new(original)?;
         let mut reader = Reader::new(self.handle);
@@ -68,11 +77,14 @@ impl Source<'_, '_> {
         frame.retain(&mut decoded.allocation)?;
         Ok(decoded.value)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn tag(&self, original: &OwnedMemoryReservation) -> Result<Tag> { self.probe(original) }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn staging(&self, original: &OwnedMemoryReservation) -> Result<Staging> { self.probe(original) }
 }
 fn invalid() -> Error { Error::Other("blob metadata source has invalid encoded boundaries".into()) }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn visit(write: &redb::WriteTransaction, original: &OwnedMemoryReservation,
     definition: TableDefinition<&[u8],&[u8]>, mut consume: impl FnMut(&Source<'_, '_>)->Result<()>) -> Result<()> {
     RedbPersistence::with_original_blob_pages(original, || {
@@ -88,6 +100,7 @@ pub(super) fn visit(write: &redb::WriteTransaction, original: &OwnedMemoryReserv
         Ok(())
     })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn get(write: &redb::WriteTransaction, original: &OwnedMemoryReservation,
     definition: TableDefinition<&[u8],&[u8]>, key: &[u8]) -> Result<Option<Bytes>> {
     let mut found = None;
@@ -112,11 +125,13 @@ impl<'a,'t> Reader<'a,'t> {
     fn new(handle: &'a redb::BoundedByteHandle<'t>) -> Self {
         Self {handle,position:0,start:0,used:0,buffer:[0;4096],failure:None}
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn number(&mut self, width: usize) -> Result<usize> {
         let mut bytes = [0u8;8];
         self.read_exact(&mut bytes[8-width..]).map_err(|_| self.failure.take().unwrap_or_else(invalid))?;
         usize::try_from(u64::from_be_bytes(bytes)).map_err(|_|invalid())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn skip(&mut self, count: usize) -> Result<()> {
         self.position=self.position.checked_add(count).filter(|end|*end<=self.handle.value_len()).ok_or_else(invalid)?;
         Ok(())
@@ -143,6 +158,7 @@ impl Read for Reader<'_, '_> {
 }
 // Structural preflight only: the unmodified serde schemas still perform all
 // type, missing/duplicate-field, enum, byte-element and integer validation.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn scan(reader: &mut Reader<'_, '_>, depth: usize) -> Result<usize> {
     if depth>1024 { return Err(invalid()); }
     let marker=reader.number(1)?;

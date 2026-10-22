@@ -18,9 +18,11 @@ const FAMILIES:[TableDefinition<&[u8],&[u8]>;8]=[
     TAGS_BY_HASH_TABLE,IMPORT_STAGING_TABLE,PAYLOAD_CHUNKS_TABLE,OUTBOARD_CHUNKS_TABLE,
 ];
 fn invalid() -> Error {Error::Other("blob durable erasure witness disagrees with its owner".into())}
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn window(original:&OwnedMemoryReservation) -> Result<OriginalPersistenceFrame<'_>> {
     OriginalPersistenceFrame::new(original)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn get(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,family:usize,key:&[u8]) -> Result<Option<metadata::Bytes>> {
     metadata::get(write,original,FAMILIES[family],key)
 }
@@ -28,6 +30,7 @@ fn get(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,family:usi
 // writers preserve these fields independently. Require the opposite index to
 // witness the complete typed owner (including its actual format/role) and the
 // exact bytes that apply will recheck before removing either index.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn require_tag_counterpart(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,
     family:usize,key:&[u8],encoded:&[u8],tag:&BlobTagRecord) -> Result<()> {
     let bytes=get(write,original,family,key)?.ok_or_else(invalid)?;
@@ -40,22 +43,27 @@ fn require_tag_counterpart(write:&redb::WriteTransaction,original:&OwnedMemoryRe
 // has a real Original invoice; raw witnesses use fixed-width value chunks.
 pub(crate) const BYTES:TableDefinition<&[u8],&[u8]>=TableDefinition::new("__discard_blob_witness_bytes");
 const WITNESS_CHUNK:usize=4096;
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn chunk_key(record:u64,offset:usize)->Result<[u8;16]> {
     let mut key=[0u8;16];key[..8].copy_from_slice(&record.to_be_bytes());
     key[8..].copy_from_slice(&u64::try_from(offset).map_err(|_|invalid())?.to_be_bytes());Ok(key)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn header(value:&[u8])->Result<(u64,usize)> {
     if value.len()!=16 {return Err(invalid());}
     let ordinal=u64::from_be_bytes(value[..8].try_into().map_err(|_|invalid())?);
     let len=usize::try_from(u64::from_be_bytes(value[8..].try_into().map_err(|_|invalid())?)).map_err(|_|invalid())?;
     Ok((ordinal,len))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn witness(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,family:usize,key:&[u8],value:&[u8]) -> Result<()> {
     witness_stream(write,original,family,key,value.len(),|range,consume|consume(&value[range]))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn witness_source(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,family:usize,source:&metadata::Source<'_, '_>)->Result<()> {
     source.with_key(|key|witness_stream(write,original,family,key,source.value_len(),|range,consume|source.value_window(range,consume)))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn witness_stream(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,family:usize,key:&[u8],len:usize,
     mut chunk:impl FnMut(std::ops::Range<usize>,&mut dyn FnMut(&[u8])->Result<()>)->Result<()>) -> Result<()> {
     let frame=window(original)?;
@@ -91,15 +99,18 @@ fn witness_stream(write:&redb::WriteTransaction,original:&OwnedMemoryReservation
     witnesses.insert(address.as_slice(),descriptor.as_slice()).map_err(RedbPersistence::storage_error)?;
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn visit(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,family:usize,
     consume:impl FnMut(&metadata::Source<'_, '_>)->Result<()>) -> Result<()> {
     metadata::visit(write,original,FAMILIES[family],consume)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn object(write:&redb::WriteTransaction,id:&[u8;16]) -> Result<()> {
     write.open_table(OBJECTS).map_err(RedbPersistence::storage_error)?.insert(id.as_slice(),0).map_err(RedbPersistence::storage_error)?;Ok(())
 }
 
 impl BlobRepository {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_original_authoritative_purge(&self,original:&OwnedMemoryReservation,
         history:&OriginalDiscardHistory,guard:&BlobExclusiveSelectorGuard,
         selected:&FrozenBlobSelector,survivors:&FrozenBlobSelector,frontier:Lsn) -> Result<BlobAuthoritativePurgeProjection> {
@@ -223,10 +234,12 @@ impl BlobRepository {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn apply(write:&redb::WriteTransaction,projection:&BlobAuthoritativePurgeProjection,
     original:&OriginalPersistenceFrame<'_>) -> Result<()> {
     RedbPersistence::with_original_blob_pages(original.original,||apply_with_pages(write,projection,original))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn apply_with_pages(write:&redb::WriteTransaction,projection:&BlobAuthoritativePurgeProjection,
     original:&OriginalPersistenceFrame<'_>) -> Result<()> {
     let control=write.open_table(CONTROL).map_err(RedbPersistence::storage_error)?;
@@ -307,13 +320,16 @@ fn apply_with_pages(write:&redb::WriteTransaction,projection:&BlobAuthoritativeP
 // The serialized treemap is already an admitted selected metadata field. Decode
 // one 32-bit bitmap at a time, paying its real container/payload layouts before
 // roaring allocates them. Never retain a treemap proportional to chunk history.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn le<const N:usize>(bytes:&mut &[u8])->Result<[u8;N]> {
     let value=bytes.get(..N).ok_or_else(invalid)?.try_into().map_err(|_|invalid())?;
     *bytes=&bytes[N..];Ok(value)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn take<'a>(bytes:&mut &'a [u8],len:usize)->Result<&'a [u8]> {
     let value=bytes.get(..len).ok_or_else(invalid)?;*bytes=&bytes[len..];Ok(value)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bitmap_plan(bytes:&[u8])->Result<(usize,usize)> {
     let mut rest=bytes;
     let cookie=u32::from_le_bytes(le::<4>(&mut rest)?);
@@ -351,6 +367,7 @@ fn bitmap_plan(bytes:&[u8])->Result<(usize,usize)> {
     }
     Ok((bytes.len()-rest.len(),allocation))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn later_partition(mut bytes:&[u8],remaining:u64,key:u32)->Result<bool> {
     for _ in 0..remaining {
         let candidate=u32::from_le_bytes(le::<4>(&mut bytes)?);
@@ -359,6 +376,7 @@ fn later_partition(mut bytes:&[u8],remaining:u64,key:u32)->Result<bool> {
     }
     Ok(false)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_partial_chunks(write:&redb::WriteTransaction,original:&OwnedMemoryReservation,
     manifest:&BlobManifest,partial:&BlobPartialState)->Result<()> {
     for (bytes,count,size,definition) in [

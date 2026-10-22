@@ -151,6 +151,7 @@ fn malformed_source_control() -> Error {
     )
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn send_source_error<W: SendStream>(
     send: &mut W,
     error: &Error,
@@ -319,6 +320,7 @@ fn command_io_error(name: &str, err: impl std::fmt::Display) -> api::Error {
     api_error(format!("ContextDB store {name}: {err}"))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn run_contextdb_store_actor(
     repository: Arc<BlobRepository>,
     mut commands: tokio::sync::mpsc::Receiver<Command>,
@@ -573,6 +575,7 @@ async fn contextdb_create_tag(repository: Arc<BlobRepository>, cmd: CreateTagMsg
     let _ = cmd.tx.send(result).await;
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn stage_reader(
     repository: &BlobRepository,
     guard: &BlobSharedGenerationGuard,
@@ -627,6 +630,7 @@ fn stage_reader(
     clippy::too_many_arguments,
     reason = "a complete content-addressed import must bind its lease, hash, payload, outboard, and replacement decision atomically"
 )]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn commit_complete_readers(
     repository: &Arc<BlobRepository>,
     guard: &BlobSharedGenerationGuard,
@@ -721,6 +725,7 @@ fn commit_complete_readers(
     outcome
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn import_complete_bytes(
     repository: &Arc<BlobRepository>,
     data: bytes::Bytes,
@@ -758,6 +763,7 @@ fn import_complete_bytes(
     Ok(hash)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn contextdb_import_bytes(repository: Arc<BlobRepository>, cmd: ImportBytesMsg) {
     let data = cmd.inner.data;
     let format = cmd.inner.format;
@@ -1039,6 +1045,7 @@ impl<R: std::io::Read> std::io::Read for RepositoryStagingReader<'_, R> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn hash_open_file(file: &mut std::fs::File, size: u64) -> Result<[u8; 32]> {
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(0))
@@ -1062,6 +1069,7 @@ fn hash_open_file(file: &mut std::fs::File, size: u64) -> Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn contextdb_import_path(repository: Arc<BlobRepository>, cmd: ImportPathMsg) {
     let path = cmd.inner.path;
     let format = cmd.inner.format;
@@ -1194,6 +1202,7 @@ async fn contextdb_import_path(repository: Arc<BlobRepository>, cmd: ImportPathM
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn contextdb_export_path(repository: Arc<BlobRepository>, cmd: ExportPathMsg) {
     let result = (|| -> Result<u64> {
         let session = repository
@@ -1248,6 +1257,7 @@ struct DurableBaoState {
     outboard_pairs: ChunkRanges,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn provisional_bao_payload(
     repository: &BlobRepository,
     hash: &[u8; 32],
@@ -1283,6 +1293,7 @@ struct PartialBaoImport {
     outboard_pairs: ChunkRanges,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn encode_durable_bao_state(
     payload: &iroh_blobs::api::proto::Bitfield,
     outboard_pairs: &ChunkRanges,
@@ -1295,6 +1306,7 @@ fn encode_durable_bao_state(
     .map_err(|err| other("encode durable Bao state", err))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn merge_canonical_partial_into_staging(
     repository: &BlobRepository,
     guard: &BlobSharedGenerationGuard,
@@ -1388,6 +1400,7 @@ fn merge_canonical_partial_into_staging(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prepare_partial_bao_import(
     repository: &Arc<BlobRepository>,
     hash: [u8; 32],
@@ -1558,6 +1571,7 @@ fn prepare_partial_bao_import(
     }))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn finish_partial_bao_import(
     repository: &Arc<BlobRepository>,
     backend_hash: Hash,
@@ -1644,6 +1658,7 @@ fn finish_partial_bao_import(
     staged
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn contextdb_import_bao(repository: Arc<BlobRepository>, mut cmd: ImportBaoMsg) {
     let backend_hash = cmd.inner.hash;
     let raw_hash = from_backend_hash(&backend_hash);
@@ -1921,6 +1936,7 @@ impl BlobStoreHandle {
 
     /// Open (or create) the content-addressed store under `root`, with GC
     /// configured so untagged blobs free at [`GC_INTERVAL`].
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn open(repository: Arc<BlobRepository>) -> Result<BlobStoreHandle> {
         let bytes_before_open = repository.bounded_blob_bytes_read();
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1964,6 +1980,7 @@ impl BlobStoreHandle {
     /// Run a store future to completion from a SYNC caller on the dedicated
     /// runtime (never the caller's), so this works under a current-thread
     /// caller runtime.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn block_on_store<F, Fut, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(Store) -> Fut + Send + 'static,
@@ -1998,6 +2015,7 @@ impl BlobStoreHandle {
 
     /// Content-address `bytes` into the store, tag them servable, return the
     /// BLAKE3 name. Idempotent: identical bytes converge on one blob.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ingest_bytes(&self, bytes: &[u8]) -> Result<[u8; 32]> {
         let data = bytes.to_vec();
         let hash = self.block_on_store(move |store| async move {
@@ -2019,6 +2037,7 @@ impl BlobStoreHandle {
 
     /// Content-address the FILE at `path` (streamed by the store, never a
     /// whole-file buffer here), tag it servable, return the BLAKE3 name.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ingest_file(&self, path: &Path) -> Result<[u8; 32]> {
         // The backing store requires an ABSOLUTE path to import; canonicalize
         // so a caller may pass a relative path, and a missing file yields a
@@ -2137,6 +2156,7 @@ impl BlobStoreHandle {
     /// partials linger here). Returns how many were reclaimed; the bytes free
     /// at the GC interval, but the served contract (unservable, BlobNotFound
     /// on resolve) is immediate.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reclaim<F>(&self, eligible: F) -> Result<usize>
     where
         F: Fn(&[u8; 32]) -> Result<bool>,
@@ -2917,6 +2937,7 @@ async fn export_local_into_sink(
 
 /// The size of the verified LOCAL state for `hash` (the resume prefix), in
 /// bytes: what a retry does not need to move again.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) async fn verified_local_bytes(store: &BlobStoreHandle, hash: &[u8; 32]) -> Result<u64> {
     store
         .repository

@@ -77,6 +77,7 @@ mod native {
             crate::memory_accounting::refund_open_residue(bytes);
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ensure_finisher() -> Result<()> {
         let mut finisher = FINISHER.lock().unwrap_or_else(|p| p.into_inner());
         if finisher.is_some() {
@@ -175,6 +176,7 @@ mod native {
         }
     }
     impl OwnedWorker {
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         pub(crate) fn spawn<F: FnOnce() + Send + 'static>(
             owner: ReadMemoryOwner,
             run: F,
@@ -183,6 +185,7 @@ mod native {
         }
         // Only ensure_finisher uses the nonrecursive bootstrap path while
         // holding FINISHER. All other workers require its live lease.
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn spawn_inner<F: FnOnce() + Send + 'static>(
             owner: ReadMemoryOwner,
             run: F,

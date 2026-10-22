@@ -4,6 +4,7 @@ use crate::{Database, database::OutboundSyncUnit, sync_types::ChangeSet};
 use contextdb_core::{Lsn, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn units(
     db: &Database,
     changes: ChangeSet,

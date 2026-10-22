@@ -738,6 +738,7 @@ fn serialized_size_for_version<T: Serialize>(
     Ok((payload.0, envelope.0))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_for_version_with_read_owner<T: Serialize>(
     version: u8,
     message_type: MessageType,

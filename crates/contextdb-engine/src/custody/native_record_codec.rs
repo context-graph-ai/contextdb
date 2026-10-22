@@ -171,6 +171,7 @@ pub(crate) fn finite_hash(
 ) -> Decoded<Digest> {
     super::canonical::finite_hash_with_error(|e| shared_walk(e, walk), || Invalid::Canonical)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn finite_bytes(
     owner: &ReadMemoryOwner,
     walk: impl Fn(&mut NativeEncoder<'_>) -> Decoded<()>,
@@ -184,6 +185,7 @@ pub(crate) fn finite_bytes(
     )?;
     Ok(b)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn verify_signature(
     owner: &ReadMemoryOwner,
     node: &str,
@@ -649,6 +651,7 @@ pub(crate) fn retirement_root<'a>(births: impl BirthDirectory<'a>) -> Decoded<Di
         Ok(())
     })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn retirement_closure<'a>(
     owner: &ReadMemoryOwner,
     active: &Birth<'a>,
@@ -656,6 +659,7 @@ pub(crate) fn retirement_closure<'a>(
 ) -> Selected<()> {
     retirement_closure_with_checkpoint(owner, active, retired, || Ok(()))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn retirement_closure_with_checkpoint<'a>(
     owner: &ReadMemoryOwner,
     active: &Birth<'a>,
@@ -813,6 +817,7 @@ impl Certificate<'_> {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         if self.format != 1
             || !state_birth_eq(&self.state.state, &self.birth.identity)
@@ -847,6 +852,7 @@ impl Checkpoint<'_> {
         e.raw(&self.digest);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         if self.count == 0 {
             return Err(Invalid::Canonical.into());
@@ -857,6 +863,7 @@ impl Checkpoint<'_> {
     }
 }
 impl Frontier<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         self.checkpoint.verify_native(owner)?;
         if self.peaks.len() != 64 {
@@ -903,6 +910,7 @@ impl Node<'_> {
     }
 }
 impl SignedBinding<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         if self.format != 1 || self.namespace.hub_incarnation != self.issuance_state.incarnation {
             return Err(Invalid::Canonical.into());
@@ -931,6 +939,7 @@ fn policy_digest(table: &str, p: &ApplicationTablePolicy<'_>) -> Decoded<Digest>
     })
 }
 impl TerminalRecord<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         if self.kind > 2 || self.namespace.hub_incarnation != self.state.incarnation {
             return Err(Invalid::Canonical.into());
@@ -971,6 +980,7 @@ impl Serialize for KeyPairs<'_> {
         seq.end()
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn lineage_verify(owner: &ReadMemoryOwner, tenant: &str, row: &RowEvidence<'_>) -> Selected<()> {
     // Match the actual compact MessagePack attestation tuple and its lowercase
     // incarnation text without a temporary String.
@@ -1087,6 +1097,7 @@ fn ddl_codec(n: NodeView<'_>) -> Decoded<()> {
     Ok(())
 }
 impl SchemaDependency<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         let mut ddl = NativeBuffer::allocate(owner, self.ddl_bytes.len())?;
         self.ddl_bytes.copy_into(ddl.bytes_mut())?;
@@ -1177,6 +1188,7 @@ fn reference_eq(a: &RowRef<'_>, b: &RowRef<'_>) -> Decoded<bool> {
 }
 
 impl ManifestRecord<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         if let Some(b) = self.binding {
             b.verify_native(owner)?;
@@ -1362,6 +1374,7 @@ impl ManifestRecord<'_> {
     }
 }
 impl RecordView<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_native(&self, owner: &ReadMemoryOwner) -> Selected<()> {
         match self {
             Self::CheckpointFrontier(f) => f.verify_native(owner),
@@ -1383,6 +1396,7 @@ impl RecordView<'_> {
 }
 use super::preparation::BorrowedHex;
 impl RecordView<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn key_native(&self, owner: &ReadMemoryOwner) -> Selected<NativeBuffer> {
         let namespace = |n: &Namespace<'_>| finite_bytes(owner, |e| n.encode_finite(e));
         let life = |l: &LocalLifeAnchor<'_>| {
@@ -1609,6 +1623,7 @@ impl RecordView<'_> {
             _ => None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn group_matches(&self, _owner: &ReadMemoryOwner, group: &str) -> Selected<bool> {
         let mut found = false;
         visit_groups(self, &mut |walk| {
@@ -1681,6 +1696,7 @@ fn evidence_eq(a: &RowEvidence<'_>, b: &RowEvidence<'_>) -> Decoded<bool> {
 /// Companions are source-selected loans with their own prepaid raw windows.
 /// No Legacy resident admission fact or owned Record is used as evidence.
 #[cfg(feature = "sync-orchestration")]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn verify_companions(
     record: &RecordView<'_>,
     views: &[super::store::NativeCustodyView<'_>],

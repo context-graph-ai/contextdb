@@ -30,6 +30,7 @@ pub(crate) fn take_public_page_request() -> bool {
     PUBLIC_PAGE_REQUESTED.with(|slot| slot.replace(false))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn column_capacity_bytes(columns: &Vec<String>) -> Result<usize> {
     columns.iter().try_fold(
         columns
@@ -117,6 +118,7 @@ impl SharedRows {
             .as_ref()
             .map_or(self.working.capacity(), |root| root.capacity())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_credit(
         &mut self,
         columns: Vec<String>,
@@ -216,6 +218,7 @@ impl OwnedCursorPage {
             prepared: None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn with_credit(mut self, credit: ReadCredit) -> Result<Self> {
         assert!(self.credit.is_none());
         self.credit = Some(credit);
@@ -237,6 +240,7 @@ impl OwnedCursorPage {
     pub(crate) fn public_carrier_bytes() -> usize {
         ReadShared::<Self, CursorPageInvoice>::layout().size()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_prepare_public(owner: ReadMemoryOwner) -> Result<PreparedPage> {
         let credit = ReadCredit::try_new_owned(
             owner,
@@ -247,6 +251,7 @@ impl OwnedCursorPage {
         )?;
         Self::prepare_publication(CursorPageInvoice::new(credit))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_publication(invoice: CursorPageInvoice) -> Result<PreparedPage> {
         CursorPage::try_prepare_invoice(invoice)
     }
@@ -278,6 +283,7 @@ impl OwnedCursorPage {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn columns_credit(columns: &[String], owner: impl Into<ReadMemoryOwner>) -> Result<ReadCredit> {
         let bytes = columns
             .iter()
@@ -294,6 +300,7 @@ impl OwnedCursorPage {
             "Reduce the columns or raise the reader memory limit.",
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_clone(&self, owner: impl Into<ReadMemoryOwner>) -> Result<Self> {
         let credit = Self::columns_credit(&self.columns, owner)?;
         let copied = Self {
@@ -305,10 +312,12 @@ impl OwnedCursorPage {
         };
         Ok(copied)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_empty(columns: &[String], owner: impl Into<ReadMemoryOwner>) -> Result<Self> {
         let credit = Self::columns_credit(columns, owner)?;
         Self::from_parts(columns.to_vec(), Vec::new(), false).with_credit(credit)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn into_public(mut self) -> Result<CursorPage> {
         if self.columns.capacity() == 0 && self.rows.capacity() == 0 && !self.has_more {
             return Ok(CursorPage::empty());

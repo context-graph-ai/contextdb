@@ -791,6 +791,7 @@ pub(crate) fn natural_key_from_row_values(
 }
 
 /// Build an identity under the caller's existing projected-answer credit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn natural_key_from_row_values_admitted(
     meta: &TableMeta,
     values: &HashMap<String, Value>,

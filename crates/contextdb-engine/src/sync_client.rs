@@ -215,6 +215,7 @@ impl ChargedOutcomes {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit(&mut self, bytes: usize) -> contextdb_core::Result<()> {
         if bytes == 0 {
             return Ok(());
@@ -252,6 +253,7 @@ impl ChargedOutcomes {
     /// Admit `decoded` bytes for `count` projections and the vector's exact
     /// growth, and reserve that growth. Called before the page's custody
     /// effects commit, so a result refusal leaves no durable change.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_projected(&mut self, decoded: usize, count: usize) -> contextdb_core::Result<()> {
         let needed = self.outcomes.len().saturating_add(count);
         let growth = needed.saturating_sub(self.outcomes.capacity());
@@ -267,6 +269,7 @@ impl ChargedOutcomes {
 
     /// Build the projections `reserve_projected` admitted, into its exact
     /// reservation; the vector never grows here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn extend_reserved(
         &mut self,
         projections: impl Iterator<Item = DeliveryOutcome>,
@@ -282,6 +285,7 @@ impl ChargedOutcomes {
     }
 
     /// The last outcome's cursor, with its strings admitted first.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn last_cursor(
         &self,
     ) -> contextdb_core::Result<(
@@ -347,6 +351,7 @@ impl Drop for PostPushReplyEffectsPause {
 }
 
 /// Decode an envelope under the actual requesting read's admitted image.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_sync_envelope(
     memory: &crate::read_image_memory::ImageMemoryHandle,
     data: &[u8],
@@ -416,6 +421,7 @@ fn malformed_purge_page(detail: impl Into<String>) -> Error {
     )).into())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn take_validated_ordinary_purges(
     changeset: &mut WireChangeSet,
     since_lsn: Lsn,
@@ -694,6 +700,7 @@ impl SyncClient {
             .await
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub async fn bind_application_table_policy_with_read_memory(
         &self,
         expectation: ApplicationTablePolicyExpectation,
@@ -886,6 +893,7 @@ impl SyncClient {
 
     // A hub's typed refusal or cancellation reaches the caller as that same
     // error kind; only transport failures become sync errors.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn fetch_delivery_page(
         &self,
         since: Option<DeliveryOutcomeCursor>,
@@ -1486,11 +1494,13 @@ impl SyncClient {
         Ok(count)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(db: Arc<Database>, endpoint: &str, tenant_id: TenantId) -> Result<Self, Error> {
         let read_memory = db.declared_reader_memory()?;
         Self::new_with_read_memory(db, endpoint, tenant_id, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new_with_read_memory(
         db: Arc<Database>,
         endpoint: &str,
@@ -1517,6 +1527,7 @@ impl SyncClient {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn build(
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
@@ -1812,6 +1823,7 @@ impl SyncClient {
         holdbacks
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_schema_sync_holdback(
         &self,
         hub_node_id: &str,
@@ -1867,6 +1879,7 @@ impl SyncClient {
     /// retained delivery. The existing retention binding is that authority's
     /// single source of truth; a different peer is refused before connection
     /// activity or row mutation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_authenticated_hub(&self) -> Result<(), Error> {
         let hub = self.hub_node_id().ok_or_else(|| {
             Error::SyncError((
@@ -1879,6 +1892,7 @@ impl SyncClient {
     /// unit is engine sync work funded by the store's writer budget
     /// (`MEMORY_LIMIT`), as in [`Self::push_with_read_memory`]; this
     /// inspection makes no other read, so it takes no read budget.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn has_pending_push_changes(&self) -> Result<bool, Error> {
         self.with_pending_unit_changes(|changes| !changes.is_empty())
     }
@@ -1886,11 +1900,13 @@ impl SyncClient {
     /// The exact number of entries this client currently considers eligible
     /// for push from its durable/in-memory push watermark. Funded like
     /// [`Self::has_pending_push_changes`].
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn pending_push_change_count(&self) -> Result<usize, Error> {
         self.with_pending_unit_changes(|changes| changes.data_entry_count() + changes.ddl.len())
     }
 
     /// Inspect the pending unit while its selection is still charged.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_pending_unit_changes<T>(
         &self,
         inspect: impl FnOnce(&ChangeSet) -> T,
@@ -1909,6 +1925,7 @@ impl SyncClient {
 
     /// One local snapshot feeds both pending-work inspection APIs, so the
     /// boolean and exact count cannot diverge on direction or arrival policy.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_push_changes(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -1969,6 +1986,7 @@ impl SyncClient {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn destination_reupload_epoch(&self) -> Result<Option<(Lsn, uuid::Uuid)>, Error> {
         let Some(hub_node_id) = self.hub_node_id() else {
             return Ok(None);
@@ -2196,6 +2214,7 @@ impl SyncClient {
     /// Query authored units one prepared batch at a time. The durable position
     /// names a unit in this deterministic traversal; neither audit history nor
     /// all candidate keys are materialized for a push.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn fetch_candidate_refusals(
         &self,
         incarnation: Incarnation,
@@ -2450,6 +2469,7 @@ impl SyncClient {
         Ok(hub_incarnation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authored_unit_keys(
         provenance: &[crate::protocol::WireDdlProvenance],
     ) -> Result<Vec<AuthoredSchemaUnitKey>, Error> {
@@ -2460,6 +2480,7 @@ impl SyncClient {
         Ok(keys)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_authored_unit_batch(
         prepared_batches: &[PreparedPushBatch],
         prepared_index: &mut usize,
@@ -2482,6 +2503,7 @@ impl SyncClient {
         Ok((!batch.is_empty()).then_some(batch))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_refused_schema_units(
         &self,
         outcomes: &[RefusedSchemaUnitOutcome],
@@ -2508,6 +2530,7 @@ impl SyncClient {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authored_ddl_units(
         provenance: &[crate::protocol::WireDdlProvenance],
     ) -> Result<HashMap<AuthoredSchemaUnitKey, Vec<usize>>, Error> {
@@ -2545,6 +2568,7 @@ impl SyncClient {
         Ok(units)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refused_ddl_indexes(
         &self,
         provenance: &[crate::protocol::WireDdlProvenance],
@@ -2605,6 +2629,7 @@ impl SyncClient {
             .clone()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode_push_reply(
         &self,
         reply: &[u8],
@@ -2952,6 +2977,7 @@ impl SyncClient {
     /// committed it the edge can always record that outcome. If even the
     /// writer budget cannot fit the unit, the push refuses with that budget's
     /// typed memory error before sending anything.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub async fn push_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -4022,6 +4048,7 @@ impl SyncClient {
     // These are the exact transmitted batch and its existing progress bounds;
     // recovery must not replace any of them with later local state.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn finish_single_attempt_interrupted_push(
         &self,
         transport_err: Error,
@@ -4248,6 +4275,7 @@ impl SyncClient {
         .await
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn pull_with_initial_adoption_and_status_probe(
         &self,
         initial_adoption: SyncAdoption,
@@ -4964,6 +4992,7 @@ impl SyncClient {
     /// new destination from everything the edge holds — including rows older
     /// than the previous destination's last confirmation — and no local row is
     /// deleted until the new destination confirms receipt.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn change_destination(&self, new_node_id: &str) -> Result<(), Error> {
         let result = self
             .db
@@ -5042,6 +5071,7 @@ fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResul
     apply_from_push_response(response)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn apply_from_push_response(response: PushResponse) -> Result<ApplyResult, PushReplyError> {
     if let Some(application_error) = response.application_error {
         return Err(PushReplyError::Terminal(match application_error {
@@ -5115,6 +5145,7 @@ fn table_has_usable_sync_identity(db: &Database, table: &str, meta: &TableMeta) 
 /// rows quietly dropped (the fixed silent-omission defect). A keyless table
 /// declared `SYNC OFF` is unaffected: it was never eligible to leave this
 /// machine either way, so there is nothing to refuse.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn refuse_keyless_tables_with_no_identity_fallback(
     db: &Database,
     directions: &HashMap<String, SyncDirection>,
@@ -5191,6 +5222,7 @@ fn drop_rows_that_arrived_by_sync_after(
 /// edge already held when it made the move. A pull from the new hub can land
 /// before the rebuild push; those later arrivals remain ordinary self-echoes
 /// and must not ride the one-time re-upload.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn checked_drop_rows_that_arrived_by_sync_after(
     db: &Database,
     changes: ChangeSet,

@@ -7,6 +7,7 @@ use crate::{
 };
 use contextdb_core::{Error, Result, TenantId};
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn manifested_request(
     db: &Database,
     tenant: &TenantId,
@@ -113,12 +114,14 @@ pub(crate) fn manifested_request(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn wire_packet(packet: &SignedOutcomePacket) -> Result<WireDeliveryOutcome> {
     let mut wire = packet.record.wire(&packet.block)?;
     wire.lookup_source = rmp_serde::to_vec_named(packet).map_err(|_| invalid())?;
     Ok(wire)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn read_packet(
     wire: &WireDeliveryOutcome,
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -130,6 +133,7 @@ pub(crate) fn read_packet(
     Ok(packet)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn packet_for(
     db: &Database,
     t: &TerminalRecord,
@@ -166,6 +170,7 @@ pub(crate) fn packet_for(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn attach(
     db: &Database,
     tenant: &TenantId,
@@ -207,6 +212,7 @@ pub(crate) struct DeliveryRoute<'a> {
 }
 
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn apply(
     db: &Database,
     route: DeliveryRoute<'_>,
@@ -483,6 +489,7 @@ pub(crate) fn apply(
     Ok((result, outcomes))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn missing_manifest(
     db: &Database,
     tenant: &TenantId,
@@ -636,6 +643,7 @@ fn missing_manifest(
     ))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn fetch(
     db: &Database,
     tenant: &TenantId,
@@ -715,6 +723,7 @@ pub(crate) fn fetch(
 
 // Resend and status share the durable outcome decision.
 // Watermarks can retire ordinary history but cannot retire an unanswered unit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn pending_changes(
     db: &Database,
     mut changes: ChangeSet,
@@ -901,6 +910,7 @@ fn remove_missing_units(
     });
 }
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn apply_remainder(
     db: &Database,
     route: DeliveryRoute<'_>,

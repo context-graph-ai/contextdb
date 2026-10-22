@@ -11,6 +11,7 @@ pub(crate) struct Runtime {
     pub signer: LineageSigner,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn require_admin(
     db: &Database,
     _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -99,6 +100,7 @@ pub(crate) fn differing_clause(
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn declare(
     db: &Database,
     p: &contextdb_parser::DeclareTenantTablePolicy,
@@ -148,6 +150,7 @@ pub(crate) fn declare(
     Ok(QueryResultData::empty())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn check_binding(
     db: &Database,
     table: &str,
@@ -183,6 +186,7 @@ pub(crate) fn check_binding(
 }
 
 // DECLARE protects even a name not installed yet.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn check_declared(
     db: &Database,
     table: &str,
@@ -353,6 +357,7 @@ fn policy_cells(p: &ApplicationTablePolicy) -> Vec<Value> {
     ]
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn show_policy(
     db: &Database,
     table: Option<&str>,
@@ -390,6 +395,7 @@ pub(crate) fn show_policy(
     Ok(result)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn show_bindings(
     db: &Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,

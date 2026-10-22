@@ -371,6 +371,7 @@ impl BlobStore {
         *self.claim_refresh.lock().expect("claim refresh lock") = hook;
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn store(&self) -> Result<Arc<BlobStoreHandle>> {
         self.store
             .get_or_init(|| {
@@ -394,12 +395,14 @@ impl BlobStore {
 
     /// Content-address `bytes` into the local store and make them servable;
     /// the returned name IS `BlobHash::of(bytes)`. Idempotent.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ingest_bytes(&self, bytes: &[u8]) -> Result<BlobHash> {
         self.store()?.ingest_bytes(bytes).map(BlobHash::from_bytes)
     }
 
     /// Content-address the file at `path` (streamed, never buffered whole)
     /// and make it servable.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ingest_file(&self, path: &Path) -> Result<BlobHash> {
         self.store()?.ingest_file(path).map(BlobHash::from_bytes)
     }
@@ -411,11 +414,13 @@ impl BlobStore {
     /// consumers can discover it. Each request receives its own child of the
     /// store's declared reader memory. Directory
     /// registration and store-open errors propagate before handler publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn serve_on(&self, endpoint: &IrohServer) -> Result<()> {
         self.serve_on_with_provider(endpoint, self.db.declared_read_request_provider())
     }
 
     /// Serve using the host's declared request budget provider.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn serve_on_with_read_budget_provider(
         &self,
         endpoint: &IrohServer,
@@ -424,6 +429,7 @@ impl BlobStore {
         self.serve_on_with_provider(endpoint, read_budgets.into())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn serve_on_with_provider(
         &self,
         endpoint: &IrohServer,
@@ -981,6 +987,7 @@ impl BlobStore {
     /// entitled resolve gets BlobNotFound — and its bytes free at the
     /// store's GC interval. Returns the count reclaimed. One operation child
     /// funds the captured ledger root throughout the sweep.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reclaim_unreferenced(&self, now_ms: i64, grace_ms: i64) -> Result<usize> {
         self.reclaim_unreferenced_with_read_memory(
             self.db.declared_reader_memory()?,
@@ -990,6 +997,7 @@ impl BlobStore {
     }
 
     /// Reclaim using the executing host operation's READ owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reclaim_unreferenced_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1036,6 +1044,7 @@ impl BlobStore {
         self.spawn_reclaim_driver_with_provider(read_budgets.into(), grace_ms)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn spawn_reclaim_driver_with_provider(
         self: Arc<Self>,
         read_budgets: crate::vector_read_memory::ReadRequestProvider,

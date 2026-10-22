@@ -148,6 +148,7 @@ impl PreparedVectorPartitionMutationBatch {
         self.mutations.is_empty()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn resolve_insert<'w>(
         &self,
         ws: &'w WriteSet,
@@ -187,6 +188,7 @@ impl PreparedVectorPartitionMutationBatch {
 /// key and a predicate literal meet under the same `=` the row filter
 /// applies. A key value no component of the declared type is `=`-equal to
 /// is refused rather than stored as a partition no query can name.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn vector_partition_key_for_row(
     index: &VectorIndexRef,
     meta: &TableMeta,
@@ -847,6 +849,7 @@ impl CompositeStore {
         NaturalKey::single("id".to_string(), Value::Int64(row_id.0 as i64))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_table_meta<'meta>(
         table_meta: &'meta HashMap<String, TableMeta>,
         index: &VectorIndexRef,
@@ -858,6 +861,7 @@ impl CompositeStore {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_declaration<'m>(
         table_meta: &'m HashMap<String, TableMeta>,
         index: &VectorIndexRef,
@@ -875,6 +879,7 @@ impl CompositeStore {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_registered_vector_declaration(
         &self,
         index: &VectorIndexRef,
@@ -900,6 +905,7 @@ impl CompositeStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn live_accepted_row(
         &self,
         table: &str,
@@ -948,6 +954,7 @@ impl CompositeStore {
         Ok(Some(row.clone()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn old_accepted_row<'a>(
         &self,
         table: &str,
@@ -965,6 +972,7 @@ impl CompositeStore {
             .map(|row| row.map(std::borrow::Cow::Owned))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn current_vector_for_partition(
         &self,
         index: &VectorIndexRef,
@@ -1020,6 +1028,7 @@ impl CompositeStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepared_binding(
         index: &VectorIndexRef,
         meta: &TableMeta,
@@ -1111,6 +1120,7 @@ impl CompositeStore {
     /// then ask the vector store to validate the complete keyed batch without
     /// mutating it. A relational key-only replacement synthesizes a local
     /// move for each unchanged live vector column.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vector_partition_mutations(
         &self,
         ws: &WriteSet,
@@ -1137,6 +1147,7 @@ impl CompositeStore {
     /// Database supplies only states it has proved reclaimable while holding
     /// its snapshot-removal guard through durable and memory publication.
     /// This layer never infers that proof from current rows.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vector_partition_mutations_with_reclaimable_partitions(
         &self,
         ws: &WriteSet,
@@ -1161,6 +1172,7 @@ impl CompositeStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vector_partition_mutations_with_registered_snapshots(
         &self,
         ws: &WriteSet,
@@ -1207,6 +1219,7 @@ impl CompositeStore {
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vector_partition_mutations_with_reclamation(
         &self,
         ws: &WriteSet,
@@ -1762,6 +1775,7 @@ impl CompositeStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_partition_insert(
         entry: &contextdb_core::VectorEntry,
         after: &PreparedVectorPartitionBinding,
@@ -1800,6 +1814,7 @@ impl CompositeStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vector_partition_projection(
         &self,
         ws: &WriteSet,
@@ -1817,6 +1832,7 @@ impl CompositeStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_deferred_vector_publication(
         &self,
         ws: &WriteSet,
@@ -1855,6 +1871,7 @@ impl CompositeStore {
         Ok(CompletedVectorPublication { publication, owner })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_exact(
         &self,
         ws: &WriteSet,
@@ -1916,6 +1933,7 @@ impl CompositeStore {
         self
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_exact_with_log_entries(
         &self,
         ws: &WriteSet,
@@ -2032,6 +2050,7 @@ pub(crate) fn sync_source_lsn_update_cardinality(ws: &WriteSet) -> Option<usize>
         .and_then(|count| count.checked_add(ws.sync_source_provenance_marks.len()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn sync_source_lsn_updates(
     ws: &WriteSet,
 ) -> (Vec<SyncSourceLsnClear>, Vec<SyncSourceLsnSet>) {
@@ -2046,6 +2065,7 @@ pub(crate) fn sync_source_lsn_updates(
 
 /// Borrow the same update order without building a second unit-sized image.
 /// Every clear precedes every set, and explicit marks follow inserted rows.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn visit_sync_source_lsn_updates(ws:&WriteSet,
     mut clear:impl FnMut(&str,RowId)->Result<()>,
     mut set:impl FnMut(&str,RowId,Lsn,u8)->Result<()>)->Result<()> {
@@ -2279,6 +2299,7 @@ fn abort_before_vector_publication_for_test() {
 /// Lend the single finalized event/DDL slot to a synchronous persistence
 /// consumer. The result cannot retain the stage borrow; all guards have ended
 /// when this bridge returns to its memory-publication caller.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn with_owned_commit_events_for_apply<R>(
     events: &crate::database::event_bus::OwnedEventBusHandle,
     lsn: Option<Lsn>,
@@ -2300,6 +2321,7 @@ pub(crate) struct OwnedPreparedMemoryApply {
     _preparation: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl OwnedPreparedMemoryApply {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn admit_resident_copies(
         &mut self, original: &crate::memory_accounting::OwnedMemoryReservation, bytes: usize,
     ) -> Result<()> {
@@ -2312,6 +2334,7 @@ impl OwnedPreparedMemoryApply {
         )?);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         ws: &WriteSet,
@@ -2342,6 +2365,7 @@ impl OwnedPreparedMemoryApply {
     }
 }
 impl CompositeStore {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_owned_change_log_entries_with_snapshots(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -2405,6 +2429,7 @@ impl CompositeStore {
         let entries = self.build_change_log_entries_with_snapshots(ws, table_meta, deleted_rows);
         Ok((entries, frame.into_reservation()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_owned_exact_with_log_entries(
         &self,
         ws: &WriteSet,

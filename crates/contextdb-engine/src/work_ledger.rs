@@ -215,6 +215,7 @@ impl BlobHash {
         BlobHash(bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn from_hex(hex: &str) -> Result<BlobHash> {
         if hex.len() != 64 {
             return Err(Error::Other(("blob hash hex must be 64 chars".to_string()).into()));
@@ -637,6 +638,7 @@ fn encode_payload(bytes: &[u8]) -> String {
     out
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_payload(encoded: &str) -> Result<Vec<u8>> {
     if !encoded.len().is_multiple_of(2) {
         return Err(Error::Other((format!(
@@ -660,6 +662,7 @@ fn decode_payload(encoded: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn column_index(columns: &[String], name: &str) -> Result<usize> {
     columns
         .iter()
@@ -667,6 +670,7 @@ fn column_index(columns: &[String], name: &str) -> Result<usize> {
         .ok_or_else(|| Error::Other((format!("work ledger: missing column {name}")).into()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn text_at(row: &[Value], idx: usize, what: &str) -> Result<String> {
     match &row[idx] {
         Value::Text(s) => Ok(s.clone()),
@@ -676,6 +680,7 @@ fn text_at(row: &[Value], idx: usize, what: &str) -> Result<String> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn opt_text_at(row: &[Value], idx: usize, what: &str) -> Result<Option<String>> {
     match &row[idx] {
         Value::Null => Ok(None),
@@ -686,6 +691,7 @@ fn opt_text_at(row: &[Value], idx: usize, what: &str) -> Result<Option<String>> 
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn int_at(row: &[Value], idx: usize, what: &str) -> Result<i64> {
     match &row[idx] {
         Value::Int64(n) => Ok(*n),
@@ -696,6 +702,7 @@ fn int_at(row: &[Value], idx: usize, what: &str) -> Result<i64> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn opt_int_at(row: &[Value], idx: usize, what: &str) -> Result<Option<i64>> {
     match &row[idx] {
         Value::Null => Ok(None),
@@ -703,6 +710,7 @@ fn opt_int_at(row: &[Value], idx: usize, what: &str) -> Result<Option<i64>> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn json_at(row: &[Value], idx: usize, what: &str) -> Result<serde_json::Value> {
     match &row[idx] {
         Value::Json(v) => Ok(v.clone()),
@@ -713,6 +721,7 @@ fn json_at(row: &[Value], idx: usize, what: &str) -> Result<serde_json::Value> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn string_list(value: &serde_json::Value, what: &str) -> Result<Vec<String>> {
     let items = value
         .as_array()
@@ -727,6 +736,7 @@ fn string_list(value: &serde_json::Value, what: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn input_refs_from_json(value: &serde_json::Value) -> Result<Vec<InputRef>> {
     let items = value
         .as_array()
@@ -754,6 +764,7 @@ fn input_refs_from_json(value: &serde_json::Value) -> Result<Vec<InputRef>> {
 /// content-addressed blob identity in its canonical lowercase form.  This is
 /// pure so destructive kernels can validate and prebuild their complete
 /// outcome before crossing a persistence boundary.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn canonical_blob_hashes_from_input_refs(value: &Value) -> Result<Vec<String>> {
     let Value::Json(value) = value else {
         return Err(Error::Other((
@@ -785,12 +796,14 @@ fn input_refs_to_json(refs: &[InputRef]) -> serde_json::Value {
 
 /// Create the seven ledger tables if absent. Idempotent; safe to call at
 /// every open, and safe when the schema already arrived via sync.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
     let read_memory = db.declared_reader_memory()?;
     install_work_ledger_schema_with_read_memory(db, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn install_work_ledger_schema_with_read_memory(
     db: &Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -959,12 +972,14 @@ pub(crate) fn apply_work_ledger_policy_overrides(policies: &mut ConflictPolicies
 
 /// Write the job row inside the caller's open transaction, so submission
 /// commits atomically with the caller's own writes.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn submit_job_in_tx(db: &Database, tx: TxId, spec: &JobSpec) -> Result<()> {
     let read_memory = db.declared_reader_memory()?;
     submit_job_in_tx_with_read_memory(db, tx, spec, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn submit_job_in_tx_with_read_memory(
     db: &Database,
     tx: TxId,
@@ -1039,6 +1054,7 @@ pub fn submit_job_in_tx_with_read_memory(
 
 /// Copy one chunk of input material into `work_inputs` inside the caller's
 /// open transaction.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn add_job_input_in_tx(
     db: &Database,
     tx: TxId,
@@ -1051,6 +1067,7 @@ pub fn add_job_input_in_tx(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn add_job_input_in_tx_with_read_memory(
     db: &Database,
     tx: TxId,
@@ -1082,12 +1099,14 @@ pub fn add_job_input_in_tx_with_read_memory(
 ///
 /// Returns an error (via [`contextdb_core::Error::Other`]) if `spec.job_id`
 /// is empty, or if `spec.max_attempts` is less than 1.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn submit_job<I: AsRef<[u8]>>(db: &Database, spec: &JobSpec, inputs: &[I]) -> Result<()> {
     let read_memory = db.declared_reader_memory()?;
     submit_job_with_read_memory(db, spec, inputs, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn submit_job_with_read_memory<I: AsRef<[u8]>>(
     db: &Database,
     spec: &JobSpec,
@@ -1126,6 +1145,7 @@ pub fn submit_job_with_read_memory<I: AsRef<[u8]>>(
 /// Read rows and report what reading them cost, in rows the engine had to
 /// look at. Every ledger read goes through here, so a caller that wants the
 /// price of a question can add up the answers.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn select_rows_with_work(
     db: &Database,
     sql: &str,
@@ -1139,6 +1159,7 @@ fn select_rows_with_work(
     Ok((result, examined))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn select_rows(
     db: &Database,
     sql: &str,
@@ -1159,6 +1180,7 @@ const KEYED_LOOKUP_WIDTH: usize = 128;
 /// read's rows to `visit` as they arrive, and adding what the reads cost to
 /// `work`. The `job_id` column is what every one of these tables is keyed or
 /// indexed by, so the rows looked at belong to the ids handed in.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_rows_for_jobs(
     db: &Database,
     columns: &str,
@@ -1194,6 +1216,7 @@ fn read_rows_for_jobs(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn job_row(
     db: &Database,
     job_id: &str,
@@ -1218,6 +1241,7 @@ fn job_row(
 
 /// Read one submitted job out of a `work_jobs` row. One place, so a job read
 /// on its own and a job read as part of a batch are the same job.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn job_snapshot_from_row(columns: &[String], row: &[Value]) -> Result<JobSnapshot> {
     Ok(JobSnapshot {
         job_id: text_at(row, column_index(columns, "job_id")?, "job_id")?,
@@ -1254,12 +1278,14 @@ fn job_snapshot_from_row(columns: &[String], row: &[Value]) -> Result<JobSnapsho
 }
 
 /// Read back one job's submitted form.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_snapshot(db: &Database, job_id: &str) -> Result<Option<JobSnapshot>> {
     let read_memory = db.declared_reader_memory()?;
     job_snapshot_with_read_memory(db, job_id, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_snapshot_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -1277,6 +1303,7 @@ struct ClaimRow {
     lease_deadline_ms: i64,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn claim_rows(
     db: &Database,
     job_id: &str,
@@ -1307,6 +1334,7 @@ fn claim_rows(
         .collect()
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn failure_attempts(
     db: &Database,
     job_id: &str,
@@ -1329,6 +1357,7 @@ fn failure_attempts(
         .collect()
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn cancellation_exists(
     db: &Database,
     job_id: &str,
@@ -1348,6 +1377,7 @@ fn cancellation_exists(
     Ok(!rows.is_empty())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn result_exists(
     db: &Database,
     job_id: &str,
@@ -1380,12 +1410,14 @@ fn result_exists(
 /// tables that keep a single row per job, and a declared index on the two that
 /// keep a row per attempt, so asking about one job never costs a walk of the
 /// whole ledger. The reads stop at the first rule that settles the job.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_state(db: &Database, job_id: &str, now_ms: i64) -> Result<JobState> {
     let read_memory = db.declared_reader_memory()?;
     job_state_with_read_memory(db, job_id, now_ms, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_state_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -1412,9 +1444,13 @@ pub fn job_state_with_read_memory(
 /// more of the ledger than the question needs. A batch answers the same
 /// questions from rows it read once for the whole batch.
 trait JobStateRows {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn result_recorded(&mut self) -> Result<bool>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cancellation_recorded(&mut self) -> Result<bool>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn failed_attempts(&mut self) -> Result<Vec<i64>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn claims(&mut self) -> Result<Vec<ClaimRow>>;
 }
 
@@ -1455,6 +1491,7 @@ struct ReadSessionJobRows<'a> {
 }
 
 impl ReadSessionJobRows<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn select_rows(
         &self,
         sql: &str,
@@ -1487,6 +1524,7 @@ impl JobStateRows for ReadSessionJobRows<'_> {
         Ok(!rows.is_empty())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn failed_attempts(&mut self) -> Result<Vec<i64>> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(self.job_id));
@@ -1501,6 +1539,7 @@ impl JobStateRows for ReadSessionJobRows<'_> {
             .collect()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn claims(&mut self) -> Result<Vec<ClaimRow>> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(self.job_id));
@@ -1554,6 +1593,7 @@ impl JobStateRows for BatchedJobRows<'_> {
 /// The one derivation, applied to a job whose row is already in hand. Both
 /// [`job_state`] and [`job_state_counts`] answer through this, so a single
 /// job and a batch of jobs can never disagree about what a job's rows mean.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn state_of_job(job: &JobSnapshot, rows: &mut dyn JobStateRows, now_ms: i64) -> Result<JobState> {
     if rows.result_recorded()? {
         return Ok(JobState::Done);
@@ -1613,6 +1653,7 @@ pub struct LedgerWork {
 /// An id with no job row is counted in `unknown` rather than refused, so one
 /// forgotten or pruned id does not cost the caller the whole batch's answer.
 /// The buckets sum to `job_ids.len()`.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_state_counts(
     db: &Database,
     job_ids: &[impl AsRef<str>],
@@ -1623,6 +1664,7 @@ pub fn job_state_counts(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_state_counts_with_read_memory(
     db: &Database,
     job_ids: &[impl AsRef<str>],
@@ -1641,6 +1683,7 @@ pub fn job_state_counts_with_read_memory(
 /// Same counts, same derivation; the second half of the answer is the price
 /// the ledger paid to produce it, so a caller can hold the boundedness promise
 /// above to account rather than to trust.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_state_counts_with_work(
     db: &Database,
     job_ids: &[impl AsRef<str>],
@@ -1651,6 +1694,7 @@ pub fn job_state_counts_with_work(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_state_counts_with_work_with_read_memory(
     db: &Database,
     job_ids: &[impl AsRef<str>],
@@ -1795,6 +1839,7 @@ pub fn job_state_counts_with_work_with_read_memory(
 pub mod read {
     use super::*;
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn job_row(session: &ReadSession, job_id: &str) -> Result<Option<JobSnapshot>> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(job_id));
@@ -1806,6 +1851,7 @@ pub mod read {
     }
 
     /// Compute one job's state through the supplied read session.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn job_state(session: &ReadSession, job_id: &str, now_ms: i64) -> Result<JobState> {
         let Some(job) = job_row(session, job_id)? else {
             return Err(Error::NotFound(format!("work ledger job {job_id}")));
@@ -1818,6 +1864,7 @@ pub mod read {
     ///
     /// Unknown ids remain part of the answer, as on the writable surface, so
     /// a missing job cannot hide the state of the rest of the requested set.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn job_state_counts(
         session: &ReadSession,
         job_ids: &[impl AsRef<str>],
@@ -1835,6 +1882,7 @@ pub mod read {
     }
 
     /// Read a job's completed result through the supplied read session.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn job_result(session: &ReadSession, job_id: &str) -> Result<Option<JobResult>> {
         let mut params = HashMap::new();
         params.insert("job_id".to_string(), text(job_id));
@@ -1869,6 +1917,7 @@ pub mod read {
 /// The jobs `node_id` may claim right now: state pending, every requirement
 /// tag advertised, input readable under the movement policy. Ordered by
 /// priority (desc), then deadline (asc, none last), then submission age.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn claimable_jobs(
     db: &Database,
     node_id: &str,
@@ -1881,6 +1930,7 @@ pub fn claimable_jobs(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn claimable_jobs_with_read_memory(
     db: &Database,
     node_id: &str,
@@ -1947,6 +1997,7 @@ pub fn claimable_jobs_with_read_memory(
 /// entitled, so the resolver can authorize and only then discover the bytes
 /// were reclaimed (`BlobNotFound`), rather than that distinction collapsing
 /// into `Unentitled` here.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn node_holds_claim_for_blob(
     db: &Database,
     node_id: &str,
@@ -1958,6 +2009,7 @@ pub fn node_holds_claim_for_blob(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn node_holds_claim_for_blob_with_read_memory(
     db: &Database,
     node_id: &str,
@@ -2018,12 +2070,14 @@ pub fn node_holds_claim_for_blob_with_read_memory(
 /// hash at all). It is never the security boundary: the holder's own
 /// [`node_holds_claim_for_blob`] check against the transport-authenticated
 /// caller is what actually authorizes a fetch.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn any_node_holds_claim_for_blob(db: &Database, hash: &BlobHash, now_ms: i64) -> Result<bool> {
     let read_memory = db.declared_reader_memory()?;
     any_node_holds_claim_for_blob_with_read_memory(db, hash, now_ms, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn any_node_holds_claim_for_blob_with_read_memory(
     db: &Database,
     hash: &BlobHash,
@@ -2083,6 +2137,7 @@ pub fn any_node_holds_claim_for_blob_with_read_memory(
 /// live matching claim) on a caller that already failed the entitlement
 /// gate is meaningless dead code, not a security gap: callers must run
 /// `node_holds_claim_for_blob` first.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn node_claim_permits_movement(
     db: &Database,
     node_id: &str,
@@ -2095,6 +2150,7 @@ pub fn node_claim_permits_movement(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn node_claim_permits_movement_with_read_memory(
     db: &Database,
     node_id: &str,
@@ -2154,6 +2210,7 @@ pub fn node_claim_permits_movement_with_read_memory(
 /// Retention (job terminal state) is a separate axis from entitlement
 /// (claim-lease liveness) — a reclaimed blob's still-entitled claimant gets
 /// BlobNotFound from the resolver, never Unentitled.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn blob_ref_retention_eligible(
     db: &Database,
     hash: &BlobHash,
@@ -2165,6 +2222,7 @@ pub fn blob_ref_retention_eligible(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn blob_ref_retention_eligible_with_read_memory(
     db: &Database,
     hash: &BlobHash,
@@ -2217,12 +2275,14 @@ fn input_refs_carry_blob(job: &JobSnapshot, target_hex: &str) -> bool {
 
 /// The attempt number a new claim must use: one past the highest attempt any
 /// claim or failure row records.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn next_attempt(db: &Database, job_id: &str) -> Result<i64> {
     let read_memory = db.declared_reader_memory()?;
     next_attempt_with_read_memory(db, job_id, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn next_attempt_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2244,6 +2304,7 @@ pub fn next_attempt_with_read_memory(
 
 /// Insert the claim row locally. The table's primary key is the same-machine
 /// half of the lease: a second local claimant gets [`ClaimInsert::AlreadyHeld`].
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn insert_claim(
     db: &Database,
     job_id: &str,
@@ -2265,6 +2326,7 @@ pub fn insert_claim(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn insert_claim_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2314,12 +2376,14 @@ pub fn insert_claim_with_read_memory(
 }
 
 /// Who holds the claim row for (job, attempt), if anyone.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn claim_holder(db: &Database, job_id: &str, attempt: i64) -> Result<Option<String>> {
     let read_memory = db.declared_reader_memory()?;
     claim_holder_with_read_memory(db, job_id, attempt, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn claim_holder_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2350,6 +2414,7 @@ pub fn claim_holder_with_read_memory(
 /// Record the structured output plus its execution receipt. Exactly-once by
 /// construction: when a result row for the job already exists, this is a
 /// no-op `Ok` — duplicate work is caught, never double-recorded.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn record_result(
     db: &Database,
     job_id: &str,
@@ -2374,6 +2439,7 @@ pub fn record_result(
 
 /// Execute using the caller's existing operation read owner.
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn record_result_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2407,12 +2473,14 @@ pub fn record_result_with_read_memory(
 }
 
 /// Read back the job's result, if one landed.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_result(db: &Database, job_id: &str) -> Result<Option<JobResult>> {
     let read_memory = db.declared_reader_memory()?;
     job_result_with_read_memory(db, job_id, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn job_result_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2449,6 +2517,7 @@ pub fn job_result_with_read_memory(
 /// Record one attempt's failure. The existence of this row is what makes the
 /// next attempt legal; at the job's attempt ceiling the computed state turns
 /// `Failed`. Idempotent for the same (job, attempt).
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn record_failure(
     db: &Database,
     job_id: &str,
@@ -2462,6 +2531,7 @@ pub fn record_failure(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn record_failure_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2504,6 +2574,7 @@ pub fn record_failure_with_read_memory(
 
 /// Write the one cancellation row. Idempotent; a cancellation that loses the
 /// race with a result is a no-op (the result stands).
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn cancel_job(
     db: &Database,
     job_id: &str,
@@ -2516,6 +2587,7 @@ pub fn cancel_job(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn cancel_job_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2561,6 +2633,7 @@ pub fn cancel_job_with_read_memory(
 /// lives in the append-only workflow tables (claims/results/receipts), never
 /// here. (See the `work_capabilities` LatestWins sync policy: the refreshed
 /// timestamp propagates edge→hub.)
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn advertise_capability(
     db: &Database,
     node_id: &str,
@@ -2573,6 +2646,7 @@ pub fn advertise_capability(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn advertise_capability_with_read_memory(
     db: &Database,
     node_id: &str,
@@ -2603,12 +2677,14 @@ pub fn advertise_capability_with_read_memory(
 }
 
 /// The union of tags this node has advertised across its capability rows.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn advertised_tags(db: &Database, node_id: &str) -> Result<Vec<String>> {
     let read_memory = db.declared_reader_memory()?;
     advertised_tags_with_read_memory(db, node_id, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn advertised_tags_with_read_memory(
     db: &Database,
     node_id: &str,
@@ -2648,6 +2724,7 @@ pub fn advertised_tags_with_read_memory(
 ///   caller must fetch it through the blob resolver
 ///   ([`crate::blob_store::BlobStore::resolve_blob_ref`])
 ///   instead of this function.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn materialize_inputs(
     db: &Database,
     job_id: &str,
@@ -2659,6 +2736,7 @@ pub fn materialize_inputs(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn materialize_inputs_with_read_memory(
     db: &Database,
     job_id: &str,
@@ -2728,6 +2806,7 @@ pub fn materialize_inputs_with_read_memory(
     Ok(inputs)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn terminal_since(
     db: &Database,
     job: &JobSnapshot,
@@ -2783,12 +2862,14 @@ fn terminal_since(
 /// ledger workflow; the state computation never reads `work_inputs`, so this
 /// provably cannot change any job's state. Returns the number of rows
 /// removed on this node.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn run_input_retention(db: &Database, now_ms: i64, grace_ms: i64) -> Result<usize> {
     let read_memory = db.declared_reader_memory()?;
     run_input_retention_with_read_memory(db, now_ms, grace_ms, read_memory)
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn run_input_retention_with_read_memory(
     db: &Database,
     now_ms: i64,
@@ -2834,6 +2915,7 @@ pub fn run_input_retention_with_read_memory(
 /// different holder (a lost race reconciled under the worker). Lease expiry
 /// alone is NOT abandonment — a revived worker may finish; the result stays
 /// exactly-once by key.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn should_abandon(
     db: &Database,
     job_id: &str,
@@ -2846,6 +2928,7 @@ pub fn should_abandon(
 }
 
 /// Execute using the caller's existing operation read owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn should_abandon_with_read_memory(
     db: &Database,
     job_id: &str,

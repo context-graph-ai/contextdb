@@ -39,6 +39,7 @@ impl<'a> CurrentAuthority<'a> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn status(
     db: &Database,
     table: &str,
@@ -135,6 +136,7 @@ pub(crate) fn projection(t: &TerminalRecord, block: &DiagnosticBlock) -> Deliver
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn outcome(
     db: &Database,
     table: &str,
@@ -198,6 +200,7 @@ pub(crate) fn outcome(
     Ok(Some(outcome))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn show(
     db: &Database,
     table: &str,
@@ -299,6 +302,7 @@ pub(crate) fn show(
 }
 
 // Each route projects the same durable record through its scoped database.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn metadata(
     db: &Database,
     request: crate::direct_file_reader::DirectMetadataRequest,

@@ -435,6 +435,7 @@ impl Default for ServerResourcePolicy {
 
 impl ServerResourcePolicy {
     /// Validate values before any identity, socket, or database resource is opened.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn validate(&self) -> TransportResult<()> {
         if self.response_staging_bytes == Some(0) {
             return Err(TransportError::Unreachable(
@@ -2164,6 +2165,7 @@ impl PreAdmissionGuardrails {
         self.connection_permits.clone().try_acquire_owned().ok()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_reserve_payload(&self, bytes: usize) -> TransportResult<OwnedSemaphorePermit> {
         let permits = u32::try_from(bytes.max(1)).map_err(|_| {
             TransportError::IncompleteReply(
@@ -2399,6 +2401,7 @@ impl IrohServer {
         Self::bind_with_resource_policy(spec, ServerResourcePolicy::default()).await
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn bind_with_validated_resource_policy(
         spec: &str,
         policy: ServerResourcePolicy,
@@ -2657,6 +2660,7 @@ impl IrohServer {
             .unwrap_or_else(|error| error.into_inner()) = Some(admission);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn lineage_signer(&self) -> LineageSigner {
         let identity = self.identity.clone();
         Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)))
@@ -3023,6 +3027,7 @@ pub(super) fn client(spec: &str) -> Arc<dyn ClientTransport> {
     client_with_lineage_signer(spec).0
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn client_with_lineage_signer(
     spec: &str,
 ) -> (Arc<dyn ClientTransport>, Option<LineageSigner>) {
@@ -3053,6 +3058,7 @@ pub(super) fn client_with_lineage_signer(
 /// Construct the database-owned sync client. An explicit endpoint identity
 /// wins over the adjacent database identity; without either, this transport
 /// refuses before opening a connection and produces no lineage signer.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn sync_client_with_lineage_signer(
     spec: &str,
     default_identity_path: Option<PathBuf>,
@@ -3687,6 +3693,7 @@ impl ClientTransport for IrohClientTransport {
 impl IrohClientTransport {
     /// One admitted exchange; a failed transport drops the connection so the
     /// next request redials, while a reader refusal keeps it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn request_once_admitted(
         &self,
         subject: &str,
@@ -3995,6 +4002,7 @@ impl ServerTransport for IrohServerTransport {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn response_transfer_key(
     remote_node_id: &str,
     control: &LargeResponseControl,
@@ -4007,6 +4015,7 @@ fn response_transfer_key(
     Ok((remote_node_id.to_string(), manifest.transfer_digest()?))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn serve_sync_connection(
     connection: Connection,
     sync_routes: SyncRoutes,
@@ -4847,6 +4856,7 @@ async fn answer_native_refusal(
 /// unanswered, exactly as the registry closes a Legacy reply that has not
 /// started.
 #[allow(clippy::too_many_arguments)] // The admitted request's parts stay explicit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn serve_paid_native_request(
     (mut send, mut recv): (SendStream, RecvStream),
     lease: ActiveSyncRequest,
@@ -4998,6 +5008,7 @@ pub(crate) fn reply_writer_bytes_for_test() -> usize {
 }
 
 impl SyncReplyWriter {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn write(self, response_bytes: Vec<u8>) -> TransportResult<()> {
         let Self {
             parts,
@@ -5227,6 +5238,7 @@ enum NativeAdmission {
 /// Read one request frame. For a subject the native root serves, the provider
 /// is consulted once, after the subject and length and before any body byte is
 /// read, and a Native body lands in its admitted allocation with no copy.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn read_request_frame_routed(
     recv: &mut iroh::endpoint::RecvStream,
     pre_admission: &PreAdmissionGuardrails,
@@ -5410,6 +5422,7 @@ async fn serve_native_subject(
     future.await
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_large_response_control_frame(bytes: &[u8]) -> TransportResult<LargeResponseControl> {
     if bytes.len() > MAX_RESPONSE_CONTROL_BYTES {
         return Err(TransportError::IncompleteReply(
@@ -5559,6 +5572,7 @@ async fn wait_for_direct_addrs(endpoint: &Endpoint) -> TransportResult<EndpointA
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_dial_target(spec: &str) -> TransportResult<(EndpointAddr, EndpointSpec)> {
     let parsed = EndpointSpec::parse(spec)
         .ok_or_else(|| TransportError::Unreachable("not a dialable endpoint spec".to_string()))?;
@@ -5575,6 +5589,7 @@ fn parse_dial_target(spec: &str) -> TransportResult<(EndpointAddr, EndpointSpec)
 
 /// Load the operator-supplied relay CA certificate(s): PEM (possibly a
 /// bundle) or a single DER certificate.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn load_relay_ca_certs(
     path: &Path,
 ) -> TransportResult<Vec<rustls_pki_types::CertificateDer<'static>>> {
@@ -5601,6 +5616,7 @@ fn load_relay_ca_certs(
 /// one, else ephemeral. Durable sync construction refuses the latter
 /// case through its separate factory; raw transport callers retain it for
 /// protocol-level anonymous-refusal coverage without a database participant.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn dialing_identity(identity_path: Option<&Path>) -> TransportResult<FabricIdentity> {
     match identity_path {
         Some(path) => FabricIdentity::load_or_generate(path)
@@ -5967,6 +5983,7 @@ async fn await_large_request_fragment_reply(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_large_request_progress(
     progress: &LargeRequestProgress,
     local_node_id: &str,
@@ -5988,6 +6005,7 @@ fn validate_large_request_progress(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn remove_stage_after_reply(stage: &DurableLargeRequestStage, path: PathBuf) {
     let _guard = stage.lock.lock().await;
     let stage_path = path.clone();

@@ -33,6 +33,7 @@ impl<'a, T> Future for AdmittedWireFuture<'a, T> {
 
 /// Core allocates the complete concrete frame before invoking its producer.
 /// A producer refusal is returned synchronously; no failed erased future exists.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn admit_wire_future_with<'a, T, F>(
     owner: ReadMemoryOwner,
     make: impl FnOnce() -> WireResult<F>,
@@ -68,6 +69,7 @@ where
 
 /// Reserve the actual concrete frame layout before allocating its Box. No
 /// erased or error future exists on a refusal path.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn admit_wire_future<'a, T, F>(
     owner: ReadMemoryOwner,
     future: F,
@@ -128,6 +130,7 @@ pub(crate) fn allocation_error() -> super::WireError {
     ))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn wire_credit(
     owner: ReadMemoryOwner,
     bytes: usize,
@@ -160,6 +163,7 @@ impl NativeStreamResponder {
         self.owner.same_owner(owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_finish(
         mut self,
         body: super::BoundedWireBody,
@@ -184,6 +188,7 @@ pub(crate) struct NativeWireString {
     _credit: ReadCredit,
 }
 impl NativeWireString {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_from_parts(owner: ReadMemoryOwner, parts: &[&str]) -> WireResult<Self> {
         let length = parts
             .iter()
@@ -283,6 +288,7 @@ impl<T, F: Future<Output = WireResult<T>>> Future for NativeOperationFuture<F> {
 
 /// Admit the wrapper INCLUDING operation custody before make sees the request.
 /// The old by-value entry is retained for existing inactive callers only.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn admit_native_operation_future_with<'a, T, F>(
     operation: crate::owner_read::NativeReadRequest,
     make: impl FnOnce(&crate::owner_read::NativeReadRequest) -> WireResult<F>,
@@ -303,6 +309,7 @@ where
 }
 
 impl NativeStreamResponder {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_new_with<H>(
         owner: ReadMemoryOwner,
         make: impl FnOnce() -> WireResult<H>,
@@ -366,12 +373,15 @@ impl Drop for NativeInitGuard {
 /// Object-safe private installation companion. It inherits no Legacy default.
 pub(crate) trait NativeRouteDispatch: Send + Sync {
     fn subject(&self) -> &str;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_request(&self) -> WireResult<NativeReadStreamBegin>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn dispatch_native(
         &self,
         request: super::ReadBoundIncomingRequest,
         operation: crate::owner_read::NativeReadRequest,
     ) -> WireResult<DispatchedWireFuture<'static, ()>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn dispatch_legacy(
         &self,
         request: super::ReadBoundIncomingRequest,
@@ -503,6 +513,7 @@ pub(crate) struct NativeRouteBuilder {
     timeouts: contextdb_core::read_contract::OwnerServiceTimeouts,
 }
 impl NativeRouteBuilder {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_new(
         installation: NativeReadChildReceipt,
         slots: usize,
@@ -543,6 +554,7 @@ impl NativeRouteBuilder {
             timeouts,
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_push<H, L>(
         &mut self,
         subject: &str,
@@ -606,6 +618,7 @@ impl NativeRouteBuilder {
         self.initialized += 1;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn finish(mut self) -> WireResult<ReadBoundStreamInstallation> {
         if self.initialized != self.slots {
             return Err(super::TransportError::NoResponder.into());
@@ -674,6 +687,7 @@ impl Drop for NativeRouteBuilder {
 /// paid copies of them and of the authenticated edge before the frame exists.
 /// The Database, identity and clock are standing roots, retained, never re-labelled.
 #[allow(clippy::too_many_arguments)] // Standing roots and policy stay explicit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn install_native_delivery_route<L>(
     installation: NativeReadChildReceipt,
     provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,

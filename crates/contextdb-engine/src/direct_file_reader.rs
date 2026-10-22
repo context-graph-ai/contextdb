@@ -915,6 +915,7 @@ impl fmt::Display for EngineDiagnostic {
     }
 }
 impl PreparedEngineDiagnostic {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new(owner: contextdb_core::read_memory::ReadMemoryOwner)
         -> contextdb_core::Result<Self> {
         contextdb_core::error::DiagnosticText::try_prepare_shared(owner,
@@ -1182,6 +1183,7 @@ fn execute_on_backend_neutral_target(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn publish_direct_result<T>(
     registration: &Arc<crate::persistence::ReadSnapshotRegistrationGuard>,
     scope: &crate::executor::ReadPublicationScope,
@@ -1375,6 +1377,7 @@ impl DirectFileReader {
         Arc::clone(&self.target)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn publish_bounded_result<T>(
         &self,
         scope: &crate::executor::ReadPublicationScope,

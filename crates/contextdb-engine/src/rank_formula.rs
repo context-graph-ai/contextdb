@@ -8,10 +8,12 @@ pub struct RankFormula {
 }
 
 impl RankFormula {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn compile(formula: &str) -> Result<Self> {
         Self::compile_for_index("", formula)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn compile_for_index(index: &str, formula: &str) -> Result<Self> {
         let mut parser = FormulaParser::new(index, formula);
         let root = parser.parse_expr()?;
@@ -193,10 +195,12 @@ impl<'a> FormulaParser<'a> {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn parse_expr(&mut self) -> Result<FormulaNode> {
         self.parse_add()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn parse_add(&mut self) -> Result<FormulaNode> {
         let mut node = self.parse_mul()?;
         loop {
@@ -210,6 +214,7 @@ impl<'a> FormulaParser<'a> {
         Ok(node)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn parse_mul(&mut self) -> Result<FormulaNode> {
         let mut node = self.parse_primary()?;
         loop {
@@ -223,6 +228,7 @@ impl<'a> FormulaParser<'a> {
         Ok(node)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn parse_primary(&mut self) -> Result<FormulaNode> {
         self.skip_ws();
         if self.is_eof() {
@@ -269,6 +275,7 @@ impl<'a> FormulaParser<'a> {
         Err(self.unexpected_at_current())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn parse_coalesce(&mut self) -> Result<FormulaNode> {
         let start = self.pos;
         self.pos += "coalesce".len();
@@ -293,6 +300,7 @@ impl<'a> FormulaParser<'a> {
         Ok(FormulaNode::Coalesce(Box::new(expr), fallback))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn parse_col_ref(&mut self) -> Result<FormulaNode> {
         let start = self.pos;
         self.pos += 1;
@@ -321,6 +329,7 @@ impl<'a> FormulaParser<'a> {
         Err(self.error_at(start, "unterminated column reference"))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn parse_number(&mut self) -> Result<f32> {
         self.skip_ws();
         let start = self.pos;

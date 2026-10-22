@@ -20,6 +20,7 @@ impl FabricIdentity {
     /// Load the identity stored at `path`, or generate one and persist it
     /// there (owner-only file permissions). The same path always yields the
     /// same identity.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn load_or_generate(path: &Path) -> contextdb_core::Result<Self> {
         if path.exists() {
             return Self::load(path);
@@ -29,6 +30,7 @@ impl FabricIdentity {
         Ok(identity)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(path: &Path) -> contextdb_core::Result<Self> {
         let bytes = std::fs::read(path)
             .map_err(|_| Error::SyncError(("cannot read fabric identity file".to_string()).into()))?;
@@ -41,6 +43,7 @@ impl FabricIdentity {
         Ok(Self { seed })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist(&self, path: &Path) -> contextdb_core::Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -119,6 +122,7 @@ impl FabricIdentity {
     /// Verify a lineage signature using the creator identity carried on the
     /// wire.  `node_id` is the lowercase hex Ed25519 public key used by the
     /// fabric, so verification never needs a local key registry.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_lineage_by_node_id(
         node_id: &str,
         bytes: &[u8],
@@ -146,6 +150,7 @@ impl FabricIdentity {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn hex_node_id(node_id: &str) -> contextdb_core::Result<[u8; 32]> {
     if node_id.len() != 64
         || !node_id

@@ -53,6 +53,7 @@ impl PersistentCompositeStore {
         self._precommit_source_memory.bytes
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new(
         inner: CompositeStore,
         persistence: Arc<RedbPersistence>,
@@ -93,6 +94,7 @@ impl PersistentCompositeStore {
     /// while its snapshot-removal guard is held. Explicit refs remain for the
     /// low-level prepared-store contract; ordinary commits supply the exact
     /// registered-snapshot sample staged under this commit's LSN.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_with_vector_reclamation(
         &self,
         ws: &WriteSet,
@@ -249,6 +251,7 @@ impl PersistentCompositeStore {
     /// Retain admitted current bodies only for row/vector identities this commit
     /// touches. The same prepared publication owner supplies the precommit
     /// physical source; no resident row directory or history walk is needed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn deleted_rows_snapshot_for_write_set(
         &self,
         ws: &WriteSet,
@@ -494,6 +497,7 @@ pub(crate) fn with_owned_terminal_apply_scope<R>(store: usize, f: impl FnOnce() 
     result
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn bind_owned_terminal_apply(
     store: usize, lsn: Lsn, identity: contextdb_tx::manager::EngineTerminalIdentity,
 ) -> Result<()> {
@@ -510,6 +514,7 @@ pub(crate) fn bind_owned_terminal_apply(
 }
 
 impl OwnedPersistentCompositeStore {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_new(
         legacy: PersistentCompositeStore,
         events: crate::database::event_bus::OwnedEventBusHandle,
@@ -520,6 +525,7 @@ impl OwnedPersistentCompositeStore {
         Ok(Self { legacy, events })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn owned_terminal_apply_identity(
         &self,
         ws: &WriteSet,
@@ -546,6 +552,7 @@ impl OwnedPersistentCompositeStore {
     /// event getters with one synchronous combined-stage loan. The supplied
     /// consumer may flush only: memory apply, take, Drop and callbacks happen
     /// after this method returns and releases its stage guards.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_owned_flush_inputs<R>(
         &self,
         ws: &WriteSet,
@@ -612,6 +619,7 @@ impl OwnedPersistentCompositeStore {
 }
 
 impl OwnedPersistentCompositeStore {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn deleted_rows_snapshot_for_owned_write_set(
         &self,
         ws: &WriteSet,
@@ -865,6 +873,7 @@ impl PreparedQueueSourceLink<'_> {
         std::mem::replace(&mut *self.link, root.downgrade())
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn with_exact_queue_source_link<R>(
     persistence: &RedbPersistence,
     operation: impl FnOnce(&mut PreparedQueueSourceLink<'_>) -> R,
@@ -913,6 +922,7 @@ impl OwnedPersistentCompositeStore {
         with_owned_metadata_publication_scope(self as *const Self as usize, f)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_owned_with_vector_reclamation(
         &self,
         ws: &WriteSet,
@@ -931,6 +941,7 @@ impl OwnedPersistentCompositeStore {
             read_memory,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_owned_with_vector_reclamation_for_terminal(
         &self,
         ws: &WriteSet,
@@ -1129,6 +1140,7 @@ impl OwnedPersistentCompositeStore {
 }
 
 impl WriteSetApplicator for OwnedPersistentCompositeStore {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
         let store = self as *const Self as usize;
         self.events.with_owned_persistence_original(|original| {
@@ -1227,6 +1239,7 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
     fn native_publication_handle(&self) -> Option<contextdb_tx::native_capture::NativeCapture> {
         self.legacy.prepared_publication.lock().take().map(|root| root.into_native())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply(
         &self,
         ws: &WriteSet,
@@ -1275,6 +1288,7 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
     dead_code,
     reason = "native delivery code is staged ahead of its first non-test caller"
 )]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn apply_owned_memory_store(
     store: &CompositeStore,
     events: &crate::database::event_bus::OwnedEventBusHandle,

@@ -370,6 +370,7 @@ impl AdmittedJsonDiagnostic {
             crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error));
         custody.finish(Diagnostic::Paid(error), None)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn finish(mut self, error: serde_json::Error,
         finite: Option<&'static str>, messagepack: bool)
         -> std::result::Result<OriginalError, (serde_json::Error, Self)> {
@@ -585,6 +586,7 @@ fn qualified_native_io(error: &redb::NativeColdReadError) -> bool {
 
 /// Build the existing corruption class from borrowed operation data. The caller
 /// supplies its actual payer; neither field allocates until admission succeeds.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn corruption_display(
     owner: contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner>,
     path: impl fmt::Display,
@@ -601,6 +603,7 @@ pub(crate) fn corruption_display(
 
 /// Re-label an already owned diagnosis without rendering or copying its text.
 /// Only the borrowed runtime path needs new, independently retained storage.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn corruption_text(
     owner: contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner>,
     path: impl fmt::Display,
@@ -612,6 +615,7 @@ pub(crate) fn corruption_text(
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn diagnostic_text(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     value: impl fmt::Display,
@@ -620,6 +624,7 @@ pub(crate) fn diagnostic_text(
         "diagnostic", "prepare_diagnostic", "Raise the declared memory limit to report this operation.")
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn original_budget(
     original: &OwnedMemoryReservation,
 ) -> contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner> {
@@ -627,6 +632,7 @@ pub(crate) fn original_budget(
 }
 
 /// Adapt a borrowed diagnostic at its caller's existing receiver boundary.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn map_diagnostic(
     owner: contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner>,
     value: impl fmt::Display,

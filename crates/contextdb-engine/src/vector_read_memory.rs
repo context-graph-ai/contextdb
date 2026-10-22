@@ -106,10 +106,12 @@ pub(crate) fn admission_prepaid(
 }
 
 pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn request_budget(&self) -> Result<Arc<dyn ReadMemoryBudget>>;
 
     /// Existing host providers acquire their exact legacy capability once.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn request_budget_owner(&self) -> Result<RequestReadOwner> {
         self.request_budget().map(RequestReadOwner::legacy)
     }
@@ -119,6 +121,7 @@ pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
     /// owned diagnostic; the default keeps today's acquisition, so a Legacy
     /// provider still selects Legacy and refuses on its Legacy terms.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {
@@ -132,6 +135,7 @@ pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
 /// the engine neither wraps it in an Arc nor acquires a second request.
 #[doc(hidden)]
 pub trait NativeReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure>;
@@ -160,6 +164,7 @@ impl ReadRequestProvider {
     pub fn native(provider: Arc<dyn NativeReadRequestBudgetProvider>) -> Self {
         Self(ReadRequestProviderKind::Native(provider))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn request_budget(&self) -> Result<ReadMemoryOwner> {
         match &self.0 {
             ReadRequestProviderKind::Declared(parent) => parent.child(),
@@ -173,6 +178,7 @@ impl ReadRequestProvider {
         }
     }
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn request_budget_owner(&self) -> Result<RequestReadOwner> {
         match &self.0 {
             ReadRequestProviderKind::Declared(parent) => parent.request_budget_owner(),
@@ -182,6 +188,7 @@ impl ReadRequestProvider {
         }
     }
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn request_budget_owner_native(&self)
         -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {
         match &self.0 {
@@ -306,10 +313,12 @@ impl DeclaredReadMemory {
     }
     /// Admit every original root, including a standing parent, against its
     /// declared TOTAL limit before requesting the exact native allocation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn query_root(limit: u64) -> Result<QueryReadRoot> {
         Self::from_reader_limit(limit).map(|root| QueryReadRoot { root })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn from_reader_limit(limit: u64) -> Result<DeclaredReadRoot> {
         Self::try_from_reader_limit(limit).map_err(contextdb_core::Error::NativeEngineOther)
     }
@@ -403,6 +412,7 @@ impl DeclaredReadRoot {
         assert_eq!(root_observations::sample(token), (false, 0, 0));
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn acl_cache_budget(&self) -> Result<ReadMemoryOwner> {
         let bytes = ReadMemoryOwner::native_layout::<ReaderAclCacheBudget, ReaderAclCacheInvoice>().size();
         self.try_reserve_native(bytes, "reader_acl_cache", "budget_owner",
@@ -501,6 +511,7 @@ impl DeclaredReadRoot {
     }
 
     /// Existing public provider result remains unqualified at its Error terminal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn native_child_unqualified(&self) -> Result<NativeReadChildReceipt> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
@@ -533,6 +544,7 @@ impl DeclaredReadRoot {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn child(&self) -> Result<ReadMemoryOwner> {
         self.native_child_unqualified().map(NativeReadChildReceipt::into_owner)
     }
@@ -1077,10 +1089,12 @@ impl ReadMemoryBudget for DeclaredReadMemory {
     }
 }
 impl DeclaredReadRoot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn request_budget_owner(&self) -> Result<RequestReadOwner> {
         self.native_child_unqualified()
             .map(RequestReadOwner::native)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {

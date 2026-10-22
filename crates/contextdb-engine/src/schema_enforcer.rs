@@ -4,6 +4,7 @@ use contextdb_parser::ast::{Expr, Literal, UnaryOp};
 use contextdb_planner::PhysicalPlan;
 use std::collections::HashMap;
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn validate_dml(
     plan: &PhysicalPlan,
     db: &Database,
@@ -121,6 +122,7 @@ pub fn validate_dml(
 /// before staging the row. Expressions that need a row are deliberately
 /// rejected here with the destination column, rather than being reported as
 /// an unrelated unsupported-expression implementation detail.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn resolve_required_expr(
     expr: &Expr,
     params: &HashMap<String, Value>,

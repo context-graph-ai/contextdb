@@ -34,6 +34,7 @@ struct PaidMemory<'a> {
     context: &'a NativeReadOpenContext,
 }
 impl PaidMemory<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn checkpoint(&self) -> Selected<()> {
         if !self
             .operation
@@ -44,10 +45,12 @@ impl PaidMemory<'_> {
         }
         self.context.checkpoint().map_err(Failure::Unqualified)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn allocate(&self, len: usize) -> Selected<NativeBuffer> {
         self.checkpoint()?;
         NativeBuffer::allocate(&self.operation.owner(), len)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn input(&self, bytes: &NativeBuffer) -> Selected<()> {
         self.checkpoint()?;
         if !bytes.is_funded_by(&self.operation.owner()) {
@@ -85,6 +88,7 @@ impl DeliveryMemory for PaidMemory<'_> {
 /// Validate the original unsigned cursor tuple against the first incarnation read.
 /// Cursor tokens are namespace/position metadata, not signed outcome packets.
 #[allow(clippy::too_many_arguments)] // Explicit original namespace and custody capabilities.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn cursor_after(
     token: &NativeBuffer,
     tenant: &TenantId,
@@ -129,6 +133,7 @@ pub(crate) fn page_bound(
 /// Server tenant/hub and authenticated edge are already original-operation buffers.
 /// This consumes no Legacy request, record, JSON tree, provider or budget child.
 #[allow(clippy::too_many_arguments)] // Private paid buffers and original capabilities stay explicit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn paid_delivery_response(
     db: &crate::Database,
     identity: &crate::identity::FabricIdentity,
