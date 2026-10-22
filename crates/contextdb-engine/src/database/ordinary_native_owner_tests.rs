@@ -1176,21 +1176,34 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
     for file in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = if file {
-            Database::open_with_options(dir.path().join("retained-trace.db"), DatabaseOpenOptions {
-                maintenance_policy: MaintenancePolicy::CallerDriven,
-                memory_limit: Some(64 * 1024 * 1024),
-                ..Default::default()
-            }).unwrap()
-        } else { Database::open_memory() };
+            Database::open_with_options(
+                dir.path().join("retained-trace.db"),
+                DatabaseOpenOptions {
+                    maintenance_policy: MaintenancePolicy::CallerDriven,
+                    memory_limit: Some(64 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        } else {
+            Database::open_memory()
+        };
         // Match the original retained-trace fixture's schema, four rows, SQL,
         // binds, clock, and snapshot. Remove only its old setup trace before
         // this independent sample so unrelated retired owners cannot move it.
-        sql(&db, "CREATE TABLE unpartitioned_items (id INT PRIMARY KEY, v VECTOR(4)) HISTORY ALL");
+        sql(
+            &db,
+            "CREATE TABLE unpartitioned_items (id INT PRIMARY KEY, v VECTOR(4)) HISTORY ALL",
+        );
         for id in 0..4 {
-            db.execute("INSERT INTO unpartitioned_items VALUES ($id,$v)", &HashMap::from([
-                ("id".into(), Value::Int64(id)),
-                ("v".into(), Value::Vector(vec![1.0, id as f32, 0.0, 0.0])),
-            ])).unwrap();
+            db.execute(
+                "INSERT INTO unpartitioned_items VALUES ($id,$v)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("v".into(), Value::Vector(vec![1.0, id as f32, 0.0, 0.0])),
+                ]),
+            )
+            .unwrap();
         }
         let params = HashMap::from([("v".into(), Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]);
         let query = "SELECT id FROM unpartitioned_items ORDER BY v <=> $v USE VECTOR EXACT LIMIT 1";
@@ -1249,11 +1262,16 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             let mut found = None;
             for request in &allocations[..count.min(allocations.len())] {
                 if request.0 <= receipt.0 && receipt.0 < request.0.saturating_add(request.1) {
-                    assert!(found.replace(*request).is_none(), "one physical allocation per retained image");
+                    assert!(
+                        found.replace(*request).is_none(),
+                        "one physical allocation per retained image"
+                    );
                 }
             }
             let found = found.expect("the actual retained image was allocated before execution");
-            if receipt.1 != 0 { assert_eq!(receipt.1, found.1); }
+            if receipt.1 != 0 {
+                assert_eq!(receipt.1, found.1);
+            }
             found
         });
         let requests = [
@@ -1297,18 +1315,31 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             after, trace_due as u64,
             "remaining live child debit equals the complete captured trace invoice and control requests"
         );
-        let independent_answer_invoice = components[2] + components[3] + components[4]
-            + image_requests.iter().map(|request| request.1).sum::<usize>();
-        assert_eq!(before - after, independent_answer_invoice as u64,
-            "the released answer debit equals its payload invoices and independently captured physical controls");
+        let independent_answer_invoice = components[2]
+            + components[3]
+            + components[4]
+            + image_requests
+                .iter()
+                .map(|request| request.1)
+                .sum::<usize>();
+        assert_eq!(
+            before - after,
+            independent_answer_invoice as u64,
+            "the released answer debit equals its payload invoices and independently captured physical controls"
+        );
         let live = oracle::source_live_at_free_for_test(8);
-        let trace_payload = invoice.prepaid_bytes + invoice.prepaid_control_bytes
-            + invoice.additional_bytes + invoice.score_credit_bytes;
+        let trace_payload = invoice.prepaid_bytes
+            + invoice.prepaid_control_bytes
+            + invoice.additional_bytes
+            + invoice.score_credit_bytes;
         for slot in 5..8 {
             assert_eq!(frees[slot].2, 1);
             assert_eq!(frees[slot].0, frees[slot].1);
-            assert_eq!(frees[slot].0 as u64, sample.parent_before + live[slot] as u64 + trace_payload as u64,
-                "each answer control physically frees while its own actual request and the independent live trace remain paid");
+            assert_eq!(
+                frees[slot].0 as u64,
+                sample.parent_before + live[slot] as u64 + trace_payload as u64,
+                "each answer control physically frees while its own actual request and the independent live trace remain paid"
+            );
         }
         assert!(
             frees[..5].iter().all(|free| free.2 == 0),

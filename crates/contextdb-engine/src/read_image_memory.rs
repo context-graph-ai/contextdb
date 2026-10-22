@@ -1603,10 +1603,22 @@ impl QueryAnswerCharge {
     pub(crate) fn control_receipts_for_test(&self) -> [(usize, usize, usize); 2] {
         match self {
             Self::Image(charge) => [
-                (&**charge as *const QueryImageCharge as usize,
-                 charge.credit().bytes(), charge.credit().original_payer_identity_for_test()),
-                (&*charge.image.value as *const ImageMemory as usize, 0,
-                 charge.image.value.reader_budget.as_ref().unwrap().accounting_identity()),
+                (
+                    &**charge as *const QueryImageCharge as usize,
+                    charge.credit().bytes(),
+                    charge.credit().original_payer_identity_for_test(),
+                ),
+                (
+                    &*charge.image.value as *const ImageMemory as usize,
+                    0,
+                    charge
+                        .image
+                        .value
+                        .reader_budget
+                        .as_ref()
+                        .unwrap()
+                        .accounting_identity(),
+                ),
             ],
             _ => [(0, 0, 0); 2],
         }
