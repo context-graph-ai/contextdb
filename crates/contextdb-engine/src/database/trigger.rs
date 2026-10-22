@@ -52,7 +52,7 @@ pub(crate) struct TriggerState {
     staged_ddl_for_persistence: Mutex<HashMap<Lsn, StagedTriggerDdlCommit>>,
     native_staged_ddl: Mutex<Option<event_bus::OwnedEventShared<OriginalTriggerDdlStage>>>,
     native_callbacks: Mutex<Option<OriginalCallbackLink>>,
-    callback_owner_threads: Mutex<HashMap<thread::ThreadId, usize>>,
+    callback_owner_threads: Mutex<HashMap<crate::owned_worker::CurrentThreadId, usize>>,
     callback_active_txs: Mutex<HashMap<TxId, usize>>,
     active_trigger_names: Mutex<Vec<String>>,
     pub(super) wait_lock: Mutex<()>,
@@ -220,7 +220,7 @@ struct OriginalCallbackLink {
     _memory: OwnedMemoryReservation,
 }
 struct OriginalCallbackNode {
-    owner: thread::ThreadId,
+    owner: crate::owned_worker::CurrentThreadId,
     tx: TxId,
     name: String,
     visible_name: bool,
@@ -233,13 +233,15 @@ impl OriginalCallbackLink {
 pub(super) struct TriggerCallbackThreadGuard {
     native_id: Option<usize>,
     trigger: Arc<TriggerState>,
-    owner: thread::ThreadId,
+    owner: crate::owned_worker::CurrentThreadId,
     tx: TxId,
     trigger_name: String,
 }
 
-fn global_trigger_callback_owner_threads() -> &'static Mutex<HashMap<thread::ThreadId, usize>> {
-    static OWNERS: OnceLock<Mutex<HashMap<thread::ThreadId, usize>>> = OnceLock::new();
+fn global_trigger_callback_owner_threads()
+-> &'static Mutex<HashMap<crate::owned_worker::CurrentThreadId, usize>> {
+    static OWNERS: OnceLock<Mutex<HashMap<crate::owned_worker::CurrentThreadId, usize>>> =
+        OnceLock::new();
     OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -280,7 +282,10 @@ impl TriggerState {
         }
     }
 
-    pub(super) fn callback_active_on_other_thread(&self, _target_owner: thread::ThreadId) -> bool {
+    pub(super) fn callback_active_on_other_thread(
+        &self,
+        _target_owner: crate::owned_worker::CurrentThreadId,
+    ) -> bool {
         // Local SQL/write-helper gates are scoped to this TriggerState. The
         // process-wide owner map is handled by explicit tx-control and DML
         // gates, so unrelated database instances can still run DDL while
@@ -288,7 +293,7 @@ impl TriggerState {
         if self.callback_active_count.load(Ordering::SeqCst) == 0 {
             return false;
         }
-        let current = thread::current().id();
+        let current = crate::owned_worker::current_thread_id();
         let owners = self.callback_owner_threads.lock();
         let native = self.native_callbacks.lock();
         let mut cursor = native.as_ref();
@@ -304,7 +309,7 @@ impl TriggerState {
 
     pub(super) fn callback_contention_for_tx_control(
         &self,
-        target_owner: thread::ThreadId,
+        target_owner: crate::owned_worker::CurrentThreadId,
         include_owner_thread_global: bool,
     ) -> TriggerContention {
         // Trigger Class B contention is scoped to this TriggerState. A process
@@ -313,7 +318,7 @@ impl TriggerState {
         // both handles live in the same process.
         let _ = (target_owner, include_owner_thread_global);
         if self.callback_active_count.load(Ordering::SeqCst) > 0 {
-            let current_id = thread::current().id();
+            let current_id = crate::owned_worker::current_thread_id();
             let owners = self.callback_owner_threads.lock();
             let native = self.native_callbacks.lock();
             let mut cursor = native.as_ref();
@@ -384,7 +389,7 @@ impl TriggerState {
         let memory = crate::memory_accounting::reserve_preparation_from_original(original, bytes,
             "trigger", "callback_registration", "Raise MEMORY_LIMIT to retain this callback registration.")?;
         let name = crate::memory_accounting::preparation_copy_string(trigger_name)?;
-        let owner = thread::current().id();
+        let owner = crate::owned_worker::current_thread_id();
         let mut link = OriginalCallbackLink { node: Box::new(OriginalCallbackNode {
             owner, tx, name, visible_name: true, next: None,
         }), _memory: memory };
@@ -408,7 +413,7 @@ impl TriggerState {
         trigger_name: &str,
         tx: TxId,
     ) -> TriggerCallbackThreadGuard {
-        let owner = thread::current().id();
+        let owner = crate::owned_worker::current_thread_id();
         *global_trigger_callback_owner_threads()
             .lock()
             .entry(owner)

@@ -19,7 +19,7 @@ pub(super) struct CronState {
     waiters: Condvar,
     dispatch_lock: Mutex<()>,
     running_schedules: Mutex<HashSet<String>>,
-    callback_owner_threads: Mutex<HashMap<thread::ThreadId, usize>>,
+    callback_owner_threads: Mutex<HashMap<crate::owned_worker::CurrentThreadId, usize>>,
     callback_active_count: AtomicUsize,
     pause_count: AtomicU64,
     schedule_count: AtomicU64,
@@ -70,7 +70,7 @@ struct ReservedCronRun {
 
 struct CronCallbackThreadGuard<'a> {
     cron: &'a CronState,
-    owner: thread::ThreadId,
+    owner: crate::owned_worker::CurrentThreadId,
 }
 
 impl CronState {
@@ -98,7 +98,7 @@ impl CronState {
         if self.callback_active_count.load(Ordering::SeqCst) == 0 {
             return false;
         }
-        let current = thread::current().id();
+        let current = crate::owned_worker::current_thread_id();
         let owners = self.callback_owner_threads.lock();
         !owners.is_empty() && !owners.contains_key(&current)
     }
@@ -108,7 +108,7 @@ impl CronState {
     }
 
     fn enter_callback_thread_scope(&self) -> CronCallbackThreadGuard<'_> {
-        let owner = thread::current().id();
+        let owner = crate::owned_worker::current_thread_id();
         *self.callback_owner_threads.lock().entry(owner).or_default() += 1;
         global_callback_active_count().fetch_add(1, Ordering::SeqCst);
         self.callback_active_count.fetch_add(1, Ordering::SeqCst);

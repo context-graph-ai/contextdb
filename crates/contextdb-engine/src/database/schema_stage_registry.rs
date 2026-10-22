@@ -2232,7 +2232,7 @@ struct Pre2Database {
     /// visible to the reader the moment it happens.
     origin_session_tx: Option<Arc<Mutex<Option<TxId>>>>,
     instance_id: uuid::Uuid,
-    owner_thread: thread::ThreadId,
+    owner_thread: crate::owned_worker::CurrentThreadId,
     plugin: Arc<dyn DatabasePlugin>,
     owner_read_config: Arc<OwnerReadConfig>,
     declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,

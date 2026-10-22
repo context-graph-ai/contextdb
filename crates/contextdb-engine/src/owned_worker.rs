@@ -34,10 +34,100 @@ mod native {
             }
         }
     }
+    struct FinishNode {
+        next: *mut FinishNode,
+        worker: Option<OwnedWorker>,
+        cleanup: Option<crate::database::event_bus::EventBusResourceCleanup>,
+    }
+    // The queue lock exclusively owns linked nodes; the worker's creator
+    // count keeps the node alive through the external join.
+    struct FinishQueue {
+        head: *mut FinishNode,
+        tail: *mut FinishNode,
+    }
+    unsafe impl Send for FinishQueue {}
+    static FINISH_QUEUE: (Mutex<FinishQueue>, std::sync::Condvar) = (
+        Mutex::new(FinishQueue {
+            head: std::ptr::null_mut(),
+            tail: std::ptr::null_mut(),
+        }),
+        std::sync::Condvar::new(),
+    );
+    static FINISHER: Mutex<Option<OwnedWorker>> = Mutex::new(None);
+
+    #[derive(Debug)]
+    struct ProcessResidue;
+    struct ResidueInvoice(usize);
+    impl Drop for ResidueInvoice {
+        fn drop(&mut self) {
+            crate::memory_accounting::refund_open_residue(self.0);
+        }
+    }
+    impl contextdb_core::read_memory::ReadMemoryBudget for ProcessResidue {
+        fn try_reserve(
+            &self,
+            bytes: usize,
+            _: &'static str,
+            operation: &'static str,
+            _: &'static str,
+        ) -> Result<()> {
+            crate::memory_accounting::admit_open_residue(bytes, operation)
+        }
+        fn release(&self, bytes: usize) {
+            crate::memory_accounting::refund_open_residue(bytes);
+        }
+    }
+    pub(crate) fn ensure_finisher() -> Result<()> {
+        let mut finisher = FINISHER.lock().unwrap_or_else(|p| p.into_inner());
+        if finisher.is_some() {
+            return Ok(());
+        }
+        let bytes = ReadMemoryOwner::native_layout::<ProcessResidue, ResidueInvoice>().size();
+        crate::memory_accounting::admit_open_residue(bytes, "worker_finisher_owner")?;
+        let owner = ReadMemoryOwner::try_native(ProcessResidue, ResidueInvoice(bytes))?;
+        // The static retains this original worker, including all invoices,
+        // for the process lifetime. It is never described as refunded.
+        *finisher = Some(OwnedWorker::spawn(owner, finish_loop)?);
+        Ok(())
+    }
+    fn finish_loop() {
+        loop {
+            let (mut worker, cleanup) = {
+                let mut queue = FINISH_QUEUE.0.lock().unwrap_or_else(|p| p.into_inner());
+                while queue.head.is_null() {
+                    queue = FINISH_QUEUE
+                        .1
+                        .wait(queue)
+                        .unwrap_or_else(|p| p.into_inner());
+                }
+                // Node storage belongs to the original prepaid body and cannot
+                // be freed until this worker's join below releases its count.
+                let node = unsafe { &mut *queue.head };
+                queue.head = node.next;
+                if queue.head.is_null() {
+                    queue.tail = std::ptr::null_mut();
+                }
+                (
+                    node.worker.take().expect("published worker"),
+                    node.cleanup.take(),
+                )
+            };
+            let _ = worker.finish();
+            drop(worker);
+            // Both original control and stack are now physically free and
+            // refunded. Only now may close/reopen observe completion.
+            if let Some(cleanup) = cleanup {
+                cleanup.complete();
+            }
+        }
+    }
     struct Body<F> {
+        finish: std::cell::UnsafeCell<FinishNode>,
         run: Mutex<Option<F>>,
         panicked: std::sync::atomic::AtomicBool,
     }
+    unsafe impl<F: Send> Sync for Body<F> {}
+    unsafe impl<F: Send> Send for Body<F> {}
     extern "C" fn enter<F: FnOnce() + Send + 'static>(pointer: *mut c_void) -> *mut c_void {
         // The creator transferred exactly this thread's strong count.
         let body = unsafe { ReadShared::<Body<F>>::from_raw(pointer.cast()) };
@@ -66,6 +156,7 @@ mod native {
         body: *const c_void,
         release_body: unsafe fn(*const c_void) -> bool,
         stack: Option<Stack>,
+        finish_node: *mut FinishNode,
     }
     unsafe impl Send for OwnedWorker {}
     impl std::fmt::Debug for OwnedWorker {
@@ -104,6 +195,11 @@ mod native {
             )?;
             let body = ReadShared::try_from_prepaid(
                 Body {
+                    finish: std::cell::UnsafeCell::new(FinishNode {
+                        next: std::ptr::null_mut(),
+                        worker: None,
+                        cleanup: None,
+                    }),
                     run: Mutex::new(Some(run)),
                     panicked: std::sync::atomic::AtomicBool::new(false),
                 },
@@ -174,14 +270,57 @@ mod native {
                 drop(unsafe { ReadShared::<Body<F>>::from_raw(thread_body) });
                 return Err(os_error(code));
             }
+            let finish_node = body.finish.get();
             Ok(Self {
                 thread: Some(unsafe { thread.assume_init() }),
                 body: body.into_raw().cast(),
                 release_body: release_body::<F>,
                 stack: Some(stack),
+                finish_node,
             })
         }
+        pub(crate) fn is_current(&self) -> bool {
+            self.thread.is_some_and(|thread| unsafe {
+                libc::pthread_equal(thread, libc::pthread_self()) != 0
+            })
+        }
+        pub(crate) fn defer_cleanup(
+            mut self,
+            cleanup: crate::database::event_bus::EventBusResourceCleanup,
+        ) {
+            // This handle uniquely owns its node until queue publication.
+            unsafe {
+                (*self.finish_node).cleanup = Some(cleanup);
+            }
+            self.handoff();
+        }
+        fn handoff(&mut self) {
+            let mut queue = FINISH_QUEUE.0.lock().unwrap_or_else(|p| p.into_inner());
+            let worker = Self {
+                thread: self.thread.take(),
+                body: self.body,
+                release_body: self.release_body,
+                stack: self.stack.take(),
+                finish_node: self.finish_node,
+            };
+            unsafe {
+                let node = &mut *self.finish_node;
+                node.worker = Some(worker);
+                node.next = std::ptr::null_mut();
+                if queue.tail.is_null() {
+                    queue.head = self.finish_node;
+                } else {
+                    (*queue.tail).next = self.finish_node;
+                }
+                queue.tail = self.finish_node;
+            }
+            FINISH_QUEUE.1.notify_one();
+        }
         fn finish(&mut self) -> std::result::Result<(), ()> {
+            if self.is_current() {
+                self.handoff();
+                return Ok(());
+            }
             let Some(thread) = self.thread.take() else {
                 return Ok(());
             };
@@ -347,7 +486,49 @@ impl OwnedWorker {
                 ))
             })
     }
+    pub(crate) fn is_current(&self) -> bool {
+        self.0.thread().id() == std::thread::current().id()
+    }
     pub(crate) fn join(self) -> std::result::Result<(), ()> {
         self.0.join().map_err(|_| ())
+    }
+}
+#[cfg(target_os = "linux")]
+pub(crate) use native::ensure_finisher;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CurrentThreadId(u64);
+#[cfg(target_os = "linux")]
+static NEXT_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[cfg(target_os = "linux")]
+thread_local! {
+    // Drop-free static TLS is inside each owned worker's paid supplied-stack
+    // extent. No Rust Thread handle or heap-backed TLS is materialized.
+    static THREAD_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) type CurrentThreadId = std::thread::ThreadId;
+pub(crate) fn current_thread_id() -> CurrentThreadId {
+    #[cfg(target_os = "linux")]
+    {
+        THREAD_ID.with(|id| {
+            let mut value = id.get();
+            if value == 0 {
+                value = NEXT_THREAD_ID
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |next| next.checked_add(1),
+                    )
+                    .expect("thread identity exhausted");
+                id.set(value);
+            }
+            CurrentThreadId(value)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::thread::current().id()
     }
 }

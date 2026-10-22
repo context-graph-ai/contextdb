@@ -850,7 +850,7 @@ struct SinkMetricsState {
 #[derive(Debug)]
 struct SinkRuntime {
     shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<crate::owned_worker::OwnedWorker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -865,7 +865,8 @@ impl EventBusThreadShutdown {
     }
 }
 
-struct EventBusResourceCleanup {
+pub(crate) struct EventBusResourceCleanup {
+    worker: Option<crate::owned_worker::OwnedWorker>,
     sink: String,
     persistence: Option<Arc<RedbPersistence>>,
     open_registry_path: Option<PathBuf>,
@@ -877,7 +878,7 @@ struct EventBusResourceCleanup {
 }
 
 impl EventBusResourceCleanup {
-    fn close(self) {
+    fn close(mut self) {
         if self.publish_quiescence
             && let Some(persistence) = &self.persistence
         {
@@ -894,9 +895,20 @@ impl EventBusResourceCleanup {
                 );
             }
         }
-        if let Some(persistence) = self.persistence {
+        if let Some(persistence) = self.persistence.take() {
             persistence.close();
         }
+        #[cfg(target_os = "linux")]
+        if let Some(worker) = self.worker.take() {
+            // The sink key was admitted by the runtime map, whose owner is
+            // released with the dispatcher body. Free it before that boundary.
+            drop(std::mem::take(&mut self.sink));
+            worker.defer_cleanup(self);
+            return;
+        }
+        self.complete();
+    }
+    pub(crate) fn complete(self) {
         if let Some(path) = self.open_registry_path {
             release_open_registry_path(&path);
         }
@@ -2820,7 +2832,6 @@ impl Database {
         if !self.resource_owner {
             return EventBusThreadShutdown::AllJoined;
         }
-        let current_thread_id = thread::current().id();
         let runtimes = {
             let mut runtimes = self.event_bus.runtimes.lock();
             for runtime in runtimes.values() {
@@ -2834,7 +2845,7 @@ impl Database {
             let is_current_thread = runtime
                 .handle
                 .as_ref()
-                .is_some_and(|handle| handle.thread().id() == current_thread_id);
+                .is_some_and(|handle| handle.is_current());
             if is_current_thread {
                 current_dispatcher = runtime.handle.take().map(|handle| (sink, handle));
                 continue;
@@ -2848,18 +2859,23 @@ impl Database {
             self.event_bus.close_dispatcher_queue_writes();
         }
         if let Some((sink, handle)) = current_dispatcher {
-            drop(handle);
-            self.defer_current_dispatcher_resource_cleanup(sink, dispatcher_acknowledges);
+            self.defer_current_dispatcher_resource_cleanup(sink, dispatcher_acknowledges, handle);
             return EventBusThreadShutdown::DeferredResourceCleanup;
         }
         EventBusThreadShutdown::AllJoined
     }
 
-    fn defer_current_dispatcher_resource_cleanup(&self, sink: String, publish_quiescence: bool) {
+    fn defer_current_dispatcher_resource_cleanup(
+        &self,
+        sink: String,
+        publish_quiescence: bool,
+        worker: crate::owned_worker::OwnedWorker,
+    ) {
         // A callback-initiated close leaves its event queued for reopen; a
         // callback-initiated drop records the delivery first. Either way the
         // dispatcher owns the persistence resource until it exits.
         let cleanup = EventBusResourceCleanup {
+            worker: Some(worker),
             sink,
             persistence: self.persistence.clone(),
             open_registry_path: self.open_registry_path.lock().take(),
@@ -2891,7 +2907,11 @@ impl Database {
     }
 
     fn ensure_sink_dispatcher_running(&self, sink: &str) -> Result<()> {
-        if self.event_bus.runtimes.lock().contains_key(sink) { return Ok(()); }
+        #[cfg(target_os = "linux")]
+        crate::owned_worker::ensure_finisher()?;
+        if self.event_bus.runtimes.lock().contains_key(sink) {
+            return Ok(());
+        }
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             return handle.with_host(|host| {
                 // Admission/copy happens before the runtime-map guard. Both
@@ -2933,7 +2953,10 @@ impl Database {
         crate::read_probe::note_event_delivery_start();
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_background_worker_start();
-        let handle = thread::spawn(move || worker.dispatch_loop(thread_shutdown));
+        let handle = crate::owned_worker::OwnedWorker::spawn(
+            self.finalization.accountant.read_budget()?,
+            move || worker.dispatch_loop(thread_shutdown),
+        )?;
         runtimes.insert(
             sink.to_string(),
             SinkRuntime {
@@ -7649,7 +7672,8 @@ impl Database {
             crate::read_probe::note_event_delivery_start();
             #[cfg(any(test, feature = "test-seams"))]
             crate::read_probe::note_background_worker_start();
-            let handle = thread::spawn(move || worker.dispatch_loop(thread_shutdown));
+            let handle = crate::owned_worker::OwnedWorker::spawn(
+            self.finalization.accountant.read_budget()?, move || worker.dispatch_loop(thread_shutdown))?;
             if let Some(count) = starts.get_mut(sink) { *count += 1; }
             else { starts.insert(launch.start_key.take().expect("paid native start key"), 1); }
             runtimes.insert(launch.key.take().expect("paid native runtime key"),

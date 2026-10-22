@@ -291,7 +291,7 @@ pub(crate) fn emit_vector_search_receipt(
         "candidates": candidates,
         "elapsed_us": elapsed_us,
         "pid": std::process::id(),
-        "thread_id": format!("{:?}", std::thread::current().id()),
+        "thread_id": format!("{:?}", crate::owned_worker::current_thread_id()),
     });
     if let Err(error) = append_receipt(&path, &line) {
         tracing::warn!(%error, "cannot append vector search test receipt");
