@@ -118,6 +118,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
     /// Authenticate one serving selection on this operation's physical root.
     /// No default is permitted: every supplier must bind its root explicitly.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_serving_selection(
         &self,
         snapshot: SnapshotId,
@@ -129,6 +130,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// Private streaming capture can account every metadata window. Ordinary
     /// suppliers preserve their existing constant-size capture unchanged.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_serving_selection_with_work(
         &self, snapshot: SnapshotId, frozen_base: Option<&VectorGraphGeneration>,
         frozen_change: Option<&VectorGraphGeneration>, owner: &mut super::VectorCopyAdmission,
@@ -139,6 +141,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
     /// Rebind a live writer source after its durable index keys are renamed.
     /// Captured cursors retain their original source and root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
@@ -158,6 +161,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// after a durable removal the store did not publish itself (retention,
     /// version cleanup, purge). A source pinned to one root returns its
     /// published summary.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn current_summary(
         &self,
         owner: &mut super::VectorCopyAdmission,
@@ -171,6 +175,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// number of indexed lookups per snapshot and no membership-record read.
     /// `None` means this source keeps no such index; the caller then streams
     /// the directory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn occupancy_visible_at_any(
         &self,
         snapshots: &[SnapshotId],
@@ -183,6 +188,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// Count visible intervals against the same root used by `open` and point
     /// probes. Older frontiers use indexed durable interval work. Verify every
     /// membership record used, including checksum and partition identity.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_count(
         &self,
         snapshot: SnapshotId,
@@ -194,6 +200,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
         false
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn select_visible_by_row(
         &self,
         row: RowId,
@@ -206,6 +213,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
             "this membership source has no root-bound selection".into()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn select_identity_by_row_lsn(
         &self,
         row: RowId,
@@ -218,6 +226,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
             "this membership source has no root-bound selection".into()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_by_row(
         &self,
         row: RowId,
@@ -228,6 +237,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
     /// Borrowed native reservation seam. Providers with already funded
     /// copies keep their existing visible lookup through this default.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_by_row_with_copy_admission(
         &self,
         row: RowId,
@@ -239,6 +249,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
         self.visible_by_row(row, snapshot, before_read, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn contains_row_lsn(
         &self,
         row: RowId,
@@ -250,6 +261,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// Resolve the exact retained row version within this partition's row
     /// prefix. Absence is authenticated by the pinned root; this must not
     /// scan unrelated rows or reconstruct a resident directory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn identity_by_row_lsn(
         &self,
         row: RowId,
@@ -266,6 +278,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
     /// Fixed durable metadata for the published serving frontier. No journal,
     /// directory or body reads are permitted; failure must reach inspection.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_counts(
         &self,
         covered: Option<TxId>,
@@ -278,6 +291,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// Return counts and catalog metadata from one authorized operation root.
     /// When installation was refused, count against the actual serving frontier.
     /// Sources without a durable catalog keep the resident path.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn inspection_snapshot(
         &self,
         serving_covered: Option<TxId>,
@@ -291,6 +305,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// after it, counted from a durable LSN-ordered change suffix without
     /// reading the covered memberships. `None` when this source keeps no such
     /// suffix.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_after(
         &self,
         covered_lsn: Lsn,
@@ -302,6 +317,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
     /// Visit every membership change after `after_lsn` in LSN order.
     /// `Ok(false)` when this source keeps no such suffix.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_suffix(
         &self,
         after_lsn: Lsn,
@@ -314,6 +330,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
 
     /// Visit every retained version of one row in this partition, as body
     /// identities, reading only that row's prefix.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_row_versions(
         &self,
         row: RowId,
@@ -327,6 +344,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     }
 
     /// Every membership's body identity, in durable key order.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_identities(
         &self,
         before_read: &mut dyn FnMut() -> bool,
@@ -343,6 +361,7 @@ pub trait RawVectorMembershipSource: Send + Sync {
     /// reservation until the cursor drops; the implementation must not also
     /// charge or release it through the memory accountant. Open errors drop
     /// their allocations before returning so the caller can release charges.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open(
         &self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
@@ -363,6 +382,7 @@ pub trait RawVectorMembershipCursor: Send {
     /// statement snapshot so physical work and cancellation stay observable.
     /// `None` is terminal. An error must leave the last successful position
     /// unchanged, allowing a suspended statement to resume the same record.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
@@ -370,6 +390,7 @@ pub trait RawVectorMembershipCursor: Send {
 
     /// Return the visibility interval and its authenticated body identity.
     /// A row-only publication can start later than the unchanged vector body.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_with_body_identity(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
@@ -413,6 +434,7 @@ pub trait RawVectorReverseMembershipSource: Send + Sync {
 
     /// Rebind a live writer source after its durable index keys are renamed.
     /// Captured cursors retain their original source and root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
@@ -426,6 +448,7 @@ pub trait RawVectorReverseMembershipSource: Send + Sync {
 
     /// Resolve a point route with the executing copy owner. Admit route scratch
     /// before allocating it; the caller retains the charge until the key dies.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_partition_admitted(
         &self,
         row: RowId,
@@ -436,6 +459,7 @@ pub trait RawVectorReverseMembershipSource: Send + Sync {
 
     /// Stream only this row's retained partition identities, current first.
     /// No population-sized row/partition projection may be retained.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_row(
         &self,
         row: RowId,
@@ -446,6 +470,7 @@ pub trait RawVectorReverseMembershipSource: Send + Sync {
 
 #[doc(hidden)]
 pub trait RawVectorReverseMembershipCursor: Send {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next(
         &mut self,
         before_read: &mut dyn FnMut() -> bool,
@@ -491,6 +516,7 @@ pub trait RawVectorMembershipFactory: Send + Sync {
         false
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         before_read: &mut dyn FnMut() -> bool,
@@ -512,6 +538,7 @@ struct LazyMembershipSlot {
     epoch: u64,
 }
 impl LazyRawVectorMembershipSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(
         summary: RawVectorMembershipSummary,
         factory: std::sync::Arc<dyn RawVectorMembershipFactory>,
@@ -526,6 +553,7 @@ impl LazyRawVectorMembershipSource {
             source: parking_lot::Mutex::new(LazyMembershipSlot::default()),
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn resolve(
         &self,
         before_read: &mut dyn FnMut() -> bool,

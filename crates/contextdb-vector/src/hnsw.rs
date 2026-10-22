@@ -157,6 +157,7 @@ enum HnswInner {
 /// return only the requested graph-envelope range; callers charge the result
 /// as query scratch before it becomes resident.
 pub trait ReadOnlyVectorGraphPageSource: Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reader(&self) -> Result<Box<dyn ReadOnlyVectorGraphPageReader>>;
 
     /// Bytes in one independently authenticated source-page body. The serving
@@ -183,6 +184,7 @@ pub trait ReadOnlyVectorGraphPageSource: Send + Sync {
 /// bounded cursor resumes on another thread, so a page reader moves between
 /// threads with its cursor.
 pub trait ReadOnlyVectorGraphPageReader: Send {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_range(&mut self, offset: usize, len: usize) -> Result<Vec<u8>>;
 }
 
@@ -2424,6 +2426,7 @@ fn set_allocation_bytes<T>(capacity: usize) -> usize {
 
 /// Shared physical bucket/control sizing for scratch sets and row-verdict maps.
 /// Refuse unrepresentable allocation geometry before asking an allocator.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn checked_hash_allocation_bytes<T>(capacity: usize) -> Result<usize> {
     const GROUP_BYTES: usize = 16;
     let overflow = || Error::Other(("bounded HNSW hash allocation size overflow".to_string()).into());
@@ -3700,6 +3703,7 @@ impl HnswIndex {
             _ => None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn publish_paged_tail_root(
         &self,
         previous: &Arc<paged_builder::PagedVectorTail>,
@@ -3718,6 +3722,7 @@ impl HnswIndex {
     }
     /// Row persistence commits its pages before swapping this small root
     /// pointer. Searches already holding the preceding Arc keep their view.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn append_paged_tail(
         &self,
         entries: &[VectorEntry],
@@ -3754,6 +3759,7 @@ impl HnswIndex {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn from_vector_entries_with_progress(
         entries: &[VectorEntry],
         dimension: usize,
@@ -3780,6 +3786,7 @@ impl HnswIndex {
         Self::new_with_policy(entries, dimension, quantization, policy)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new_with_policy(
         entries: &[StoredVectorEntry],
         dimension: usize,
@@ -3790,6 +3797,7 @@ impl HnswIndex {
             .expect("infallible graph progress callback")
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new_with_policy_and_progress(
         entries: &[StoredVectorEntry],
         dimension: usize,
@@ -3811,6 +3819,7 @@ impl HnswIndex {
     /// Maintenance-only borrowed insertion pool. The caller admits the worker
     /// bound before source materialization and holds it through every join.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn from_vector_entries_with_parallel_progress(
         entries: &[VectorEntry],
         dimension: usize,
@@ -3932,6 +3941,7 @@ impl HnswIndex {
     /// process-lifetime owner separately admits the requested native stacks
     /// and the measured stack-cache/arena/TLS runtime retention.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn parallel_insertion_extra_bytes(
         points: usize,
         policy: crate::store::ResolvedVectorPolicy,
@@ -3969,6 +3979,7 @@ impl HnswIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new_with_policy_and_workers(
         entries: &[StoredVectorEntry],
         dimension: usize,
@@ -4295,6 +4306,7 @@ impl HnswIndex {
     /// the native page codec. Links and data ids are exported unchanged; this
     /// performs no insertion or graph search. The caller admits the retained
     /// graph, borrowed row directory and transaction workspace before calling.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn export_resident_paged_batch(
         &self,
         rows: &[&VectorEntry],
@@ -4304,6 +4316,7 @@ impl HnswIndex {
     ) -> Result<paged_builder::PagedVectorProgress> {
         use paged_builder::{PagedEdge, PagedVectorIdentity, PagedVectorPhase, PagedVectorPoint};
         #[allow(clippy::too_many_arguments)]
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn export<T: Clone + Send + Sync>(
             points: &hnsw_rs::hnsw::PointIndexation<'_, T>,
             id_to_row: &HashMap<usize, RowId>,
@@ -4548,6 +4561,7 @@ impl HnswIndex {
 
     /// Validate and encode an insertion without changing the fresh graph.
     /// The caller admits and retains this work until transaction publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_insert(
         &self,
         entry: &StoredVectorEntry,
@@ -4707,6 +4721,7 @@ impl HnswIndex {
     }
 
     #[allow(dead_code)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert(&self, entry: &StoredVectorEntry) -> Result<()> {
         let prepared = self.prepare_insert(entry, 1)?;
         self.publish_insert(prepared);
@@ -4719,6 +4734,7 @@ impl HnswIndex {
     /// neighbour record is 8 + 1 + 4 + 4 bytes. Exact keys use the stored representation.
     /// This bounds encoded bytes, not construction scratch or resident maps.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn durable_generation_capacity_bound(
         count: usize,
         dimension: usize,
@@ -4757,6 +4773,7 @@ impl HnswIndex {
 
     /// Refine the codec bound using the completed builder's actual edges and
     /// exact-key lists, without materializing a generation-sized payload.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_generation_encoding_capacity(&self) -> Result<usize> {
         let overflow =
             || Error::Other("durable HNSW codec capacity exceeds the process range".into());
@@ -4821,6 +4838,7 @@ impl HnswIndex {
     /// with the row and exact-vector maps, so loading never scans the vector
     /// store or rebuilds a graph.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn encode_durable_generation(&self) -> Result<Vec<u8>> {
         // One buffer owns the envelope, graph and maps. Backfill the length
         // and checksum after appending their bytes; never retain separate
@@ -4927,6 +4945,7 @@ impl HnswIndex {
     /// provide the column definition it is loading for; incompatible
     /// dimension or quantization is refused before a graph is exposed.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn decode_durable_generation(
         bytes: &[u8],
         expected_dimension: usize,
@@ -5137,6 +5156,7 @@ impl HnswIndex {
     /// Read the allocation bound from the existing envelope without decoding
     /// or retaining points. Old catalogs may contain an earlier charge formula.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn durable_resident_bound(
         bytes: &[u8],
         dimension: usize,
@@ -5191,6 +5211,7 @@ impl HnswIndex {
     /// row mappings, the serving cache and its slot directory, and a fixed
     /// allowance for the layer headers and small state around them.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn durable_reader_resident_bound(
         bytes: &[u8],
         dimension: usize,
@@ -5270,6 +5291,7 @@ impl HnswIndex {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn durable_reader_resident_bound_for_cache(
         bytes: &[u8],
         dimension: usize,
@@ -5347,6 +5369,7 @@ impl HnswIndex {
     /// here exactly as the decode refuses it, so the declared degree bounds
     /// every list, and a graph that uses fewer links than its degree allows is
     /// charged only for the links it has.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_reader_points_resident(topology: &mut DurableReader<'_>, m: usize) -> Result<usize> {
         let overflow = || Error::Other(("durable HNSW point residency overflow".to_string()).into());
         let _ef_construction = topology.read_usize()?;
@@ -5403,6 +5426,7 @@ impl HnswIndex {
     /// Decode immutable topology while retaining point values in the saved
     /// generation. `source` addresses byte ranges within this envelope.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn decode_paged_durable_generation(
         bytes: &[u8],
         source: Arc<dyn ReadOnlyVectorGraphPageSource>,
@@ -5429,6 +5453,7 @@ impl HnswIndex {
     /// could catch nothing the first did not, so it is not repeated; every
     /// length and cross-reference is still checked.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn decode_paged_authenticated_generation(
         bytes: &[u8],
         source: Arc<dyn ReadOnlyVectorGraphPageSource>,
@@ -5448,6 +5473,7 @@ impl HnswIndex {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode_paged_generation(
         bytes: &[u8],
         source: Arc<dyn ReadOnlyVectorGraphPageSource>,
@@ -6062,6 +6088,7 @@ impl HnswIndex {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn search(
         &self,
         index: &VectorIndexRef,
@@ -6071,6 +6098,7 @@ impl HnswIndex {
         self.search_with_ef_search(index, query, k, self.ef_search)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn search_with_ef_search(
         &self,
         index: &VectorIndexRef,
@@ -7910,6 +7938,7 @@ impl HnswIndex {
         }
     }
     #[cfg(any(test, feature = "test-seams"))]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_topology_digest_with_owner_for_test(
         &self, owner: &mut crate::VectorCopyAdmission,
     ) -> Result<u64> {
@@ -7991,6 +8020,7 @@ fn quantization_tag(quantization: VectorQuantization) -> u8 {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn quantization_from_tag(tag: u8) -> Result<VectorQuantization> {
     match tag {
         0 => Ok(VectorQuantization::F32),
@@ -8037,6 +8067,7 @@ fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     let length = u64::try_from(value.len())
         .map_err(|_| Error::Other(("durable HNSW byte length exceeds u64".to_string()).into()))?;
@@ -8055,6 +8086,7 @@ impl<'a> DurableReader<'a> {
         Self { bytes, position: 0 }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_exact(&mut self, length: usize) -> Result<&'a [u8]> {
         let end = self
             .position
@@ -8068,10 +8100,12 @@ impl<'a> DurableReader<'a> {
         Ok(value)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_u8(&mut self) -> Result<u8> {
         Ok(self.read_exact(1)?[0])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_u16(&mut self) -> Result<u16> {
         let bytes: [u8; 2] = self
             .read_exact(2)?
@@ -8080,6 +8114,7 @@ impl<'a> DurableReader<'a> {
         Ok(u16::from_le_bytes(bytes))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_u32(&mut self) -> Result<u32> {
         let bytes: [u8; 4] = self
             .read_exact(4)?
@@ -8088,6 +8123,7 @@ impl<'a> DurableReader<'a> {
         Ok(u32::from_le_bytes(bytes))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_i32(&mut self) -> Result<i32> {
         let bytes: [u8; 4] = self
             .read_exact(4)?
@@ -8096,22 +8132,27 @@ impl<'a> DurableReader<'a> {
         Ok(i32::from_le_bytes(bytes))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_f32(&mut self) -> Result<f32> {
         Ok(f32::from_bits(self.read_u32()?))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_f64(&mut self) -> Result<f64> {
         Ok(f64::from_bits(self.read_u64()?))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_point_id(&mut self) -> Result<hnsw_rs::hnsw::PointId> {
         Ok(hnsw_rs::hnsw::PointId(self.read_u8()?, self.read_i32()?))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn skip(&mut self, length: usize) -> Result<()> {
         self.read_exact(length).map(|_| ())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_u64(&mut self) -> Result<u64> {
         let bytes: [u8; 8] = self
             .read_exact(8)?
@@ -8120,12 +8161,14 @@ impl<'a> DurableReader<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_usize(&mut self) -> Result<usize> {
         usize::try_from(self.read_u64()?).map_err(|_| {
             Error::Other(("durable HNSW value exceeds this platform address space".to_string()).into())
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_bytes(&mut self) -> Result<&'a [u8]> {
         let length = self.read_usize()?;
         self.read_exact(length)
@@ -8199,6 +8242,7 @@ fn graph_identity_key_of_quantized(bytes: &[u8]) -> Vec<u8> {
 /// (representative, member) data id pairs. Every id must be a mapped row, a
 /// member never its own representative nor listed twice; returns the groups,
 /// each ascending by member row, and their member count.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_graph_members(
     reader: &mut DurableReader<'_>,
     id_to_row: &HashMap<usize, RowId>,
@@ -8231,6 +8275,7 @@ fn read_graph_members(
 }
 
 /// Give every member row its representative's graph point.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn map_member_points(
     members: &GraphMembers,
     id_to_row: &HashMap<usize, RowId>,

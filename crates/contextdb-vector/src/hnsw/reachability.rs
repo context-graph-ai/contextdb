@@ -155,6 +155,7 @@ where
 /// were appended. Runs after every insertion worker joined and before the
 /// graph is published or encoded. `checkpoint` runs before each level, so
 /// the pass stops with the build.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn link_built<T, D>(
     graph: &Hnsw<'static, T, D>,
     checkpoint: &mut dyn FnMut() -> contextdb_core::Result<()>,

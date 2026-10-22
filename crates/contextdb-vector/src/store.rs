@@ -1555,6 +1555,7 @@ pub enum DormantVectorLoadRequest {
 /// exposes partial graph state to search.
 #[doc(hidden)]
 pub trait DormantVectorGraphLoader: Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         generation: DormantVectorGraphGeneration,
@@ -1564,6 +1565,7 @@ pub trait DormantVectorGraphLoader: Send + Sync {
 
     /// A writable loader may omit suffix reconstruction when the registry
     /// already owns its authenticated fresh tail. Captured readers still use load.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_reusing_fresh_tail(
         &self,
         generation: DormantVectorGraphGeneration,
@@ -1591,6 +1593,7 @@ pub struct LoadedCapturedVectorSuffix {
 
 #[doc(hidden)]
 pub trait CapturedVectorSuffixLoader: Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         caller_reserved_load_bytes: usize,
@@ -1611,6 +1614,7 @@ pub trait CapturedVectorSuffixSource: Send + Sync {
     /// retain that root and never publish a fresh tail into the registry.
     /// Called only after `bind_serving_frontier`, once per dormant layer; the
     /// descriptor's identity names its role among the frozen frontier's.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_serving_layer(
         &self,
         descriptor: &DormantVectorGraphGeneration,
@@ -1619,6 +1623,7 @@ pub trait CapturedVectorSuffixSource: Send + Sync {
 
     /// Receives the frozen serving base and change identities exactly once,
     /// before any dormant layer binds and before request pricing.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_serving_frontier(
         &self,
         base: Option<VectorGraphGeneration>,
@@ -1652,6 +1657,7 @@ impl RawVectorTailEntry {
 
 #[doc(hidden)]
 pub trait StreamedVectorSuffixHandle: Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stream_tail(
         &self,
         visit: &mut dyn FnMut(RawVectorTailEntry) -> Result<bool>,
@@ -1686,10 +1692,13 @@ pub struct CapturedVectorSuffix {
 /// a creation timestamp alone is not sufficient.
 #[doc(hidden)]
 pub trait CapturedVectorStreamedTail: Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate(&self) -> Result<()>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn includes(&self, interval: &RawVectorDirectoryEntry, body: &RawVectorDirectoryEntry,
         snapshot: SnapshotId, owner: &mut VectorCopyAdmission,
         before_read: &mut dyn FnMut() -> bool) -> Result<bool>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn includes_row(&self, row: RowId, snapshot: SnapshotId,
         owner: &mut VectorCopyAdmission, before_read: &mut dyn FnMut() -> bool) -> Result<bool>;
 }
@@ -1769,6 +1778,7 @@ impl CapturedVectorServingSelection {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn with_streamed_tail(mut self, tail: CapturedVectorStreamedTailHandle) -> Result<Self> {
         tail.validate()?;
         self.streamed_tail = Some(tail);
@@ -1946,6 +1956,7 @@ impl VectorVersionIdentity {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn with_copy_admission<T>(
     owner: &mut VectorCopyAdmission,
     action: impl FnOnce(&mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<T>,
@@ -1972,6 +1983,7 @@ fn with_copy_admission<T>(
 #[doc(hidden)]
 pub struct QuerySourceControl(Option<Arc<VectorCopyAdmission>>);
 impl QuerySourceControl {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(mut owner: VectorCopyAdmission) -> Result<Self> {
         owner.reserve(contextdb_tx::staged_source::source_arc_layout::<VectorCopyAdmission>().size())?;
         Ok(Self(Some(Arc::new(owner))))
@@ -2070,6 +2082,7 @@ impl OwnedVectorEntries<'_> {
         self.scratch = None;
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_next(&mut self) -> Result<Option<VectorEntry>> {
         if self.scratch.is_none() {
             return Ok(None);
@@ -2427,6 +2440,7 @@ pub trait DurableRawColumnFactory: Send + Sync {
     ) {
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn create(
         &self,
         index: &VectorIndexRef,
@@ -2450,14 +2464,17 @@ pub trait DurableRawPartitionFactory: Send + Sync {
 
     /// A working catalog is authoritative even when the resident map is empty.
     /// Capture occurs after store guards are released, with the actual reader.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_catalog(&self, _index: &VectorIndexRef, _owner: &mut VectorCopyAdmission)
         -> Result<Option<PagedVectorCatalogSelection>> { Ok(None) }
     /// Complete physical, live, retained and cap-occupied counts, with no
     /// query-owned partition handles or standing cache changes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn catalog_scalar_counts(&self, _index: &VectorIndexRef) -> Result<Option<[usize; 6]>> { Ok(None) }
     /// Prevalidated maintained scalars for existing infallible observers.
     /// Working factories seed these before exposure and refresh on apply/DDL.
     fn published_catalog_counts(&self) -> Option<[usize; 6]> { None }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn catalog_scalar_occupied(&self, _index: &VectorIndexRef, _key: &VectorPartitionKey) -> Result<Option<bool>> { Ok(None) }
 
     /// Borrow retained metadata credits without creating or loading a partition.
@@ -2470,6 +2487,7 @@ pub trait DurableRawPartitionFactory: Send + Sync {
     ) {
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn create(
         &self,
         partition: &VectorPartitionRef,
@@ -2501,6 +2519,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
     }
 
     /// Rebind a live writer loader after its durable index keys are renamed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
@@ -2519,6 +2538,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
     /// Load every body of a durable-membership partition in durable key
     /// order, admitting the complete load from its count before any body is
     /// read.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_all(&self, owner: &mut VectorCopyAdmission) -> Result<LoadedRawVectorPartition> {
         let _ = owner;
         Err(Error::Other(
@@ -2533,12 +2553,14 @@ pub trait DormantRawVectorLoader: Send + Sync {
         false
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         directory: &[RawVectorDirectoryEntry],
         owner: &mut VectorCopyAdmission,
     ) -> Result<LoadedRawVectorPartition>;
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate(
         &self,
         identity: &RawVectorDirectoryEntry,
@@ -2546,6 +2568,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<LoadedRawVectorCandidate>;
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_streamed_membership(
         &self,
         scan: &mut dyn RawVectorBodyScan,
@@ -2555,6 +2578,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_selected_candidate(
         &self,
         selected: &dyn RawVectorMembershipSelection,
@@ -2567,6 +2591,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
     /// Which open body read serves this loader. Loaders reporting the same
     /// nonzero value read the same pinned durable image, so one statement's
     /// scan serves all of them; zero means this loader has no such read.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_body_scan_for_membership(
         &self,
         receipt: &dyn std::any::Any,
@@ -2586,11 +2611,13 @@ pub trait DormantRawVectorLoader: Send + Sync {
     /// Open one read of authoritative bodies that a statement reuses for every
     /// candidate it compares: one pinned transaction, its tables opened once,
     /// and one authentication batch. `None` means this loader has none.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_body_scan(&self) -> Result<Option<Box<dyn RawVectorBodyScan>>> {
         Ok(None)
     }
 
     /// The membership was already authenticated by this statement's source cursor.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_streamed_candidate_with_scan(
         &self,
         scan: &mut dyn RawVectorBodyScan,
@@ -2612,6 +2639,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
 
     /// `load_candidate_with_scan` for a one-pass exhaustive scan: a body read
     /// once must not displace the warm working set of a shared page cache.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate_with_scan_once(
         &self,
         scan: &mut dyn RawVectorBodyScan,
@@ -2623,6 +2651,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
     }
 
     /// `load_candidate`, reading the body through a statement's open scan.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate_with_scan(
         &self,
         _scan: &mut dyn RawVectorBodyScan,
@@ -2640,6 +2669,7 @@ pub trait DormantRawVectorLoader: Send + Sync {
 /// body's bytes before asking and releases them once it has scored it.
 #[doc(hidden)]
 pub trait RawVectorBodyScan: Send {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_streamed_membership(
         &mut self,
         partition: &VectorPartitionRef,
@@ -2650,6 +2680,7 @@ pub trait RawVectorBodyScan: Send {
     }
 
     /// Read a body whose complete identity the source stream has authenticated.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_streamed_body(
         &mut self,
         partition: &VectorPartitionRef,
@@ -2660,6 +2691,7 @@ pub trait RawVectorBodyScan: Send {
         self.read_body(partition, identity, dimension, quantization)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_body(
         &mut self,
         partition: &VectorPartitionRef,
@@ -2705,6 +2737,7 @@ impl RawVectorBodyReads {
         std::mem::replace(&mut self.one_pass, one_pass)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scan_for(
         &mut self,
         loader: &dyn DormantRawVectorLoader,
@@ -2713,6 +2746,7 @@ impl RawVectorBodyReads {
         self.scan_for_membership(loader, None, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scan_for_membership(
         &mut self,
         loader: &dyn DormantRawVectorLoader,
@@ -2983,6 +3017,7 @@ struct PagedBuildOperation {
     invalidating: bool,
 }
 impl PagedBuildOperation {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn take(state: Arc<IndexState>, cleanup: bool) -> Result<Option<Self>> {
         let mut slot = if cleanup {
             state.paged_reclaimer.lock()
@@ -3007,6 +3042,7 @@ impl PagedBuildOperation {
             invalidating: false,
         }))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn take_for_abandon(state: Arc<IndexState>) -> Result<Self> {
         let mut slot = state.paged_builder.lock();
         if slot.invalidating {
@@ -3086,6 +3122,7 @@ impl WriterVectorTail {
             std::mem::take(&mut self.metadata_bytes),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn admit_metadata(&mut self, bytes: usize) -> Result<()> {
         self.accountant.try_allocate_for_static(
             bytes,
@@ -3097,6 +3134,7 @@ impl WriterVectorTail {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reattach_budget(&mut self, accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Result<()> {
         let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
 
@@ -3255,13 +3293,17 @@ impl Drop for VectorMaintenanceProgressGuard {
 #[doc(hidden)]
 pub trait PagedVectorCatalog: Send + Sync {
     fn counts(&self) -> [usize; 6];
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate(&self) -> Result<()>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_empty(&self, owner: &mut VectorCopyAdmission,
         visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
             Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<bool>) -> Result<()>;
     fn len(&self) -> usize;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn probe(&self, key: &VectorPartitionKey, owner: &mut VectorCopyAdmission)
         -> Result<Option<PagedVectorPartitionSources>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit(&self, owner: &mut VectorCopyAdmission, before_read: &mut dyn FnMut() -> Result<()>,
         visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
             Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<()>) -> Result<()>;
@@ -3318,6 +3360,7 @@ pub struct PagedVectorSourceSelection {
 impl PagedVectorSourceSelection {
     pub fn len(&self) -> usize { self.catalog.catalog.len() }
     pub fn counts(&self) -> [usize; 6] { self.catalog.catalog.counts() }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn empty_declared_state(&self, owner: &mut VectorCopyAdmission) -> Result<Option<VectorQueryState>> {
         self.catalog.catalog.validate()?;
         if self.partitioned || self.len() != 0 { return Ok(None); }
@@ -3331,10 +3374,12 @@ impl PagedVectorSourceSelection {
         self.catalog.catalog.validate()?;
         Ok(Some(VectorQueryState { state, control: Some(control) }))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn probe(&self, key: &VectorPartitionKey, owner: &mut VectorCopyAdmission) -> Result<Option<VectorQueryState>> {
         let Some(source) = self.catalog.catalog.probe(key, owner)? else { return Ok(None); };
         self.make_state(source.memberships.clone(), source.loader.clone(), source.summary, source.historical_only, owner).map(Some)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn make_state(&self, memberships: Arc<dyn RawVectorMembershipSource>, loader: Arc<dyn DormantRawVectorLoader>,
         summary: RawVectorMembershipSummary, historical_only: bool, owner: &mut VectorCopyAdmission) -> Result<VectorQueryState> {
         let mut control = owner.scratch();
@@ -3350,6 +3395,7 @@ impl PagedVectorSourceSelection {
         drop(transient);
         Ok(VectorQueryState { state, control: Some(control) })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visit_empty<E: From<Error>>(&self, owner: &mut VectorCopyAdmission,
         mut visit: impl FnMut(&VectorPartitionKey, VectorQueryState) -> std::result::Result<bool, E>)
         -> std::result::Result<(), E> {
@@ -3369,6 +3415,7 @@ impl PagedVectorSourceSelection {
         -> std::result::Result<(), E> {
         self.visit_checked(owner, &mut || Ok(()), visit)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visit_checked<E: From<Error>>(&self, owner: &mut VectorCopyAdmission,
         before: &mut impl FnMut() -> std::result::Result<(), E>,
         mut visit: impl FnMut(&VectorPartitionKey, VectorQueryState) -> std::result::Result<(), E>)
@@ -3768,6 +3815,7 @@ impl IndexState {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn install_dormant_raw_directory(
         &self,
         entries: Vec<RawVectorDirectoryEntry>,
@@ -3788,6 +3836,7 @@ impl IndexState {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn attach_durable_raw_loader(
         &self,
         mut expected: Vec<RawVectorDirectoryEntry>,
@@ -3859,6 +3908,7 @@ impl IndexState {
     /// visibility boundaries (two binary searches per snapshot); durable
     /// partitions from their source's occupancy-interval index. Neither reads
     /// a membership record.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_at_any_registered(
         &self,
         snapshots: &[SnapshotId],
@@ -3885,6 +3935,7 @@ impl IndexState {
     /// Whether any retained membership of this durable partition is visible
     /// to one of `snapshots`. Streams the durable directory once; an incomplete
     /// read refuses the preparation before any partition is retired.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_visible_at_any(
         &self,
         snapshots: &[SnapshotId],
@@ -3976,6 +4027,7 @@ impl IndexState {
     /// Pending work is authoritative fixed metadata for writable durable
     /// sources. Storage-neutral sources may answer from their bounded log;
     /// an unavailable frontier refuses rather than walking memberships.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_pending_counts(
         &self,
         covered: Option<TxId>,
@@ -4028,6 +4080,7 @@ impl IndexState {
     /// The boolean pending-work fact, without constructing an inspection
     /// record or enumerating any other partition. The durable source keeps
     /// its captured root and uses the same frontier as full inspection.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn has_pending_work_for_read(&self, owner: &mut VectorCopyAdmission) -> Result<bool> {
         let covered = VectorStore::inspection_covered_tx(self);
         if self.is_durable() {
@@ -4040,6 +4093,7 @@ impl IndexState {
 
     /// Refresh the durable counts after a removal published elsewhere.
     /// A refusal reaches the caller before any directory pruning begins.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refresh_durable_counts(&self, owner: &mut VectorCopyAdmission) -> Result<()> {
         let mut local_copy_admission = owner.local_scratch();
         let owner = local_copy_admission.as_mut().unwrap_or(owner);
@@ -4065,6 +4119,7 @@ impl IndexState {
     }
 
     /// Every visibility interval of a durable partition, streamed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_durable_intervals(
         &self,
         mut visit: impl FnMut(&RawVectorDirectoryEntry) -> Result<()>,
@@ -4083,6 +4138,7 @@ impl IndexState {
 
     /// Copy the bodies of every durable interval `select` accepts, one point
     /// read each; a body is decoded only for a selected interval.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_entries_selected(
         &self,
         index: &VectorIndexRef,
@@ -4159,6 +4215,7 @@ impl IndexState {
 
     /// The live bodies at `snapshot` published after `after_lsn`, selected
     /// from the durable change suffix alone; `None` without a suffix.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_suffix_entries(
         &self,
         index: &VectorIndexRef,
@@ -4264,6 +4321,7 @@ impl IndexState {
 
     /// Body identities of every retained version of `rows` in a durable
     /// partition, each read from that row's own prefix.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_row_versions(
         &self,
         rows: &HashSet<RowId>,
@@ -4294,6 +4352,7 @@ impl IndexState {
     }
 
     /// Test selected lineages without retaining their version directory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_contains_rows(
         &self,
         rows: impl IntoIterator<Item = RowId>,
@@ -4354,6 +4413,7 @@ impl IndexState {
     }
 
     /// Rows visible at a maintenance sample frontier.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sampled_visible_count(
         &self,
         snapshot: SnapshotId,
@@ -4384,6 +4444,7 @@ impl IndexState {
     /// Cache this durable partition's bodies when they fit. `Ok(false)` when
     /// the memory to hold them is refused; the caller then reads bodies one
     /// at a time through the durable source.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_cache_durable_bodies(&self, owner: &mut VectorCopyAdmission) -> Result<bool> {
         if self.is_durable()
             || (owner.historical_durable_reads() && self.durable_membership_source().is_some())
@@ -4469,6 +4530,7 @@ impl IndexState {
         self.is_durable().then(|| *self.durable_counts.lock())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_directory_has_visible_row(
         &self,
         row: RowId,
@@ -4484,6 +4546,7 @@ impl IndexState {
 
     /// The LSN of the version of `row` that `snapshot` sees, if any: which
     /// stored version a graph member must be to answer for its row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_directory_visible_lsn_with_copy_admission(
         &self,
         row: RowId,
@@ -4503,6 +4566,7 @@ impl IndexState {
             .map(|entry| entry.lsn))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_directory_visible_entry_count(
         &self,
         snapshot: SnapshotId,
@@ -4525,6 +4589,7 @@ impl IndexState {
         source.visible_count(snapshot, &mut || true, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_visible_directory_entry_by_row(
         &self,
         row_id: RowId,
@@ -4555,6 +4620,7 @@ impl IndexState {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_visible_directory_entry_by_row_with_copy_admission<E: From<Error>>(
         &self,
         row_id: RowId,
@@ -4580,6 +4646,7 @@ impl IndexState {
         Ok(self.visible_directory_entry_by_row(row_id, snapshot))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bind_streamed_membership(
         &self,
         cursor: &dyn RawVectorMembershipCursor,
@@ -4600,6 +4667,7 @@ impl IndexState {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_vector_for_row_lsn(
         &self,
         index: &VectorIndexRef,
@@ -4723,6 +4791,7 @@ impl IndexState {
     }
 
     #[allow(dead_code)] // Retain the direct visible-entry route for bounded read fallbacks.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_visible_entry_by_row(
         &self,
         index: &VectorIndexRef,
@@ -4735,6 +4804,7 @@ impl IndexState {
 
     /// `cache` lets a caller-facing read fault in a fitting durable
     /// partition; commit and maintenance reads only use an existing cache.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_visible_entry_by_row_caching(
         &self,
         index: &VectorIndexRef,
@@ -4746,6 +4816,7 @@ impl IndexState {
         self.load_visible_entry_by_row_selected(index, row_id, snapshot, cache, None, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_visible_entry_by_row_selected(
         &self,
         index: &VectorIndexRef,
@@ -4861,6 +4932,7 @@ impl IndexState {
         self.ensure_raw_vectors_loaded(owner)?;
         Ok(self.visible_entry_by_row(index, row_id, snapshot))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_visible_entry_for_tail(
         &self,
         index: &VectorIndexRef,
@@ -4875,6 +4947,7 @@ impl IndexState {
     /// Legacy full-load readers retain an operation-owned authenticated copy.
     /// Their original load refusal remains observable; the shared current
     /// residency and its owning accountant are never changed by this copy.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn historical_partition(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -4933,6 +5006,7 @@ impl IndexState {
         Ok(Some(HistoricalRawVectorPartition { loaded }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn historical_partition_score(
         &self,
         partition: &HistoricalRawVectorPartition,
@@ -4962,10 +5036,12 @@ impl IndexState {
         )))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ensure_raw_vectors_loaded(&self, owner: &mut VectorCopyAdmission) -> Result<()> {
         self.ensure_raw_vectors_loaded_with_copy_preference(false, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ensure_raw_vectors_loaded_with_copy_preference(
         &self,
         prefer_unique_owned: bool,
@@ -5289,6 +5365,7 @@ impl IndexState {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_directory_visible_entry_count<E>(
         &self,
         snapshot: SnapshotId,
@@ -5511,6 +5588,7 @@ impl IndexState {
     /// Eligibility shares the snapshot boundary index used by ordinary counts.
     /// Durable historical probes checkpoint and charge every physical record;
     /// resident counts use their snapshot boundary index.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_hnsw_eligibility<E>(
         &self,
         snapshot_tx: TxId,
@@ -5596,6 +5674,7 @@ impl IndexState {
             }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn all_entries(
         &self,
         index: &VectorIndexRef,
@@ -5630,6 +5709,7 @@ impl IndexState {
 
     /// Admit the complete output before copying the first body. The cursor
     /// point-loads durable bodies and closes its decode window at exhaustion.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn owned_entries<'a>(
         &'a self,
         index: &'a VectorIndexRef,
@@ -5638,6 +5718,7 @@ impl IndexState {
         self.owned_entries_with_copy_preference(index, owner, false)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn owned_entries_with_copy_preference<'a>(
         &'a self,
         index: &'a VectorIndexRef,
@@ -5690,6 +5771,7 @@ impl IndexState {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn find_by_row_id(
         &self,
         index: &VectorIndexRef,
@@ -5774,6 +5856,7 @@ impl IndexState {
     /// so that returns "no pages here" and the statement carries on, which is
     /// what a declared memory limit is for -- sweeping a store larger than the
     /// reader's memory. A layer that simply will not load says the same.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sealed_page_scoring<E>(
         &self,
         snapshot: SnapshotId,
@@ -6174,6 +6257,7 @@ impl IndexState {
     }
 
     #[allow(dead_code)] // Retain the bounded candidate scoring seam for read fallbacks.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn score_visible_candidate(
         &self,
         index: &VectorIndexRef,
@@ -6507,6 +6591,7 @@ impl IndexState {
     /// mistake a stale route for a complete one; the authoritative vectors
     /// remain available to exact search and maintenance can build a new graph.
     #[allow(dead_code)] // Retain the materialized-index insertion path for loader fallbacks.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_into_materialized_hnsw(
         &self,
         index: &VectorIndexRef,
@@ -6875,12 +6960,14 @@ impl IndexState {
 
     /// Capture durable serving metadata once, then freeze the actual registry
     /// serving chain when this is the writer's current physical publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn capture_serving_selection(
         &self, snapshot: SnapshotId, owner: &mut VectorCopyAdmission,
     ) -> Result<Option<Arc<CapturedVectorServingSelection>>> {
         self.capture_serving_selection_with_work(snapshot, owner, &mut || true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn capture_serving_selection_with_work(
         &self, snapshot: SnapshotId, owner: &mut VectorCopyAdmission,
         before_read: &mut dyn FnMut() -> bool,
@@ -6997,6 +7084,7 @@ impl IndexState {
     /// the selection holds an `Arc` share and no charge, so a later retirement
     /// leaves the selection serving its captured snapshot. A store refusal is
     /// recorded on the selection and answered `None`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn share_current_store_layer<E>(
         &self,
         selection: &CapturedVectorServingSelection,
@@ -7534,6 +7622,7 @@ impl IndexState {
     /// Only topology diagnostics walk nodes; stats/length/serial use the
     /// authenticated graph progress. No diagnostic installs a resident graph.
     #[cfg(any(test, feature = "test-seams"))]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn captured_hnsw_observation_for_test(
         &self, snapshot: SnapshotId, owner: &mut VectorCopyAdmission, topology: bool,
     ) -> Result<Option<(crate::HnswGraphStats, usize, u64, u64)>> {
@@ -7598,6 +7687,7 @@ impl IndexState {
     /// resident graph.  The engine chooses when the catalog pointer itself is
     /// durable; this store only makes the descriptor visible atomically.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_dormant_sealed_generation(
         &self,
         is_base: bool,
@@ -7683,6 +7773,7 @@ impl IndexState {
     /// reserved its resident bytes.  A loaded graph is never inserted into:
     /// future commits extend only `hnsw`, the fresh process-created tail.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn install_loaded_sealed_generation(
         &self,
         is_base: bool,
@@ -7693,6 +7784,7 @@ impl IndexState {
         self.install_loaded_sealed_generation_inner(is_base, identity, loaded, false)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn install_loaded_sealed_generation_inner(
         &self,
         is_base: bool,
@@ -7867,6 +7959,7 @@ impl IndexState {
     /// tail; callers may create and populate that tail only after the commit
     /// that made its change journal durable.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn publish_replacement_base_generation(
         &self,
         identity: VectorGraphGeneration,
@@ -8150,6 +8243,7 @@ impl IndexState {
     /// with the owned graph.  A racing successful load releases its own
     /// reservation and keeps the first complete publication.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn preload_dormant_sealed_generation(&self, is_base: bool) -> Result<bool> {
         let mut checkpoint = || Ok::<(), Error>(());
         let mut reserve = |_bytes| Ok::<(), Error>(());
@@ -8438,6 +8532,7 @@ impl IndexState {
                 .to_string()).into())))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preload_retired_sealed_generation(
         &self,
         base_generation_id: u64,
@@ -9183,6 +9278,7 @@ impl IndexState {
         Ok((availability, results))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn raw_hnsw_search(
         &self,
         index: &VectorIndexRef,
@@ -9311,6 +9407,7 @@ impl IndexState {
     /// Freeze one in-memory build frontier and move subsequent commits onto a
     /// new fresh tail. The existing serving graph becomes the current sealed
     /// base/change chain, so reads keep using it while construction runs.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_sampled_hnsw_maintenance(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -9793,6 +9890,7 @@ impl IndexState {
     /// sealed base generation. Every fallible step completes before the graph
     /// moves: encoding, charge reconciliation, and construction of the empty
     /// mutable tail that later commits will extend.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_fresh_tail_as_base_generation(
         &self,
         identity: VectorGraphGeneration,
@@ -9906,6 +10004,7 @@ impl IndexState {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn initialize_empty_fresh_tail(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -9942,6 +10041,7 @@ impl IndexState {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn storage_bytes_per_entry(&self, owner: &mut VectorCopyAdmission) -> Result<Vec<usize>> {
         let vectors = self.vectors.read();
         let bytes = vectors
@@ -10838,6 +10938,7 @@ impl PreparedDirectoryReservation {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve(accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>, bytes: usize) -> Result<Self> {
         let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
 
@@ -10853,6 +10954,7 @@ impl PreparedDirectoryReservation {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_index(
         &self,
         index: VectorIndexRef,
@@ -11326,12 +11428,14 @@ impl VectorColumnState {
         self.layout.read().clone()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admitted_layout(&self, owner: &mut VectorCopyAdmission) -> Result<VectorIndexLayout> {
         let layout = self.layout.read();
         owner.reserve(layout.estimated_bytes())?;
         Ok(layout.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scoped_layout(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -11355,6 +11459,7 @@ impl VectorColumnState {
     /// Keep route copies under the same caller admission as returned bodies.
     /// Hold the map read guard across pricing and cloning so the quote covers
     /// the exact inventory allocated, including empty partitions and text keys.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admitted_partition_snapshots(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -11439,6 +11544,7 @@ impl VectorColumnState {
     /// that finishes calls [`Self::complete_failed_partitions`], so a refused
     /// one leaves the set incomplete. Noted keys whose partition is gone are
     /// dropped here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn failure_recheck_snapshots(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -11488,6 +11594,7 @@ impl VectorColumnState {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scoped_partition_snapshots(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -11704,6 +11811,7 @@ impl VectorColumnState {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_snapshot_visible_partition_for_row_handling_mismatch<E, T, C>(
         &self,
         row_id: RowId,
@@ -11789,6 +11897,7 @@ impl VectorColumnState {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_admitted_snapshot_visible_partition_for_row<T>(
         &self,
         row_id: RowId,
@@ -12438,6 +12547,7 @@ impl ProjectedPartitionState {
 
     /// A durable partition is projected from its maintained counts plus a
     /// point probe of each row this batch touches; nothing is enumerated.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn from_durable_state(
         state: &IndexState,
         counts_toward_partition_limit: bool,
@@ -12621,6 +12731,7 @@ impl VectorRegistry {
         column
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_insert(
         &mut self,
         index: VectorIndexRef,
@@ -13044,6 +13155,7 @@ impl PreparedVectorPublication {
     /// persistence; the same prepared graph becomes visible in memory only
     /// if that transaction commits and consumes this publication.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_partition_base_generation(
         &self,
         partition: &VectorPartitionRef,
@@ -13071,6 +13183,7 @@ impl PreparedVectorPublication {
 impl PreparedVectorPublication {
     /// Adopt the identity a replacement base generation was durably published
     /// under. Only identity fields change; nothing is allocated.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn adopt_published_base_generation(
         &self,
         partition: &VectorPartitionRef,
@@ -13174,6 +13287,7 @@ impl VectorStore {
 
     /// Admit a real temporary owner before vector generation publication.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reserve_workspace(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -13194,6 +13308,7 @@ impl VectorStore {
 
     /// Static labels keep their original lifetime through workspace admission.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reserve_workspace_static(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -13466,6 +13581,7 @@ impl VectorStore {
             .is_some_and(|slot| slot.take())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_received_schema_publication(
         schemas: Vec<(VectorIndexRef, usize, VectorQuantization)>,
         entries: Vec<VectorEntry>,
@@ -13521,6 +13637,7 @@ impl VectorStore {
     /// Key-aware received-schema staging. Unlike the legacy wire-shaped
     /// method above, declarations carry their full layout and entries carry
     /// their already-derived typed key.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_partitioned_received_schema_publication(
         &self,
         schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
@@ -13608,6 +13725,7 @@ impl VectorStore {
 
     // This helper has no public copy door: callers reserve the complete
     // candidate before entering, then adopt its retained charge on success.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_partitioned_received_schema_admitted(
         schemas: Vec<(VectorIndexRef, VectorIndexLayout, crate::memory_budget::MemoryBudgetOwner)>,
         mut entries: Vec<PartitionedVectorEntry>,
@@ -13745,6 +13863,7 @@ impl VectorStore {
     /// normal lazy search construction, this preserves a graph only for an
     /// index that already had one, and builds it before durability even when
     /// the survivor count has crossed below the ordinary lazy threshold.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_authoritative_purge_publication(
         schemas: Vec<(VectorIndexRef, usize, VectorQuantization)>,
         entries: Vec<VectorEntry>,
@@ -13781,6 +13900,7 @@ impl VectorStore {
     /// Internal erasure bridge. Copy only declarations in the selected tables;
     /// all other registry cells, sources, policies and graph owners stay put.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn copy_erasure_layouts(
         &self,
         selected_table: impl Fn(&str) -> bool,
@@ -13828,6 +13948,7 @@ impl VectorStore {
     /// Prepare a complete selected-table delta before durability. No registry
     /// entry may be added by erasure; publication uses existing-cell swaps.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_selected_authoritative_purge_publication(
         &self,
         schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
@@ -14002,6 +14123,7 @@ impl VectorStore {
         Ok(publication)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_partitioned_authoritative_purge_publication(
         &self,
         schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
@@ -14265,6 +14387,7 @@ impl VectorStore {
         Ok(publication)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn build_prepared_hnsw(
         index: &VectorIndexRef,
         state: &Arc<IndexState>,
@@ -14343,6 +14466,7 @@ impl VectorStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn in_memory_maintenance_request(
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
@@ -14372,6 +14496,7 @@ impl VectorStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_sampled_hnsw_maintenance(
         &self,
         partition: &VectorPartitionRef,
@@ -14617,6 +14742,7 @@ impl VectorStore {
     /// callback. Subsequent ordinary maintenance cycles dispatch this finite
     /// builder and never enter the resident whole-partition build for it.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_partition_paged_builder(
         &self,
         partition: &VectorPartitionRef,
@@ -14642,6 +14768,7 @@ impl VectorStore {
     /// replacement builder. The engine inventory owns retired identities; this
     /// partition retains at most one finite cleanup operation at a time.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_partition_paged_reclaimer(
         &self,
         partition: &VectorPartitionRef,
@@ -14673,6 +14800,7 @@ impl VectorStore {
         )
     }
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_paged_operation(
         &self,
         partition: &VectorPartitionRef,
@@ -14723,6 +14851,7 @@ impl VectorStore {
     /// Maintenance bridge for exporting an already admitted resident graph.
     /// The engine retains its graph, source rows and finite transaction owner.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn export_resident_paged_batch(
         &self,
         graph: &HnswIndex,
@@ -14753,6 +14882,7 @@ impl VectorStore {
     /// the callback runs after the slot lock is released. A busy or absent
     /// operation returns false without driving another partition.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn step_partition_paged_build(
         &self,
         partition: &VectorPartitionRef,
@@ -14777,6 +14907,7 @@ impl VectorStore {
     /// engine derives from its current writer budget. The registered plan is
     /// replaced first, so a later limit change never runs a stale workspace.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn step_partition_paged_build_with_plan(
         &self,
         partition: &VectorPartitionRef,
@@ -14801,6 +14932,7 @@ impl VectorStore {
 
     /// `publish_partition_paged_build` under a plan derived at publication.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn publish_partition_paged_build_with_plan(
         &self,
         partition: &VectorPartitionRef,
@@ -14872,6 +15004,7 @@ impl VectorStore {
     /// install_loaded_sealed_generation / publish_replacement_base_generation;
     /// retired cleanup records remain in the engine's durable inventory.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn publish_partition_paged_build(
         &self,
         partition: &VectorPartitionRef,
@@ -14893,6 +15026,7 @@ impl VectorStore {
     /// Call outside the engine commit gate: an in-flight finite batch finishes
     /// before the persistence callback acquires that gate for the abandon CAS.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn abandon_partition_paged_build(
         &self,
         partition: &VectorPartitionRef,
@@ -14907,6 +15041,7 @@ impl VectorStore {
         Ok(progress)
     }
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reclaim_partition_paged_build(
         &self,
         partition: &VectorPartitionRef,
@@ -14930,6 +15065,7 @@ impl VectorStore {
     /// Install a captured-root fresh tail before enabling ordinary writer
     /// maintenance. Admission precedes the short state publication boundary.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn install_partition_paged_tail(
         &self,
         partition: &VectorPartitionRef,
@@ -14994,6 +15130,7 @@ impl VectorStore {
     /// This test seam never installs a graph or changes resident inspection.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn inspect_captured_vector_suffix_for_test(
         &self,
         partition: &VectorPartitionRef,
@@ -15107,6 +15244,7 @@ impl VectorStore {
     /// during admission or that callback. The engine serializes this operation
     /// with DDL/purge and ordinary commits using its existing commit gate.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn append_partition_paged_tail(
         &self,
         partition: &VectorPartitionRef,
@@ -15162,6 +15300,7 @@ impl VectorStore {
     /// holding its commit and snapshot-removal guards. Keeping that separate
     /// makes the proof boundary explicit: this graph-build loop has no
     /// authority to decide that an old snapshot has released a state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn run_hnsw_maintenance_cycle(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -15173,6 +15312,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn run_hnsw_maintenance_cycle_with(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -15306,6 +15446,7 @@ impl VectorStore {
     /// scheduling remains the finite store-wide maintenance cycle above.
     #[doc(hidden)]
     #[cfg(feature = "test-seams")]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn run_hnsw_maintenance_for_index_for_test(
         &self,
         index: &VectorIndexRef,
@@ -15430,6 +15571,7 @@ impl VectorStore {
     /// The caller must hold the transaction commit lock and the matching
     /// snapshot-removal guard for this entire call.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn retire_snapshot_free_partition_states(
         &self,
         registered_snapshots: &[SnapshotId],
@@ -15569,6 +15711,7 @@ impl VectorStore {
     /// commit. Unaffected columns keep their exact state and declared owners;
     /// their copied identity keys are transiently admitted by the caller.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_received_schema_tables_publication(
         &self,
         mut publication: PreparedVectorPublication,
@@ -15646,6 +15789,7 @@ impl VectorStore {
     /// columns keep their exact sources and standing owners; no body or
     /// partition directory is collected. A recreated table starts a new life.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_received_schema_declarations_publication(
         &self, schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
         affected_tables: &std::collections::HashSet<String>,
@@ -15754,6 +15898,7 @@ impl VectorStore {
         &self.graph_candidate_caps
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_index(
         &self,
         index: VectorIndexRef,
@@ -15789,6 +15934,7 @@ impl VectorStore {
     /// Register or update a manager-resolved declaration. Policy-only changes
     /// retain every partition; a physical-layout change is accepted only when
     /// the column has no retained vector entry.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_index_with_layout(
         &self,
         index: VectorIndexRef,
@@ -15899,6 +16045,7 @@ impl VectorStore {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn recheck_maintenance_failures_for_layout(
         &self,
         index: &VectorIndexRef,
@@ -15963,6 +16110,7 @@ impl VectorStore {
     /// caller that must publish after durability applies the result with
     /// [`Self::publish_policy_layout_update`], which cannot fail. `None` means
     /// the index already has this layout.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_policy_layout_update(
         &self,
         index: &VectorIndexRef,
@@ -16071,6 +16219,7 @@ impl VectorStore {
     /// needs. The failure mark is inspection-only, so a caller that cannot
     /// fail after durability may ignore a refusal here; the mark then stays
     /// until the next maintenance pass touches the partition.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn recheck_policy_maintenance_failures(
         &self,
         published: &PublishedVectorPolicyLayout,
@@ -16092,6 +16241,7 @@ impl VectorStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_layout(index: &VectorIndexRef, layout: &VectorIndexLayout) -> Result<()> {
         match (layout.is_partitioned(), layout.max_partitions) {
             (false, None) => Ok(()),
@@ -16116,6 +16266,7 @@ impl VectorStore {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_partition_key(
         index: &VectorIndexRef,
         layout: &VectorIndexLayout,
@@ -16130,6 +16281,7 @@ impl VectorStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_partition_cap(
         index: &VectorIndexRef,
         column: &VectorColumnState,
@@ -16178,6 +16330,7 @@ impl VectorStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_partition_batch(
         &self,
         touched: &HashSet<VectorPartitionRef>,
@@ -16218,6 +16371,7 @@ impl VectorStore {
     /// registered snapshot sees any of its retained memberships. The hold
     /// test is a fixed number of indexed lookups per snapshot, never a walk
     /// of the route's membership history.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reclaim_candidate_selected(
         &self,
         partition: &VectorPartitionRef,
@@ -16287,6 +16441,7 @@ impl VectorStore {
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
     /// Resolve only the actual mutation's selected key, preserving reader
     /// control when the complete directory is paged rather than resident.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn query_partition_state(&self, index: &VectorIndexRef, key: &VectorPartitionKey,
         owner: &mut VectorCopyAdmission) -> Result<Option<VectorQueryState>> {
         if let Some(selection) = self.capture_paged_partition_sources(index, owner)? {
@@ -16295,6 +16450,7 @@ impl VectorStore {
         Ok(self.try_partition_state(index, key).map(VectorQueryState::from))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn project_partitioned_batch(
         &self,
         deletes: &[PartitionedVectorDelete],
@@ -16815,6 +16971,7 @@ impl VectorStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_tail_insertion(
         &self,
         pending: &mut Vec<PreparedTailInsertion>,
@@ -16907,6 +17064,7 @@ impl VectorStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_tail_insertions(
         &self,
         inserts: &[PartitionedVectorEntry],
@@ -16983,6 +17141,7 @@ impl VectorStore {
     /// this before durability and names only source partitions for which its
     /// snapshot gate proves that no active snapshot needs the maintained
     /// source state. Raw historical vector versions are never discarded here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_partitioned_batch(
         &self,
         deletes: Vec<PartitionedVectorDelete>,
@@ -17028,6 +17187,7 @@ impl VectorStore {
     /// can see one of its retained versions. Raw historical vectors remain
     /// available for later EXACT reads.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_partitioned_batch_with_registered_snapshots(
         &self,
         deletes: Vec<PartitionedVectorDelete>,
@@ -17067,6 +17227,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_canonical_closures(
         &self,
         deletes: &[PartitionedVectorDelete],
@@ -17211,6 +17372,7 @@ impl VectorStore {
 
     /// Price every coexistently held route/header and projection container
     /// before the first route clone. Input payloads are moved, never copied.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn partitioned_batch_workspace_bytes(
         &self,
         deletes: &[PartitionedVectorDelete],
@@ -17342,6 +17504,7 @@ impl VectorStore {
         Ok(bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ensure_existing_raw_partitions_for_batch(
         &self,
         deletes: &[PartitionedVectorDelete],
@@ -17563,6 +17726,7 @@ impl VectorStore {
     }
 
     /// Build every absent state and its durable sources before publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_partition_states(
         &self,
         requested: &HashMap<VectorIndexRef, PartitionKeySet>,
@@ -17645,6 +17809,7 @@ impl VectorStore {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_admitted_partition_states<R>(
         &self,
         touched: &HashSet<VectorPartitionRef>,
@@ -17686,6 +17851,7 @@ impl VectorStore {
     /// Filter borrowed names before creating an owned route inventory. Each
     /// capacity growth and name clone is admitted before allocation, and the
     /// unstable sort requires no additional sorting workspace.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admitted_sorted_refs(
         &self,
         keep: impl Fn(&VectorIndexRef) -> bool,
@@ -17706,6 +17872,7 @@ impl VectorStore {
         Ok(refs)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scoped_sorted_refs(
         &self,
         keep: impl Fn(&VectorIndexRef) -> bool,
@@ -17834,6 +18001,7 @@ impl VectorStore {
         f()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_or_reconfigure_empty_index(
         &self,
         index: VectorIndexRef,
@@ -17916,6 +18084,7 @@ impl VectorStore {
     /// it. The store releases graph reservations here. The engine owns the
     /// separate admission charge for raw vector copies, and must settle that
     /// charge from these entries only after durable DDL publication succeeds.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn deregister_index(
         &self,
         index: &VectorIndexRef,
@@ -17947,6 +18116,7 @@ impl VectorStore {
     /// original index identity with each entry lets the engine release exactly
     /// the charge it admitted, without treating graph bytes as raw-vector
     /// bytes a second time.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn deregister_table(
         &self,
         table: &str,
@@ -18042,6 +18212,7 @@ impl VectorStore {
     /// Prepare all rename copies before the enclosing durable transaction.
     /// The returned token holds the registry and bulk gates: until it is
     /// published or dropped, the caller must not enter another vector operation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_index_rename<'a>(
         &'a self,
         old: &VectorIndexRef,
@@ -18053,6 +18224,7 @@ impl VectorStore {
 
     /// Prepare the explicitly named destination removal and source rename as
     /// one publication. The existing destination remains intact on refusal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_index_replacement_rename<'a>(
         &'a self,
         old: &VectorIndexRef,
@@ -18070,6 +18242,7 @@ impl VectorStore {
         self.prepare_index_rename_inner(old, new, Some(replaced), Some(removal_accountant), owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_index_rename_inner<'a>(
         &'a self,
         old: &VectorIndexRef,
@@ -18233,10 +18406,12 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn state(&self, index: &VectorIndexRef) -> Result<Arc<IndexState>> {
         self.partition_state(index, &VectorPartitionKey::unpartitioned())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn partition_state(
         &self,
         index: &VectorIndexRef,
@@ -18265,6 +18440,7 @@ impl VectorStore {
         self.registry.read().get(index).cloned()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn with_registered_partition_state<R>(
         &self,
         index: &VectorIndexRef,
@@ -18281,6 +18457,7 @@ impl VectorStore {
         self.with_bulk_read(|| self.registry.read().contains_key(index))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn index_layout(
         &self,
         index: &VectorIndexRef,
@@ -18296,6 +18473,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn scoped_index_layout(
         &self,
         index: &VectorIndexRef,
@@ -18307,6 +18485,7 @@ impl VectorStore {
     /// Inspect scalar layout facts in place. The callback must not re-enter
     /// vector source work or mutate the layout while its read guard is held.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn with_index_layout<T>(
         &self,
         index: &VectorIndexRef,
@@ -18323,6 +18502,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn partition_keys(
         &self,
         index: &VectorIndexRef,
@@ -18381,6 +18561,7 @@ impl VectorStore {
     /// vectors solely for historical EXACT reads. Ordinary inspection and
     /// live partition counts use `partition_keys` instead.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn partition_keys_including_historical(
         &self,
         index: &VectorIndexRef,
@@ -18444,6 +18625,7 @@ impl VectorStore {
     #[doc(hidden)]
     #[doc(hidden)]
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn paged_partition_counts(&self, index: &VectorIndexRef) -> Result<Option<[usize; 6]>> {
         let Some(column) = self.try_column(index) else { return Ok(None); };
         let factory = column.durable_partition_factory.read().clone();
@@ -18451,6 +18633,7 @@ impl VectorStore {
         match factory { Some(factory) => factory.catalog_scalar_counts(index), None => Ok(None) }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn query_partition_source_count(&self, index: &VectorIndexRef, owner: &mut VectorCopyAdmission) -> Result<usize> {
         if let Some(selection) = self.capture_paged_partition_sources(index, owner)? { return Ok(selection.len()); }
         self.with_partition_sources(index, |sources| Ok::<_, Error>(sources.len()))
@@ -18467,6 +18650,7 @@ impl VectorStore {
             visit(key, VectorQueryState::from(state.clone()), owner)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn capture_paged_partition_sources(&self, index: &VectorIndexRef, owner: &mut VectorCopyAdmission)
         -> Result<Option<PagedVectorSourceSelection>> {
         let Some(column) = self.try_column(index) else {
@@ -18570,6 +18754,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn current_partition_for_row(
         &self,
         index: &VectorIndexRef,
@@ -18600,6 +18785,7 @@ impl VectorStore {
 
     /// Fallible body-free current ownership copy, funded by the executing owner.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_current_partition_for_row(
         &self,
         index: &VectorIndexRef,
@@ -18656,6 +18842,7 @@ impl VectorStore {
     #[doc(hidden)]
     /// Query selection preserves the external owner of ephemeral working states.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn with_query_snapshot_visible_partition_for_row<E, T, C>(&self,
         index: &VectorIndexRef, row_id: RowId, snapshot: SnapshotId,
         before: &mut C, mut inspect: impl FnMut(&VectorPartitionKey, &VectorQueryState,
@@ -18720,6 +18907,7 @@ impl VectorStore {
     }
 
     /// Passive count probe. Inconsistent reverse routes retain the base scan fallback.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn snapshot_visible_partition_matches(
         &self,
         index: &VectorIndexRef,
@@ -18746,6 +18934,7 @@ impl VectorStore {
     /// The row's vector visible at `snapshot` in one partition: a point read
     /// for a durable partition, a load of the resident partition otherwise.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_live_entry_for_row_in_partition(
         &self,
         index: &VectorIndexRef,
@@ -18760,6 +18949,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn live_entry_for_row_in_partition(
         &self,
         index: &VectorIndexRef,
@@ -18777,6 +18967,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn partition_info(
         &self,
         index: &VectorIndexRef,
@@ -18786,6 +18977,7 @@ impl VectorStore {
         self.try_partition_info(index, partition_key, owner)
     }
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_partition_info(
         &self,
         index: &VectorIndexRef,
@@ -18839,6 +19031,7 @@ impl VectorStore {
             .or((local_generation_id != 0).then_some(TxId(local_base_tx)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn partition_info_snapshot(
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
@@ -19077,6 +19270,7 @@ impl VectorStore {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn partition_infos(
         &self,
         index: &VectorIndexRef,
@@ -19131,6 +19325,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_partition_maintenance_progress(
         &self,
         partition: &VectorPartitionRef,
@@ -19144,6 +19339,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn select_maintenance_partition<'a>(
         &self,
         candidates: &'a [VectorPartitionRef],
@@ -19645,6 +19841,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_partition_policy_build(
         &self,
         partition: &VectorPartitionRef,
@@ -19674,6 +19871,7 @@ impl VectorStore {
         Some(column.layout.read().quantization.storage_bytes(dimension))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn index_layout_info(
         &self,
         index: &VectorIndexRef,
@@ -19714,6 +19912,7 @@ impl VectorStore {
         self.with_bulk_read(|| self.registry.read().len())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn validate_vector(&self, index: &VectorIndexRef, actual: usize) -> Result<()> {
         self.with_bulk_read(|| {
             let expected = self.with_index_layout(index, |layout| layout.dimension)?;
@@ -19738,6 +19937,7 @@ impl VectorStore {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_inserts(
         &self,
         inserts: Vec<VectorEntry>,
@@ -19746,6 +19946,7 @@ impl VectorStore {
         self.apply_inserts_with_accountant(inserts, None, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_inserts_with_accountant(
         &self,
         inserts: Vec<VectorEntry>,
@@ -19762,6 +19963,7 @@ impl VectorStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_deletes(
         &self,
         deletes: Vec<(VectorIndexRef, RowId, TxId, TxId, Lsn)>,
@@ -19770,6 +19972,7 @@ impl VectorStore {
         self.apply_deletes_with_accountant(deletes, None, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_deletes_with_accountant(
         &self,
         deletes: Vec<(VectorIndexRef, RowId, TxId, TxId, Lsn)>,
@@ -19786,6 +19989,7 @@ impl VectorStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_moves(
         &self,
         moves: Vec<(VectorIndexRef, RowId, RowId, TxId, TxId, Lsn)>,
@@ -19795,6 +19999,7 @@ impl VectorStore {
         self.apply_moves_with_accountant(moves, lsn, None, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_moves_with_accountant(
         &self,
         moves: Vec<(VectorIndexRef, RowId, RowId, TxId, TxId, Lsn)>,
@@ -19805,6 +20010,7 @@ impl VectorStore {
         self.apply_changes_with_accountant(Vec::new(), Vec::new(), moves, lsn, accountant, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_changes_with_accountant(
         &self,
         deletes: Vec<(VectorIndexRef, RowId, TxId, TxId, Lsn)>,
@@ -19895,6 +20101,7 @@ impl VectorStore {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_changes_with_accountant_ref(
         &self,
         deletes: &[(VectorIndexRef, RowId, TxId, TxId, Lsn)],
@@ -19980,6 +20187,7 @@ impl VectorStore {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_partitioned_inserts(
         &self,
         inserts: Vec<PartitionedVectorEntry>,
@@ -19988,6 +20196,7 @@ impl VectorStore {
         self.apply_partitioned_inserts_with_accountant(inserts, None, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_partitioned_inserts_with_accountant(
         &self,
         inserts: Vec<PartitionedVectorEntry>,
@@ -20004,6 +20213,7 @@ impl VectorStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_partitioned_deletes(
         &self,
         deletes: Vec<PartitionedVectorDelete>,
@@ -20019,6 +20229,7 @@ impl VectorStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_partitioned_moves(
         &self,
         moves: Vec<PartitionedVectorMove>,
@@ -20028,6 +20239,7 @@ impl VectorStore {
         self.apply_partitioned_moves_with_accountant(moves, lsn, None, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_partitioned_moves_with_accountant(
         &self,
         moves: Vec<PartitionedVectorMove>,
@@ -20045,6 +20257,7 @@ impl VectorStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn apply_partitioned_changes_with_accountant(
         &self,
         deletes: Vec<PartitionedVectorDelete>,
@@ -20363,6 +20576,7 @@ impl VectorStore {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn insert_loaded_vector(
         &self,
         entry: VectorEntry,
@@ -20395,6 +20609,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn insert_loaded_partitioned_vector(
         &self,
         entry: PartitionedVectorEntry,
@@ -20448,6 +20663,7 @@ impl VectorStore {
     /// The engine publishes it together with forward sources against one root.
     /// Registration reads no membership records and retains no decoded rows.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_durable_raw_reverse_source(
         &self,
         index: &VectorIndexRef,
@@ -20475,6 +20691,7 @@ impl VectorStore {
     /// Make every partition this column creates after open durable, with the
     /// source and loader `factory` builds. Register with the reverse source.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_durable_raw_partition_factory(
         &self,
         index: &VectorIndexRef,
@@ -20506,6 +20723,7 @@ impl VectorStore {
     /// Every registered column retains its explicitly declared funder.
     /// The executing statement's owner supplies no retained fallback.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn retained_column_copy_owner(
         &self,
         index: &VectorIndexRef,
@@ -20522,6 +20740,7 @@ impl VectorStore {
 
     /// Prepare sources against the executing owner before the enclosing
     /// schema commit. Local publication performs no factory calls.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_received_schema_durable_sources(
         &self,
         publication: &mut PreparedVectorPublication,
@@ -20538,6 +20757,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn validate_private_paged_columns(&self) -> Result<()> {
         let registry = self.registry.read();
         for column in registry.values() {
@@ -20568,6 +20788,7 @@ impl VectorStore {
     /// Activate declared columns only, after entering the private source loan.
     /// Partition history remains in the paged catalog, never installed here.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn activate_durable_raw_columns(&self, owner: &mut VectorCopyAdmission) -> Result<()> {
         let indexes = self.with_bulk_read(|| {
             let registry = self.registry.read();
@@ -20589,6 +20810,7 @@ impl VectorStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn make_column_durable(
         &self,
         index: &VectorIndexRef,
@@ -20664,6 +20886,7 @@ impl VectorStore {
     /// partition source is opened and verified on its first point/count/cursor
     /// use, never during writable-open registration.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_lazy_durable_raw_partition(
         &self,
         partition: &VectorPartitionRef,
@@ -20687,6 +20910,7 @@ impl VectorStore {
     /// source's admitted scratch. Register this on the empty registry at open;
     /// row commits update durable memberships and catalog counts atomically.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_durable_raw_partition(
         &self,
         partition: &VectorPartitionRef,
@@ -20774,6 +20998,7 @@ impl VectorStore {
     /// remain behind each partition's loader until a read or mutation selects
     /// that partition.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn replace_with_dormant_raw_partitions(
         &self,
         dormant: Vec<DormantRawVectorPartition>,
@@ -20869,6 +21094,7 @@ impl VectorStore {
     /// image has no reloadable body, so its stale resident body is retired at
     /// this compaction boundary. Graph routes remain untouched.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn attach_durable_raw_partition_loaders(
         &self,
         dormant: Vec<DormantRawVectorPartition>,
@@ -20911,6 +21137,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn replace_loaded_vectors(
         &self,
         entries: Vec<VectorEntry>,
@@ -20945,6 +21172,7 @@ impl VectorStore {
     /// Prepare a restamped image for an already-accounted detached store.
     /// All copying and admission precede publication. The supplied owner is
     /// consumed, and only actual retained bodies/directories keep its credit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prepare_loaded_partitioned_replacement(
         &self,
         entries: Vec<PartitionedVectorEntry>,
@@ -21083,6 +21311,7 @@ impl VectorStore {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn replace_loaded_partitioned_vectors(
         &self,
         entries: Vec<PartitionedVectorEntry>,
@@ -21093,6 +21322,7 @@ impl VectorStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn all_entries(&self, owner: &mut VectorCopyAdmission) -> Result<Vec<VectorEntry>> {
         self.with_bulk_read(|| {
             let mut entries = Vec::new();
@@ -21113,6 +21343,7 @@ impl VectorStore {
     /// that genuinely need the complete body set and can propagate a load or
     /// admission refusal.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_all_entries(&self, owner: &mut VectorCopyAdmission) -> Result<Vec<VectorEntry>> {
         self.with_bulk_read(|| {
             let mut entries = Vec::new();
@@ -21133,6 +21364,7 @@ impl VectorStore {
     /// Lightweight durable identities used by startup bookkeeping. This does
     /// not fault a vector body into memory.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn raw_directory_entries(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -21170,6 +21402,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ensure_all_raw_vectors_loaded(&self, owner: &mut VectorCopyAdmission) -> Result<()> {
         self.with_bulk_read(|| {
             for column in self.registry.read().values() {
@@ -21182,6 +21415,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ensure_raw_partition_loaded(
         &self,
         index: &VectorIndexRef,
@@ -21197,6 +21431,7 @@ impl VectorStore {
     /// Admit the raw-image copies and affected graph encodings before purge
     /// loads its selected values or constructs a replacement registry.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn purge_workspace_bounds(
         &self,
         rows: &[(String, RowId)],
@@ -21261,6 +21496,7 @@ impl VectorStore {
     /// replacement image: every version of the selected lineage must be
     /// available, while unrelated partitions remain dormant.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ensure_raw_partitions_containing_rows(
         &self,
         table: &str,
@@ -21312,6 +21548,7 @@ impl VectorStore {
     /// The caller admits the complete selected-partition copy first through
     /// `purge_workspace_bounds`; unaffected states are carried by handle.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn durable_entries_of_partitions_containing_rows(
         &self,
         table: &str,
@@ -21357,6 +21594,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn all_partitioned_entries(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -21432,6 +21670,7 @@ impl VectorStore {
     /// `try_all_partitioned_entries` restricted to the indexes `keep`
     /// selects: only those are hydrated and cloned.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_partitioned_entries_matching(
         &self,
         keep: impl Fn(&VectorIndexRef) -> bool,
@@ -21466,6 +21705,7 @@ impl VectorStore {
 
     /// Export the resident image with exact source membership and executing
     /// copy ownership. Memory stores remain whole-resident; no row reconstruction.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_resident_partitioned_entries_with_membership(
         &self,
         owner: VectorCopyAdmission,
@@ -21474,6 +21714,7 @@ impl VectorStore {
     }
 
     /// Select borrowed column metadata before any selected image allocation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_resident_partitioned_entries_with_membership_matching(
         &self,
         mut owner: VectorCopyAdmission,
@@ -21534,6 +21775,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_all_partitioned_entries(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -21569,6 +21811,7 @@ impl VectorStore {
     /// Whole-row removal can update reverse maps in place instead of copying
     /// every surviving partition key into a rebuilt map.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prune_row_ids_in_indexes(
         &self,
         row_ids: &HashSet<RowId>,
@@ -21626,6 +21869,7 @@ impl VectorStore {
 
     /// Admit the complete pruning inventory before changing any partition.
     /// Summaries are read now and applied only after every column has prepared.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_pruning_columns(
         &self,
         indexes: &[VectorIndexRef],
@@ -21678,6 +21922,7 @@ impl VectorStore {
         Ok(prepared)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prune_row_ids(
         &self,
         row_ids: &HashSet<RowId>,
@@ -21765,6 +22010,7 @@ impl VectorStore {
     /// accountant (this never releases the reported bytes internally, so a
     /// caller summing several populations into one `accountant.release(...)`
     /// call never double-releases).
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn prune_superseded_versions(
         &self,
         versions: &[VectorVersionIdentity],
@@ -21851,6 +22097,7 @@ impl VectorStore {
     /// partitions' durable directories alone: no partition is faulted in, so
     /// an idle retained partition stays dormant while a superseded version it
     /// holds is still found and can be pruned durably.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn directory_versions_matching(
         &self,
         index: &VectorIndexRef,
@@ -21906,6 +22153,7 @@ impl VectorStore {
     /// The caller can admit each owned copy before making it; vector bodies
     /// and unrelated directory entries are never materialized by this visit.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visit_directory_versions_for_rows(
         &self,
         index: &VectorIndexRef,
@@ -21948,6 +22196,7 @@ impl VectorStore {
     /// loading vector bodies. Complete-image replacement uses this after the
     /// replacement registry is published, when the prior live version is now
     /// historical but still owns a raw body and durable membership.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn directory_versions_for_rows(
         &self,
         index: &VectorIndexRef,
@@ -21996,6 +22245,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn entries_for_index(
         &self,
         index: &VectorIndexRef,
@@ -22036,6 +22286,7 @@ impl VectorStore {
     /// Count the raw snapshot and selected live graph input without loading or
     /// cloning vector bodies. A change graph selects only the post-base suffix.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn partition_generation_entry_counts(
         &self,
         index: &VectorIndexRef,
@@ -22116,6 +22367,7 @@ impl VectorStore {
     /// only append or tombstone entries; each payload copy takes one short read
     /// lock, and a later tombstone cannot erase visibility at this snapshot.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn entries_for_partition_at_snapshot(
         &self,
         index: &VectorIndexRef,
@@ -22187,6 +22439,7 @@ impl VectorStore {
     /// frontier. Retained history stays in the store; later appends and
     /// tombstones cannot enlarge this snapshot's admitted selection.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn entries_for_partition_generation_at_snapshot(
         &self,
         index: &VectorIndexRef,
@@ -22296,6 +22549,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn entries_for_partition(
         &self,
         index: &VectorIndexRef,
@@ -22311,6 +22565,7 @@ impl VectorStore {
     /// Count one column at the caller's snapshot without materializing inspection
     /// rows or traversing retained vector bodies and reverse directories.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visible_entry_count(
         &self,
         index: &VectorIndexRef,
@@ -22322,6 +22577,7 @@ impl VectorStore {
 
     /// Count source-backed membership without hydrating directory records.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_visible_entry_count(
         &self,
         index: &VectorIndexRef,
@@ -22390,6 +22646,7 @@ impl VectorStore {
 
     /// The purge planner uses this to preserve the materialization contract
     /// without causing previously lazy indexes to allocate a graph.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn materialized_hnsw_indexes(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -22410,6 +22667,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn materialized_hnsw_partitions(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -22571,6 +22829,7 @@ impl VectorStore {
 
     /// Register durable graph metadata for one partition without loading it.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_dormant_partition_generation(
         &self,
         partition: &VectorPartitionRef,
@@ -22615,6 +22874,7 @@ impl VectorStore {
     /// owner reserves its resident bytes before this call; this method only
     /// transfers ownership at one atomic partition publication point.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn install_loaded_partition_generation(
         &self,
         partition: &VectorPartitionRef,
@@ -22632,6 +22892,7 @@ impl VectorStore {
     /// tail. Superseded sealed graphs remain pinned until the engine calls the
     /// reclaim method with no registered old snapshots.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn publish_partition_base_generation(
         &self,
         partition: &VectorPartitionRef,
@@ -22863,6 +23124,7 @@ impl VectorStore {
     /// entry bytes but gives later commits the fresh in-process insertion
     /// target that sealed graphs deliberately refuse.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn initialize_partition_fresh_tail(
         &self,
         partition: &VectorPartitionRef,
@@ -22882,6 +23144,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn preload_dormant_partition_generation(
         &self,
         partition: &VectorPartitionRef,
@@ -22935,6 +23198,7 @@ impl VectorStore {
     /// crate (for example disk admission); only a later successful generation
     /// publication clears the mark.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn record_partition_maintenance_failure(
         &self,
         partition: &VectorPartitionRef,
@@ -22947,6 +23211,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn record_partition_maintenance_failure_details(
         &self,
         partition: &VectorPartitionRef,
@@ -22969,6 +23234,7 @@ impl VectorStore {
     /// Classify and retain a maintenance error raised by an engine-owned
     /// durable preparation or publication step outside this crate.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn record_partition_maintenance_error(
         &self,
         partition: &VectorPartitionRef,
@@ -22987,6 +23253,7 @@ impl VectorStore {
     /// Clear a retained failure only after the caller has completed the
     /// matching durable publication successfully.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn clear_partition_maintenance_failure(
         &self,
         partition: &VectorPartitionRef,
@@ -23159,6 +23426,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn partition_route_quarantines(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -23289,6 +23557,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn find_by_row_id(
         &self,
         row_id: RowId,
@@ -23309,6 +23578,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn live_entry_for_row(
         &self,
         index: &VectorIndexRef,
@@ -23377,6 +23647,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn load_live_entry_for_row(
         &self,
         index: &VectorIndexRef,
@@ -23401,6 +23672,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn live_entries_for_row(
         &self,
         row_id: RowId,
@@ -23426,6 +23698,7 @@ impl VectorStore {
 
     /// Whether a row has a visible vector in this column. This consults only
     /// the lightweight durable directory and never faults a body into memory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn has_live_entry_for_row(
         &self,
         index: &VectorIndexRef,
@@ -23439,6 +23712,7 @@ impl VectorStore {
     /// Durable counterpart of the resident-only existence probe. Integrity and
     /// storage errors remain errors rather than an absent row.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_has_live_entry_for_row(
         &self,
         index: &VectorIndexRef,
@@ -23465,6 +23739,7 @@ impl VectorStore {
 
     /// Whether a row has any visible vector column. This is the body-free
     /// existence check used by row delete and replacement planning.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn has_any_live_entry_for_row(
         &self,
         row_id: RowId,
@@ -23475,6 +23750,7 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_has_any_live_entry_for_row(
         &self,
         row_id: RowId,
@@ -23512,6 +23788,7 @@ impl VectorStore {
 
     /// Load only partitions that contain a visible value for this row, then
     /// return every vector column owned by that row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn load_live_entries_for_row(
         &self,
         row_id: RowId,
@@ -23543,6 +23820,7 @@ impl VectorStore {
 
     /// Materialize only partitions containing one of the selected row ids and
     /// return every retained vector version for those rows.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn load_entries_for_rows(
         &self,
         row_ids: &HashSet<RowId>,
@@ -23597,6 +23875,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn vector_for_row_lsn(
         &self,
         index: &VectorIndexRef,
@@ -23616,6 +23895,7 @@ impl VectorStore {
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn vector_for_row_lsn_in_partition(
         &self,
         index: &VectorIndexRef,
@@ -23637,6 +23917,7 @@ impl VectorStore {
 
     /// Resolve an exact row version through the lightweight directories and
     /// load only the partition that owns that version.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn load_vector_for_row_lsn(
         &self,
         index: &VectorIndexRef,
@@ -23658,6 +23939,7 @@ impl VectorStore {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn storage_bytes_per_entry(
         &self,
         index: &VectorIndexRef,
@@ -23670,6 +23952,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn storage_bytes_per_entry_in_partition(
         &self,
         index: &VectorIndexRef,
@@ -23683,6 +23966,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn live_partition_count(&self, index: &VectorIndexRef) -> Result<usize> {
         if let Some(counts) = self.paged_partition_counts(index)? { return Ok(counts[1]); }
         self.with_bulk_read(|| {
@@ -23694,6 +23978,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn retained_partition_count(&self, index: &VectorIndexRef) -> Result<usize> {
         if let Some(counts) = self.paged_partition_counts(index)? { return Ok(counts[2]); }
         self.with_bulk_read(|| {
@@ -23707,6 +23992,7 @@ impl VectorStore {
 
     /// Number of partition states that count against MAX_PARTITIONS: each
     /// state with at least one live row or one retained historical row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn live_or_retained_partition_count(&self, index: &VectorIndexRef) -> Result<usize> {
         if let Some(counts) = self.paged_partition_counts(index)? { return Ok(counts[3]); }
         self.with_bulk_read(|| {
@@ -23718,6 +24004,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn retained_bytes_for_index(&self, index: &VectorIndexRef) -> Result<usize> {
         self.with_bulk_read(|| {
             self.try_column(index)
@@ -23929,6 +24216,7 @@ impl VectorStore {
     /// exact reservations makes later column/table removal release the same
     /// bytes without guessing from the then-current cache contents.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn account_loaded_state(&self, accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Result<usize> {
         let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
 
@@ -23941,6 +24229,7 @@ impl VectorStore {
     /// `reserved` is newly admitted, and a surplus is released. On an error
     /// nothing of `reserved` is touched; the caller still owns it.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn account_loaded_state_within(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -23953,6 +24242,7 @@ impl VectorStore {
 
     // Received owned bodies stay inline. Each column admits its retained
     // bodies before publication; the executing workspace remains transient.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn account_received_state_with_directory_charges(
         &self,
         mut directory_charges: PreparedDirectoryCharges,
@@ -24011,6 +24301,7 @@ impl VectorStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn account_loaded_state_with_directory_charges(
         &self,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -24149,6 +24440,7 @@ impl VectorStore {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn index_infos(&self, owner: &mut VectorCopyAdmission) -> Result<Vec<VectorIndexInfo>> {
         self.with_bulk_read(|| {
             let registry = self.registry.read();
@@ -24187,6 +24479,7 @@ impl VectorStore {
             Ok(infos)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn index_layout_infos(
         &self,
         owner: &mut VectorCopyAdmission,

@@ -57,6 +57,7 @@ pub struct SavedPoint<'a> {
 impl SavedPoint<'_> {
     /// Upper bound for the one native decode, native encoding and key frame
     /// that coexist. The caller admits this before `decode`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn workspace_bytes(&self) -> Result<usize> {
         self.encoded_bytes
             .checked_mul(8)
@@ -73,6 +74,7 @@ impl SavedPoint<'_> {
             self.values.to_vec()
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn decode(&self) -> Result<PagedVectorPoint> {
         let mut reader = DurableReader::new(self.edges);
         let mut neighbours = Vec::with_capacity(16);
@@ -114,6 +116,7 @@ impl SavedPoint<'_> {
     }
 }
 impl<'a> SavedTopology<'a> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn inspect(
         bytes: &'a [u8],
         dimension: usize,
@@ -357,10 +360,12 @@ impl<'a> SavedTopology<'a> {
     }
 
     /// The row a data id names.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn row_of(&self, origin: usize) -> Result<RowId> {
         self.row(origin)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row(&self, origin: usize) -> Result<RowId> {
         let mut low = 0usize;
         let mut high = self.rows.len() / ROW_BYTES;
@@ -378,6 +383,7 @@ impl<'a> SavedTopology<'a> {
         }
         Err(invalid())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn next_point(&self, cursor: &mut SavedPointCursor) -> Result<Option<SavedPoint<'a>>> {
         while cursor.layer < self.max_layer && cursor.rank == self.state.layer_counts[cursor.layer]
         {
@@ -431,6 +437,7 @@ impl<'a> SavedTopology<'a> {
             quantization: self.quantization,
         }))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visit_exact(&self, visitor: &mut dyn FnMut(&[u8], RowId) -> Result<()>) -> Result<()> {
         let mut reader = DurableReader::new(self.exact);
         let count = reader.read_usize()?;
@@ -477,6 +484,7 @@ impl<'a> SavedTopology<'a> {
 }
 /// The byte length of a saved envelope's exact-vector section at the start of
 /// `bytes`, validating it as [`SavedTopology::visit_exact`] does.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn exact_section_len(
     bytes: &[u8],
     dimension: usize,
@@ -512,6 +520,7 @@ fn exact_section_len(
     Ok(bytes.len() - reader.remaining().len())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_values(bytes: &[u8], dimension: usize, quantization: VectorQuantization) -> Result<()> {
     match quantization {
         VectorQuantization::F32 => {

@@ -824,6 +824,7 @@ impl Drop for ScoreCredit {
 }
 
 impl SearchScores {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(index: &VectorIndexRef, budget: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Result<Self> {
         let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
 
@@ -849,6 +850,7 @@ impl SearchScores {
 
     /// Consume the allocation and its actual charge together. The destination
     /// must consume this charge through the matched prepaid admission bridge.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn into_prepaid(
         self,
         destination: &crate::memory_budget::MemoryBudgetOwner,
@@ -860,6 +862,7 @@ impl SearchScores {
         Ok((self.rows, self.credit))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn from_charged(
         rows: Vec<(RowId, f32)>,
         index: &VectorIndexRef,
@@ -897,6 +900,7 @@ impl SearchScores {
         self
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reserve(&mut self, additional: usize) -> Result<()> {
         let wanted = self
             .rows
@@ -926,6 +930,7 @@ impl SearchScores {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn charge(&mut self, bytes: usize) -> Result<()> {
         self.credit
             .budget
@@ -953,12 +958,14 @@ impl SearchScores {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_push(&mut self, row: (RowId, f32)) -> Result<()> {
         self.reserve(1)?;
         self.rows.push(row);
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_extend(&mut self, rows: impl IntoIterator<Item = (RowId, f32)>) -> Result<()> {
         let rows = rows.into_iter();
         self.reserve(rows.size_hint().0)?;
@@ -1029,6 +1036,7 @@ fn vector_score_quality(left: &(RowId, f32), right: &(RowId, f32)) -> std::cmp::
         .then_with(|| right.0.cmp(&left.0))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn push_bounded_score_heap(scores: &mut Vec<(RowId, f32)>, score: (RowId, f32)) -> Result<()> {
     scores.push(score);
     let mut child = scores.len().checked_sub(1).ok_or_else(|| {
@@ -1048,6 +1056,7 @@ fn push_bounded_score_heap(scores: &mut Vec<(RowId, f32)>, score: (RowId, f32)) 
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn replace_bounded_score_heap_root(scores: &mut [(RowId, f32)], score: (RowId, f32)) -> Result<()> {
     let Some(root) = scores.first_mut() else {
         return Err(Error::Other((
@@ -1762,6 +1771,7 @@ impl OwnedVectorSearchTrace {
     pub fn debug_trace_for_test(&self) -> &VectorSearchDebugTrace {
         &self.trace
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn brute_force(
         index: &VectorIndexRef,
         rows: &[(RowId, f32)],
@@ -1782,6 +1792,7 @@ impl OwnedVectorSearchTrace {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn brute_force_with_owner(
         index: &VectorIndexRef,
         rows: &[(RowId, f32)],
@@ -1837,6 +1848,7 @@ impl OwnedVectorSearchTrace {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn replace_final_rows(&mut self, rows: &[(RowId, f32)]) -> Result<()> {
         let (ids, bytes) = allocate_vector_row_ids(
             rows,
@@ -1881,6 +1893,7 @@ impl OwnedVectorSearchTrace {
 
     /// The destination consumes this charge via VectorCopyAdmission::from_prepaid
     /// against its actual owner and adopts the charge exactly once before transfer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn into_prepaid(
         mut self,
         destination: &crate::memory_budget::MemoryBudgetOwner,
@@ -2179,6 +2192,7 @@ impl BoundedVectorCandidateGroups {
 
     /// Inspect only the already captured nonempty sources, one fixed
     /// metadata window at a time. This never builds a partition-info array.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn has_pending_tail_without_load(&self, owner: &mut crate::VectorCopyAdmission) -> Result<bool> {
         for source in self.sources.iter().filter(|source| source.allowed_count != 0) {
             let pending = if let Some(selection) = &source.serving_selection {
@@ -2294,6 +2308,7 @@ impl BoundedVectorSearchTrace {
     /// Move the trace together with the actual caller's already held charge.
     /// The prepaid bridge rejects another accountant and retains the complete
     /// token until output drop or a consuming matched destination transfer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn into_owned<C: crate::PrepaidVectorCopyCharge + 'static>(
         self,
         executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -2476,6 +2491,7 @@ impl BoundedBruteForceCursor {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn checked_vector_add(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_add(right).ok_or_else(|| {
         Error::Other((format!(
@@ -2484,6 +2500,7 @@ fn checked_vector_add(left: usize, right: usize, operation: &str) -> Result<usiz
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn checked_vector_mul(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_mul(right).ok_or_else(|| {
         Error::Other((format!(
@@ -2729,6 +2746,7 @@ where
     Ok((VectorIndexRef { table, column }, retained_bytes))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn next_vector_capacity(current: usize, required: usize) -> Result<usize> {
     if current == 0 {
         return Ok(required);
@@ -2904,6 +2922,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_hnsw_trace<E>(
     index: &VectorIndexRef,
     hnsw_len: usize,
@@ -3299,6 +3318,7 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
         }
     }
     // Existing standalone/public mutations retain their genuine Legacy route.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_write_set<R>(
         &self,
         tx: TxId,
@@ -3322,6 +3342,7 @@ pub struct MemVectorExecutor<S: WriteSetApplicator> {
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// The row checks a statement over `index` may spend checking its filter
     /// row by row: see `BoundedVectorCandidateGroups::row_check_allowance`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn bounded_row_check_allowance(
         &self,
         index: &VectorIndexRef,
@@ -3349,6 +3370,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         }
     }
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn stage_engine_vector(
         &self,
         tx: TxId,
@@ -3928,6 +3950,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// admitted candidate grouping. Query allocation is reconciled before copy;
     /// partition-local candidate slices transfer directly into the cursor.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn bounded_brute_force_cursor_grouped<E>(
         &self,
         index: VectorIndexRef,
@@ -4702,6 +4725,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// Existing public callers keep the original never-true classification.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn bounded_hnsw_search_grouped_with_reader_memory_refusal<E>(
         &self,
         index: &VectorIndexRef,
@@ -5918,6 +5942,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// their own partition's stored vector. The request work limit is shared.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::drop_non_drop)] // Explicitly end callback borrows before partition publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bounded_union_search<E>(
         &self,
         index: &VectorIndexRef,
@@ -6500,6 +6525,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// than its walk distance promised, and the next row is scored in its
     /// place instead of the page going out short or out of order.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn resolve_union_candidates<E>(
         &self,
         index: &VectorIndexRef,
@@ -7197,6 +7223,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     /// Narrow through the captured reverse and forward membership at this snapshot.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn selected_partition_sources(
         &self,
         index: &VectorIndexRef,
@@ -7307,6 +7334,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// at a time. AUTO may also stream a resident loader when bulk admission
     /// refuses; explicit EXACT preserves that loader's typed refusal.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn brute_force_search_sources(
         &self,
         index: &VectorIndexRef,
@@ -7456,6 +7484,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// against the database's memory before it is read and returning it
     /// straight after, so the comparison never needs room for the partition.
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stream_source_bodies(
         &self,
         index: &VectorIndexRef,
@@ -7579,6 +7608,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn aggregate_authorized_source_count(
         sources: &[BoundedSnapshotVectorSource],
         candidates: Option<&RoaringTreemap>,
@@ -7615,6 +7645,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// the already-resident raw directories and honors the same authorization
     /// bitmap and selected partition prefixes as execution; it never loads a
     /// vector body or graph and never builds a route.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn authorized_visible_count_without_build(
         &self,
         index: &VectorIndexRef,
@@ -7802,6 +7833,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn search_with_mode(
         &self,
         index: VectorIndexRef,
@@ -7818,6 +7850,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn search_with_mode_owned(
         &self,
         index: VectorIndexRef,
@@ -7844,6 +7877,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// Preserve the search ladder while inheriting the executing route's
     /// durable-read preference and its actual temporary-capacity funder.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn search_with_mode_admission(
         &self,
         index: VectorIndexRef,
@@ -7863,6 +7897,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn search_with_mode_route(
         &self,
         index: VectorIndexRef,
@@ -8180,6 +8215,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// Compatibility route for existing lower-level callers. Their published
     /// behavior is the column-default automatic ladder; engine query surfaces
     /// that resolve an explicit mode call [`Self::search_with_mode`] instead.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn search_with_strategy(
         &self,
         index: VectorIndexRef,
@@ -8203,6 +8239,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn search_with_strategy_for_test(
         &self,
         index: VectorIndexRef,
@@ -8219,6 +8256,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
     /// Compatibility availability probe. Despite its retained name, this is
     /// now an observer: only explicit store maintenance may build a graph.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ensure_hnsw_built(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> Result<bool> {
         self.store.with_bulk_read(|| {
             let snapshot_tx = TxId::from_snapshot(snapshot);
@@ -8237,6 +8275,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn hnsw_eligible_without_build(
         &self,
         index: &VectorIndexRef,
@@ -8251,6 +8290,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_hnsw_eligible_without_build(
         &self,
         index: &VectorIndexRef,
@@ -8284,6 +8324,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// caller supplies the already-authorized candidate set and may install a
     /// partition-prefix scope with `with_selected_partition_prefixes`, exactly
     /// as execution does.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn graph_layer_presence_without_load(
         &self,
         index: &VectorIndexRef,
@@ -8321,6 +8362,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// pull kernel's already-sorted authorized candidate list. Reusing that
     /// list keeps route disclosure from rescanning the relational table just
     /// to reconstruct authorization the query has already applied.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn graph_layer_presence_without_load_for_sorted_ids(
         &self,
         index: &VectorIndexRef,
@@ -8357,6 +8399,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_hnsw_search_covers_all_without_build(
         &self,
         index: &VectorIndexRef,
@@ -8395,6 +8438,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn hnsw_search_covers_all_without_build(
         &self,
         index: &VectorIndexRef,

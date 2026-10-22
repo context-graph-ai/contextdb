@@ -23,6 +23,7 @@ pub trait MemoryBudget: Debug + Send + Sync {
         self as *const Self as *const () as usize
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_allocate_for(
         &self,
         bytes: usize,
@@ -33,6 +34,7 @@ pub trait MemoryBudget: Debug + Send + Sync {
 
     /// Keep engine literals borrowed through refusal. The default preserves
     /// the ordinary contract of externally supplied budgets.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_allocate_for_static(
         &self, bytes: usize, subsystem: &'static str,
         operation: &'static str, hint: &'static str,
@@ -40,6 +42,7 @@ pub trait MemoryBudget: Debug + Send + Sync {
         self.try_allocate_for(bytes, subsystem, operation, hint)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_allocate_for_label(
         &self, bytes: usize, subsystem: &'static str,
         operation: contextdb_core::error::DiagnosticLabel, hint: &'static str,
@@ -52,6 +55,7 @@ pub trait MemoryBudget: Debug + Send + Sync {
     /// Atomically replace the caller's held charge. Delta-based budgets can
     /// use the default: it never exposes the old charge or adds old + new.
     /// A shared budget must validate growth against its published limit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transition_reservation_for(
         &self,
         old_bytes: usize,
@@ -69,6 +73,7 @@ pub trait MemoryBudget: Debug + Send + Sync {
     }
 
     /// External implementations retain their existing atomic transition.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transition_reservation_for_static(
         &self, old_bytes: usize, new_bytes: usize,
         subsystem: &'static str, operation: &'static str, hint: &'static str,
@@ -85,6 +90,7 @@ pub trait MemoryBudget: Debug + Send + Sync {
     /// Move bytes already charged to the active caller into a retained store
     /// owner without touching the shared total. Budgets with no caller-bound
     /// transfer return `false`, and loaders reserve those bytes themselves.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn adopt_caller_reservation(&self, _bytes: usize) -> Result<bool> {
         Ok(false)
     }
@@ -96,6 +102,7 @@ impl Drop for LabelInvoice {
     fn drop(&mut self) { self.owner.release(self.bytes); }
 }
 #[doc(hidden)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn prepare_operation_label(
     owner: &MemoryBudgetOwner, value: impl std::fmt::Display,
 ) -> Result<contextdb_core::error::DiagnosticLabel> {
@@ -351,6 +358,7 @@ impl VectorCopyAdmission {
 
     /// Consume the caller's real prepaid owner without admitting it again.
     /// A mismatched accountant refuses and drops the supplied charge normally.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn from_prepaid<C: PrepaidVectorCopyCharge + 'static>(
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         charge: C,
@@ -363,6 +371,7 @@ impl VectorCopyAdmission {
 
     /// On refusal or callback unwind, the caller still owns its prepaid charge.
     /// Trace handoff uses this to free buffers before returning their debit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn from_prepaid_retaining_charge<C: PrepaidVectorCopyCharge + 'static>(
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         charge: &mut Option<C>,
@@ -442,6 +451,7 @@ impl VectorCopyAdmission {
         );
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reserve(&mut self, bytes: usize) -> Result<()> {
         self.reserve_for_static(
             bytes,
@@ -452,6 +462,7 @@ impl VectorCopyAdmission {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reserve_for(
         &mut self,
         bytes: usize,
@@ -480,6 +491,7 @@ impl VectorCopyAdmission {
     /// Static companion for engine-created copy labels; the dynamic host
     /// entry point above retains its original signature and behavior.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn reserve_for_static(
         &mut self, bytes: usize, component: &'static str,
         operation: &'static str, hint: &'static str,
@@ -611,6 +623,7 @@ impl<T> ScopedVectorCopy<T> {
     /// Transform while source and output coexist under the same admitted
     /// window; on every exit the source buffer drops before its token.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_map<U>(
         self,
         materialize: impl FnOnce(&T) -> Result<U>,
@@ -625,6 +638,7 @@ impl<T> ScopedVectorCopy<T> {
 
     /// Only for provider paths whose allocation is already funded elsewhere.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn into_already_funded(self) -> Result<T> {
         if self._admission.is_some() {
             return Err(contextdb_core::Error::Other(
@@ -634,6 +648,7 @@ impl<T> ScopedVectorCopy<T> {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(
         owner: &mut VectorCopyAdmission,
         materialize: impl FnOnce(&mut VectorCopyAdmission) -> Result<T>,
@@ -662,6 +677,7 @@ impl<T> std::ops::DerefMut for ScopedVectorCopy<T> {
 
 /// Workspace-internal layout copy; public layout fields remain unchanged.
 #[doc(hidden)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn scoped_index_layout(
     store: &crate::VectorStore,
     index: &contextdb_core::VectorIndexRef,
@@ -762,10 +778,12 @@ impl VectorWorkspaceReservation {
 
     /// Validate a materialization against this already admitted workspace.
     /// The caller retains this reservation until all copied output is dropped.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn require_capacity(&self, bytes: usize) -> Result<()> {
         require_copy_capacity(self.bytes, bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_new(
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_bytes: Arc<AtomicUsize>,
@@ -786,6 +804,7 @@ impl VectorWorkspaceReservation {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_new_static(
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_bytes: Arc<AtomicUsize>,
@@ -810,6 +829,7 @@ impl VectorWorkspaceReservation {
     /// and before new owners allocate. Refusal preserves the old token and
     /// charge; success changes the token and the live workspace counter once.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn resize(&mut self, bytes: usize, operation: &str, hint: &str) -> Result<()> {
         self.accountant.transition_reservation_for(
             self.bytes,
@@ -829,6 +849,7 @@ impl VectorWorkspaceReservation {
         self.bytes = bytes;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn resize_static(&mut self, bytes: usize, operation: &'static str, hint: &'static str) -> Result<()> {
         self.accountant.transition_reservation_for_static(
             self.bytes,
@@ -1014,6 +1035,7 @@ mod tests {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn require_copy_capacity(capacity: usize, bytes: usize) -> Result<()> {
     if bytes > capacity {
         return Err(contextdb_core::Error::MemoryBudgetExceeded {

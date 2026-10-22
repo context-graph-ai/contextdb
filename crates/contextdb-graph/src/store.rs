@@ -131,6 +131,7 @@ impl GraphStore {
         self.source.is_some()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn capture_source(
         &self,
         snapshot: SnapshotId,
@@ -147,6 +148,7 @@ impl GraphStore {
     /// Visit one version at a time; false stops at the current window. This
     /// helper never collects adjacency, and an identity query seeks only that
     /// identity in the durable implementation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visit_edges(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,
@@ -156,6 +158,7 @@ impl GraphStore {
         self.visit_edges_with_owner(root, query, |entry, _| visit(entry))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visit_edges_with_owner(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,
@@ -204,6 +207,7 @@ impl GraphStore {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn visit_row_edges(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,

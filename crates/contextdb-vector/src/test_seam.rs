@@ -416,6 +416,7 @@ pub struct SavedTopologyBoundaryForTest {
     pub max_exact_key_bytes: usize,
 }
 #[doc(hidden)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn saved_topology_boundary_for_test(
     bytes: &[u8],
     dimension: usize,

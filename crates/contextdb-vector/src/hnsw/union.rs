@@ -403,6 +403,7 @@ impl NavigationSession {
             .try_lock()
             .is_some_and(|mut cache| cache.evict_lru())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve_for(
         &self,
         token: &mut crate::memory_budget::VectorCopyAdmission,
@@ -419,6 +420,7 @@ impl NavigationSession {
             }
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve_for_static(
         &self,
         token: &mut crate::memory_budget::VectorCopyAdmission,
@@ -435,6 +437,7 @@ impl NavigationSession {
             }
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve(
         &self,
         token: &mut crate::memory_budget::VectorCopyAdmission,

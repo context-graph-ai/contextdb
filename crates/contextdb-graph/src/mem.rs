@@ -258,6 +258,7 @@ impl BoundedBfsCursor {
     /// Preserve every visible physical edge binding for single-hop SQL. This
     /// must be selected before the first pull; reachability keeps coalescing.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn preserve_single_hop_bindings(&mut self) -> Result<()> {
         if self.min_depth != 1 || self.max_depth != 1 {
             return Err(Error::InvalidStateTransition(
@@ -274,6 +275,7 @@ impl BoundedBfsCursor {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn checked_graph_add(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_add(right).ok_or_else(|| {
         Error::Other((format!(
@@ -282,6 +284,7 @@ fn checked_graph_add(left: usize, right: usize, operation: &str) -> Result<usize
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn checked_graph_mul(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_mul(right).ok_or_else(|| {
         Error::Other((format!(
@@ -290,6 +293,7 @@ fn checked_graph_mul(left: usize, right: usize, operation: &str) -> Result<usize
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_capacity_bytes<T>(capacity: usize, operation: &str) -> Result<usize> {
     checked_graph_mul(capacity, std::mem::size_of::<T>(), operation)
 }
@@ -816,6 +820,7 @@ where
     Ok((Some(filters), retained))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn next_graph_capacity(current: usize, required: usize) -> Result<usize> {
     if current == 0 {
         return Ok(required);
@@ -998,6 +1003,7 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
             Self::Owned(handle) => handle.with_transactions(|transactions| transactions.snapshot()),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_graph_read<R>(&self, tx: TxId, f: impl FnOnce(GraphStaging<'_>) -> R) -> Result<R> {
         match self {
             Self::Legacy(manager) => manager.with_write_set(tx, |ws| {
@@ -1020,6 +1026,7 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
             }),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_write_set<R>(
         &self,
         tx: TxId,
@@ -1101,6 +1108,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
 
     /// Validate a row-derived edge before its admitted transaction mutation.
     /// Endpoint deduplication is deliberately absent: ownership is per row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn validate_row_edge(
         &self,
         tx: TxId,
@@ -1129,6 +1137,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn edge_count(
         &self,
         source: NodeId,
@@ -1141,6 +1150,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         self.try_edge_count(source, edge_type, snapshot, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_edge_count(
         &self,
         source: NodeId,
@@ -1170,6 +1180,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_neighbors(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,
@@ -1254,6 +1265,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bfs_with_write_set(
         &self,
         tx: TxId,
@@ -1412,6 +1424,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     /// Use the root already captured by the enclosing statement. The engine
     /// supplies the same handle used by relational and vector consumers.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn bounded_bfs_cursor_at_source<E>(
         &self,
         start: NodeId,
@@ -2288,6 +2301,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     /// alike would put an allocation on every walked edge that nothing had
     /// reserved.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_bounded_neighbor<E, Edge, Path, Retain, Release>(
         &self,
         cursor: &mut BoundedBfsCursor,
@@ -2471,6 +2485,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
 
     /// Traverse using the enclosing statement's pinned source root.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn bfs_at_source(
         &self,
         start: NodeId,
@@ -2600,6 +2615,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok((TraversalResult { nodes }, credit.into_inner()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn current_edge_properties(
         &self,
         source: NodeId,
@@ -2629,6 +2645,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(existing)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn current_owned_edge_properties(
         &self, source: NodeId, target: NodeId, edge_type: &str,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -2656,6 +2673,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(existing)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn owned_dag_reaches(
         &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
         start: NodeId, goal: NodeId, edge_type: &str,
@@ -2707,6 +2725,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(false)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_owned_graph_entry(
         &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
         entry: &AdjEntry, replacement: bool,
@@ -2745,6 +2764,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_owned_edge(
         &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
         source: NodeId, target: NodeId, edge_type: String,
@@ -2781,6 +2801,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     }
 
     /// Carry one edge forward with a new property set, as one replacement.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn replace_edge_properties(
         &self,
         tx: TxId,
@@ -2842,6 +2863,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         .map(|(result, _credit)| result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn neighbors(
         &self,
         node: NodeId,
@@ -2957,6 +2979,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         Ok(true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_edge(
         &self,
         tx: TxId,
