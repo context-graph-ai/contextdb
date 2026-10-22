@@ -1,8 +1,9 @@
+#[cfg(test)]
+use crate::memory_budget::MemoryBudget;
 use crate::hnsw::{
     BoundedHnswQuerySelfScores, HnswAllowedSearchIncomplete, HnswAllowedSearchLimits,
     HnswAllowedSearchStatus,
 };
-use crate::memory_budget::MemoryBudget;
 use crate::{
     HnswIndex,
     store::{VectorGraphLayerAvailability, VectorStore},
@@ -747,8 +748,10 @@ pub fn with_selected_partition_prefixes<T>(
 
 // capture969 begin
 #[cfg(feature = "test-seams")]
+type TraceHandoffObserver = fn(&'static str, usize, usize, usize);
+#[cfg(feature = "test-seams")]
 thread_local! {
-    static TRACE_HANDOFF_CUT: std::cell::Cell<Option<fn(&'static str, usize, usize, usize)>> =
+    static TRACE_HANDOFF_CUT: std::cell::Cell<Option<TraceHandoffObserver>> =
         const { std::cell::Cell::new(None) };
 }
 #[cfg(feature = "test-seams")]
@@ -1730,11 +1733,10 @@ impl OwnedVectorSearchTrace {
             score_credit_bytes: self.credit.bytes,
             ..Default::default()
         };
-        if let Some(admission) = self.admission.as_ref() {
-            if let Some(original) = admission.complete_invoice_for_test(&mut receipt) {
+        if let Some(admission) = self.admission.as_ref()
+            && let Some(original) = admission.complete_invoice_for_test(&mut receipt) {
                 visit(original);
             }
-        }
         receipt
     }
 
@@ -3366,7 +3368,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Self {
             store,
             tx_mgr: ExecutorTransactions::Owned(transactions),
-            _accountant: accountant,
+            _accountant,
         }
     }
     #[doc(hidden)]
@@ -3422,7 +3424,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Self {
             store,
             tx_mgr: ExecutorTransactions::Legacy(tx_mgr),
-            _accountant: accountant,
+            _accountant,
         }
     }
 
@@ -3493,6 +3495,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
+    #[expect(clippy::too_many_arguments, reason = "Source capture keeps layout, snapshot, selection, admission and cancellation owners explicit.")]
     fn bounded_scoped_snapshot_sources<E>(
         &self,
         index: &VectorIndexRef,
@@ -4112,13 +4115,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     pub fn bounded_brute_force_step_charged<E>(
         &self,
         cursor: &mut BoundedBruteForceCursor,
-        mut admit_row: Option<&mut dyn FnMut(RowId) -> std::result::Result<bool, E>>,
-        mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
-        mut before_precharged_candidate: impl FnMut() -> std::result::Result<(), E>,
-        mut before_exhaustive_candidate: impl FnMut() -> std::result::Result<(), E>,
-        mut before_distance: impl FnMut() -> std::result::Result<(), E>,
-        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
-        mut release_retained: impl FnMut(usize),
+        admit_row: Option<&mut dyn FnMut(RowId) -> std::result::Result<bool, E>>,
+        before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        before_precharged_candidate: impl FnMut() -> std::result::Result<(), E>,
+        before_exhaustive_candidate: impl FnMut() -> std::result::Result<(), E>,
+        before_distance: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
         owner: &mut crate::VectorCopyAdmission,
     ) -> std::result::Result<BoundedVectorStep, E>
     where
@@ -4887,7 +4890,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
         }
 
-        let snapshot_tx = TxId::from_snapshot(snapshot);
         // Each load makes room for exactly what it reads from its saved
         // topology, by evicting idle graphs of partitions this statement is
         // not searching -- never one it is about to search, which would make a
@@ -5435,9 +5437,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         layout.resolve_search_radius(),
                         HnswAllowedSearchLimits {
                             max_vector_evaluations: allowed_search_limits
-                                .max_vector_evaluations
-                                .checked_sub(distance_spent.get())
-                                .unwrap_or(0),
+                                .max_vector_evaluations.saturating_sub(distance_spent.get()),
                             ..allowed_search_limits
                         },
                         &mut query_self_scores,
@@ -6841,8 +6841,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         )?;
                         if score.is_some()
                             && let Some(streamed) = source.streamed_suffix()
-                        {
-                            if let Some(visible) = state
+                            && let Some(visible) = state
                                 .bounded_visible_directory_entry_by_row_with_copy_admission(
                                     candidate.row_id,
                                     snapshot,
@@ -6850,15 +6849,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     owner,
                                     None,
                                 )?
-                            {
-                                if visible.lsn > streamed.covered_lsn() {
-                                    streamed.observe_vector_decode(
-                                        visible.row_id,
-                                        visible.created_tx,
-                                        visible.lsn,
-                                    );
-                                }
-                            }
+                            && visible.lsn > streamed.covered_lsn()
+                        {
+                            streamed.observe_vector_decode(
+                                visible.row_id,
+                                visible.created_tx,
+                                visible.lsn,
+                            );
                         }
                         score
                     }
@@ -6945,15 +6942,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         if entry.visible_from.0 > snapshot.0 {
                             return Ok(true);
                         }
-                        if let Some(deleted) = entry.deleted_tx {
-                            if deleted.0 <= snapshot.0 {
+                        if let Some(deleted) = entry.deleted_tx
+                            && deleted.0 <= snapshot.0 {
                                 return Ok(true);
                             }
-                        }
-                        if let Some(candidates) = partition.candidates {
-                            if candidates.binary_search(&entry.row_id.0).is_err() {
-                                return Ok(true);
-                            }
+                        if let Some(candidates) = partition.candidates
+                            && candidates.binary_search(&entry.row_id.0).is_err()
+                        {
+                            return Ok(true);
                         }
                         if searched.candidates[..resolved_prefix].iter().any(|candidate| {
                             candidate.partition == position && candidate.row_id == entry.row_id
@@ -7180,8 +7176,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 HnswAllowedSearchIncomplete::VectorEvaluationLimitReached,
             ));
         }
-        if let Some(ledger) = row_check {
-            if let Some(error) = ledger.borrow_mut().error.take() {
+        if let Some(ledger) = row_check
+            && let Some(error) = ledger.borrow_mut().error.take() {
                 drop(accepted);
                 release_retained(accepted_bytes);
                 drop(walked);
@@ -7192,7 +7188,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 release_retained(short_bytes);
                 return Err(error);
             }
-        }
         if accepted.len() < required {
             drop(accepted);
             release_retained(accepted_bytes);
@@ -7282,7 +7277,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     };
                     routes.push(BoundedSnapshotVectorSource {
                         partition_key: key,
-                        state: state.into(),
+                        state,
                         serving_selection: None,
                         candidate_ids: None,
                         point_load: false,

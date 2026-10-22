@@ -2765,6 +2765,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     }
 
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(clippy::too_many_arguments, reason = "The transaction, edge identity, payload and read owner must reach the same admitted insertion.")]
     fn insert_owned_edge(
         &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
         source: NodeId, target: NodeId, edge_type: String,

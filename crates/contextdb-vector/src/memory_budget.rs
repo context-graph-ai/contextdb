@@ -227,11 +227,10 @@ impl MemoryBudget for ReaderCopyBudget {
             },
             other => other,
         }) };
-        if result.is_ok() {
-            if let Some(observer) = self.observer {
+        if result.is_ok()
+            && let Some(observer) = self.observer {
                 observer(self.reader.accounting_identity(), component, operation);
             }
-        }
         result
     }
     fn try_allocate_for_label(
@@ -278,11 +277,10 @@ impl MemoryBudget for ReaderCopyBudget {
                 },
                 other => other,
             }) };
-        if result.is_ok() {
-            if let Some(observer) = self.observer {
+        if result.is_ok()
+            && let Some(observer) = self.observer {
                 observer(self.reader.accounting_identity(), component, operation);
             }
-        }
         result
     }
     fn release(&self, bytes: usize) {

@@ -1230,7 +1230,7 @@ impl PaidRetainedMemoryCharge {
         let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
 
         let invoice = accountant.control_invoice();
-        Self { charge: RetainedMemoryCharge { bytes, accountant: accountant.into() }, _control_invoice: invoice }
+        Self { charge: RetainedMemoryCharge { bytes, accountant: accountant }, _control_invoice: invoice }
     }
 }
 impl std::ops::Deref for PaidRetainedMemoryCharge {
@@ -3291,22 +3291,29 @@ impl Drop for VectorMaintenanceProgressGuard {
 /// Opaque captured private directory. Each visit owns one admitted identity
 /// window and releases native guards before constructing sources or callbacks.
 #[doc(hidden)]
+pub type PagedVectorCatalogVisitor<'a, T> = dyn FnMut(
+    &VectorPartitionKey,
+    RawVectorMembershipSummary,
+    bool,
+    Arc<dyn RawVectorMembershipSource>,
+    Arc<dyn DormantRawVectorLoader>,
+) -> Result<T> + 'a;
+#[doc(hidden)]
 pub trait PagedVectorCatalog: Send + Sync {
     fn counts(&self) -> [usize; 6];
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate(&self) -> Result<()>;
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_empty(&self, owner: &mut VectorCopyAdmission,
-        visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
-            Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<bool>) -> Result<()>;
+        visit: &mut PagedVectorCatalogVisitor<'_, bool>) -> Result<()>;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool { self.len() == 0 }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn probe(&self, key: &VectorPartitionKey, owner: &mut VectorCopyAdmission)
         -> Result<Option<PagedVectorPartitionSources>>;
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit(&self, owner: &mut VectorCopyAdmission, before_read: &mut dyn FnMut() -> Result<()>,
-        visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
-            Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<()>) -> Result<()>;
+        visit: &mut PagedVectorCatalogVisitor<'_, ()>) -> Result<()>;
 }
 #[doc(hidden)]
 pub struct PagedVectorPartitionSources {
@@ -3359,6 +3366,7 @@ pub struct PagedVectorSourceSelection {
 }
 impl PagedVectorSourceSelection {
     pub fn len(&self) -> usize { self.catalog.catalog.len() }
+    pub fn is_empty(&self) -> bool { self.catalog.catalog.is_empty() }
     pub fn counts(&self) -> [usize; 6] { self.catalog.catalog.counts() }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn empty_declared_state(&self, owner: &mut VectorCopyAdmission) -> Result<Option<VectorQueryState>> {
@@ -3830,7 +3838,7 @@ impl IndexState {
         }
         *self.raw_directory.write() = entries;
         self.rebuild_raw_directory_positions();
-        *self.raw_loader.write() = Some(loader.into());
+        *self.raw_loader.write() = Some(loader);
         self.raw_resident.store(false, Ordering::SeqCst);
         self.raw_resident_bytes.store(0, Ordering::SeqCst);
         Ok(())
@@ -3867,7 +3875,7 @@ impl IndexState {
         // Commits append to the resident directory, while Redb enumerates the
         // same durable set by key. Canonicalize both without another O(n)
         // allocation before later eviction makes them positional again.
-        *self.raw_loader.write() = Some(loader.into());
+        *self.raw_loader.write() = Some(loader);
         Ok(())
     }
 
@@ -3890,14 +3898,14 @@ impl IndexState {
         // cache. Retaining decoded bodies here would create an additional
         // population-sized cache outside that share.
         let resident = false;
-        *self.durable_memberships.write() = Some(memberships.into());
+        *self.durable_memberships.write() = Some(memberships);
         *self.durable_counts.lock() = summary;
         *self.durable_pending.lock() = DurablePendingLog {
             floor: summary.max_tx,
             events: Vec::new(),
             cached: None,
         };
-        *self.raw_loader.write() = Some(loader.into());
+        *self.raw_loader.write() = Some(loader);
         self.raw_resident.store(resident, Ordering::SeqCst);
         *self.raw_payload_counter.write() = payload;
         *self.raw_payload_header_counter.write() = payload_headers;
@@ -5589,6 +5597,7 @@ impl IndexState {
     /// Durable historical probes checkpoint and charge every physical record;
     /// resident counts use their snapshot boundary index.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg(test)]
     pub(crate) fn bounded_hnsw_eligibility<E>(
         &self,
         snapshot_tx: TxId,
@@ -7672,7 +7681,6 @@ impl IndexState {
                 }
             }
         }
-        drop(observe);
         Ok((serial != 0).then_some((stats, len, digest, serial)))
     }
 
@@ -7834,7 +7842,7 @@ impl IndexState {
             Self::release_uninstalled_loaded_generation(LoadedVectorGraphGeneration {
                 graph,
                 resident_bytes,
-                accountant: accountant.into(),
+                accountant,
                 caller_adopted_bytes: 0,
                 fresh_tail,
             });
@@ -7847,7 +7855,7 @@ impl IndexState {
             Self::release_uninstalled_loaded_generation(LoadedVectorGraphGeneration {
                 graph,
                 resident_bytes,
-                accountant: accountant.into(),
+                accountant,
                 caller_adopted_bytes: 0,
                 fresh_tail,
             });
@@ -16292,8 +16300,8 @@ impl VectorStore {
             return Ok(());
         };
         let factory = column.durable_partition_factory.read().clone();
-        if let Some(factory) = factory {
-            if let Some(counts) = factory.catalog_scalar_counts(index)? {
+        if let Some(factory) = factory
+            && let Some(counts) = factory.catalog_scalar_counts(index)? {
                 let mut new_count = 0usize;
                 for key in requested {
                     let occupied = factory.catalog_scalar_occupied(index, key)?.ok_or_else(||
@@ -16305,7 +16313,6 @@ impl VectorStore {
                 }
                 return Ok(());
             }
-        }
         let new_count = {
             let partitions = column.partitions.read();
             requested
@@ -16451,6 +16458,7 @@ impl VectorStore {
     }
 
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(clippy::too_many_arguments, reason = "Atomic batch projection keeps inserts, deletes, moves, snapshots and their owner in one boundary.")]
     fn project_partitioned_batch(
         &self,
         deletes: &[PartitionedVectorDelete],
@@ -17262,8 +17270,7 @@ impl VectorStore {
                 )
             }))
         {
-            let column = self
-                .try_column(index)
+            self.try_column(index)
                 .ok_or_else(|| Error::UnknownVectorIndex {
                     index: index.clone(),
                 })?;
@@ -18510,7 +18517,7 @@ impl VectorStore {
     ) -> Result<Vec<VectorPartitionKey>> {
         if let Some(selection) = self.capture_paged_partition_sources(index, owner)? {
             let layout = self.scoped_index_layout(index, owner)?;
-            if selection.len() == 0 && !layout.is_partitioned() {
+            if selection.is_empty() && !layout.is_partitioned() {
                 // A declared empty unpartitioned column has a real metadata
                 // scaffold even though its authenticated directory has no rows.
                 owner.reserve(std::mem::size_of::<VectorPartitionKey>())?;
@@ -18569,7 +18576,7 @@ impl VectorStore {
     ) -> Result<Vec<VectorPartitionKey>> {
         if let Some(selection) = self.capture_paged_partition_sources(index, owner)? {
             let layout = self.scoped_index_layout(index, owner)?;
-            if selection.len() == 0 && !layout.is_partitioned() {
+            if selection.is_empty() && !layout.is_partitioned() {
                 // A declared empty unpartitioned column has a real metadata
                 // scaffold even though its authenticated directory has no rows.
                 owner.reserve(std::mem::size_of::<VectorPartitionKey>())?;
@@ -18580,7 +18587,7 @@ impl VectorStore {
                 .ok_or_else(|| Error::Other("vector key output size overflow".into()))?)?;
             let mut keys = Vec::with_capacity(count);
             let mut traversal = owner.scratch();
-            selection.visit(&mut traversal, |key, state| {
+            selection.visit(&mut traversal, |key, _state| {
                 if true {
                     if keys.len() == count { return Err(Error::Other("working vector key count disagrees with its capture".into())); }
                     owner.reserve(key.estimated_bytes().saturating_sub(std::mem::size_of::<VectorPartitionKey>()))?;
@@ -20684,7 +20691,7 @@ impl VectorStore {
                 return Err(Error::Other(
                     "durable vector reverse source requires an empty column directory".into()));
             }
-            *column.durable_reverse_memberships.write() = Some(source.into());
+            *column.durable_reverse_memberships.write() = Some(source);
             Ok(())
         })
     }
@@ -20709,7 +20716,7 @@ impl VectorStore {
                 return Err(Error::Other(
                     "durable vector partition factory requires a column reverse source".into()));
             }
-            *column.durable_partition_factory.write() = Some(factory.into());
+            *column.durable_partition_factory.write() = Some(factory);
             Ok(())
         })
     }
@@ -20867,8 +20874,8 @@ impl VectorStore {
             }
         }
         column.clear_row_maps();
-        *column.durable_reverse_memberships.write() = Some(reverse.into());
-        *column.durable_partition_factory.write() = Some(partitions.into());
+        *column.durable_reverse_memberships.write() = Some(reverse);
+        *column.durable_partition_factory.write() = Some(partitions);
         Ok(())
     }
 
@@ -21303,7 +21310,7 @@ impl VectorStore {
             Ok(PreparedLoadedVectorReplacement {
                 destination: self,
                 registry,
-                accountant: accountant.into(),
+                accountant,
             })
         });
         if result.is_ok() {
@@ -22941,7 +22948,7 @@ impl VectorStore {
                     })
                 },
                 bytes: state.hnsw_bytes.swap(0, Ordering::SeqCst),
-                accountant: accountant.into(),
+                accountant,
                 replayed_through_lsn: state.fresh_tail_replayed_through_lsn.load(Ordering::SeqCst),
                 mutated_through_lsn: state.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst),
                 replay_frontier_active: state

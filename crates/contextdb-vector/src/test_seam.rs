@@ -35,8 +35,9 @@ fn take(armed: &AtomicBool, consumed: &AtomicBool) -> bool {
 
 // A passive phase callback into the engine's existing allocator oracle.
 // Const TLS has no allocator footprint, and observation is confined to this query thread.
+type RowCheckCacheObserver = fn(u8, usize);
 thread_local! {
-    static ROW_CHECK_CACHE_OBSERVER: Cell<Option<fn(u8, usize)>> = const { Cell::new(None) };
+    static ROW_CHECK_CACHE_OBSERVER: Cell<Option<RowCheckCacheObserver>> = const { Cell::new(None) };
 }
 
 #[doc(hidden)]

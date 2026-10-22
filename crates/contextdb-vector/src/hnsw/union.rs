@@ -1906,6 +1906,7 @@ pub(crate) fn merge_layer_searches_with_settled<E>(
 /// The caller supplies its existing reader's fallible growth operation; on
 /// success it updates `all.retained_bytes` for the actual destination capacity.
 /// On failure it leaves the original destination and its charge intact.
+#[cfg(test)]
 pub(crate) fn merge_layer_searches_with_custody<E>(
     layers: usize,
     cap: usize,

@@ -3,7 +3,7 @@
 //! graph or row/exact-vector map.
 use super::{DistQuantizedCosine, HNSW_BUILD_SEED, exact_key_for_stored_vector, hnsw_f32_distance};
 use crate::memory_budget::{
-    MemoryBudget, ScopedVectorCopy, VectorCopyAdmission, VectorWorkspaceReservation,
+    ScopedVectorCopy, VectorCopyAdmission, VectorWorkspaceReservation,
 };
 use crate::quantized::StoredVector;
 use crate::store::{ResolvedVectorPolicy, VectorPartitionRef};

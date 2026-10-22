@@ -1,4 +1,3 @@
-use crate::memory_budget::MemoryBudget;
 use crate::store::VectorMembershipProvenance;
 use contextdb_core::{Lsn, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuantization};
 use parking_lot::Mutex;
@@ -269,7 +268,7 @@ impl<T> SharedVectorPayload<T> {
                 header_bytes,
                 _body_control_invoice: accountant.control_invoice(),
                 _header_control_invoice: None,
-                accountant: accountant.into(),
+                accountant,
                 header_accountant: None,
                 live_body_bytes,
                 live_header_bytes,
