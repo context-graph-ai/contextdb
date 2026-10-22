@@ -228,6 +228,30 @@ CLI binary environment, then runs its own Cargo command.
 The canonical full manifest preserves 30 logical slices as 36 physical slices, including
 four optional default-suite slices; the normal routing view selects 22 physical slices
 when the source-bound dedup certificate applies and 26 in its conservative fallback.
+Fourteen registered engine targets also run in these existing families and shards;
+no qualification job is added. The partition-key and partition-insert tests use
+family/shard 8; float equality and the two planner targets use family/shard 2;
+in-transaction count and the two native allocator targets use family/shard 1.
+Tied index probes, cycle cost and reclaim use family 4 and PR shard 5.
+`seed_commit_memory` runs only in full/nightly family 3 with `test-seams` and
+`nightly-tests`, preserving its 100,000-row, 768-dimension workload.
+
+The `custody` and `vector` aggregate binaries use family/shard 12. Each runs in
+its own Cargo command with one test thread. Shared module prefixes are skipped
+only in the aggregate; their existing standalone owners still execute them.
+The reviewed `ci-aggregate-routing.json` certificate binds module names, source
+closures, wrapper features, cfg guards and allocator semantics. Source drift,
+missing or duplicated unique modules, changed owners and changed skip filters
+fail closed. The normal and full feature tuples are checked separately. The
+full-feature compile/list inventory contains 60 custody and 475 vector cases.
+The aggregate filters select one custody case and 94 vector cases, including
+eight existing ignored vector cases. Together with the 38 standalone cases,
+full qualification selects 133 listed cases. The PR feature tuple selects zero
+custody cases, 93 vector cases (eight ignored) and 35 standalone cases; the seed
+is absent. Every compiled name was checked against libtest's substring skip
+semantics, with no missing unique case or shared case left in the aggregate.
+These compile/list results do not establish runtime passes.
+
 **Vector default search-breadth calibration** retains the existing
 `vector_graph_route_profile_quality` target and its single calibration test.
 Four full-qualification **vector graph recall** jobs each cover one complete corpus:
@@ -537,3 +561,13 @@ remain unchanged, and all three functional oracles remain required. The 18 bundl
 still use at most three slots. The observed 1,555 seconds before f27 is partial
 cost evidence, not a completion bound; a complete hosted pass within 30 minutes
 remains unproved.
+
+The existing full redb integration slice first runs its unchanged default-feature
+suite, then runs five registered feature-gated targets in separate commands.
+`named_root_capture_contract`, `reclaim_step_contract`,
+`open_table_registry_allocations` and `admission_reads_are_bounded_by_the_format`
+use exactly `contextdb-internal,test-seams`; `growth_after_compaction_contract`
+uses exactly `contextdb-internal`. All retain the same isolated redb target
+directory, locked manifest and one test thread. Registration and ownership checks
+reject missing, duplicate or wrongly featured targets. This adds no job and does
+not establish a runtime pass.

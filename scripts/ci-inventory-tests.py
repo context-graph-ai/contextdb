@@ -99,13 +99,27 @@ for suffix in ['profile','tests','targets.json','time']:
         self.assertEqual(lines['contextdb-engine-test-seams-4'], ['acceptance'])
         self.assertEqual(lines['contextdb-engine-test-seams-13'], ['acceptance_long_running'])
         self.assertEqual(lines['contextdb-engine-test-seams-14'], ['acceptance_sync'])
-        self.assertEqual(lines['contextdb-engine-test-seams-5'], ['sync', *moved])
+        self.assertEqual(lines['contextdb-engine-test-seams-5'], ['sync', *moved, 'tied_index_probes_stay_inside_the_read_limits',
+                         'writecost_cycle_bound', 'writecost_reclaim'])
         for target in moved:
             replacement = original.replace(' ' + target, '', 1)
             with self.subTest(target=target), patch.object(
                     Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
                 with self.assertRaises(ValueError):
                     i.inventory(i.ROOT)
+
+    def test_redb_featured_targets_have_one_exact_owner(self):
+        path = i.ROOT / 'scripts/ci-integration.py'
+        original = path.read_text(); read = Path.read_text
+        for target, features in [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal')]:
+            entry = repr((target, features)) + ','
+            for replacement in (
+                    original.replace(entry, ''), original.replace(entry, entry + entry),
+                    original.replace(entry, repr((target, 'test-seams')) + ',')):
+                with self.subTest(target=target), patch.object(
+                        Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
+                    with self.assertRaisesRegex(ValueError, 'redb featured target'):
+                        i.inventory(i.ROOT)
 
     def test_actual_inventory(self):
         i.inventory(i.ROOT)

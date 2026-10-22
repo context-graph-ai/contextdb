@@ -65,6 +65,7 @@ fi
 # examples and doctests run once, in the shard that lists `lib`.
 run_extras=true
 skip_case=""
+aggregate_names=()
 manifest="$(dirname -- "${BASH_SOURCE[0]}")/ci-shard-targets.txt"
 while read -r name items; do
   [[ "$name" == "$shard:" ]] || continue
@@ -74,6 +75,10 @@ while read -r name items; do
   items=${routing%%|*}
   skip_case=${routing#*|}
   for item in $items; do
+    if [[ "$item" == custody || "$item" == vector ]]; then
+      aggregate_names+=("$item")
+      continue
+    fi
     if [[ "$item" == lib ]]; then targets+=(--lib --bins); run_extras=true; else targets+=(--test "$item"); fi
   done
 done < <(grep -v '^#' "$manifest")
@@ -155,6 +160,24 @@ fi
 statuses=("${PIPESTATUS[@]}")
 status=${statuses[0]}
 if [[ "$status" == 0 ]]; then status=${statuses[1]}; fi
+# Aggregate filters belong only to their own binary, never the standalone owners.
+for aggregate_name in "${aggregate_names[@]}"; do
+  if ! aggregate_plan=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" aggregate-skips "$aggregate_name" --aggregate-features "$features"); then
+    if [[ "$status" == 0 ]]; then status=2; fi
+    continue
+  fi
+  aggregate_flags=(--test-threads=1)
+  while IFS= read -r prefix; do
+    [[ -n "$prefix" ]] && aggregate_flags+=(--skip "$prefix")
+  done <<< "$aggregate_plan"
+  env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
+      "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
+    timeout 300m cargo test --locked "${args[@]}" --test "$aggregate_name" -- "${aggregate_flags[@]}" 2>&1 | tee "$receipt_dir/$shard.aggregate-$aggregate_name.log"
+  statuses=("${PIPESTATUS[@]}")
+  aggregate_status=${statuses[0]}
+  if [[ "$aggregate_status" == 0 ]]; then aggregate_status=${statuses[1]}; fi
+  if [[ "$status" == 0 ]]; then status=$aggregate_status; fi
+done
 set -e
 if [[ "$status" == 0 && "$run_extras" == true ]]; then
   # cargo test's default example compilation and doctests remain required.

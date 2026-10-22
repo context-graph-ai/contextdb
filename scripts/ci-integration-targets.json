@@ -321,7 +321,10 @@
         "direct_file_image_memory_lifetime",
         "graph_property_memory_charge_measurement",
         "received_schema_metadata_peak",
-        "vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph"
+        "vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph",
+        "in_transaction_count_stays_inside_its_memory",
+        "native_backing_allocator",
+        "native_terminal_allocations"
       ]
     },
     {
@@ -332,7 +335,10 @@
         "engine",
         "integration",
         "sql",
-        "vector_generation"
+        "vector_generation",
+        "float_equality_follows_postgresql",
+        "writecost_planner",
+        "writecost_planner_reversed"
       ]
     },
     {
@@ -341,7 +347,8 @@
       "kind": "engine-tests",
       "targets": [
         "history_request_memory",
-        "vector_declared_budget"
+        "vector_declared_budget",
+        "seed_commit_memory"
       ]
     },
     {
@@ -356,7 +363,10 @@
         "reader_release",
         "sql_surface",
         "staged_predecode_row",
-        "text_memory_charge_measurement"
+        "text_memory_charge_measurement",
+        "tied_index_probes_stay_inside_the_read_limits",
+        "writecost_cycle_bound",
+        "writecost_reclaim"
       ]
     },
     {
@@ -407,7 +417,9 @@
         "custody_delivery_outcome",
         "vector_an_exhaustive_find_streams_bodies_it_cannot_hold",
         "vector_multi_partition_union_recovers_nearest_rows",
-        "vector_partition"
+        "vector_partition",
+        "a_row_pays_for_its_partition_key_once",
+        "cdb120_partition_insert_cost"
       ]
     },
     {
@@ -519,7 +531,9 @@
         "vector_where_one_partition_spends_its_find",
         "vector_a_graph_search_stays_inside_its_serving_cache",
         "vector_a_find_locks_its_serving_cache_once_per_page",
-        "vector_graph_build_distance_evaluations_stay_under_the_ratchet"
+        "vector_graph_build_distance_evaluations_stay_under_the_ratchet",
+        "custody",
+        "vector"
       ]
     },
     {

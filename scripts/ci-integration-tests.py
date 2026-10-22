@@ -185,18 +185,32 @@ class IntegrationControls(unittest.TestCase):
             self.assertLessEqual(required[target], features)
         self.assertEqual(i.commands(kinds['workspace']), [['cargo', 'test', '--locked', '--workspace']])
         with patch.dict(os.environ, {'CARGO_TARGET_DIR': '/tmp/isolated-target'}):
-            self.assertEqual(i.commands(kinds['redb']), [['cargo', 'test', '--manifest-path', 'crates/contextdb-redb/Cargo.toml', '--target-dir', '/tmp/isolated-target/redb', '--locked']])
+            default = ['cargo', 'test', '--manifest-path', 'crates/contextdb-redb/Cargo.toml',
+                       '--target-dir', '/tmp/isolated-target/redb', '--locked']
+            expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal')]
+            self.assertEqual(i.commands(kinds['redb']), [default] + [
+                default + ['--features', features, '--test', name, '--', '--test-threads=1']
+                for name, features in expected])
         for row in self.rows:
             if row['kind'] == 'engine-tests':
                 expected = base.copy()
                 for target in row['targets']:
+                    if target in {'custody', 'vector'}:
+                        continue
                     expected += ['--lib', '--bins'] if target == 'lib' else ['--test', target]
                 selected = i.commands(row, mode='full')
                 self.assertEqual(selected[0], expected + ['--', '--test-threads=1'])
                 if set(row['targets']) & i.FULL_SCHEMA or 'sync_schema_transactions' in row['targets']:
                     self.assertEqual(selected[1][selected[1].index('--features') + 1], 'test-seams,iroh')
                 else:
-                    self.assertEqual(len(selected), 1)
+                    self.assertEqual(len(selected), 1 + len(set(row['targets']) & {'custody', 'vector'}))
+                for target, command in zip([t for t in row['targets'] if t in {'custody', 'vector'}], selected[1:]):
+                    i.aggregate_module(ROOT).validate_command(ROOT, target, command)
+
+    def test_aggregate_ownership_negative_controls(self):
+        run = subprocess.run([sys.executable, '-B', 'scripts/ci-aggregate-routing-tests.py'],
+                             cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
     def test_union_omissions_duplicates_acceptance_profiles_and_optional_classes(self):
         path = ROOT / 'scripts/ci-integration-targets.json'

@@ -2,6 +2,7 @@
 """Fail closed when PR shards do not cover every workspace package and redb."""
 from pathlib import Path
 import re
+import ast
 import json
 import sys
 sys.dont_write_bytecode = True
@@ -115,6 +116,13 @@ fi'''
                     'if [[ "$status" == 0 && "$run_extras" == true ]]; then']:
         if script.count(snippet) != 1:
             raise ValueError("shard runner lost split-shard target selection")
+    for snippet in ['aggregate_names=()',
+                    'if [[ "$item" == custody || "$item" == vector ]]; then',
+                    'for aggregate_name in "${aggregate_names[@]}"; do',
+                    'aggregate-skips "$aggregate_name" --aggregate-features "$features"',
+                    '--test "$aggregate_name" -- "${aggregate_flags[@]}"']:
+        if script.count(snippet) != 1:
+            raise ValueError("shard runner lost isolated aggregate coverage")
     if script.count('--timings "$thread_mode" "${logs[@]}"') != 1:
         raise ValueError("shard runner lost per-target timing receipts")
     for command in ['--examples --no-run', '--doc -- --test-threads=1']:
@@ -141,7 +149,8 @@ def split_shard_contract(root, rows, documents, paths, workspace):
     moved = ['bounded_in_subquery_stays_inside_the_read_limits',
              'bounded_read_of_staged_graph_work_stays_within_its_limits',
              'local_transport', 'owner_read', 'reader_release', 'sql_surface',
-             'staged_predecode_row', 'text_memory_charge_measurement']
+             'staged_predecode_row', 'text_memory_charge_measurement',
+             'tied_index_probes_stay_inside_the_read_limits', 'writecost_cycle_bound', 'writecost_reclaim']
     expected_shards = {
         'contextdb-engine-test-seams-4': ['acceptance'],
         'contextdb-engine-test-seams-13': ['acceptance_long_running'],
@@ -313,6 +322,19 @@ def pr_jobs(root):
     return jobs
 
 
+def redb_featured_contract(root):
+    expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal')]
+    source = (root / 'scripts/ci-integration.py').read_text()
+    declarations = [node for node in ast.parse(source).body if isinstance(node, ast.Assign)
+                    and any(isinstance(name, ast.Name) and name.id == 'REDB_FEATURED_TARGETS'
+                            for name in node.targets)]
+    if len(declarations) != 1 or ast.literal_eval(declarations[0].value) != expected:
+        raise ValueError('redb featured target ownership missing, duplicated or wrongly featured')
+    if source.count('for name, features in REDB_FEATURED_TARGETS]') != 1:
+        raise ValueError('redb featured targets lost their isolated commands')
+    return {name: set(features.split(',')) for name, features in expected}
+
+
 def inventory(root):
     schema_replay_fixture_contract(root)
     shard_target_contract(root)
@@ -370,9 +392,17 @@ def inventory(root):
                                       documents, paths, workspace)
                 for shard, crate, features in rows}
     extended = feature_closure("contextdb-engine", EXTENDED_FEATURES, documents, paths, workspace)
+    redb_featured = redb_featured_contract(root)
+    registered_redb = target_inventory(documents['contextdb-redb'], paths['contextdb-redb'], 'test')
+    if not set(redb_featured) <= set(registered_redb):
+        raise ValueError('redb featured target registration missing')
     for package, doc in documents.items():
         for kind in ("test", "example"):
             for target, required in target_inventory(doc, paths[package], kind).items():
+                if package == "contextdb-redb" and kind == "test" and target in redb_featured:
+                    if required != redb_featured[target]:
+                        raise ValueError("redb featured target registration changed: " + target)
+                    continue
                 if required & EXTENDED_ONLY:
                     if package != "contextdb-engine" or not required <= extended:
                         raise ValueError(f"uncovered extended {package} {kind} {target}: "

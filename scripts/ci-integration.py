@@ -15,6 +15,13 @@ import tomllib
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 FEATURES = 'nightly-tests,test-seams,iroh'
+REDB_FEATURED_TARGETS = [
+    ('named_root_capture_contract', 'contextdb-internal,test-seams'),
+    ('reclaim_step_contract', 'contextdb-internal,test-seams'),
+    ('open_table_registry_allocations', 'contextdb-internal,test-seams'),
+    ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'),
+    ('growth_after_compaction_contract', 'contextdb-internal'),
+]
 OPTIONAL = {'workspace', 'redb', 'production', 'production-release'}
 KINDS = {'engine-tests', 'release-acceptance', 'examples', 'doctests'} | OPTIONAL
 ACCEPTANCE_TARGETS = ('acceptance', 'acceptance_long_running', 'acceptance_sync')
@@ -44,6 +51,7 @@ VECTOR_PROFILE_SLICES = {
 # The canonical manifest always describes the full inventory; routing is a view.
 FULL_SCHEMA = {value[1] for value in SCHEMA_REPLAY_SLICES.values()}
 FULL_CORPORA = {value[1] for value in VECTOR_PROFILE_SLICES.values()}
+FULL_ONLY_TARGETS = {'seed_commit_memory'}
 OVERSIZED = ('a_received_schema_transaction_never_publishes_a_prefix::'
              'schema_migration_chunked_transport::'
              'oversized_authenticated_schema_stays_invisible_until_one_commit_and_retry')
@@ -98,7 +106,14 @@ def gate_mode(value=None):
 
 def routed_targets(targets, mode):
     gate_mode(mode)
-    return [t for t in targets if mode == 'full' or t not in FULL_SCHEMA | FULL_CORPORA]
+    return [t for t in targets if mode == 'full' or t not in FULL_SCHEMA | FULL_CORPORA | FULL_ONLY_TARGETS]
+
+
+def aggregate_module(root=ROOT):
+    spec = importlib.util.spec_from_file_location('aggregate_routing', root / 'scripts/ci-aggregate-routing.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def routing_contract(root=ROOT):
@@ -553,6 +568,7 @@ def load_manifest(root=ROOT):
     if len(listed) != len(set(listed)) or set(listed) != expected:
         raise ValueError('integration test-profile target union mismatch (duplicate, missing or extra): '
                          f'missing={sorted(expected-set(listed))}, extra={sorted(set(listed)-expected)}')
+    aggregate_module(root).contract(root)
     return rows
 
 
@@ -570,12 +586,14 @@ def metadata(row):
 def commands(row, root=ROOT, mode=None):
     """Keep default-target commands intact, including custom harnesses and doctests."""
     mode = gate_mode(mode)
-    if mode == 'normal' and any(t in FULL_SCHEMA | FULL_CORPORA for t in row['targets']):
+    if mode == 'normal' and any(t in FULL_SCHEMA | FULL_CORPORA | FULL_ONLY_TARGETS for t in row['targets']):
         raise ValueError('unrouted full-qualification target in normal mode')
     kind = row['kind']
     base = ['cargo', 'test', '--locked', '-p', 'contextdb-engine', '--features', metadata(row)['features']]
     if kind == 'engine-tests':
-        for target in row['targets']:
+        aggregates = [t for t in row['targets'] if t in {'custody', 'vector'}]
+        ordinary = [t for t in row['targets'] if t not in aggregates]
+        for target in ordinary:
             base += ['--lib', '--bins'] if target == 'lib' else ['--test', target]
         flags = ['--test-threads=1']
         if mode == 'normal' and 'sync_schema_transactions' in row['targets']:
@@ -586,7 +604,7 @@ def commands(row, root=ROOT, mode=None):
                 raise ValueError('long-running partition target/cache envelope changed')
             flags += (['--skip', LONG_RUNNING_CASES[2]] if 'transfer' in row['id']
                       else [LONG_RUNNING_CASES[2], '--exact'])
-        result = [base + ['--'] + flags]
+        result = [base + ['--'] + flags] if ordinary else []
         if mode == 'normal':
             decision = runtime_decision(row, mode, root)
             if decision['dedup_sha'] and set(row['targets']) & set(NORMAL_DEDUP_TARGETS):
@@ -609,6 +627,14 @@ def commands(row, root=ROOT, mode=None):
                 if not qualification:
                     companion += [OVERSIZED, '--exact']
                 result.append(companion)
+        for target in aggregates:
+            aggregate = aggregate_module(root)
+            command = ['cargo', 'test', '--locked', '-p', 'contextdb-engine',
+                       '--features', metadata(row)['features'], '--test', target, '--', '--test-threads=1']
+            for prefix in aggregate.skip_prefixes(root, target):
+                command += ['--skip', prefix]
+            aggregate.validate_command(root, target, command)
+            result.append(command)
         return result
     if kind == 'release-acceptance':
         return [base + ['--release', '--test', row['targets'][0], '--', '--test-threads=1']]
@@ -620,8 +646,11 @@ def commands(row, root=ROOT, mode=None):
         return [['cargo', 'test', '--locked', '--workspace']]
     if kind == 'redb':
         target = Path(os.environ.get('CARGO_TARGET_DIR', str(root / 'target')))
-        return [['cargo', 'test', '--manifest-path', 'crates/contextdb-redb/Cargo.toml',
-                 '--target-dir', str(target / 'redb'), '--locked']]
+        default = ['cargo', 'test', '--manifest-path', 'crates/contextdb-redb/Cargo.toml',
+                   '--target-dir', str(target / 'redb'), '--locked']
+        return [default] + [default + ['--features', features, '--test', name,
+                                       '--', '--test-threads=1']
+                            for name, features in REDB_FEATURED_TARGETS]
     if kind == 'production':
         return [base]
     if kind == 'production-release':
@@ -983,10 +1012,11 @@ def run_slice(row, out, mode=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['plan', 'required', 'normal-required', 'check', 'run', 'shard-plan', 'shard-receipt', 'dedup-targets', 'dedup-snapshot', 'regenerate-dedup'])
+    parser.add_argument('action', choices=['plan', 'required', 'normal-required', 'check', 'run', 'shard-plan', 'shard-receipt', 'dedup-targets', 'dedup-snapshot', 'regenerate-dedup', 'aggregate-skips'])
+    parser.add_argument('--aggregate-features')
     parser.add_argument('slice', nargs='?')
     args = parser.parse_args()
-    if args.action not in {'run', 'shard-plan', 'shard-receipt', 'dedup-snapshot', 'regenerate-dedup'} and args.slice:
+    if args.action not in {'run', 'shard-plan', 'shard-receipt', 'dedup-snapshot', 'regenerate-dedup', 'aggregate-skips'} and args.slice:
         raise ValueError('slice selection is only supported by run')
     if args.action == 'dedup-targets':
         print(' '.join('--test ' + t for t in NORMAL_DEDUP_TARGETS))
@@ -1002,6 +1032,13 @@ def main():
         return 0
     mode = gate_mode()
     rows = load_manifest()
+    if args.action == 'aggregate-skips':
+        aggregate = aggregate_module()
+        if frozenset((args.aggregate_features or '').split(',')) not in aggregate.PROFILES:
+            raise ValueError('aggregate shard feature envelope changed')
+        for prefix in aggregate.skip_prefixes(ROOT, args.slice):
+            print(prefix)
+        return 0
     if args.action == 'shard-receipt':
         sync_routing_counts(json.loads(Path(args.slice).read_text())['targets'], mode)
         return 0
@@ -1011,7 +1048,7 @@ def main():
                    if line.startswith(str(args.slice) + ': ')]
         if len(matches) != 1:
             raise ValueError('unknown/duplicate split shard')
-        targets = [t for t in matches[0] if mode == 'full' or t not in FULL_SCHEMA]
+        targets = [t for t in matches[0] if mode == 'full' or t not in FULL_SCHEMA | FULL_ONLY_TARGETS]
         if not targets:
             raise ValueError('routing must not produce an empty shard')
         skip = OVERSIZED if mode == 'normal' and 'sync_schema_transactions' in targets else ''
