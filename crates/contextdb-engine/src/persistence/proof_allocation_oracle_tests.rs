@@ -1351,6 +1351,9 @@ fn a_cross_thread_free_is_attributed_only_to_its_allocation_window() {
     });
     neighbour.join().unwrap();
     assert_eq!((peak, live), (bytes, 0));
+    // Destructive negative evidence must remain confined to its child. These
+    // original physical-free rows then run in the unchanged parent process.
+    crate::vector_read_memory::root_observations::installed_provenance_rejects_reuse_and_payer_changes();
     crate::vector_read_memory::native_ownership_proof::run_native_rows();
 }
 

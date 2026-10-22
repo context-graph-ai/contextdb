@@ -1330,6 +1330,9 @@ fn register_native_child_observer(parent: &DeclaredReadRoot, owner: &ReadMemoryO
     // or invoice enters this registry, including during first registration.
     if statement_child_proof::limit(parent).is_none()
         && !READER_BUDGET_LEDGER.with(|ledger| ledger.borrow().is_some()) { return; }
+    // Charge-only ledgers remain useful without an observing allocator, but
+    // their roots carry no physical evidence for a child consumer to sample.
+    if parent.observation.is_none_or(|token| !root_observations::has_evidence(token)) { return; }
     let identity = owner.accounting_identity();
     let bytes = ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
     native_child_observers().lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -2828,6 +2831,7 @@ pub(crate) mod root_observations {
     static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub(crate) fn install_physical_observer() { INSTALLED.store(true, Ordering::SeqCst); }
     fn installed() -> bool { INSTALLED.load(Ordering::SeqCst) }
+    pub(super) fn has_evidence(token: Token) -> bool { token.0 != 0 }
     static INVALID_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     #[derive(Debug, Clone, Copy)]
     pub(crate) struct Token(u64);
@@ -3119,7 +3123,27 @@ pub(crate) mod root_observations {
 
     #[cfg(test)]
     #[test]
-    fn installed_provenance_rejects_reuse_and_payer_changes() {
+    pub(crate) fn installed_provenance_rejects_reuse_and_payer_changes() {
+        const CHILD: &str = "CONTEXTDB_INSTALLED_PROVENANCE_NEGATIVE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",
+                    "vector_read_memory::root_observations::installed_provenance_rejects_reuse_and_payer_changes",
+                    "--nocapture"])
+                .env(CHILD, "1").output().expect("run isolated provenance negatives");
+            assert!(output.status.success(), "isolated provenance negatives failed: {}",
+                String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains(
+                "PROVENANCE_NEGATIVES payer reuse duplicate_free capacity PASS"),
+                "the child must execute every destructive negative branch");
+            return;
+        }
+        fn rejects(operation: impl FnOnce() + std::panic::UnwindSafe, expected: &str) {
+            let error = std::panic::catch_unwind(operation).expect_err(expected);
+            let message = error.downcast_ref::<&str>().copied()
+                .or_else(|| error.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(message, Some(expected));
+        }
         use crate::read_image_memory::{ImageMemory, ImageMemoryObservation};
         assert!(installed(), "unit GlobalAlloc must establish the installation fact");
         let image = ImageMemory::new(None).unwrap();
@@ -3134,28 +3158,39 @@ pub(crate) mod root_observations {
         assert!(producer_sample(token).0);
         let wrong_payer = if actual.payer.is_some() { None }
             else { Some(image.accountant.as_ptr() as usize) };
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        rejects(std::panic::AssertUnwindSafe(|| {
             producer(address, 1, actual.counter, actual.last_charged as usize,
-                actual.payload_bytes, wrong_payer))).is_err());
+                actual.payload_bytes, wrong_payer);
+        }), "producer cannot change its original payer");
         // Withhold only the observer's deallocation boundary. The real image
         // remains pinned; a second registration cannot qualify address reuse.
         producer_dropped(address, 1, actual.last_charged as usize, actual.payload_bytes);
-        assert!(std::panic::catch_unwind(|| producer(address, 1, actual.counter,
-            actual.last_charged as usize, actual.payload_bytes, actual.payer)).is_err());
+        rejects(|| {
+            producer(address, 1, actual.counter,
+                actual.last_charged as usize, actual.payload_bytes, actual.payer);
+        }, "address reused without original physical-free evidence; observation unqualified");
         assert!(!producer_sample(token).3, "a rejected reuse cannot invent a free");
         drop(image);
         assert!(producer_sample(token).3, "only the GlobalAlloc return qualifies free");
+        // Invalidate this actual free before capacity reuse can retire its slot.
+        after_physical_free(token.0);
+        rejects(|| { producer_sample(token); }, "unqualified physical-free observation");
         let images: Vec<_> = (0..65).map(|_| ImageMemory::new(None).unwrap()).collect();
         let mut rejected = 0;
         for image in &images {
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                ImageMemoryObservation::new(image))).is_err() { rejected += 1; }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                ImageMemoryObservation::new(image))) {
+                Ok(_) => {},
+                Err(error) => {
+                    assert_eq!(error.downcast_ref::<&str>().copied(),
+                        Some("producer observation static capacity exhausted; proof invalid"));
+                    rejected += 1;
+                }
+            }
         }
         assert!(rejected > 0, "installed provenance capacity remains fail-closed");
         drop(images);
-        after_physical_free(token.0);
-        assert!(std::panic::catch_unwind(|| producer_sample(token)).is_err(),
-            "a duplicate allocator return must invalidate evidence");
+        println!("PROVENANCE_NEGATIVES payer reuse duplicate_free capacity PASS");
     }
 
 }
