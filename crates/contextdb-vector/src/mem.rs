@@ -738,7 +738,7 @@ fn streamed_tail_row_with_navigation(
     owner: &mut crate::VectorCopyAdmission,
     before_read: &mut dyn FnMut() -> bool,
 ) -> Result<bool> {
-    navigation.release_navigation_before_body();
+    // Planted regression: optional cache remains resident.
     tail.includes_row(row, snapshot, owner, before_read)
 }
 
@@ -757,7 +757,7 @@ fn journal_row_with_navigation(
             &mut || Ok(()),
             owner,
             Some(&mut |token, bytes, component, operation, hint| {
-                navigation.reserve_for(token, bytes, component, operation, hint)
+                token.reserve_for(bytes, component, operation, hint)
             }),
         )
         .map(|entry| {
@@ -784,7 +784,7 @@ fn admit_row_check_with_navigation<E: From<Error>>(
         row,
         &mut |bytes| {
             let mut admission = owner.scratch();
-            navigation.reserve(&mut admission, bytes).map_err(E::from)?;
+            admission.reserve(bytes).map_err(E::from)?;
             drop(admission);
             before_retain(bytes)
         },
