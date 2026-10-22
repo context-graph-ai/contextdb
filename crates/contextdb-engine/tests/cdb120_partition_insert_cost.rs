@@ -245,7 +245,7 @@ fn r1b_cap_four_refuses_the_fifth_key_and_admits_the_fourth() {
         let rows = db
             .execute("SELECT id FROM items", &none())
             .unwrap()
-            .rows
+            .rows()
             .len();
         assert_eq!(rows, 5, "{label}: the refused write left no row behind");
     }
@@ -340,7 +340,7 @@ fn r3_edge_refuses_exactly_as_the_base_does_visits_no_historical_route_and_admit
         assert_eq!(
             db.execute("SELECT id FROM items", &none())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             1,
             "{label}: the refused write left no row"
@@ -614,7 +614,7 @@ fn r2_a_process_death_after_durable_commits_reopens_with_exact_cap_figures() {
     assert_eq!(
         db.execute("SELECT id FROM items", &none())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         4
     );
