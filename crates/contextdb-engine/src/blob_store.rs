@@ -24,7 +24,7 @@ use crate::work_ledger::{
     node_claim_permits_movement_with_read_memory as node_claim_permits_movement,
     node_holds_claim_for_blob_with_read_memory as node_holds_claim_for_blob,
 };
-use contextdb_core::{Error, Result, Wallclock, read_memory::ReadMemoryBudget};
+use contextdb_core::{Error, Result, Wallclock};
 #[cfg(any(test, feature = "test-seams"))]
 use std::collections::BTreeSet;
 use std::io::Write;

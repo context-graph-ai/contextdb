@@ -2,7 +2,7 @@
 //! Image cursors retain keys and one admitted edge window, never adjacency.
 use super::*;
 use contextdb_core::Direction;
-use contextdb_core::read_memory::{OwnedReadBox, ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::{OwnedReadBox, ReadCredit};
 use contextdb_graph::source::{
     GraphCursor, GraphCursorOwner, GraphEdgeWindow, GraphQuery, GraphReadSource, GraphSnapshot,
 };

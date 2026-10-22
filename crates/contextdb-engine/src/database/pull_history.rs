@@ -1,6 +1,6 @@
 //! One protected resident history view and admitted per-occurrence copies.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::{ReadCredit};
 
 /// The registration protects superseded occurrences as well as the visible
 /// version. Its slot is admitted before the registry can allocate it.

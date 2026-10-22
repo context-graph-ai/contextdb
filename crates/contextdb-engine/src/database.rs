@@ -46067,7 +46067,7 @@ impl Database {
         // The persistence input is a distinct physical edge copy from the
         // replacement graph's forward/reverse bodies. Its invoice stays with
         // the stage after the target invoice transfers into the live store.
-        let (received_edge_input_original, received_edge_input_count) = if let Some(original) = preparation_original {
+        let (received_edge_input_original, _received_edge_input_count) = if let Some(original) = preparation_original {
             let (count, bytes) = working.graph_store.forward_adj.read().values()
                 .flat_map(|entries| entries.iter()).try_fold((0usize, 0usize), |(count, bytes), edge| {
                     Ok::<_, Error>((count.saturating_add(1), bytes.saturating_add(std::mem::size_of::<AdjEntry>())
@@ -111164,7 +111164,7 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let discard_selections = self.capture_original_discard_selections(host, tx)?;
-        let discard_fence_memory = host.events.with_owned_persistence_original(|original| {
+        let _discard_fence_memory = host.events.with_owned_persistence_original(|original| {
             let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
             frame.tree::<String, ()>(discard_selections.values.len().saturating_mul(2))?;
             for selection in &discard_selections.values { frame.reserve(selection.table.len().saturating_mul(2))?; }

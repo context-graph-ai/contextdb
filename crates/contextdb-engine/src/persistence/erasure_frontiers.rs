@@ -1,6 +1,6 @@
 //! Store-local erasure publication watermarks, independent of row-life history.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::{ReadCredit};
 
 pub(super) const TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("read_erasure_frontiers");

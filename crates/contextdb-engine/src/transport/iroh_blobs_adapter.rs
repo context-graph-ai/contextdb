@@ -26,7 +26,7 @@ use bao_tree::io::{BaoContentItem, EncodeError, Leaf};
 use bao_tree::{BaoTree, ChunkNum, ChunkRanges};
 use contextdb_core::{
     Error, Result,
-    read_memory::{ReadCredit, ReadMemoryBudget},
+    read_memory::{ReadCredit},
 };
 use iroh::endpoint::VarInt;
 use iroh_blobs::api::Store;

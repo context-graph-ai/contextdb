@@ -1,6 +1,6 @@
 //! Immutable transaction decisions retained by a captured graph read.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::{ReadCredit};
 
 #[derive(Clone)]
 pub(crate) struct GraphCursorReadGuard(Arc<GraphDecisionContext>);

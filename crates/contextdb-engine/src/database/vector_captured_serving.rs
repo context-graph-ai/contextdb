@@ -957,16 +957,16 @@ impl contextdb_vector::store::StreamedVectorSuffixHandle for CapturedSuffixLoade
     }
 
 
-    fn observe_vector_decode(&self, row_id: RowId, created_tx: TxId, lsn: Lsn) {
+    fn observe_vector_decode(&self, _row_id: RowId, _created_tx: TxId, _lsn: Lsn) {
         #[cfg(any(test, feature = "test-seams"))]
         crate::vector_observations::emit(
             &self.partition.index,
             &self.partition.partition_key,
             self.covered_lsn,
             crate::vector_observations::VectorJournalReplayWork::Vector {
-                row_id,
-                created_tx,
-                lsn,
+                row_id: _row_id,
+                created_tx: _created_tx,
+                lsn: _lsn,
             },
         );
     }

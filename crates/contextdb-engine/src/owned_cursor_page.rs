@@ -2,14 +2,13 @@
 use crate::executor::bounded::CursorPageInvoice;
 use contextdb_core::read_contract::{CursorPage, ReadContractViolation};
 use contextdb_core::read_memory::{
-    NativeProduce, ReadCredit, ReadMemoryBudget, ReadMemoryOwner, ReadShared,
+    NativeProduce, ReadCredit, ReadMemoryOwner, ReadShared,
 };
 use contextdb_core::{Result, Value};
 type PreparedPage =
     contextdb_core::read_contract::PreparedCursorPage<OwnedCursorPage, CursorPageInvoice>;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::ops::Deref;
-use std::sync::Arc;
 
 // Only the public ReadSession producer opts in. OwnerReadService's private
 // pages, retained templates and wire encoders never need a public shared cell.

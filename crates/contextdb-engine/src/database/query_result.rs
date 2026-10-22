@@ -2,10 +2,10 @@
 use super::{CascadeReport, QueryTrace};
 use crate::read_image_memory::QueryAnswerCharge;
 use contextdb_core::read_memory::{
-    NativeProduce, ReadCredit, ReadMemoryBudget, ReadMemoryOwner, ReadShared,
+    NativeProduce, ReadCredit, ReadMemoryOwner, ReadShared,
 };
 use contextdb_core::{Error, Result, Value};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 /// An immutable answer. Cloning retains the same admitted allocations.
 /// Borrowed components cannot outlive this handle; application copies belong

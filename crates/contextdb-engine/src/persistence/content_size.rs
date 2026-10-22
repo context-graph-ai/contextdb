@@ -1,6 +1,6 @@
 //! Exact committed content lengths, maintained beside the selected physical writes.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::{ReadCredit};
 use std::ops::Deref;
 
 pub(super) const TOTALS: TableDefinition<&str, &[u8]> = TableDefinition::new("content_size_totals");

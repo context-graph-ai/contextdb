@@ -136,9 +136,9 @@ impl<'f, 'o, 'w> OriginalMutationLog<'f, 'o, 'w> {
         Ok(())
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn push_at(&mut self, site: &'static str, mutation: content_identity::ContentIdentityMutation) -> Result<()> {
+    pub(super) fn push_at(&mut self, _site: &'static str, mutation: content_identity::ContentIdentityMutation) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
-        if REFUSED_IDENTITY_GROWTH_SITE.with(|armed| armed.get() == Some(site)) {
+        if REFUSED_IDENTITY_GROWTH_SITE.with(|armed| armed.get() == Some(_site)) {
             return Err(Error::MemoryBudgetExceeded {
                 subsystem: "persistence".into(), operation: "prepare_commit".into(),
                 requested_bytes: std::mem::size_of::<content_identity::ContentIdentityMutation>(),
@@ -635,7 +635,7 @@ impl RedbPersistence {
     pub(super) fn erase_received_graph_adjacencies_in_write(
         &self, write: &redb::WriteTransaction, selected_types: &HashSet<String>,
     ) -> Result<()> {
-        for (definition, probe, context) in [
+        for (definition, _probe, _context) in [
             (GRAPH_FWD_TABLE, "graph_fwd", "received_schema_forward_selection"),
             (GRAPH_REV_TABLE, "graph_rev", "received_schema_reverse_selection"),
         ] {
@@ -653,10 +653,10 @@ impl RedbPersistence {
                     let mut cursor = source.range::<&[u8]>((lower, Bound::Unbounded)).map_err(Self::storage_error)?;
                     cursor.next().transpose().map_err(Self::storage_error)?.map(|(key, value)| {
                         #[cfg(any(test, feature = "test-seams"))]
-                        crate::read_work_probe::graph_storage_key(probe, "iteration_step", key.value());
+                        crate::read_work_probe::graph_storage_key(_probe, "iteration_step", key.value());
                         #[cfg(any(test, feature = "test-seams"))]
                         crate::read_work_probe::note_graph("graph_payload", "payload_decode",
-                            key.value(), None, Some(context));
+                            key.value(), None, Some(_context));
                         let required = key.value().len().saturating_mul(2).saturating_add(128);
                         if required > coordinate_bytes {
                             coordinate_credit.admit(required - coordinate_bytes)?;
@@ -671,7 +671,7 @@ impl RedbPersistence {
                 let Some((key, remove)) = selected else { break; };
                 if remove {
                     write.open_table(definition).map_err(Self::storage_error)?
-                        .remove(observed_graph_key!(probe, "remove", key.as_slice(), 5))
+                        .remove(observed_graph_key!(_probe, "remove", key.as_slice(), 5))
                         .map_err(Self::storage_error)?;
                 }
                 after = Some(key);
@@ -685,7 +685,7 @@ impl RedbPersistence {
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction, selected_types: &HashSet<String>,
         working: Option<(&received_working::ReceivedWorkingWrite, Option<&received_working_graph::WorkingGraphCapture>)>,
     ) -> Result<()> {
-        for (definition, probe, context) in [
+        for (definition, _probe, _context) in [
             (GRAPH_FWD_TABLE, "graph_fwd", "received_schema_forward_selection"),
             (GRAPH_REV_TABLE, "graph_rev", "received_schema_reverse_selection"),
         ] {
@@ -700,10 +700,10 @@ impl RedbPersistence {
                     let mut cursor = source.range::<&[u8]>((lower, Bound::Unbounded)).map_err(Self::storage_error)?;
                     cursor.next().transpose().map_err(Self::storage_error)?.map(|(key, value)| {
                         #[cfg(any(test, feature = "test-seams"))]
-                        crate::read_work_probe::graph_storage_key(probe, "iteration_step", key.value());
+                        crate::read_work_probe::graph_storage_key(_probe, "iteration_step", key.value());
                         #[cfg(any(test, feature = "test-seams"))]
                         crate::read_work_probe::note_graph("graph_payload", "payload_decode",
-                            key.value(), None, Some(context));
+                            key.value(), None, Some(_context));
                         let required = key.value().len().saturating_mul(2).saturating_add(128);
                         if required > coordinate_bytes {
                             coordinate_credit.reserve(required - coordinate_bytes)?;
@@ -720,7 +720,7 @@ impl RedbPersistence {
                 let Some((key, remove)) = selected else { break; };
                 if remove {
                     write.open_table(definition).map_err(Self::storage_error)?
-                        .remove(observed_graph_key!(probe, "remove", key.as_slice(), 5))
+                        .remove(observed_graph_key!(_probe, "remove", key.as_slice(), 5))
                         .map_err(Self::storage_error)?;
                 }
                 after = Some(key);

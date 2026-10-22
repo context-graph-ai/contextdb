@@ -2199,7 +2199,7 @@ impl Database {
         })
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn finish_private_graph_schema_transition(&self, tx: TxId,
+    pub(super) fn finish_private_graph_schema_transition(&self, _tx: TxId,
         transition: Option<PrivateGraphSchemaTransition>) -> Result<()> {
         let Some(transition) = transition else { return Ok(()); };
         let source = crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())?

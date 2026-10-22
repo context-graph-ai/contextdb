@@ -1,6 +1,6 @@
 //! Immutable pending-delete roots, changed only by lineage publication.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::{ReadCredit};
 use contextdb_relational::membership::MembershipImage;
 use contextdb_relational::store::IndexEntry;
 use parking_lot::{ArcMutexGuard, RawMutex};

@@ -3,7 +3,7 @@
 use super::*;
 use contextdb_core::Direction;
 use super::received_working::ReceivedWorkingWrite;
-use contextdb_core::read_memory::{OwnedReadBox, ReadCredit, ReadMemoryBudget};
+use contextdb_core::read_memory::{OwnedReadBox, ReadCredit};
 use contextdb_relational::source::{RelationalCursor, RelationalCursorOwner,
     RelationalReadSource, RelationalWindow, RelationalIndexRange, RelationalPosting,
     RelationalPositionKey};
