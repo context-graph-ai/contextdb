@@ -57,7 +57,7 @@ SYNC_ROUTING_FINGERPRINTS = {'crates/contextdb-engine/tests/sync_schema_transact
 # Reviewed normal-only partition of the unchanged three-case native inventory.
 LONG_RUNNING_CASES = ('long_running::f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes', 'long_running::f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge', 'long_running::f27_incremental_pull_after_initial_sync')
 LONG_RUNNING_PARTITIONS = {'acceptance-long-running-transfer-test': ('long_running::f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes', 'long_running::f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge'), 'acceptance-long-running-test': ('long_running::f27_incremental_pull_after_initial_sync',)}
-LONG_RUNNING_FINGERPRINTS = {'tests/acceptance_long_running.rs': 'c070eb6fe18b5871b42419f33ed2c78c8e938c421384e7f1bcc9f35641b6e04d', 'tests/acceptance/long_running.rs': 'a1441aa17b96b6583fcfde53406205bf223447c00da8f613d330a438a936c5cb', 'tests/acceptance/common.rs': '1bd9e6cc921e8354c500434e362995d9afb59e3c3646a459ea7b25adf7760901', 'tests/support/binary_path_helpers.rs': '05bd95280e47f5141b2a04bec3bcf5ca934c4cc642597cc46e16496d9461cb0c'}
+LONG_RUNNING_FINGERPRINTS = {'tests/acceptance_long_running.rs': 'c070eb6fe18b5871b42419f33ed2c78c8e938c421384e7f1bcc9f35641b6e04d', 'tests/acceptance/long_running.rs': 'a1441aa17b96b6583fcfde53406205bf223447c00da8f613d330a438a936c5cb', 'tests/acceptance/common.rs': 'fea3fd47556cbcabc2da91f3deb434c9dddad561a2517a4b303c44bb7479130c', 'tests/support/binary_path_helpers.rs': '05bd95280e47f5141b2a04bec3bcf5ca934c4cc642597cc46e16496d9461cb0c'}
 
 def long_running_contract(root=ROOT):
     for path, expected in LONG_RUNNING_FINGERPRINTS.items():
