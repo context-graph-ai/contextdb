@@ -28,7 +28,7 @@ pub(super) struct CronState {
 #[derive(Debug)]
 struct CronRuntime {
     shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<crate::owned_worker::OwnedWorker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,10 +170,11 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn start_cron_tickler_if_schedules_present(&self) {
+    pub(super) fn start_cron_tickler_if_schedules_present(&self) -> Result<()> {
         if self.access_is_admin() && !self.cron.schedules.lock().is_empty() {
-            self.ensure_cron_tickler_running();
+            self.ensure_cron_tickler_running()?;
         }
+        Ok(())
     }
 
     pub(super) fn create_cron_schedule(
@@ -222,7 +223,7 @@ impl Database {
                 .schedule_count
                 .store(schedule_count as u64, Ordering::SeqCst);
         }
-        self.ensure_cron_tickler_running();
+        self.ensure_cron_tickler_running()?;
         self.cron.waiters.notify_all();
         Ok(())
     }
@@ -267,7 +268,7 @@ impl Database {
             .write()
             .insert(name.to_string(), Arc::new(callback));
         if !self.cron.schedules.lock().is_empty() {
-            self.ensure_cron_tickler_running();
+            self.ensure_cron_tickler_running()?;
         }
         self.cron.waiters.notify_all();
         Ok(())
@@ -399,23 +400,23 @@ impl Database {
         }
     }
 
-    fn ensure_cron_tickler_running(&self) {
+    fn ensure_cron_tickler_running(&self) -> Result<()> {
         if !self.resource_owner {
-            return;
+            return Ok(());
         }
         if self.resource_closed.load(Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
         if self.cron.pause_count.load(Ordering::SeqCst) > 0 {
-            return;
+            return Ok(());
         }
-        self.start_cron_tickler_runtime();
+        self.start_cron_tickler_runtime()
     }
 
-    fn start_cron_tickler_runtime(&self) {
+    fn start_cron_tickler_runtime(&self) -> Result<()> {
         let mut runtime = self.cron.runtime.lock();
         if runtime.handle.is_some() {
-            return;
+            return Ok(());
         }
         runtime.shutdown.store(false, Ordering::SeqCst);
         let shutdown = runtime.shutdown.clone();
@@ -424,8 +425,12 @@ impl Database {
         crate::read_probe::note_cron_worker_start();
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_background_worker_start();
-        let handle = thread::spawn(move || db.cron_tickler_loop(shutdown));
+        let handle = crate::owned_worker::OwnedWorker::spawn(
+            self.finalization.accountant.read_budget()?,
+            move || db.cron_tickler_loop(shutdown),
+        )?;
         runtime.handle = Some(handle);
+        Ok(())
     }
 
     fn cron_tickler_loop(self, shutdown: Arc<AtomicBool>) {

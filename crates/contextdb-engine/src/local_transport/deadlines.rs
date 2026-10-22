@@ -725,6 +725,7 @@ impl DeadlineClock for MonotonicDeadlineClock {
                 let (lock, changed) = &*timer;
                 let until = std::time::Instant::now() + std::time::Duration::from_millis(remaining);
                 let mut state = lock.lock().unwrap_or_else(|held| held.into_inner());
+                state.owner = Some(crate::owned_worker::current_thread_id());
                 loop {
                     if state.abandoned {
                         return;
@@ -783,6 +784,7 @@ impl Future for InjectedTimerArmFailureWait<'_> {
 
 #[derive(Default)]
 struct TimerState {
+    owner: Option<crate::owned_worker::CurrentThreadId>,
     reached: bool,
     abandoned: bool,
     waker: Option<Waker>,
@@ -815,7 +817,8 @@ impl Drop for TimerWait {
         }
         self.state.1.notify_all();
         if let Some(thread) = self.thread.take()
-            && thread.thread().id() != std::thread::current().id()
+            && self.state.0.lock().unwrap_or_else(|p| p.into_inner()).owner
+                != Some(crate::owned_worker::current_thread_id())
         {
             let _ = thread.join();
         }
@@ -1334,6 +1337,7 @@ impl OwnedTimerSource {
         let (lock, changed) = &*self.state;
         let until = std::time::Instant::now() + std::time::Duration::from_millis(self.remaining);
         let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        state.owner = Some(crate::owned_worker::current_thread_id());
         loop {
             if state.abandoned { return; }
             let now = std::time::Instant::now();
@@ -1364,7 +1368,8 @@ impl Drop for OwnedTimerWait {
           state.abandoned = true; state.waker = None; }
         self.state.1.notify_all();
         if let Some(thread) = self.thread.take() {
-            if thread.thread().id() != std::thread::current().id() { let _ = thread.join(); }
+            if self.state.0.lock().unwrap_or_else(|p| p.into_inner()).owner
+                != Some(crate::owned_worker::current_thread_id()) { let _ = thread.join(); }
         }
     }
 }

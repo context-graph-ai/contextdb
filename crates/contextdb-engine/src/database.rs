@@ -30918,7 +30918,7 @@ impl Database {
             db.kernel_observer = test_kernel_observer;
         }
         if !in_memory {
-            db.start_cron_tickler_if_schedules_present();
+            db.start_cron_tickler_if_schedules_present()?;
             db.load_retention_sync_peer();
             db.reconcile_maintenance_thread();
             match db.start_owner_read_service(path) {
@@ -74312,7 +74312,7 @@ impl Database {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_plugin_start();
         db.plugin.on_open()?;
-        db.start_cron_tickler_if_schedules_present();
+        db.start_cron_tickler_if_schedules_present()?;
         db.load_retention_sync_peer();
         db.reconcile_maintenance_thread();
         Ok(db)
