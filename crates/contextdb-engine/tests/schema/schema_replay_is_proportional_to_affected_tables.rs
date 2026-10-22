@@ -160,12 +160,14 @@ fn resident_rows(db: &Database) -> Vec<Vec<Value>> {
                     ("end".to_string(), Value::Int64(start + WINDOW)),
                 ]),
             )
-            .expect("resident data remains readable")
-            .rows();
-        if window.is_empty() {
+            .expect("resident data remains readable");
+        if window.rows().is_empty() {
             break;
         }
-        rows.extend(window);
+        // Keep the original application-owned baseline, not native answer handles.
+        // The immutable window remains funded through the explicit caller copy.
+        rows.extend(window.rows().iter().cloned());
+        drop(window);
         start += WINDOW;
     }
     assert_eq!(
