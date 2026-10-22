@@ -705,6 +705,12 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
     );
     let pending = info().pending_inserts;
     assert!(pending > 0);
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.built_partitions,
+        0,
+        "the old high threshold must leave the same changes ineligible"
+    );
+    assert_eq!(info().pending_inserts, pending);
     take_projected_rows();
     run(
         &db,
@@ -713,13 +719,27 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
     assert_eq!(take_projected_rows(), 0);
     assert_eq!(info().base_generation, Some(initial));
     assert_eq!(info().pending_inserts, pending);
-    let report = db.run_maintenance_cycle().unwrap();
-    assert_eq!(
-        report.vector.built_partitions, 1,
-        "the metadata publisher must preserve the newly due replacement work"
-    );
+    for pass in 0..8 {
+        let report = db.run_maintenance_cycle().unwrap();
+        let current = info();
+        eprintln!(
+            "consolidation_recheck pass={pass} built={} base={:?} base_tx={:?} pending={} tombstones={}",
+            report.vector.built_partitions,
+            current.base_generation,
+            current.base_tx,
+            current.pending_inserts,
+            current.tombstones
+        );
+        if current.base_generation > Some(initial) {
+            break;
+        }
+    }
     let replacement = info().base_generation.unwrap();
-    assert_ne!(replacement, initial);
+    assert!(
+        replacement > initial,
+        "newly due work must publish a complete successor base within finite maintenance passes"
+    );
+    assert_eq!(info().pending_inserts, 0);
     let original_limit = db.memory_limit();
     db.set_memory_limit(Some(db.accountant().usage().used.saturating_add(96 * 1024)))
         .unwrap();
@@ -727,6 +747,9 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         &db,
         "UPDATE recheck_rows SET embedding = '[0,0,1]' WHERE id = 1",
     );
+    let before_failure = info();
+    let retained_changes = (before_failure.pending_inserts, before_failure.tombstones);
+    assert!(retained_changes.0 > 0);
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.first_failure,
         Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
@@ -734,6 +757,12 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
     assert_eq!(
         info().maintenance_failure,
         Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
+    );
+    let after_failure = info();
+    assert_eq!(
+        (after_failure.pending_inserts, after_failure.tombstones),
+        retained_changes,
+        "a refused replacement must preserve every pending insert and tombstone"
     );
     // This new guard deliberately isolates the post-durability recheck from
     // the separately retained, unchanged low-headroom ALTER contract test.
@@ -745,6 +774,11 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
     );
     assert_eq!(take_projected_rows(), 0);
     assert_eq!(info().base_generation, Some(replacement));
+    let retained = info();
+    assert_eq!(
+        (retained.pending_inserts, retained.tombstones),
+        retained_changes
+    );
     assert_eq!(
         info().maintenance_failure,
         None,
@@ -755,15 +789,39 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         0
     );
     assert_eq!(info().base_generation, Some(replacement));
+    let retained = info();
+    assert_eq!(
+        (retained.pending_inserts, retained.tombstones),
+        retained_changes
+    );
     run(
         &db,
         "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
     );
+    let eligible = info();
     assert_eq!(
-        db.run_maintenance_cycle().unwrap().vector.built_partitions,
-        1,
-        "pending work must survive disabled consolidation and become eligible again"
+        (eligible.pending_inserts, eligible.tombstones),
+        retained_changes
     );
-    assert_ne!(info().base_generation, Some(replacement));
+    for pass in 0..8 {
+        let report = db.run_maintenance_cycle().unwrap();
+        let current = info();
+        eprintln!(
+            "consolidation_reenable pass={pass} built={} base={:?} pending={} tombstones={}",
+            report.vector.built_partitions,
+            current.base_generation,
+            current.pending_inserts,
+            current.tombstones
+        );
+        if current.base_generation > Some(replacement) {
+            break;
+        }
+    }
+    assert!(info().base_generation > Some(replacement));
+    assert_eq!(
+        info().pending_inserts,
+        0,
+        "reenabling must consume the actual retained insert work"
+    );
     db.close().unwrap();
 }
