@@ -804,3 +804,8 @@ required-features = ["test-seams", "iroh"]
 name = "vector"
 path = "tests/vector.rs"
 required-features = ["test-seams"]
+
+[[bin]]
+name = "memory-census"
+path = "src/bin/memory-census.rs"
+required-features = ["test-seams"]

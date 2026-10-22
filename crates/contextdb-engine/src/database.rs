@@ -11942,7 +11942,7 @@ pub(crate) struct VectorMemoryOwnershipReceipt {
 /// Passive exact ownership receipt used by the memory-contract proof.
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct VectorMemoryOwnershipReceiptForTest {
     /// Actual held source/loader metadata credits, deduplicated by Arc identity.
     pub source_metadata: usize,
@@ -11980,7 +11980,7 @@ pub struct VectorMemoryOwnershipReceiptForTest {
 /// row prices are observations, not additional accountant charges.
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct WriterMemoryOwnershipReceiptForTest {
     pub writer_registration: usize,
     pub engine_accountant_backing: usize,
@@ -12016,6 +12016,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub current_membership_charge: usize,
     pub captured_membership_charge: usize,
     pub current_membership_by_table: std::collections::BTreeMap<String, usize>,
+    #[serde(serialize_with = "serialize_relational_inventory_for_test")]
     pub relational_inventory: contextdb_relational::store::RetainedStructureBytes,
     pub ddl_log_entries: usize,
     pub ddl_log_estimated_bytes: usize,
@@ -12038,13 +12039,32 @@ pub struct WriterMemoryOwnershipReceiptForTest {
 
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CurrentRowOwnershipForTest {
     pub versions: usize,
     pub values: usize,
     pub side_maps: usize,
     pub index_postings: usize,
     pub f32_projections: usize,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn serialize_relational_inventory_for_test<S: serde::Serializer>(
+    inventory: &contextdb_relational::store::RetainedStructureBytes,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    let mut fields = serializer.serialize_struct("RetainedStructureBytes", 9)?;
+    fields.serialize_field("row_versions", &inventory.row_versions)?;
+    fields.serialize_field("row_positions", &inventory.row_positions)?;
+    fields.serialize_field("row_version_positions", &inventory.row_version_positions)?;
+    fields.serialize_field("sync_provenance", &inventory.sync_provenance)?;
+    fields.serialize_field("index_trees", &inventory.index_trees)?;
+    fields.serialize_field("index_exact", &inventory.index_exact)?;
+    fields.serialize_field("index_exact_filters", &inventory.index_exact_filters)?;
+    fields.serialize_field("index_membership", &inventory.index_membership)?;
+    fields.serialize_field("index_descriptors", &inventory.index_descriptors)?;
+    fields.end()
 }
 
 impl VectorSearchTailState {
