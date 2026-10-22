@@ -1863,7 +1863,9 @@ async fn a_refused_transaction_in_a_pulled_batch_leaves_its_unrelated_siblings_i
         vec![
             vec![Value::Text("first memo".into())],
             vec![Value::Text("second memo".into())],
-        ],
+        ]
+        .iter()
+        .collect::<Vec<_>>(),
         "every unrelated unit in the batch installed, including the one after the held unit"
     );
 

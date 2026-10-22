@@ -1,5 +1,9 @@
 //! Hub-authored outcomes, complete readback, truthful pending, and automatic restore.
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
+use retained_query_rows::RetainedRows;
+
 use contextdb_core::{Lsn, TenantId, Value, Wallclock};
 use contextdb_engine::database::DeliveryManifest;
 use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;
@@ -2476,13 +2480,13 @@ async fn a_refused_unit_is_terminal_the_resend_obligation_ends_status_is_clean_a
     let _ = hub.stop().await;
 }
 
-fn whole_unit_rows(db: &Database) -> Vec<Vec<Vec<Value>>> {
+fn whole_unit_rows(db: &Database) -> Vec<RetainedRows> {
     [ROOT_TABLE, MEMBER_TABLE]
         .into_iter()
         .map(|table| {
             db.execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows()
+                .into()
         })
         .collect()
 }

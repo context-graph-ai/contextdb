@@ -35,9 +35,9 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 fn text_column(result: QueryResult) -> Vec<String> {
     result
         .rows()
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Text(value)) => value,
+        .iter()
+        .map(|row| match row.iter().next() {
+            Some(Value::Text(value)) => value.clone(),
             value => panic!("expected one text value, got {value:?}"),
         })
         .collect()

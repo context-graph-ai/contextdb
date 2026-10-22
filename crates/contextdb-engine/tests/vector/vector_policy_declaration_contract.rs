@@ -3,7 +3,7 @@
 
 use contextdb_core::{Error, Value};
 use contextdb_engine::cli_render::render_table_meta;
-use contextdb_engine::{Database, MaintenancePolicy};
+use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use std::collections::HashMap;
 
 fn empty() -> HashMap<String, Value> {
@@ -50,7 +50,7 @@ fn schema_identity(db: &Database, table: &str) -> Vec<u8> {
     .expect("table metadata has a stable persisted encoding")
 }
 
-fn summary_row(db: &Database, table: &str) -> (Vec<String>, Vec<Value>) {
+fn summary_row(db: &Database, table: &str) -> (QueryResult, Vec<Value>) {
     let summary = db
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("the public vector inspection statement succeeds");
@@ -72,15 +72,20 @@ fn summary_row(db: &Database, table: &str) -> (Vec<String>, Vec<Value>) {
                 && row[column_column] == Value::Text("embedding".to_owned())
         })
         .unwrap_or_else(|| panic!("vector inspection describes {table}.embedding: {summary:?}"));
-    (summary.columns(), row.clone())
+    let row = row.clone();
+    (summary, row)
 }
 
 fn assert_declared_values_are_null_when_silent_and_exact_when_set(
-    silent: &(Vec<String>, Vec<Value>),
-    declared: &(Vec<String>, Vec<Value>),
+    silent: &(QueryResult, Vec<Value>),
+    declared: &(QueryResult, Vec<Value>),
     expected: &[i64],
 ) {
-    assert_eq!(silent.0, declared.0, "inspection shape is stable");
+    assert_eq!(
+        silent.0.columns(),
+        declared.0.columns(),
+        "inspection shape is stable"
+    );
     assert_eq!(
         silent.1.len(),
         declared.1.len(),

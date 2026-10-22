@@ -5,6 +5,10 @@
 //! threshold the partition walks its graph as before. A scope may mix both;
 //! its answer is the one global top-k either way.
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
+use retained_query_rows::RetainedRows;
+
 use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
 use contextdb_core::{Error, Value, VectorIndexRef, VectorPolicyDeclarationIssue as Issue};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
@@ -452,10 +456,11 @@ fn routes_at(db: &Database, snapshot: contextdb_core::SnapshotId) -> Vec<Option<
     })
     .trace()
     .vector_search
+    .as_ref()
     .expect("the snapshot search discloses its route")
     .partition_hnsw
-    .into_iter()
-    .map(|partition| partition.reason)
+    .iter()
+    .map(|partition| partition.reason.clone())
     .collect()
 }
 
@@ -1186,7 +1191,7 @@ fn a_flat_partition_with_growing_replaced_history_stays_exact_and_charged() {
     assert_eq!(accountant.underflow_count_for_test(), 0);
 }
 
-fn answer_at(db: &Database, mode: &str, snapshot: contextdb_core::SnapshotId) -> Vec<Vec<Value>> {
+fn answer_at(db: &Database, mode: &str, snapshot: contextdb_core::SnapshotId) -> RetainedRows {
     db.execute_at_snapshot(
         &format!(
             "SELECT id FROM flat_docs ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 10"
@@ -1195,7 +1200,7 @@ fn answer_at(db: &Database, mode: &str, snapshot: contextdb_core::SnapshotId) ->
         snapshot,
     )
     .expect("the snapshot search executes")
-    .rows()
+    .into()
 }
 
 #[test]

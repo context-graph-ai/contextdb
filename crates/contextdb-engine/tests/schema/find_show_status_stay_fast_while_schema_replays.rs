@@ -18,8 +18,12 @@
 //! Parameters: CONTEXTDB_SO_RESIDENT_ROWS (10000), CONTEXTDB_SO_WARMUP_QUERIES (20),
 //! CONTEXTDB_SO_RECEIPT (path; default is a temp file whose path is printed).
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
 #[path = "../fixtures/schema_wall/mod.rs"]
 mod support;
+use retained_query_rows::RetainedRows;
+
 use contextdb_core::Value;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_engine::{Database, MaintenancePolicy};
@@ -94,14 +98,14 @@ fn resident_store(path: &std::path::Path, rows: u64) -> Arc<Database> {
     db
 }
 
-fn resident_digest(db: &Database, rows: u64) -> Vec<Vec<Value>> {
-    let answer = db
+fn resident_digest(db: &Database, rows: u64) -> RetainedRows {
+    let answer: RetainedRows = db
         .execute(
             "SELECT id, embedding FROM resident_vectors ORDER BY id",
             &empty(),
         )
         .expect("resident data remains readable")
-        .rows();
+        .into();
     assert_eq!(
         answer.len() as u64,
         rows,

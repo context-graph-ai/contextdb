@@ -4,6 +4,10 @@
 //! joined body at a time however many candidates are ranked. Each case also
 //! answers the same on the writer, the owner route and the file route.
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
+use retained_query_rows::RetainedRows;
+
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;
 use contextdb_engine::vector_read_memory::{
@@ -63,17 +67,17 @@ fn query() -> HashMap<String, Value> {
 /// The ranked answer on the writer, the owner route and the file route, and
 /// the most the file route's reader held above where it started while it
 /// answered.
-fn answer_on_every_route(db: Database, path: &std::path::Path) -> (Vec<Vec<Value>>, usize) {
-    let writer = db.execute(RANKED, &query()).unwrap().rows();
-    let owner = {
+fn answer_on_every_route(db: Database, path: &std::path::Path) -> (RetainedRows, usize) {
+    let writer: RetainedRows = db.execute(RANKED, &query()).unwrap().into();
+    let owner: RetainedRows = {
         let reader = read_session(path);
-        reader.execute(RANKED, &query()).unwrap().rows()
+        reader.execute(RANKED, &query()).unwrap().into()
     };
     db.close().unwrap();
     drop(db);
     let reader = read_session(path);
     watch_reader_budget_ledger_for_test();
-    let file = reader.execute(RANKED, &query()).unwrap().rows();
+    let file: RetainedRows = reader.execute(RANKED, &query()).unwrap().into();
     let ledger = take_reader_budget_ledger_for_test();
     let start = ledger
         .first()
@@ -91,7 +95,7 @@ fn answer_on_every_route(db: Database, path: &std::path::Path) -> (Vec<Vec<Value
 /// One decision whose rank weight joins on `bucket`, against a run of `run`
 /// outcome rows that all share that bucket. The newest of them carries the
 /// weight that decides the order.
-fn duplicate_run(composite: bool, run_length: u128) -> (Vec<Vec<Value>>, usize) {
+fn duplicate_run(composite: bool, run_length: u128) -> (RetainedRows, usize) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("ranked-run.redb");
     let db = open(&path);
@@ -181,7 +185,7 @@ fn a_ranked_file_route_join_holds_one_visited_identity_at_a_time() {
 
 /// `candidates` decisions ranked through joined outcome rows with 32 KiB
 /// bodies; half of the decisions share one joined row.
-fn many_candidates(candidates: u128) -> (Vec<Vec<Value>>, usize) {
+fn many_candidates(candidates: u128) -> (RetainedRows, usize) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("ranked-bodies.redb");
     let db = open(&path);

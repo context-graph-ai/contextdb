@@ -1,3 +1,7 @@
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
+use retained_query_rows::RetainedRows;
+
 use super::maintained_search;
 use contextdb_core::read_contract::{
     DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureLimit, ReadLimits,
@@ -211,7 +215,7 @@ fn seed(include_unrelated_contexts: bool) -> Database {
     db
 }
 
-fn selected_context_snapshot(db: &Database) -> Vec<Vec<Value>> {
+fn selected_context_snapshot(db: &Database) -> RetainedRows {
     db.execute(
         "SELECT id, context_id, generation_id, is_current, embedding FROM scoped_vectors \
          WHERE context_id = $context AND generation_id = $generation ORDER BY id ASC",
@@ -221,7 +225,7 @@ fn selected_context_snapshot(db: &Database) -> Vec<Vec<Value>> {
         ]),
     )
     .expect("read every selected-Context field that can affect search")
-    .rows()
+    .into()
 }
 
 fn query(db: &Database, partitions: usize) -> ChargedQuery {
@@ -662,7 +666,8 @@ fn a_filtered_scope_is_charged_for_its_candidates() {
     let small = query(&small_db, 1);
     let grown = query(&grown_db, 1);
     assert_eq!(
-        small.result.result.rows(), grown.result.result.rows(),
+        small.result.result.rows(),
+        grown.result.result.rows(),
         "unrelated partitions cannot alter the selected answer"
     );
     assert_eq!(
@@ -720,7 +725,8 @@ fn one_thousand_candidates_are_grouped_once_across_eight_or_sixty_four_partition
         let eight_query = grouped_query(&eight, 8, mode);
         let sixty_four_query = grouped_query(&sixty_four, 64, mode);
         assert_eq!(
-            eight_query.result.result.rows(), sixty_four_query.result.result.rows(),
+            eight_query.result.result.rows(),
+            sixty_four_query.result.result.rows(),
             "partition fanout cannot alter the fixed 1,000-candidate answer in {mode} mode"
         );
         assert_eq!(
@@ -788,11 +794,13 @@ fn graph_query_self_score_is_charged_once_per_compatible_representation() {
             "{column} INDEXED must traverse the sealed and fresh graph layers"
         );
         assert_eq!(
-            exact.result.result.rows(), expected_ids,
+            exact.result.result.rows(),
+            expected_ids,
             "{column} exact duplicates"
         );
         assert_eq!(
-            indexed.result.result.rows(), exact.result.result.rows(),
+            indexed.result.result.rows(),
+            exact.result.result.rows(),
             "{quantization:?} graph duplicate correction must preserve complete recall and canonical order"
         );
         assert_eq!(
@@ -829,7 +837,8 @@ fn grouping_charge_bounds_reject_uncharged_and_repeated_candidate_work() {
         ] {
             let faulty = grouped_query_with_fault(&db, partitions, "INDEXED", Some(fault));
             assert_eq!(
-                faulty.result.result.rows(), control.result.result.rows(),
+                faulty.result.result.rows(),
+                control.result.result.rows(),
                 "the {fault:?} control changes work observation, not the answer"
             );
             let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -851,7 +860,7 @@ fn historical_partition_rows(
     db: &Database,
     snapshot: Option<contextdb_core::SnapshotId>,
     partition: i64,
-) -> Vec<Vec<Value>> {
+) -> RetainedRows {
     let sql = "SELECT id FROM historical_grouping \
                WHERE kind = 'eligible' AND partition_id IN ($partition) \
                ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10";
@@ -865,13 +874,13 @@ fn historical_partition_rows(
             |snapshot| db.execute_at_snapshot(sql, &params, snapshot),
         )
         .expect("historical partition query")
-        .rows()
+        .into()
 }
 
 fn historical_deleted_rows(
     db: &Database,
     snapshot: Option<contextdb_core::SnapshotId>,
-) -> Vec<Vec<Value>> {
+) -> RetainedRows {
     let sql = "SELECT id FROM historical_deleted WHERE kind = 'eligible' \
                ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10";
     let params = HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
@@ -881,7 +890,7 @@ fn historical_deleted_rows(
             |snapshot| db.execute_at_snapshot(sql, &params, snapshot),
         )
         .expect("historical deleted-row query")
-        .rows()
+        .into()
 }
 
 fn bounded_historical_grouping(

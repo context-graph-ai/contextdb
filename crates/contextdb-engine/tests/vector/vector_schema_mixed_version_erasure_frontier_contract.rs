@@ -7,6 +7,10 @@
 //! lands after a schema-only outbound snapshot. Every public bookmark must
 //! describe only history delivered to the current store.
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
+use retained_query_rows::RetainedRows;
+
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::sync_types::{SchemaSyncCapability, SchemaSyncHoldback};
 use contextdb_engine::{Database, QueryResult};
@@ -82,9 +86,9 @@ fn insert_partitioned(db: &Database, id: Uuid, scope_id: Uuid) {
 fn one_column_uuids(result: QueryResult) -> Vec<Uuid> {
     result
         .rows()
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Uuid(value)) => value,
+        .iter()
+        .map(|row| match row.iter().next() {
+            Some(Value::Uuid(value)) => *value,
             value => panic!("expected one UUID value, got {value:?}"),
         })
         .collect()
@@ -869,15 +873,15 @@ async fn sibling_edge_rows_survive_replication_retry_erasure_and_a_wiped_receive
             &params([("id",Value::Uuid(id)),("source",Value::Uuid(start)),("target",Value::Uuid(target)),
                 ("context",Value::Uuid(context)),("from",Value::TxId(contextdb_core::TxId(1))),("subtype",Value::Text(subtype.into()))])).unwrap();
     }
-    let traverse = |db: &Database| {
+    let traverse = |db: &Database| -> RetainedRows {
         db.execute(
         "SELECT t FROM GRAPH_TABLE(edge_rows MATCH (a)-[:RELATES_TO]->(b) WHERE a.id=$start COLUMNS(b.id AS t))",
-        &params([("start",Value::Uuid(start))])).unwrap().rows()
+        &params([("start",Value::Uuid(start))])).unwrap().into()
     };
-    let row_ids = |db: &Database| {
+    let row_ids = |db: &Database| -> RetainedRows {
         db.execute("SELECT id FROM edge_rows ORDER BY id", &empty())
             .unwrap()
-            .rows()
+            .into()
     };
     let initial_outbound = source.changes_since(contextdb_core::Lsn(0)).unwrap();
     assert!(

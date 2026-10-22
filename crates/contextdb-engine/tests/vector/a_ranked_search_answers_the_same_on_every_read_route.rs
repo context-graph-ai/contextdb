@@ -3,6 +3,10 @@
 //! that reads the closed store's file directly. The rank policy's joined
 //! weights decide the order on every one of them.
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
+use retained_query_rows::RetainedRows;
+
 use contextdb_core::Value;
 use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
@@ -72,16 +76,16 @@ fn a_ranked_vector_search_answers_the_same_on_the_writer_owner_and_file_routes()
     let query = HashMap::from([("q".to_string(), Value::Vector(vec![1.0, 0.0]))]);
     let ranked = vec![vec![id(3)], vec![id(1)], vec![id(2)]];
 
-    let writer = db.execute(RANKED, &query).unwrap().rows();
-    let owner = {
+    let writer: RetainedRows = db.execute(RANKED, &query).unwrap().into();
+    let owner: RetainedRows = {
         let reader = contextdb_engine::ReadSession::open(&path).expect("read session on the owner");
-        reader.execute(RANKED, &query).unwrap().rows()
+        reader.execute(RANKED, &query).unwrap().into()
     };
     db.close().unwrap();
     drop(db);
-    let file = {
+    let file: RetainedRows = {
         let reader = contextdb_engine::ReadSession::open(&path).expect("read session on the file");
-        reader.execute(RANKED, &query).unwrap().rows()
+        reader.execute(RANKED, &query).unwrap().into()
     };
     eprintln!("ranked order: writer {writer:?}, owner {owner:?}, file {file:?}");
     for (route, rows) in [
@@ -126,16 +130,16 @@ fn an_equal_score_cutoff_across_partitions_keeps_row_id_order_on_every_route() {
     let query = HashMap::from([("q".to_string(), Value::Vector(vec![1.0, 0.0]))]);
     let first_five = (1..=5).map(|n| vec![id(n)]).collect::<Vec<_>>();
 
-    let writer = db.execute(CUTOFF, &query).unwrap().rows();
-    let owner = {
+    let writer: RetainedRows = db.execute(CUTOFF, &query).unwrap().into();
+    let owner: RetainedRows = {
         let reader = contextdb_engine::ReadSession::open(&path).expect("read session on the owner");
-        reader.execute(CUTOFF, &query).unwrap().rows()
+        reader.execute(CUTOFF, &query).unwrap().into()
     };
     db.close().unwrap();
     drop(db);
-    let file = {
+    let file: RetainedRows = {
         let reader = contextdb_engine::ReadSession::open(&path).expect("read session on the file");
-        reader.execute(CUTOFF, &query).unwrap().rows()
+        reader.execute(CUTOFF, &query).unwrap().into()
     };
     for (route, rows) in [
         ("writer", writer),

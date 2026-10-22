@@ -800,10 +800,11 @@ fn declared_flat_multi_context_cells_are_never_slower_than_exact() {
             .expect("the declared flat INDEXED search executes")
             .trace()
             .vector_search
+            .as_ref()
             .expect("the executed search reports its route")
             .partition_hnsw
-            .into_iter()
-            .map(|partition| (partition.route, partition.reason))
+            .iter()
+            .map(|partition| (partition.route.clone(), partition.reason.clone()))
             .collect();
         assert_eq!(
             routes,

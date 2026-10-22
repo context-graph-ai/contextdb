@@ -29,9 +29,9 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 fn ids(result: QueryResult) -> Vec<Uuid> {
     result
         .rows()
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Uuid(id)) => id,
+        .iter()
+        .map(|row| match row.iter().next() {
+            Some(Value::Uuid(id)) => *id,
             value => panic!("expected one UUID value, got {value:?}"),
         })
         .collect()

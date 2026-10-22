@@ -3,6 +3,10 @@
 //! maintained indexed route; permanently forgetting one row cannot make every
 //! surviving row unavailable until a later maintenance call.
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
+use retained_query_rows::RetainedRows;
+
 use contextdb_core::{Error, TenantId, Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;
 use contextdb_engine::sync_types::NaturalKey;
@@ -440,8 +444,8 @@ async fn build_quantized_erasure_fixture(
 
 #[derive(Debug, PartialEq)]
 struct ErasureState {
-    roots: Vec<Vec<Value>>,
-    vectors: Vec<Vec<Value>>,
+    roots: RetainedRows,
+    vectors: RetainedRows,
     vector_directory: Vec<String>,
     generations: Vec<String>,
     delivery_status: contextdb_engine::DeliveryStatusCounts,
@@ -455,14 +459,14 @@ fn erasure_state(db: &Database, scope: Uuid, selected_root: Uuid) -> ErasureStat
             &empty(),
         )
         .expect("read all root rows")
-        .rows();
+        .into();
     let vectors = db
         .execute(
             "SELECT id, root_id, scope_id, batch_ref FROM erasure_vectors ORDER BY id",
             &empty(),
         )
         .expect("read all vector-owner rows")
-        .rows();
+        .into();
     let vector_fixture_reader_1 = db
         .declared_reader_memory()
         .expect("admit the vector fixture reader");
