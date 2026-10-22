@@ -52686,7 +52686,9 @@ pub(crate) fn arm_policy_metadata_fault_for_test(boundary: u8, crash: bool) {
 fn policy_metadata_checkpoint_for_test(boundary: u8) -> Result<()> {
     let crash = POLICY_METADATA_FAULT.with(|armed| {
         let (selected, crash) = armed.get();
-        if selected != boundary { return None; }
+        if selected != boundary {
+            return None;
+        }
         armed.set((0, false));
         Some(crash)
     });
@@ -52694,8 +52696,10 @@ fn policy_metadata_checkpoint_for_test(boundary: u8) -> Result<()> {
         Some(true) => {
             eprintln!("POLICY_METADATA_CRASH={boundary}");
             std::process::abort()
-        },
-        Some(false) => Err(Error::Other("injected policy metadata publication failure".into())),
+        }
+        Some(false) => Err(Error::Other(
+            "injected policy metadata publication failure".into(),
+        )),
         None => Ok(()),
     }
 }

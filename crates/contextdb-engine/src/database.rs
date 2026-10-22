@@ -15264,7 +15264,11 @@ impl DatabaseTransactionHost {
         clippy::result_large_err,
         reason = "Preserve the existing public diagnostic through postcommit publication."
     )]
-    fn with_deferred_metadata_write_after_commit<R>(&self, committed: &std::cell::Cell<bool>, write: impl FnOnce() -> Result<R>) -> Result<R> {
+    fn with_deferred_metadata_write_after_commit<R>(
+        &self,
+        committed: &std::cell::Cell<bool>,
+        write: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         let publish = || {
             let reservation = self.reserve_deferred_metadata_publication()?;
             let result = write();

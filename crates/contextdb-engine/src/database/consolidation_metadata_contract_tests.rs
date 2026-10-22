@@ -504,6 +504,14 @@ fn consolidation_failure_before_and_after_durability_keeps_one_authoritative_dec
             "the actual durability cut must refuse: {error:?}"
         );
         assert_eq!(column(&db).consolidation_disabled, cut == 11);
+        let fresh = db.writer_read_root().unwrap().unwrap();
+        assert_eq!(
+            canonical(fresh.borrow_captured_table_meta("breadth_rows").unwrap()),
+            canonical(&db.table_meta("breadth_rows").unwrap()),
+            "a root captured after the error must expose the authoritative durable declaration"
+        );
+        assert_frontier(&db);
+        drop(fresh);
         assert_eq!(
             db.ddl_log_since(Lsn(0)).unwrap().len(),
             count + usize::from(cut == 11)
@@ -520,9 +528,15 @@ fn consolidation_failure_before_and_after_durability_keeps_one_authoritative_dec
         assert_eq!(visible(&db), rows);
         assert_eq!(authored_rows(&db), authored);
         if cut == 11 {
-            run(&db, "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION NONE");
-            assert_eq!(db.ddl_log_since(Lsn(0)).unwrap().len(), count + 2,
-                "a committed operation that returned an error must not reuse its durable DDL LSN");
+            run(
+                &db,
+                "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
+            );
+            assert_eq!(
+                db.ddl_log_since(Lsn(0)).unwrap().len(),
+                count + 2,
+                "a committed operation that returned an error must not reuse its durable DDL LSN"
+            );
         }
         let authoritative = canonical(&db.table_meta("breadth_rows").unwrap());
         let history = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
