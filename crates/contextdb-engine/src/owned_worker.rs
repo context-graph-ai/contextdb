@@ -398,7 +398,8 @@ mod native {
         fn fixed_worker_startup_and_physical_release_rows() {
             let control = ReadShared::<Body<fn()>>::layout();
             let before = threads();
-            for limit in [control.size() - 1] {
+            {
+                let limit = control.size() - 1;
                 ENTERED.store(0, Ordering::SeqCst);
                 let actual = Arc::new(MemoryAccountant::with_budget(limit));
                 let error = match OwnedWorker::spawn(actual.clone().into(), worker_body as fn()) {
