@@ -50,8 +50,8 @@ OVERSIZED = ('a_received_schema_transaction_never_publishes_a_prefix::'
 
 
 SYNC_ROUTING_FINGERPRINTS = {'crates/contextdb-engine/tests/sync_schema_transactions.rs': '2de1becdc822e29dc11ef5a28f15420c1a0ae8eab7984fbd2729553666d88052',
- 'crates/contextdb-engine/tests/sync/a_received_schema_transaction_never_publishes_a_prefix.rs': 'ff2446bd039196506772d08b64e896160f29c750bcb30485084ecf8b5e7f9118',
- 'crates/contextdb-engine/tests/sync/schema_migration_chunked_transport.rs': 'b819a0f1f9ffcda711400bf00a0d5e78fd46d914835a36b3fa46ab00665022ad'}
+ 'crates/contextdb-engine/tests/sync/a_received_schema_transaction_never_publishes_a_prefix.rs': '703ad13191db6a817e27eff79bec2512e186434c6be013b52c57333ed5e360bd',
+ 'crates/contextdb-engine/tests/sync/schema_migration_chunked_transport.rs': 'a6570b71b1b899e1e8729eeefe08fa8ff0c89652c789785a55467a8b8fae2bac'}
 
 
 # Reviewed normal-only partition of the unchanged three-case native inventory.
