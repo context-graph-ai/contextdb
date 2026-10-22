@@ -679,7 +679,7 @@ impl OwnerClient {
 /// over, which is the strongest form of stopped.
 #[derive(Default)]
 pub(crate) struct CancelCoordination {
-    reading: Mutex<Option<std::thread::ThreadId>>,
+    reading: Mutex<Option<crate::owned_worker::CurrentThreadId>>,
     awaiting: Mutex<std::collections::BTreeMap<u64, Arc<CancelApplication>>>,
 }
 
@@ -690,7 +690,7 @@ impl CancelCoordination {
         *self
             .reading
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::thread::current().id());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(crate::owned_worker::current_thread_id());
         ReadingHere { coordination: self }
     }
 
@@ -702,7 +702,7 @@ impl CancelCoordination {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
         {
-            Some(reader) => reader != std::thread::current().id(),
+            Some(reader) => reader != crate::owned_worker::current_thread_id(),
             None => false,
         }
     }

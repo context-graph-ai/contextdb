@@ -87,7 +87,7 @@ mod native {
         let owner = ReadMemoryOwner::try_native(ProcessResidue, ResidueInvoice(bytes))?;
         // The static retains this original worker, including all invoices,
         // for the process lifetime. It is never described as refunded.
-        *finisher = Some(OwnedWorker::spawn(owner, finish_loop)?);
+        *finisher = Some(OwnedWorker::spawn_inner(owner, finish_loop, false)?);
         Ok(())
     }
     fn finish_loop() {
@@ -112,12 +112,20 @@ mod native {
                     node.cleanup.take(),
                 )
             };
-            let _ = worker.finish();
-            drop(worker);
-            // Both original control and stack are now physically free and
-            // refunded. Only now may close/reopen observe completion.
-            if let Some(cleanup) = cleanup {
-                cleanup.complete();
+            // A node's cleanup must not take down the only process finisher.
+            // Join/unmap failures still abort; completion is reached only after
+            // the original worker has physically released its storage.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _ = worker.finish();
+                drop(worker);
+                if let Some(cleanup) = cleanup {
+                    cleanup.complete();
+                }
+            }));
+            // The panic hook reports the failure. Even a hostile panic payload
+            // must not unwind out of the finisher's permanent loop.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(outcome))).is_err() {
+                std::process::abort();
             }
         }
     }
@@ -171,6 +179,15 @@ mod native {
             owner: ReadMemoryOwner,
             run: F,
         ) -> Result<Self> {
+            Self::spawn_inner(owner, run, true)
+        }
+        // Only ensure_finisher uses the nonrecursive bootstrap path while
+        // holding FINISHER. All other workers require its live lease.
+        fn spawn_inner<F: FnOnce() + Send + 'static>(
+            owner: ReadMemoryOwner,
+            run: F,
+            needs_finisher: bool,
+        ) -> Result<Self> {
             let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
             if page <= 0 {
                 return Err(os_error(libc::EINVAL));
@@ -193,6 +210,11 @@ mod native {
                 "worker_stack",
                 "Raise MEMORY_LIMIT for the fixed engine workers.",
             )?;
+            // Keep the original under-budget refusal free of extra startup:
+            // both worker invoices must be admitted before process bootstrap.
+            if needs_finisher {
+                ensure_finisher()?;
+            }
             let body = ReadShared::try_from_prepaid(
                 Body {
                     finish: std::cell::UnsafeCell::new(FinishNode {
