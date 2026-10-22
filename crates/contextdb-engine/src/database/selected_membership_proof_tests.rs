@@ -63,7 +63,7 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
             }).unwrap().unwrap().0;
             drop(first);
             drop(first_window);
-            let loader = DurableDormantRawVectorLoader {
+            let loader = DurableRawVectorPartitionLoader {
                 source: DurableRawVectorSource::Writable(persistence), accountant: db.accountant.clone(),
                 partition, dimension: 4, quantization: VectorQuantization::F32, metadata_copy_owner: None,
             };
