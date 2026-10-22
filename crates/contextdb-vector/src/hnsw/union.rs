@@ -394,6 +394,15 @@ impl NavigationSession {
         );
         self.navigation.lock()
     }
+    #[cfg(test)]
+    pub(crate) fn fill_base_body_for_test(&self, point: &paged_builder::PagedVectorPoint) {
+        self.lock().remember_point(0, PointId(0, 0), point);
+        assert!(self.lock().point(0, PointId(0, 0)).unwrap().values.is_some());
+    }
+    #[cfg(test)]
+    pub(crate) fn has_base_body_for_test(&self) -> bool {
+        self.lock().point(0, PointId(0, 0)).is_some()
+    }
     pub(crate) fn owner(&self) -> Option<crate::memory_budget::MemoryBudgetOwner> {
         self.lock().accountant.clone()
     }
