@@ -876,3 +876,108 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         vec![vec![Value::Int64(1)]], "reenabling must publish the actual retained insert in the maintained route");
     db.close().unwrap();
 }
+
+// Fixed, nonallocating observation at the two actual stored-row decode doors.
+// Parent usage includes legitimate growing proof/index state; this guard only
+// compares the decoder's own original-funded row window for identical shapes.
+#[derive(Clone, Copy, Default)]
+struct ProjectionDecodeWindows {
+    active: bool,
+    starts: [usize; 2],
+    finishes: [usize; 2],
+    dirty_start: bool,
+    empty_finish: bool,
+    peak: [usize; 2],
+}
+thread_local! { static DECODE_WINDOWS: Cell<ProjectionDecodeWindows> = const { Cell::new(ProjectionDecodeWindows { active: false, starts: [0;2], finishes: [0;2], dirty_start: false, empty_finish: false, peak: [0;2] }) }; }
+pub(crate) fn observe_projection_decode_window(pass: usize, before: bool, held: usize) {
+    DECODE_WINDOWS.with(|slot| {
+        let mut work = slot.get();
+        if !work.active {
+            return;
+        }
+        if before {
+            work.starts[pass] += 1;
+            work.dirty_start |= held != 0;
+        } else {
+            work.finishes[pass] += 1;
+            work.empty_finish |= held == 0;
+            work.peak[pass] = work.peak[pass].max(held);
+        }
+        slot.set(work);
+    });
+}
+#[test]
+fn scalar_schema_projection_uses_one_fresh_original_funded_decoder_per_actual_row() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let mut previous_peak = None;
+    for rows in [16, 32] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_options(
+            dir.path().join("row-windows.redb"),
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        run(
+            &db,
+            "CREATE TABLE row_windows (id INTEGER PRIMARY KEY, body TEXT) HISTORY ALL",
+        );
+        for id in 0..rows {
+            db.execute(
+                "INSERT INTO row_windows VALUES ($id,$body)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id as i64)),
+                    ("body".into(), Value::Text("same-width".repeat(32))),
+                ]),
+            )
+            .unwrap();
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                DECODE_WINDOWS.with(|s| s.set(ProjectionDecodeWindows::default()));
+            }
+        }
+        let reset = Reset;
+        DECODE_WINDOWS.with(|slot| {
+            slot.set(ProjectionDecodeWindows {
+                active: true,
+                ..Default::default()
+            })
+        });
+        run(&db, "ALTER TABLE row_windows ADD COLUMN marker INTEGER");
+        let work = DECODE_WINDOWS.with(Cell::get);
+        drop(reset);
+        assert_eq!(
+            work.starts, [rows; 2],
+            "both actual stored-row passes visit each physical version exactly once"
+        );
+        assert_eq!(work.finishes, work.starts);
+        assert!(
+            !work.dirty_start,
+            "a new row must not inherit a preceding row's decoder debit"
+        );
+        assert!(
+            !work.empty_finish,
+            "the actual row decode must debit its own original-funded decoder"
+        );
+        if let Some(peak) = previous_peak {
+            assert_eq!(
+                work.peak, peak,
+                "doubling equal-shaped rows must not grow either one-row decoder window"
+            );
+        }
+        previous_peak = Some(work.peak);
+        assert_eq!(
+            db.execute("SELECT id FROM row_windows ORDER BY id", &empty())
+                .unwrap()
+                .rows()
+                .len(),
+            rows
+        );
+        db.close().unwrap();
+    }
+}

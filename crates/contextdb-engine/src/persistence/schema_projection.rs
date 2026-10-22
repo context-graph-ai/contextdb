@@ -1958,8 +1958,12 @@ impl RedbPersistence {
                         "decode_stored_value",
                         "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
                     )?;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    crate::database::consolidation_metadata_contract_tests::observe_projection_decode_window(0, true, row_memory.held());
                     let row =
                         row_memory.scope(|| Self::decode_versioned_row(value.value(), None))?;
+                    #[cfg(all(test, feature = "test-seams"))]
+                    crate::database::consolidation_metadata_contract_tests::observe_projection_decode_window(0, false, row_memory.held());
                     #[cfg(any(test, feature = "test-seams"))]
                     {
                         decoded_rows += 1;
@@ -2047,9 +2051,13 @@ impl RedbPersistence {
                                     "decode_stored_value",
                                     "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
                                 )?);
-                                row_memory.as_ref().expect("stored row has its decode owner")
-                                    .scope(|| Self::decode_versioned_row(value.value(), None))
-                                    .map(|row| (key, row))
+                                #[cfg(all(test, feature = "test-seams"))]
+                                crate::database::consolidation_metadata_contract_tests::observe_projection_decode_window(1, true, row_memory.as_ref().unwrap().held());
+                                let decoded = row_memory.as_ref().expect("stored row has its decode owner")
+                                    .scope(|| Self::decode_versioned_row(value.value(), None))?;
+                                #[cfg(all(test, feature = "test-seams"))]
+                                crate::database::consolidation_metadata_contract_tests::observe_projection_decode_window(1, false, row_memory.as_ref().unwrap().held());
+                                Ok((key, decoded))
                             })
                             .transpose()?
                     };
