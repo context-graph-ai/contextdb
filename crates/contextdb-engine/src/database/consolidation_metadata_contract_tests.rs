@@ -3,7 +3,7 @@ use super::*;
 use redb::{ReadableDatabase, TableHandle};
 use std::cell::Cell;
 thread_local! { static PROJECTED_ROWS: Cell<u64> = const { Cell::new(0) }; }
-pub(super) fn note_projection_rows(rows: u64) {
+pub(crate) fn note_projection_rows(rows: u64) {
     PROJECTED_ROWS.with(|count| count.set(count.get() + rows));
 }
 fn take_projected_rows() -> u64 {
@@ -112,7 +112,10 @@ fn physical_roots(db: &Database) -> BTreeMap<String, Option<Option<[u8; 32]>>> {
                     || name.starts_with("content_size_")
                     || matches!(
                         name,
-                        "vector_entries" | "vector_open_directory" | "__authored_row_bodies"
+                        "vector_entries"
+                            | "vector_open_directory"
+                            | "__authored_row_bodies"
+                            | "__historical_index_commitments"
                     )
                 {
                     roots.insert(name.to_owned(), read.normal_table_root(name).unwrap());
@@ -594,4 +597,73 @@ fn consolidation_crash_cuts_recover_complete_metadata_and_ddl_with_unchanged_dat
         assert_eq!(physical_roots(&reopened), roots);
         reopened.close().unwrap();
     }
+}
+
+#[test]
+fn phase_file_is_visible_before_an_isolated_child_completes() {
+    use std::io::{BufRead, Read, Write};
+    const CHILD: &str = "CONTEXTDB_PHASE_VISIBILITY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let db = Database::open_memory();
+        run(
+            &db,
+            "CREATE TABLE phase_visibility (id INTEGER PRIMARY KEY)",
+        );
+        println!("PHASE_CHILD_READY");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_exact(&mut [0u8]).unwrap();
+        db.close().unwrap();
+        return;
+    }
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("phases.log");
+    let name = format!(
+        "{}::phase_file_is_visible_before_an_isolated_child_completes",
+        module_path!().split_once("::").unwrap().1
+    );
+    let mut child = Child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD, "1")
+            .env("CONTEXTDB_MAINTENANCE_PHASES", "1")
+            .env("CONTEXTDB_MAINTENANCE_PHASE_FILE", &path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = std::io::BufReader::new(child.0.stdout.take().unwrap());
+    let mut ready = false;
+    loop {
+        let mut line = String::new();
+        if output.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if line.contains("PHASE_CHILD_READY") {
+            ready = true;
+            break;
+        }
+    }
+    assert!(
+        ready,
+        "the harmless actual operation must finish before inspecting its live child"
+    );
+    let records = std::fs::read_to_string(&path).unwrap();
+    assert!(records.contains(&format!("maintenance_phase pid={}", child.0.id())));
+    assert!(records.contains("operation=execute phase=enter"));
+    assert!(records.contains("operation=execute phase=exit"));
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "phase records are visible while the child is still blocked on stdin"
+    );
+    child.0.stdin.take().unwrap().write_all(&[1]).unwrap();
+    assert!(child.0.wait().unwrap().success());
 }

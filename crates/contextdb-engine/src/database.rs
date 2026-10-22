@@ -119797,4 +119797,4 @@ pub(crate) mod ef_search_metadata_contract_tests;
 
 #[cfg(test)]
 #[path = "database/consolidation_metadata_contract_tests.rs"]
-mod consolidation_metadata_contract_tests;
+pub(crate) mod consolidation_metadata_contract_tests;
