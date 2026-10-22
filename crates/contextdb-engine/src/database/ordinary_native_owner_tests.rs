@@ -21,6 +21,12 @@ struct Capture {
     children: usize,
     stages: usize,
     requests: [Request; 3], // native child, external keeper, forwarding Arc
+    trace_requests: [Request; 2], // independently observed keeper, provider
+    trace_ordinals: [usize; 2],
+    trace_stages: usize,
+    trace_before: usize,
+    trace_parent: [usize; 2],
+    trace_credits: [usize; 2],
     child_limit: u64,
     declared_limit: u64,
     parent_after_constructor: [u64; 3],
@@ -41,6 +47,8 @@ thread_local! {
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
         active: false, invalid: false, parent: 0, parent_counter: 0,
         baseline: 0, children: 0, stages: 0, requests: [(0, 0, 0); 3],
+        trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_stages: 0,
+        trace_before: 0, trace_parent: [0; 2], trace_credits: [0; 2],
         child_limit: 0, declared_limit: 0, parent_after_constructor: [0; 3], allocator_funding: [0; 3],
         child_payload: 0, child_counter: 0, child_at_keeper: 0,
         child_at_forwarding: 0, payer: 0, keeper_payload: 0,
@@ -106,6 +114,60 @@ fn record(c: &mut Capture, stage: usize, payload: usize, expected: Layout) {
     // target has checked equal atomic width/alignment before entering here.
     // Each extension happens before any of the preceding allocations can die.
     oracle::watch_exact_frees_for_test(&c.requests[..c.stages], c.parent_counter);
+}
+
+pub(crate) fn trace_admission_begin(payer: usize) {
+    update(|c| {
+        if payer != c.payer || c.trace_stages != 0 {
+            c.invalid = true;
+            return;
+        }
+        c.trace_before =
+            unsafe { &*(c.parent_counter as *const AtomicU64) }.load(Ordering::SeqCst) as usize;
+    });
+}
+pub(crate) fn trace_control_allocated(
+    stage: usize,
+    payload: usize,
+    layout: Layout,
+    payer: usize,
+    invoice: usize,
+) {
+    update(|c| {
+        let (bytes, align, ordinal) = oracle::last_request_for_test(false);
+        let pointer = oracle::last_request_pointer_for_test();
+        if c.trace_stages != stage
+            || stage >= 2
+            || c.stages != 3
+            || payer != c.payer
+            || pointer == 0
+            || invoice != layout.size()
+            || (bytes, align) != (layout.size(), layout.align())
+            || payload < pointer
+            || payload >= pointer.saturating_add(bytes)
+            || ordinal <= 3
+            || (stage == 1 && ordinal != c.trace_ordinals[0] + 1)
+        {
+            c.invalid = true;
+            return;
+        }
+        if oracle::source_free_for_test(c.stages + c.trace_stages)[..c.stages + c.trace_stages]
+            .iter()
+            .any(|free| free.2 != 0)
+        {
+            c.invalid = true;
+            return;
+        }
+        c.trace_requests[stage] = (pointer, bytes, align);
+        c.trace_ordinals[stage] = ordinal;
+        c.trace_parent[stage] =
+            unsafe { &*(c.parent_counter as *const AtomicU64) }.load(Ordering::SeqCst) as usize;
+        c.trace_stages += 1;
+        let mut requests = [(0, 0, 0); 5];
+        requests[..3].copy_from_slice(&c.requests);
+        requests[3..3 + c.trace_stages].copy_from_slice(&c.trace_requests[..c.trace_stages]);
+        oracle::watch_exact_frees_for_test(&requests[..3 + c.trace_stages], c.parent_counter);
+    });
 }
 
 pub(crate) fn child_allocated(
@@ -192,6 +254,31 @@ pub(crate) fn forwarding_allocated(
 }
 
 struct Observation;
+// This validates copies of independent allocator/invoice receipts. It never
+// reads a current usage balance or alters an engine/allocator observation.
+#[derive(Clone, Copy)]
+struct OriginalControlCut {
+    request: Request,
+    original_payer: usize,
+    invoice_payer: usize,
+    invoice_bytes: usize,
+    free: (usize, usize, usize),
+    independent_live: usize,
+    baseline: usize,
+}
+fn original_control_cut_is_complete(cut: OriginalControlCut) -> bool {
+    cut.request.0 != 0
+        && cut.request.1 != 0
+        && cut.request.2.is_power_of_two()
+        && cut.original_payer != 0
+        && cut.invoice_payer == cut.original_payer
+        && cut.invoice_bytes == cut.request.1
+        && cut.free.2 == 1
+        && cut.free.0 == cut.free.1
+        && cut.independent_live >= cut.request.1
+        && cut.baseline.checked_add(cut.independent_live) == Some(cut.free.0)
+}
+
 impl Observation {
     fn begin(db: &Database) -> Self {
         // The existing exact-free oracle reads AtomicUsize. Do not qualify a
@@ -277,8 +364,28 @@ impl Observation {
     }
     fn assert_freed(&self, db: &Database) {
         let c = self.capture();
-        let frees = oracle::source_free_for_test(c.stages);
-        for (i, free) in frees[..c.stages].iter().enumerate() {
+        let count = c.stages + c.trace_stages;
+        assert!(
+            c.trace_stages == 0 || c.trace_stages == 2,
+            "both actual trace controls must qualify"
+        );
+        if c.trace_stages == 2 {
+            let trace_bytes = c
+                .trace_requests
+                .iter()
+                .map(|request| request.1)
+                .sum::<usize>();
+            for stage in 0..2 {
+                assert_eq!(c.trace_parent[stage], c.trace_before + trace_bytes);
+                assert_eq!(
+                    c.trace_credits[stage], c.trace_parent[stage],
+                    "same original parent funded this actual allocation before System.alloc"
+                );
+            }
+        }
+        let frees = oracle::source_free_for_test(count);
+        let live = oracle::source_live_at_free_for_test(count);
+        for (i, free) in frees[..count].iter().enumerate() {
             assert_eq!(
                 free.2, 1,
                 "selected allocation {i} must physically free exactly once"
@@ -287,19 +394,31 @@ impl Observation {
                 free.0, free.1,
                 "original counter must not refund inside physical free"
             );
-            let still_due: usize = c.requests[..=i].iter().map(|r| r.1).sum();
-            assert_eq!(
-                free.0,
-                c.baseline as usize + still_due,
-                "exact original child/keeper/forwarding debit must survive each physical free; a new invoice cannot replace it"
+            let request = if i < c.stages {
+                c.requests[i]
+            } else {
+                c.trace_requests[i - c.stages]
+            };
+            assert!(
+                original_control_cut_is_complete(OriginalControlCut {
+                    request,
+                    original_payer: c.payer,
+                    invoice_payer: c.payer,
+                    invoice_bytes: request.1,
+                    free: *free,
+                    independent_live: live[i],
+                    baseline: c.baseline as usize,
+                }),
+                "every independently still-live original native and trace control must remain paid through this physical free: index={i} request={request:?} free={free:?} live={}",
+                live[i]
             );
         }
         assert_eq!(db.declared_read_memory.charged_bytes(), c.baseline);
     }
     fn assert_live(&self) {
         let c = self.capture();
-        let frees = oracle::source_free_for_test(c.stages);
-        for free in &frees[..c.stages] {
+        let frees = oracle::source_free_for_test(c.stages + c.trace_stages);
+        for free in &frees[..c.stages + c.trace_stages] {
             assert_eq!(free.2, 0);
         }
     }
@@ -337,6 +456,14 @@ fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], u
                 c.invalid = true;
             }
             c.allocator_funding[stage] = credits[stage];
+        }
+        for stage in 0..c.trace_stages {
+            let ordinal = c.trace_ordinals[stage];
+            if ordinal == 0 || ordinal > count || requests[ordinal - 1] != c.trace_requests[stage] {
+                c.invalid = true;
+                return;
+            }
+            c.trace_credits[stage] = credits[ordinal - 1];
         }
     });
     (value, requests[..3].try_into().unwrap(), count)
@@ -739,6 +866,10 @@ fn an_escaped_actual_trace_keeps_the_native_child_and_original_invoice_alive() {
                 let answer = answer.unwrap();
                 assert_eq!(answer.rows(), vec![vec![Value::Int64(1)]]);
                 let c = observation.assert_admitted();
+                assert_eq!(
+                    c.trace_stages, 2,
+                    "both original trace allocations must be independently captured"
+                );
                 let retained = db
                     .last_vector_search_trace
                     .write()
@@ -857,6 +988,57 @@ fn ordinary_producer_callback_unwind_frees_each_original_control_once() {
                 plugin.stage.store(0, Ordering::SeqCst);
                 assert_eq!(sql(&db, query).rows(), vec![vec![Value::Int64(10)]]);
             }
+        }
+    }
+}
+
+// A real ordinary execution supplies the positive allocator cut. Mutations
+// affect only copied readonly receipts; no engine counter, free or invoice is
+// reset, simulated, substituted or admitted by this diagnostic negative control.
+#[test]
+#[serial_test::serial]
+fn ordinary_native_physical_cut_rejects_missing_duplicate_early_wrong_and_extra_receipts() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    for file in [false, true] {
+        let (_dir, db) = fixture(file);
+        sql(&db, "CREATE TABLE cut_rows (id INT PRIMARY KEY)");
+        sql(&db, "INSERT INTO cut_rows VALUES (1)");
+        sql(&db, "SELECT id FROM cut_rows");
+        let observation = Observation::begin(&db);
+        let (answer, _, _) = observed(&db, || {
+            db.execute("SELECT id FROM cut_rows", &HashMap::new())
+        });
+        assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(1)]]);
+        let c = observation.assert_admitted();
+        observation.assert_freed(&db);
+        let frees = oracle::source_free_for_test(c.stages);
+        let live = oracle::source_live_at_free_for_test(c.stages);
+        let valid = OriginalControlCut {
+            request: c.requests[1],
+            original_payer: c.payer,
+            invoice_payer: c.payer,
+            invoice_bytes: c.requests[1].1,
+            free: frees[1],
+            independent_live: live[1],
+            baseline: c.baseline as usize,
+        };
+        assert!(original_control_cut_is_complete(valid));
+        let mut missing = valid;
+        missing.free.2 = 0;
+        let mut duplicate = valid;
+        duplicate.free.2 = 2;
+        let mut early = valid;
+        early.free.0 -= 1;
+        early.free.1 -= 1;
+        let mut wrong_payer = valid;
+        wrong_payer.invoice_payer ^= 1;
+        let mut extra = valid;
+        extra.free.0 += 1;
+        extra.free.1 += 1;
+        let mut wrong_layout = valid;
+        wrong_layout.request.1 += 1;
+        for cut in [missing, duplicate, early, wrong_payer, extra, wrong_layout] {
+            assert!(!original_control_cut_is_complete(cut));
         }
     }
 }

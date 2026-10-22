@@ -778,6 +778,13 @@ pub(crate) fn source_free_for_test(count: usize) -> [(usize, usize, usize); 128]
     })
 }
 
+/// Independently recorded live allocator obligations on each watched counter.
+/// Reading them changes no watch, event, admission, free or existing tuple.
+pub(crate) fn source_live_at_free_for_test(count: usize) -> [usize; 128] {
+    assert!(count <= NATIVE_FREE.len());
+    std::array::from_fn(|index| NATIVE_FREE[index].live_at_free.load(AtomicOrdering::SeqCst))
+}
+
 pub(crate) fn native_requests_for_test<T>(
     operation: impl FnOnce() -> T,
 ) -> (T, [(usize, usize, usize); 3], usize) {
