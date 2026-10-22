@@ -7,7 +7,6 @@ use std::cell::RefCell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::Arc;
 
 const ADMISSION_ERROR: &str = "JSON allocation admission failed";
 const MISSING_OWNER: &str = "JSON decode requires an operation memory owner";
@@ -273,10 +272,10 @@ pub(crate) fn deserialize_json_closed(input: &str) -> Result<Value, ClosedJsonFa
     // Neither a successful refund nor an accounting failure allocates text.
     // In particular, a cleanup failure must not replace the primary refusal.
     let scratch = state.scratch.bytes();
-    if let Err(error) = state.scratch.try_shrink_native(scratch) {
-        if result.is_ok() {
-            return Err(ClosedJsonFailure::Refused(error));
-        }
+    if let Err(error) = state.scratch.try_shrink_native(scratch)
+        && result.is_ok()
+    {
+        return Err(ClosedJsonFailure::Refused(error));
     }
     match result {
         Ok(value) => {
@@ -749,11 +748,11 @@ impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
                     4
                 } else {
                     old.checked_mul(2)
-                        .ok_or_else(|| capacity_error::<A::Error>())?
+                        .ok_or_else(capacity_error::<A::Error>)?
                 };
                 let bytes = new
                     .checked_mul(std::mem::size_of::<Value>())
-                    .ok_or_else(|| capacity_error::<A::Error>())?;
+                    .ok_or_else(capacity_error::<A::Error>)?;
                 BuildState::grow(&mut self.state.payload, bytes)?;
                 values.reserve_exact(new - values.len());
                 if values.capacity() != new {
@@ -784,19 +783,19 @@ impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
                 let members = values.len();
                 let next_members = members
                     .checked_add(1)
-                    .ok_or_else(|| capacity_error::<A::Error>())?;
+                    .ok_or_else(capacity_error::<A::Error>)?;
                 let split = map_levels(members)
                     .checked_add(1)
                     .and_then(|levels| levels.checked_mul(MAP_NODE))
-                    .ok_or_else(|| capacity_error::<A::Error>())?;
+                    .ok_or_else(capacity_error::<A::Error>)?;
                 BuildState::grow(&mut self.state.payload, split)?;
                 values.insert(key, value);
                 let retained_delta = map_bytes(next_members)
                     .checked_sub(map_bytes(members))
-                    .ok_or_else(|| capacity_error::<A::Error>())?;
+                    .ok_or_else(capacity_error::<A::Error>)?;
                 let excess = split
                     .checked_sub(retained_delta)
-                    .ok_or_else(|| capacity_error::<A::Error>())?;
+                    .ok_or_else(capacity_error::<A::Error>)?;
                 BuildState::shrink(&mut self.state.payload, excess)?;
             }
         }

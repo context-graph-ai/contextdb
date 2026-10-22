@@ -4,6 +4,8 @@
 //! persistence, channel framing, deadline waiting, and query execution are performed by the
 //! route and transport layers that consume this vocabulary.
 
+#![expect(clippy::result_large_err, reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating.")]
+
 use crate::Value;
 use crate::read_memory::{
     NativeCancellationCallback, OwnedReadBox, ReadCredit, ReadMemoryOwner, ReadShared,

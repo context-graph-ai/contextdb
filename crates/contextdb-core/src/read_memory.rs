@@ -1,6 +1,8 @@
 //! Owned memory charges shared by storage and suspendable readers.
 //!
 //! The engine supplies the budget capability; storage cannot change its limit.
+#![expect(clippy::result_large_err, reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating.")]
+
 use crate::Result;
 use std::alloc::{Layout, alloc, dealloc};
 use std::borrow::Cow;
@@ -1035,14 +1037,16 @@ impl ReadCredit {
 // capture969 begin
 // A passive callback for the selected retained-trace payer only. No token fields.
 #[cfg(feature = "test-seams")]
+type TraceCreditDropObserver = fn(bool, usize, usize, usize);
+#[cfg(feature = "test-seams")]
 thread_local! {
-    static TRACE_CREDIT_DROP: std::cell::Cell<(usize, Option<fn(bool, usize, usize, usize)>)> =
+    static TRACE_CREDIT_DROP: std::cell::Cell<(usize, Option<TraceCreditDropObserver>)> =
         const { std::cell::Cell::new((0, None)) };
 }
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub fn set_trace_credit_drop_observer_for_test(
-    payer: usize, callback: Option<fn(bool, usize, usize, usize)>,
+    payer: usize, callback: Option<TraceCreditDropObserver>,
 ) {
     TRACE_CREDIT_DROP.with(|slot| slot.set((payer, callback)));
 }

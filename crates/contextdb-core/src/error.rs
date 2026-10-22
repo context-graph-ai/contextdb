@@ -119,6 +119,7 @@ impl DiagnosticText {
         std::fmt::write(&mut equal, format_args!("{self}")).is_ok()
             && equal.equal && equal.offset == equal.expected.len()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating.")]
     fn admit(
         owner: crate::read_memory::ReadMemoryOwner, bytes: usize,
         subsystem: &'static str, operation: &'static str, hint: &'static str,
@@ -145,6 +146,7 @@ impl DiagnosticText {
     /// Prepare native diagnostic storage on its actual existing payer before
     /// invoking the producer. Failure has no engine-owned formatted backing.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating.")]
     pub fn try_prepare_shared<T>(
         owner: crate::read_memory::ReadMemoryOwner,
         subsystem: &'static str, operation: &'static str, hint: &'static str,
@@ -155,6 +157,7 @@ impl DiagnosticText {
     }
     /// Admit both the exact output buffer and native cell before allocating.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating.")]
     pub fn try_format(
         owner: crate::read_memory::ReadMemoryOwner, value: impl std::fmt::Display,
         subsystem: &'static str, operation: &'static str, hint: &'static str,
@@ -294,6 +297,7 @@ impl DiagnosticLabel {
     /// Count without materializing, then admit the exact buffer and control
     /// layout on the supplier's existing payer before either allocation.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating.")]
     pub fn try_format_with_invoice<I: Send + Sync + 'static>(
         value: impl std::fmt::Display,
         admit: impl FnOnce(usize) -> crate::Result<I>,
@@ -1255,12 +1259,14 @@ impl Error {
     }
 }
 
+type DiagnosticInspector = unsafe fn(std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool);
+
 /// An opaque bridge to the engine's already admitted diagnostic storage, or
 /// an inline native OS diagnosis. Construction neither allocates nor admits bytes.
 #[doc(hidden)]
 pub struct FundedEngineError {
     pointer: std::ptr::NonNull<()>,
-    inspect: unsafe fn(std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool),
+    inspect: DiagnosticInspector,
     display: unsafe fn(std::ptr::NonNull<()>, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
     release: unsafe fn(std::ptr::NonNull<()>),
 }
@@ -1312,7 +1318,7 @@ impl FundedEngineError {
     /// this carrier.
     pub unsafe fn from_owned(
         pointer: std::ptr::NonNull<()>,
-        inspect: unsafe fn(std::ptr::NonNull<()>) -> (Option<std::ptr::NonNull<Error>>, bool),
+        inspect: DiagnosticInspector,
         display: unsafe fn(std::ptr::NonNull<()>, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
         release: unsafe fn(std::ptr::NonNull<()>),
     ) -> Self {
@@ -1427,3 +1433,6 @@ fn foreign_key_violation_display<'a>(
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// Inline refusal diagnostics must stay allocation-free without further Error growth.
+const _: () = assert!(std::mem::size_of::<Error>() <= 160);
