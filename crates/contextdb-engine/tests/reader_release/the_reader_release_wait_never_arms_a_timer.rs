@@ -15,49 +15,9 @@
 //! and the count also settles the other half: a wait that blocks a bounded
 //! number of times per real hold is not spinning.
 //!
-//! This journey owns its test binary. The recorder below is process-wide,
-//! because the wait does its blocking on threads it spawns itself, and a second
-//! wait running beside this one would mix its blocks in.
-//!
-//! -------------------------------------------------------------------------
-//! SEAM THIS JOURNEY NEEDS, VERBATIM
-//!
-//! It does not exist yet, so this file is compile-RED until it lands. In
-//! `crates/contextdb-engine/src/persistence.rs`, inside
-//! `pub mod read_persistence_test_scaffold`:
-//!
-//! ```ignore
-//!     /// One blocking wait a reader-release wait actually performed.
-//!     ///
-//!     /// A wait that sleeps until the kernel reports a holder let go blocks
-//!     /// once per hold and supplies no deadline of its own. A wait that polls
-//!     /// supplies a deadline every time, and that deadline IS the poll
-//!     /// interval. Recording the shape of each block separates the two
-//!     /// without measuring how long anything took.
-//!     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-//!     pub enum ReaderReleaseBlockForTest {
-//!         /// Blocked until the kernel reported that a real holder of the
-//!         /// store let go or died. Nothing but that event decides when this
-//!         /// wakes.
-//!         UntilHolderReleased,
-//!         /// Blocked with a deadline of the wait's own choosing, in
-//!         /// milliseconds.
-//!         UntilDeadline { after_ms: u64 },
-//!     }
-//!
-//!     /// Start recording what reader-release waits block in, discarding
-//!     /// anything recorded before. Recording is process-wide, so a proof
-//!     /// that uses it owns its test binary.
-//!     pub fn reset_reader_release_blocks_for_test() { .. }
-//!
-//!     /// Every block reader-release waits have performed since the reset, in
-//!     /// order.
-//!     pub fn reader_release_blocks_for_test() -> Vec<ReaderReleaseBlockForTest> { .. }
-//! ```
-//!
-//! Production `wait_for_reader_release` records one entry for every block it
-//! performs, whatever mechanism it blocks on.
-//! -------------------------------------------------------------------------
+//! The recorder belongs to the thread calling the wait. The waiting thread
+//! resets it and returns its own observations with its answer, so sibling
+//! tests cannot add blocks or clear this journey's recording.
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::{OwnerReadCancellation, ReadRoute};
@@ -164,13 +124,18 @@ fn park_a_reader(path: &Path, runtime: &Path) -> (Arc<ParkingReader>, std::threa
     (Arc::new(ParkingReader { pause, ticket }), holding)
 }
 
-fn wait_in_thread(path: &Path, runtime: &Path) -> mpsc::Receiver<ReaderReleaseWait> {
+fn wait_in_thread(
+    path: &Path,
+    runtime: &Path,
+) -> mpsc::Receiver<(ReaderReleaseWait, Vec<ReaderReleaseBlockForTest>)> {
     let (tell, heard) = mpsc::channel();
     let path = path.to_path_buf();
     let runtime = RuntimeDirectory::supplied(runtime);
     std::thread::spawn(move || {
         let stop = OwnerReadCancellation::new();
-        let _ = tell.send(wait_for_reader_release(&path, Some(&runtime), &stop));
+        reset_reader_release_blocks_for_test();
+        let answer = wait_for_reader_release(&path, Some(&runtime), &stop);
+        let _ = tell.send((answer, reader_release_blocks_for_test()));
     });
     heard
 }
@@ -185,7 +150,6 @@ fn waiting_out_two_readers_arms_no_deadline_and_blocks_once_per_hold() {
     let (first, first_thread) = park_a_reader(&path, &runtime);
     let (second, second_thread) = park_a_reader(&path, &runtime);
 
-    reset_reader_release_blocks_for_test();
     let heard = wait_in_thread(&path, &runtime);
     assert!(
         heard.recv_timeout(PARKED).is_err(),
@@ -201,17 +165,14 @@ fn waiting_out_two_readers_arms_no_deadline_and_blocks_once_per_hold() {
 
     second.let_go();
     second_thread.join().expect("the second reader finishes");
+    let (answer, blocks) = heard
+        .recv_timeout(WATCHDOG)
+        .expect("the wait answers once the last reader lets go");
     assert!(
-        matches!(
-            heard
-                .recv_timeout(WATCHDOG)
-                .expect("the wait answers once the last reader lets go"),
-            ReaderReleaseWait::Released
-        ),
+        matches!(answer, ReaderReleaseWait::Released),
         "the last hold ending ends the wait"
     );
 
-    let blocks = reader_release_blocks_for_test();
     assert!(
         !blocks.is_empty(),
         "the wait answered without ever blocking, so it spun while two readers held the store",

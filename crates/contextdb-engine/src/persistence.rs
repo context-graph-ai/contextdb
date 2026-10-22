@@ -15406,37 +15406,51 @@ pub mod read_persistence_test_scaffold {
         UntilDeadline { after_ms: u64 },
     }
 
-    fn reader_release_blocks() -> &'static Mutex<Vec<ReaderReleaseBlockForTest>> {
-        static BLOCKS: OnceLock<Mutex<Vec<ReaderReleaseBlockForTest>>> = OnceLock::new();
-        BLOCKS.get_or_init(|| Mutex::new(Vec::new()))
+    thread_local! {
+        static READER_RELEASE_BLOCKS: std::cell::RefCell<Vec<ReaderReleaseBlockForTest>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// Start recording what reader-release waits block in, discarding
-    /// anything recorded before. Recording is process-wide, so a proof
-    /// that uses it owns its test binary.
+    /// Start recording this thread's reader-release blocks, discarding its
+    /// previous observations. The wait blocks on its caller's thread.
     pub fn reset_reader_release_blocks_for_test() {
-        reader_release_blocks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        READER_RELEASE_BLOCKS.with(|blocks| blocks.borrow_mut().clear());
     }
 
-    /// Every block reader-release waits have performed since the reset, in
-    /// order.
+    /// Every block this thread's reader-release waits performed since reset,
+    /// in order. Other threads cannot reset or contribute to this recording.
     pub fn reader_release_blocks_for_test() -> Vec<ReaderReleaseBlockForTest> {
-        reader_release_blocks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        READER_RELEASE_BLOCKS.with(|blocks| blocks.borrow().clone())
     }
 
     /// Production reader-release waits call this once for every block they
     /// perform, whatever mechanism they block on.
     pub(super) fn note_reader_release_block_for_test(block: ReaderReleaseBlockForTest) {
-        reader_release_blocks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(block);
+        READER_RELEASE_BLOCKS.with(|blocks| blocks.borrow_mut().push(block));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn reader_release_recording_cannot_be_reset_or_extended_by_another_thread() {
+        use std::sync::{Arc, Barrier};
+
+        let own = ReaderReleaseBlockForTest::UntilHolderReleased;
+        let sibling = ReaderReleaseBlockForTest::UntilDeadline { after_ms: 1 };
+        reset_reader_release_blocks_for_test();
+        note_reader_release_block_for_test(own);
+        let recorded = Arc::new(Barrier::new(2));
+        let other_recorded = Arc::clone(&recorded);
+        let other = std::thread::spawn(move || {
+            reset_reader_release_blocks_for_test();
+            note_reader_release_block_for_test(sibling);
+            other_recorded.wait();
+            reader_release_blocks_for_test()
+        });
+        recorded.wait();
+        let blocks = reader_release_blocks_for_test();
+        let other_blocks = other.join().expect("join the sibling recorder");
+        assert_eq!(blocks, vec![own]);
+        assert_eq!(other_blocks, vec![sibling]);
     }
 
     /// What answering reads has cost this thread in operating-system objects.
