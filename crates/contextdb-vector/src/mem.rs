@@ -10004,7 +10004,7 @@ mod indexed_row_check_empty_merge_tests {
         use crate::hnsw::paged_builder::{PagedPoint, PagedVectorPoint};
         let navigation = crate::hnsw::union::NavigationSession::new(Some(payer.into()));
         navigation.fill_base_body_for_test(&PagedVectorPoint::F32(PagedPoint {
-            id: crate::hnsw::PointId(0, 0),
+            id: hnsw_rs::hnsw::PointId(0, 0),
             origin_id: 1,
             values: vec![1.0; 128],
             neighbours: vec![Vec::new()],
@@ -10019,14 +10019,22 @@ mod indexed_row_check_empty_merge_tests {
             limit: AtomicUsize::new(1024 * 1024),
         });
         let owner = crate::VectorCopyAdmission::new(payer.clone());
-        let retained = RefCell::new(owner.scratch());
+        let retained = Cell::new(0usize);
+        let mut admit = |bytes| {
+            payer.try_allocate_for(bytes, "vector_index", "row_check_retained", "same original finite predicate funder")?;
+            retained.set(retained.get() + bytes);
+            Ok::<_, Error>(())
+        };
         let calls = Cell::new(0);
         let mut predicate = |row| {
             assert_eq!(row, RowId(1));
             calls.set(calls.get() + 1);
             Ok::<_, Error>(true)
         };
-        let release = |bytes| retained.borrow_mut().release(bytes);
+        let release = |bytes| {
+            retained.set(retained.get().checked_sub(bytes).unwrap());
+            payer.release(bytes);
+        };
         let mut ledger = RowCheckLedger::new(
             RowCheck {
                 allowance: 1,
@@ -10034,7 +10042,7 @@ mod indexed_row_check_empty_merge_tests {
             },
             1,
             &release,
-            &mut |bytes| retained.borrow_mut().reserve(bytes),
+            &mut admit,
         )
         .unwrap();
         let navigation = full_navigation(payer.clone());
@@ -10046,7 +10054,7 @@ mod indexed_row_check_empty_merge_tests {
             RowId(1),
             &navigation,
             &owner,
-            &mut |bytes| retained.borrow_mut().reserve(bytes),
+            &mut admit,
             &mut || Ok(())
         ));
         assert_eq!(calls.get(), 1);
@@ -10063,13 +10071,13 @@ mod indexed_row_check_empty_merge_tests {
             RowId(1),
             &navigation,
             &owner,
-            &mut |bytes| retained.borrow_mut().reserve(bytes),
+            &mut admit,
             &mut || Ok(())
         ));
         assert_eq!(calls.get(), 1);
         drop(ledger);
         drop(navigation);
-        drop(retained);
+        assert_eq!(retained.get(), 0);
         drop(owner);
         assert_eq!(payer.used.load(SeqCst), 0);
     }
