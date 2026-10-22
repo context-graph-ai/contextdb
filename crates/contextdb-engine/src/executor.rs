@@ -24374,7 +24374,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             clock,
             cancellation,
             native_trace_refund,
-            native_trace_refund,
         )
     }
 
@@ -24405,7 +24404,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             clock,
             cancellation,
             snapshot,
-            native_trace_refund,
             native_trace_refund,
         )
     }

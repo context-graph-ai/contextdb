@@ -1276,7 +1276,6 @@ fn open_cursor_on_backend_neutral_target(
                 cancellation,
                 reader.image.snapshot,
                 native_trace_refund.as_ref(),
-                native_trace_refund.as_ref(),
             )?;
             let observation = reader.clock.now_ms();
             let opened = DirectCursorOpen {

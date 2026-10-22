@@ -3011,25 +3011,30 @@ impl ReadSession {
         match self.state.as_ref() {
             ReadSessionState::LiveDatabase(database) => {
                 let child = database.ordinary_read_child()?;
-                crate::executor::bounded::with_native_read_memory(child, |read_memory| {
-                    let executed = crate::executor::execute_bounded(
-                        database,
-                        sql,
-                        params,
-                        read_memory,
-                        self.options.limits,
-                        self.session_clock(),
-                        cancellation.clone(),
-                        #[cfg(any(test, feature = "test-seams"))]
-                        self.kernel_probe(ReadSessionOperation::Execute, cancellation),
-                    )
-                    .map_err(read_error)?;
-                    database.publish_authoritative_read(
-                        &executed.publication,
-                        |error| error,
-                        || Ok(executed.result),
-                    )
-                })
+                crate::executor::bounded::with_native_read_memory(
+                    child,
+                    |read_memory, native_trace_refund| {
+                        let executed =
+                            crate::executor::execute_bounded_on_target_with_native_trace_refund(
+                                database,
+                                sql,
+                                params,
+                                read_memory,
+                                self.options.limits,
+                                self.session_clock(),
+                                cancellation.clone(),
+                                #[cfg(any(test, feature = "test-seams"))]
+                                self.kernel_probe(ReadSessionOperation::Execute, cancellation),
+                                Some(&native_trace_refund),
+                            )
+                            .map_err(read_error)?;
+                        database.publish_authoritative_read(
+                            &executed.publication,
+                            |error| error,
+                            || Ok(executed.result),
+                        )
+                    },
+                )
             }
             // The committed file is asked through the target the reader
             // already holds, so the engine answers this route in the same
