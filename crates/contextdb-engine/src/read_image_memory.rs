@@ -1600,13 +1600,14 @@ pub(crate) struct QueryImageCharge {
 impl QueryAnswerCharge {
     /// Passive pointers and the existing invoice of the actual retained image.
     #[cfg(all(test, feature = "test-seams"))]
-    pub(crate) fn control_receipts_for_test(&self) -> [(usize, usize, usize); 2] {
+    pub(crate) fn control_receipts_for_test(&self) -> [(usize, usize, usize, usize); 2] {
         match self {
             Self::Image(charge) => [
                 (
                     &**charge as *const QueryImageCharge as usize,
                     charge.credit().bytes(),
                     charge.credit().original_payer_identity_for_test(),
+                    charge._previous.held(),
                 ),
                 (
                     &*charge.image.value as *const ImageMemory as usize,
@@ -1618,9 +1619,10 @@ impl QueryAnswerCharge {
                         .as_ref()
                         .unwrap()
                         .accounting_identity(),
+                    charge.image.value.held(),
                 ),
             ],
-            _ => [(0, 0, 0); 2],
+            _ => [(0, 0, 0, 0); 2],
         }
     }
     /// Admit and allocate the retention node BEFORE execution. A nested

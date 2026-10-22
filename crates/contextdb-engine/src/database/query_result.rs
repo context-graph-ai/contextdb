@@ -83,12 +83,12 @@ impl QueryResult {
         }
     }
     #[cfg(all(test, feature = "test-seams"))]
-    pub(super) fn image_control_receipts_for_test(&self) -> [(usize, usize, usize); 2] {
+    pub(super) fn image_control_receipts_for_test(&self) -> [(usize, usize, usize, usize); 2] {
         match &self.inner {
             QueryResultInner::Shared(answer) => {
                 answer.vector_copy_charge.control_receipts_for_test()
             }
-            QueryResultInner::Empty { .. } => [(0, 0, 0); 2],
+            QueryResultInner::Empty { .. } => [(0, 0, 0, 0); 2],
         }
     }
     pub fn columns(&self) -> &[String] {

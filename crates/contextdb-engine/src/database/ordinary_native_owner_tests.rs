@@ -1258,7 +1258,6 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         assert_eq!(publication.1, components[2]);
         let image_receipts = answer.image_control_receipts_for_test();
         let image_requests = image_receipts.map(|receipt| {
-            assert_eq!(receipt.2, native.adapter.unwrap().payload);
             let mut found = None;
             for request in &allocations[..count.min(allocations.len())] {
                 if request.0 <= receipt.0 && receipt.0 < request.0.saturating_add(request.1) {
@@ -1274,6 +1273,16 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             }
             found
         });
+        assert_eq!(
+            image_receipts[0].2, image_requests[1].0,
+            "the actual retention-node invoice belongs to its image owner"
+        );
+        assert_eq!(
+            image_receipts[1].2,
+            native.adapter.unwrap().payload,
+            "that image forwards to the same original native reader"
+        );
+        assert_eq!(components[4], image_receipts[0].3 + image_receipts[1].3);
         let requests = [
             native_requests[0],
             native_requests[1],
@@ -1337,7 +1346,14 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             assert_eq!(frees[slot].0, frees[slot].1);
             assert_eq!(
                 frees[slot].0 as u64,
-                sample.parent_before + live[slot] as u64 + trace_payload as u64,
+                sample.parent_before
+                    + live[slot] as u64
+                    + trace_payload as u64
+                    + if slot == 6 {
+                        (image_receipts[1].3 - image_receipts[0].1) as u64
+                    } else {
+                        0
+                    },
                 "each answer control physically frees while its own actual request and the independent live trace remain paid"
             );
         }
@@ -1359,9 +1375,193 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             db.declared_read_memory.charged_bytes(),
             sample.parent_before
         );
+        oracle::disarm_source_free_watch();
+        ANSWER_TRACE.with(|slot| slot.set(AnswerTraceCapture::default()));
+        // A separate companion to the protected stale-baseline fixture: the
+        // preceding named answer and trace have now physically freed every
+        // request. Its exact actual native-block request determines this cap.
+        let stable = sample.parent_before;
+        let refusal_limit = stable + native_requests[0].1 as u64;
+        let ((refused, _, _), refusal) = crate::vector_read_memory::statement_child_proof::observe(
+            &parent,
+            refusal_limit,
+            || {
+                oracle::source_requests_for_test(counter, || {
+                    db.execute_at_snapshot(query, &params, db.snapshot())
+                })
+            },
+        );
+        let error = refused.unwrap_err();
+        let Error::MemoryBudgetExceeded {
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            operation,
+            ..
+        } = error
+        else {
+            panic!("the actual stable-baseline query must retain its typed refusal: {error:?}");
+        };
+        let actual = refusal
+            .identity
+            .last_target_refusal
+            .expect("actual failed request must be recorded before later frees");
+        assert_eq!(actual.kind, "ChildRefused");
+        assert_eq!(actual.operation, "native_adapter_keeper");
+        assert_eq!(actual.bytes, native_requests[1].1);
+        assert_eq!(requested_bytes, actual.bytes);
+        assert_eq!(available_bytes, 0);
+        assert_eq!(budget_limit_bytes, refusal_limit as usize);
+        assert_eq!(operation, actual.operation);
+        assert_eq!(refusal.children, 1);
+        assert_eq!(refusal.refusals, 1);
+        assert_eq!(refusal.peak, native_requests[0].1 as u64);
+        assert_eq!(refusal.control_bytes, native_requests[0].1);
+        assert_eq!(
+            actual.live_controls_before, native_requests[0].1 as u64,
+            "no old sibling control remains at this actual refusal"
+        );
+        assert_eq!(refusal.parent_before, stable);
+        assert_eq!(refusal.parent_after, stable);
+        assert_eq!(refusal.final_bytes, 0);
+        assert_eq!(refusal.drops, 1);
+        assert_eq!(refusal.parent_funding_mismatches, 0);
+        eprintln!(
+            "actual_stable_refusal_companion file={file} freed_trace_owner={} trace_plus_native_control={} stable={stable} cap={refusal_limit} refused={actual:?}",
+            native.owner,
+            trace_due + native_requests[0].1
+        );
         eprintln!(
             "actual_answer_trace_cuts file={file} sampled_return={before} after_answer_drop={after} released_by_answer={} actual_components={components:?} publication={publication:?} images={image_requests:?} image_receipts={image_receipts:?} independent_answer_invoice={independent_answer_invoice} physical={physical:?} trace_invoice={invoice:?}",
             before - after
         );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    for file in [false, true] {
+        for route in ["request", "session", "cursor"] {
+            let (_dir, db) = fixture(file);
+            sql(
+                &db,
+                "CREATE TABLE route_points (id INT PRIMARY KEY, v VECTOR(4)) HISTORY ALL",
+            );
+            for id in 0..4 {
+                db.execute(
+                    "INSERT INTO route_points VALUES ($id,$v)",
+                    &HashMap::from([
+                        ("id".into(), Value::Int64(id)),
+                        ("v".into(), Value::Vector(vec![1.0, id as f32, 0.0, 0.0])),
+                    ]),
+                )
+                .unwrap();
+            }
+            db.clear_last_vector_search_trace();
+            let query = "SELECT id FROM route_points ORDER BY v <=> $v USE VECTOR EXACT LIMIT 1";
+            let params = HashMap::from([("v".into(), Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]);
+            let session = db
+                .read_session(contextdb_core::read_contract::ReadLimits::default())
+                .unwrap();
+            let capture = Observation::begin(&db);
+            let mut answer = None;
+            let mut cursor = None;
+            let mut page = None;
+            oracle::measured(|| {
+                match route {
+                    "request" => {
+                        // Exercise the real provider's Native route and its
+                        // explicit refund propagation, including real SQL.
+                        let request = db
+                            .declared_read_request_provider()
+                            .request_budget_owner()
+                            .unwrap();
+                        answer = Some(
+                            crate::executor::bounded::with_request_read_memory(
+                                request,
+                                |error| error,
+                                |owner, refund| {
+                                    db.execute_owned_with_native_trace_refund(
+                                        query,
+                                        &params,
+                                        owner,
+                                        refund.as_ref(),
+                                    )
+                                    .and_then(OwnedQueryResult::into_public)
+                                },
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    "session" => answer = Some(session.execute(query, &params).unwrap()),
+                    "cursor" => {
+                        let mut opened = session.open_cursor(query, &params).unwrap();
+                        page = Some(opened.fetch(None).unwrap());
+                        cursor = Some(opened);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            if let Some(answer) = &answer {
+                assert_eq!(answer.rows(), vec![vec![Value::Int64(0)]]);
+            }
+            if let Some(page) = &page {
+                assert_eq!(page.rows(), vec![vec![Value::Int64(0)]]);
+            }
+            let controls = capture.assert_admitted();
+            assert_eq!(
+                controls.trace_stages, 2,
+                "the actual {route} vector trace must reach both native factories"
+            );
+            capture.assert_live();
+            let retained = db.last_vector_search_trace.write().take().unwrap();
+            let invoice = retained.complete_invoice_for_test(|_| {});
+            assert_eq!(invoice.original_payer, controls.forwarding_payload);
+            let mut requests = [(0, 0, 0); 16];
+            requests[..3].copy_from_slice(&controls.requests);
+            requests[3..5].copy_from_slice(&controls.trace_requests);
+            let mut count = 5;
+            for request in invoice.allocations {
+                if request.1 != 0 {
+                    requests[count] = request;
+                    count += 1;
+                }
+            }
+            requests[count] = invoice.prepaid_control;
+            count += 1;
+            oracle::watch_exact_frees_for_test(&requests[..count], controls.parent_counter);
+            drop(answer);
+            drop(page);
+            if let Some(cursor) = cursor {
+                cursor.close().unwrap();
+            }
+            drop(session);
+            // The escaped actual trace now keeps its own original invoices.
+            assert_eq!(oracle::source_free_for_test(count)[3].2, 0);
+            assert_eq!(oracle::source_free_for_test(count)[4].2, 0);
+            drop(retained);
+            let freed = oracle::source_free_for_test(count);
+            let live = oracle::source_live_at_free_for_test(count);
+            for slot in 0..count {
+                assert_eq!(
+                    freed[slot].2, 1,
+                    "{route} physical request {slot} frees once"
+                );
+                assert_eq!(freed[slot].0, freed[slot].1);
+                assert_eq!(
+                    freed[slot].0,
+                    controls.baseline as usize + live[slot],
+                    "{route} keeps every actual still-live original invoice through physical free"
+                );
+            }
+            assert_eq!(db.declared_read_memory.charged_bytes(), controls.baseline);
+            eprintln!(
+                "actual_request_cursor_physical route={route} file={file} requests={:?} frees={:?}",
+                &requests[..count],
+                &freed[..count]
+            );
+        }
     }
 }

@@ -2717,6 +2717,8 @@ pub mod statement_child_proof {
         pub first_completed_mismatch: Option<Event>,
         pub last_final_writer: Option<Event>,
         pub last_completed: Option<Event>,
+        /// The actual refused request, retained independently of later frees.
+        pub last_target_refusal: Option<Event>,
         pub last_parent: Option<Event>,
         pub target_drop_seen: bool,
         pub target_drop: Option<Event>,
@@ -2887,6 +2889,9 @@ pub mod statement_child_proof {
                     identity.target_calls += 1;
                     identity.target_last_held = held;
                     identity.target_refusals += usize::from(self.refused.get());
+                    if self.refused.get() {
+                        identity.last_target_refusal = Some(record);
+                    }
                     if delta >= 0 {
                         identity.target_reserves += delta as u64;
                     } else {
