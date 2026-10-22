@@ -1,4 +1,5 @@
-//! Fixed engine workers retain their original invoices through join and unmap.
+//! Worker payloads retain their original invoices through join and unmap.
+//! Intrinsic thread stacks are accounted by the whole-process limit.
 use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner, ReadShared};
 use contextdb_core::{Error, Result};
 use std::sync::Mutex;
@@ -22,13 +23,12 @@ mod native {
     struct Stack {
         address: *mut c_void,
         bytes: usize,
-        _invoice: ReadCredit,
     }
     unsafe impl Send for Stack {}
     impl Drop for Stack {
         fn drop(&mut self) {
             // Only an unstarted worker or a joined worker can own this value.
-            // Do not refund an extent the OS has not actually unmapped.
+            // Preserve physical stack cleanup even though stacks are process-accounted.
             if unsafe { libc::munmap(self.address, self.bytes) } != 0 {
                 std::process::abort();
             }
@@ -203,15 +203,8 @@ mod native {
                 "worker_control",
                 "Raise MEMORY_LIMIT for the fixed engine workers.",
             )?;
-            let stack_invoice = ReadCredit::try_new_owned(
-                owner,
-                bytes,
-                "worker",
-                "worker_stack",
-                "Raise MEMORY_LIMIT for the fixed engine workers.",
-            )?;
-            // Keep the original under-budget refusal free of extra startup:
-            // both worker invoices must be admitted before process bootstrap.
+            // Engine closure and queue data stay prepaid; the intrinsic stack,
+            // thread control block and TLS belong to the whole-process limit.
             if needs_finisher {
                 ensure_finisher()?;
             }
@@ -247,7 +240,6 @@ mod native {
             let stack = Stack {
                 address,
                 bytes,
-                _invoice: stack_invoice,
             };
             if unsafe { libc::mprotect(address, page, libc::PROT_NONE) } != 0 {
                 return Err(os_error(
