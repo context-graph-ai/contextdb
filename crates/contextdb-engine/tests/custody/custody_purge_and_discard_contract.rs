@@ -977,7 +977,8 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         "every selected table reports its affected count and survivors"
     );
     assert_eq!(
-        listed.rows_affected(), 3,
+        listed.rows_affected(),
+        3,
         "the statement reports the total it destroyed"
     );
     assert_eq!(
@@ -1879,7 +1880,8 @@ fn discard_transaction_writes() {
     .unwrap();
     db.execute("INSERT INTO notes VALUES (1, 'original', [1.0, 0.0])", &p())
         .unwrap();
-    let original = db.execute("SELECT * FROM notes", &p()).unwrap().rows();
+    let original_answer = db.execute("SELECT * FROM notes", &p()).unwrap();
+    let original = original_answer.rows();
     for commit in [false, true] {
         let tx = db.begin().unwrap();
         db.execute_in_tx(

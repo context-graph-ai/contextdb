@@ -337,7 +337,8 @@ fn snapshot_inspection_counts_vectors_without_hydrating_the_inspection_copy_firs
                 .limits
                 .limits
                 .memory,
-        );
+        )
+        .expect("admit the unchanged inspection fixture parent");
 
     {
         let db = reopen(&path);

@@ -1227,7 +1227,10 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
         Some(ConflictPolicy::KEEP_LATEST)
     );
     assert_eq!(
-        hub.db.execute("SELECT body FROM memos", &p()).unwrap().rows(),
+        hub.db
+            .execute("SELECT body FROM memos", &p())
+            .unwrap()
+            .rows(),
         vec![vec![Value::Text("sender memo".into())]]
     );
     assert_eq!(
@@ -1850,10 +1853,10 @@ async fn a_refused_transaction_in_a_pulled_batch_leaves_its_unrelated_siblings_i
         declared_before,
         "the receiver's declared policy stands"
     );
-    let mut memos = edge
+    let memos_answer = edge
         .execute("SELECT body FROM memos", &p())
-        .expect("the unrelated sibling transaction installed")
-        .rows();
+        .expect("the unrelated sibling transaction installed");
+    let mut memos = memos_answer.rows().iter().collect::<Vec<_>>();
     memos.sort_by_key(|row| format!("{row:?}"));
     assert_eq!(
         memos,

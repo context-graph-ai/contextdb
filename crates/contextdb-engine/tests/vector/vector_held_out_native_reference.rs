@@ -141,7 +141,7 @@ fn held_out_unfiltered_native_reference_recovers_the_required_neighbors() {
         .unwrap();
         assert_eq!(ordinary.rows(), bounded.result.rows());
         assert_eq!(ordinary.rows().len(), 10);
-        for row in &ordinary.rows() {
+        for row in ordinary.rows() {
             let Value::Int64(id) = row[0] else {
                 panic!("integer identity");
             };

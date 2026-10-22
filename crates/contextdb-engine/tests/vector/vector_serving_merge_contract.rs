@@ -121,7 +121,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
         "the compatibility profile resolves graph breadth from k, independent of the 201-row physical population"
     );
     for result in [first, bounded_query(&db, sql, &query)] {
-        let disclosure = result.trace().vector_search.unwrap();
+        let disclosure = result.trace().vector_search.as_ref().unwrap();
         assert_eq!(disclosure.aggregate_allowed_vectors, Some(100));
         assert_eq!(disclosure.partition_hnsw[0], initial);
     }
@@ -143,7 +143,12 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
         db.execute(sql, &parameters(&query)).unwrap(),
         bounded_query(&db, sql, &query),
     ] {
-        let serving = &result.trace().vector_search.as_ref().unwrap().partition_hnsw[0];
+        let serving = &result
+            .trace()
+            .vector_search
+            .as_ref()
+            .unwrap()
+            .partition_hnsw[0];
         assert_eq!(serving.hnsw_m, initial.hnsw_m);
         assert_eq!(
             serving.policy_revision, initial.policy_revision,
@@ -159,7 +164,12 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     .unwrap();
     db.run_maintenance_cycle().unwrap();
     let current = db.execute(sql, &parameters(&query)).unwrap();
-    let serving = &current.trace().vector_search.as_ref().unwrap().partition_hnsw[0];
+    let serving = &current
+        .trace()
+        .vector_search
+        .as_ref()
+        .unwrap()
+        .partition_hnsw[0];
     assert_eq!(serving.hnsw_m, 24);
     assert!(serving.policy_revision > initial.policy_revision);
     let old = db
@@ -256,7 +266,8 @@ fn quantized_candidates_use_the_original_query_and_native_visible_scores() {
             .execute(&sql.replace("INDEXED", "EXACT"), &parameters(&query))
             .unwrap();
         assert_eq!(
-            ordinary.rows(), expected.rows(),
+            ordinary.rows(),
+            expected.rows(),
             "native order and scores for {mode}: {exact:?}"
         );
         if mode == "SQ4" {
@@ -307,6 +318,7 @@ fn exact_discloses_its_actual_allowed_membership() {
             result
                 .trace()
                 .vector_search
+                .as_ref()
                 .unwrap()
                 .aggregate_allowed_vectors,
             Some(2)
@@ -463,7 +475,8 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                 );
                 let bounded = bounded_query(&db, &sql, &query);
                 assert_eq!(
-                    actual.rows(), bounded.rows(),
+                    actual.rows(),
+                    bounded.rows(),
                     "{mode} selectivity {selected} reader parity"
                 );
                 let expected_ids = ids(&expected);
@@ -471,7 +484,7 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                     .iter()
                     .filter(|id| expected_ids.contains(id))
                     .count();
-                for row in &actual.rows() {
+                for row in actual.rows() {
                     if let Some(reference) = expected
                         .rows()
                         .iter()
@@ -605,7 +618,10 @@ fn a_long_update_history_does_not_fill_indexed_result_slots_with_one_identity() 
         .unwrap();
     let indexed = db.execute(sql, &parameters(&[0.7, 0.3, -0.2])).unwrap();
     assert_eq!(indexed.rows(), exact.rows());
-    assert_eq!(bounded_query(&db, sql, &[0.7, 0.3, -0.2]).rows(), exact.rows());
+    assert_eq!(
+        bounded_query(&db, sql, &[0.7, 0.3, -0.2]).rows(),
+        exact.rows()
+    );
 }
 
 #[test]
@@ -716,7 +732,8 @@ fn durable_native_scores_and_unique_results_survive_updates_and_restart() {
                         bounded_query(&db, &sql, &query),
                     ] {
                         assert_eq!(
-                            result.rows(), reference.rows(),
+                            result.rows(),
+                            reference.rows(),
                             "native durable {mode} stage {stage} probe {probe}"
                         );
                     }
@@ -855,7 +872,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                     .unwrap();
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
-                    assert_eq!(ordinary.rows(), expected.rows()[..limit]);
+                    assert_eq!(ordinary.rows(), &expected.rows()[..limit]);
                     db.__reset_last_query_vector_trace_for_test();
                     let bounded = bounded_query(&db, &sql, &query);
                     let trace = {
@@ -869,7 +886,8 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(
-                        bounded.rows(), ordinary.rows(),
+                        bounded.rows(),
+                        ordinary.rows(),
                         "{quantization}, partitioned={partitioned}, restart={restart}"
                     );
                 }
@@ -904,15 +922,21 @@ fn embedded_graph_scratch_obeys_memory_admission_and_returns_its_charge() {
     let mut query = SemanticQuery::new("items", "embedding", generated_vector(10_000, 32), 10);
     query.search_mode = Some(VectorSearchMode::Indexed);
     let control = db.semantic_search(query.clone()).unwrap();
-    let answer = |rows: &[contextdb_engine::SearchResult]| rows.iter()
-        .map(|row| (row.row_id, row.vector_score.to_bits())).collect::<Vec<_>>();
+    let answer = |rows: &[contextdb_engine::SearchResult]| {
+        rows.iter()
+            .map(|row| (row.row_id, row.vector_score.to_bits()))
+            .collect::<Vec<_>>()
+    };
     assert_eq!(control.len(), 10);
     let resident = db.accountant().usage().used;
     db.set_memory_limit(Some(resident)).unwrap();
     // Real reader exhaustion, child identity, physical-free ordering and
     // recovery are complementary rows in the existing private funder host.
     for _ in 0..2 {
-        assert_eq!(answer(&db.semantic_search(query.clone()).unwrap()), answer(&control));
+        assert_eq!(
+            answer(&db.semantic_search(query.clone()).unwrap()),
+            answer(&control)
+        );
         assert!(db.__debug_last_query_vector_used_hnsw_for_test());
         assert_eq!(db.accountant().usage().used, resident);
     }
@@ -1014,12 +1038,23 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             .vector_store_for_test()
             .passive_activity_counters_for_test();
         let scored = (end - 100 + 32) as u64;
-        assert_eq!(after.raw_candidate_point_loads - before.raw_candidate_point_loads, scored);
-        assert_eq!(after.raw_candidate_point_body_bytes - before.raw_candidate_point_body_bytes,
-            scored * 3 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(
+            after.raw_candidate_point_loads - before.raw_candidate_point_loads,
+            scored
+        );
+        assert_eq!(
+            after.raw_candidate_point_body_bytes - before.raw_candidate_point_body_bytes,
+            scored * 3 * std::mem::size_of::<f32>() as u64
+        );
         assert_eq!(after.raw_partition_loads, before.raw_partition_loads);
-        assert_eq!(after.whole_entry_slice_requests, before.whole_entry_slice_requests);
-        assert_eq!(after.whole_entry_slice_entries_exposed, before.whole_entry_slice_entries_exposed);
+        assert_eq!(
+            after.whole_entry_slice_requests,
+            before.whole_entry_slice_requests
+        );
+        assert_eq!(
+            after.whole_entry_slice_entries_exposed,
+            before.whole_entry_slice_entries_exposed
+        );
 
         for mode in ["AUTO", "INDEXED"] {
             let sql = current_sql.replace("INDEXED", mode);
@@ -1045,7 +1080,11 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                     .expect("read the admitted trace observation")
             }
             .unwrap();
-            assert_eq!(trace.used_hnsw, mode == "INDEXED", "source route: {trace:?}");
+            assert_eq!(
+                trace.used_hnsw,
+                mode == "INDEXED",
+                "source route: {trace:?}"
+            );
             assert_eq!(trace.supplemented_row_count, 0);
             if mode == "INDEXED" {
                 assert!(distances.0.load(Ordering::SeqCst) > 0);
@@ -1076,7 +1115,11 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                     .expect("read the admitted trace observation")
             }
             .unwrap();
-            assert_eq!(trace.used_hnsw, mode == "INDEXED", "source route: {trace:?}");
+            assert_eq!(
+                trace.used_hnsw,
+                mode == "INDEXED",
+                "source route: {trace:?}"
+            );
             assert_eq!(trace.supplemented_row_count, 0);
             assert_eq!(
                 bounded

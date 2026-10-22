@@ -143,7 +143,7 @@ fn assert_answers_the_quantized_columns(result: &QueryResult, route: &str, shape
     );
     let by_id: HashMap<Uuid, Vec<f32>> = fixture_rows().into_iter().collect();
 
-    for row in &result.rows() {
+    for row in result.rows() {
         let id = match row.first() {
             Some(Value::Uuid(id)) => *id,
             other => panic!("the {route} route answers with an id-leading row, got {other:?}"),

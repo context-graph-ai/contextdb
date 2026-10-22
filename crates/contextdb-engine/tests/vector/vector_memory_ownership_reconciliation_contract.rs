@@ -243,7 +243,11 @@ fn assert_exact_vector(
             ]),
         )
         .expect("the authoritative exact vector remains readable");
-    assert_eq!(result.rows().len(), 1, "exact lookup returns one current row");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "exact lookup returns one current row"
+    );
     let id_column = result
         .columns()
         .iter()
@@ -1847,7 +1851,10 @@ fn graph_load_and_reconciliation_failures_restore_the_dormant_route_and_exact_re
     let bounded_loaded = bounded::execute(&db, &bounded_indexed_request(vector(1)))
         .expect("an admitted bounded request loads and owns the dormant generation");
     assert_eq!(bounded_loaded.result.rows(), calibration_result.rows());
-    assert_eq!(bounded_loaded.result.columns(), calibration_result.columns());
+    assert_eq!(
+        bounded_loaded.result.columns(),
+        calibration_result.columns()
+    );
     assert!(
         bounded_loaded
             .telemetry
@@ -1937,7 +1944,9 @@ fn retired_graphs_release_between_partition_rebuilds_without_losing_pinned_reads
     db.run_maintenance_cycle().unwrap();
     assert!(receipt!(&db).retired_pinned_graph_bytes > 0);
     assert_eq!(
-        db.execute_at_snapshot(sql, &query, snapshot).unwrap().rows(),
+        db.execute_at_snapshot(sql, &query, snapshot)
+            .unwrap()
+            .rows(),
         old.rows()
     );
     let route =
@@ -1949,10 +1958,8 @@ fn retired_graphs_release_between_partition_rebuilds_without_losing_pinned_reads
     );
     let newer_snapshot = db.snapshot();
     let newer_pin = db.pin_snapshot(newer_snapshot).unwrap();
-    let newer_rows = db
-        .execute_at_snapshot(sql, &query, newer_snapshot)
-        .unwrap()
-        .rows();
+    let newer_rows_answer = db.execute_at_snapshot(sql, &query, newer_snapshot).unwrap();
+    let newer_rows = newer_rows_answer.rows();
     drop(pin);
     db.run_maintenance_cycle().unwrap();
     let after = receipt!(&db);
@@ -2165,7 +2172,9 @@ fn journal_cleanup_charges_large_keys_during_publication_refusal_and_retry() {
         !pending_cleanup.physical_record_lsns.is_empty(),
         "the injected boundary leaves a real covered journal record for retry"
     );
-    let searchable_before_refusal = indexed_result(&db, "cleanup_items", &long_key, vector(1)).rows();
+    let searchable_before_refusal_answer =
+        indexed_result(&db, "cleanup_items", &long_key, vector(1));
+    let searchable_before_refusal = searchable_before_refusal_answer.rows();
 
     let used_before_refusal = accountant.usage().used;
     let refusal_limit = used_before_refusal.saturating_add(long_key.len());

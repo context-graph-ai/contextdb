@@ -218,7 +218,7 @@ fn a_store_reopens_for_writing_after_every_vector_maintenance_cycle() {
     }
 
     let db = open_writable(&path, "both rounds");
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT id FROM reopen_items WHERE scope_id = $scope \
              ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 4",
@@ -227,8 +227,8 @@ fn a_store_reopens_for_writing_after_every_vector_maintenance_cycle() {
                 ("query", Value::Vector(ranked(1, 0))),
             ]),
         )
-        .expect("the maintained route answers after every reopen")
-        .rows();
+        .expect("the maintained route answers after every reopen");
+    let rows = rows_answer.rows();
     assert_eq!(
         rows.first(),
         Some(&vec![Value::Uuid(Uuid::from_u128(0xB000))]),

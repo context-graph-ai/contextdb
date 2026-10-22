@@ -202,7 +202,7 @@ fn overlap_at_ten(indexed: &QueryResult, exact: &QueryResult) -> u64 {
 }
 
 fn assert_only_current_rows(result: &QueryResult) {
-    for row in &result.rows() {
+    for row in result.rows() {
         let [Value::Int64(id)] = row.as_slice() else {
             panic!("expected one integer corpus id, got {row:?}");
         };

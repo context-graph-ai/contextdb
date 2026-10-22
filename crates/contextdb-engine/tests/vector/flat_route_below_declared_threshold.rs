@@ -166,7 +166,8 @@ fn indexed_below_a_declared_flat_threshold_compares_its_rows_exactly() {
         "the flat route compares every allowed row of each flat partition once"
     );
     assert_eq!(
-        indexed.result.rows(), exact.result.rows(),
+        indexed.result.rows(),
+        exact.result.rows(),
         "the flat answer is EXACT's"
     );
     let disclosure = indexed
@@ -269,7 +270,8 @@ fn a_mixed_scope_serves_small_partitions_flat_and_large_ones_by_graph() {
             "the large partitions walk their graphs"
         );
         assert_eq!(
-            indexed.result.rows(), exact.result.rows(),
+            indexed.result.rows(),
+            exact.result.rows(),
             "one global top-10 across flat and graph partitions ({rows:?})"
         );
         assert!(
@@ -519,26 +521,26 @@ fn a_reader_keeps_its_captured_count_and_route_across_a_threshold_crossing() {
     // After the raw bodies are evicted the flat route streams them and keeps
     // the same answer.
     let index = VectorIndexRef::new("flat_docs", "embedding");
-    let before_eviction = db
+    let before_eviction_answer = db
         .execute_at_snapshot(
             "SELECT id FROM flat_docs ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10",
             &HashMap::from([("query".to_owned(), Value::Vector(vector(1_000_000)))]),
             below,
         )
-        .expect("search before eviction")
-        .rows();
+        .expect("search before eviction");
+    let before_eviction = before_eviction_answer.rows();
     let key = contextdb_core::VectorPartitionKey::from_values(&[Value::Int64(0)])
         .expect("an integer is a partition identity");
     db.vector_store_for_test()
         .evict_raw_partition_for_test(&index, &key);
-    let after_eviction = db
+    let after_eviction_answer = db
         .execute_at_snapshot(
             "SELECT id FROM flat_docs ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10",
             &HashMap::from([("query".to_owned(), Value::Vector(vector(1_000_000)))]),
             below,
         )
-        .expect("search after eviction")
-        .rows();
+        .expect("search after eviction");
+    let after_eviction = after_eviction_answer.rows();
     assert_eq!(after_eviction, before_eviction);
 }
 
@@ -598,7 +600,8 @@ fn refused_flat_admissions(db: &Database, flat_partitions: usize) -> BTreeSet<&'
             Ok(outcome) => {
                 answered += 1;
                 assert_eq!(
-                    outcome.result.rows(), baseline.result.rows(),
+                    outcome.result.rows(),
+                    baseline.result.rows(),
                     "an admitted flat search gives the whole answer (memory {memory})"
                 );
                 assert_eq!(
@@ -649,7 +652,8 @@ fn refused_flat_admissions(db: &Database, flat_partitions: usize) -> BTreeSet<&'
         contextdb_vector::mem::refuse_vector_admission_once_for_test("");
         match outcome {
             Ok(outcome) => assert_eq!(
-                outcome.result.rows(), baseline.result.rows(),
+                outcome.result.rows(),
+                baseline.result.rows(),
                 "a route that never makes the {site} admission answers whole"
             ),
             Err(bounded::TestError::Refused(failure))
@@ -783,11 +787,11 @@ fn assert_explain_predicts_execution(db: &Database, filter: &str) {
         .expect("passive explain")
         .vector_search
         .expect("passive explain discloses the vector route");
-    let executed = db
-        .execute(&sql, &empty())
-        .expect("the search executes")
+    let executed_answer = db.execute(&sql, &empty()).expect("the search executes");
+    let executed = executed_answer
         .trace()
         .vector_search
+        .as_ref()
         .expect("the executed search discloses its route");
     assert_eq!(
         passive.route, executed.route,

@@ -810,7 +810,7 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
             .index_layout(&index(), &mut vector_fixture_copy_2)
             .unwrap();
         let desired = layout.resolve_policy(7, 2);
-        let disclosure = db
+        let disclosure_answer = db
             .execute(
                 "SELECT id FROM partial_purge_items WHERE scope_id = $scope \
              ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 2",
@@ -819,10 +819,8 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
                     ("query", Value::Vector(vec![1.0, 0.0, 0.0])),
                 ]),
             )
-            .unwrap()
-            .trace()
-            .vector_search
             .unwrap();
+        let disclosure = disclosure_answer.trace().vector_search.as_ref().unwrap();
         let serving = &disclosure.partition_hnsw[0];
         assert_eq!(
             (

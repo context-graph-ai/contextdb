@@ -1599,6 +1599,7 @@ fn a_synced_restricted_reads_disclosure_lists_only_its_own_authorized_ids() {
     let disclosure = runtime
         .trace()
         .vector_search
+        .as_ref()
         .expect("the executed synced restricted read publishes a vector disclosure");
     assert_eq!(
         disclosure.aggregate_allowed_vectors,

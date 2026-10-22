@@ -413,6 +413,7 @@ fn explain_reports_the_route_forced_exact_mode_the_query_actually_took() {
     let runtime_disclosure = runtime
         .trace()
         .vector_search
+        .as_ref()
         .expect("the executed query publishes a vector disclosure");
     assert_eq!(
         runtime_disclosure.resolved_mode,
