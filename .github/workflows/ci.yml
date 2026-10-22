@@ -115,6 +115,20 @@ jobs:
           key: lint-debug0-jobs2
       - run: bash scripts/verify pr lint
 
+  lint-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: lint-macos-debug0-jobs2
+      - run: bash scripts/verify pr lint
+
   test-bundles:
     name: test / ${{ matrix.name }}
     needs: impact
@@ -400,7 +414,7 @@ jobs:
   required:
     name: PR checks
     if: always()
-    needs: [lint, test-bundles, build, features, installed-smoke, cross-compile, impact, integration]
+    needs: [lint, lint-macos, test-bundles, build, features, installed-smoke, cross-compile, impact, integration]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

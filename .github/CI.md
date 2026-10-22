@@ -23,7 +23,7 @@ its per-row cache key, preserving each old cache namespace; feature sets and
 target directories stay unchanged. The cache action uses its baseline behavior for failed jobs.
 The compile roots form `lint` → `features` → `build` → `cross-compile`; each
 successor runs after predecessor failure unless the workflow is cancelled, so the
-aggregate records every root error. `installed-smoke` remains an independent root.
+aggregate records every root error. `installed-smoke` and `lint-macos` remain independent roots.
 Setup savings are a forecast; hosted whole-gate timing remains unproven.
 
 > Normal correctness blocks merge; original scale/corpus qualification
@@ -139,6 +139,7 @@ Superseded PR runs are cancelled; push runs are not.
 | `test / bundle <number> / <behavior families>` — 18 bundles | `CI_CRATE=… CI_SHARD=… CI_FEATURES=… bash scripts/verify pr shard` | The bundles expand to the original 29 logical PR command/feature tuples plus every active integration row. Acceptance runs as separate remaining-module, long-running, and replication targets; vector decoding and delivery, many-context search, and layer search are separate work units. Their physical rows reuse the original logical parent's cache key and preserve its profile and feature closure. The normal plan has 49 physical rows when the source-bound dedup certificate applies and 53 in the conservative fallback. Default builds use parallel libtest execution; `test-seams` builds use one test thread. The engine's `test-seams,iroh` coverage is partitioned into seventeen physical rows by [`ci-shard-targets.txt`](../scripts/ci-shard-targets.txt). The inventory guard rejects missing or repeated targets and changed parent bindings. The lib shard alone covers examples and doctests within the split group. The redb fork retains its own target directory. |
 | `build` | `bash scripts/verify pr build` | Release build of the workspace, then [`verify-packaged-engine.sh`](../scripts/verify-packaged-engine.sh) builds the engine only from packaged crate archives. |
 | `features` | `bash scripts/verify pr features` | Supported standalone feature shapes: engine default, engine `mdns`, server `mdns,production-smoke-driver`, plus `cargo doc` for the workspace. |
+| `lint-macos` | `bash scripts/verify pr lint` on `macos-latest` | The same `cargo fmt` and `clippy -D warnings` lint entry as `lint`, run natively on macOS in parallel so macOS-only build and lint breaks fail the PR. |
 | `installed-smoke` | `bash scripts/verify pr installed` | Installs release CLI and server binaries into a temporary root and runs [`installed-release-durable-sync-smoke.sh`](../scripts/installed-release-durable-sync-smoke.sh), the installed-binary durability and sync smoke over real files and ticketed Iroh. |
 | `cross-compile (<target>)` | `CI_TARGET=<target> bash scripts/verify pr cross` | Release build of CLI and server for `aarch64-unknown-linux-gnu`. The macOS targets are set aside until CDB-153 (the engine uses Linux-only `pipe2`/`SOCK_CLOEXEC`) is fixed. |
 | `integration / engine / test-profile / acceptance` and named families | see Extended integration | Nightly-only fixtures when the change affects runtime or integration paths; otherwise the job still runs and records why it was not required. |
@@ -297,7 +298,7 @@ active matrix. Failure, cancellation, a missing plan or an unexpected skip fails
 the reusable workflow and therefore the unchanged **PR checks** aggregate.
 Inactive integration emits the classified impact reason in logs and summary;
 only that explicit inactive mode admits the matrix's expected skip. The original
-PR checks still run. Normal PR lint/test/build/features/installed-smoke/cross jobs have 30-minute runaway
+PR checks still run. Normal PR lint/lint-macos/test/build/features/installed-smoke/cross jobs have 30-minute runaway
 caps; helper jobs keep five minutes. Integration slices use 30 minutes in normal mode
 and the existing 330 minutes in full qualification. These per-job caps do not bound the
 whole normal DAG, setup or queue; they do not establish end-to-end acceptance. The hard thirty-minute normal end-to-end

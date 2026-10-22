@@ -35152,9 +35152,7 @@ mod reader_breadcrumb_location_proofs {
                 }
             }
             for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
-                let error = macos_process_info(pid)
-                    .err()
-                    .expect("invalid PID must fail");
+                let error = macos_process_info(pid).expect_err("invalid PID must fail");
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             }
         }
@@ -35353,10 +35351,9 @@ mod reader_breadcrumb_location_proofs {
             // Validate raw-record failures directly as well: otherwise a later
             // changed-tuple rejection could mask a broken arithmetic guard.
             if !label.starts_with("invalid-name/") {
-                with_observations(queue(good.pid, &[bad.clone()]), || {
-                    let error = macos_process_info(good.pid)
-                        .err()
-                        .expect("raw record must be rejected");
+                with_observations(queue(good.pid, std::slice::from_ref(&bad)), || {
+                    let error =
+                        macos_process_info(good.pid).expect_err("raw record must be rejected");
                     if let Some(errno) = errno {
                         assert_eq!(error.raw_os_error(), Some(errno), "{label}");
                     } else {
@@ -35381,7 +35378,7 @@ mod reader_breadcrumb_location_proofs {
                 root,
                 &format!("{label}/first"),
                 good.pid,
-                &[bad.clone()],
+                std::slice::from_ref(&bad),
                 errno,
                 false,
             );
@@ -35465,9 +35462,8 @@ mod reader_breadcrumb_location_proofs {
                 );
                 pending[0].pid = requested as libc::c_int;
                 with_observations(pending, || {
-                    let error = macos_process_info(requested)
-                        .err()
-                        .expect("caller PID must be rejected");
+                    let error =
+                        macos_process_info(requested).expect_err("caller PID must be rejected");
                     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
                     assert_eq!(counts(), (0, 0), "production must reject before the FFI");
                     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -35687,7 +35683,7 @@ mod reader_breadcrumb_location_proofs {
                 root,
                 "claimed-pid",
                 pid + 1,
-                &[good.clone()],
+                std::slice::from_ref(&good),
                 None,
                 false,
             );
@@ -35729,8 +35725,7 @@ mod reader_breadcrumb_location_proofs {
                 with_observations(queue(pid, &[bad]), || {
                     assert_eq!(
                         macos_process_info(pid)
-                            .err()
-                            .expect("raw failure")
+                            .expect_err("raw failure")
                             .raw_os_error(),
                         Some(libc::EACCES)
                     );
@@ -35739,7 +35734,7 @@ mod reader_breadcrumb_location_proofs {
                 assert_eq!(unsafe { *libc::__error() }, before);
                 assert_eq!(counts(), (1, 1));
                 let panic = catch_unwind(AssertUnwindSafe(|| {
-                    with_observations(queue(pid, &[good.clone()]), || {
+                    with_observations(queue(pid, std::slice::from_ref(good)), || {
                         unsafe { *libc::__error() = libc::ESRCH };
                         panic!("native scope original panic");
                     });
@@ -35753,7 +35748,7 @@ mod reader_breadcrumb_location_proofs {
             });
             assert_eq!(unsafe { *libc::__error() }, errno);
             for mode in ["unused", "ordinal", "pid", "exhausted"] {
-                let mut observations = queue(pid, &[good.clone()]);
+                let mut observations = queue(pid, std::slice::from_ref(good));
                 match mode {
                     "ordinal" => observations[0].ordinal = 2,
                     "pid" => observations[0].pid += 1,
@@ -35796,7 +35791,7 @@ mod reader_breadcrumb_location_proofs {
                     )
                     .is_none()
                 );
-                with_observations(queue(pid, &[good.clone()]), || {
+                with_observations(queue(pid, std::slice::from_ref(good)), || {
                     macos_process_info(pid).unwrap();
                     assert_eq!(counts(), (1, 1));
                 });
