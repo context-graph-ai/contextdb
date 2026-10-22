@@ -206,6 +206,11 @@ impl Database {
             "pending_schema_stages".into(),
             serde_json::json!(receipt.pending_schema_stages),
         );
+        owners.insert("writer_schema_charge".into(), serde_json::json!(receipt.writer_schema_charge));
+        owners.insert("custody_companion_memo".into(), serde_json::json!(receipt.custody_companion_memo));
+        owners.insert("custody_tenant_mirror".into(), serde_json::json!(receipt.custody_tenant_mirror));
+        owners.insert("pending_lineage_generation_charge".into(), serde_json::json!(receipt.pending_lineage_generation_charge));
+        owners.insert("sink_window_charge".into(), serde_json::json!(receipt.sink_window_charge));
         owners.insert(
             "named_owner_total".into(),
             serde_json::json!(receipt.named_owner_total),
