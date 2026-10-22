@@ -750,12 +750,17 @@ impl HopScratch {
     {
         let wanted = point.neighbour_count(level);
         if wanted > self.charged {
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::Result,
-                previous_capacity: self.charged,
-                requested_capacity: wanted,
-                element_bytes: Self::ELEMENT_BYTES,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::Result,
+                    previous_capacity: self.charged,
+                    requested_capacity: wanted,
+                    element_bytes: Self::ELEMENT_BYTES,
+                })
+            }?;
             self.charged = wanted;
             self.ids.clear();
             self.ids.reserve_exact(wanted);
@@ -772,11 +777,16 @@ impl HopScratch {
         let charged = self.charged;
         drop(self.ids);
         if charged != 0 {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::Result,
-                capacity: charged,
-                element_bytes: Self::ELEMENT_BYTES,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::Result,
+                    capacity: charged,
+                    element_bytes: Self::ELEMENT_BYTES,
+                })
+            };
         }
     }
 }
@@ -1011,12 +1021,22 @@ impl<'a, 's> OpenLayer<'a, 's> {
         F: FnMut(usize, RowId) -> bool,
     {
         let partition = self.partition;
-        if row.is_some_and(|row| is_allowed(partition, row)) {
+        if row.is_some_and(|row| {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+            );
+            is_allowed(partition, row)
+        }) {
             return Ok(true);
         }
         let mut found = false;
         self.for_each_member(origin, before_source, &mut |member, _, _| {
-            found = is_allowed(partition, member);
+            found = {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, member)
+            };
             Ok(!found)
         })?;
         Ok(found)
@@ -1107,12 +1127,17 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     // separate admission while their allocations coexist.
                     let wanted = super::layer0_serving_degree(tail.definition().2.hnsw_m);
                     if wanted > scratch.charged {
-                        acquire(HnswSearchScratchEvent::Reserve {
-                            container: HnswSearchScratchContainer::Result,
-                            previous_capacity: scratch.charged,
-                            requested_capacity: wanted,
-                            element_bytes: HopScratch::ELEMENT_BYTES,
-                        })?;
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                                contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                            );
+                            acquire(HnswSearchScratchEvent::Reserve {
+                                container: HnswSearchScratchContainer::Result,
+                                previous_capacity: scratch.charged,
+                                requested_capacity: wanted,
+                                element_bytes: HopScratch::ELEMENT_BYTES,
+                            })
+                        }?;
                         scratch.charged = wanted;
                         scratch.ids.clear();
                         scratch.ids.reserve_exact(wanted);
@@ -1208,65 +1233,78 @@ impl<'a, 's> OpenLayer<'a, 's> {
         R: FnMut(HnswSearchScratchEvent),
     {
         match &mut self.graph {
-            LayerGraph::Durable { tail, reader } => (|| {
-                before_source_entry()?;
-                let cached = {
-                    let mut navigation = self.navigation.lock();
-                    navigation
-                        .point(self.source_layer, point)
-                        .and_then(|point| point.values.as_ref())
-                        .is_some()
-                };
-                if cached {
-                    before_distance()?;
-                    let mut navigation = self.navigation.lock();
-                    if let Some(values) = navigation
-                        .point(self.source_layer, point)
-                        .and_then(|point| point.values.as_ref())
+            LayerGraph::Durable { tail, reader } => {
+                (|| {
                     {
-                        let distance = hnsw_f32_distance().eval(query.values, values);
-                        if !distance.is_finite() {
-                            return Err(E::from(Error::Other(
-                                "invalid paged graph distance".into(),
-                            )));
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                        );
+                        before_source_entry()
+                    }?;
+                    let cached = {
+                        let mut navigation = self.navigation.lock();
+                        navigation
+                            .point(self.source_layer, point)
+                            .and_then(|point| point.values.as_ref())
+                            .is_some()
+                    };
+                    if cached {
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance);
+                            before_distance()
+                        }?;
+                        let mut navigation = self.navigation.lock();
+                        if let Some(values) = navigation
+                            .point(self.source_layer, point)
+                            .and_then(|point| point.values.as_ref())
+                        {
+                            let distance = hnsw_f32_distance().eval(query.values, values);
+                            if !distance.is_finite() {
+                                return Err(E::from(Error::Other(
+                                    "invalid paged graph distance".into(),
+                                )));
+                            }
+                            return Ok(Some(distance));
                         }
-                        return Ok(Some(distance));
                     }
-                }
-                let value = paged_builder::AdmittedPagedReader::with_reclamation(
-                    reader.borrow_mut().as_mut(),
-                    self.navigation.owner(),
-                    &|| self.navigation.reclaim(),
-                )
-                .load_point(point)
-                .map_err(E::from)?;
-                self.navigation
-                    .lock()
-                    .remember_point(self.source_layer, point, &value);
-                if !cached {
-                    before_distance()?;
-                }
-                let distance = match &*value {
-                    paged_builder::PagedVectorPoint::F32(point) => {
-                        hnsw_f32_distance().eval(query.values, &point.values)
+                    let value = paged_builder::AdmittedPagedReader::with_reclamation(
+                        reader.borrow_mut().as_mut(),
+                        self.navigation.owner(),
+                        &|| self.navigation.reclaim(),
+                    )
+                    .load_point(point)
+                    .map_err(E::from)?;
+                    self.navigation
+                        .lock()
+                        .remember_point(self.source_layer, point, &value);
+                    if !cached {
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance);
+                            before_distance()
+                        }?;
                     }
-                    paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
-                        quantization: tail.definition().1,
+                    let distance = match &*value {
+                        paged_builder::PagedVectorPoint::F32(point) => {
+                            hnsw_f32_distance().eval(query.values, &point.values)
+                        }
+                        paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
+                            quantization: tail.definition().1,
+                        }
+                        .eval(
+                            query.encoded.ok_or_else(|| {
+                                E::from(Error::Other(
+                                    "paged quantized graph requires an encoded query".into(),
+                                ))
+                            })?,
+                            &point.values,
+                        ),
+                    };
+                    if !distance.is_finite() {
+                        return Err(E::from(Error::Other("invalid paged graph distance".into())));
                     }
-                    .eval(
-                        query.encoded.ok_or_else(|| {
-                            E::from(Error::Other(
-                                "paged quantized graph requires an encoded query".into(),
-                            ))
-                        })?,
-                        &point.values,
-                    ),
-                };
-                if !distance.is_finite() {
-                    return Err(E::from(Error::Other("invalid paged graph distance".into())));
-                }
-                Ok(Some(distance))
-            })(),
+                    Ok(Some(distance))
+                })()
+            }
             LayerGraph::Paged { paged, reader } => {
                 let Some(stored) = paged.point(point) else {
                     return Ok(None);
@@ -1289,7 +1327,12 @@ impl<'a, 's> OpenLayer<'a, 's> {
                 let Some(stored) = points.resident_point(&point) else {
                     return Ok(None);
                 };
-                before_distance()?;
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance,
+                    );
+                    before_distance()
+                }?;
                 Ok(Some(distance.eval(query.values, stored.get_v())))
             }
             LayerGraph::ResidentQuantized { points, distance } => {
@@ -1303,7 +1346,12 @@ impl<'a, 's> OpenLayer<'a, 's> {
                         .into(),
                     ))
                 })?;
-                before_distance()?;
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance,
+                    );
+                    before_distance()
+                }?;
                 Ok(Some(distance.eval(encoded, stored.get_v())))
             }
         }
@@ -1390,7 +1438,12 @@ where
             if let Err(stop) = walk.charge_rescore() {
                 return Ok(Err(stop));
             }
-            let score = resolve_score(partition, row_id, before_source_entry, before_distance)?;
+            let score = {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::ResolveScore,
+                );
+                resolve_score(partition, row_id, before_source_entry, before_distance)
+            }?;
             Ok(Ok(score.map(|score| (1.0 - score, Some(score)))))
         }
     }
@@ -1505,32 +1558,47 @@ impl Walk<'_> {
                 .checked_mul(VISIT_ELEMENT_BYTES)
                 .and_then(|n| n.checked_add(16))
                 .ok_or_else(|| E::from(Error::Other("graph visit allocation overflow".into())))?;
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::VisitedPoints,
-                previous_capacity: 0,
-                requested_capacity: bytes,
-                element_bytes: 1,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::VisitedPoints,
+                    previous_capacity: 0,
+                    requested_capacity: bytes,
+                    element_bytes: 1,
+                })
+            }?;
             if self
                 .reached
                 .try_reserve(wanted.saturating_sub(self.reached.len()))
                 .is_err()
             {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::VisitedPoints,
-                    capacity: bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::VisitedPoints,
+                        capacity: bytes,
+                        element_bytes: 1,
+                    })
+                };
                 return Err(E::from(Error::Other(
                     "cannot allocate admitted graph visit scratch".into(),
                 )));
             }
             if self.visit_bytes != 0 {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::VisitedPoints,
-                    capacity: self.visit_bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::VisitedPoints,
+                        capacity: self.visit_bytes,
+                        element_bytes: 1,
+                    })
+                };
             }
             self.visit_bytes = bytes;
         }
@@ -1708,19 +1776,29 @@ impl Walk<'_> {
                         "graph retained-row allocation overflow".into(),
                     ))
                 })?;
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::SeenRows,
-                previous_capacity: 0,
-                requested_capacity: bytes,
-                element_bytes: 1,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::SeenRows,
+                    previous_capacity: 0,
+                    requested_capacity: bytes,
+                    element_bytes: 1,
+                })
+            }?;
             let mut replacement = HashMap::new();
             if replacement.try_reserve(wanted).is_err() {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::SeenRows,
-                    capacity: bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::SeenRows,
+                        capacity: bytes,
+                        element_bytes: 1,
+                    })
+                };
                 return Err(E::from(Error::Other(
                     "cannot allocate retained-row scratch".into(),
                 )));
@@ -1729,11 +1807,16 @@ impl Walk<'_> {
             self.kept_rows.extend(old);
             // Consuming the old map has physically freed its buckets.
             if self.kept_rows_bytes != 0 {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::SeenRows,
-                    capacity: self.kept_rows_bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::SeenRows,
+                        capacity: self.kept_rows_bytes,
+                        element_bytes: 1,
+                    })
+                };
             }
             self.kept_rows_bytes = bytes;
         }
@@ -1761,32 +1844,47 @@ impl Walk<'_> {
                 .saturating_mul(2)
                 .max(FRONTIER_FIRST_CHARGE)
                 .min(self.frontier_capacity);
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::CandidateHeap,
-                previous_capacity: 0,
-                requested_capacity: grown,
-                element_bytes: std::mem::size_of::<Nearest>(),
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::CandidateHeap,
+                    previous_capacity: 0,
+                    requested_capacity: grown,
+                    element_bytes: std::mem::size_of::<Nearest>(),
+                })
+            }?;
             if self
                 .frontier
                 .try_reserve_exact(grown.saturating_sub(self.frontier.len()))
                 .is_err()
             {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::CandidateHeap,
-                    capacity: grown,
-                    element_bytes: std::mem::size_of::<Nearest>(),
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::CandidateHeap,
+                        capacity: grown,
+                        element_bytes: std::mem::size_of::<Nearest>(),
+                    })
+                };
                 return Err(E::from(Error::Other(
                     "cannot allocate graph frontier".into(),
                 )));
             }
             if self.frontier_charged != 0 {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::CandidateHeap,
-                    capacity: self.frontier_charged,
-                    element_bytes: std::mem::size_of::<Nearest>(),
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::CandidateHeap,
+                        capacity: self.frontier_charged,
+                        element_bytes: std::mem::size_of::<Nearest>(),
+                    })
+                };
             }
             self.frontier_charged = grown;
         }
@@ -2261,12 +2359,17 @@ where
             if paged.entry_point.is_none() {
                 return Ok(None);
             }
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::ServingPageDirectory,
-                previous_capacity: 0,
-                requested_capacity: paged.page_slots,
-                element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::ServingPageDirectory,
+                    previous_capacity: 0,
+                    requested_capacity: paged.page_slots,
+                    element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
+                })
+            }?;
             *directory_entries = directory_entries.saturating_add(paged.page_slots);
             let reader =
                 ServingPages::new(paged.source.reader().map_err(E::from)?, paged.page_slots);
@@ -2463,12 +2566,17 @@ where
     // duplicate directory or uncharged replacement during layer opening.
     let open_element_bytes =
         std::mem::size_of::<OpenLayer<'_, '_>>() + 16 * std::mem::size_of::<usize>();
-    acquire(HnswSearchScratchEvent::Reserve {
-        container: HnswSearchScratchContainer::ServingPageDirectory,
-        previous_capacity: 0,
-        requested_capacity: layers.len(),
-        element_bytes: open_element_bytes,
-    })?;
+    {
+        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+        );
+        acquire(HnswSearchScratchEvent::Reserve {
+            container: HnswSearchScratchContainer::ServingPageDirectory,
+            previous_capacity: 0,
+            requested_capacity: layers.len(),
+            element_bytes: open_element_bytes,
+        })
+    }?;
     // Open every layer: how it is read, its identity map, its seed directory.
     let mut open = Vec::<OpenLayer<'_, '_>>::with_capacity(layers.len());
     let mut total_points = 0usize;
@@ -2482,12 +2590,22 @@ where
     let mut encoded_query = None::<Vec<u8>>;
     let opened = (|| -> std::result::Result<(), E> {
         for (source_layer, layer) in layers.iter().enumerate() {
-            before_source_entry()?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                );
+                before_source_entry()
+            }?;
             if layer.graph.is_empty() {
                 continue;
             }
             let partition = layer.partition;
-            let mut layer_allowed = |row: RowId| is_allowed(partition, row);
+            let mut layer_allowed = |row: RowId| {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, row)
+            };
             let seed_all = layer.seed_rows.is_none();
             let seed_rows = || {
                 layer.seed_rows.map_or_else(
@@ -2595,20 +2713,30 @@ where
     })();
     let release_seeds = |release: &mut R, bytes: usize| {
         if bytes != 0 {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::Result,
-                capacity: bytes / std::mem::size_of::<PointId>().max(1),
-                element_bytes: std::mem::size_of::<PointId>(),
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::Result,
+                    capacity: bytes / std::mem::size_of::<PointId>().max(1),
+                    element_bytes: std::mem::size_of::<PointId>(),
+                })
+            };
         }
     };
     let release_directories = |release: &mut R, entries: usize| {
         if entries != 0 {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::ServingPageDirectory,
-                capacity: entries,
-                element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::ServingPageDirectory,
+                    capacity: entries,
+                    element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
+                })
+            };
         }
     };
     fn release_encoded<E, A, R>(acquire: &mut A, release: &mut R, encoded: Option<Vec<u8>>)
@@ -2624,11 +2752,16 @@ where
     }
     if let Err(error) = opened {
         drop(open);
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::ServingPageDirectory,
-            capacity: layers.len(),
-            element_bytes: open_element_bytes,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::ServingPageDirectory,
+                capacity: layers.len(),
+                element_bytes: open_element_bytes,
+            })
+        };
         release_encoded(&mut acquire, &mut release, encoded_query);
         release_directories(&mut release, directory_entries);
         release_seeds(&mut release, seed_bytes);
@@ -2636,11 +2769,16 @@ where
     }
     if open.is_empty() {
         drop(open);
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::ServingPageDirectory,
-            capacity: layers.len(),
-            element_bytes: open_element_bytes,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::ServingPageDirectory,
+                capacity: layers.len(),
+                element_bytes: open_element_bytes,
+            })
+        };
         release_encoded(&mut acquire, &mut release, encoded_query);
         release_directories(&mut release, directory_entries);
         release_seeds(&mut release, seed_bytes);
@@ -2685,25 +2823,40 @@ where
     for (reserved, (container, requested_capacity, element_bytes)) in
         reservations.into_iter().enumerate()
     {
-        if let Err(error) = acquire(HnswSearchScratchEvent::Reserve {
-            container,
-            previous_capacity: 0,
-            requested_capacity,
-            element_bytes,
-        }) {
+        if let Err(error) = {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+            );
+            acquire(HnswSearchScratchEvent::Reserve {
+                container,
+                previous_capacity: 0,
+                requested_capacity,
+                element_bytes,
+            })
+        } {
             for (container, capacity, element_bytes) in &reservations[..reserved] {
-                release(HnswSearchScratchEvent::Release {
-                    container: *container,
-                    capacity: *capacity,
-                    element_bytes: *element_bytes,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: *container,
+                        capacity: *capacity,
+                        element_bytes: *element_bytes,
+                    })
+                };
             }
             drop(open);
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::ServingPageDirectory,
-                capacity: layers.len(),
-                element_bytes: open_element_bytes,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::ServingPageDirectory,
+                    capacity: layers.len(),
+                    element_bytes: open_element_bytes,
+                })
+            };
             release_encoded(&mut acquire, &mut release, encoded_query);
             release_directories(&mut release, directory_entries);
             release_seeds(&mut release, seed_bytes);
@@ -2955,7 +3108,10 @@ where
             if let Some(key) = key {
                 for open_layer in &open {
                     if let LayerGraph::Durable { reader, .. } = &open_layer.graph {
-                        before_source_entry()?;
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                            before_source_entry()
+                        }?;
                         if paged_builder::AdmittedPagedReader::with_reclamation(
                             reader.borrow_mut().as_mut(),
                             navigation.owner(),
@@ -3053,13 +3209,21 @@ where
                 return Ok(());
             };
             for (position, layer) in layers.iter().enumerate() {
-                before_source_entry()?;
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                    );
+                    before_source_entry()
+                }?;
                 if let Some(open_layer) = open.iter().find(|opened| opened.source_layer == position)
                     && let LayerGraph::Durable { reader, .. } = &open_layer.graph
                 {
                     let mut after = None;
                     loop {
-                        before_source_entry()?;
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                            before_source_entry()
+                        }?;
                         let Some(row_id) = paged_builder::AdmittedPagedReader::with_reclamation(
                             reader.borrow_mut().as_mut(),
                             navigation.owner(),
@@ -3077,7 +3241,10 @@ where
                         }
                         after = Some(row_id);
                         if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0))
-                            || !is_allowed(layer.partition, row_id)
+                            || !{
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed);
+                                is_allowed(layer.partition, row_id)
+                            }
                         {
                             continue;
                         }
@@ -3119,9 +3286,9 @@ where
                             &mut acquire,
                             &mut release,
                             |row_id, before_source_entry, _, _| {
-                                before_source_entry()?;
+                                { let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource); before_source_entry() }?;
                                 if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0))
-                                    || !is_allowed(layer.partition, row_id)
+                                    || !{ let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed); is_allowed(layer.partition, row_id) }
                                 {
                                     return Ok(false);
                                 }
@@ -3165,8 +3332,18 @@ where
                         break;
                     };
                     let row_id = &row_id;
-                    before_source_entry()?;
-                    if is_allowed(layer.partition, *row_id) {
+                    {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                        );
+                        before_source_entry()
+                    }?;
+                    if {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                        );
+                        is_allowed(layer.partition, *row_id)
+                    } {
                         if ties.len() < kept_capacity {
                             ties.push((position, *row_id, None));
                         } else if let Some((worst, worst_id)) = ties
@@ -3206,11 +3383,21 @@ where
             let mut index = 0usize;
             while index < ties.len() {
                 let (position, row_id, _) = ties[index];
-                if let Err(error) = before_source_entry() {
+                if let Err(error) = {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                    );
+                    before_source_entry()
+                } {
                     retained = Err(error);
                     break;
                 }
-                if !is_allowed(layers[position].partition, row_id) {
+                if !{
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                    );
+                    is_allowed(layers[position].partition, row_id)
+                } {
                     ties.remove(index);
                     continue;
                 }
@@ -3238,12 +3425,15 @@ where
                             ties.clear();
                             break;
                         }
-                        match resolve_score(
-                            partition,
-                            row_id,
-                            &mut before_source_entry,
-                            &mut before_distance,
-                        ) {
+                        match {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                            resolve_score(
+                                partition,
+                                row_id,
+                                &mut before_source_entry,
+                                &mut before_distance,
+                            )
+                        } {
                             Ok(score) => score,
                             Err(error) => {
                                 retained = Err(error);
@@ -3408,11 +3598,16 @@ where
     if disconnected.capacity() != 0 {
         let capacity = disconnected.capacity();
         drop(disconnected);
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::Result,
-            capacity,
-            element_bytes: std::mem::size_of::<usize>(),
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::Result,
+                capacity,
+                element_bytes: std::mem::size_of::<usize>(),
+            })
+        };
     }
 
     // Each charge goes back only once what it covers has been dropped.
@@ -3423,34 +3618,54 @@ where
     let bridges = std::mem::take(&mut walk.bridges);
     drop(walk);
     if visit_bytes != 0 {
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::VisitedPoints,
-            capacity: visit_bytes,
-            element_bytes: 1,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::VisitedPoints,
+                capacity: visit_bytes,
+                element_bytes: 1,
+            })
+        };
     }
     hops.release(&mut release);
     bridges.release(&mut release);
     for (container, capacity, element_bytes) in reservations {
-        release(HnswSearchScratchEvent::Release {
-            container,
-            capacity,
-            element_bytes,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container,
+                capacity,
+                element_bytes,
+            })
+        };
     }
     if frontier_charged != 0 {
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::CandidateHeap,
-            capacity: frontier_charged,
-            element_bytes: std::mem::size_of::<Nearest>(),
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::CandidateHeap,
+                capacity: frontier_charged,
+                element_bytes: std::mem::size_of::<Nearest>(),
+            })
+        };
     }
     drop(open);
-    release(HnswSearchScratchEvent::Release {
-        container: HnswSearchScratchContainer::ServingPageDirectory,
-        capacity: layers.len(),
-        element_bytes: open_element_bytes,
-    });
+    {
+        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Release,
+        );
+        release(HnswSearchScratchEvent::Release {
+            container: HnswSearchScratchContainer::ServingPageDirectory,
+            capacity: layers.len(),
+            element_bytes: open_element_bytes,
+        })
+    };
     release_encoded(&mut acquire, &mut release, encoded_query);
     release_directories(&mut release, directory_entries);
     release_seeds(&mut release, seed_bytes);
@@ -3593,10 +3808,12 @@ where
             let origin = layer
                 .origin(entry_id, before_source_entry)?
                 .ok_or_else(|| E::from(Error::Other("graph entry identity".into())))?;
-            if !layer
-                .row(origin, before_source_entry)?
-                .is_some_and(|row| is_allowed(partition, row))
-            {
+            if !layer.row(origin, before_source_entry)?.is_some_and(|row| {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, row)
+            }) {
                 let mut oldest = None;
                 for (level, end) in layer.level_ends.iter().copied().enumerate() {
                     let start = if level == 0 {
@@ -3616,9 +3833,12 @@ where
                     }
                 }
                 if let Some((point, origin)) = oldest
-                    && layer
-                        .row(origin, before_source_entry)?
-                        .is_some_and(|row| is_allowed(partition, row))
+                    && layer.row(origin, before_source_entry)?.is_some_and(|row| {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                        );
+                        is_allowed(partition, row)
+                    })
                 {
                     entry_id = point;
                 }
@@ -3693,7 +3913,7 @@ where
                     if !allow_bridges
                         && !layer
                             .row(neighbour_origin, before_source_entry)?
-                            .is_some_and(|row| is_allowed(partition, row))
+                            .is_some_and(|row| { let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed); is_allowed(partition, row) })
                     {
                         continue;
                     }
@@ -3876,18 +4096,28 @@ where
     ];
     if !settled.is_empty() {
         for (admitted, element_bytes) in settled_charges.iter().copied().enumerate() {
-            if let Err(error) = acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::MergeResults,
-                previous_capacity: 0,
-                requested_capacity: settled.len(),
-                element_bytes,
-            }) {
+            if let Err(error) = {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::MergeResults,
+                    previous_capacity: 0,
+                    requested_capacity: settled.len(),
+                    element_bytes,
+                })
+            } {
                 for element_bytes in settled_charges[..admitted].iter().copied() {
-                    release(HnswSearchScratchEvent::Release {
-                        container: HnswSearchScratchContainer::MergeResults,
-                        capacity: settled.len(),
-                        element_bytes,
-                    });
+                    {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::Release,
+                        );
+                        release(HnswSearchScratchEvent::Release {
+                            container: HnswSearchScratchContainer::MergeResults,
+                            capacity: settled.len(),
+                            element_bytes,
+                        })
+                    };
                 }
                 walk.hops = hops;
                 walk.bridges = bridges;
@@ -3949,8 +4179,16 @@ where
                             break;
                         }
                         let row = &settled[position];
-                        before_source_entry()?;
-                        if !is_allowed(row.partition, row.row_id) {
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                            before_source_entry()
+                        }?;
+                        if !{
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                                contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                            );
+                            is_allowed(row.partition, row.row_id)
+                        } {
                             continue;
                         }
                         let score = match settled_scores[position] {
@@ -3963,12 +4201,15 @@ where
                                         stop: Some(stop),
                                     });
                                 }
-                                let score = resolve_score(
-                                    row.partition,
-                                    row.row_id,
-                                    before_source_entry,
-                                    before_distance,
-                                )?;
+                                let score = {
+                                    let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                                    resolve_score(
+                                        row.partition,
+                                        row.row_id,
+                                        before_source_entry,
+                                        before_distance,
+                                    )
+                                }?;
                                 settled_scores[position] = Some(score);
                                 score
                             }
@@ -4014,8 +4255,14 @@ where
                             after =
                                 Some((kept.0.reached.distance, kept.0.partition, kept.0.row_id));
                             let key = (kept.0.partition, kept.0.row_id);
-                            before_source_entry()?;
-                            if !is_allowed(key.0, key.1) {
+                            {
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                                before_source_entry()
+                            }?;
+                            if !{
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed);
+                                is_allowed(key.0, key.1)
+                            } {
                                 continue;
                             }
                             let score = match walk
@@ -4033,12 +4280,15 @@ where
                                             stop: Some(stop),
                                         });
                                     }
-                                    resolve_score(
-                                        key.0,
-                                        key.1,
-                                        before_source_entry,
-                                        before_distance,
-                                    )?
+                                    {
+                                        let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                                        resolve_score(
+                                            key.0,
+                                            key.1,
+                                            before_source_entry,
+                                            before_distance,
+                                        )
+                                    }?
                                 }
                             };
                             if let Some(entry) = walk.kept_rows.get_mut(&key) {
@@ -4061,8 +4311,14 @@ where
                                 break;
                             }
                             let row = &settled[position];
-                            before_source_entry()?;
-                            if !is_allowed(row.partition, row.row_id) {
+                            {
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                                before_source_entry()
+                            }?;
+                            if !{
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed);
+                                is_allowed(row.partition, row.row_id)
+                            } {
                                 continue;
                             }
                             let score = match settled_scores[position] {
@@ -4075,12 +4331,15 @@ where
                                             stop: Some(stop),
                                         });
                                     }
-                                    let score = resolve_score(
-                                        row.partition,
-                                        row.row_id,
-                                        before_source_entry,
-                                        before_distance,
-                                    )?;
+                                    let score = {
+                                        let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                                        resolve_score(
+                                            row.partition,
+                                            row.row_id,
+                                            before_source_entry,
+                                            before_distance,
+                                        )
+                                    }?;
                                     settled_scores[position] = Some(score);
                                     score
                                 }
@@ -4217,11 +4476,16 @@ where
     drop(settled_scores);
     if !settled.is_empty() {
         for element_bytes in settled_charges {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::MergeResults,
-                capacity: settled.len(),
-                element_bytes,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::MergeResults,
+                    capacity: settled.len(),
+                    element_bytes,
+                })
+            };
         }
     }
     expanded
@@ -4269,7 +4533,12 @@ where
             if !visit.marked {
                 continue;
             }
-            before_source_entry()?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                );
+                before_source_entry()
+            }?;
             let Some(layer) = open.iter().rev().find(|layer| layer.first_bit <= *bit) else {
                 continue;
             };
@@ -4293,7 +4562,12 @@ where
             // only when the snapshot allows it.
             let partition = layer.partition;
             if let Some(row) = layer.row(origin, before_source_entry)?
-                && is_allowed(partition, row)
+                && {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                    );
+                    is_allowed(partition, row)
+                }
             {
                 let needed = rows.len() + 1;
                 scratch.ensure_vec_capacity_compact(
@@ -4319,7 +4593,12 @@ where
             COUNTING_MEMBERS.with(|counting| counting.set(true));
             let counted =
                 layer.for_each_member(origin, &mut traversal_checkpoint, &mut |member, _, _| {
-                    if !is_allowed(partition, member) {
+                    if !{
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                        );
+                        is_allowed(partition, member)
+                    } {
                         return Ok(true);
                     }
                     let needed = rows.len() + 1;
@@ -4540,7 +4819,12 @@ where
 {
     let partition = layer.partition;
     if let Some(row_id) = layer.row(origin, before_source_entry)?
-        && is_allowed(partition, row_id)
+        && {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+            );
+            is_allowed(partition, row_id)
+        }
     {
         let stored = layer.row_version(origin, before_source_entry)?;
         let answered = match answer_distance(
@@ -4625,7 +4909,12 @@ where
         origin,
         before_source_entry,
         &mut |member, lsn, before_source| {
-            if !is_allowed(partition, member) {
+            if !{
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, member)
+            } {
                 return Ok(true);
             }
             let answered = match answer_distance(
@@ -5058,7 +5347,12 @@ where
             let Some(row_id) = layer.row(origin, before_source_entry)? else {
                 continue;
             };
-            if !is_allowed(layer.partition, row_id) {
+            if !{
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(layer.partition, row_id)
+            } {
                 continue;
             }
             let distance = match walk.reached.get(&bit).and_then(PointVisit::distance) {

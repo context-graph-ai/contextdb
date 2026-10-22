@@ -450,6 +450,7 @@ static PAGE_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn note_page_lookup(hit: bool) {
+    inline_phases::page_lookup(hit);
     if !enabled() {
         return;
     }
@@ -461,6 +462,7 @@ pub fn note_page_lookup(hit: bool) {
 
 #[inline]
 pub fn note_page_fill(bytes: usize) {
+    inline_phases::page_fill(bytes);
     if !enabled() {
         return;
     }
@@ -839,4 +841,224 @@ pub fn note_refused_saved_graph_load() {
 /// What this thread has loaded and hashed so far.
 pub fn load_meters() -> LoadMeters {
     LOAD_METERS.with(std::cell::Cell::get)
+}
+
+/// Fixed inline measurements for the private default-feature diagnostic.
+/// This path never enters the legacy allocating Record or its sink.
+#[doc(hidden)]
+pub mod inline_phases {
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
+    use std::time::Instant;
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub enum Phase {
+        Planning,
+        CandidateDrain,
+        Grouping,
+        Hnsw,
+        Adapter,
+        Rescore,
+        Materialize,
+        IsAllowed,
+        ResolveScore,
+        BeforeSource,
+        BeforeDistance,
+        Acquire,
+        Release,
+        PageRead,
+        PageAuth,
+    }
+    const N: usize = 15;
+    const NAMES: [&str; N] = [
+        "planning",
+        "candidate_drain",
+        "grouping",
+        "hnsw",
+        "adapter",
+        "rescore",
+        "materialize",
+        "is_allowed",
+        "resolve_score",
+        "before_source",
+        "before_distance",
+        "acquire",
+        "release",
+        "page_read",
+        "page_auth",
+    ];
+    #[derive(Clone, Copy)]
+    struct State {
+        active: bool,
+        request: u64,
+        depth: u32,
+        calls: [u64; N],
+        ns: [u64; N],
+        page_lookups: u64,
+        page_hits: u64,
+        page_fills: u64,
+        page_bytes: u64,
+        auth_bytes: u64,
+    }
+    const EMPTY: State = State {
+        active: false,
+        request: 0,
+        depth: 0,
+        calls: [0; N],
+        ns: [0; N],
+        page_lookups: 0,
+        page_hits: 0,
+        page_fills: 0,
+        page_bytes: 0,
+        auth_bytes: 0,
+    };
+    thread_local! { static STATE: Cell<State> = const { Cell::new(EMPTY) }; }
+    pub struct Statement {
+        start: Option<Instant>,
+        root: bool,
+    }
+    pub fn statement() -> Statement {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        // Resolved once, outside every per-evaluation path. The transient
+        // environment value is gone before the first statement starts.
+        if !*ENABLED.get_or_init(|| std::env::var_os("CONTEXTDB_INLINE_PHASES").is_some()) {
+            return Statement {
+                start: None,
+                root: false,
+            };
+        }
+        STATE.with(|slot| {
+            let mut state = slot.get();
+            let root = !state.active;
+            if root {
+                state = EMPTY;
+                state.active = true;
+                state.request = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
+            state.depth += 1;
+            slot.set(state);
+            Statement {
+                start: root.then(Instant::now),
+                root,
+            }
+        })
+    }
+    impl Drop for Statement {
+        fn drop(&mut self) {
+            if self.start.is_none() && !self.root {
+                STATE.with(|slot| {
+                    let mut state = slot.get();
+                    if state.active {
+                        state.depth -= 1;
+                        slot.set(state);
+                    }
+                });
+                return;
+            }
+            let elapsed = self
+                .start
+                .map_or(0, |start| start.elapsed().as_nanos() as u64);
+            let state = STATE.with(|slot| {
+                let state = slot.get();
+                slot.set(EMPTY);
+                state
+            });
+            // One bounded flush per statement, with PID/request identity and
+            // thread-local storage. Nested phase times are inclusive.
+            let stderr = std::io::stderr();
+            let mut out = stderr.lock();
+            let _ = write!(
+                out,
+                "inline_phases pid={} request={} elapsed_ns={} nested_times=inclusive page_lookups={} page_hits={} page_fills={} page_bytes={} auth_bytes={}",
+                std::process::id(),
+                state.request,
+                elapsed,
+                state.page_lookups,
+                state.page_hits,
+                state.page_fills,
+                state.page_bytes,
+                state.auth_bytes
+            );
+            for (index, name) in NAMES.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    " {}_calls={} {}_ns={}",
+                    name, state.calls[index], name, state.ns[index]
+                );
+            }
+            let _ = writeln!(out);
+            let _ = out.flush();
+        }
+    }
+    pub struct Timer {
+        phase: Phase,
+        start: Option<Instant>,
+        request: u64,
+    }
+    #[inline]
+    pub fn enter(phase: Phase) -> Timer {
+        STATE.with(|slot| {
+            let state = slot.get();
+            Timer {
+                phase,
+                start: state.active.then(Instant::now),
+                request: state.request,
+            }
+        })
+    }
+    impl Drop for Timer {
+        #[inline]
+        fn drop(&mut self) {
+            let Some(start) = self.start else {
+                return;
+            };
+            let elapsed = start.elapsed().as_nanos() as u64;
+            STATE.with(|slot| {
+                let mut state = slot.get();
+                if state.active && state.request == self.request {
+                    let index = self.phase as usize;
+                    state.calls[index] = state.calls[index].saturating_add(1);
+                    state.ns[index] = state.ns[index].saturating_add(elapsed);
+                    slot.set(state);
+                }
+            });
+        }
+    }
+    #[inline]
+    pub fn page_lookup(hit: bool) {
+        STATE.with(|slot| {
+            let mut state = slot.get();
+            if state.active {
+                state.page_lookups += 1;
+                state.page_hits += u64::from(hit);
+                slot.set(state);
+            }
+        });
+    }
+    #[inline]
+    pub fn page_fill(bytes: usize) {
+        STATE.with(|slot| {
+            let mut state = slot.get();
+            if state.active {
+                state.page_fills += 1;
+                state.page_bytes += bytes as u64;
+                slot.set(state);
+            }
+        });
+    }
+    #[inline]
+    pub fn authenticated(bytes: usize) {
+        STATE.with(|slot| {
+            let mut state = slot.get();
+            if state.active {
+                state.auth_bytes += bytes as u64;
+                slot.set(state);
+            }
+        });
+    }
 }

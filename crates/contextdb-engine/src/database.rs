@@ -75729,6 +75729,9 @@ impl Database {
 
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.clear_last_vector_search_trace();
+            let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Adapter,
+            );
             let _attribution = contextdb_core::find_attribution::stage("vector_search");
             let result = crate::memory_accounting::with_vector_load_reservation_transfer(
                 &self.finalization.accountant,
