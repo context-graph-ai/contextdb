@@ -12590,7 +12590,10 @@ mod original_ddl_occurrences {
         bytes
     }
 
-    fn prefix(change: &DdlChange) -> Result<Vec<u8>> {
+    fn prefix(
+        change: &DdlChange,
+        admission: &mut content_identity::original_writer::ProofAdmission,
+    ) -> Result<Vec<u8>> {
         let (kind, name) = match change {
             DdlChange::CreateTable { name, .. } => (0, name),
             DdlChange::DropTable { name } => (1, name),
@@ -12605,7 +12608,15 @@ mod original_ddl_occurrences {
             DdlChange::DropRoute { name, .. } => (10, name),
             DdlChange::CreateTriggerIncludingSync { name, .. } => (11, name),
         };
-        let mut key = Vec::with_capacity(name.len() + 42);
+        // The decoded declaration already retains its exact original invoice.
+        // This closed serializer borrows only strings, vectors, tuples and
+        // primitive enums; HashWriter and the codec controls stay on the stack.
+        // Fund the one native selector buffer, including its eventual suffix,
+        // before allocation so appending the occurrence cannot grow it.
+        let bytes = name.len().checked_add(42 + 12)
+            .ok_or_else(|| damage("declaration selector capacity overflow"))?;
+        admission.admit(bytes)?;
+        let mut key = Vec::with_capacity(bytes);
         key.extend_from_slice(&[1, kind]);
         key.extend_from_slice(&(name.len() as u64).to_be_bytes());
         key.extend_from_slice(name.as_bytes());
@@ -12833,13 +12844,13 @@ mod original_ddl_occurrences {
                 {
                     return Err(damage("occurrence primary key changed spelling"));
                 }
-                let body_bytes = found.map_or(0, |value| {
-                    value.value().len().saturating_mul(64).saturating_add(512)
-                });
-                admission.admit(body_bytes)?;
+                let mut body_bytes = 0;
                 let next = if let Some(value) = found {
+                    // frame.decode retains the exact decoded-body invoice until
+                    // every declaration use and physical payload free has ended.
                     let change: DdlChange = frame.decode(value.value())?;
-                    let mut selector = prefix(&change)?;
+                    let mut selector = prefix(&change, admission)?;
+                    body_bytes = selector.capacity();
                     selector.extend_from_slice(&suffix(at));
                     let mut marker = |namespace: &str| -> Result<bool> {
                         let key = format!("{namespace}{:020}.{:06}", at.0.0, at.1);
@@ -12905,6 +12916,12 @@ mod original_ddl_occurrences {
                 } else {
                     counts.insert(at.0.0, count).map_err(Self::storage_error)?;
                 }
+                // The selector/encoded successor died in the branch above.
+                // End the separately funded key copies before their refund too.
+                drop(old);
+                drop(primary_key);
+                drop(bare);
+                drop(indexed);
                 admission.release(body_bytes + old_bytes + key_bytes);
             }
             admission.release(charged);
