@@ -156,7 +156,10 @@ fn check_owners(receipt: &Json) {
             "source_metadata",
             "reader_source_metadata",
             "reader_last_query_trace",
+            "reader_root_control",
             "reader_child_controls",
+            "reader_child_payloads",
+            "reader_acl_cache",
             "reader_parent_total",
             "base_graph",
             "change_graph",
@@ -186,10 +189,17 @@ fn check_owners(receipt: &Json) {
         .map(|field| vector[*field].as_u64().unwrap())
         .sum::<u64>();
     assert_eq!(retained_sum, vector["retained_total"].as_u64().unwrap());
+    assert!(
+        vector["reader_root_control"].as_u64().unwrap() > 0,
+        "the declared reader root remains present at each checkpoint"
+    );
+    // Source metadata and the last-query trace are subsets of child payloads.
+    // Sum only disjoint live owners, including the root and its ACL cache.
     let reader_sum = [
-        "reader_source_metadata",
+        "reader_root_control",
         "reader_child_controls",
-        "reader_last_query_trace",
+        "reader_child_payloads",
+        "reader_acl_cache",
     ]
     .iter()
     .map(|field| vector[*field].as_u64().unwrap())
