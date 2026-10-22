@@ -690,7 +690,7 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
     );
     let vector = VectorIndexRef::new("recheck_rows", "embedding");
     let key =
-        contextdb_vector::VectorPartitionKey::from_values(&[Value::Text("scope".into())]).unwrap();
+        contextdb_core::VectorPartitionKey::from_values(&[Value::Text("scope".into())]).unwrap();
     let info = || {
         let mut owner = crate::vector_read_memory::admission(db.declared_reader_memory().unwrap());
         db.vector_store_for_test()
